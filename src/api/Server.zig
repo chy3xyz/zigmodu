@@ -1314,6 +1314,81 @@ fn parseFormBody(allocator: std.mem.Allocator, body: []const u8, max_params: usi
     return form;
 }
 
+/// The status a failed parameter parse owes the client.
+///
+/// `parseQueryInto` and `parseFormBody` fail for two unrelated reasons, and the
+/// caller must not flatten them into one: `error.TooManyParams` is the
+/// client's fault (it sent more occurrences than `Server.Config.max_params`
+/// allows) and is a 400, while everything else these parsers return — the arena
+/// under them refusing an allocation — is the server's and is a 500. Answering
+/// the second as "the client sent no fields" serves a request whose fields were
+/// never read; answering the first as a success leaves the client with an empty
+/// form and no way to learn it sent too many fields.
+fn paramParseFailureStatus(err: anyerror) u16 {
+    return if (err == error.TooManyParams) 400 else 500;
+}
+
+/// What the urlencoded-body step found for one request.
+const UrlencodedForm = union(enum) {
+    /// No urlencoded body on this request.
+    absent,
+    /// Parsed; the `Params` belongs to the allocator the step was given.
+    parsed: Params,
+    /// The request cannot be served. `status` says what it owes the client and
+    /// `message` is the reason phrase for that status.
+    refused: struct { status: u16, message: []const u8 },
+};
+
+/// The urlencoded-body step both request paths run between taking the request
+/// apart and matching a route.
+///
+/// It reports the two failures of `parseFormBody` separately instead of
+/// collapsing them into "there was no form" (see `paramParseFailureStatus`):
+/// only a request that was actually parsed may reach a handler with
+/// `ctx.form` set, and a request whose parse failed is answered instead — 400
+/// for a field count over `max_params`, 500 for an allocation failure.
+fn parseUrlencodedForm(
+    allocator: std.mem.Allocator,
+    content_type: []const u8,
+    body: ?[]const u8,
+    max_params: usize,
+) UrlencodedForm {
+    const raw = body orelse return .absent;
+    if (!std.mem.startsWith(u8, content_type, "application/x-www-form-urlencoded")) return .absent;
+
+    const form = parseFormBody(allocator, raw, max_params) catch |err| {
+        // `warn`, not `err`: the request *is* answered, and an error-level line
+        // fails the whole suite (`scripts/test-runner.zig` counts those).
+        std.log.warn("[Server] urlencoded body refused: {s}", .{@errorName(err)});
+        const status = paramParseFailureStatus(err);
+        return .{ .refused = .{ .status = status, .message = getStatusText(status) } };
+    };
+    return .{ .parsed = form };
+}
+
+/// The answer a request-boundary parse failure owes the client.
+///
+/// Every request-boundary failure is a refusal, never a best-effort reparse:
+/// 413/431 for the size guards, 501 for a method token this server does not
+/// implement, 400 for everything else (including the CL/TE framing conflicts,
+/// and `IncompleteBody` — a `Content-Length` the peer never delivered, which
+/// used to be a `return` with nothing written: a closed socket and no status
+/// line, which reads as a crash rather than a 400).
+///
+/// `error.OutOfMemory` is the exception. The parser allocates the request line,
+/// the query map, the headers and the body on the request arena, and an arena
+/// that refused an allocation is this server's fault, not a malformed request.
+/// It used to fall into the catch-all with a 400 — the status a genuinely
+/// malformed target gets, so the client could not tell the two apart and the
+/// wrong side was blamed.
+fn requestParseRefusal(err: anyerror) struct { status: u16, message: []const u8 } {
+    if (err == error.BodyTooLarge) return .{ .status = 413, .message = "Payload Too Large" };
+    if (err == error.TooManyHeaders) return .{ .status = 431, .message = "Request Header Fields Too Large" };
+    if (err == error.InvalidMethod) return .{ .status = 501, .message = "Not Implemented" };
+    if (err == error.OutOfMemory) return .{ .status = 500, .message = "Internal Server Error" };
+    return .{ .status = 400, .message = "Bad Request" };
+}
+
 // ==== §4  HTTP/1.1 parsing ====
 
 /// Simple stream reader wrapper for HTTP parsing
@@ -2499,16 +2574,21 @@ pub const Server = struct {
 
         if (query_start) |q| {
             parseQueryInto(&ctx.query, path[q + 1 ..], arena_alloc, server.max_params) catch |err| {
-                // H1 fails such a request (400) instead of routing it with a
+                // H1 fails such a request instead of routing it with a
                 // half-parsed query. Refuse here too — quietly answering the
                 // route with the parameters missing is the divergence class
                 // this adapter already refuses to have for streaming (501).
+                // The *kind* of failure decides the status, exactly as on H1:
+                // an over-limit query string is the client's 400, an arena that
+                // refused an allocation is the server's 500.
+                const status = paramParseFailureStatus(err);
                 std.log.warn("[Server] HTTP/2 query string refused: {s}", .{@errorName(err)});
+                const refusal = try allocator.dupe(u8, getStatusText(status));
                 ctx.deinit();
                 return .{
-                    .status = 400,
+                    .status = status,
                     .content_type = "text/plain",
-                    .body = try allocator.dupe(u8, "Bad Request"),
+                    .body = refusal,
                 };
             };
         }
@@ -2550,11 +2630,22 @@ pub const Server = struct {
         if (server.path_rewriter) |rewriter| {
             rewriter(&ctx);
         }
-        if (ctx.body) |form_body| {
-            const form_ctype = ctx.headers.get("content-type") orelse "";
-            if (std.mem.startsWith(u8, form_ctype, "application/x-www-form-urlencoded")) {
-                ctx.form = parseFormBody(arena_alloc, form_body, server.max_params) catch null;
-            }
+        // Same step, same two answers as H1 (see `parseUrlencodedForm`). A
+        // refusal has to be returned *before* the handler runs: this path has
+        // no `connFiber` around it to turn an exception into a status, and
+        // `ctx.deinit()` is what the other early returns here do.
+        switch (parseUrlencodedForm(arena_alloc, ctx.headers.get("content-type") orelse "", ctx.body, server.max_params)) {
+            .absent => {},
+            .parsed => |form| ctx.form = form,
+            .refused => |refusal| {
+                const body_text = try allocator.dupe(u8, refusal.message);
+                ctx.deinit();
+                return .{
+                    .status = refusal.status,
+                    .content_type = "text/plain",
+                    .body = body_text,
+                };
+            },
         }
 
         try server.handleForTest(&ctx);
@@ -3100,30 +3191,8 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
             // A malformed request is a client fault, not a server error: warn,
             // so scanners/probes cannot inflate the error signal.
             std.log.warn("Parse error: {any}", .{err});
-            // Every request-boundary failure is a refusal, never a best-effort
-            // reparse: 413/431 for the size guards, 501 for a method token this
-            // server does not implement, 400 for everything else (including
-            // the CL/TE framing conflicts, and `IncompleteBody` — a
-            // `Content-Length` the peer never delivered, which used to be a
-            // `return` with nothing written: a closed socket and no status
-            // line, which reads as a crash rather than a 400).
-            const msg = if (err == error.BodyTooLarge)
-                "Payload Too Large"
-            else if (err == error.TooManyHeaders)
-                "Request Header Fields Too Large"
-            else if (err == error.InvalidMethod)
-                "Not Implemented"
-            else
-                "Bad Request";
-            const status: u16 = if (err == error.BodyTooLarge)
-                413
-            else if (err == error.TooManyHeaders)
-                431
-            else if (err == error.InvalidMethod)
-                501
-            else
-                400;
-            writeErrorResponse(server.io, stream, arena_alloc, status, msg, requestLineIsHead(first_line_raw));
+            const refusal = requestParseRefusal(err);
+            writeErrorResponse(server.io, stream, arena_alloc, refusal.status, refusal.message, requestLineIsHead(first_line_raw));
             return;
         };
         defer request.deinit(arena_alloc);
@@ -3172,12 +3241,17 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
             request.path = ctx.path; // sync — router.match uses request.path
         }
 
-        // Parse form body
-        if (request.body) |body| {
-            const ctype = ctx.headers.get("content-type") orelse "";
-            if (std.mem.startsWith(u8, ctype, "application/x-www-form-urlencoded")) {
-                ctx.form = parseFormBody(arena_alloc, body, server.max_params) catch null;
-            }
+        // Parse form body — a failure here is answered, never folded into "the
+        // request carried no fields" (see `parseUrlencodedForm`). `catch null`
+        // here served a request whose form was never read as a 200 with an
+        // empty `ctx.form`, and a client over `max_params` was never told.
+        switch (parseUrlencodedForm(arena_alloc, ctx.headers.get("content-type") orelse "", request.body, server.max_params)) {
+            .absent => {},
+            .parsed => |form| ctx.form = form,
+            .refused => |refusal| {
+                writeErrorResponse(server.io, stream, arena_alloc, refusal.status, refusal.message, request.method == .HEAD);
+                return;
+            },
         }
 
         // ── HTTP/2 cleartext upgrade (h2c, RFC 7540 §3.2) ──
@@ -6558,6 +6632,21 @@ fn h2PostForm(
     body: []const u8,
     out: []u8,
 ) ![]const u8 {
+    const reply = try h2PostFormReply(allocator, port, route, body, out);
+    const frame = h2FindFrame(reply, .data, 1) orelse return error.NoDataFrameInReply;
+    return frame.payload;
+}
+
+/// The same exchange, but the whole reply: a refusal carries its answer in the
+/// HEADERS frame (`:status`) and may carry a body the body-only helper above
+/// cannot tell apart from a success's.
+fn h2PostFormReply(
+    allocator: std.mem.Allocator,
+    port: u16,
+    route: []const u8,
+    body: []const u8,
+    out: []u8,
+) ![]const u8 {
     const ctype = [_]Hpack.Header{.{ .name = "content-type", .value = "application/x-www-form-urlencoded" }};
     const block = try h2RequestBlock(allocator, "POST", route, &ctype);
     defer allocator.free(block);
@@ -6572,8 +6661,18 @@ fn h2PostForm(
     try script.appendSlice(allocator, data);
 
     const n = try h2SendToServer(port, script.items, out);
-    const frame = h2FindFrame(out[0..n], .data, 1) orelse return error.NoDataFrameInReply;
-    return frame.payload;
+    return out[0..n];
+}
+
+/// The `:status` of a reply's stream-1 HEADERS frame, as a number.
+fn h2ReplyStatus(allocator: std.mem.Allocator, reply: []const u8) !u16 {
+    const hframe = h2FindFrame(reply, .headers, 1) orelse return error.NoHeadersFrameInReply;
+    var dec = Hpack.Decoder.init(allocator);
+    defer dec.deinit();
+    const hdrs = try dec.decode(hframe.payload);
+    defer Hpack.freeHeaders(allocator, hdrs);
+    const raw = h2FirstHeaderValue(hdrs, ":status") orelse return error.NoStatusHeaderInReply;
+    return std.fmt.parseInt(u16, raw, 10);
 }
 
 /// A real `Server` listening on a loopback port on its own thread.
@@ -6662,15 +6761,165 @@ test "h2 adapter parity: the form parser takes Server.Config.max_params too" {
     defer running.stop(&server);
 
     // Two bodies through the same route: one within the limit is parsed, the
-    // one over it is refused — so "the limit is applied" is distinguishable from
-    // "no body is ever parsed".
+    // one over it is refused with the same 400 the query string's limit
+    // produces — so "the limit is applied" is distinguishable from "no body is
+    // ever parsed", and a client that sent too many fields is told so instead
+    // of being handed a handler that sees no fields at all.
     var out_a: [8192]u8 = undefined;
-    const within_limit = try h2PostForm(allocator, running.port, "/h2formlimit", "a=1&b=2", &out_a);
-    try std.testing.expectEqualStrings("1", within_limit);
+    const within_limit = try h2PostFormReply(allocator, running.port, "/h2formlimit", "a=1&b=2", &out_a);
+    try std.testing.expectEqual(@as(u16, 200), try h2ReplyStatus(allocator, within_limit));
+    const data_a = h2FindFrame(within_limit, .data, 1) orelse return error.NoDataFrameInReply;
+    try std.testing.expectEqualStrings("1", data_a.payload);
 
     var out_b: [8192]u8 = undefined;
-    const over_limit = try h2PostForm(allocator, running.port, "/h2formlimit", "a=1&b=2&c=3", &out_b);
-    try std.testing.expectEqualStrings("MISSING", over_limit);
+    const over_limit = try h2PostFormReply(allocator, running.port, "/h2formlimit", "a=1&b=2&c=3", &out_b);
+    try std.testing.expectEqual(@as(u16, 400), try h2ReplyStatus(allocator, over_limit));
+    const data_b = h2FindFrame(over_limit, .data, 1) orelse return error.NoDataFrameInReply;
+    try std.testing.expectEqualStrings("Bad Request", data_b.payload);
+}
+
+// ── A urlencoded body that fails to parse: two causes, two answers ───────
+//
+// `parseFormBody` fails for two unrelated reasons, and both request paths used
+// to flatten them into one with `catch null` — "there was no form" — and then
+// answer 200. A handler reading `ctx.formValue` could not tell "the client sent
+// no fields" from "the server could not parse the ones it sent", and a body
+// over `Config.max_params` was never reported to the client at all.
+//
+// The two halves are covered where each one is reachable. The field flood goes
+// through real sockets (below and in the H2 parity test above): a body over
+// `max_params` needs nothing but a small limit. The allocation half cannot be
+// driven that way — the parse allocates on the *request arena*, which is carved
+// out of the server's allocator in whole chunks, so a size-trapping server
+// allocator never sees one of the parse's own requests (measured: it fires zero
+// times for a request whose form parse definitely allocated). The seam that
+// does reach them is the parser itself, and the step's classification is what
+// turns its two errors into the two statuses.
+
+test "the urlencoded-body step answers an allocation failure with 500, and never with a form" {
+    const allocator = std.testing.allocator;
+    const ctype = "application/x-www-form-urlencoded";
+    const body = "a=1&roles%5B1%5D=8&note=a+b";
+
+    // Baseline: with memory to spare the body parses, so the assertions below
+    // are about failures and not about a step that never parsed anything.
+    switch (parseUrlencodedForm(allocator, ctype, body, 1000)) {
+        .parsed => |form| {
+            var parsed = form;
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings("1", parsed.get("a").?);
+            try std.testing.expectEqualStrings("a b", parsed.get("note").?);
+            try std.testing.expectEqualStrings("8", parsed.getPath("roles.1").?);
+        },
+        .absent, .refused => return error.TestUnexpectedResult,
+    }
+
+    // Refusing the *first* allocation the parse makes (the first key's decode)
+    // is the injection that leaves nothing half-built behind, so what comes
+    // back is the step's refusal and nothing else.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, parseFormBody(failing.allocator(), body, 1000));
+    try std.testing.expect(failing.has_induced_failure);
+    var failing_query = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var query_params = Params.init(failing_query.allocator());
+    defer query_params.deinit();
+    try std.testing.expectError(error.OutOfMemory, parseQueryInto(&query_params, "a=1&b=2", failing_query.allocator(), 1000));
+    try std.testing.expect(failing_query.has_induced_failure);
+
+    // The other failure of the same parse is the client's field count, and it
+    // is a different error: the two callers classify on exactly that.
+    try std.testing.expectError(error.TooManyParams, parseFormBody(allocator, body, 1));
+}
+
+test "a parse failure is answered by its kind: 400 for the field flood, 500 for the server's own" {
+    // The H1 request boundary classifies with `requestParseRefusal`, the H2
+    // adapter and both urlencoded-body call sites with `paramParseFailureStatus`
+    // — and the two have to agree, or the same request gets one answer on each
+    // protocol.
+    try std.testing.expectEqual(@as(u16, 400), paramParseFailureStatus(error.TooManyParams));
+    try std.testing.expectEqual(@as(u16, 500), paramParseFailureStatus(error.OutOfMemory));
+    try std.testing.expectEqual(@as(u16, 400), requestParseRefusal(error.TooManyParams).status);
+    try std.testing.expectEqual(@as(u16, 500), requestParseRefusal(error.OutOfMemory).status);
+    try std.testing.expectEqualStrings("Internal Server Error", requestParseRefusal(error.OutOfMemory).message);
+
+    // The rest of the request boundary keeps the statuses it had.
+    try std.testing.expectEqual(@as(u16, 413), requestParseRefusal(error.BodyTooLarge).status);
+    try std.testing.expectEqual(@as(u16, 431), requestParseRefusal(error.TooManyHeaders).status);
+    try std.testing.expectEqual(@as(u16, 501), requestParseRefusal(error.InvalidMethod).status);
+    try std.testing.expectEqual(@as(u16, 400), requestParseRefusal(error.InvalidRequest).status);
+    try std.testing.expectEqual(@as(u16, 400), requestParseRefusal(error.IncompleteBody).status);
+}
+
+test "a request the server could not allocate room for is answered 500, not 400" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    // The parser allocates the request line on the request arena, and the arena
+    // asks for it in one chunk-sized request. Refusing chunk-sized requests
+    // therefore fails the *request-line* allocation — an allocation failure
+    // inside the parse, which is this server's fault — while the small
+    // allocations the refusal itself needs (`writeErrorResponse`'s
+    // `Content-Type`) still go through, so the client gets an answer and not a
+    // vanished socket. The same failure used to fall into the parse boundary's
+    // catch-all and come back as 400, a status that blames the client for a
+    // request it sent correctly.
+    var trap = LargeAllocTrap{ .child = allocator, .min_size = 4096 };
+
+    var server = Server.initWithConfig(std.testing.io, trap.allocator(), .{ .port = 0, .name = "h1-parse-oom" });
+    defer server.deinit();
+
+    var group = server.group("");
+    try group.get("h1parseoom", struct {
+        fn h(ctx: *Context) anyerror!void {
+            try ctx.text(200, "MISSING");
+        }
+    }.h, null);
+
+    var running = try H2TestServer.start(&server);
+    defer running.stop(&server);
+
+    // A target long enough that the request line is a chunk-sized allocation.
+    const filler: [5000]u8 = @splat('a');
+    const request = "GET /h1parseoom?q=" ++ filler ++ " HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+
+    var out: [4096]u8 = undefined;
+    const response = try h1RawExchange(running.port, request, &out);
+
+    try std.testing.expect(trap.trapped.load(.monotonic) >= 1);
+    try std.testing.expectEqualStrings("HTTP/1.1 500 Internal Server Error", h1StatusLine(response));
+}
+
+test "a urlencoded body over max_params is refused with 400, not served as an empty form" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .max_params = 2, .name = "h1-form-limit" });
+    defer server.deinit();
+
+    var group = server.group("");
+    try group.post("h1formlimit", struct {
+        fn h(ctx: *Context) anyerror!void {
+            try ctx.text(200, ctx.requestParam("a") orelse "MISSING");
+        }
+    }.h, null);
+
+    var running = try H2TestServer.start(&server);
+    defer running.stop(&server);
+
+    const ctype = "Content-Type: application/x-www-form-urlencoded\r\n";
+    var out: [4096]u8 = undefined;
+
+    // Within the limit: parsed, so "refused" is distinguishable from "no form
+    // is ever parsed on this route".
+    const ok = try h1RawExchange(running.port, "POST /h1formlimit HTTP/1.1\r\nHost: x\r\n" ++ ctype ++ "Content-Length: 7\r\nConnection: close\r\n\r\na=1&b=2", &out);
+    try std.testing.expectEqualStrings("HTTP/1.1 200 OK", h1StatusLine(ok));
+    try std.testing.expectEqualStrings("1", h1Body(ok));
+
+    // Over it: three occurrences against a limit of two is the client's fault,
+    // and the answer is the 400 the query string's own limit already produces.
+    const over = try h1RawExchange(running.port, "POST /h1formlimit HTTP/1.1\r\nHost: x\r\n" ++ ctype ++ "Content-Length: 11\r\nConnection: close\r\n\r\na=1&b=2&c=3", &out);
+    try std.testing.expectEqualStrings("HTTP/1.1 400 Bad Request", h1StatusLine(over));
+    try std.testing.expect(std.mem.indexOf(u8, over, "MISSING") == null);
 }
 
 test "h2 adapter parity: the path rewriter runs before routing" {
@@ -7605,6 +7854,60 @@ fn h1Body(response: []const u8) []const u8 {
     const end = std.mem.indexOf(u8, response, "\r\n\r\n") orelse return "";
     return response[end + 4 ..];
 }
+
+/// The status line of an H1 response — status *and* reason phrase, so a test
+/// can compare the whole thing it saw instead of a prefix of it.
+fn h1StatusLine(response: []const u8) []const u8 {
+    const end = std.mem.indexOf(u8, response, "\r\n") orelse response.len;
+    return response[0..end];
+}
+
+/// An allocator that refuses every request of `min_size` bytes or more, and
+/// passes everything smaller to `child`, counting the refusals.
+///
+/// `connFiber` builds the per-request arena on `Server.allocator`, and the
+/// arena asks its child for memory in whole chunks — one chunk-sized request
+/// per node, never one per parse allocation. Refusing chunk-sized requests is
+/// therefore how a *server-side* allocation failure is injected into a real
+/// request without also failing the listener, the fiber or the response writer
+/// (those ask for less). See the tests that use it for what each size reaches.
+const LargeAllocTrap = struct {
+    child: std.mem.Allocator,
+    min_size: usize,
+    trapped: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *LargeAllocTrap = @ptrCast(@alignCast(ctx));
+        if (len >= self.min_size) {
+            _ = self.trapped.fetchAdd(1, .monotonic);
+            return null;
+        }
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *LargeAllocTrap = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *LargeAllocTrap = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *LargeAllocTrap = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn allocator(self: *LargeAllocTrap) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
 
 test "a handler's Content-Length is written once, not twice" {
     const allocator = std.testing.allocator;

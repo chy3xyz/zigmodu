@@ -57,7 +57,9 @@ pub const DataPermissionContext = struct {
         switch (self.scope) {
             // `.all` is the only scope that means "no restriction", so it is the
             // only one that comes back `null` — the single caller-visible way to
-            // spell it. Every other scope returns a filter that matches rows.
+            // spell it. Every other scope returns a filter the caller splices,
+            // and when one cannot be built it comes back as the fail-closed
+            // clause (`reject`), never as `null`.
             .all => return null,
             .dept_custom => {
                 // The list names the departments the caller may see. A list that
@@ -73,18 +75,28 @@ pub const DataPermissionContext = struct {
                     return reject("the .dept_custom dept list could not be rendered");
                 return DataPermissionFilter{ .clause = clause, .params = ids };
             },
+            // The three scopes below bind exactly one param, so that allocation
+            // is the only thing that can fail. On failure they deny instead of
+            // returning `null`: `null` means "the caller applies no
+            // data-permission clause at all", so an allocation failure must not
+            // be the way a department- or user-scoped read becomes a full-table
+            // read. Failing closed keeps the restriction that the caller asked
+            // for; the warn in `reject` is the signal to act on.
             .dept_only => {
-                const params = allocator.alloc(i64, 1) catch return null;
+                const params = allocator.alloc(i64, 1) catch
+                    return reject("the .dept_only scope could not bind its department id");
                 params[0] = self.self_dept_id;
                 return DataPermissionFilter{ .clause = dept_column ++ " = ?", .params = params };
             },
             .dept_and_child => {
-                const params = allocator.alloc(i64, 1) catch return null;
+                const params = allocator.alloc(i64, 1) catch
+                    return reject("the .dept_and_child scope could not bind its department id");
                 params[0] = self.self_dept_id;
                 return DataPermissionFilter{ .clause = dept_column ++ " = ?", .params = params };
             },
             .self_ => {
-                const params = allocator.alloc(i64, 1) catch return null;
+                const params = allocator.alloc(i64, 1) catch
+                    return reject("the .self_ scope could not bind the user id");
                 params[0] = self.user_id;
                 return DataPermissionFilter{ .clause = user_column ++ " = ?", .params = params };
             },
@@ -103,7 +115,11 @@ pub const DataPermissionFilter = struct {
     params: []const i64,
 };
 
-/// Fail-closed result for a `.dept_custom` scope whose list cannot be built.
+/// Fail-closed result for a restricting scope that could not be built.
+///
+/// Two things make a scope unbuildable: a `.dept_custom` list that names no
+/// department (absent, empty, unparseable) and an allocation failure while
+/// binding the param of `.self_` / `.dept_only` / `.dept_and_child`.
 ///
 /// The point of this shape is that it is a **filter**: it comes back as a
 /// clause the caller already splices and applies, so "could not build the
@@ -121,8 +137,9 @@ fn reject(why: []const u8) DataPermissionFilter {
 /// the scope clause ("AND {col} = ?" / "AND {col} IN (?,…)") so handlers apply
 /// data permission at the SQL layer instead of hand-writing filters.
 /// NOTE: the returned clause is comptime static for `.all`/`.self_`/`.dept_only`
-/// (do NOT free) and for a rejected `.dept_custom` (`"1 = 0"`); a well-formed
-/// `.dept_custom` is the only shape that allocates from the interceptor allocator.
+/// (do NOT free) and for a rejected scope (`"1 = 0"`, including one rejected
+/// because binding its param failed to allocate); a well-formed `.dept_custom`
+/// is the only shape that allocates from the interceptor allocator.
 pub const DataPermissionInterceptor = struct {
     allocator: std.mem.Allocator,
 
@@ -133,9 +150,11 @@ pub const DataPermissionInterceptor = struct {
     /// Scope clause for the current context.
     ///
     /// `null` means "everything allowed" and is produced by **one** scope only:
-    /// `.all`. A `.dept_custom` scope whose dept list cannot be built comes back
-    /// as a filter that matches no row — never as `null`, which a caller splices
-    /// as "no data-permission clause at all".
+    /// `.all`. A restricting scope that cannot be built — a `.dept_custom` list
+    /// that names no department, or a `.self_` / `.dept_only` / `.dept_and_child`
+    /// whose param allocation failed — comes back as a filter that matches no
+    /// row, never as `null`, which a caller splices as "no data-permission
+    /// clause at all".
     pub fn andWhere(
         self: *DataPermissionInterceptor,
         ctx: *const DataPermissionContext,
@@ -147,22 +166,31 @@ pub const DataPermissionInterceptor = struct {
 };
 
 fn buildInClause(allocator: std.mem.Allocator, comptime col: []const u8, ids: []const i64) ![]const u8 {
-    var buf: [256]u8 = undefined;
-    var pos: usize = col.len + 5; // "col IN ("
-    @memcpy(buf[0..col.len], col);
-    @memcpy(buf[col.len..pos], " IN (");
+    // Size the buffer from the list instead of rendering into a fixed one: the
+    // count is data (a role's dept list), and the clause it produces is
+    // `3 * n + col.len + 4` bytes for n ids — the fixed `[256]u8` this used to
+    // write into fit 81 ids for a 7-char column and wrote past the array from the
+    // 82nd on: a bounds trap in Debug, a clobbered frame in ReleaseFast.
+    const separators: usize = if (ids.len > 0) (ids.len - 1) * 2 else 0;
+    const clause = try allocator.alloc(u8, col.len + 5 + ids.len + separators + 1);
+    var pos: usize = 0;
+    @memcpy(clause[pos..][0..col.len], col);
+    pos += col.len;
+    @memcpy(clause[pos..][0..5], " IN (");
+    pos += 5;
     for (ids, 0..) |_, i| {
         if (i > 0) {
-            buf[pos] = ',';
-            buf[pos + 1] = ' ';
+            clause[pos] = ',';
+            clause[pos + 1] = ' ';
             pos += 2;
         }
-        buf[pos] = '?';
+        clause[pos] = '?';
         pos += 1;
     }
-    buf[pos] = ')';
+    clause[pos] = ')';
     pos += 1;
-    return allocator.dupe(u8, buf[0..pos]);
+    std.debug.assert(pos == clause.len);
+    return clause;
 }
 
 /// Parse the `data_scope_dept_ids` column: `[1, 2]`, `[1,2]`, `1,2`, `[]`.
@@ -251,6 +279,73 @@ test "only the .all scope can yield a null filter" {
     }
 }
 
+test "an allocation failure while building a restricting filter matches no row (sqlite)" {
+    const allocator = std.testing.allocator;
+    const data = @import("../data.zig");
+
+    var client = try data.Client.open(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    _ = try client.exec("CREATE TABLE doc (id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL, dept_id INTEGER NOT NULL)", &.{});
+    _ = try client.exec("INSERT INTO doc (id, owner_id, dept_id) VALUES (1, 7, 3), (2, 7, 4)", &.{});
+
+    const Doc = struct { id: i64 };
+    // Every restricting scope allocates its bound params. Fail that allocation
+    // and splice the result exactly the way the real caller does
+    // (`examples/zmsaas/backend/src/shard.zig`): a `null` filter means "no
+    // data-permission clause at all", so acquiring one here would hand the
+    // query the whole table.
+    for ([_]Rbac.DataScope{ .self_, .dept_only, .dept_and_child }) |scope| {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+        var ctx = DataPermissionContext.init(allocator);
+        defer ctx.deinit();
+        ctx.scope = scope;
+        ctx.user_id = 7;
+        ctx.self_dept_id = 3;
+        var interceptor = DataPermissionInterceptor.init(failing.allocator());
+
+        const filter = try interceptor.andWhere(&ctx, "dept_id", "owner_id");
+        try std.testing.expect(filter != null);
+        try std.testing.expectEqualStrings("1 = 0", filter.?.clause);
+        try std.testing.expectEqual(@as(usize, 0), filter.?.params.len);
+
+        var sql = std.ArrayList(u8).empty;
+        defer sql.deinit(allocator);
+        try sql.appendSlice(allocator, "SELECT id FROM doc WHERE owner_id = ?");
+        var args: [2]data.sqlx.Value = undefined;
+        var arg_count: usize = 0;
+        args[arg_count] = .{ .int = 7 };
+        arg_count += 1;
+        if (filter) |f| {
+            try sql.appendSlice(allocator, " AND ");
+            try sql.appendSlice(allocator, f.clause);
+            for (f.params) |p| {
+                args[arg_count] = .{ .int = p };
+                arg_count += 1;
+            }
+        }
+        var rows = try client.queryRows(Doc, sql.items, args[0..arg_count]);
+        defer rows.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 0), rows.items.len);
+    }
+
+    // Control: with a working allocator the very same scope still restricts to
+    // its own department — the fix above is "deny on failure", not "always deny".
+    var ok_ctx = DataPermissionContext.init(allocator);
+    defer ok_ctx.deinit();
+    ok_ctx.scope = .dept_only;
+    ok_ctx.self_dept_id = 3;
+    var ok_interceptor = DataPermissionInterceptor.init(allocator);
+    const ok_filter = (try ok_interceptor.andWhere(&ok_ctx, "dept_id", "owner_id")) orelse
+        return error.UnexpectedNull;
+    defer allocator.free(ok_filter.params);
+    try std.testing.expectEqualStrings("dept_id = ?", ok_filter.clause);
+    try std.testing.expectEqual(@as(i64, 3), ok_filter.params[0]);
+    var ok_rows = try client.queryRows(Doc, "SELECT id FROM doc WHERE owner_id = ? AND dept_id = ?", &.{ .{ .int = 7 }, .{ .int = 3 } });
+    defer ok_rows.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), ok_rows.items.len);
+    try std.testing.expectEqual(@as(i64, 1), ok_rows.items[0].id);
+}
+
 test ".dept_custom rejects an empty or absent dept list instead of allowing everything" {
     const allocator = std.testing.allocator;
     var interceptor = DataPermissionInterceptor.init(allocator);
@@ -281,6 +376,29 @@ test ".dept_custom rejects an empty or absent dept list instead of allowing ever
             try std.testing.expectEqualSlices(i64, good, filter.params);
         }
     }
+}
+
+test "a .dept_custom list longer than a fixed clause buffer still renders" {
+    const allocator = std.testing.allocator;
+    // A role can legitimately name hundreds of departments; the clause grows with
+    // the list, so rendering it into a fixed-size buffer is a size bug waiting on
+    // data (the old `[256]u8` fit only 81 ids for this column).
+    const n: usize = 300;
+    const ids = try allocator.alloc(i64, n);
+    for (ids, 0..) |*id, i| id.* = @intCast(i + 1);
+
+    var ctx = DataPermissionContext.init(allocator);
+    defer ctx.deinit();
+    ctx.scope = .dept_custom;
+    ctx.dept_ids = ids; // owned by ctx, freed by ctx.deinit()
+    var interceptor = DataPermissionInterceptor.init(allocator);
+    const filter = (try interceptor.andWhere(&ctx, "dept_id", "owner_id")) orelse
+        return error.RejectedScopeCameBackAsUnrestricted;
+    defer allocator.free(filter.clause);
+    try std.testing.expectEqual(@as(usize, n), filter.params.len);
+    try std.testing.expectEqual("dept_id IN (".len + n + 2 * (n - 1) + 1, filter.clause.len);
+    try std.testing.expect(std.mem.startsWith(u8, filter.clause, "dept_id IN (?, "));
+    try std.testing.expect(std.mem.endsWith(u8, filter.clause, "?)"));
 }
 
 test "fromRoles rejects a data_scope_dept_ids that is empty or not a list of ids" {

@@ -127,8 +127,17 @@ pub const HttpClient = struct {
                 const conn = self.idle_connections.items[idx];
                 if (std.mem.eql(u8, conn.host, host) and conn.port == port) {
                     if (conn.isAlive()) {
+                        // Reserve the active-list slot *before* the removal: the
+                        // `swapRemove` is the irreversible half, so a fallible
+                        // `append` after it would lose the connection on OOM —
+                        // gone from `idle_connections`, never on
+                        // `active_connections`, never closed, `host` never freed,
+                        // and `max_connections` still counting its slot. Failing
+                        // the reservation first leaves the pool as it was, with
+                        // the connection still idle for the next caller.
+                        try self.active_connections.ensureUnusedCapacity(self.allocator, 1);
                         const connection = self.idle_connections.swapRemove(idx);
-                        try self.active_connections.append(self.allocator, connection);
+                        self.active_connections.appendAssumeCapacity(connection);
                         return connection;
                     } else {
                         const dead = self.idle_connections.swapRemove(idx);
@@ -147,7 +156,12 @@ pub const HttpClient = struct {
 
             const addr = try std.Io.net.IpAddress.resolve(self.io, host, port);
             const stream = try addr.connect(self.io, .{ .mode = .stream });
+            // Nothing owns the socket or the copy yet, so these are the only
+            // chances to close/free them if a later step fails: the append below
+            // is the last fallible operation before the pool takes over.
+            errdefer stream.close(self.io);
             const host_copy = try self.allocator.dupe(u8, host);
+            errdefer self.allocator.free(host_copy);
 
             const conn = Connection{
                 .host = host_copy,
@@ -171,7 +185,14 @@ pub const HttpClient = struct {
         /// pooling a connection whose request failed hands the next request a
         /// socket that is already dead. A failed request ends in `discard`.
         pub fn release(self: *ConnectionPool, conn: Connection) void {
-            self.mutex.lock(self.io) catch return;
+            // Uncancelable: `release` is the borrower handing the socket back,
+            // and a canceled `lock` has no way to say "never mind". The old
+            // `catch return` left the connection on `active_connections` for
+            // good — never idle, never closed, with `max_connections` still
+            // counting its slot — so every canceled release shrank the pool by
+            // one. Waiting is the honest answer: the critical section is a list
+            // move. Same choice as `pool.Pool.release` and `sqlx.ConnPool.release`.
+            self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
 
             self.removeActiveLocked(conn);
@@ -180,9 +201,15 @@ pub const HttpClient = struct {
             if (conn.isAlive()) {
                 var released_conn = conn;
                 released_conn.last_used = Time.monotonicNowSeconds();
-                // Best-effort: OOM while pooling just drops the connection
-                // (same outcome as the dead-connection branch below).
-                self.idle_connections.append(self.allocator, released_conn) catch |err| std.log.debug("[http-client] idle connection dropped ({s})", .{@errorName(err)});
+                // The connection is off `active_connections` already, so a failed
+                // append has to end like the dead-connection branch below:
+                // dropped here it would be on no list at all, with nobody left to
+                // close the socket or free its host.
+                self.idle_connections.append(self.allocator, released_conn) catch |err| {
+                    std.log.debug("[http-client] idle connection closed instead of pooled ({s})", .{@errorName(err)});
+                    if (released_conn.stream) |stream| stream.close(self.io);
+                    self.allocator.free(released_conn.host);
+                };
             } else {
                 if (conn.stream) |stream| {
                     stream.close(self.io);
@@ -197,7 +224,11 @@ pub const HttpClient = struct {
         /// (timeout mid-head, truncated body, malformed framing), and neither is
         /// a state the next request may resume from.
         pub fn discard(self: *ConnectionPool, conn: Connection) void {
-            self.mutex.lock(self.io) catch return;
+            // Uncancelable for the same reason as `release`: a canceled
+            // `catch return` here left a socket the caller had already written
+            // off on `active_connections` — never closed, `host` never freed,
+            // slot never released.
+            self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
 
             self.removeActiveLocked(conn);
@@ -1345,6 +1376,252 @@ test "HttpClient ConnectionPool discard drops the connection instead of pooling 
     try std.testing.expectEqual(@as(usize, 1), pool.active_connections.items.len);
     pool.release(conn2);
     try std.testing.expectEqual(@as(usize, 1), pool.idle_connections.items.len);
+}
+
+/// The two `ConnectionPool` operations that give a connection back, in the shape
+/// the cancelation tests below drive them.
+const PoolReturnOp = *const fn (*HttpClient.ConnectionPool, HttpClient.ConnectionPool.Connection) void;
+
+/// Call `op(pool, conn)` on a concurrent task whose wait on the pool mutex is
+/// canceled, and return once that task has returned.
+///
+/// The test thread holds the mutex throughout, and the task is gated behind pure
+/// spinning, so a cancel request placed while it is gated is still pending when
+/// it reaches the lock wait: the cancelation point is the lock wait under test,
+/// never an earlier operation of the task.
+fn cancelWhilePoolLocked(
+    pool: *HttpClient.ConnectionPool,
+    conn: HttpClient.ConnectionPool.Connection,
+    op: PoolReturnOp,
+) !void {
+    const io = pool.io;
+    const Gate = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+        var returned = std.atomic.Value(bool).init(false);
+
+        fn run(
+            p: *HttpClient.ConnectionPool,
+            c: HttpClient.ConnectionPool.Connection,
+            f: PoolReturnOp,
+        ) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            f(p, c);
+            returned.store(true, .release);
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Gate.entered.store(false, .monotonic);
+    Gate.open.store(false, .monotonic);
+    Gate.returned.store(false, .monotonic);
+
+    try pool.mutex.lock(io);
+    var op_fut = try io.concurrent(Gate.run, .{ pool, conn, op });
+    while (!Gate.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Gate.cancel, .{ io, &op_fut });
+    // Give the request time to land on the task's thread while it is still gated.
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Gate.open.store(true, .release);
+    // The task is now inside `op`: parked on the mutex (it swaps the state to
+    // `contended` on its way into the wait) or already gone.
+    while (pool.mutex.state.load(.monotonic) != .contended and !Gate.returned.load(.acquire)) {
+        std.atomic.spinLoopHint();
+    }
+    pool.mutex.unlock(io);
+
+    cancel_fut.await(io);
+    op_fut.await(io);
+    try std.testing.expect(Gate.returned.load(.acquire));
+}
+
+// Regression: `release` used to return early when its (cancelable) mutex lock
+// came back `error.Canceled`. The connection was then left on
+// `active_connections` for good — never idle, never closed, with
+// `max_connections` still counting its slot — so every canceled release shrank
+// the pool by one until it could not hand anything out, while nothing was in
+// flight. Whatever `release` decides about a canceled wait, the connection must
+// not fall out of the pool's books.
+test "HttpClient ConnectionPool release keeps a connection whose lock wait is canceled" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    const server_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try server_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = server.socket.address.getPort();
+
+    var pool = HttpClient.ConnectionPool.init(allocator, std.testing.io, 1);
+    defer pool.deinit();
+
+    const conn = try pool.acquire("127.0.0.1", port);
+    try std.testing.expectEqual(@as(usize, 1), pool.active_connections.items.len);
+
+    try cancelWhilePoolLocked(&pool, conn, HttpClient.ConnectionPool.release);
+
+    // Accounted for, and in the branch `release` documents for a live
+    // connection (see its comment): idle, off the active list. The other
+    // defensible answer — treat the cancelation as "this connection is gone",
+    // close it and free it — would satisfy "not on the active list" with
+    // `idle == 0`; what is not fine is `active == 1`, the lost slot.
+    try std.testing.expectEqual(@as(usize, 0), pool.active_connections.items.len);
+    try std.testing.expectEqual(@as(usize, 1), pool.idle_connections.items.len);
+
+    // Not merely counted: the next `acquire` gets that same socket back, and the
+    // `max_connections = 1` slot is usable again.
+    const again = try pool.acquire("127.0.0.1", port);
+    try std.testing.expectEqual(conn.stream.?.socket.handle, again.stream.?.socket.handle);
+    pool.release(again);
+}
+
+// The same defect in `discard`, whose caller has already written the socket off:
+// a canceled lock wait left a dead socket on `active_connections` — never
+// closed, `host` never freed, and the slot never released.
+test "HttpClient ConnectionPool discard drops a connection whose lock wait is canceled" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    const server_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try server_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = server.socket.address.getPort();
+
+    var pool = HttpClient.ConnectionPool.init(allocator, std.testing.io, 1);
+    defer pool.deinit();
+
+    const conn = try pool.acquire("127.0.0.1", port);
+    try cancelWhilePoolLocked(&pool, conn, HttpClient.ConnectionPool.discard);
+
+    // On neither list, so the slot is free again and the pool is still usable.
+    try std.testing.expectEqual(@as(usize, 0), pool.active_connections.items.len);
+    try std.testing.expectEqual(@as(usize, 0), pool.idle_connections.items.len);
+    const conn2 = try pool.acquire("127.0.0.1", port);
+    pool.release(conn2);
+}
+
+// Regression: `acquire` took the connection out of `idle_connections` and only
+// then appended it to `active_connections`, so an OOM in that append lost it
+// outright — on neither list, socket never closed, `host` never freed, while
+// `max_connections` kept counting its slot. Nothing can hand that slot back:
+// the pool simply got smaller, and `std.testing.allocator` reports the missing
+// free at the end of the test.
+test "HttpClient ConnectionPool acquire keeps an idle connection when the active append fails" {
+    const backing = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var failing = std.testing.FailingAllocator.init(backing, .{});
+    const allocator = failing.allocator();
+
+    // Two listeners: `acquire` matches on host *and* port, so the second port is
+    // what lets connections be created while the first port's sit idle.
+    const first_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var first = try first_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer first.deinit(std.testing.io);
+    const first_port = first.socket.address.getPort();
+
+    const second_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var second = try second_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer second.deinit(std.testing.io);
+    const second_port = second.socket.address.getPort();
+
+    var pool = HttpClient.ConnectionPool.init(allocator, std.testing.io, 8);
+    defer pool.deinit();
+
+    // Fill `active_connections` to exactly its capacity — read from the list
+    // rather than assumed, since it comes from ArrayList's growth policy — then
+    // hand those connections back. The append under test has to *grow* the list
+    // to be fallible at all, and after a `swapRemove` there is always room
+    // unless the list is right at capacity.
+    var held = std.ArrayList(HttpClient.ConnectionPool.Connection).empty;
+    defer held.deinit(backing);
+    try held.append(backing, try pool.acquire("127.0.0.1", first_port));
+    while (pool.active_connections.items.len < pool.active_connections.capacity) {
+        try held.append(backing, try pool.acquire("127.0.0.1", first_port));
+    }
+    const capacity = pool.active_connections.capacity;
+    for (held.items) |conn| pool.release(conn);
+    try std.testing.expectEqual(capacity, pool.idle_connections.items.len);
+
+    // Refill `active_connections` — from the other port, so the idle ones stay
+    // idle — to the same length: the next idle-path append is at capacity and
+    // must allocate.
+    for (0..capacity) |_| {
+        _ = try pool.acquire("127.0.0.1", second_port);
+    }
+    try std.testing.expectEqual(capacity, pool.active_connections.items.len);
+    try std.testing.expectEqual(capacity, pool.idle_connections.items.len);
+
+    // The next allocation this pool makes is the one inside that append.
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, pool.acquire("127.0.0.1", first_port));
+    failing.fail_index = std.math.maxInt(usize);
+
+    // The failed `acquire` left the pool as it was: the connection is still
+    // idle — reachable by the next caller — and not stranded between the lists.
+    try std.testing.expectEqual(capacity, pool.idle_connections.items.len);
+    try std.testing.expectEqual(capacity, pool.active_connections.items.len);
+}
+
+// The mirror of the test above, on the way back: `release` takes the connection
+// off `active_connections` and appends it to `idle_connections` after, so when
+// that append fails the connection used to disappear from both lists — socket
+// left open, `host` never freed, and nobody left to do either. `release` cannot
+// hand the connection back to its caller, so the only honest end is its own
+// dead-connection branch: close it and free it. The pool's counters look the
+// same either way; the red/green signal is the leak check.
+test "HttpClient ConnectionPool release closes a live connection when pooling it fails" {
+    const backing = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var failing = std.testing.FailingAllocator.init(backing, .{});
+    const allocator = failing.allocator();
+
+    const first_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var first = try first_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer first.deinit(std.testing.io);
+    const first_port = first.socket.address.getPort();
+
+    const second_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var second = try second_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer second.deinit(std.testing.io);
+    const second_port = second.socket.address.getPort();
+
+    var pool = HttpClient.ConnectionPool.init(allocator, std.testing.io, 8);
+    defer pool.deinit();
+
+    // Fill `active_connections` to its capacity, then hand all of it back. Both
+    // lists grow the same way from empty, so `idle_connections` ends up exactly
+    // at *its* capacity and the next append has to grow — which is what makes it
+    // fallible at all.
+    var held = std.ArrayList(HttpClient.ConnectionPool.Connection).empty;
+    defer held.deinit(backing);
+    try held.append(backing, try pool.acquire("127.0.0.1", first_port));
+    while (pool.active_connections.items.len < pool.active_connections.capacity) {
+        try held.append(backing, try pool.acquire("127.0.0.1", first_port));
+    }
+    for (held.items) |conn| pool.release(conn);
+    const pooled = pool.idle_connections.items.len;
+    try std.testing.expectEqual(pool.idle_connections.capacity, pooled);
+
+    // One live connection to give back — from the other port, so it cannot come
+    // out of the idle list — and the next allocation is the append's.
+    const conn = try pool.acquire("127.0.0.1", second_port);
+    try std.testing.expect(conn.isAlive());
+    failing.fail_index = failing.alloc_index;
+    pool.release(conn);
+    failing.fail_index = std.math.maxInt(usize);
+
+    // Not pooled, so it is gone rather than stranded: off the active list, the
+    // pool unchanged, and — the part the counters cannot show — the socket
+    // closed and its `host` freed, which is what `std.testing.allocator` checks
+    // when this test ends.
+    try std.testing.expectEqual(@as(usize, 0), pool.active_connections.items.len);
+    try std.testing.expectEqual(pooled, pool.idle_connections.items.len);
 }
 
 test "HttpClient HttpRequest and HttpResponse" {

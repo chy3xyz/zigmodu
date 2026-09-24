@@ -1,7 +1,9 @@
 //! Outbox consumer — the read side of the transactional outbox pattern.
 //! Polls pending entries (optionally filtered by topic), dispatches each to a
 //! registered handler and advances the lifecycle: pending → processing →
-//! delivered, or retry_count++ (→ failed once retries are exhausted). This
+//! delivered, or retry_count++ (→ failed once retries are exhausted). A row
+//! that cannot even be parsed is failed outright (dead-lettered) rather than
+//! left in the pending set, where it would block the queue silently. This
 //! closes the loop for the AI business tools (`ai.approval`, `ai.recon`,
 //! `ai.notify`, ...) whose outbox writebacks can be routed to handlers here
 //! (or paired with `zigmodu.ai.trigger`).
@@ -11,6 +13,7 @@ const SqlxBackend = @import("../persistence/backends/SqlxBackend.zig").SqlxBacke
 const Outbox = @import("OutboxPublisher.zig");
 const PrometheusMetrics = @import("../metrics/PrometheusMetrics.zig").PrometheusMetrics;
 const sqlx = @import("../sqlx/sqlx.zig");
+const Time = @import("../core/Time.zig");
 
 pub const OutboxEntry = Outbox.OutboxEntry;
 
@@ -76,7 +79,7 @@ pub const OutboxConsumer = struct {
         self.metrics = .{
             .selected = try metrics.createCounter("outbox_selected_total", "Outbox entries picked up for delivery"),
             .delivered = try metrics.createCounter("outbox_delivered_total", "Outbox entries delivered successfully"),
-            .failed = try metrics.createCounter("outbox_failed_total", "Outbox entries that exhausted their retries"),
+            .failed = try metrics.createCounter("outbox_failed_total", "Outbox entries permanently failed (retries exhausted or unparseable)"),
             .pending = metrics.createGauge("outbox_pending", "Outbox entries waiting to be delivered") catch null,
         };
     }
@@ -145,7 +148,16 @@ pub const OutboxConsumer = struct {
 
         var stats = PollStats{ .selected = 0, .delivered = 0, .failed = 0 };
         while (try cursor.next()) |row| {
-            const entry = self.parseEntry(row) catch continue;
+            const entry = self.parseEntry(row) catch |err| {
+                // A row that cannot be parsed can never be delivered, and
+                // leaving it pending makes it the head of every batch forever:
+                // the poller spins on it while everything behind it stays put
+                // and no counter moves. Dead-letter it instead.
+                stats.selected += 1;
+                stats.failed += 1;
+                try self.quarantine(row, err);
+                continue;
+            };
             stats.selected += 1;
             _ = try self.backend.exec("UPDATE event_outbox SET status = 1, updated_at = ? WHERE id = ?", &.{
                 .{ .int = @intCast(entry.created_at) }, .{ .int = entry.id },
@@ -232,6 +244,43 @@ pub const OutboxConsumer = struct {
         return &.{};
     }
 
+    /// Dead-letter a row that could not be parsed (`status = 3`, the same
+    /// disposition a handler failure ends in). Nothing else in this file can
+    /// retire such a row, and `OutboxPublisher.buildResubmit` is the existing
+    /// way back once the schema or the data is fixed.
+    fn quarantine(self: *Self, row: *sqlx.Row, err: anyerror) !void {
+        // Reported at `warn`: this fires once per bad row (the row is retired
+        // right here), it is counted in `outbox_failed_total`, and the
+        // neighbouring `OutboxPublisher` reports its permanent failures at the
+        // same level.
+        const id = unparsedId(row) orelse {
+            std.log.warn(
+                "[outbox] unparseable entry ({s}) and no usable id column: it cannot be dead-lettered and will be re-selected until the row is fixed",
+                .{@errorName(err)},
+            );
+            return;
+        };
+        std.log.warn("[outbox] unparseable entry id={d} ({s}); dead-lettering it (status = 3)", .{ id, @errorName(err) });
+        _ = try self.backend.exec("UPDATE event_outbox SET status = 3, error_message = ?, updated_at = ? WHERE id = ?", &.{
+            .{ .string = @errorName(err) },
+            .{ .int = Time.monotonicNowSeconds() },
+            .{ .int = id },
+        });
+    }
+
+    /// `id` of a row that failed to parse. The name lookup is tried first; when
+    /// that is itself what failed (a schema whose columns differ in case, say),
+    /// fall back to the first column of the pending SELECT, which
+    /// `buildSelectPending` puts `id` in.
+    fn unparsedId(row: *sqlx.Row) ?i64 {
+        const value = (row.get("id") orelse
+            (if (row.values.len > 0) row.values[0] else null)) orelse return null;
+        return switch (value) {
+            .int => |v| v,
+            else => null,
+        };
+    }
+
     fn parseEntry(self: *Self, row: *@import("../sqlx/sqlx.zig").Row) !OutboxEntry {
         _ = self;
         const id_v = row.get("id") orelse return error.MissingColumn;
@@ -257,6 +306,101 @@ pub const OutboxConsumer = struct {
         };
     }
 };
+
+test "OutboxConsumer quarantines an unparseable row instead of stalling the queue" {
+    const allocator = std.testing.allocator;
+    var client = sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    // `PAYLOAD` (not `payload`) still resolves in SQL, so the SELECT built by
+    // the consumer works — but `Row.get` is a case-sensitive name lookup, so
+    // `parseEntry` can never parse this row's topic/payload.
+    _ = try client.exec(
+        "CREATE TABLE event_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, PAYLOAD TEXT, status INTEGER DEFAULT 0, tenant_id INTEGER, retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 5, created_at INTEGER, updated_at INTEGER, error_message TEXT)",
+        &.{},
+    );
+    _ = try client.exec(
+        "INSERT INTO event_outbox (topic, PAYLOAD, status, retry_count, max_retries, created_at, updated_at) VALUES ('ai.approval', '{\"run\":1}', 0, 0, 3, 100, 100)",
+        &.{},
+    );
+
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    const State = struct {
+        var handled: usize = 0;
+    };
+    const Handler = struct {
+        fn call(_: *anyopaque, _: std.mem.Allocator, _: OutboxEntry) anyerror!void {
+            State.handled += 1;
+        }
+    };
+    State.handled = 0;
+    var dummy: u8 = 0;
+    var consumer = OutboxConsumer.init(allocator, &backend, .{}, &dummy, Handler.call);
+
+    const first = try consumer.pollOnce();
+    // The defect: an unparsed row was skipped without being marked, so the next
+    // poll selected it again — forever — and nothing behind it ever drained.
+    const second = try consumer.pollOnce();
+    try std.testing.expectEqual(@as(usize, 0), second.selected);
+    try std.testing.expectEqual(@as(usize, 0), State.handled);
+
+    // And it is dead-lettered, not silently dropped: one order attempt in the
+    // queue is permanently failed, in the counter operators alert on.
+    try std.testing.expectEqual(@as(usize, 1), first.selected);
+    try std.testing.expectEqual(@as(usize, 0), first.delivered);
+    try std.testing.expectEqual(@as(usize, 1), first.failed);
+
+    var cursor = try client.queryCursorEx("SELECT status, error_message FROM event_outbox", &.{}, .{});
+    defer cursor.deinit();
+    const row = (try cursor.next()).?;
+    try std.testing.expectEqual(@as(i64, 3), row.get("status").?.int); // DLQ
+    try std.testing.expectEqualStrings("MissingColumn", row.get("error_message").?.string);
+    try std.testing.expectEqual(@as(u64, 0), try consumer.pendingCount());
+
+    // Quarantining is not the end of the line: the existing resubmit policy
+    // brings the row back once the schema is fixed.
+    _ = try client.exec("ALTER TABLE event_outbox RENAME COLUMN PAYLOAD TO payload", &.{});
+    var publisher = Outbox.OutboxPublisher.init(allocator, .{});
+    const resubmit = try publisher.buildResubmit(.{}, 0);
+    defer allocator.free(resubmit);
+    _ = try client.exec(resubmit, &.{});
+
+    const third = try consumer.pollOnce();
+    try std.testing.expectEqual(@as(usize, 1), third.delivered);
+    try std.testing.expectEqual(@as(usize, 1), State.handled);
+}
+
+test "OutboxConsumer quarantines a row whose id column name differs too" {
+    // The name lookup for `id` can be the failing one (this is what a schema
+    // with differently-cased columns looks like to `Row.get`), so the
+    // quarantine must still be able to address the row.
+    const allocator = std.testing.allocator;
+    var client = sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    _ = try client.exec(
+        "CREATE TABLE event_outbox (ID INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, PAYLOAD TEXT, status INTEGER DEFAULT 0, tenant_id INTEGER, retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 5, created_at INTEGER, updated_at INTEGER, error_message TEXT)",
+        &.{},
+    );
+    _ = try client.exec(
+        "INSERT INTO event_outbox (topic, PAYLOAD, status, retry_count, max_retries, created_at, updated_at) VALUES ('ai.recon', '{}', 0, 0, 3, 100, 100)",
+        &.{},
+    );
+
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    const Handler = struct {
+        fn call(_: *anyopaque, _: std.mem.Allocator, _: OutboxEntry) anyerror!void {}
+    };
+    var dummy: u8 = 0;
+    var consumer = OutboxConsumer.init(allocator, &backend, .{}, &dummy, Handler.call);
+
+    const stats = try consumer.pollOnce();
+    try std.testing.expectEqual(@as(usize, 1), stats.failed);
+    try std.testing.expectEqual(@as(u64, 0), try consumer.pendingCount());
+
+    const after = try consumer.pollOnce();
+    try std.testing.expectEqual(@as(usize, 0), after.selected);
+}
 
 test "OutboxConsumer dispatches pending entries and updates lifecycle" {
     const allocator = std.testing.allocator;

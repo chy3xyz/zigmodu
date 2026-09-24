@@ -41,8 +41,19 @@ pub const BufferPool = struct {
     }
 
     /// Acquire a 4KB buffer from the pool.
+    ///
+    /// `error.PoolExhausted` when the pool is already holding its cap; a canceled
+    /// lock wait surfaces as `error.Canceled` (see the note in the body).
     pub fn acquire(self: *Self) ![]u8 {
-        self.mutex.lock(self.io) catch return error.OutOfMemory;
+        // `std.Io.Mutex.lock` fails only with `error.Canceled` (`std.Io.Cancelable`)
+        // — it was reported here as `error.OutOfMemory`, an allocation failure
+        // this call cannot have: the only allocations below go through
+        // `self.allocator` and are reported as themselves. A cancellation is not
+        // resource pressure, and the caller (`api/Server.zig`'s WS read loop)
+        // reads any error here as "give up on this connection"; propagating it is
+        // also what `Future.cancel` asks for — an unconsumed request stays pending
+        // for the next cancellation point, which is not this call's to decide.
+        self.mutex.lock(self.io) catch |err| return err;
         defer self.mutex.unlock(self.io);
 
         if (self.free.pop()) |buf| {
@@ -190,4 +201,72 @@ test "stats track allocation" {
 
     pool.release(buf);
     try std.testing.expectEqual(@as(usize, 1), pool.stats().free);
+}
+
+// `acquire` used to answer a canceled `mutex.lock(io)` with `error.OutOfMemory`.
+// `std.Io.Mutex.lock` cannot fail that way — `std.Io.Cancelable` is
+// `error{Canceled}` — and `error.OutOfMemory` already means the allocation two
+// branches down. The two are not interchangeable for a caller: the WS read loop
+// turns any failure here into "drop this connection", so a canceled wait was
+// reported as memory pressure.
+//
+// The task below is parked on the pool mutex (held by the test thread) with a
+// cancel request already placed on its thread, so the cancelation point is the
+// lock wait itself: the gate between the two is pure spinning, which is not one.
+test "acquire reports a canceled lock wait as error.Canceled" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var pool = BufferPool.init(allocator, io, 1);
+    defer pool.deinit();
+
+    const Task = struct {
+        var err: ?anyerror = null;
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+
+        fn acquire(p: *BufferPool) void {
+            entered.store(true, .release);
+            // Pure spinning: no cancelation point, so a request placed while the
+            // task is gated here is still pending when it reaches the lock wait.
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            const buf = p.acquire() catch |e| {
+                err = e;
+                return;
+            };
+            p.release(buf);
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Task.err = null;
+    Task.entered.store(false, .monotonic);
+    Task.open.store(false, .monotonic);
+
+    // The test thread holds the pool mutex, so the task cannot get past the lock
+    // wait until told to.
+    try pool.mutex.lock(io);
+
+    var task_fut = try io.concurrent(Task.acquire, .{&pool});
+    while (!Task.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Task.cancel, .{ io, &task_fut });
+    // Give the request time to land on the task's thread while it is still gated.
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Task.open.store(true, .release);
+    // The task is now inside `acquire`: parked on the mutex (it swaps the state
+    // to `contended` on its way to the wait), or already gone.
+    while (pool.mutex.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    pool.mutex.unlock(io);
+
+    cancel_fut.await(io);
+    task_fut.await(io);
+
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), Task.err);
+    // Nothing was handed out: the canceled wait must not have taken a buffer.
+    try std.testing.expectEqual(@as(usize, 0), pool.stats().free);
+    try std.testing.expectEqual(@as(usize, 0), pool.stats().allocated);
 }

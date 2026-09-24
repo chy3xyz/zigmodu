@@ -1702,6 +1702,20 @@ fn bindSQLite(stmt: ?*sqlite3_c.sqlite3_stmt, args: []const Value) !void {
     }
 }
 
+/// Column types this process has already reported as undecoded, one bit per
+/// `sqlite3_column_type` value (see `markUndecodedSqliteType`).
+///
+/// Process-global on purpose: the gap is a fact about the driver, not about one
+/// row, and a scan of a BLOB column would otherwise log it once per cell.
+var undecoded_sqlite_type_warn_mask: std.atomic.Value(u32) = .init(0);
+
+/// Record that column type `t` is not decoded. Returns `true` for the call that
+/// is the first to see it — the one that has to warn.
+fn markUndecodedSqliteType(t: c_int) bool {
+    const flag = @as(u32, 1) << @as(u5, @intCast(@as(u32, @intCast(t)) & 31));
+    return (undecoded_sqlite_type_warn_mask.fetchOr(flag, .monotonic) & flag) == 0;
+}
+
 /// Decode one SQLite cell.
 ///
 /// `null` means the column holds SQL NULL — or a type this driver does not
@@ -1709,6 +1723,19 @@ fn bindSQLite(stmt: ?*sqlite3_c.sqlite3_stmt, args: []const Value) !void {
 /// driver is this process's memory, so it leaves through the error channel as
 /// `error.OutOfMemory`, the way `pgReadCell` does; reporting it as `null` gave
 /// the caller a wrong value with no error at all.
+///
+/// The other `null` cannot leave through the error channel either: a row's
+/// columns are all decoded before any of them is scanned, so erroring here would
+/// fail a query that merely *lists* such a column — `SELECT *` on a table with a
+/// BLOB, including for the callers that never read it. BLOB is the only SQLite
+/// type this does not decode, and the other two drivers carry one as a `.string`
+/// (`pgDecodeBinary`'s bytea, `mysqlStmtReadRows`' `MYSQL_TYPE_BLOB`); doing the
+/// same here needs `sqlite3_column_blob` / `sqlite3_column_bytes`, which are
+/// declared in `sqlite3_c.zig`, not in this file. So the value channel keeps
+/// reporting `null` until that lands, and what this arm changes is that the type
+/// is *said* instead of silent: the first cell of a given type logs a warning
+/// once per process, which is what tells a caller's truncated-looking NULL apart
+/// from a column that really is SQL NULL.
 fn readSQLiteValue(allocator: std.mem.Allocator, stmt: ?*sqlite3_c.sqlite3_stmt, col: c_int) !?Value {
     const t = sqlite3_c.sqlite3_column_type(stmt, col);
     return switch (t) {
@@ -1721,7 +1748,12 @@ fn readSQLiteValue(allocator: std.mem.Allocator, stmt: ?*sqlite3_c.sqlite3_stmt,
             break :blk Value{ .string = try allocator.dupe(u8, text) };
         },
         sqlite3_c.SQLITE_NULL => null,
-        else => null,
+        else => blk: {
+            if (markUndecodedSqliteType(t)) {
+                std.log.warn("[sqlx] SQLite column type {d} is not decoded by this driver; its cells read as SQL NULL", .{t});
+            }
+            break :blk null;
+        },
     };
 }
 
@@ -3663,6 +3695,10 @@ pub const MySqlConn = struct {
                 }
             }
         }
+        // `mysql_stmt_init` returning NULL is the library's *own* out of memory,
+        // and there is no statement handle yet to read an errno from: it stays
+        // `error.DatabaseError` with the other "could not prepare" verdicts,
+        // which the callers below answer with the text-protocol fallback.
         const stmt = libmysql_c.mysql_stmt_init(self.mysql) orelse return error.DatabaseError;
         if (libmysql_c.mysql_stmt_prepare(stmt, @ptrCast(sql_str.ptr), @intCast(sql_str.len)) != 0) {
             const err_no = libmysql_c.mysql_stmt_errno(stmt);
@@ -3673,9 +3709,10 @@ pub const MySqlConn = struct {
         }
         // Both allocations are this process's memory, so their failure keeps the
         // allocator's own name (`error.OutOfMemory`) rather than becoming the
-        // driver's `error.DatabaseError`. The `catch |err|` blocks still close
-        // the statement handle the callers rely on before they decline the
-        // prepared path (`catch return null`).
+        // driver's `error.DatabaseError`. The `catch |err|` blocks still close the
+        // statement handle the callers rely on before they decline the prepared
+        // path — and the callers re-raise `error.OutOfMemory` instead of reading
+        // it as that decline.
         const key = self.allocator.dupe(u8, sql_str) catch |err| {
             _ = libmysql_c.mysql_stmt_close(stmt);
             return err;
@@ -3689,12 +3726,27 @@ pub const MySqlConn = struct {
         return stmt;
     }
 
-    /// Execute via binary prepared statement. Returns `null` to signal formatQuery fallback.
+    /// Execute via binary prepared statement. Returns `null` to signal the
+    /// `formatQuery` fallback.
+    ///
+    /// `null` is for a *driver* verdict on the statement — the server would not
+    /// take this one prepared — which is what `getCachedStmt` and
+    /// `mysqlBindParams` report for every failure except this process's own
+    /// memory. `error.OutOfMemory` is re-raised instead of folded into the
+    /// fallback: that fallback allocates from the same allocator, so folding it
+    /// hides exactly the failures that are not permanent — the one where the
+    /// fallback's own buffer happens to fit and the statement then runs for real.
     fn execViaStmt(self: *MySqlConn, sql_str: []const u8, args: []const Value) !?ExecResult {
-        const stmt = self.getCachedStmt(sql_str) catch return null;
+        const stmt = self.getCachedStmt(sql_str) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
-        mysqlBindParams(stmt, scratch.allocator(), args) catch return null;
+        mysqlBindParams(stmt, scratch.allocator(), args) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
         if (libmysql_c.mysql_stmt_execute(stmt) != 0) {
             const err_no = libmysql_c.mysql_stmt_errno(stmt);
             const err_msg = std.mem.span(libmysql_c.mysql_stmt_error(stmt));
@@ -3711,12 +3763,20 @@ pub const MySqlConn = struct {
         };
     }
 
-    /// Query via binary prepared statement. Returns `null` to signal formatQuery fallback.
+    /// Query via binary prepared statement. Returns `null` to signal the
+    /// `formatQuery` fallback — for a driver verdict on the statement only, never
+    /// for this process's memory: see `execViaStmt`.
     fn queryViaStmt(self: *MySqlConn, allocator: std.mem.Allocator, sql_str: []const u8, args: []const Value) !?Rows {
-        const stmt = self.getCachedStmt(sql_str) catch return null;
+        const stmt = self.getCachedStmt(sql_str) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
-        mysqlBindParams(stmt, scratch.allocator(), args) catch return null;
+        mysqlBindParams(stmt, scratch.allocator(), args) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
 
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
@@ -6196,9 +6256,11 @@ pub const CachedConn = struct {
     pub fn queryRow(self: *CachedConn, comptime T: type, cache_key: []const u8, sql_str: []const u8, args: []const Value) !T {
         if (self.getCache(cache_key)) |cached| {
             defer self.allocator.free(cached);
-            var parsed = std.json.parseFromSlice(T, self.allocator, cached, .{}) catch return error.DatabaseError;
-            defer parsed.deinit();
-            return try deepCopyStruct(self.allocator, T, parsed.value);
+            if (try self.decodeCached(T, cache_key, cached)) |hit| {
+                var parsed = hit;
+                defer parsed.deinit();
+                return try deepCopyStruct(self.allocator, T, parsed.value);
+            }
         }
         const result = try self.client.queryRow(T, sql_str, args);
         const json = std.json.Stringify.valueAlloc(self.allocator, result, .{}) catch {
@@ -6228,9 +6290,11 @@ pub const CachedConn = struct {
     pub fn queryRowPartial(self: *CachedConn, comptime T: type, cache_key: []const u8, sql_str: []const u8, args: []const Value) !T {
         if (self.getCache(cache_key)) |cached| {
             defer self.allocator.free(cached);
-            var parsed = std.json.parseFromSlice(T, self.allocator, cached, .{}) catch return error.DatabaseError;
-            defer parsed.deinit();
-            return try deepCopyStruct(self.allocator, T, parsed.value);
+            if (try self.decodeCached(T, cache_key, cached)) |hit| {
+                var parsed = hit;
+                defer parsed.deinit();
+                return try deepCopyStruct(self.allocator, T, parsed.value);
+            }
         }
         const result = try self.client.queryRowPartial(T, sql_str, args);
         const json = std.json.Stringify.valueAlloc(self.allocator, result, .{}) catch {
@@ -6253,17 +6317,19 @@ pub const CachedConn = struct {
     pub fn queryRows(self: *CachedConn, comptime T: type, cache_key: []const u8, sql_str: []const u8, args: []const Value) !QueryResult(T) {
         if (self.getCache(cache_key)) |cached| {
             defer self.allocator.free(cached);
-            var parsed = std.json.parseFromSlice([]T, self.allocator, cached, .{}) catch return error.DatabaseError;
-            defer parsed.deinit();
-            const items = try self.allocator.alloc(T, parsed.value.len);
-            errdefer {
-                for (items) |item| freeScanned(self.allocator, T, item);
-                self.allocator.free(items);
+            if (try self.decodeCached([]T, cache_key, cached)) |hit| {
+                var parsed = hit;
+                defer parsed.deinit();
+                const items = try self.allocator.alloc(T, parsed.value.len);
+                errdefer {
+                    for (items) |item| freeScanned(self.allocator, T, item);
+                    self.allocator.free(items);
+                }
+                for (parsed.value, 0..) |item, i| {
+                    items[i] = try deepCopyStruct(self.allocator, T, item);
+                }
+                return .{ .items = items, .arena = null };
             }
-            for (parsed.value, 0..) |item, i| {
-                items[i] = try deepCopyStruct(self.allocator, T, item);
-            }
-            return .{ .items = items, .arena = null };
         }
         const result = try self.client.queryRows(T, sql_str, args);
         const json = std.json.Stringify.valueAlloc(self.allocator, result.items, .{}) catch {
@@ -6286,17 +6352,19 @@ pub const CachedConn = struct {
     pub fn queryRowsPartial(self: *CachedConn, comptime T: type, cache_key: []const u8, sql_str: []const u8, args: []const Value) !QueryResult(T) {
         if (self.getCache(cache_key)) |cached| {
             defer self.allocator.free(cached);
-            var parsed = std.json.parseFromSlice([]T, self.allocator, cached, .{}) catch return error.DatabaseError;
-            defer parsed.deinit();
-            const items = try self.allocator.alloc(T, parsed.value.len);
-            errdefer {
-                for (items) |item| freeScanned(self.allocator, T, item);
-                self.allocator.free(items);
+            if (try self.decodeCached([]T, cache_key, cached)) |hit| {
+                var parsed = hit;
+                defer parsed.deinit();
+                const items = try self.allocator.alloc(T, parsed.value.len);
+                errdefer {
+                    for (items) |item| freeScanned(self.allocator, T, item);
+                    self.allocator.free(items);
+                }
+                for (parsed.value, 0..) |item, i| {
+                    items[i] = try deepCopyStruct(self.allocator, T, item);
+                }
+                return .{ .items = items, .arena = null };
             }
-            for (parsed.value, 0..) |item, i| {
-                items[i] = try deepCopyStruct(self.allocator, T, item);
-            }
-            return .{ .items = items, .arena = null };
         }
         const result = try self.client.queryRowsPartial(T, sql_str, args);
         const json = std.json.Stringify.valueAlloc(self.allocator, result.items, .{}) catch {
@@ -6394,6 +6462,29 @@ pub const CachedConn = struct {
     pub fn findAllNoCacheCtx(self: *CachedConn, ctx: SqlContext, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) !QueryResult(T) {
         if (ctx.isDone()) return error.Timeout;
         return self.findAllNoCache(T, table, where_clause, args);
+    }
+
+    /// Decode a cached JSON blob.
+    ///
+    /// `null` means the bytes are not a decodable `T` — an entry written for an
+    /// older row shape, or corruption. That is a cache **miss**, not a query
+    /// failure: this is a read-through cache, so the caller runs the query and
+    /// the same call overwrites the entry. That mirrors the fail-open stance the
+    /// serialize side of these methods already takes (`catch { return result; }`,
+    /// "serve the value, skip the cache").
+    ///
+    /// An allocation failure inside the parser is a different event: it is this
+    /// process running out of memory, so it propagates as `error.OutOfMemory`
+    /// rather than being folded into `error.DatabaseError` — a name that means
+    /// the database and nothing else (see `Error.zig`).
+    fn decodeCached(self: *CachedConn, comptime T: type, cache_key: []const u8, cached: []const u8) error{OutOfMemory}!?std.json.Parsed(T) {
+        return std.json.parseFromSlice(T, self.allocator, cached, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                std.log.warn("[CachedConn] cached entry for '{s}' is not a decodable {s} ({s}); querying and overwriting it", .{ cache_key, @typeName(T), @errorName(err) });
+                return null;
+            },
+        };
     }
 
     fn getCache(self: *CachedConn, key: []const u8) ?[]const u8 {
@@ -8560,6 +8651,82 @@ test "sqlite CachedConn respects TTL expiration" {
     try std.testing.expectEqualStrings("Alice", user2.name);
 }
 
+test "cached conn treats an undecodable cache entry as a miss, not a query failure" {
+    if (!DriverFeatures.sqlite) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+
+    _ = try client.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)", &.{});
+    _ = try client.exec("INSERT INTO t (id, name) VALUES (1, 'Alice')", &.{});
+
+    var cache = StringCache.init(allocator);
+    defer cache.deinit();
+    var cached = CachedConn{ .allocator = allocator, .client = &client, .local_cache = &cache, .ttl_sec = 60 };
+
+    // An entry the current row shape cannot decode — bytes written for an older
+    // `User`, or corruption. It is not expired, so `StringCache` hands it back
+    // verbatim and the read path has to decide what that means.
+    try cache.set("u:1", "{\"id\":1,\"nickname\":\"Al", 60);
+
+    const User = struct { id: i64, name: []const u8 };
+    const row = try cached.queryRow(User, "u:1", "SELECT id, name FROM t WHERE id = 1", &.{});
+    defer freeScanned(allocator, User, row);
+    try std.testing.expectEqualStrings("Alice", row.name);
+
+    // The read also repaired the entry: the arguments below match no row, so
+    // `Alice` can only come back from the cache — the same hit evidence the
+    // cache tests above use.
+    const again = try cached.queryRow(User, "u:1", "SELECT id, name FROM t WHERE id = ?1", &.{.{ .int = 999 }});
+    defer freeScanned(allocator, User, again);
+    try std.testing.expectEqualStrings("Alice", again.name);
+}
+
+test "cached conn reports a cache decode allocation failure as OutOfMemory" {
+    if (!DriverFeatures.sqlite) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+
+    _ = try client.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)", &.{});
+    _ = try client.exec("INSERT INTO t (id, name) VALUES (1, 'Alice')", &.{});
+
+    var cache = StringCache.init(allocator);
+    defer cache.deinit();
+    const User = struct { id: i64, name: []const u8 };
+    const sql = "SELECT id, name FROM t WHERE id = 1";
+
+    // Valid JSON for `User`, so anything that fails below failed in the
+    // allocator and not on the blob's shape. The `StringCache` itself is built
+    // on the real allocator (`get`/`set` use their own), so the walk lands on
+    // the two allocations `CachedConn` owns here: the decode and the copy-out.
+    try cache.set("u:1", "{\"id\":1,\"name\":\"Alice\"}", 60);
+
+    var idx: usize = 0;
+    var oom_failures: usize = 0;
+    var succeeded = false;
+    while (idx < 16) : (idx += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = idx, .resize_fail_index = 0 });
+        var cached = CachedConn{ .allocator = failing.allocator(), .client = &client, .local_cache = &cache, .ttl_sec = 60 };
+        const row = cached.queryRow(User, "u:1", sql, &.{}) catch |err| {
+            // A decode that could not allocate is this process running out of
+            // memory, not a failed query: reporting it as `error.DatabaseError`
+            // hides the resource failure from the error mapping and sends the
+            // caller looking at the database.
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            oom_failures += 1;
+            continue;
+        };
+        freeScanned(allocator, User, row);
+        succeeded = true;
+    }
+    try std.testing.expect(oom_failures > 0);
+    try std.testing.expect(succeeded);
+}
+
 test "sqlite connection pool warmup" {
     const allocator = std.testing.allocator;
 
@@ -10267,6 +10434,57 @@ test "sqlite text cell: allocation failure is OutOfMemory, SQL NULL stays null" 
     try std.testing.expect(failing.has_induced_failure);
 }
 
+// `readSQLiteValue`'s `else` arm answers `null` for a column type it does not
+// decode — SQLite has exactly one left, BLOB — and `null` is also what it
+// answers for a `SQLITE_NULL` cell. No consumer of the *value* can tell the two
+// apart: `Row.get` hands back `?Value`, an optional `[]const u8` field scans to
+// `null`, `valueToType` is never reached for either.
+//
+// The value channel keeps that shape — a row's columns are all decoded before any
+// of them is scanned, so erroring here would fail a query that merely lists such
+// a column (`SELECT *`) — but the arm no longer drops the driver's information on
+// the floor: the type is logged once per process, which is what tells a
+// truncated-looking NULL from a column that really is SQL NULL.
+test "sqlite blob cell reads as SQL NULL, but the type is reported" {
+    if (!DriverFeatures.sqlite) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    // The once-per-type guard is process-global; clear it for this run and put it
+    // back, so the assertions hold whatever test ran before.
+    undecoded_sqlite_type_warn_mask.store(0, .monotonic);
+    defer undecoded_sqlite_type_warn_mask.store(0, .monotonic);
+    const blob_bit = @as(u32, 1) << @as(u5, @intCast(@as(u32, sqlite3_c.SQLITE_BLOB) & 31));
+
+    var conn = try SQLiteConn.open(allocator, ":memory:");
+    defer closeStackSQLiteConn(&conn);
+    _ = try SQLiteConn.execFn(&conn, "CREATE TABLE t (b BLOB, n INTEGER)", &.{});
+    // Bytes that are not text: not UTF-8, and the first one is a NUL.
+    _ = try SQLiteConn.execFn(&conn, "INSERT INTO t VALUES (x'00ff10', NULL)", &.{});
+
+    const stmt = try SQLiteConn.getCachedStmt(&conn, "SELECT b, n FROM t");
+    try std.testing.expectEqual(@as(c_int, sqlite3_c.SQLITE_ROW), sqlite3_c.sqlite3_step(stmt));
+    try std.testing.expectEqual(@as(c_int, sqlite3_c.SQLITE_BLOB), sqlite3_c.sqlite3_column_type(stmt, 0));
+
+    // A real SQL NULL is a value, not a report: it leaves the guard untouched.
+    try std.testing.expect((try readSQLiteValue(allocator, stmt, 1)) == null);
+    try std.testing.expectEqual(@as(u32, 0), undecoded_sqlite_type_warn_mask.load(.monotonic));
+
+    // The BLOB is still `null` in the value channel …
+    try std.testing.expect((try readSQLiteValue(allocator, stmt, 0)) == null);
+    // … and the type it could not decode is reported — once, not per cell.
+    try std.testing.expectEqual(blob_bit, undecoded_sqlite_type_warn_mask.load(.monotonic));
+    try std.testing.expect(!markUndecodedSqliteType(sqlite3_c.SQLITE_BLOB));
+    try std.testing.expectEqual(blob_bit, undecoded_sqlite_type_warn_mask.load(.monotonic));
+
+    // And that is what a scan sees: the optional field is simply absent.
+    const BlobRow = struct { b: ?[]const u8 };
+    var rows = try SQLiteConn.queryFn(&conn, allocator, "SELECT b FROM t", &.{});
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
+    const scanned = try rows.rows[0].scan(allocator, BlobRow);
+    try std.testing.expect(scanned.b == null);
+}
+
 /// One scan on a connection of its own — `SQLiteConn.queryFn` builds its result
 /// set on the connection's allocator, so the connection has to be rebuilt on the
 /// allocator under test for a run to replay the same allocation sequence.
@@ -10421,7 +10639,7 @@ test "postgres prepared-statement row scan reports an allocation failure as OutO
     try std.testing.expect(failing.has_induced_failure);
 }
 
-test "mysql query fallback reports an allocation failure as OutOfMemory" {
+test "mysql query prepared path reports an allocation failure as OutOfMemory" {
     try skipUnlessDb("mysql");
     const allocator = std.testing.allocator;
 
@@ -10429,15 +10647,15 @@ test "mysql query fallback reports an allocation failure as OutOfMemory" {
     var conn = try mysqlFailingConn(&failing);
     defer closeStackMySqlConn(&conn);
 
-    // The prepared-statement path declines (`catch return null`) once its own
-    // allocations fail, which is what routes `queryFn` to interpolation — the
-    // buffer it then builds is `self.allocator`'s.
+    // Pinned at the next allocation, the first one the prepared path makes is
+    // its copy of the SQL text into the statement cache — and that failure is
+    // the whole call's: `error.OutOfMemory`, not the fallback.
     pinAllocatorLimit(&failing);
     try std.testing.expectError(error.OutOfMemory, MySqlConn.queryFn(&conn, allocator, "SELECT ? AS a", &.{.{ .int = 1 }}));
     try std.testing.expect(failing.has_induced_failure);
 }
 
-test "mysql exec fallback reports an allocation failure as OutOfMemory" {
+test "mysql exec prepared path reports an allocation failure as OutOfMemory" {
     try skipUnlessDb("mysql");
     const allocator = std.testing.allocator;
 
@@ -10448,6 +10666,47 @@ test "mysql exec fallback reports an allocation failure as OutOfMemory" {
     pinAllocatorLimit(&failing);
     try std.testing.expectError(error.OutOfMemory, MySqlConn.execFn(&conn, "SELECT ? AS a", &.{.{ .int = 1 }}));
     try std.testing.expect(failing.has_induced_failure);
+}
+
+// The pinned tests above fail *every* allocation from their limit on, so the
+// fallback fails too and the error would resurface even if the prepared path
+// swallowed it. The case that shows the swallowing is a failure that does not
+// persist: the fallback allocates from the same allocator, and when its own
+// buffer happens to fit, the statement runs for real and the caller never learns
+// that the allocation it needed had failed.
+//
+// `FailOnceAllocator` (below) fails one allocation and lets every later one
+// through, which is exactly what `std.testing.FailingAllocator` cannot express.
+test "mysql exec prepared path does not swallow an allocation failure" {
+    try skipUnlessDb("mysql");
+    const allocator = std.testing.allocator;
+    const cfg = mysqlLiveConfig();
+
+    // 0 is the copy of the SQL text into the statement cache, 1 the cache insert
+    // right after it. Both sit inside the prepared path, ahead of the fallback.
+    var fail_at: usize = 0;
+    while (fail_at < 2) : (fail_at += 1) {
+        var once = FailOnceAllocator.init(allocator, fail_at);
+        var conn = try MySqlConn.connect(once.allocator(), cfg.host, cfg.username, cfg.password, cfg.database, cfg.port);
+        defer closeStackMySqlConn(&conn);
+
+        try std.testing.expectError(error.OutOfMemory, MySqlConn.execFn(&conn, "SELECT ? AS a", &.{.{ .int = 1 }}));
+    }
+}
+
+test "mysql query prepared path does not swallow an allocation failure" {
+    try skipUnlessDb("mysql");
+    const allocator = std.testing.allocator;
+    const cfg = mysqlLiveConfig();
+
+    var fail_at: usize = 0;
+    while (fail_at < 2) : (fail_at += 1) {
+        var once = FailOnceAllocator.init(allocator, fail_at);
+        var conn = try MySqlConn.connect(once.allocator(), cfg.host, cfg.username, cfg.password, cfg.database, cfg.port);
+        defer closeStackMySqlConn(&conn);
+
+        try std.testing.expectError(error.OutOfMemory, MySqlConn.queryFn(&conn, allocator, "SELECT ? AS a", &.{.{ .int = 1 }}));
+    }
 }
 
 test "mysql streaming cursor reports an allocation failure as OutOfMemory" {

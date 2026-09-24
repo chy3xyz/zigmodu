@@ -1456,8 +1456,16 @@ pub fn init(allocator: std.mem.Allocator, jwt_secret: []const u8, token_expiry_s
 pub fn generateToken(self: *Self, payload: JwtPayload) ![]const u8
 pub fn verifyToken(self: *Self, token_string: []const u8) !JwtPayload
 pub fn hashPassword(self: *Self, password: []const u8) ![]const u8
-pub fn verifyPassword(self: *Self, password: []const u8, hash: []const u8) bool
+// 失败在两处不同来源之间可区分：存储记录不可用 vs 我们这侧出错（分配失败）。
+pub fn verifyPassword(self: *Self, password: []const u8, hash: []const u8) PasswordError!bool
+pub const PasswordError = error{MalformedStoredHash} || std.mem.Allocator.Error;
 ```
+
+> `verifyPassword` / `PasswordEncoder.matches` 返回**错误联合**（不是裸 `bool`）：以前存储哈希
+> 不可解码、或解码时分配失败，都会被答成 `false`，调用方只能回 401 —— 把一个"我们这边出错"记成
+> "口令错"。现在 `error.MalformedStoredHash`（记录不可用）与 `error.OutOfMemory` 各自冒泡，
+> 调用方按需回 5xx；口令**不匹配**仍然只是 `false`。
+> `zigmodu.security.PasswordEncoder.matches` 同形。
 
 ### Permission matching
 

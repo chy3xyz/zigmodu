@@ -53,14 +53,15 @@ pub const Params = struct {
         if (!gop.found_existing) {
             gop.key_ptr.* = name_copy;
             gop.value_ptr.* = .empty;
-        } else {
-            // The map owns one copy of the name; ours is redundant.
-            self.allocator.free(name_copy);
         }
         errdefer if (!gop.found_existing) {
             _ = self.map.swapRemove(name_copy);
         };
         try gop.value_ptr.append(self.allocator, value_copy);
+        // The map owns one copy of the name; ours is redundant. Released only
+        // after the append succeeded: freeing it earlier would leave the
+        // errdefer above releasing the same copy a second time.
+        if (gop.found_existing) self.allocator.free(name_copy);
     }
 
     /// Like `put`, but takes ownership of already-allocated `name`/`value`
@@ -73,17 +74,21 @@ pub const Params = struct {
     /// return err; }` so a later error in the same scope cannot double-free.
     pub fn putOwned(self: *Params, name: []const u8, value: []const u8) !void {
         const gop = try self.map.getOrPut(self.allocator, name);
-        if (gop.found_existing) {
-            // The map already owns a copy of this name; ours is redundant.
-            self.allocator.free(name);
-        } else {
-            gop.value_ptr.* = .empty;
-        }
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+
         gop.value_ptr.append(self.allocator, value) catch |err| {
+            // Nothing is freed here: the caller still owns both slices. The
+            // only thing to undo is the entry we just inserted for a new name.
             if (!gop.found_existing) _ = self.map.swapRemove(name);
-            self.allocator.free(value);
             return err;
         };
+
+        if (gop.found_existing) {
+            // The map already owns a copy of this name; ours is redundant.
+            // Freed only now that the append has succeeded — freeing it earlier
+            // would hand the caller back a dangling slice, which it frees again.
+            self.allocator.free(name);
+        }
     }
 
     /// Last occurrence (see the ordering note above). Null when absent.
@@ -291,6 +296,87 @@ test "Params: dotted path lookup and segment lookup" {
     try testing.expectEqualStrings("9.99", p.getPath("params.balance.money").?);
     try testing.expect(p.getPath("params.missing.money") == null);
     try testing.expectEqualStrings("9.99", p.getSegments(&.{ "params", "balance", "money" }).?);
+}
+
+// `putOwned`'s ownership contract when an insert fails: the caller keeps both
+// slices. Both request parsers free them on error (`src/api/Server.zig:1281`,
+// `:1306`), so a slice freed here is freed a second time by the caller.
+test "Params: putOwned keeps the caller's slices when the value append fails" {
+    const testing_alloc = testing.allocator;
+
+    // New name: the map insert is allocation #0, the value append is #1.
+    {
+        var fa = std.testing.FailingAllocator.init(testing_alloc, .{});
+        var p = Params.init(fa.allocator());
+        defer p.deinit();
+
+        const name = try testing_alloc.dupe(u8, "k");
+        const value = try testing_alloc.dupe(u8, "v");
+        fa.fail_index = fa.alloc_index + 1;
+        try testing.expectError(error.OutOfMemory, p.putOwned(name, value));
+        try testing.expect(fa.has_induced_failure);
+
+        // The contract: free them once, here.
+        testing_alloc.free(name);
+        testing_alloc.free(value);
+        try testing.expect(!p.contains("k"));
+        try testing.expectEqual(@as(usize, 0), p.count());
+    }
+
+    // Existing name: the value list is at capacity, so the append is the only
+    // allocation the call needs to make.
+    {
+        var fa = std.testing.FailingAllocator.init(testing_alloc, .{});
+        var p = Params.init(fa.allocator());
+        defer p.deinit();
+        while (true) {
+            const list = p.map.get("k") orelse {
+                try p.put("k", "seed");
+                continue;
+            };
+            if (list.items.len >= list.capacity) break;
+            try p.put("k", "seed");
+        }
+        const before = p.getAll("k").len;
+
+        const name = try testing_alloc.dupe(u8, "k");
+        const value = try testing_alloc.dupe(u8, "v");
+        fa.fail_index = fa.alloc_index;
+        try testing.expectError(error.OutOfMemory, p.putOwned(name, value));
+        try testing.expect(fa.has_induced_failure);
+
+        testing_alloc.free(name);
+        testing_alloc.free(value);
+        try testing.expectEqual(before, p.getAll("k").len);
+        try testing.expectEqual(@as(usize, 1), p.count());
+    }
+}
+
+// Same shape in `put`, from the other side: `put` owns its *copies*, and the
+// name copy must be released exactly once — not early, while the value append
+// can still fail with it already released.
+test "Params: put releases its name copy exactly once when the append fails" {
+    const testing_alloc = testing.allocator;
+    var fa = std.testing.FailingAllocator.init(testing_alloc, .{});
+    var p = Params.init(fa.allocator());
+    defer p.deinit();
+
+    while (true) {
+        const list = p.map.get("k") orelse {
+            try p.put("k", "seed");
+            continue;
+        };
+        if (list.items.len >= list.capacity) break;
+        try p.put("k", "seed");
+    }
+    const before = p.getAll("k").len;
+
+    // dupe(name) #0, dupe(value) #1, the append is #2.
+    fa.fail_index = fa.alloc_index + 2;
+    try testing.expectError(error.OutOfMemory, p.put("k", "seed"));
+    try testing.expect(fa.has_induced_failure);
+    try testing.expectEqual(before, p.getAll("k").len);
+    try testing.expectEqual(@as(usize, 1), p.count());
 }
 
 test "Params: many values for one name stay bounded by the caller's guard" {

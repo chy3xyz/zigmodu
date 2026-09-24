@@ -35,11 +35,57 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 
 ---
 
-## v0.33.3（未发布）
+## v0.33.4（未发布）
+
+> **本版有 1 处破坏性变更（编译错）**：口令校验不再返回裸 `bool`。另有 4 处**行为变化**值得确认：
+> Redis 不可达时不再静默返回 `0`/`false`、表单解析超限从 200 变 400、`CachedConn` 的坏缓存条目从
+> `DatabaseError` 变成"缓存未命中 + 修复"、`BufferPool.acquire` 的取消不再报 `OutOfMemory`。
+> 逐条背景见 [`../CHANGELOG.md`](../CHANGELOG.md) 的 `[Unreleased]` 段。
+
+**破坏：口令校验返回错误联合。** `PasswordEncoder.matches` 与 `SecurityModule.verifyPassword` 由
+`bool` 变成 `PasswordError!bool`（`error{MalformedStoredHash} || std.mem.Allocator.Error`）。
+以前**存储哈希不可解码**或**解码时分配失败**都被答成"口令不匹配"，调用方只能回 401 —— 把"我们这边
+出错"记成"口令错"，也让失败登录计数说谎。
+**Breaking?** 是（编译错）· **影响面**：消费者的登录 handler · **一行改法**：
+```zig
+const ok = encoder.matches(input, stored) catch |err| switch (err) {
+    error.OutOfMemory => return err,                                    // → 5xx
+    error.MalformedStoredHash => { log.err("unusable stored hash", .{}); return err; },
+};
+if (!ok) return unauthorized();
+```
+仓库内没有调用方（只有本文件测试），改的是消费者侧。**顺带修掉一条真漏洞**：旧代码用
+`expected_hash[0..32]` 做**前缀比较**，所以"32 字节真实摘要 + 1 字节垃圾"的存储记录会被判定通过；
+现在长度必须**恰好**等于派生 key 长度。若你的库里有 PBKDF2 派生 key 长度 > 32 的历史记录并依赖旧的
+前缀接受，它们现在会被拒（那正是修复本身）。
+
+**行为变化（非破坏）①：Redis 不可达不再是一个"数据答案"。** `setNX`/`lock` 返回 `false`、`del` 返回
+`0`、`exists` 返回 `false`、`ttl` 返回 `-1`（"存在且永不过期"）、`unlock` 静默返回 —— 这些以前在连接/池/
+锁失败时也会发生，于是调用方读到一个看起来正常的答案。现在基础设施故障一律抛错，**服务端真实回答的语义
+不变**（真 `-1`、真 `false`、真 `nil` 仍是值）。`RedisRateLimiter`、`RedisCooldownStore` 等调用方因此
+会在 Redis 不可达时看到错误而不是静默的 `0`/`false`；请确认你的调用点有处理。
+
+**行为变化（非破坏）②：超限的表单体从 200 变 400，解析时的分配失败变 500。**
+`application/x-www-form-urlencoded` 的字段数超过 `Server.Config.max_params` 以前会**以空表单继续处理并
+回 200**（H1 与 H2 都是），现在回 400；解析时我们的分配失败以前被读成"没有表单体"（200），现在回 500。
+请求边界上的同类塌陷也一并分开（查询串解析的分配失败现在 500）。
+
+**行为变化（非破坏）③：`CachedConn` 读到坏缓存条目时不再报 `DatabaseError`。** 现在它当作**缓存未命中**
+继续查库，并在同一次调用里用 `setCache` 把该条目修好（记一条 warn）；只有**分配失败**才冒泡
+`error.OutOfMemory`。按 `error.DatabaseError` 分支处理 `CachedConn` 的消费者需要改。
+
+**行为变化（非破坏）④：`BufferPool.acquire` 的锁等待被取消时返回 `error.Canceled`**（以前是
+`error.OutOfMemory`）；顺带：`HttpClient` 的 `ConnectionPool.release` / `discard` 改成不可取消的锁等待
+（以前取消即丢一条连接），`OutboxConsumer` 遇到解析不了的行会**死信化**（`status = 3` + warn + 计数），
+而不是每次 poll 都重新选中它、永远不排空。数据权限在 OOM 下现在是**收紧**（匹配不到任何行）而不是放宽。
+
+---
+
+## v0.33.3
 
 > **本版有 2 处破坏性变更，都是编译错**（`Cursor.next` 的错误联合、`csrf()` 要求中间件拿到
 > `CsrfConfig`），另有 1 处**默认行为收紧**（CSRF 不再采信 `X-Forwarded-Host`）。逐条背景见
-> [`../CHANGELOG.md`](../CHANGELOG.md) 的 `[Unreleased]` 段。
+> [`../CHANGELOG.md`](../CHANGELOG.md) 的 `[0.33.3]` 段。
 
 **破坏 ①：`Cursor.next` 返回错误联合。** `sqlx.Cursor.next` 从 `?*Row` 变成
 `errors.ResultT(?*Row)`——**流中途的驱动/服务器错误以前被折叠成 `null`**，即"查询坏了"和"结果取完"

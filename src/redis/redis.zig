@@ -393,7 +393,7 @@ pub const Redis = struct {
 
     /// Set a value only if key doesn't exist
     pub fn setNX(self: *Redis, key: []const u8, value: []const u8) errors.ResultT(bool) {
-        const borrowed = self.acquireStream() catch return false;
+        const borrowed = try self.acquireStream();
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
         const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$5\r\nSETNX\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{ key.len, key, value.len, value }) catch return error.RedisError;
@@ -413,15 +413,17 @@ pub const Redis = struct {
         const response = response_list.items;
 
         if (response.len > 1 and response[0] == ':') {
-            const val = std.fmt.parseInt(i32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return false;
+            const val = std.fmt.parseInt(i32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
             return val == 1;
         }
-        return false;
+        return error.RedisError;
     }
 
     /// Delete keys
     pub fn del(self: *Redis, keys: []const []const u8) errors.ResultT(u32) {
-        const borrowed = self.acquireStream() catch return 0;
+        // Nothing to delete is a real "0 deleted", not a failure.
+        if (keys.len == 0) return 0;
+        const borrowed = try self.acquireStream();
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
         var cmd_builder: std.ArrayList(u8) = std.ArrayList(u8).empty;
@@ -449,12 +451,12 @@ pub const Redis = struct {
             const val = std.fmt.parseInt(u32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
             return val;
         }
-        return 0;
+        return error.RedisError;
     }
 
     /// Check if key exists
     pub fn exists(self: *Redis, key: []const u8) errors.ResultT(bool) {
-        const borrowed = self.acquireStream() catch return false;
+        const borrowed = try self.acquireStream();
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
         const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$6\r\nEXISTS\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
@@ -474,10 +476,10 @@ pub const Redis = struct {
         const response = response_list.items;
 
         if (response.len > 1 and response[0] == ':') {
-            const val = std.fmt.parseInt(i32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return false;
+            const val = std.fmt.parseInt(i32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
             return val == 1;
         }
-        return false;
+        return error.RedisError;
     }
 
     /// Increment a value
@@ -558,7 +560,7 @@ pub const Redis = struct {
 
     /// Get remaining TTL
     pub fn ttl(self: *Redis, key: []const u8) errors.ResultT(i64) {
-        const borrowed = self.acquireStream() catch return -1;
+        const borrowed = try self.acquireStream();
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
         const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$3\r\nTTL\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
@@ -581,12 +583,12 @@ pub const Redis = struct {
             const val = std.fmt.parseInt(i64, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
             return val;
         }
-        return -1;
+        return error.RedisError;
     }
 
     /// Acquire a distributed lock
     pub fn lock(self: *Redis, key: []const u8, value: []const u8, ttl_seconds: u32) errors.ResultT(bool) {
-        const borrowed = self.acquireStream() catch return false;
+        const borrowed = try self.acquireStream();
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
         const px = ttl_seconds * 1000;
@@ -616,12 +618,18 @@ pub const Redis = struct {
         if (response.len >= 3 and std.mem.eql(u8, response[0..3], "+OK")) {
             return true;
         }
-        return false;
+        // A losing `SET ... NX` answers with a nil bulk string — the server
+        // telling us the key is held elsewhere. That is an answer; any other
+        // reply (an `-ERR`, say) is not, and must not read as "not acquired".
+        if (response.len >= 4 and std.mem.eql(u8, response[0..4], "$-1\r")) {
+            return false;
+        }
+        return error.RedisError;
     }
 
     /// Release a distributed lock
     pub fn unlock(self: *Redis, key: []const u8) errors.Result {
-        const borrowed = self.acquireStream() catch return;
+        const borrowed = try self.acquireStream();
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
         const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$3\r\nDEL\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
@@ -636,7 +644,15 @@ pub const Redis = struct {
             self.evictStream(borrowed);
             return error.RedisError;
         };
-        return;
+        const response = response_list.items;
+
+        // DEL answers with an integer count; 0 means "the lock had already
+        // expired" and still counts as released. Any other reply — an `-ERR`,
+        // say — leaves us not knowing, which is not a success.
+        if (response.len > 1 and response[0] == ':') {
+            return;
+        }
+        return error.RedisError;
     }
 
     /// List operations
@@ -729,10 +745,10 @@ pub const Redis = struct {
         const response = response_list.items;
 
         if (response.len > 1 and response[0] == ':') {
-            const val = std.fmt.parseInt(i32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return 0;
+            const val = std.fmt.parseInt(i32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
             return val == 1;
         }
-        return false;
+        return error.RedisError;
     }
 
     pub fn hGet(self: *Redis, key: []const u8, field: []const u8) errors.ResultT(?[]const u8) {
@@ -1273,4 +1289,136 @@ test "redis concurrent incr on a single shared stream (pool_size = 1)" {
     // on the shared socket (the bug this test exists for).
     try std.testing.expectEqualStrings("32", final.?);
     _ = r.del(&.{key}) catch {};
+}
+
+// ── "no answer" vs "the answer is X" (regression tests for fabricated values) ──
+
+/// A client that has never connected. With `pool_size = 1` there is no pool and
+/// `stream` stays null until `connect`, so `acquireStream` fails before any
+/// socket is touched: the deterministic stand-in for "Redis is unreachable".
+fn offlineClient() !Redis {
+    return Redis.new(std.testing.allocator, std.testing.io, .{ .pool_size = 1 });
+}
+
+/// A client whose socket is the given socketpair end, so a peer can hand it a
+/// canned RESP reply: "the server answered X" without a live server.
+fn cannedReplyClient(fd: std.posix.socket_t) !Redis {
+    var r = try Redis.new(std.testing.allocator, std.testing.io, .{ .pool_size = 1 });
+    r.stream = .{ .socket = .{ .handle = fd, .address = undefined } };
+    return r;
+}
+
+test "redis: an unreachable server is an error, not a data answer" {
+    var r = try offlineClient();
+    defer r.deinit();
+
+    // Every one of these used to return *success* carrying the value a caller
+    // reads as data — `-1` = "key exists, no expiry", `false` = "already set" /
+    // "key absent" / "lock held elsewhere", `0` = "nothing deleted" — a made-up
+    // answer to a question that never reached Redis.
+    try std.testing.expectError(error.RedisError, r.ttl("k"));
+    try std.testing.expectError(error.RedisError, r.setNX("k", "v"));
+    try std.testing.expectError(error.RedisError, r.del(&.{"k"}));
+    try std.testing.expectError(error.RedisError, r.exists("k"));
+    try std.testing.expectError(error.RedisError, r.lock("k", "v", 5));
+    try std.testing.expectError(error.RedisError, r.unlock("k"));
+
+    // Control group: commands that already propagated the very same failure.
+    try std.testing.expectError(error.RedisError, r.get("k"));
+    try std.testing.expectError(error.RedisError, r.set("k", "v", null));
+    try std.testing.expectError(error.RedisError, r.incr("k"));
+    try std.testing.expectError(error.RedisError, r.hSet("k", "f", "v"));
+    try std.testing.expectError(error.RedisError, r.publish("c", "m"));
+
+    // ...while a request that asks for nothing still answers 0 deleted: the
+    // empty list is a decision, not an unreachable server.
+    try std.testing.expectEqual(@as(u32, 0), try r.del(&.{}));
+}
+
+test "redis: a server reply is data, a server error reply is not" {
+    const fds = testPair() orelse return error.SkipZigTest;
+    var r = try cannedReplyClient(fds[0]);
+    defer r.deinit(); // closes fds[0] unless a command already evicted it
+    defer _ = std.posix.system.close(fds[1]);
+
+    // In-protocol answers stay values: TTL -1 is "exists, no expiry", -2 is
+    // "no such key" — the server talking, not us guessing.
+    peerWriteAll(fds[1], ":-1\r\n");
+    try std.testing.expectEqual(@as(i64, -1), try r.ttl("k"));
+    peerWriteAll(fds[1], ":-2\r\n");
+    try std.testing.expectEqual(@as(i64, -2), try r.ttl("k"));
+
+    // SETNX: 1 = we took it, 0 = someone else holds it.
+    peerWriteAll(fds[1], ":1\r\n");
+    try std.testing.expect(try r.setNX("k", "v"));
+    peerWriteAll(fds[1], ":0\r\n");
+    try std.testing.expect(!try r.setNX("k", "v"));
+
+    // EXISTS / DEL / HSET return counts.
+    peerWriteAll(fds[1], ":1\r\n");
+    try std.testing.expect(try r.exists("k"));
+    peerWriteAll(fds[1], ":0\r\n");
+    try std.testing.expect(!try r.exists("k"));
+    peerWriteAll(fds[1], ":2\r\n");
+    try std.testing.expectEqual(@as(u32, 2), try r.del(&.{"a"}));
+    peerWriteAll(fds[1], ":1\r\n");
+    try std.testing.expect(try r.hSet("k", "f", "v"));
+
+    // SET NX PX answers +OK when the lock is ours and a nil bulk when it is not.
+    peerWriteAll(fds[1], "+OK\r\n");
+    try std.testing.expect(try r.lock("k", "v", 5));
+    peerWriteAll(fds[1], "$-1\r\n");
+    try std.testing.expect(!try r.lock("k", "v", 5));
+
+    // A `-ERR` reply is the server refusing the command, not an answer to it.
+    // These were the sharpest lies: each one came back as plausible data.
+    peerWriteAll(fds[1], "-ERR wrong number of arguments for 'ttl' command\r\n");
+    try std.testing.expectError(error.RedisError, r.ttl("k"));
+    peerWriteAll(fds[1], "-ERR wrong number of arguments for 'setnx' command\r\n");
+    try std.testing.expectError(error.RedisError, r.setNX("k", "v"));
+    peerWriteAll(fds[1], "-ERR wrong number of arguments for 'del' command\r\n");
+    try std.testing.expectError(error.RedisError, r.del(&.{"k"}));
+    peerWriteAll(fds[1], "-ERR wrong number of arguments for 'exists' command\r\n");
+    try std.testing.expectError(error.RedisError, r.exists("k"));
+    peerWriteAll(fds[1], "-ERR wrong number of arguments for 'hset' command\r\n");
+    try std.testing.expectError(error.RedisError, r.hSet("k", "f", "v"));
+    peerWriteAll(fds[1], "-ERR wrong number of arguments for 'set' command\r\n");
+    try std.testing.expectError(error.RedisError, r.lock("k", "v", 5));
+    peerWriteAll(fds[1], "-ERR wrong number of arguments for 'del' command\r\n");
+    try std.testing.expectError(error.RedisError, r.unlock("k"));
+}
+
+test "redis: real server answers arrive as data (TTL -1, SETNX false)" {
+    // The other half of the distinction, against a live server: a genuine -1
+    // from TTL must still be -1, and a genuine false from SETNX/SET NX must
+    // still be false.
+    const redis_url = if (builtin.os.tag == .windows) @as(?[]const u8, null) else if (std.c.getenv("REDIS_URL")) |ptr| std.mem.span(ptr) else null;
+    if (redis_url == null or redis_url.?.len == 0) return error.SkipZigTest;
+
+    var r = try Redis.new(std.testing.allocator, std.testing.io, RedisConfig.fromUrl(redis_url.?));
+    defer r.deinit();
+    try r.connect();
+
+    const key = "zigmodu:test:redis:answers-are-data";
+    const lock_key = "zigmodu:test:redis:answers-are-data:lock";
+    const absent = "zigmodu:test:redis:definitely-absent";
+    _ = r.del(&.{ key, lock_key }) catch {};
+
+    try r.set(key, "v", null);
+    // No expiry set: the server says -1, and that is an answer.
+    try std.testing.expectEqual(@as(i64, -1), try r.ttl(key));
+    try std.testing.expectEqual(@as(i64, -2), try r.ttl(absent));
+
+    try std.testing.expect(!try r.setNX(key, "other"));
+    _ = r.del(&.{key}) catch {};
+    try std.testing.expect(try r.setNX(key, "first"));
+
+    try std.testing.expectEqual(@as(u32, 0), try r.del(&.{absent}));
+
+    // The second acquire losing is a value, not a failure.
+    try std.testing.expect(try r.lock(lock_key, "t1", 5));
+    try std.testing.expect(!try r.lock(lock_key, "t2", 5));
+    try r.unlock(lock_key);
+
+    _ = r.del(&.{ key, lock_key }) catch {};
 }

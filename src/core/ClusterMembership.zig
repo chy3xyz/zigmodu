@@ -345,10 +345,25 @@ pub const ClusterMembership = struct {
         }
 
         if (event.event_type == .leader_election) {
+            // Own the copy *before* dropping the old one. Freeing first and
+            // copying after leaves `current_leader` pointing at freed memory
+            // when the copy fails, and the only signal left (`return`) reads
+            // as "nothing to do" — while `getLeader`/`isLeader`, the callback
+            // below and `deinit` all keep reading that pointer.
+            //
+            // The copy cannot be propagated: this runs inside the bus callback
+            // (`onBusEvent` is `void`), where an error has no channel and the
+            // caller is the event bus, not a request. Keeping the previously
+            // elected leader is the honest no-op — the alternative, nulling the
+            // field, makes `isLeader` fall back to "single node ⇒ leader".
+            const new_leader = self.allocator.dupe(u8, event.node_id) catch |err| {
+                std.log.warn("[ClusterMembership] Leader copy for {s} failed, keeping the current leader: {}", .{ event.node_id, err });
+                return;
+            };
             if (self.current_leader) |leader| {
                 self.allocator.free(leader);
             }
-            self.current_leader = self.allocator.dupe(u8, event.node_id) catch return;
+            self.current_leader = new_leader;
             if (self.on_leader_change_cb) |cb| {
                 cb(self.current_leader);
             }
@@ -444,10 +459,20 @@ pub const ClusterMembership = struct {
 
         if (leader_id) |new_leader| {
             if (self.current_leader == null or !std.mem.eql(u8, self.current_leader.?, new_leader)) {
+                // Same rule as the gossip writer above: take the owned copy
+                // first, so a failed copy cannot leave `current_leader` at
+                // freed memory. `false` here already means "no broadcast", so
+                // an error return would be indistinguishable from it — this is
+                // a no-op with the previous leader (and every reader's view of
+                // it) intact, not a silently failed election.
+                const owned = self.allocator.dupe(u8, new_leader) catch |err| {
+                    std.log.warn("[ClusterMembership] Leader copy for {s} failed, keeping the current leader: {}", .{ new_leader, err });
+                    return false;
+                };
                 if (self.current_leader) |old| {
                     self.allocator.free(old);
                 }
-                self.current_leader = self.allocator.dupe(u8, new_leader) catch return false;
+                self.current_leader = owned;
                 std.log.info("[ClusterMembership] New leader elected: {s}", .{new_leader});
 
                 if (self.on_leader_change_cb) |cb| {
@@ -605,4 +630,112 @@ test "ClusterMembership node leave and rejoin" {
         .timestamp = 0,
     });
     try std.testing.expectEqual(@as(usize, 3), cluster.getHealthyNodeCount());
+}
+
+// `current_leader` is owned memory, and both writers below free the old copy
+// *before* they try to make the new one. When that copy fails they return as if
+// nothing had happened, leaving the field pointing at freed memory — which
+// `getLeader`/`isLeader`, the leader callback and `deinit` all read afterwards.
+//
+// The failing allocator is installed once the node table exists, so the induced
+// failure lands on the leader copy and nowhere else. The peers are put into the
+// table directly rather than announced through gossip: the branch for an unknown
+// node dials a socket, and these tests are about memory, not networking.
+test "ClusterMembership leader_election keeps a live leader when the copy fails" {
+    const allocator = std.testing.allocator;
+
+    var bus = try DistributedEventBus.init(allocator, std.testing.io, "test-node");
+    defer bus.deinit();
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 18210);
+    var cluster = try ClusterMembership.init(allocator, std.testing.io, "node-c", addr, &bus);
+    defer cluster.deinit();
+
+    const peer_a = try allocator.dupe(u8, "node-a");
+    try cluster.nodes.put(peer_a, .{
+        .id = peer_a,
+        .address = addr,
+        .state = .healthy,
+        .last_seen = 0,
+        .joined_at = 0,
+    });
+    const peer_m = try allocator.dupe(u8, "node-m");
+    try cluster.nodes.put(peer_m, .{
+        .id = peer_m,
+        .address = addr,
+        .state = .healthy,
+        .last_seen = 0,
+        .joined_at = 0,
+    });
+
+    cluster.handleGossipEvent(.{
+        .event_type = .leader_election,
+        .node_id = "node-a",
+        .host = "127.0.0.1",
+        .port = 18211,
+        .timestamp = 0,
+    });
+    try std.testing.expectEqualStrings("node-a", cluster.getLeader().?);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    cluster.allocator = failing.allocator();
+
+    cluster.handleGossipEvent(.{
+        .event_type = .leader_election,
+        .node_id = "node-m",
+        .host = "127.0.0.1",
+        .port = 18212,
+        .timestamp = 0,
+    });
+
+    // The copy failed, so the recorded leader must still be the old one: alive,
+    // and neither the gossiped id nor freed bytes (`Allocator.free` overwrites
+    // the buffer with `undefined`, so a dangling read comes back as garbage).
+    try std.testing.expectEqualStrings("node-a", cluster.getLeader().?);
+}
+
+test "ClusterMembership electLeader keeps a live leader when the copy fails" {
+    const allocator = std.testing.allocator;
+
+    var bus = try DistributedEventBus.init(allocator, std.testing.io, "test-node");
+    defer bus.deinit();
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 18213);
+    var cluster = try ClusterMembership.init(allocator, std.testing.io, "node-c", addr, &bus);
+    defer cluster.deinit();
+
+    // The lowest id wins an election, so recording "node-z" as leader makes the
+    // election below try to replace it.
+    const peer_a = try allocator.dupe(u8, "node-a");
+    try cluster.nodes.put(peer_a, .{
+        .id = peer_a,
+        .address = addr,
+        .state = .healthy,
+        .last_seen = 0,
+        .joined_at = 0,
+    });
+    const peer_z = try allocator.dupe(u8, "node-z");
+    try cluster.nodes.put(peer_z, .{
+        .id = peer_z,
+        .address = addr,
+        .state = .healthy,
+        .last_seen = 0,
+        .joined_at = 0,
+    });
+
+    cluster.handleGossipEvent(.{
+        .event_type = .leader_election,
+        .node_id = "node-z",
+        .host = "127.0.0.1",
+        .port = 18214,
+        .timestamp = 0,
+    });
+    try std.testing.expectEqualStrings("node-z", cluster.getLeader().?);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    cluster.allocator = failing.allocator();
+
+    cluster.electLeader();
+
+    try std.testing.expectEqualStrings("node-z", cluster.getLeader().?);
 }

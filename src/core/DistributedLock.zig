@@ -23,6 +23,11 @@
 //! run concurrently by another replica in the next window — set the TTL above
 //! the worst-case job duration.
 //!
+//! Release is best-effort *and* allocation-free: it reports nothing to its
+//! caller, so it builds its statement on the stack rather than through the
+//! allocator, and a database failure there is logged with the TTL as the
+//! backstop. Nothing a caller can do would change either outcome.
+//!
 //! Postgres users who prefer server-side advisory locks can implement the same
 //! `Lock` interface over `pg_try_advisory_lock` / `pg_advisory_unlock`
 //! (MySQL: `GET_LOCK` / `RELEASE_LOCK`) — the call sites only need
@@ -41,7 +46,11 @@ pub const Lock = struct {
         /// Errors are real failures (connection down, bad table name) and are
         /// deliberately distinct from "held by someone else" (false).
         tryAcquire: *const fn (ptr: *anyopaque, name: []const u8, ttl_ms: u64) anyerror!bool,
-        /// Idempotent; only releases the lock if this owner holds it.
+        /// Idempotent; only releases the lock if this owner holds it. Returns
+        /// nothing, so an implementation must not have a failure the caller
+        /// needs to see: `SqlLock` builds its statement on the stack (no
+        /// allocation to lose) and logs a database failure, leaving the TTL as
+        /// the backstop.
         release: *const fn (ptr: *anyopaque, name: []const u8) void,
     };
 
@@ -90,6 +99,11 @@ pub const Dialect = enum { sqlite, postgres, mysql };
 pub fn SqlLock(comptime Client: type) type {
     return struct {
         const Self = @This();
+
+        /// The statement `release` runs. It is formatted into a stack buffer
+        /// (`release_sql_max`), never allocated — see `release`.
+        const release_sql_fmt = "DELETE FROM {s} WHERE name = ? AND owner = ?";
+        const release_sql_max = release_sql_fmt.len - "{s}".len + max_table_name_len;
 
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -175,8 +189,20 @@ pub fn SqlLock(comptime Client: type) type {
 
         fn release(ptr: *anyopaque, name: []const u8) void {
             const self: *Self = @ptrCast(@alignCast(ptr));
-            const sql = std.fmt.allocPrint(self.allocator, "DELETE FROM {s} WHERE name = ? AND owner = ?", .{self.table}) catch return;
-            defer self.allocator.free(sql);
+            // Built on the stack, not with `allocPrint`: this is the end of the
+            // critical section and the vtable gives it no error channel, so an
+            // allocation failure here cannot be reported and used to strand the
+            // lock until its TTL (`catch return`, which is what this was, said
+            // nothing at all). `init` bounds the table name (`isSafeIdentifier`)
+            // and the rest of the statement is fixed text, so the buffer always
+            // fits.
+            var buf: [release_sql_max]u8 = undefined;
+            const sql = std.fmt.bufPrint(&buf, release_sql_fmt, .{self.table}) catch |err| {
+                // Unreachable while the two bounds above agree; kept so a future
+                // table rule cannot turn this back into a silent non-release.
+                std.log.warn("[lock] release of '{s}' could not build its statement ({s}); ttl will expire it", .{ name, @errorName(err) });
+                return;
+            };
             _ = self.client.exec(sql, &.{ .{ .string = name }, .{ .string = &self.owner } }) catch |err| std.log.debug("[lock] release of '{s}' failed ({s}); ttl will expire it", .{ name, @errorName(err) });
         }
 
@@ -192,10 +218,15 @@ pub fn SqlLock(comptime Client: type) type {
     };
 }
 
+/// Longest table name the lock accepts. Table names cannot be bound, so they are
+/// interpolated into the statements — and this bound is what lets `release` size
+/// its statement buffer at comptime instead of allocating it.
+const max_table_name_len = 64;
+
 /// Table names are interpolated into DDL/DML (they cannot be bound), so they
 /// must be a plain identifier.
 fn isSafeIdentifier(name: []const u8) bool {
-    if (name.len == 0 or name.len > 64) return false;
+    if (name.len == 0 or name.len > max_table_name_len) return false;
     for (name, 0..) |c, i| {
         const ok = std.ascii.isAlphanumeric(c) or c == '_';
         if (!ok) return false;
@@ -252,6 +283,52 @@ test "SqlLock: an expired holder (crashed replica) is reaped" {
     // exactly what a crashed replica looks like.
     try std.testing.expect(try a.lock().tryAcquire("migration", 0));
     try std.testing.expect(try b.lock().tryAcquire("migration", 60_000));
+}
+
+test "SqlLock: the longest table name it accepts still releases" {
+    const allocator = std.testing.allocator;
+    var db = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:", .max_open_conns = 2, .max_idle_conns = 1 });
+    defer db.deinit();
+
+    // `isSafeIdentifier`'s cap is what `release` sizes its stack buffer from, so
+    // the widest legal name is the one an off-by-one there would strand.
+    var name_buf: [max_table_name_len]u8 = undefined;
+    @memset(&name_buf, 't');
+    var a = try SqlLock(@TypeOf(db)).init(allocator, std.testing.io, &db, &name_buf, .sqlite);
+    defer a.deinit();
+    var b = try SqlLock(@TypeOf(db)).init(allocator, std.testing.io, &db, &name_buf, .sqlite);
+    defer b.deinit();
+
+    try std.testing.expect(try a.lock().tryAcquire("cron:nightly", 600_000));
+    a.lock().release("cron:nightly");
+    try std.testing.expect(try b.lock().tryAcquire("cron:nightly", 600_000));
+}
+
+test "SqlLock: release still frees the lock when the allocator refuses" {
+    const allocator = std.testing.allocator;
+    var db = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:", .max_open_conns = 2, .max_idle_conns = 1 });
+    defer db.deinit();
+
+    var a = try SqlLock(@TypeOf(db)).init(allocator, std.testing.io, &db, "zmodu_lock_release_oom", .sqlite);
+    defer a.deinit();
+    var b = try SqlLock(@TypeOf(db)).init(allocator, std.testing.io, &db, "zmodu_lock_release_oom", .sqlite);
+    defer b.deinit();
+
+    try std.testing.expect(try a.lock().tryAcquire("cron:nightly", 600_000));
+    try std.testing.expect(!try b.lock().tryAcquire("cron:nightly", 600_000));
+
+    // Releasing is the end of the critical section and returns nothing, so a
+    // failure here cannot be reported to the caller: any allocation it made
+    // would strand the lock until its TTL, with B blocked out for that whole
+    // window. Hence the release statement is built on the stack — from here on
+    // every allocation through A's own allocator fails, and the hand-over below
+    // has to happen anyway.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    a.allocator = failing.allocator();
+    a.lock().release("cron:nightly");
+
+    try std.testing.expect(try b.lock().tryAcquire("cron:nightly", 600_000));
+    try std.testing.expect(!failing.has_induced_failure);
 }
 
 test "SqlLock rejects unsafe table identifiers" {

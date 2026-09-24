@@ -1,5 +1,116 @@
 # Changelog
 
+## [Unreleased]
+
+### 第 15 批：授权路径在 OOM 下 fail-open（真红，含一处越界写）、口令校验把"我们这侧出错"答成"口令错"（**破坏性：是**，1 处编译错）、另有 10 处"失败被当成成功值"（**破坏性：否**）
+
+全量 `-Ddb=all` **1815/1871（56 skipped，0 failed）**。
+
+**数据权限在分配失败时 fail-open —— 这是本批最严重的一条。** `DataPermission.buildWhere` 的
+`.dept_only` / `.dept_and_child` / `.self_` 三个**限制性**作用域把 SQL 片段的分配写成
+`catch return null`，而 `null` 在本模块的文档与既有用例里**只**表示 `.all`（不限）。于是内存紧张时
+**限制条件整条消失**，调用方（`examples/zmsaas/backend/src/shard.zig` 的 `if (filter) |f|`）把范围查询
+变成全表查询。红证据（`FailingAllocator(fail_index = 0)` + 与真实调用方逐字相同的拼接）：
+```
+RED self_:          filter=null => UNRESTRICTED  rows_returned=2 (table has 2 rows, 1 belongs to the user)
+RED dept_only:      filter=null => UNRESTRICTED  rows_returned=2
+RED dept_and_child: filter=null => UNRESTRICTED  rows_returned=2
+```
+修法：**fail closed**（复用文件里 `.dept_custom` 已有的 `reject`，即 `"1 = 0"` + 空参数），而不是改签名
+—— `null` 继续只表示 `.all`，调用方的拼接逻辑无论怎么写都丢不掉限制；`.all` 与正常路径未变。
+> **顺带查出一处越界写（同一分支）**：`buildInClause` 往 `var buf: [256]u8` 里按运行期下标写入，而子句
+> 长度随部门列表增长（`3*n + col.len + 4`）。红证据：`.dept_custom` 列表到第 82 个 id 时
+> `panic: index out of bounds: index 256, len 256`（ReleaseFast 下是写穿栈帧）。改为按 `ids.len` 精确分配。
+> 另记录未改：`.dept_and_child` 的实现与 `.dept_only` 完全相同（没有子孙展开），比名字更**宽松**但仍是
+> fail-closed，改它是语义决定；`fromRoles` 依赖 `DataScope` 的整数顺序（重排会静默换作用域，方向是过度
+> 限制）。
+
+**口令校验：把"我们这侧出错"答成"口令错"，并关掉一处前缀比较（破坏性）。**
+`PasswordEncoder.matches` 与 `SecurityModule.verifyPassword` 的 base64 解码写成 `catch return false`，
+于是**存储哈希不可解码**或**解码时分配失败**都被答成"口令不匹配"——登录在内存压力下得到 401 而不是 500，
+失败登录计数也是假的。红证据：`[REDREPRO] fail_index=0 matches(correct password) = false`、
+`[REDREPRO] matches(valid password, un-decodable stored hash) = false`。
+> **顺带找出一条真漏洞**：旧代码在长度检查后做 `expected_hash[0..32]`，是**前缀比较** ——
+> "32 字节真实摘要 + 1 字节垃圾"的存储记录会被**判定通过**（实测 `[PRE-FIX] 33-byte digest (32 real +
+> 1 garbage byte) accepted = true`）。现在摘要长度必须**恰好**等于派生 key 长度。
+> **Breaking?** 是（编译错）：两个函数改为返回 `PasswordError!bool`
+> （`error{MalformedStoredHash} || std.mem.Allocator.Error`），调用点必须 `try`/`catch`。仓库内
+> **没有**调用方（只有本文件测试），但**消费者 App 的登录 handler 必须改**，见
+> [`docs/UPGRADING.md`](docs/UPGRADING.md) §v0.33.4 的一行改法。`SecurityModule.verifyPassword` 另外
+> 改为**解码后比较字节**（不再"把派生 key 重新 base64 再比字符串"），于是那次分配整个消失、校验算法
+> 字段也不再被忽略。常量时间比较未改（仍是 `timingSafeSliceEql` 比字节）——**但没有做时序测量**，
+> 只能说实现没被削弱。
+
+**另外 10 处"失败被当成一个看起来正常的值"（都不改签名）。**
+- **`src/core/ClusterMembership.zig` 的 use-after-free（红：`UUUUUU` = `free` 写入的 undefined 填充）**：
+  `.leader_election` 与 `electLeaderLocked` 都是**先 free 旧 leader、再 dupe 新的**，`dupe` 失败时字段仍
+  指向已释放内存，之后每次读（`getLeader`/回调/比较/`deinit`）都是 UAF，并伴随
+  `panic: double free`（`ClusterMembership.zig:349` 与 `:111` 两处 free）。改为**先 dupe 再 free**，
+  失败则保留旧 leader 并 warn（写入侧是 `onBusEvent` 的 `void` 回调、`electLeader` 全链 `void`，没有错误
+  通道；`false` 本来就表示"不广播"，改成错误无法区分。**这是缓解而非传播**，理由写在代码里）。
+- **`src/core/cluster/LoadBalancer.zig` 的 invalid free（红：`double free` / `Bus error` on `.rodata`）**：
+  `recordResult` 先把调用方的**借用** `peer_key` 放进 map，再用 `dupe` 换成自有副本，`dupe` 失败即
+  `catch return` —— map 里留下借用切片（多数是临时值），`deinit` 去 free 它。改为 `!void` 并在插入前
+  先取自有副本，失败则释放副本并返回错误（计数因此不会与 map 内容不一致）。仓库内只有本文件测试调用它。
+- **`src/redis/redis.zig`：基础设施故障被答成数据（7 处）**。`setNX`/`lock` 返回 `false`（读作"别人先占"）、
+  `del` 返回 `0`（"一个都没删"）、`exists` 返回 `false`、`ttl` 返回 `-1`（**"键存在且永不过期"**，最锋利）、
+  `unlock` 静默返回（"锁已释放"）。`errors.ResultT(T)` 就是 `Error!T`，所以**返回一个值等于成功**。
+  红证据（离线 client，`acquireStream` 在任何 socket 之前失败）：
+  `expected error.RedisError, found -1` / `expected error.RedisError, found false`。
+  改为 `try`，并**保留**服务端真实回答的语义（真 `-1`、真 `false`、真 `nil` 仍是值），非预期回复/解析失败
+  一律报错。**行为变化**：调用方（`RedisRateLimiter`、`RedisCooldownStore` 等）在 Redis 不可达时会**抛错**
+  而不是静默拿到 `0`/`false`。
+  > 顺带：`hSet` **从未被任何代码调用过**，所以在惰性分析下这一行从未编译 ——
+  > `error: expected type 'error{...}!bool', found 'comptime_int'`。又一个"只导出、没调用者"的陷阱实例。
+- **表单解析：客户端错与服务端错被塌成一个 `null`（H1 + H2 两个调用点）**。`parseFormBody` 的
+  `error.TooManyParams`（客户端字段超限 → 该 400）与分配失败（我们这侧 → 该 500）都被
+  `catch null` 读成"没有表单体"。红证据（同一请求两种协议）：
+  `expected: HTTP/1.1 400 Bad Request / found: HTTP/1.1 200 OK`、
+  `h2 adapter parity: the form parser takes Server.Config.max_params too...expected 400, found 200`。
+  现在新增 `parseUrlencodedForm`（`.absent` / `.parsed` / `.refused{status, message}`）与
+  `paramParseFailureStatus`，两条协议各自按类别回 400 或 500；**顺带**把请求边界的同一个塌陷也分开
+  （查询串解析的分配失败以前回 400，现在 500；字段洪泛仍 400）。
+- **`src/http/Params.zig` 的 double free（红：`panic: double free`）**：`putOwned` 在插入失败时
+  **释放调用方拥有的内存**，而它自己的文档注释写着"出错时调用方仍拥有它们"，两个请求解析器正是按该契约
+  写的清理。`put` 是反过来的同一问题（自己那份名字被 `errdefer` 与显式 free 释放两次）。两处都改为
+  **只在插入成功后**释放多余副本，契约未变。
+- **`src/messaging/OutboxConsumer.zig` 的静默停摆**：`parseEntry(row) catch continue` —— 无日志、无计数、
+  无死信、**且不标记该行**，于是每次 poll 都重新选中它，队列永远不排空、什么都不投递。红证据（列名大小写
+  不匹配的声明列，`sqlite3_column_name` 报的是声明名，`Row.get` 大小写敏感 → 每行 `MissingColumn`）：
+  `after 2 polls: pending=1 selected=0/0 delivered=0 failed=0`。现在**死信化**：`status = 3` +
+  `error_message` + 一条 warn + 计入既有 `outbox_failed_total`，复用**已有**的
+  `OutboxPublisher.buildResubmit`（`status = 3 → 0`）恢复，没有引入新表或新子系统。
+- **`src/http/HttpClient.zig` 的连接池**：`release` 取不到池锁时 `catch return` → 连接既不入 idle 也不关闭、
+  `active_connections` 里永远留着（池静默缩水）；`discard` 同形；`acquire` 在 append 失败时已 `swapRemove`
+  掉 idle 项 → **整条连接丢失**（红：`leaked [len: 9]`，正是 host 字符串）；`release` 往 idle 追加失败时
+  只 debug 后丢掉（socket 不关、host 不 free，注释还错说"与死连接分支结果相同"）。前两处改用
+  `lockUncancelable`（本文件 `deinit`/`https_mutex` 早已如此，同仓 `Pool.zig` 也修过同一 bug），后两处
+  把不可逆的移除放在可失败的分配之后 / 失败时关闭并释放。
+- **`src/im/BufferPool.zig`：把取消说成 `error.OutOfMemory`**（红：`expected error.Canceled, found
+  error.OutOfMemory`）。`std.Io.Mutex.lock` 是 `std.Io.Cancelable`，如实传播 `error.Canceled`。
+- **`src/sqlx/sqlx.zig` `CachedConn`：缓存解码把"缓存的 JSON 坏了"与"我们分配失败"一起报成
+  `error.DatabaseError`**（4 处；红证据的栈显示失败发生在解析器内部的
+  `allocator.create(ArenaAllocator)`，不是解析判定）。现在**坏条目 = cache miss**（穿到查询并在同一次调用里
+  由 `setCache` 修复，与序列化侧既有的 fail-open 对齐），**分配失败 = `error.OutOfMemory`** 冒泡。
+  `CachedConn` 是公开类型，按 `DatabaseError` 分支的消费者需知。
+- **`src/core/DistributedLock.zig`：release 在分配失败时静默不释放**（红：A 释放后 B 仍拿不到锁，
+  没有日志，只有 TTL 兜底）。`allocPrint(...) catch return` 换成栈上 `bufPrint`（表名上限 64 是
+  `init` 已保证的），错误路径**从"降级"变成"不存在"**，签名不变。
+- 另记录：`src/sqlx/sqlx.zig` 的 sqlite **BLOB 列**（唯一未解码的类型）以前静默读成 SQL NULL，现在
+  **每种类型每个进程 warn 一次**（值通道仍是 `null`，因为把 BLOB 当字符串解码会按第一个 NUL 截断、
+  而 BLOB 的 C 绑定不在可改范围内；直接报错会让任何 `SELECT *` 到该列的查询失败，包括从不读它的调用方）；
+  MySQL 预处理路径的 4 处 `catch return null`（把 OOM 折成"退回文本协议"）改为
+  `switch (err) { error.OutOfMemory => return err, else => return null }`（红：
+  `expected error.OutOfMemory, found .{ .arena = …, .rows = … }`）。
+
+> **本批未做（已记录）**：`src/api/Middleware.zig:815` 的 `jwtBackend` 与
+> `src/security/AuthMiddleware.zig` 把 `verifyToken` 的 OOM/`UnknownKeyId` 一起答成 401；
+> `src/core/cluster/TlsTransport.zig:83` 的 `sign catch return false`；`ApiKeyAuth.validateKey` 用
+> `std.mem.eql`（**非恒定时间**）且 loader 契约 `fn ([]const u8) bool` 没有错误通道；
+> `src/sqlx/sqlx.zig` 的 `mysqlParseJson` 把解析器 OOM 折成 `InvalidFormat`；
+> `BufferPool.release`/`available`/`stats` 与 `ConnectionPool.acquire` 的取消处理；
+> `Middleware.zig:403` 的 `joinCsv` 失败会留下**没有 roles 的身份**。
+
 ## [0.33.3] - 2026-09-24
 
 ### 第 14 批：H2 上 gRPC 路由的 `HEAD` 仍会发 DATA 帧（真红）、sqlite 把 OOM 与 SQL NULL 混成一个 `null` 并顺带修掉一个真泄漏（**破坏性：否**）

@@ -137,13 +137,24 @@ pub const LoadBalancer = struct {
     /// Record a connection result. For least_connections strategy, success=true
     /// increments the connection count, success=false decrements it.
     /// peer_key should be in "host:port" format (e.g., "10.0.0.1:8080").
-    pub fn recordResult(self: *Self, peer_key: []const u8, success: bool) void {
+    ///
+    /// The map owns its keys (`deinit` frees every one of them), so the caller's
+    /// slice is copied *before* it goes in: a failure of that copy — or of the
+    /// map's own growth — is reported instead of leaving the map holding the
+    /// caller's memory. A failed call records nothing, so the count can never
+    /// disagree with what the map holds.
+    pub fn recordResult(self: *Self, peer_key: []const u8, success: bool) !void {
         if (self.strategy != .least_connections) return;
 
         if (success) {
-            const gop = self.connections.getOrPut(peer_key) catch return;
-            if (!gop.found_existing) {
-                gop.key_ptr.* = self.allocator.dupe(u8, peer_key) catch return;
+            const owned = try self.allocator.dupe(u8, peer_key);
+            const gop = self.connections.getOrPut(owned) catch |err| {
+                self.allocator.free(owned);
+                return err;
+            };
+            if (gop.found_existing) {
+                self.allocator.free(owned);
+            } else {
                 gop.value_ptr.* = 0;
             }
             gop.value_ptr.* +%= 1;
@@ -320,14 +331,14 @@ test "LoadBalancer least_connections" {
     // First two should go to different peers (0 connections each)
     _ = lb.next("api") orelse return error.NoPeer;
     // Record result for 10.0.0.1
-    lb.recordResult("10.0.0.1:8080", true);
+    try lb.recordResult("10.0.0.1:8080", true);
 
     const p1 = lb.next("api") orelse return error.NoPeer;
     // Now 10.0.0.2 should have 0 connections, so next should go there
     try std.testing.expect(std.mem.eql(u8, p1.host, "10.0.0.2"));
 
     // Record a connection for 10.0.0.2 as well
-    lb.recordResult("10.0.0.2:8080", true);
+    try lb.recordResult("10.0.0.2:8080", true);
     // Both have 1 connection now; next returns the first one in list
     const p2 = lb.next("api") orelse return error.NoPeer;
     // Either is fine; just verify we get a valid peer
@@ -336,7 +347,7 @@ test "LoadBalancer least_connections" {
     );
 
     // Release a connection from 10.0.0.1
-    lb.recordResult("10.0.0.1:8080", false);
+    try lb.recordResult("10.0.0.1:8080", false);
     // Now 10.0.0.1 has 0, 10.0.0.2 has 1 → next should pick 10.0.0.1
     const p3 = lb.next("api") orelse return error.NoPeer;
     try std.testing.expect(std.mem.eql(u8, p3.host, "10.0.0.1"));
@@ -351,4 +362,78 @@ test "LoadBalancer empty service returns null" {
     defer lb.deinit();
 
     try std.testing.expect(lb.next("nonexistent") == null);
+}
+
+// `recordResult` used to put the caller's key into the map and only then
+// replace it with an owned copy (`catch return`). When that copy failed the map
+// kept the borrowed slice, and `deinit` frees every key in the map — so the
+// caller's buffer was freed here too, while the count was left un-incremented
+// (which biases `.least_connections`). Every allocation index is failed in turn:
+// the failure has to be reported, nothing may be recorded, and no key in the map
+// may be the caller's memory.
+test "LoadBalancer least_connections: an allocation failure never keeps a borrowed key" {
+    const allocator = std.testing.allocator;
+    var disco = PeerDiscovery.init(allocator, .{});
+    defer disco.deinit();
+
+    try disco.registerPeer("lc1", "10.0.0.1", 8080);
+    try disco.registerService("api", .{ .id = "lc1", .host = "10.0.0.1", .port = 8080 });
+
+    // Heap-allocated on purpose: a map that stored this slice instead of a copy
+    // would free it in `deinit`, and so would the `defer` below.
+    const key = try allocator.dupe(u8, "10.0.0.1:8080");
+    defer allocator.free(key);
+
+    var fail_at: usize = 0;
+    while (fail_at < 8) : (fail_at += 1) {
+        var probing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_at });
+        var lb = LoadBalancer.init(probing.allocator(), .least_connections, &disco);
+        defer lb.deinit();
+
+        lb.recordResult(key, true) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            // Reported, and nothing recorded: the count cannot disagree with
+            // what the map holds.
+            try std.testing.expectEqual(@as(usize, 0), lb.connections.count());
+        };
+
+        var keys = lb.connections.keyIterator();
+        while (keys.next()) |stored| {
+            try std.testing.expect(stored.ptr != key.ptr);
+        }
+    }
+
+    // With a working allocator the count and the stored value agree.
+    var lb = LoadBalancer.init(allocator, .least_connections, &disco);
+    defer lb.deinit();
+    try lb.recordResult(key, true);
+    try std.testing.expectEqual(@as(usize, 1), lb.connections.count());
+    try std.testing.expectEqual(@as(u64, 1), lb.connections.get("10.0.0.1:8080").?);
+}
+
+// The same defect seen from the allocator: the key that used to end up in the
+// map was a string literal the map cannot own, and `deinit` frees every key —
+// a bus error in `.rodata`. The table is grown beforehand, so the single
+// allocation `recordResult` still performs is the key copy, the one
+// `FailingAllocator` fails.
+test "LoadBalancer deinit frees only the keys the map owns" {
+    const allocator = std.testing.allocator;
+    var disco = PeerDiscovery.init(allocator, .{});
+    defer disco.deinit();
+
+    try disco.registerPeer("lc1", "10.0.0.1", 8080);
+    try disco.registerService("api", .{ .id = "lc1", .host = "10.0.0.1", .port = 8080 });
+
+    var lb = LoadBalancer.init(allocator, .least_connections, &disco);
+    defer lb.deinit();
+
+    try lb.connections.ensureTotalCapacity(8);
+
+    var probing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    lb.allocator = probing.allocator();
+
+    // The copy fails → reported → nothing recorded → `deinit` has no key to
+    // free, so the literal never reaches the allocator.
+    try std.testing.expectError(error.OutOfMemory, lb.recordResult("10.0.0.1:8080", true));
+    try std.testing.expectEqual(@as(usize, 0), lb.connections.count());
 }

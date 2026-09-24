@@ -3,6 +3,7 @@ const crypto = std.crypto;
 const Time = @import("../core/Time.zig");
 const api = @import("../api/Server.zig");
 const JwksKeyRing = @import("JwksKeyRing.zig").JwksKeyRing;
+const PasswordEncoder = @import("PasswordEncoder.zig").PasswordEncoder;
 
 /// Security module - provides authentication, authorization and encryption
 pub const SecurityModule = struct {
@@ -17,6 +18,10 @@ pub const SecurityModule = struct {
     /// verified against whichever key the token names — so an old key can stay
     /// valid during the rollout window. Must outlive the module.
     keyring: ?*JwksKeyRing = null,
+
+    /// `verifyPassword`'s error set — identical to `PasswordEncoder.PasswordError`
+    /// so an app can handle both verifiers with one `switch`.
+    pub const PasswordError = PasswordEncoder.PasswordError;
 
     pub fn init(allocator: std.mem.Allocator, jwt_secret: []const u8, token_expiry_seconds: i64) Self {
         return .{
@@ -289,8 +294,10 @@ pub const SecurityModule = struct {
         var salt: [16]u8 = undefined;
         try std.Io.randomSecure(io, &salt);
 
-        // SAFETY: Buffer is immediately filled by pbkdf2() before use
-        var derived_key: [32]u8 = undefined;
+        // SAFETY: Buffer is immediately filled by pbkdf2() before use.
+        // The length is the one `verifyPassword` accepts — writing a different
+        // one here would make every stored hash unverifiable.
+        var derived_key: [PasswordEncoder.derived_key_len]u8 = undefined;
         try crypto.pwhash.pbkdf2(
             &derived_key,
             password,
@@ -308,35 +315,50 @@ pub const SecurityModule = struct {
         return std.fmt.allocPrint(self.allocator, "$pbkdf2$100000${s}${s}", .{ salt_b64, hash_b64 });
     }
 
-    /// Verify password
-    pub fn verifyPassword(self: *Self, password: []const u8, hash: []const u8) bool {
+    /// Verify password.
+    ///
+    /// `false` is a genuine mismatch; an error means **we** could not check the
+    /// credential (the stored record is unusable, or the process is out of
+    /// memory). Never render an error as 401 "bad credentials" — that turns an
+    /// operational fault into an invisible wrong-password rate.
+    pub fn verifyPassword(self: *Self, password: []const u8, hash: []const u8) PasswordError!bool {
         // Parse hash: $pbkdf2$<iterations>$<salt>$<hash>
         var parts = std.mem.splitSequence(u8, hash, "$");
         _ = parts.next(); // empty
-        _ = parts.next(); // pbkdf2
-        const iter_str = parts.next() orelse return false;
-        const iterations = std.fmt.parseInt(u32, iter_str, 10) catch return false;
-        const salt_b64 = parts.next() orelse return false;
-        const expected_hash_b64 = parts.next() orelse return false;
+        const algo = parts.next() orelse return error.MalformedStoredHash;
+        if (!std.mem.eql(u8, algo, "pbkdf2")) return error.MalformedStoredHash;
+        const iter_str = parts.next() orelse return error.MalformedStoredHash;
+        const iterations = std.fmt.parseInt(u32, iter_str, 10) catch return error.MalformedStoredHash;
+        const salt_b64 = parts.next() orelse return error.MalformedStoredHash;
+        const expected_hash_b64 = parts.next() orelse return error.MalformedStoredHash;
 
-        const salt = base64Decode(self.allocator, salt_b64) catch return false;
+        // Decode the stored digest instead of re-encoding the derived key: the
+        // comparison then needs no allocation after the PBKDF2 work, and a
+        // stored value that is not a digest is reported as a corrupt record
+        // rather than compared as text and answered "wrong password".
+        const salt = try decodeStoredField(self.allocator, salt_b64);
         defer self.allocator.free(salt);
 
+        const expected_hash = try decodeStoredField(self.allocator, expected_hash_b64);
+        defer self.allocator.free(expected_hash);
+
+        if (expected_hash.len != PasswordEncoder.derived_key_len) return error.MalformedStoredHash;
+
         // SAFETY: Buffer is immediately filled by pbkdf2() before use
-        var derived_key: [32]u8 = undefined;
+        var derived_key: [PasswordEncoder.derived_key_len]u8 = undefined;
         crypto.pwhash.pbkdf2(
             &derived_key,
             password,
             salt,
             iterations,
             crypto.auth.hmac.sha2.HmacSha256,
-        ) catch return false;
-
-        const hash_b64 = base64Encode(self.allocator, &derived_key) catch return false;
-        defer self.allocator.free(hash_b64);
+        ) catch |err| switch (err) {
+            // rounds < 1: the stored parameters are corrupt, not the password.
+            error.WeakParameters, error.OutputTooLong => return error.MalformedStoredHash,
+        };
 
         // Constant-time comparison to prevent timing side-channel
-        return timingSafeSliceEql(hash_b64, expected_hash_b64);
+        return timingSafeSliceEql(&derived_key, expected_hash[0..PasswordEncoder.derived_key_len]);
     }
 
     /// Check whether the payload carries the given role
@@ -537,6 +559,16 @@ fn base64Decode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     return decoded;
 }
 
+/// Decode one base64 field of a *stored* hash. Text that is not valid base64
+/// is a corrupt stored record (`MalformedStoredHash`); only the allocator's own
+/// failure stays `OutOfMemory`, so neither can be answered as "wrong password".
+fn decodeStoredField(allocator: std.mem.Allocator, data: []const u8) SecurityModule.PasswordError![]const u8 {
+    return base64Decode(allocator, data) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.MalformedStoredHash,
+    };
+}
+
 test "SecurityModule JWT generate and verify" {
     const allocator = std.testing.allocator;
     var sec = SecurityModule.init(allocator, "my-secret-key", 3600);
@@ -594,14 +626,83 @@ test "SecurityModule password hash and verify" {
     const hash = try sec.hashPassword("my_password");
     defer allocator.free(hash);
 
-    try std.testing.expect(sec.verifyPassword("my_password", hash));
-    try std.testing.expect(!sec.verifyPassword("wrong_password", hash));
+    try std.testing.expect(try sec.verifyPassword("my_password", hash));
+    try std.testing.expect(!try sec.verifyPassword("wrong_password", hash));
 }
 
 test "SecurityModule hashPassword without an io refuses instead of using a weak salt" {
     const allocator = std.testing.allocator;
     var sec = SecurityModule.init(allocator, "secret", 3600);
     try std.testing.expectError(error.EntropyUnavailable, sec.hashPassword("my_password"));
+}
+
+// ── Regression: an error on our side is never reported as "wrong password" ──
+//
+// Before this change both branches below returned `false`: an allocation
+// failure and an unusable stored record were indistinguishable from a genuine
+// mismatch, so a correct login during memory pressure was answered 401 and a
+// corrupt row looked like a bad password.
+
+test "verifyPassword reports every induced allocation failure as OutOfMemory" {
+    const allocator = std.testing.allocator;
+    var sec = SecurityModule.initWithIo(allocator, "secret", 3600, std.testing.io);
+    const hash = try sec.hashPassword("correct horse battery staple");
+    defer allocator.free(hash);
+
+    const Scan = struct {
+        fn run(alloc: std.mem.Allocator, stored: []const u8) !void {
+            var squeezed = SecurityModule.initWithIo(alloc, "secret", 3600, std.testing.io);
+            // The credential is correct, so anything but OutOfMemory is a wrong
+            // answer: `checkAllAllocationFailures` propagates it as-is.
+            try std.testing.expect(try squeezed.verifyPassword("correct horse battery staple", stored));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{hash});
+}
+
+test "verifyPassword refuses an unusable stored hash instead of answering false" {
+    const allocator = std.testing.allocator;
+    var sec = SecurityModule.initWithIo(allocator, "secret", 3600, std.testing.io);
+    const password = "correct horse battery staple";
+
+    const unusable = [_][]const u8{
+        "",
+        "plaintext-password",
+        "$pbkdf2$100000$c2FsdA==$aGFzaA==", // digest of the wrong length
+        "$pbkdf2$not-a-number$c2FsdA==$aGFzaA==",
+        "$pbkdf2$100000$not*base64$aGFzaA==",
+        "$pbkdf2$100000$c2FsdA==$not*base64",
+        "$pbkdf2$100000$c2FsdA==",
+        "$bcrypt$100000$c2FsdA==$aGFzaA==",
+        "$pbkdf2$0$c2FsdA==$aGFzaA==",
+    };
+    for (unusable) |stored| {
+        try std.testing.expectError(error.MalformedStoredHash, sec.verifyPassword(password, stored));
+    }
+}
+
+test "verifyPassword refuses a digest longer than the derived key (no prefix match)" {
+    const allocator = std.testing.allocator;
+    var sec = SecurityModule.initWithIo(allocator, "secret", 3600, std.testing.io);
+    const password = "correct horse battery staple";
+
+    var salt: [16]u8 = undefined;
+    @memset(&salt, 0x2a);
+    var derived: [PasswordEncoder.derived_key_len]u8 = undefined;
+    try crypto.pwhash.pbkdf2(&derived, password, &salt, 1000, crypto.auth.hmac.sha2.HmacSha256);
+
+    var longer: [PasswordEncoder.derived_key_len + 1]u8 = undefined;
+    @memcpy(longer[0..PasswordEncoder.derived_key_len], &derived);
+    longer[PasswordEncoder.derived_key_len] = 0xAB;
+
+    const salt_b64 = try base64Encode(allocator, &salt);
+    defer allocator.free(salt_b64);
+    const longer_b64 = try base64Encode(allocator, &longer);
+    defer allocator.free(longer_b64);
+    const stored = try std.fmt.allocPrint(allocator, "$pbkdf2$1000${s}${s}", .{ salt_b64, longer_b64 });
+    defer allocator.free(stored);
+
+    try std.testing.expectError(error.MalformedStoredHash, sec.verifyPassword(password, stored));
 }
 
 test "SecurityModule role checking" {
