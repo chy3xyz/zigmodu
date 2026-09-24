@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.33.2] - 2026-09-24
 
 ### 第 5 批：CI bench 基线重录、Lru/Pool 两处真红修复、h2 dispatch E2E、OOM 注入扫出两个真缺陷（**破坏性：否**）
 

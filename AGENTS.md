@@ -409,7 +409,7 @@ filter 是**测试全限定名的子串**（形如 `core.cluster.RaftElection.te
 > 逐个失败会否掉所有正常的聚焦运行）；判定权在脚本的汇总。旧脚本 `bash scripts/test-fast.sh <name>` 的裸参数形式仍可用。
 
 ## Version
-- Framework: **v0.33.1** (`build.zig.zon`)
+- Framework: **v0.33.2** (`build.zig.zon`)
 - Zig: **0.17.0-dev.1970+67f39b551**（CI 同款锁定版本，见 `.github/workflows/ci.yml` → `ZIG_VERSION`；避免 fmt 行为漂移。注意 ziglang 镜像会回收旧 dev 构建——dev.1567 已 404，升级时本地先验证再改 CI）
 - Tests: **以 `zig build test` 输出为准**（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`）。
   本文件不再抄写具体数字：`-Ddb` 收窄、平台（Linux/macOS）、门控用例都会改变计数，
@@ -445,7 +445,7 @@ filter 是**测试全限定名的子串**（形如 `core.cluster.RaftElection.te
 
 ## Learned Workspace Facts
 
-- Package **v0.33.1** · Zig **0.17.0** · GitHub `chy3xyz/zigmodu` · branch `master`.
+- Package **v0.33.2** · Zig **0.17.0** · GitHub `chy3xyz/zigmodu` · branch `master`.
 - Sandbox cache：`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`.
 - Auth Path A + `CatalogPermLoadInput` 已落地；legacy JWT 只写 `auth_info`。
 - x402 fail-closed；OTLP/Vault 已支持 HTTPS（系统 CA）。
