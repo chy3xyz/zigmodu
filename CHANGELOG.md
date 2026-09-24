@@ -2,6 +2,46 @@
 
 ## [Unreleased]
 
+### 第 17 批：`BufferPool.deinit` 在锁被别人持有时**照样**释放空闲表（内存不安全）、`verifyToken` 在分配失败时泄漏已拷好的字段（OOM 扫描抓出）（**破坏性：否**）
+
+全量 `-Ddb=all` **1829/1886（57 skipped，0 failed）**。
+
+**`BufferPool.deinit` 的 `tryLock` 失败路径是内存不安全的。** 旧实现抢不到锁就**直接**
+释放空闲表 —— 而持锁者要么正在 `release`（它现在会不可取消地等这把锁），要么正要进入临界区：
+于是 `free.append` 会写进已释放的存储，同一条缓冲区还可能被释放两次。这不是"少一次析构"，是 UAF。
+红证据（把修复临时还原后）：
+```
+deinit waits for a held lock instead of freeing underneath its holder...FAIL (TestUnexpectedResult)
+```
+改法：析构函数必须跑完，所以**等**（`lockUncancelable`，与 `cache/Lru.zig`、`pool/Pool.zig` 的 `deinit`
+同一规则）；这里没有错误通道，`catch return` 只会留下一个永远没人释放的池。新用例用两个线程
+（一个故意持锁、一个 `deinit`）+ 一个 `deinited` 标志钉住"不能在持锁期间完成"，判据是
+`std.testing.allocator` 的泄漏检测 + `!ran_while_locked`；绿：`BufferPool` 8/8。
+
+**`verifyToken` 在分配失败时会泄漏已经拷好的字段（OOM 扫描抓出）。** 上一批有个 agent 把这条列为
+"读代码的推测、**没有实测**"，并因为担心它而没敢做全量扫描 —— 这次做了，猜测**成立**：
+```
+verifyToken survives every allocation point failing (OOM scan)...
+fail_index: 13/15   allocated 1086 / freed 1080
+... SecurityModule.zig:254 in verifyToken    .iss = try self.allocator.dupe(u8, parsed.value.iss),
+FAIL (MemoryLeakDetected)
+```
+两处成因：① `roles` 的逐个 `dupe` 循环用的是**循环结束后**才注册的 `errdefer` —— 中途失败时一个都
+没释放（改成计数器 + 先注册）；② 返回的 struct literal 里 `.sub`/`.iss`/`.aud` 三个 `dupe` 是**从左到右**
+求值的，`.iss` 失败会把已拷好的 `.sub` 悬在那里，而调用方**根本没收到**这个 payload、无从释放
+（与之前 `Hpack` 那个 OOM 泄漏同形）—— 改为先具名拷贝、各挂一个 `errdefer`。
+绿：`SecurityModule` 19/19；该扫描现在覆盖 `verifyToken` 的**每一个**分配点，下一个 agent 不会再撞到
+同一堵墙。
+
+> **本批未做（原计划的另一半）**：把全仓约 11 处 `mutex.lock(io) catch return …` 逐个判定
+> （`im/ConnectionRegistry.zig`、`core/ModuleRuntime.zig`、`core/ClusterMembership.zig`、
+> `scheduler/Cron.zig`、`ai/cooldown_store.zig`、`resilience/LoadShedder.zig`、`web4/challenge.zig`、
+> `core/DistributedEventBus.zig`）—— 负责这一步的 agent 在写完 `BufferPool` 的用例后因网络故障中断，
+> 其余站点**未被判定**（其中 `ConnectionRegistry` 的三处在上一批的清点里被列为"低影响"）。
+> 同类待办还有：`sqlx` 的 `MySqlConn` 若干 `catch return null`（已文档化为"退回文本协议"）、
+> `metrics/AutoInstrumentation.zig`、`runtime/scheduler.zig`、`api/Server.zig`、`OutboxConsumer.zig`
+> 的若干低ranked站点。
+
 ### 第 16 批：认证路径把"我们这侧出错"答成 401（含一条静默半份身份）、API key 比较非恒定时间（实测 3560×）、MySQL 把 NULL metadata 读成"零行"、审计的一处前提被证伪（**破坏性：是**，1 处编译错）
 
 全量 `-Ddb=all` **1827/1884（57 skipped，0 failed）**；MySQL 门控真机（含全量 `DB=mysql` 跑）全绿。

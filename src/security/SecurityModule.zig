@@ -242,19 +242,29 @@ pub const SecurityModule = struct {
         // Copy to owned memory so caller doesn't depend on parsed lifetime
         var roles = try self.allocator.alloc([]const u8, parsed.value.roles.len);
         errdefer self.allocator.free(roles);
+        var copied_roles: usize = 0;
+        errdefer for (roles[0..copied_roles]) |role| self.allocator.free(role);
         for (parsed.value.roles, 0..) |role, i| {
             roles[i] = try self.allocator.dupe(u8, role);
-        }
-        errdefer {
-            for (roles) |role| {
-                self.allocator.free(role);
-            }
+            copied_roles += 1;
         }
 
+        // Same shape as the role copies above, and for the same reason: the
+        // struct literal's fields are allocated left to right, so a failure on
+        // `.iss` used to strand the `.sub` copy (and a failure on `.aud` used to
+        // strand both) — the caller never receives the payload, so nobody can
+        // free it. Hoist each copy and give it its own `errdefer`.
+        const sub = try self.allocator.dupe(u8, parsed.value.sub);
+        errdefer self.allocator.free(sub);
+        const iss = try self.allocator.dupe(u8, parsed.value.iss);
+        errdefer self.allocator.free(iss);
+        const aud = try self.allocator.dupe(u8, parsed.value.aud);
+        errdefer self.allocator.free(aud);
+
         return JwtToken.JwtPayload{
-            .sub = try self.allocator.dupe(u8, parsed.value.sub),
-            .iss = try self.allocator.dupe(u8, parsed.value.iss),
-            .aud = try self.allocator.dupe(u8, parsed.value.aud),
+            .sub = sub,
+            .iss = iss,
+            .aud = aud,
             .exp = parsed.value.exp,
             .iat = parsed.value.iat,
             .roles = roles,
@@ -826,5 +836,34 @@ test "generateTokenWithTenantAndVersion survives every allocation point failing 
     try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{
         "scan-secret-0123456789abcdef",
         &.{ "user", "admin" },
+    });
+}
+
+// Verification allocates a chain of single-owner buffers (header JSON, the
+// signing base, the expected signature, the payload JSON, the parsed payload's
+// backing store, then the caller-owned copies) and the owned copies are handed
+// back as a *value* — there is no `defer` at the call site to unwind them, so
+// every copy needs its own `errdefer`. Failing each allocation in turn pins that
+// down: a payload half-copied when the allocator gives up must release the parts
+// already copied, not leak them to the caller who never received them.
+test "verifyToken survives every allocation point failing (OOM scan)" {
+    const allocator = std.testing.allocator;
+    var sec = SecurityModule.init(allocator, "scan-secret-0123456789abcdef", 3600);
+    const token = try sec.generateTokenWithTenant("user-1", &.{ "user", "admin" }, "tenant-1");
+    defer allocator.free(token);
+
+    const Scan = struct {
+        fn run(alloc: std.mem.Allocator, secret: []const u8, raw: []const u8) !void {
+            var squeezed = SecurityModule.init(alloc, secret, 3600);
+            const payload = try squeezed.verifyToken(raw);
+            defer squeezed.freePayload(payload);
+            try std.testing.expectEqualStrings("user-1", payload.sub);
+            try std.testing.expectEqualStrings("tenant-1", payload.aud);
+            try std.testing.expectEqual(@as(usize, 2), payload.roles.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{
+        "scan-secret-0123456789abcdef",
+        token,
     });
 }

@@ -26,13 +26,16 @@ pub const BufferPool = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        if (!self.mutex.tryLock()) {
-            for (self.free.items) |buf| {
-                self.allocator.free(buf);
-            }
-            self.free.deinit(self.allocator);
-            return;
-        }
+        // A destructor has to run to completion, so it waits rather than
+        // answering a contended `tryLock` by freeing the list underneath its
+        // holder — that is memory unsafety: the holder's `free.append` would
+        // write into freed storage and a buffer could be freed twice (same rule
+        // as `cache/Lru.zig`'s and `pool/Pool.zig`'s `deinit`). There is no error
+        // channel here, and `catch return` would leave the pool alive with
+        // nothing left to free it. Red evidence for the old shape: the test
+        // `deinit waits for a held lock instead of freeing underneath its holder`
+        // fails on it.
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         for (self.free.items) |buf| {
             self.allocator.free(buf);
@@ -418,4 +421,68 @@ test "acquire reports a canceled lock wait as error.Canceled" {
     // Nothing was handed out: the canceled wait must not have taken a buffer.
     try std.testing.expectEqual(@as(usize, 0), pool.stats().free);
     try std.testing.expectEqual(@as(usize, 0), pool.stats().allocated);
+}
+
+// `deinit` used to answer a contended `tryLock` by freeing the free list anyway,
+// while the thread that held the lock was still either inside `release` (which now
+// waits on that same mutex uncancelably) or about to enter it. The teardown then
+// frees the backing array and every buffer out from under a live critical section:
+// `free.append` writes into freed storage, and `deinit`'s own loop may free a
+// buffer twice (once here, once when the holder's append lands). Memory unsafety,
+// not a missed teardown.
+//
+// A destructor has to run to completion (same rule as `cache/Lru.zig`'s `deinit`),
+// and there is no error channel: `catch return` would leave the pool alive with
+// nothing to free it later. So it waits — the critical section it is waiting on is
+// the one in `release`, one list append long.
+test "deinit waits for a held lock instead of freeing underneath its holder" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var pool = BufferPool.init(allocator, io, 4);
+    // Two buffers on the books and back in the pool, so a skipped teardown is
+    // visible: `std.testing.allocator` fails the test on the leaked allocations.
+    const a = try pool.acquire();
+    const b = try pool.acquire();
+    pool.release(a);
+    pool.release(b);
+
+    const Task = struct {
+        var held = std.atomic.Value(bool).init(false);
+        var go = std.atomic.Value(bool).init(false);
+        var deinited = std.atomic.Value(bool).init(false);
+
+        fn hold(p: *BufferPool) void {
+            p.mutex.lock(std.testing.io) catch return;
+            held.store(true, .release);
+            while (!go.load(.acquire)) std.atomic.spinLoopHint();
+            p.mutex.unlock(std.testing.io);
+        }
+
+        fn teardown(p: *BufferPool) void {
+            p.deinit();
+            deinited.store(true, .release);
+        }
+    };
+    Task.held.store(false, .monotonic);
+    Task.go.store(false, .monotonic);
+    Task.deinited.store(false, .monotonic);
+
+    var hold_fut = try io.concurrent(Task.hold, .{&pool});
+    while (!Task.held.load(.acquire)) std.atomic.spinLoopHint();
+
+    // The other thread holds the pool lock, so `deinit` cannot run yet — and it
+    // must not pretend to have run: before the fix its `tryLock` failed and it
+    // freed the list anyway, which `deinited` catches.
+    var teardown_fut = try io.concurrent(Task.teardown, .{&pool});
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+    const ran_while_locked = Task.deinited.load(.acquire);
+
+    // Let the holder out, then join both before touching the pool again.
+    Task.go.store(true, .release);
+    hold_fut.await(io);
+    teardown_fut.await(io);
+
+    try std.testing.expect(!ran_while_locked);
+    try std.testing.expect(Task.deinited.load(.acquire));
 }
