@@ -5298,3 +5298,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 🔴 **build.zig test paths**: Replaced hardcoded macOS Homebrew paths with dynamic detection via `detectPqPaths()`/`detectMysqlPaths()`. Tests now work on Linux/CI.
 
 - **`ApplicationModules.register()`**: Now invalidates cached `sorted_order` to prevent stale topological sort after module set changes.
+
+### 修一条长期潜伏的 flake：等 `seen` 却读 `total`，两个 monotonic 写之间没有 release/acquire（**破坏性：否**）
+
+Ubuntu CI 在修掉 `poll` 的 ABRT 之后露出第二条红（此前被 ABRT 提前打断、根本没跑到）：
+`runtime: a timer's delivery to a pooled worker arms its ready token` →
+**`expected 41, found 0`**。这条测试早于本轮（`d2a1cd6`），是长期潜伏的 flake：
+
+worker 里先 `seen.fetchAdd(1, .monotonic)` 再 `total.fetchAdd(msg, .monotonic)`，而测试
+**等的是 `seen`、读的是 `total`**。两个写都是 monotonic，读者在 x86 上可以合法地看到
+`seen=1` 而 `total` 尚未传播——测试就是在负载较高的 runner 上踩到这个交错。
+
+修法：把**最后写的那个计数器**作为发布点（`total.fetchAdd(msg, .release)`），测试改为
+**等 `total`**（`Published(total, 41)`）再断言 `seen == 1`。这样 acquire 到 `total` 就必然
+看到 `seen` 的增量，而测试原本要抓的"定时器投递没上 ready token"仍然抓得住（不修的话
+`total` 永远到不了 41 → `WaitTimeout`）。
+
+验证：本地该测试连跑 6 次稳定通过，`runtime.` 全组 162/162。顺带扫了同类形状——
+`src/runtime/runtime.zig` 里其余 `waitUntil(Published(…))` 都是"等同一个计数器再断言它"，
+不存在第二处。

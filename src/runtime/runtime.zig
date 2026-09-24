@@ -4729,7 +4729,14 @@ test "Runtime: a timer's delivery to a pooled worker arms its ready token" {
         pub fn handle(self: *@This(), msg: u32, ctx: anytype) anyerror!void {
             _ = ctx;
             _ = self.shared.seen.fetchAdd(1, .monotonic);
-            _ = self.shared.total.fetchAdd(msg, .monotonic);
+            // `total` carries the `release`: it is written *last*, so a reader that
+            // acquire-loads it and sees its final value is also guaranteed to see
+            // the `seen` bump. Waiting on `seen` and then reading `total` is not
+            // equivalent — both were `monotonic`, so the reader could legally
+            // observe the first increment while the second is still in flight
+            // (this test did exactly that on a loaded Linux runner: `expected 41,
+            // found 0`).
+            _ = self.shared.total.fetchAdd(msg, .release);
         }
     };
 
@@ -4750,8 +4757,8 @@ test "Runtime: a timer's delivery to a pooled worker arms its ready token" {
     clk.now_ms = 5;
     try std.testing.expectEqual(@as(usize, 1), rt.tick());
 
-    try waitUntil(Published(@TypeOf(shared.seen), u32){ .value = &shared.seen, .want = 1 }, 2_000);
-    try std.testing.expectEqual(@as(u32, 41), shared.total.load(.acquire));
+    try waitUntil(Published(@TypeOf(shared.total), u32){ .value = &shared.total, .want = 41 }, 2_000);
+    try std.testing.expectEqual(@as(u32, 1), shared.seen.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), rt.stats().timer_deliveries_dropped);
 }
 
