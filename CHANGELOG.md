@@ -30,6 +30,18 @@
 且 40+ 处 `try registry.register(...)` 依赖"注册即设置"，改成报错会把"模块更新自己的工具"变成启动失败。
 `initCapacity` 的注释也改成"提示不是上限"。
 
+> **修补（第 21 批的 CI 红就是这一处）**：参数表从 `StringHashMap` 换成借用的定长 `RouteParams` 后，
+> **例子 `examples/ai-ops` 还在用旧迭代器形状**（`p.key_ptr.*` / `p.value_ptr.*`）—— 新的
+> `Iterator.next()` 按**值**返回 `Entry{ key: []const u8, value: []const u8 }`，改为 `p.key` / `p.value`
+> 即可。CI 那三个红 job（两个平台 + Build Examples）是**同一个根因**。
+> **我的验证漏了它**：本地跑的是框架套件 + 一个示例（`mcp-server`），而 CI 的 "Build framework examples"
+> 是一份**清单**（15 个示例 + `zmsaas/backend`）—— 没跑到的示例就是"没人编译的示例"。已在修补时把**整份
+> 清单**逐条构建过（16/16 OK）；这类漏检以后按清单跑，不再挑一个。
+> 另记：CI 日志里那两处 `failed command: …/test` **不是**失败 —— 那是模块图渲染测试
+> （`[renderErrors] module graph is not startable …`）**预期的**内层失败，外层 `zig build test` 退出 0
+> （本机用 CI 的同一条命令 `zig build test --test-timeout 300s` 复核，EXIT=0）。job 日志看不到原因，是因为
+> `scripts/ci-run-logged.sh` 把输出整个重定向进 artifact。
+
 **`Router.match` 的分配失败会伪装成"没有这条路由"（404），或者更糟 —— 匹配成功却少了路径参数。**
 `dupe … catch return null` 让一个**存在的路由**在 OOM 时返回 404；精确匹配分支的
 `catch { log; continue }` 让 `null` 之外的另一种失败变成了**参数缺失的成功匹配**（handler 读租户/用户
