@@ -3021,6 +3021,54 @@ test "h2 session answers too many header fields with one RST" {
     try std.testing.expectEqualStrings("not found", data.payload);
 }
 
+test "the h2 loop's own 404 answers HEAD with a field section and no body" {
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    // No `site_handler`: this is the 404 the *loop* builds, the one response no
+    // handler and no adapter is involved in. `appendPseudoHeaders` (the shape the
+    // tests above send) is `GET`, so the `HEAD` block is built explicitly.
+    {
+        // The `GET` answer first: the 404 entity the `HEAD` response has to
+        // describe, and proof that this session reaches the loop's own 404 at
+        // all.
+        var block = std.ArrayList(u8).empty;
+        defer block.deinit(allocator);
+        try appendPseudoHeaders(&block, allocator, "/nope");
+        const head = try Http2.encodeHeaders(allocator, 1, block.items, true, true);
+        defer allocator.free(head);
+
+        var out: [4096]u8 = undefined;
+        const n = try runLoopbackH2Session(.{}, head, &out);
+        const reply = out[0..n];
+        const data = findFrameInReply(reply, .data, 1) orelse return error.TestUnexpectedResultWithMessage;
+        try std.testing.expectEqualStrings("not found", data.payload);
+    }
+    {
+        const block = try hpackRequestBlock(allocator, "HEAD", "/nope", &.{});
+        defer allocator.free(block);
+        const head = try Http2.encodeHeaders(allocator, 1, block, true, true);
+        defer allocator.free(head);
+
+        var out: [4096]u8 = undefined;
+        const n = try runLoopbackH2Session(.{}, head, &out);
+        const reply = out[0..n];
+
+        // No DATA frame at all, and the HEADERS frame closes the stream
+        // (RFC 9110 §9.3.2, RFC 9113 §8.2): the client never sees the `not
+        // found` octets it has no reason to skip.
+        try std.testing.expect(findFrameInReply(reply, .data, 1) == null);
+        const hframe = findFrameInReply(reply, .headers, 1) orelse return error.TestUnexpectedResultWithMessage;
+        try std.testing.expect((hframe.header.flags & Http2.FrameFlags.end_stream) != 0);
+
+        var dec = Hpack.Decoder.init(allocator);
+        defer dec.deinit();
+        const hdrs = try dec.decode(hframe.payload);
+        defer Hpack.freeHeaders(allocator, hdrs);
+        try std.testing.expectEqualStrings("404", firstHeaderValue(hdrs, ":status") orelse return error.TestUnexpectedResultWithMessage);
+    }
+}
+
 test "h2 session arms the read idle deadline and clears it on exit" {
     if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
 

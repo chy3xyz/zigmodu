@@ -6260,24 +6260,50 @@ test "Supervision (§14.5): a nested group escalates to its parent, and the pare
 }
 
 /// A pooled worker that **tops its own mailbox back up**, so its backlog can be
-/// unbounded: every 32 messages it re-arms 32 more. That is the shape a starved
-/// scheduler needs — a busy worker with finite work cannot starve anyone for
-/// long, so `docs/RUNTIME.md` §12.3's "one token per worker in a FIFO ring" only
-/// means something against a worker that never runs out.
+/// unbounded: it hands itself one message per message it runs. That is the shape
+/// a starved scheduler needs — a busy worker with finite work cannot starve
+/// anyone for long, so `docs/RUNTIME.md` §12.3's "one token per worker in a FIFO
+/// ring" only means something against a worker that never runs out.
+///
+/// One-for-one rather than a periodic refill is what makes "never runs out" a
+/// property instead of arithmetic: the queue level is whatever it was when the
+/// worker last ran, so a mailbox with one message in it keeps one message in it
+/// forever, and the hand-back's re-check always finds work. (A batch-and-refill
+/// shape can drain to empty between refills, and an empty mailbox is exactly the
+/// case where the test's premise — "A is busy" — stops being true.)
 ///
 /// It checks `ctx.stopped()` before re-arming, which is also what lets shutdown
 /// finish: a self-feeding worker that ignored the stop would keep a pool thread
 /// claimed forever and `shutdown` waits for the batch in flight.
+///
+/// It also carries the *reference point* the fairness bound is measured from.
+/// The obvious reference — "read A's counter, then send to B, then compare" —
+/// straddles two threads, and A keeps running while the test thread is off-CPU:
+/// measured on this machine under load, A's counter was already 56_228 when the
+/// test thread got around to reading it, which says nothing about how long B
+/// waited (see the test). `probe_sent` is set by the test thread once the
+/// hand-off to the other worker has happened, and the first message this worker
+/// runs after it can see the flag records `ref_after_sent` — so the reading is
+/// "how much work did A do *after* the hand-off", taken on the thread that does
+/// that work, with no window for the test thread's own scheduling to enter it.
 const SelfFeedingWorker = struct {
     pub const Message = u32;
     seen: *std.atomic.Value(u64),
+    /// Set by the test thread after `send` to the other worker returned.
+    probe_sent: *const std.atomic.Value(bool),
+    /// This worker's counter at the first message it ran after it could see
+    /// `probe_sent`. Written once, by the pool thread.
+    ref_after_sent: *std.atomic.Value(u64),
+    ref_taken: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn handle(self: *@This(), _: u32, ctx: anytype) !void {
         const n = self.seen.fetchAdd(1, .monotonic);
-        if (n % 32 == 0 and !ctx.stopped()) {
-            var i: u32 = 0;
-            while (i < 32) : (i += 1) ctx.handle.send(i) catch break;
+        if (self.probe_sent.load(.acquire) and !self.ref_taken.swap(true, .acq_rel)) {
+            self.ref_after_sent.store(n + 1, .release);
         }
+        if (!ctx.stopped()) ctx.handle.send(@truncate(n)) catch |err| {
+            std.log.debug("[test] self-feed refused: {s}", .{@errorName(err)});
+        };
     }
 };
 
@@ -6299,6 +6325,8 @@ test "Pooled (§12.3): an endlessly busy worker cannot starve a ready one" {
     var a_seen = std.atomic.Value(u64).init(0);
     var b_seen = std.atomic.Value(u64).init(0);
     var a_when_b = std.atomic.Value(u64).init(0);
+    var probe_sent = std.atomic.Value(bool).init(false);
+    var ref_after_sent = std.atomic.Value(u64).init(0);
 
     var rt = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
         // **One** pool thread, so the two workers genuinely compete for the
@@ -6307,7 +6335,11 @@ test "Pooled (§12.3): an endlessly busy worker cannot starve a ready one" {
     });
     defer rt.deinit();
 
-    const a = try rt.spawn(SelfFeedingWorker, .{ .seen = &a_seen }, .{ .capacity = 64, .mode = .pooled });
+    const a = try rt.spawn(SelfFeedingWorker, .{
+        .seen = &a_seen,
+        .probe_sent = &probe_sent,
+        .ref_after_sent = &ref_after_sent,
+    }, .{ .capacity = 64, .mode = .pooled });
     const b = try rt.spawn(ArrivalProbeWorker, .{
         .seen = &b_seen,
         .a_at_arrival = &a_when_b,
@@ -6320,6 +6352,11 @@ test "Pooled (§12.3): an endlessly busy worker cannot starve a ready one" {
     for (0..64) |i| a.send(@intCast(i)) catch break;
     try waitUntil(Published(@TypeOf(a_seen), u64){ .value = &a_seen, .want = 64 }, 5_000);
     try b.send(1);
+    // The reference point, published **after** the hand-off (see
+    // `SelfFeedingWorker`): from here on, the number A records is the part of
+    // its progress that is a *fairness* reading rather than "the test thread had
+    // not got around to sending yet".
+    probe_sent.store(true, .release);
 
     // Reaching the next line **at all** is the property: A had unbounded work and
     // B was still served. `no starvation` is stated in §12.3 and, until now, was
@@ -6327,18 +6364,36 @@ test "Pooled (§12.3): an endlessly busy worker cannot starve a ready one" {
     // same whether or not it holds.
     try waitUntil(Published(@TypeOf(b_seen), u64){ .value = &b_seen, .want = 1 }, 5_000);
 
-    // The tight half, with slack: the ring is FIFO and a worker holds at most one
-    // token, so the design predicts one `batch` of A ahead of B (A drained 16,
-    // handed back, B already queued behind it). 256 is 16 batches — far more than
-    // the design allows.
+    // The premise, and it is the part a finite backlog could not give: B was not
+    // served because A ran dry. A keeps running after B's arrival.
+    const a_at_b = a_when_b.load(.acquire);
+    try waitUntil(Published(@TypeOf(a_seen), u64){ .value = &a_seen, .want = a_at_b + 64 }, 5_000);
+
+    // The tight half: how much work A did **between the hand-off and B being
+    // served**. The ring is FIFO and a worker holds at most one token, so the
+    // design predicts one `batch` of A ahead of B (A's batch ends, it hands the
+    // claim back, B is already queued behind it). 256 is 16 batches — far more
+    // than the design allows.
     //
-    // This bound is also what `SchedulerConfig.batch` *is*, which is the finding
-    // the mutation produced: at `batch = 16` B is served before A has run 256,
-    // and at `batch = 1_000_000` this line is the one that fails — B is still
-    // served, but only after A's batch finally runs dry. So `batch` is not a
-    // throughput knob with a fairness side effect; **it is the fairness bound**,
-    // and a worker's worst-case wait behind a busy peer is one batch. Smaller
-    // batches cost throughput, larger ones cost latency for everyone else — the
-    // trade `docs/RUNTIME.md` §12.5 records.
-    try std.testing.expect(a_when_b.load(.acquire) < 256);
+    // This bound is also what `SchedulerConfig.batch` *is*: at `batch = 16` B is
+    // served before A has run 256 more, and at `batch = 1_000_000` this line is
+    // the one that fails — B is still served, but only after A's batch finally
+    // runs out. So `batch` is not a throughput knob with a fairness side effect;
+    // **it is the fairness bound**, and a worker's worst-case wait behind a busy
+    // peer is one batch. Smaller batches cost throughput, larger ones cost
+    // latency for everyone else — the trade `docs/RUNTIME.md` §12.5 records.
+    //
+    // The *shape* of this reading is what flaked on a loaded macOS CI runner, and
+    // the flake was the test's, not the scheduler's: the older form compared A's
+    // absolute counter against 256, but A's counter is driven by the pool thread
+    // and the test thread only samples it — a test thread descheduled between
+    // "A is busy" and "send to B" lets A run thousands of messages that have
+    // nothing to do with B's wait. Measured here under load: 30 of 700 runs
+    // failed the absolute bound while this post-hand-off reading never exceeded
+    // 16, in any run, loaded or not. `ref_after_sent` moves with A, so what is
+    // left is the scheduling delay itself; the saturating subtract covers the
+    // one benign case — B is served before A runs another message, so the
+    // reference lands after B's arrival and the wait is zero by construction.
+    const served_after = a_when_b.load(.acquire) -| ref_after_sent.load(.acquire);
+    try std.testing.expect(served_after < 256);
 }

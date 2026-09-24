@@ -2,6 +2,65 @@
 
 ## [Unreleased]
 
+### 第 11 批：CI 那条 macos 红是同一条测试测错了量；HEAD 收尾（流式与错误响应）；sqlx 的 OOM 误标清扫并带出一个真 bug（**破坏性：否**）
+
+全量 `-Ddb=all` **1775/1814（39 skipped，0 failed）**；MySQL 门控真机 19 passed / 2 skipped，PG 门控真机
+12 passed / 4 skipped（`allocation failure` 组）。
+
+**CI 的 macos 红：公平性用例测的是"A 的绝对计数"，而它由池线程推进、测试线程只是采样。**
+`Pooled (§12.3): an endlessly busy worker cannot starve a ready one` 断言 `a_when_b < 256`，其中
+`a_when_b` 是 B 首次处理时读到的 A 的计数。但 A 是**自喂**且无界的（每次处理都给自己再发一条），计数由
+**池线程**推进；测试线程只是在自旋里采样，它一旦被调度走，它看到的（以及被比较的）就已经是"这几万条"
+之后的值 —— 于是这条断言测的是 **A 的绝对进度**，不是 **B 在 A 后面等了多久**。实测（本机 10 核、load
+avg 15.5）：带 6 个忙循环 700 次 → **30 次失败**；空载 400 次 → **2 次失败**；而把两端都放在池线程上读的
+增量 `a_when_b − a_after_send` 在**每一次**运行里都 ≤ **16（= 一个 batch）**，最大 16，p99 = 15 ——
+**调度器的公平性界一次都没破**。失败值的拆解也印证：Σ(when−64) 里 97% 发生在 B 被发送**之前**，真正
+"B 的等待"只占 2.6%。
+修法（只改测试，`scheduler.zig` 一行未动）：A 的自喂改成 **1:1**（邮箱水位恒定、永远抽不干，"A 一直
+忙"这个前提才成立），测试线程在 `b.send(1)` 之后置 `probe_sent`，A 在此之后跑的第一条消息记下
+`ref_after_sent`，断言改为 `a_when_b −| ref_after_sent < 256`（饱和减覆盖"B 先被服务"的情形），并加了
+一条**前提检查**：B 被服务之后 A 仍在继续跑（否则"B 没被饿死"可能只是因为 A 已经跑干）。
+**两次变异证明新用例有牙**：`default_batch: 16 → 1_000_000` → `served_after=999932` 红；让忙 worker
+插队 64 个 batch（等于取消公平性）→ `served_after=972` 红（两次都已还原）。修后 **1200 次带载 + 600 次
+空载 0 失败**。
+> 这条与第 8 批那条（等待谓词极性反了）是同一类病：**用例在测一个它其实控制不住的量**。两条都是只在
+> 加载的 CI runner 上暴露，本地全绿。
+
+**HEAD 收尾（上一批记录的三处空缺）。** ① **H1 流式路径不再给 HEAD 写 chunk**：`writeChunk` /
+`endStream` 在 `method == .HEAD` 时直接返回（`startChunked` 的文档写明理由），字段段仍照发，所以 HEAD 的
+应答与 GET 的字段段逐字节相同（`Transfer-Encoding: chunked` + `Content-Type`）而后面什么都不跟 ——
+流的长度在最后一个 chunk 之前不可知，所以**不**编造 `Content-Length`，保留 GET 会带的
+`Transfer-Encoding`（RFC 9112 §6.3：对 HEAD 的响应在第一个空行就结束，与定界字段无关）。红证据：
+`expected: "" / found: 5`（body 是 `5\r\nalpha\r\n4\r\nbeta\r\n0\r\n\r\n`）。② **`writeErrorResponse`
+服从 HEAD**：新增 `head_request` 参数与 `requestLineIsHead`（按请求行取方法 token，大小写敏感，
+`HEADER`/`head` 不算），八个调用点分别传"能确定的方法"或 `false`（首行没到达 / accept 线程的 503 甩
+负载根本没读过请求字节）；红证据：`expected: "" / found: {"error":"Bad Request"}`。③ H2 自带 404 的
+`no_body` **本来就是对的**，这次只是补了用例（红跑里它就已经是 OK）。
+> **仍缺**：accept 线程的 503 甩负载（方法在那一刻真的不可知，读一点就会毁掉这条路径存在的意义，**有意
+> 保留**）；**SSE** —— `SseWriter` 直接把事件写进 `ctx.stream`，所以 HEAD 打到 SSE 路由仍会拿到事件字节
+> （与 ① 同类，需要在 `Sse.zig` 里做同样的处理，不在本批范围）；**H2 + gRPC** —— `buildStreamResponseWire`
+> 在 `no_body` 判定之前就返回 gRPC 的帧，所以 `HEAD` + `content-type: application/grpc` 仍会有 DATA
+> （需要一个决定而不是一个 `and !no_body`，否则会静默变成 404）。
+
+**sqlx 的 OOM 误标清扫（上一批只改了 MySQL 缓冲路径，这批扫其余）。** 把"分配失败被包成
+`error.DatabaseError`"的站点逐处看过，改这些：sqlite 语句缓存键、sqlite 行扫描（`queryFn` 与
+`SQLiteStmt.queryFn`）、sqlite `prepareFn` 的 stub 分配、**PG 缓冲行路径**（`PostgresConn.queryFn` 与
+`PostgresStmt.queryFn`）、MySQL 的 `formatQuery` 三个调用点、`scanStruct` 的两处字符串复制、
+`valueToType` 的 `[]const u8` 复制。PG 的 `PostgresStmt.prepare` **不能**直接 `try`：它推断出的错误集
+含 `error.NoSpaceLeft`（来自它自己的 32 字节名字缓冲），按 err 分派保持对外错误集不变。每个改动点都有
+一次性失败分配器的用例，红证据统一是 `expected error.OutOfMemory, found error.DatabaseError`
+（在 `/tmp` 的临时副本里还原出红、已复原）；PG 与 MySQL 的用例分别在**真机**上跑过。
+**顺带查出一个真 bug（不是这个缺陷类）**：`PostgresStmt.name` 声明成 `[]const u8`，但它由 `allocZ`
+分配，`closeFn` 的 `free(self.name)` 因此交给分配器一个**长度少 1** 的切片 —— 在
+`std.testing.allocator` 下直接 `panic: free of [...] mismatches allocation of [...]`（长度 14 vs 15）。
+改成 `[:0]const u8`。
+> **仍未清扫**（各自需要自己的用例，本批预算不够，**没有**做未经验证的批量替换）：PG 流式
+> `queryCursorFn` 的分配点、PG `copyFrom`、MySQL `mysqlStmtReadRows` 一族、MySQL `MySqlStmt`、
+> `mysqlBindParams` 的 catch。PG `execPrepared`/`execParamsDirect` 的契约是 `?*PGresult`（null 表示
+> 失败），要正确标注 OOM 得改签名、牵动 `queryFn`/`execFn`/游标/`copyFrom`。
+> 另：`validateIdentifier` 与 JSON `parseFromSlice` 的 catch 是**校验/解析失败**、`valueToType` 的
+> `parseInt`/`parseFloat` 是**真值转换失败**，都不是分配失败，**有意不动**。
+
 ### 第 10 批：H1 会写出重复的 `Content-Length`（真红）、h2c 升级放开方法限制、HEAD 不再带 body、MySQL 缓冲路径把 OOM 误报成 `DatabaseError`、游标断线现在会上报 breaker（**破坏性：否**）
 
 全量 `-Ddb=all` **1763/1795（32 skipped，0 failed）**；MySQL 门控真机 16 passed / 2 skipped / 0 failed，

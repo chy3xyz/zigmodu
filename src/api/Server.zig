@@ -843,6 +843,10 @@ pub const Context = struct {
     /// Call writeChunk() for each chunk, then endStream() when done.
     /// If a direct stream is available, data goes straight to the socket
     /// without buffering in response_body.
+    ///
+    /// Under `HEAD` the field section still goes out — those are the `GET`
+    /// response's own headers — while `writeChunk` / `endStream` put nothing
+    /// after it, so the message ends where a response to `HEAD` ends.
     pub fn startChunked(self: *Context, status: u16, content_type: []const u8) !void {
         self.status_code = status;
         try self.setHeader("Transfer-Encoding", "chunked");
@@ -874,7 +878,14 @@ pub const Context = struct {
 
     /// Write a chunk in chunked transfer encoding.
     /// Writes directly to socket when streaming, falls back to response_body buffer.
+    ///
+    /// Nothing at all under `HEAD`: the response is its field section and no
+    /// more (RFC 9110 §9.3.2), and a chunk header is body framing. The length of
+    /// a stream is not known before the last chunk, so the field section cannot
+    /// carry a `Content-Length` — it carries the `Transfer-Encoding: chunked`
+    /// that `startChunked` set, which is the framing a `GET` would have used.
     pub fn writeChunk(self: *Context, data: []const u8) !void {
+        if (self.method == .HEAD) return;
         if (self.stream != null and self.io != null) {
             var write_buf: [4096]u8 = undefined;
             var w = self.stream.?.writer(self.io.?, &write_buf);
@@ -895,7 +906,13 @@ pub const Context = struct {
 
     /// End chunked transfer encoding.
     /// Writes directly to socket when streaming, falls back to response_body buffer.
+    ///
+    /// Under `HEAD` there is no transfer coding to end: the zero-length chunk is
+    /// part of the body a `GET` would have sent, so it stays off the wire with the
+    /// rest of it (RFC 9112 §6.3: a response to `HEAD` ends at the first empty
+    /// line after the field section, whatever the framing fields say).
     pub fn endStream(self: *Context) !void {
+        if (self.method == .HEAD) return;
         if (self.stream != null and self.io != null) {
             var write_buf: [4096]u8 = undefined;
             var w = self.stream.?.writer(self.io.?, &write_buf);
@@ -3028,13 +3045,15 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
 
         // Prefetch first line — HTTP/2 prior-knowledge preface starts with PRI.
         const first_line_raw = reader.readUntilDelimiterOrEof('\n') catch |err| {
+            // No complete request line: there is nothing to read a method out of,
+            // so these two answers are the `GET` shape (see `writeErrorResponse`).
             switch (err) {
                 error.ReadFailed => {
-                    if (reader.timed_out) writeErrorResponse(server.io, stream, arena_alloc, 408, "Request Timeout");
+                    if (reader.timed_out) writeErrorResponse(server.io, stream, arena_alloc, 408, "Request Timeout", false);
                     return;
                 },
                 else => {
-                    writeErrorResponse(server.io, stream, arena_alloc, 400, "Bad Request");
+                    writeErrorResponse(server.io, stream, arena_alloc, 400, "Bad Request", false);
                     return;
                 },
             }
@@ -3073,7 +3092,7 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                 error.ReadFailed => {
                     // A spent read deadline is the client that stalled (headers
                     // or body): 408, observable, instead of a vanished socket.
-                    if (reader.timed_out) writeErrorResponse(server.io, stream, arena_alloc, 408, "Request Timeout");
+                    if (reader.timed_out) writeErrorResponse(server.io, stream, arena_alloc, 408, "Request Timeout", requestLineIsHead(first_line_raw));
                     return;
                 },
                 else => {},
@@ -3104,7 +3123,7 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                 501
             else
                 400;
-            writeErrorResponse(server.io, stream, arena_alloc, status, msg);
+            writeErrorResponse(server.io, stream, arena_alloc, status, msg, requestLineIsHead(first_line_raw));
             return;
         };
         defer request.deinit(arena_alloc);
@@ -3184,7 +3203,7 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                 var hdr_it = ctx.headers.iterator();
                 while (hdr_it.next()) |e| {
                     upgrade_headers.append(arena_alloc, .{ .name = e.key_ptr.*, .value = e.value_ptr.* }) catch {
-                        writeErrorResponse(server.io, stream, arena_alloc, 500, "Internal Server Error");
+                        writeErrorResponse(server.io, stream, arena_alloc, 500, "Internal Server Error", request.method == .HEAD);
                         return;
                     };
                 }
@@ -3235,8 +3254,10 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                         // `writeErrorResponse`, not `ctx.sendError`: this block
                         // returns out of `connFiber` rather than falling through
                         // to the normal response write, so a queued response
-                        // would never reach the socket.
-                        writeErrorResponse(server.io, stream, allocator, 400, "WebSocket handshake failed");
+                        // would never reach the socket. The method is the real
+                        // one — `GET` is the only method that gets this far, and
+                        // passing it keeps the answer honest if that ever widens.
+                        writeErrorResponse(server.io, stream, allocator, 400, "WebSocket handshake failed", request.method == .HEAD);
                         return;
                     }
 
@@ -3246,7 +3267,7 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                     // Perform handshake
                     var framer = WsFramer.init(stream, server.io);
                     framer.handshake(ws_key) catch {
-                        writeErrorResponse(server.io, stream, allocator, 400, "WebSocket handshake failed");
+                        writeErrorResponse(server.io, stream, allocator, 400, "WebSocket handshake failed", request.method == .HEAD);
                         return;
                     };
                     ctx.upgraded = true;
@@ -3369,7 +3390,7 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                 // err-level logs as failures).
                 if (err == error.InvalidHeader or err == error.HeaderTooLarge) {
                     std.log.warn("[HC] response header refused: {any}", .{err});
-                    writeErrorResponse(server.io, stream, arena_alloc, 500, "Internal Server Error");
+                    writeErrorResponse(server.io, stream, arena_alloc, 500, "Internal Server Error", ctx.method == .HEAD);
                 } else {
                     std.log.err("[HC] write error: {any}", .{err});
                 }
@@ -3414,7 +3435,22 @@ fn writeRaw(stream: std.Io.net.Stream, bytes: []const u8) void {
 /// Error response for requests that failed *before* routing (bad request line,
 /// oversized body, header flood). This runs outside the middleware chain, so a
 /// middleware cannot restyle it — `transport_error_renderer` is the hook.
-fn writeErrorResponse(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, status: u16, message: []const u8) void {
+///
+/// `head_request`: a response to `HEAD` is its field section — `Content-Length`
+/// for the entity the answer would have carried, included — and no octets
+/// (RFC 9110 §9.3.2). These failures are answered before there is a `Context`,
+/// so the caller decides: a request line in hand says `HEAD` (`requestLineIsHead`),
+/// and a caller with no request line at all passes `false` — the method is
+/// genuinely unknown there, and the body is the only answer that is right for
+/// every request that is not `HEAD`.
+fn writeErrorResponse(
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    allocator: std.mem.Allocator,
+    status: u16,
+    message: []const u8,
+    head_request: bool,
+) void {
     var body_buf: [1024]u8 = undefined;
     const rendered = renderTransportError(status, message, &body_buf);
 
@@ -3439,7 +3475,19 @@ fn writeErrorResponse(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.
         return;
     };
 
-    writeResponse(io, stream, status, headers, rendered.body, true) catch |err| std.log.err("[Server] writeErrorResponse failed: {}", .{err});
+    writeResponse(io, stream, status, headers, rendered.body, !head_request) catch |err| std.log.err("[Server] writeErrorResponse failed: {}", .{err});
+}
+
+/// Whether a request line read from the wire begins with the `HEAD` method
+/// token. The pre-routing failures `writeErrorResponse` answers have no parsed
+/// request, and this is the only thing their answer needs from one: a method
+/// token is case-sensitive (RFC 9110 §9.1) and is separated from the target by
+/// one space, so a leading `HEAD ` is the method while `HEADER` and `head` are
+/// not.
+fn requestLineIsHead(raw: []const u8) bool {
+    const line = RequestParser.trimCrlf(raw);
+    if (!std.mem.startsWith(u8, line, "HEAD")) return false;
+    return line.len == 4 or line[4] == ' ';
 }
 
 // ==== §8  Middleware runner & struct binding ====
@@ -7683,4 +7731,169 @@ test "a response to HEAD carries the entity length and no body bytes" {
     try std.testing.expectEqual(@as(usize, 1), values.len);
     try std.testing.expectEqualStrings("11", values[0]);
     try std.testing.expectEqualStrings("", h1Body(response));
+}
+
+/// Two chunks and the terminator, through the streaming API — the one response
+/// shape whose bytes are not assembled by `writeResponse`.
+fn streamAlphaBeta(ctx: *Context) anyerror!void {
+    try ctx.startChunked(200, "text/plain");
+    try ctx.writeChunk("alpha");
+    try ctx.writeChunk("beta");
+    try ctx.endStream();
+}
+
+test "a HEAD request to a streaming route puts no chunk bytes on the wire" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h1-head-stream" });
+    defer server.deinit();
+
+    var group = server.group("");
+    // Both methods take the same handler, so the method is the only variable
+    // between the two exchanges below.
+    try group.get("s", streamAlphaBeta, null);
+    try group.head("s", streamAlphaBeta, null);
+
+    var running = try H2TestServer.start(&server);
+    defer running.stop(&server);
+
+    var out: [4096]u8 = undefined;
+    {
+        // The `GET` first: it proves the route really streams (`Transfer-Encoding:
+        // chunked` and the chunk framing on the wire), so the `HEAD` assertion
+        // below is about the method and not about a route that never streamed.
+        const response = try h1RawExchange(running.port, "GET /s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+        try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200"));
+        const te = try h1HeaderValues(allocator, response, "transfer-encoding");
+        defer allocator.free(te);
+        try std.testing.expectEqual(@as(usize, 1), te.len);
+        try std.testing.expectEqualStrings("chunked", te[0]);
+        try std.testing.expectEqualStrings("5\r\nalpha\r\n4\r\nbeta\r\n0\r\n\r\n", h1Body(response));
+    }
+    {
+        // RFC 9110 §9.3.2: a response to `HEAD` ends at the field section. The
+        // field section is the `GET` one — `Transfer-Encoding: chunked`, which is
+        // the only framing field a stream of unknown length can carry — and not
+        // one octet follows it, not even the zero-length chunk that would end
+        // the body a `GET` sends.
+        const response = try h1RawExchange(running.port, "HEAD /s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+        try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200"));
+        const te = try h1HeaderValues(allocator, response, "transfer-encoding");
+        defer allocator.free(te);
+        try std.testing.expectEqual(@as(usize, 1), te.len);
+        try std.testing.expectEqualStrings("chunked", te[0]);
+        try std.testing.expectEqualStrings("", h1Body(response));
+    }
+}
+
+test "a HEAD request refused before routing carries no error body" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h1-head-preflight" });
+    defer server.deinit();
+
+    var group = server.group("");
+    try group.get("never", struct {
+        fn h(ctx: *Context) anyerror!void {
+            try ctx.text(200, "must not be reached");
+        }
+    }.h, null);
+
+    var running = try H2TestServer.start(&server);
+    defer running.stop(&server);
+
+    // A `Transfer-Encoding` request is refused by the parser with 400 before any
+    // route is matched, so the answer comes from `writeErrorResponse` — the
+    // factory for every request that never reached the success path.
+    const bad = "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+
+    var get_out: [4096]u8 = undefined;
+    const get_bad = try std.fmt.allocPrint(allocator, "GET /never HTTP/1.1\r\nHost: x\r\n{s}", .{bad});
+    defer allocator.free(get_bad);
+    const get_response = try h1RawExchange(running.port, get_bad, &get_out);
+    try std.testing.expect(std.mem.startsWith(u8, get_response, "HTTP/1.1 400"));
+    const entity = h1Body(get_response);
+    try std.testing.expect(entity.len > 0);
+    // The entity length a `HEAD` response has to describe, without being told
+    // which number it is here: whatever the `GET` answer carried.
+    const expected_length = try std.fmt.allocPrint(allocator, "{d}", .{entity.len});
+    defer allocator.free(expected_length);
+
+    var out: [4096]u8 = undefined;
+    const head_bad = try std.fmt.allocPrint(allocator, "HEAD /never HTTP/1.1\r\nHost: x\r\n{s}", .{bad});
+    defer allocator.free(head_bad);
+    const response = try h1RawExchange(running.port, head_bad, &out);
+    try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 400"));
+
+    // RFC 9110 §9.3.2 again, on the error factory: the field section, the length
+    // the body *would* have had, and no octets.
+    const values = try h1HeaderValues(allocator, response, "content-length");
+    defer allocator.free(values);
+    try std.testing.expectEqual(@as(usize, 1), values.len);
+    try std.testing.expectEqualStrings(expected_length, values[0]);
+    try std.testing.expectEqualStrings("", h1Body(response));
+}
+
+test "a HEAD request whose response field the server refuses carries no error body" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h1-head-refused" });
+    defer server.deinit();
+
+    var group = server.group("");
+    // A field name that is not `1*tchar` (RFC 9110 §5.6.2) — the bug
+    // `writeResponse` refuses the whole response for, before a byte of it is
+    // written. `setHeader` validates, so the map is filled the way the comment
+    // in `writeResponse` says it can be: directly.
+    const bad_field = struct {
+        fn h(ctx: *Context) anyerror!void {
+            try ctx.response_headers.put(try ctx.allocator.dupe(u8, "X Bad Name"), try ctx.allocator.dupe(u8, "1"));
+            ctx.status_code = 200;
+            ctx.responded = true;
+        }
+    }.h;
+    try group.get("badfield", bad_field, null);
+    try group.head("badfield", bad_field, null);
+
+    var running = try H2TestServer.start(&server);
+    defer running.stop(&server);
+
+    var get_out: [4096]u8 = undefined;
+    const get_response = try h1RawExchange(running.port, "GET /badfield HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &get_out);
+    try std.testing.expect(std.mem.startsWith(u8, get_response, "HTTP/1.1 500"));
+    const entity = h1Body(get_response);
+    try std.testing.expect(entity.len > 0);
+    const expected_length = try std.fmt.allocPrint(allocator, "{d}", .{entity.len});
+    defer allocator.free(expected_length);
+
+    var out: [4096]u8 = undefined;
+    const response = try h1RawExchange(running.port, "HEAD /badfield HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 500"));
+
+    // The 500 the handler's own response was refused for is still a response to
+    // a `HEAD` request: same field section, no octets (RFC 9110 §9.3.2).
+    const values = try h1HeaderValues(allocator, response, "content-length");
+    defer allocator.free(values);
+    try std.testing.expectEqual(@as(usize, 1), values.len);
+    try std.testing.expectEqualStrings(expected_length, values[0]);
+    try std.testing.expectEqualStrings("", h1Body(response));
+}
+
+test "requestLineIsHead reads the method token, not a prefix of it" {
+    // The first line of a request, terminator included, as `connFiber` has it.
+    try std.testing.expect(requestLineIsHead("HEAD /x HTTP/1.1\r\n"));
+    try std.testing.expect(requestLineIsHead("HEAD /x HTTP/1.1\n"));
+    try std.testing.expect(requestLineIsHead("HEAD"));
+
+    // `HEADER` is a method token of its own (`M-SEARCH`-style), and a method
+    // token is case-sensitive (RFC 9110 §9.1) — neither is a `HEAD` request, so
+    // their answer keeps the body the other requests get.
+    try std.testing.expect(!requestLineIsHead("HEADER /x HTTP/1.1\r\n"));
+    try std.testing.expect(!requestLineIsHead("head /x HTTP/1.1\r\n"));
+    try std.testing.expect(!requestLineIsHead("GET /x HTTP/1.1\r\n"));
+    try std.testing.expect(!requestLineIsHead(""));
+    try std.testing.expect(!requestLineIsHead("HEA"));
 }

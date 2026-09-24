@@ -1118,6 +1118,11 @@ fn scanStruct(allocator: std.mem.Allocator, comptime T: type, row: Row, partial:
         const ci: ?usize = if (indices) |idx| idx[fi] else null;
 
         if (is_string) {
+            // The copies below are this process's memory: a failed `dupe` is
+            // `error.OutOfMemory` — the name `Error.zig` documents for "dupe
+            // failures while scanning rows" — while a missing column stays
+            // `error.NotFound` and the driver's own failures stay
+            // `error.DatabaseError`.
             // String fields: use index if available, otherwise linear scan.
             if (ci) |c| {
                 const raw_val = row.values[c];
@@ -1134,7 +1139,7 @@ fn scanStruct(allocator: std.mem.Allocator, comptime T: type, row: Row, partial:
                     @field(result, fname) = if (borrow_strings)
                         str
                     else
-                        allocator.dupe(u8, str) catch return error.DatabaseError;
+                        try allocator.dupe(u8, str);
                 }
             } else {
                 // Fallback: linear scan (no column index provided)
@@ -1155,7 +1160,7 @@ fn scanStruct(allocator: std.mem.Allocator, comptime T: type, row: Row, partial:
                                 @field(result, fname) = if (borrow_strings)
                                     str
                                 else
-                                    allocator.dupe(u8, str) catch return error.DatabaseError;
+                                    try allocator.dupe(u8, str);
                             }
                             break :found;
                         }
@@ -1263,7 +1268,9 @@ fn valueToType(allocator: std.mem.Allocator, comptime T: type, val: Value) !T {
             .string => |s| std.mem.eql(u8, s, "t") or std.mem.eql(u8, s, "true") or std.mem.eql(u8, s, "1"),
             else => error.DatabaseError,
         },
-        []const u8 => if (val == .string) (allocator.dupe(u8, val.string) catch return error.DatabaseError) else error.DatabaseError,
+        // The one allocation in this function: a failed `dupe` is
+        // `error.OutOfMemory`, not a value the database refused to hand over.
+        []const u8 => if (val == .string) (try allocator.dupe(u8, val.string)) else error.DatabaseError,
         else => @compileError("Unsupported scan type: " ++ @typeName(T)),
     };
 }
@@ -1487,9 +1494,12 @@ pub const SQLiteConn = struct {
             std.log.err("SQLite prepare error: code={d} msg={s}", .{ ext_code, err_msg });
             return error.DatabaseError;
         }
-        const key = self.allocator.dupe(u8, sql_str) catch {
+        // Cache the statement under a copy of the SQL. A failed `dupe` is the
+        // process running out of memory — the statement was prepared fine — so
+        // it keeps `error.OutOfMemory` rather than becoming `DatabaseError`.
+        const key = self.allocator.dupe(u8, sql_str) catch |err| {
             _ = sqlite3_c.sqlite3_finalize(stmt);
-            return error.DatabaseError;
+            return err;
         };
         self.stmt_counter += 1;
         try self.stmt_cache.put(key, .{ .value = stmt.?, .last_used = self.stmt_counter });
@@ -1508,11 +1518,16 @@ pub const SQLiteConn = struct {
 
         try bindSQLite(stmt, args);
 
+        // The row buffer below is built in `arena`, so an allocation failure is
+        // the process running out of memory, not the server rejecting the
+        // statement — it propagates as `error.OutOfMemory` (the name `Error.zig`
+        // documents this file as producing for "arena/dupe failures while
+        // scanning rows") instead of being folded into `error.DatabaseError`.
         const col_count = sqlite3_c.sqlite3_column_count(stmt);
         var rows_list: std.ArrayList(Row) = std.ArrayList(Row).empty;
 
         // Column names are identical for every row — allocate once and share.
-        const shared_columns = arena_alloc.alloc([]const u8, @intCast(col_count)) catch return error.DatabaseError;
+        const shared_columns = try arena_alloc.alloc([]const u8, @intCast(col_count));
         var names_ready = false;
 
         var step_rc = sqlite3_c.sqlite3_step(stmt);
@@ -1521,15 +1536,15 @@ pub const SQLiteConn = struct {
                 for (0..@intCast(col_count)) |i| {
                     const raw_name = sqlite3_c.sqlite3_column_name(stmt, @intCast(i));
                     const name_len = std.mem.len(raw_name);
-                    shared_columns[i] = arena_alloc.dupe(u8, raw_name[0..name_len]) catch return error.DatabaseError;
+                    shared_columns[i] = try arena_alloc.dupe(u8, raw_name[0..name_len]);
                 }
                 names_ready = true;
             }
-            const values = arena_alloc.alloc(?Value, @intCast(col_count)) catch return error.DatabaseError;
+            const values = try arena_alloc.alloc(?Value, @intCast(col_count));
             for (0..@intCast(col_count)) |i| {
                 values[i] = readSQLiteValue(arena_alloc, stmt, @intCast(i));
             }
-            rows_list.append(arena_alloc, .{ .arena = undefined, .columns = shared_columns, .values = values }) catch return error.DatabaseError;
+            try rows_list.append(arena_alloc, .{ .arena = undefined, .columns = shared_columns, .values = values });
             step_rc = sqlite3_c.sqlite3_step(stmt);
         }
         // Check if step ended with an error (not DONE)
@@ -1540,7 +1555,7 @@ pub const SQLiteConn = struct {
             return error.DatabaseError;
         }
 
-        const rows_slice = arena_alloc.alloc(Row, rows_list.items.len) catch return error.DatabaseError;
+        const rows_slice = try arena_alloc.alloc(Row, rows_list.items.len);
         @memcpy(rows_slice, rows_list.items);
         return Rows{ .arena = arena, .rows = rows_slice };
     }
@@ -1619,7 +1634,9 @@ pub const SQLiteConn = struct {
     fn prepareFn(ptr: *anyopaque, allocator: std.mem.Allocator, sql_str: []const u8) errors.ResultT(Stmt) {
         const self = @as(*SQLiteConn, @ptrCast(@alignCast(ptr)));
         self.guard();
-        const stmt = allocator.create(SQLiteStmt) catch return error.DatabaseError;
+        // The stub itself is this process's memory; only the prepare that
+        // follows can be the database refusing the statement.
+        const stmt = try allocator.create(SQLiteStmt);
         errdefer allocator.destroy(stmt);
         stmt.* = SQLiteStmt.prepare(self.db, allocator, sql_str) catch return error.DatabaseError;
         return stmt.toStmt();
@@ -2291,21 +2308,26 @@ pub const PostgresConn = struct {
 
         var rows_list: std.ArrayList(Row) = std.ArrayList(Row).empty;
 
-        const shared_columns = arena_alloc.alloc([]const u8, @intCast(n_cols)) catch return error.DatabaseError;
+        // The row buffer is built in the caller's arena, so an allocation
+        // failure here is the process running out of memory — `error.OutOfMemory`,
+        // the name `Error.zig` documents for "arena/dupe failures while scanning
+        // rows" — while a failure of the driver to hand over a field or a cell
+        // stays `error.DatabaseError` (it comes from `pgReadCell`).
+        const shared_columns = try arena_alloc.alloc([]const u8, @intCast(n_cols));
         for (0..@intCast(n_cols)) |c| {
             const name = cStrSpan(libpq_c.PQfname(res.?, @intCast(c)));
-            shared_columns[c] = arena_alloc.dupe(u8, name) catch return error.DatabaseError;
+            shared_columns[c] = try arena_alloc.dupe(u8, name);
         }
 
         for (0..@intCast(n_rows)) |r| {
-            const values = arena_alloc.alloc(?Value, @intCast(n_cols)) catch return error.DatabaseError;
+            const values = try arena_alloc.alloc(?Value, @intCast(n_cols));
             for (0..@intCast(n_cols)) |c| {
-                values[c] = pgReadCell(arena_alloc, res.?, @intCast(r), @intCast(c)) catch return error.DatabaseError;
+                values[c] = try pgReadCell(arena_alloc, res.?, @intCast(r), @intCast(c));
             }
-            rows_list.append(arena_alloc, .{ .arena = undefined, .columns = shared_columns, .values = values }) catch return error.DatabaseError;
+            try rows_list.append(arena_alloc, .{ .arena = undefined, .columns = shared_columns, .values = values });
         }
 
-        const rows_slice = arena_alloc.alloc(Row, rows_list.items.len) catch return error.DatabaseError;
+        const rows_slice = try arena_alloc.alloc(Row, rows_list.items.len);
         @memcpy(rows_slice, rows_list.items);
         return Rows{ .arena = arena, .rows = rows_slice };
     }
@@ -2713,9 +2735,18 @@ pub const PostgresConn = struct {
     fn prepareFn(ptr: *anyopaque, allocator: std.mem.Allocator, sql_str: []const u8) errors.ResultT(Stmt) {
         const self = @as(*PostgresConn, @ptrCast(@alignCast(ptr)));
         self.guard();
-        const stmt = allocator.create(PostgresStmt) catch return error.DatabaseError;
+        // Two kinds of failure, two names: the cell and the statement name are
+        // this process's memory (`error.OutOfMemory`), while a statement the
+        // server refused is `error.DatabaseError`. `PostgresStmt.prepare`'s
+        // inferred set also carries `error.NoSpaceLeft` from its own 32-byte
+        // name buffer — unreachable for `"stmt_{x}"` of a pointer, and not a
+        // member of `ZigModuError`, so it lands on the database arm.
+        const stmt = try allocator.create(PostgresStmt);
         errdefer allocator.destroy(stmt);
-        stmt.* = PostgresStmt.prepare(self.conn, allocator, sql_str) catch return error.DatabaseError;
+        stmt.* = PostgresStmt.prepare(self.conn, allocator, sql_str) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.DatabaseError,
+        };
         return stmt.toStmt();
     }
 
@@ -3642,7 +3673,14 @@ pub const MySqlConn = struct {
             if (maybe_rows) |rows| return rows;
         } else |err| return err;
 
-        const query = formatQuery(self.allocator, sql_str, args) catch return error.DatabaseError;
+        // `formatQuery` interpolates into a fresh buffer: a failure of
+        // `self.allocator` there is this process running out of memory, while
+        // `formatQuery`'s own `error.DatabaseError` (too few arguments for the
+        // placeholders) is a caller bug. Both keep their own name — folding the
+        // first into the second made running out of memory look like the server
+        // rejecting the statement, in the metrics callback's `@errorName`, in
+        // the logs, and in `toErrorContext`.
+        const query = try formatQuery(self.allocator, sql_str, args);
         defer self.allocator.free(query);
 
         if (libmysql_c.mysql_real_query(self.mysql, @ptrCast(query.ptr), @intCast(query.len)) != 0) {
@@ -3671,7 +3709,9 @@ pub const MySqlConn = struct {
                 if (maybe_res) |res| return res;
             } else |err| return err;
 
-            const query = formatQuery(self.allocator, sql_str, args) catch return error.DatabaseError;
+            // See the `queryFn` fallback above: an allocation failure here is
+            // `error.OutOfMemory`, not the driver failing.
+            const query = try formatQuery(self.allocator, sql_str, args);
             defer self.allocator.free(query);
 
             if (libmysql_c.mysql_real_query(self.mysql, @ptrCast(query.ptr), @intCast(query.len)) != 0) {
@@ -3756,7 +3796,9 @@ pub const MySqlConn = struct {
             return Cursor.init(rows);
         }
 
-        const query = if (args.len == 0) sql_str else formatQuery(self.allocator, sql_str, args) catch return error.DatabaseError;
+        // The interpolated buffer is `self.allocator`'s, so its failure is
+        // `error.OutOfMemory` (see `queryFn`), not a database failure.
+        const query = if (args.len == 0) sql_str else try formatQuery(self.allocator, sql_str, args);
         defer if (args.len != 0) self.allocator.free(query);
         if (libmysql_c.mysql_real_query(self.mysql, @ptrCast(query.ptr), @intCast(query.len)) != 0) {
             const err_no = libmysql_c.mysql_errno(self.mysql);
@@ -3936,23 +3978,26 @@ pub const SQLiteStmt = struct {
         _ = sqlite3_c.sqlite3_reset(self.stmt);
         try bindSQLite(self.stmt.?, args);
 
+        // As in `SQLiteConn.queryFn`: this arena is the caller's, and a failure
+        // to allocate the row buffer in it is `error.OutOfMemory`, not a
+        // database failure.
         const col_count = sqlite3_c.sqlite3_column_count(self.stmt);
         var rows_list: std.ArrayList(Row) = std.ArrayList(Row).empty;
 
         while (sqlite3_c.sqlite3_step(self.stmt) == sqlite3_c.SQLITE_ROW) {
-            const columns = arena_alloc.alloc([]const u8, @intCast(col_count)) catch return error.DatabaseError;
-            const values = arena_alloc.alloc(?Value, @intCast(col_count)) catch return error.DatabaseError;
+            const columns = try arena_alloc.alloc([]const u8, @intCast(col_count));
+            const values = try arena_alloc.alloc(?Value, @intCast(col_count));
             for (0..@intCast(col_count)) |i| {
                 const raw_name = sqlite3_c.sqlite3_column_name(self.stmt, @intCast(i));
                 const name_len = std.mem.len(raw_name);
                 const name = raw_name[0..name_len];
-                columns[i] = arena_alloc.dupe(u8, name) catch return error.DatabaseError;
+                columns[i] = try arena_alloc.dupe(u8, name);
                 values[i] = readSQLiteValue(arena_alloc, self.stmt, @intCast(i));
             }
-            rows_list.append(arena_alloc, .{ .arena = undefined, .columns = columns, .values = values }) catch return error.DatabaseError;
+            try rows_list.append(arena_alloc, .{ .arena = undefined, .columns = columns, .values = values });
         }
 
-        const rows_slice = arena_alloc.alloc(Row, rows_list.items.len) catch return error.DatabaseError;
+        const rows_slice = try arena_alloc.alloc(Row, rows_list.items.len);
         @memcpy(rows_slice, rows_list.items);
         return Rows{ .arena = arena, .rows = rows_slice };
     }
@@ -3992,7 +4037,14 @@ pub const SQLiteStmt = struct {
 
 pub const PostgresStmt = struct {
     conn: ?*libpq_c.PGconn,
-    name: []const u8,
+    /// The statement name, kept **with its sentinel**: `prepare` allocates it
+    /// with `allocZ`, and `closeFn` frees the same slice. Storing it as
+    /// `[]const u8` dropped the sentinel, so the allocator was handed a length
+    /// one byte short of what it handed out — a sizing allocator (`std.testing`,
+    /// `GeneralPurposeAllocator` in Debug) panics on that, and `PQexecPrepared`
+    /// is given the name through `@ptrCast(self.name.ptr)`, which wants the
+    /// sentinel anyway.
+    name: [:0]const u8,
     allocator: std.mem.Allocator,
 
     pub fn prepare(conn: ?*libpq_c.PGconn, allocator: std.mem.Allocator, sql: []const u8) !PostgresStmt {
@@ -4050,20 +4102,23 @@ pub const PostgresStmt = struct {
         const n_cols = libpq_c.PQnfields(res);
         var rows_list: std.ArrayList(Row) = std.ArrayList(Row).empty;
 
-        const shared_columns = arena_alloc.alloc([]const u8, @intCast(n_cols)) catch return error.DatabaseError;
+        // Same split as `PostgresConn.queryFn`: the caller's arena failing is
+        // `error.OutOfMemory`; anything the driver cannot hand over stays
+        // `error.DatabaseError` (that is what `pgReadCell` returns for it).
+        const shared_columns = try arena_alloc.alloc([]const u8, @intCast(n_cols));
         for (0..@intCast(n_cols)) |c| {
             const name = std.mem.span(libpq_c.PQfname(res, @intCast(c)));
-            shared_columns[c] = arena_alloc.dupe(u8, name) catch return error.DatabaseError;
+            shared_columns[c] = try arena_alloc.dupe(u8, name);
         }
 
         for (0..@intCast(n_rows)) |r| {
-            const values = arena_alloc.alloc(?Value, @intCast(n_cols)) catch return error.DatabaseError;
+            const values = try arena_alloc.alloc(?Value, @intCast(n_cols));
             for (0..@intCast(n_cols)) |c| {
-                values[c] = pgReadCell(arena_alloc, res, @intCast(r), @intCast(c)) catch return error.DatabaseError;
+                values[c] = try pgReadCell(arena_alloc, res, @intCast(r), @intCast(c));
             }
-            rows_list.append(arena_alloc, .{ .arena = undefined, .columns = shared_columns, .values = values }) catch return error.DatabaseError;
+            try rows_list.append(arena_alloc, .{ .arena = undefined, .columns = shared_columns, .values = values });
         }
-        const rows_slice = arena_alloc.alloc(Row, rows_list.items.len) catch return error.DatabaseError;
+        const rows_slice = try arena_alloc.alloc(Row, rows_list.items.len);
         @memcpy(rows_slice, rows_list.items);
         return Rows{ .arena = arena, .rows = rows_slice };
     }
@@ -9923,4 +9978,334 @@ test "queryScalar reads the first column" {
     try std.testing.expectEqual(@as(?f64, 1.5), try client.queryScalar(f64, "SELECT 1.5", &.{}));
     // Bound arguments reach the driver on this path too.
     try std.testing.expectEqual(@as(?i64, 5), try client.queryScalar(i64, "SELECT ?1 + 2", &.{.{ .int = 3 }}));
+}
+
+// ==== Allocation failures in the row-scanning and query-building paths ====
+//
+// `Error.zig` documents this file as producing `error.OutOfMemory` for
+// "arena/dupe failures while scanning rows", and `toErrorContext` gives that
+// name a code of its own while an unmapped error degrades to `UnknownError`.
+// These tests pin the split at the sites where a row buffer, a column name, or
+// an interpolated query is built in memory this process owns: a failed
+// allocation must not be reported as the database refusing the statement.
+//
+// The seam is `std.testing.FailingAllocator` under the allocator that site
+// uses. Two properties make it usable here: it counts only *successful*
+// allocations, so pinning `fail_index` at the current count fails exactly the
+// next one, and its `free` never fails, so teardown still works afterwards.
+// (`resize_fail_index` is pinned alongside so a `remap` cannot quietly satisfy
+// a grow that `alloc` would have refused.) Nothing below needs a schema or a
+// load — only a live server for the two drivers whose paths exist solely
+// against one.
+
+/// Skip unless the live-PG tests may run: `ZIGMODU_TEST_PG=1` (the opt-in that
+/// survives `scripts/test-fast.sh`, which owns `DB`) or `DB=postgres`.
+fn skipUnlessLivePg() !void {
+    const opt_in = if (std.c.getenv("ZIGMODU_TEST_PG")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else false;
+    if (!opt_in) try skipUnlessDb("postgres");
+    if (!DriverFeatures.postgres) return error.SkipZigTest;
+}
+
+/// Connection string for the live-PG tests below — the same variable and the
+/// same default as the streaming-cursor tests above.
+fn pgTestConninfo() []const u8 {
+    const default = "host=127.0.0.1 port=5432 dbname=postgres user=postgres";
+    if (builtin.os.tag == .windows) return default;
+    if (std.c.getenv("PGconninfo")) |ptr| return std.mem.span(ptr);
+    return default;
+}
+
+/// A live MySQL connection whose *own* allocator is the caller's
+/// `FailingAllocator`. `connect` makes no Zig-side allocations of its own, so
+/// the handshake succeeds and the failure can be pinned afterwards.
+fn mysqlFailingConn(failing: *std.testing.FailingAllocator) !MySqlConn {
+    const cfg = mysqlLiveConfig();
+    return MySqlConn.connect(failing.allocator(), cfg.host, cfg.username, cfg.password, cfg.database, cfg.port);
+}
+
+/// Pin a `FailingAllocator` so that its next allocation fails.
+fn pinAllocatorLimit(failing: *std.testing.FailingAllocator) void {
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+}
+
+// The tests below drive the driver functions directly, on connections that live
+// on the stack. `Conn.close` / `Stmt.close` go through `closeFn`, which
+// destroys the connection cell — right for the heap cells the framework makes,
+// wrong for a local — so these mirror `closeFn` without the destroy.
+
+fn closeStackSQLiteConn(conn: *SQLiteConn) void {
+    var it = conn.stmt_cache.iterator();
+    while (it.next()) |entry| {
+        _ = sqlite3_c.sqlite3_finalize(entry.value_ptr.value);
+        conn.allocator.free(entry.key_ptr.*);
+    }
+    conn.stmt_cache.deinit();
+    if (conn.db) |db| _ = sqlite3_c.sqlite3_close(db);
+}
+
+fn closeStackPostgresConn(conn: *PostgresConn) void {
+    var it = conn.stmt_cache.iterator();
+    while (it.next()) |entry| {
+        conn.allocator.free(entry.key_ptr.*);
+        conn.allocator.free(entry.value_ptr.value);
+    }
+    conn.stmt_cache.deinit();
+    if (conn.conn) |c| libpq_c.PQfinish(c);
+}
+
+fn closeStackMySqlConn(conn: *MySqlConn) void {
+    var it = conn.stmt_cache.iterator();
+    while (it.next()) |entry| {
+        _ = libmysql_c.mysql_stmt_close(entry.value_ptr.value);
+        conn.allocator.free(entry.key_ptr.*);
+    }
+    conn.stmt_cache.deinit();
+    if (conn.mysql) |m| libmysql_c.mysql_close(m);
+}
+
+test "sqlite row scan reports an allocation failure as OutOfMemory" {
+    if (!DriverFeatures.sqlite) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    // `SQLiteConn.queryFn` builds its result set on `self.allocator` — it
+    // ignores the allocator its caller passes — so the failure is injected
+    // there, after the connection, its statements and one query have run.
+    var failing = std.testing.FailingAllocator.init(allocator, .{});
+    var conn = try SQLiteConn.open(failing.allocator(), ":memory:");
+    defer closeStackSQLiteConn(&conn);
+
+    _ = try SQLiteConn.execFn(&conn, "CREATE TABLE t (a INTEGER, b TEXT)", &.{});
+    _ = try SQLiteConn.execFn(&conn, "INSERT INTO t VALUES (1, 'x')", &.{});
+
+    const sql = "SELECT a, b FROM t";
+    {
+        // Also warms the statement cache, so `getCachedStmt`'s copy of the SQL
+        // text is not what the pinned limit trips over.
+        var warm = try SQLiteConn.queryFn(&conn, allocator, sql, &.{});
+        defer warm.deinit();
+        try std.testing.expectEqual(@as(usize, 1), warm.rows.len);
+        try std.testing.expectEqualStrings("x", warm.rows[0].get("b").?.string);
+    }
+
+    pinAllocatorLimit(&failing);
+    try std.testing.expectError(error.OutOfMemory, SQLiteConn.queryFn(&conn, allocator, sql, &.{}));
+    try std.testing.expect(failing.has_induced_failure);
+}
+
+test "sqlite prepared-statement row scan reports an allocation failure as OutOfMemory" {
+    if (!DriverFeatures.sqlite) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var conn = try SQLiteConn.open(allocator, ":memory:");
+    defer closeStackSQLiteConn(&conn);
+    _ = try SQLiteConn.execFn(&conn, "CREATE TABLE t (a INTEGER)", &.{});
+    _ = try SQLiteConn.execFn(&conn, "INSERT INTO t VALUES (1)", &.{});
+
+    // Unlike `SQLiteConn.queryFn`, the prepared-statement path builds its rows
+    // in the allocator its caller passes — which is what the interface says.
+    var stmt = try SQLiteConn.prepareFn(&conn, allocator, "SELECT a FROM t");
+    defer stmt.close();
+    {
+        var warm = try stmt.query(allocator, &.{});
+        defer warm.deinit();
+        try std.testing.expectEqual(@as(usize, 1), warm.rows.len);
+    }
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, stmt.query(failing.allocator(), &.{}));
+    try std.testing.expect(failing.has_induced_failure);
+}
+
+test "sqlite statement stub allocation failure is OutOfMemory" {
+    if (!DriverFeatures.sqlite) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var conn = try SQLiteConn.open(allocator, ":memory:");
+    defer closeStackSQLiteConn(&conn);
+
+    // `prepareFn` allocates the statement cell itself and only then asks the
+    // driver to prepare: the first failure is this process's memory, not the
+    // database's.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, SQLiteConn.prepareFn(&conn, failing.allocator(), "SELECT 1"));
+    try std.testing.expect(failing.has_induced_failure);
+}
+
+test "sqlite statement-cache key allocation failure is OutOfMemory" {
+    if (!DriverFeatures.sqlite) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{});
+    var conn = try SQLiteConn.open(failing.allocator(), ":memory:");
+    defer closeStackSQLiteConn(&conn);
+
+    // `getCachedStmt` prepares with the driver and only then copies the SQL text
+    // into the cache, so the copy is the first allocation on this path.
+    pinAllocatorLimit(&failing);
+    try std.testing.expectError(error.OutOfMemory, SQLiteConn.getCachedStmt(&conn, "SELECT 1"));
+    try std.testing.expect(failing.has_induced_failure);
+}
+
+test "scanStruct indexed string-dupe allocation failure is OutOfMemory" {
+    const allocator = std.testing.allocator;
+    const columns = [_][]const u8{"name"};
+    const values = [_]?Value{.{ .string = "ada" }};
+    const row = Row{ .arena = undefined, .columns = &columns, .values = &values };
+    const Named = struct { name: []const u8 };
+
+    // The column-indexed path, the one `buildColumnIndices` feeds.
+    var indices = [_]?usize{0};
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, scanStruct(failing.allocator(), Named, row, false, &indices, false));
+    try std.testing.expect(failing.has_induced_failure);
+}
+
+test "scanStruct linear-scan string-dupe allocation failure is OutOfMemory" {
+    const allocator = std.testing.allocator;
+    const columns = [_][]const u8{"name"};
+    const values = [_]?Value{.{ .string = "ada" }};
+    const row = Row{ .arena = undefined, .columns = &columns, .values = &values };
+    const Named = struct { name: []const u8 };
+
+    // The fallback that matches the field name against the row's column names.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, scanStruct(failing.allocator(), Named, row, false, null, false));
+    try std.testing.expect(failing.has_induced_failure);
+}
+
+test "valueToType reports a string-dupe allocation failure as OutOfMemory" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, valueToType(failing.allocator(), []const u8, .{ .string = "ada" }));
+    try std.testing.expect(failing.has_induced_failure);
+}
+
+test "postgres buffered read reports an allocation failure as OutOfMemory" {
+    try skipUnlessLivePg();
+    const allocator = std.testing.allocator;
+
+    var conn = try PostgresConn.connect(allocator, pgTestConninfo(), 0);
+    defer closeStackPostgresConn(&conn);
+
+    // `queryFn`'s row buffer lives in the arena its caller passes; the query
+    // itself runs on the connection's own allocator. So the first failure here
+    // is the buffer — the same name the streaming path reports for the same
+    // condition.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        PostgresConn.queryFn(&conn, failing.allocator(), "SELECT i * 10 AS q FROM generate_series(1, 3) AS i", &.{}),
+    );
+    try std.testing.expect(failing.has_induced_failure);
+
+    // The failed read must not have consumed or corrupted the connection: the
+    // next statement on it still returns its row. (The cell's union member
+    // depends on the result format libpq was asked for, so both are accepted.)
+    var after = try PostgresConn.queryFn(&conn, allocator, "SELECT 42 AS n", &.{});
+    defer after.deinit();
+    try std.testing.expectEqual(@as(usize, 1), after.rows.len);
+    const n = after.rows[0].get("n").?;
+    try std.testing.expectEqual(@as(i64, 42), switch (n) {
+        .int => |v| v,
+        .string => |s| try std.fmt.parseInt(i64, s, 10),
+        else => return error.TestUnexpectedResult,
+    });
+}
+
+test "postgres prepared-statement row scan reports an allocation failure as OutOfMemory" {
+    try skipUnlessLivePg();
+    const allocator = std.testing.allocator;
+
+    var conn = try PostgresConn.connect(allocator, pgTestConninfo(), 0);
+    defer closeStackPostgresConn(&conn);
+
+    var stmt = try PostgresConn.prepareFn(&conn, allocator, "SELECT 1 AS a");
+    defer stmt.close();
+    {
+        var warm = try stmt.query(allocator, &.{});
+        defer warm.deinit();
+        try std.testing.expectEqual(@as(usize, 1), warm.rows.len);
+        try std.testing.expectEqualStrings("a", warm.rows[0].columns[0]);
+    }
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, stmt.query(failing.allocator(), &.{}));
+    try std.testing.expect(failing.has_induced_failure);
+}
+
+test "mysql query fallback reports an allocation failure as OutOfMemory" {
+    try skipUnlessDb("mysql");
+    const allocator = std.testing.allocator;
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{});
+    var conn = try mysqlFailingConn(&failing);
+    defer closeStackMySqlConn(&conn);
+
+    // The prepared-statement path declines (`catch return null`) once its own
+    // allocations fail, which is what routes `queryFn` to interpolation — the
+    // buffer it then builds is `self.allocator`'s.
+    pinAllocatorLimit(&failing);
+    try std.testing.expectError(error.OutOfMemory, MySqlConn.queryFn(&conn, allocator, "SELECT ? AS a", &.{.{ .int = 1 }}));
+    try std.testing.expect(failing.has_induced_failure);
+}
+
+test "mysql exec fallback reports an allocation failure as OutOfMemory" {
+    try skipUnlessDb("mysql");
+    const allocator = std.testing.allocator;
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{});
+    var conn = try mysqlFailingConn(&failing);
+    defer closeStackMySqlConn(&conn);
+
+    pinAllocatorLimit(&failing);
+    try std.testing.expectError(error.OutOfMemory, MySqlConn.execFn(&conn, "SELECT ? AS a", &.{.{ .int = 1 }}));
+    try std.testing.expect(failing.has_induced_failure);
+}
+
+test "mysql streaming cursor reports an allocation failure as OutOfMemory" {
+    try skipUnlessDb("mysql");
+    const allocator = std.testing.allocator;
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{});
+    var conn = try mysqlFailingConn(&failing);
+    defer closeStackMySqlConn(&conn);
+
+    // The streaming cursor interpolates before it touches the wire, so this is
+    // the first — and only — allocation on its path.
+    pinAllocatorLimit(&failing);
+    try std.testing.expectError(
+        error.OutOfMemory,
+        MySqlConn.queryCursorFn(&conn, allocator, "SELECT ? AS a", &.{.{ .int = 1 }}, .{ .mode = .streaming }),
+    );
+    try std.testing.expect(failing.has_induced_failure);
+}
+
+test "postgres statement stub allocation failure is OutOfMemory" {
+    try skipUnlessLivePg();
+    const allocator = std.testing.allocator;
+
+    var conn = try PostgresConn.connect(allocator, pgTestConninfo(), 0);
+    defer closeStackPostgresConn(&conn);
+
+    // As in the sqlite driver: `prepareFn` allocates the statement cell itself
+    // and only then asks the server to prepare, so the first failure is this
+    // process's memory rather than a statement the server rejected.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, PostgresConn.prepareFn(&conn, failing.allocator(), "SELECT 1"));
+    try std.testing.expect(failing.has_induced_failure);
+}
+
+test "postgres statement name allocation failure is OutOfMemory" {
+    try skipUnlessLivePg();
+    const allocator = std.testing.allocator;
+
+    var conn = try PostgresConn.connect(allocator, pgTestConninfo(), 0);
+    defer closeStackPostgresConn(&conn);
+
+    // One allocation is allowed — the statement cell — so what fails is the
+    // `allocZ` of the statement name inside `PostgresStmt.prepare`, the other
+    // allocation on that path.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
+    try std.testing.expectError(error.OutOfMemory, PostgresConn.prepareFn(&conn, failing.allocator(), "SELECT 1"));
+    try std.testing.expect(failing.has_induced_failure);
 }
