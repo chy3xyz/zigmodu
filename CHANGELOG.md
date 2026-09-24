@@ -2,6 +2,80 @@
 
 ## [Unreleased]
 
+### 第 18 批：`mutex.lock(io) catch …` 家族的系统清点（15 处改成不可取消的等待，含一处 UAF 与一处析构泄漏）、`LoadBalancer` 把"量不出来"读成"空闲"（真红）、一批"注释即修复"（**破坏性：否**）
+
+全量 `-Ddb=all` **1838/1895（57 skipped，0 failed）**。
+
+**`mutex.lock(io) catch …` 家族：8 个文件里 48 处逐个判定，15 处改了。** 关键机制（决定了大多数判定）：
+这些 `catch` 全都发生在**临界区开始之前**，所以不存在"改了一半"——只有两种失败模式：**临界区根本没跑**
+（状态/资源被永久留着）与**返回一个被当成事实的伪造值**。而且 `std.Io.Mutex.lock` 唯一的错误是
+`error.Canceled`，一个正在被拆掉的任务**每次都**带着它，所以 `defer`/关闭路径里的那个 `catch` 是
+**每次都触发**，不是偶尔。`lockUncancelable` 没有这个提前返回，也不是取消点。
+红证据（7 条新用例，跑在修复前）：
+```
+ai.cooldown_store.test.canceled lock wait does not fabricate a key as not-cooling...FAIL
+scheduler.Cron.test.canceled lock wait does not let the scheduler deinit leak its jobs
+  [SafeAllocator] (err): leaked [len: 352]  leaked [len: 5]
+  [default] (err): [cron] scheduler deinit: mutex lock failed; skipping job cleanup
+scheduler.Cron.test.canceled lock wait does not report a live job as missing...FAIL
+core.ModuleRuntime.test.canceled lock wait does not lose a bulkhead slot...expected 0, found 1
+core.ModuleRuntime.test.canceled lock wait does not fabricate an all-idle stats reading...expected 1, found 0
+im.ConnectionRegistry.test.canceled lock wait does not lose a disconnect...FAIL
+im.ConnectionRegistry.test.canceled lock wait does not fabricate an offline reading...FAIL
+zm-test-runner: selected 8 of 1780 tests — 2 passed; 6 failed; 1 leaked
+```
+改掉的 15 处里有三条值得单独点出来：
+- **`ConnectionRegistry.unregister` / `unregisterByConn`：UAF。** 取消时条目留在 `by_user` 里、`ctx` 指向
+  调用方**正要释放**的会话 —— 下一次 `sendToUser` 就是 use-after-free；而且它返回 `false`（读作"id 未知"），
+  注册表级的清理永远不知道什么都没退掉。
+- **`Cron.deinit`：析构函数泄漏。** 跳过清理会漏掉每个 job 名与列表，然后 `self.* = undefined`
+  让补救也不可能。与第 17 批 `BufferPool.deinit` 同一类。
+- **伪造读数**：`isOnline`（false = "用户离线"，网关按它路由）、`onlineCount`/`onlineUsers`（0/空）、
+  `ModuleRuntime.getStats`（`.{}` = 全空闲/全健康）、`ClusterMembership.isLeader`/`nodesSnapshot`
+  （"我不是 leader"/空集群，后者喂给路由用的 `ClusterView`）、`cooldown_store.isCoolingFn`
+  （`!isCooling(key)` 正是 `key_pool` 重新选取该键的条件）、`LoadShedder.highThru`（false = "未过载"
+  → 在过载时放行流量）。
+> **未做（已列全）**：同族里还有一批未改 —— `ClusterMembership.getNodeCount`/`getHealthyNodeCount`/`getLeader`、
+> `Cron.jobCount`、`cooldown_store` 的 `cool`/`bumpFailures`/`reset`（两个 store 各一套）、`pool/Pool.zig`
+> 的 `idle()`。另有约 52 处分布在本次范围外的文件里（`ai/key_pool`、`ai/provider_registry`、`core/EventBus`
+> 一族、`cache/Lru`、`runtime/mailbox`、`metrics/PrometheusMetrics` 等），**未被判定**。
+> **一条记录在案的残留**：`DistributedEventBus.takeNodeSocket` 的 `null` 在 `disconnectNode` 路径上会漏
+> 一个 fd；按规则它该用 `lockUncancelable`，但那里的对端写没有超时，等锁可能让拆除永远停在一次卡住的
+> `writeAll` 后面 —— 所以**没改**，记为残留而不是修复。
+> **未验证**：改动里 8 处只有"triage 推理 + 本文件套件绿"，**没有红证据**（没搭 `ClusterMembership`/Redis
+> fixture；其余四处按"每个文件一条复现"这预算取舍）；`lockUncancelable` 的阻塞代价未测量（只按检视确认
+> 没有嵌套持锁）；全部为 macOS + Debug。
+
+**`LoadBalancer` 把"量不出来"读成"空闲"（真红）。** `getConnectionCount` 的
+`bufPrint(...) catch return 0`：对端名装不进 128 字节栈缓冲时返回 **0 条连接** —— 而 `0` 正是
+`.least_connections` **最喜欢**的值，于是**量不出来的对端反而吸引流量**（与本文件刚把 `recordResult`
+改成可失败、"绝不记录一个假值"的决定自相矛盾）。红证据：
+```
+LoadBalancer least_connections: an unreadable count is not read as idle...FAIL (TestUnexpectedResult)
+  try std.testing.expect(std.mem.eql(u8, picked.host, "10.0.0.1"));   ← 有 7 条连接的长名对端赢了
+```
+改法：返回 `?u64`（栈缓冲装不下就回落到真正构造 key 的那条路径，所以合法的 253 字节主机名**永远**可测），
+选择器对量不出来的对端 `orelse continue`（全部量不出来时保持原答案）。
+
+**一批"注释即修复"（这些地方代码是对的，但读者无从知道）。** 三处的结论是"合法的尽力而为，但**没说**"：
+`AutoInstrumentation` 丢弃一次耗时采样（同一文件几行之上就有"报告被丢弃的 span 事件"的既有约定）、
+`OutboxConsumer` 的可选 gauge 注册失败（一个静默缺席/陈旧的 gauge 读起来就是"一切正常"，而这正是本文件
+开头那段文档要防的事）、`scheduler.wakeIdle` 的锁等待（错过一次唤醒的代价是一个 poll 间隔，有文档语义
+兜底，且没有调用方能对失败做任何事）。三处都补了文档 + 日志，**行为不变**。
+反过来说，有两处审计点经核查是**形状不符**：`scheduler.zig` 那个是**测试假件**（真实生产者路径把
+`error.Full` 回压给调用方），`api/Server.zig` 那处不是吞错（header 拒绝会回真 500，其余记 err 并关连接 ——
+在一条刚失败的 socket 上这是调用方仅有的通道）。
+> **顺带确认一条被怀疑的事**：`ClusterMembership.checkNodeHealth` 先 `free` leader 再 `null` 再重选，
+> **不是缺陷** —— 两条语句在**同一次持锁**内（`lock` 在 :180、`defer unlock` 在 :213），而 `isLeader`/
+> `getLeader` 取同一把锁，所以读者看不到那个中间态；且它**永远不会**在有健康节点时停在 `null`（`self` 在
+> `init` 插入、文件里没有任何移除路径、也从不会被移到 `.healthy` 之外）。已用注释 + 一条回归用例钉住，
+> **没有改生产代码**。
+> **未做（新发现）**：`AutoInstrumentation` 的时钟是**桩** —— `const start_time = 0;` 让每个记录的耗时都是
+> `0 - 0 = 0`，这是比它上面那个吞错更严重的"伪造值"，但不在本批的审计清单里，修它要引入真实时钟
+> （`Time.monotonicNowNanoseconds`）并会动到所有针对耗时的断言；`ClusterMembership` 里到达 `.failed` 的
+> 节点**从不被移除**，`getNodeCount`/`nodesSnapshot` 会一直把死对端算进去（leader 仍正确，因为
+> `electLeaderLocked` 按状态过滤），要做退役策略（TTL/回收），比本批大。
+
 ### 第 17 批：`BufferPool.deinit` 在锁被别人持有时**照样**释放空闲表（内存不安全）、`verifyToken` 在分配失败时泄漏已拷好的字段（OOM 扫描抓出）（**破坏性：否**）
 
 全量 `-Ddb=all` **1829/1886（57 skipped，0 failed）**。

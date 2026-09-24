@@ -561,6 +561,11 @@ pub const Scheduler = struct {
 
     /// Wake every parked pool thread so it re-reads `stopping`.
     fn wakeIdle(self: *Self) void {
+        // Not propagated on purpose: a lock that cannot be taken delays the wake,
+        // it does not lose it. The park is a *timeout* (`poolMain` waits
+        // `idle_wait_ms`), so the threads re-read `stopping` on their own and
+        // `shutdown` still joins them within that interval — the same bound the
+        // park already documents, and no caller of `wakeIdle` could shorten it.
         self.mu.lock(self.io) catch return;
         self.idle.broadcast(self.io);
         self.mu.unlock(self.io);

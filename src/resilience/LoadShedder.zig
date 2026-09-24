@@ -253,7 +253,12 @@ pub const AdaptiveShedder = struct {
     }
 
     fn highThru(self: *Self) bool {
-        self.avg_flying_mutex.lock(self.io) catch return false;
+        // Uncancelable: `false` here *is* the reading the shedding decision rests
+        // on ("average in-flight is not high"), so a fabricated one admits
+        // traffic while the system is overloaded — the direction this primitive
+        // exists to prevent. The critical section is a load plus three float
+        // operations on a leaf mutex, so waiting costs nothing.
+        self.avg_flying_mutex.lockUncancelable(self.io);
         defer self.avg_flying_mutex.unlock(self.io);
         const avg_flying = self.avg_flying;
         const max_flight = self.maxFlight() * self.overloadFactor();

@@ -202,6 +202,17 @@ pub const ClusterMembership = struct {
 
                         if (self.current_leader) |leader| {
                             if (std.mem.eql(u8, leader, node.id)) {
+                                // Dropping the leader and electing its replacement
+                                // are one critical section, and it is this one: the
+                                // mutex is held until the end of the loop, and
+                                // `isLeader`/`getLeader` take the same mutex — so
+                                // the `null` never reaches a reader, and it is not
+                                // left behind either (`self` is in `nodes`, never
+                                // removed, never moved off `.healthy`, so the
+                                // election below always finds a candidate; only a
+                                // failed leader copy can leave it null, and then
+                                // `isLeader`'s "single node ⇒ leader" fallback is
+                                // saying the truth — the one node left is this one).
                                 self.allocator.free(leader);
                                 self.current_leader = null;
                                 should_broadcast_leader = self.electLeaderLocked();
@@ -313,7 +324,15 @@ pub const ClusterMembership = struct {
                 std.log.info("[ClusterMembership] Node {s} is back healthy", .{event.node_id});
             }
         } else {
-            const id_copy = self.allocator.dupe(u8, event.node_id) catch return;
+            const id_copy = self.allocator.dupe(u8, event.node_id) catch |err| {
+                // Reported, never swallowed: the node stays untracked (its next
+                // heartbeat re-attempts the join, so this is recoverable), and the
+                // caller is the event bus — `onBusEvent` is `void`, so a log is
+                // the only channel there is. The same rule as the leader copy
+                // below.
+                std.log.warn("[ClusterMembership] cannot track joining node {s}: {}", .{ event.node_id, err });
+                return;
+            };
             self.nodes.put(id_copy, .{
                 .id = id_copy,
                 .address = addr,
@@ -401,7 +420,12 @@ pub const ClusterMembership = struct {
     /// this hash map. `ClusterNode` values borrow `id` — valid while the
     /// membership lives, which is exactly what a view publish expects.
     pub fn nodesSnapshot(self: *Self, out: []ClusterNode) usize {
-        self.mutex.lock(self.io) catch return 0;
+        // Uncancelable: `0` is a published reading, not a placeholder — this is
+        // the snapshot the read side is fed from (`cluster/MembershipView.zig`),
+        // so "zero nodes" claims the cluster is empty while it is not, and the
+        // publish path that consumes it replaces the whole view. The critical
+        // section is a bounded copy.
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
         var n: usize = 0;
@@ -421,7 +445,13 @@ pub const ClusterMembership = struct {
     }
 
     pub fn isLeader(self: *Self) bool {
-        self.mutex.lock(self.io) catch return false;
+        // Uncancelable: `false` is a reading, not a placeholder — it asserts "this
+        // node is not the leader", and the callers that act on it (leader-only
+        // duties, failover paths) cannot tell a fabricated answer from the truth.
+        // The critical section is one string compare, so waiting costs nothing;
+        // the old `catch return false` answered a canceled wait, which is the
+        // only error `std.Io.Mutex.lock` has.
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.current_leader) |leader| {
             return std.mem.eql(u8, leader, self.node_id);
@@ -738,4 +768,48 @@ test "ClusterMembership electLeader keeps a live leader when the copy fails" {
     cluster.electLeader();
 
     try std.testing.expectEqualStrings("node-z", cluster.getLeader().?);
+}
+
+// `checkNodeHealth` drops the failed leader (`free` + `current_leader = null`)
+// *before* electing its replacement. That reads like a window — between the two,
+// `isLeader` would fall back to `nodes.count() == 1` and answer "I am leader" —
+// but both statements run inside one mutex hold, which `isLeader`/`getLeader`
+// also take, and the replacement is in place before the lock is dropped. This
+// pins the property a reader actually depends on: after the pass that fails the
+// leader, a leader is there, and it is the surviving node.
+test "ClusterMembership checkNodeHealth re-elects before it lets the lock go" {
+    const allocator = std.testing.allocator;
+
+    var bus = try DistributedEventBus.init(allocator, std.testing.io, "test-node");
+    defer bus.deinit();
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 18215);
+    var cluster = try ClusterMembership.init(allocator, std.testing.io, "node-m", addr, &bus);
+    defer cluster.deinit();
+
+    // The lowest id wins, so the peer is the elected leader — the failure below is
+    // the one that must be replaced. Backdated well past `node_timeout_ms`
+    // (10s default, doubled for the suspect → failed step), so one pass takes it
+    // healthy → suspect and the next suspect → failed. `node_timeout_ms` is only
+    // read here; `start()` is not needed to drive the health check.
+    const peer = try allocator.dupe(u8, "node-a");
+    try cluster.nodes.put(peer, .{
+        .id = peer,
+        .address = addr,
+        .state = .healthy,
+        .last_seen = Time.monotonicNowSeconds() - 100,
+        .joined_at = 0,
+    });
+
+    cluster.electLeader();
+    try std.testing.expectEqualStrings("node-a", cluster.getLeader().?);
+    try std.testing.expect(!cluster.isLeader());
+
+    cluster.checkNodeHealth();
+    try std.testing.expectEqual(ClusterMembership.NodeState.suspect, cluster.nodes.get("node-a").?.state);
+
+    cluster.checkNodeHealth();
+    try std.testing.expectEqual(ClusterMembership.NodeState.failed, cluster.nodes.get("node-a").?.state);
+    try std.testing.expectEqualStrings("node-m", cluster.getLeader().?);
+    try std.testing.expect(cluster.isLeader());
 }

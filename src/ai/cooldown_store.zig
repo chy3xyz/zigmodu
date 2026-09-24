@@ -95,7 +95,14 @@ pub const MemoryCooldownStore = struct {
 
     fn isCoolingFn(ctx: *anyopaque, key: []const u8) bool {
         const self = selfOf(ctx);
-        self.mutex.lock(self.io) catch return false;
+        // Uncancelable: `false` here is the reading `KeyPool` rotates on
+        // (`!store.isCooling(key)` re-selects the key, `ai/key_pool.zig`), so a
+        // canceled wait that answers `false` puts the key that just failed back
+        // into service and the caller has no way to tell the two apart. The
+        // critical section is one map lookup. Red:
+        // `ai.cooldown_store.test.canceled lock wait does not fabricate a key as
+        // not-cooling`.
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const until = self.cooling.get(key) orelse return false;
         return until > self.now_fn();
@@ -217,7 +224,11 @@ pub const RedisCooldownStore = struct {
         if (self.redis.get(rkey)) |v| {
             return v != null;
         } else |_| {
-            self.mutex.lock(self.io) catch return false;
+            // Uncancelable, for the same reason as the in-process store's
+            // `isCoolingFn`: this mirror answer is what `KeyPool` selects keys
+            // with (`!store.isCooling(key)`), so a canceled wait answered with
+            // `false` re-selects the key that just failed.
+            self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             const until = self.mirror_cooling.get(key) orelse return false;
             return until > self.now_fn();
@@ -337,4 +348,61 @@ test "redis cooldown store builds and formats keys" {
     var fbuf: [128]u8 = undefined;
     const f = RedisCooldownStore.failKey(&fbuf, "deepseek:3");
     try std.testing.expectEqualStrings("zigmodu:llm:key:deepseek:3:fail", f);
+}
+
+// `isCooling` answering a canceled lock wait with `false` is the reading that
+// decides whether a failing key goes back into rotation: `KeyPool` selects a key
+// with `!store.isCooling(key)` (`ai/key_pool.zig`), so a fabricated "not cooling"
+// re-selects the key that just failed and the caller has no way to tell the two
+// apart. The key *is* cooling here.
+//
+// Red evidence: with the old `self.mutex.lock(self.io) catch return false` this
+// fails with `expected true, found false`. The lock wait is the cancelation point:
+// the task is parked on the store's mutex (held by the test thread) with a cancel
+// request already placed on its thread.
+test "canceled lock wait does not fabricate a key as not-cooling" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    fake_now = 1_000_000;
+    var store = MemoryCooldownStore.initWithOptions(allocator, io, .{ .now_fn = fakeNow });
+    defer store.deinit();
+    store.asStore().cool("p:0", 60_000);
+    try std.testing.expect(store.asStore().isCooling("p:0"));
+
+    const Task = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+        var seen: bool = false;
+
+        fn read(s: *MemoryCooldownStore) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            seen = s.asStore().isCooling("p:0");
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Task.entered.store(false, .monotonic);
+    Task.open.store(false, .monotonic);
+    Task.seen = false;
+
+    try store.mutex.lock(io);
+
+    var read_fut = try io.concurrent(Task.read, .{&store});
+    while (!Task.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Task.cancel, .{ io, &read_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Task.open.store(true, .release);
+    while (store.mutex.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    store.mutex.unlock(io);
+
+    cancel_fut.await(io);
+    read_fut.await(io);
+
+    try std.testing.expect(Task.seen);
 }

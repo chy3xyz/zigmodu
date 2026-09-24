@@ -75,12 +75,22 @@ pub const OutboxConsumer = struct {
 
     /// Attach Prometheus handles. Creates the counters against `metrics`;
     /// `pending` is refreshed on every poll and on demand via `refreshPending`.
+    ///
+    /// The `pending` gauge is best-effort and the counters are not: the gauge is
+    /// optional by type, so a registration failure leaves it absent (and
+    /// `refreshPending` a no-op) instead of failing the whole attachment — the
+    /// three counters are what "the outbox stopped moving" is read from. Best
+    /// effort is not the same as quiet, though: an absent gauge reads as "nothing
+    /// pending" on a dashboard, so the failure is logged.
     pub fn setMetrics(self: *Self, metrics: *PrometheusMetrics) !void {
         self.metrics = .{
             .selected = try metrics.createCounter("outbox_selected_total", "Outbox entries picked up for delivery"),
             .delivered = try metrics.createCounter("outbox_delivered_total", "Outbox entries delivered successfully"),
             .failed = try metrics.createCounter("outbox_failed_total", "Outbox entries permanently failed (retries exhausted or unparseable)"),
-            .pending = metrics.createGauge("outbox_pending", "Outbox entries waiting to be delivered") catch null,
+            .pending = metrics.createGauge("outbox_pending", "Outbox entries waiting to be delivered") catch |err| blk: {
+                std.log.warn("[outbox] pending gauge not registered ({s}); a stalled outbox now shows on the counters only", .{@errorName(err)});
+                break :blk null;
+            },
         };
     }
 
@@ -88,7 +98,15 @@ pub const OutboxConsumer = struct {
     pub fn refreshPending(self: *Self) void {
         const m = self.metrics orelse return;
         const gauge = m.pending orelse return;
-        gauge.set(@floatFromInt(self.pendingCount() catch return));
+        gauge.set(@floatFromInt(self.pendingCount() catch |err| {
+            // The gauge keeps its previous value — it cannot say "unknown" — so the
+            // failure is logged rather than silently leaving a stale reading on a
+            // dashboard. It is not escalated: `pollLoop` already reports the failed
+            // poll at error level and bumps `consecutive_failures`, and a second
+            // report of the same failure would only be noise.
+            std.log.debug("[outbox] pending refresh failed ({s}); gauge keeps its last value", .{@errorName(err)});
+            return;
+        }));
     }
 
     /// Pending entries (`status IN (0,1)` and retries left). This is the number

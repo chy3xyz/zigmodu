@@ -146,19 +146,22 @@ pub const Scheduler = struct {
 
     pub fn deinit(self: *Scheduler) void {
         self.stop();
-        // Lock failure here means the mutex is corrupted or the io is gone;
-        // unlocking an unlocked mutex is UB in the futex backend, so record
-        // and skip the paired unlock (and cleanup) in that case.
-        var locked = true;
-        self.mutex.lock(self.io) catch {
-            locked = false;
-            std.log.err("[cron] scheduler deinit: mutex lock failed; skipping job cleanup", .{});
-        };
-        if (locked) {
-            for (self.jobs.items) |job| self.allocator.free(job.name);
-            self.jobs.deinit(self.allocator);
-            self.mutex.unlock(self.io);
-        }
+        // Uncancelable: a destructor has to run to completion. `std.Io.Mutex.lock`
+        // fails only with `error.Canceled`, and "skip the cleanup because the lock
+        // could not be taken" leaves every job name and the list's own storage
+        // allocated with nothing left that could free them — `self.*` is
+        // `undefined` by the time the old branch returned, so no later call can
+        // repair it either. Same rule as `cache/Lru.zig`'s, `pool/Pool.zig`'s and
+        // `im/BufferPool.zig`'s `deinit`. Red:
+        // `scheduler.Cron.test.canceled lock wait does not let the scheduler
+        // deinit leak its jobs` leaks the list (352 bytes) and the job name
+        // ("leaky", 5 bytes) on the old shape.
+        self.mutex.lockUncancelable(self.io);
+
+        for (self.jobs.items) |job| self.allocator.free(job.name);
+        self.jobs.deinit(self.allocator);
+
+        self.mutex.unlock(self.io);
         self.* = undefined;
     }
 
@@ -215,7 +218,13 @@ pub const Scheduler = struct {
 
     /// Remove a job by name. Returns true when removed. Thread-safe.
     pub fn cancelJob(self: *Scheduler, name: []const u8) bool {
-        self.mutex.lock(self.io) catch return false;
+        // Uncancelable: `false` answers "there is no such job", and it is also the
+        // only channel this function has — so a canceled wait does not merely
+        // skip a removal, it reports the job as gone while the job stays
+        // registered and keeps firing on every matching tick. Red:
+        // `scheduler.Cron.test.canceled lock wait does not report a live job as
+        // missing`.
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         for (self.jobs.items, 0..) |job, i| {
             if (std.mem.eql(u8, job.name, name)) {
@@ -418,4 +427,120 @@ test "cron: no lock configured keeps single-process behavior" {
     // Same minute: not due again.
     sched.tick(1_700_000_045);
     try std.testing.expectEqual(@as(usize, 1), runs);
+}
+
+// A destructor has to run to completion. `deinit`'s old shape answered a
+// contended lock by *skipping* the cleanup (`locked = false`), which leaves every
+// job name and the list's own storage allocated with nothing left that could free
+// them — the scheduler is `undefined` by the time that branch returns. Same rule
+// as `cache/Lru.zig`'s, `pool/Pool.zig`'s and `im/BufferPool.zig`'s `deinit`:
+// wait, do not skip.
+//
+// Red evidence: with the old shape this test fails on the leak the testing
+// allocator reports (`FAIL (MemoryLeakDetected)`, one leaked job name plus the
+// list). The lock wait is the cancelation point: the task is parked on the
+// scheduler's mutex (held by the test thread) with a cancel request already
+// placed on its thread.
+test "canceled lock wait does not let the scheduler deinit leak its jobs" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var runs: usize = 0;
+    var scheduler = Scheduler.init(allocator, io);
+    try scheduler.addJob("leaky", try Expression.parse("* * * * *"), countTask, &runs);
+
+    const Task = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+        var deinited = std.atomic.Value(bool).init(false);
+
+        fn teardown(s: *Scheduler) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            s.deinit();
+            deinited.store(true, .release);
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Task.entered.store(false, .monotonic);
+    Task.open.store(false, .monotonic);
+    Task.deinited.store(false, .monotonic);
+
+    try scheduler.mutex.lock(io);
+
+    var task_fut = try io.concurrent(Task.teardown, .{&scheduler});
+    while (!Task.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Task.cancel, .{ io, &task_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Task.open.store(true, .release);
+    while (scheduler.mutex.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    scheduler.mutex.unlock(io);
+
+    cancel_fut.await(io);
+    task_fut.await(io);
+
+    // `scheduler` is `undefined` after a `deinit` that ran, so nothing here may
+    // touch it — and no `defer scheduler.deinit()`: a second deinit would either
+    // double-free (if the first skipped) or be undefined behaviour (if it did not).
+    try std.testing.expect(Task.deinited.load(.acquire));
+}
+
+// `cancelJob` answering a canceled lock wait with `false` reports "no job by that
+// name" while the job stays registered and keeps running on every matching tick —
+// the one reading a caller uses to decide the job is gone (and to stop waiting for
+// its side effects). There is no error channel: the `bool` *is* the answer.
+//
+// Red evidence: with the old `self.mutex.lock(self.io) catch return false` both
+// assertions below fail — `expected true, found false` and then
+// `expected 0, found 1`: the job is still scheduled.
+test "canceled lock wait does not report a live job as missing" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var scheduler = Scheduler.init(allocator, io);
+    defer scheduler.deinit();
+    var runs: usize = 0;
+    try scheduler.addJob("nightly", try Expression.parse("* * * * *"), countTask, &runs);
+
+    const Task = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+        var removed: bool = false;
+
+        fn cancel_job(s: *Scheduler) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            removed = s.cancelJob("nightly");
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Task.entered.store(false, .monotonic);
+    Task.open.store(false, .monotonic);
+    Task.removed = false;
+
+    try scheduler.mutex.lock(io);
+
+    var task_fut = try io.concurrent(Task.cancel_job, .{&scheduler});
+    while (!Task.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Task.cancel, .{ io, &task_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Task.open.store(true, .release);
+    while (scheduler.mutex.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    scheduler.mutex.unlock(io);
+
+    cancel_fut.await(io);
+    task_fut.await(io);
+
+    try std.testing.expect(Task.removed);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.jobCount());
 }

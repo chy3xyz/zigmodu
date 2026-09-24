@@ -335,8 +335,18 @@ pub const InstrumentedEventListener = struct {
     }
 
     /// Called on event consumption complete
+    ///
+    /// Best-effort by design, and reported rather than swallowed: this is the
+    /// metrics/tracing side of an event whose handling already happened in the
+    /// caller, so it can never be worth failing the work it describes. Giving up
+    /// here costs one duration sample and leaves the span's map entry to
+    /// `deinit` — the same trade `recordApiRequestEnd` makes for a dropped span
+    /// event, which is why it logs at the same level.
     pub fn onEventConsumeEnd(self: *Self, event_name: []const u8, module_name: []const u8, success: bool) void {
-        const key = std.fmt.allocPrint(self.event_start_times.allocator, "consume:{s}:{s}", .{ event_name, module_name }) catch return;
+        const key = std.fmt.allocPrint(self.event_start_times.allocator, "consume:{s}:{s}", .{ event_name, module_name }) catch |err| {
+            std.log.debug("[metrics] event consume end dropped ({s}); the span stays un-ended", .{@errorName(err)});
+            return;
+        };
         defer self.event_start_times.allocator.free(key);
 
         const start_time = self.event_start_times.get(key) orelse 0;

@@ -278,7 +278,18 @@ const Shard = struct {
 
     fn unregister(self: *SelfShard, allocator: std.mem.Allocator, user_id: u64) void {
         _ = allocator;
-        self.mutex.lock(self.io) catch return;
+        // Uncancelable: `std.Io.Mutex.lock` fails only with `error.Canceled`, and
+        // this is the WS disconnect path — a task that is already being torn down
+        // has that cancellation pending, so the old `catch return` dropped the
+        // removal on *every* such call, not occasionally. The dropped removal is
+        // not a missing cleanup: the entry stays in `by_user` with its `ctx`
+        // still pointing at the session the caller is about to free, and the next
+        // `sendToUser` calls `send_fn(entry.*.ctx, …)` on that freed session. The
+        // critical section is two hash-map removals and there is no error channel
+        // (`void`), so waiting is the honest answer — the same choice as
+        // `pool/Pool.zig`'s `release`, `im/BufferPool.zig`'s `release` and
+        // `sqlx.ConnPool.release`.
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
         if (self.by_user.fetchRemove(user_id)) |kv| {
@@ -290,7 +301,15 @@ const Shard = struct {
 
     fn unregisterByConn(self: *SelfShard, allocator: std.mem.Allocator, conn_id: u32) bool {
         _ = allocator;
-        self.mutex.lock(self.io) catch return false;
+        // Uncancelable, for the same reason as `unregister`: `false` reads as "no
+        // connection has this id", so a canceled wait does not just skip a
+        // cleanup — the entry survives in `by_user` with a `ctx` the caller is
+        // about to free (use-after-free on the next `sendToUser`), and
+        // `ConnectionRegistry.unregisterByConn` walks every shard on `false`
+        // without ever reporting that nothing was retired. Red:
+        // `im.ConnectionRegistry.test.canceled lock wait does not lose a
+        // disconnect`.
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
         if (self.by_conn.fetchRemove(conn_id)) |kv| {
@@ -324,7 +343,13 @@ const Shard = struct {
     }
 
     fn isOnline(self: *SelfShard, user_id: u64) bool {
-        self.mutex.lock(self.io) catch return false;
+        // Uncancelable: `false` claims "this user has no connection" — the
+        // gateway routes on it (a user it believes offline gets the message
+        // stored instead of pushed) and cannot tell a fabricated answer from the
+        // truth. The critical section is a single hash lookup. Red:
+        // `im.ConnectionRegistry.test.canceled lock wait does not fabricate an
+        // offline reading`.
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
         const entry = self.by_user.getPtr(user_id) orelse return false;
@@ -374,13 +399,20 @@ const Shard = struct {
     }
 
     fn onlineCount(self: *SelfShard) usize {
-        self.mutex.lock(self.io) catch return 0;
+        // Uncancelable: `0` is a count a caller reports as fact (health checks,
+        // metrics, `ConnectionRegistry.onlineCount` sums the shards) and cannot
+        // be told apart from the truth — the same reading `im/BufferPool.zig`'s
+        // `available`/`stats` were changed to stop fabricating.
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return self.by_user.count();
     }
 
     fn onlineUsers(self: *SelfShard, buf: []u64) usize {
-        self.mutex.lock(self.io) catch return 0;
+        // Uncancelable, for the same reason as `onlineCount`: `0` is published as
+        // "no user is online" (the caller's `buf` is left untouched), which a
+        // health check or a broadcast fan-out cannot tell apart from the truth.
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
         var count: usize = 0;
@@ -651,4 +683,125 @@ test "a shard id counter wraps inside its own window, never onto the sentinel" {
     // And it keeps counting from there rather than sitting on the boundary.
     try std.testing.expectEqual(window_base | 1, shard.nextId());
     try std.testing.expectEqual(window_base | 2, shard.next_id);
+}
+
+// `unregisterByConn`'s `catch return false` is not a harmless "no such
+// connection": the caller (`ConnectionRegistry.unregisterByConn` walks the shards
+// with it) reads it as "this id was never registered" and the entry stays in
+// `by_user` with its `ctx` pointing at the session the caller is tearing down —
+// the next `sendToUser` calls `send_fn(entry.*.ctx, …)` on that freed session.
+//
+// The disconnect path is where a cancellation lands: the generated gateway runs
+// `unregisterByConn` from the close handler of a task that may already be
+// canceled, and `std.Io.Mutex.lock` is a cancelation point that then fails
+// immediately (`error.Canceled` is the only error it has).
+//
+// Red evidence: with the old `self.mutex.lock(self.io) catch return false` the
+// assertion below fails — `expected false, found true` — the user is still online
+// after a disconnect that reported success. The lock wait is the cancelation
+// point here: the task is parked on shard 0's mutex (held by the test thread)
+// with a cancel request already placed on its thread, and the gate between the
+// two is pure spinning.
+test "canceled lock wait does not lose a disconnect" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var reg = ConnectionRegistry.init(allocator, io);
+    defer reg.deinit();
+
+    var dummy: u8 = 0;
+    const conn_id = reg.register(0, @ptrCast(&dummy), testSendFn);
+    try std.testing.expect(conn_id != 0);
+
+    const Task = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+
+        fn unregister(r: *ConnectionRegistry, id: u32) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            r.unregisterByConn(id);
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Task.entered.store(false, .monotonic);
+    Task.open.store(false, .monotonic);
+
+    // The test thread holds shard 0's mutex, so the task cannot get past the lock
+    // wait until told to. user_id 0 is shard 0.
+    try reg.shards[0].mutex.lock(io);
+
+    var task_fut = try io.concurrent(Task.unregister, .{ &reg, conn_id });
+    while (!Task.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Task.cancel, .{ io, &task_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Task.open.store(true, .release);
+    // The task is now inside `unregisterByConn`: parked on the mutex (it swaps the
+    // state to `contended` on its way to the wait), or already gone.
+    while (reg.shards[0].mutex.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    reg.shards[0].mutex.unlock(io);
+
+    cancel_fut.await(io);
+    task_fut.await(io);
+
+    try std.testing.expect(!reg.isOnline(0));
+}
+
+// The same defect class in the read-only accessors: `isOnline` answering a
+// canceled lock wait with `false` fabricates "this user has no connection" — a
+// reading the gateway routes on (offline → store the message instead of pushing
+// it). The user is online here, so the reading has to say so.
+//
+// Red evidence: with the old `self.mutex.lock(self.io) catch return false` this
+// fails with `expected true, found false`.
+test "canceled lock wait does not fabricate an offline reading" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var reg = ConnectionRegistry.init(allocator, io);
+    defer reg.deinit();
+
+    var dummy: u8 = 0;
+    try std.testing.expect(reg.register(0, @ptrCast(&dummy), testSendFn) != 0);
+
+    const Task = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+        var seen: bool = false;
+
+        fn read(r: *ConnectionRegistry) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            seen = r.isOnline(0);
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Task.entered.store(false, .monotonic);
+    Task.open.store(false, .monotonic);
+    Task.seen = false;
+
+    try reg.shards[0].mutex.lock(io);
+
+    var read_fut = try io.concurrent(Task.read, .{&reg});
+    while (!Task.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Task.cancel, .{ io, &read_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Task.open.store(true, .release);
+    while (reg.shards[0].mutex.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    reg.shards[0].mutex.unlock(io);
+
+    cancel_fut.await(io);
+    read_fut.await(io);
+
+    try std.testing.expect(Task.seen);
 }

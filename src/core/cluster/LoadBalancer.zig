@@ -123,7 +123,10 @@ pub const LoadBalancer = struct {
                 var best_count: u64 = std.math.maxInt(u64);
 
                 for (peer_list, 0..) |peer, i| {
-                    const count = self.getConnectionCount(peer);
+                    // A peer whose count cannot be read is passed over rather than
+                    // assumed idle (see `getConnectionCount`); with every peer
+                    // unreadable this keeps the previous answer, `peer_list[0]`.
+                    const count = self.getConnectionCount(peer) orelse continue;
                     if (count < best_count) {
                         best_count = count;
                         best_idx = i;
@@ -182,12 +185,26 @@ pub const LoadBalancer = struct {
         try self.canary_peers.append(self.allocator, .{ .id = id_dup, .host = host_dup, .port = port });
     }
 
-    /// Internal: get current connection count for a peer.
-    fn getConnectionCount(self: *const Self, peer: Peer) u64 {
-        // Build key inline; we own the connections map, so use a small buffer.
+    /// Internal: get current connection count for a peer, or `null` when the peer
+    /// cannot be keyed at all. `null` is deliberately not `0`: `.least_connections`
+    /// prefers the smallest count, so collapsing "unreadable" into "idle" sends
+    /// traffic *to* the peer whose count is unknown.
+    fn getConnectionCount(self: *const Self, peer: Peer) ?u64 {
+        // Build key inline; the common case allocates nothing. The fallback below
+        // is the key builder `recordResult` writes with, so both sides agree on
+        // the string — it is only reached for a host nothing can hold on the
+        // stack (longer than any legal name + ":65535").
         var buf: [128]u8 = undefined;
-        const key = std.fmt.bufPrint(&buf, "{s}:{d}", .{ peer.host, peer.port }) catch return 0;
-        return self.connections.get(key) orelse 0;
+        if (std.fmt.bufPrint(&buf, "{s}:{d}", .{ peer.host, peer.port })) |key| {
+            return self.connections.get(key) orelse 0;
+        } else |_| {
+            const owned = peerKey(self.allocator, peer) catch |err| {
+                std.log.warn("[LoadBalancer] cannot key peer {s}:{d} ({s}); it has no comparable connection count", .{ peer.host, peer.port, @errorName(err) });
+                return null;
+            };
+            defer self.allocator.free(owned);
+            return self.connections.get(owned) orelse 0;
+        }
     }
 
     /// Build a peer key string. Caller owns the returned memory.
@@ -436,4 +453,41 @@ test "LoadBalancer deinit frees only the keys the map owns" {
     // free, so the literal never reaches the allocator.
     try std.testing.expectError(error.OutOfMemory, lb.recordResult("10.0.0.1:8080", true));
     try std.testing.expectEqual(@as(usize, 0), lb.connections.count());
+}
+
+// `getConnectionCount` builds the lookup key in a fixed stack buffer and used to
+// report `0` when it did not fit — the same reading as "no connections at all",
+// which is the reading `.least_connections` prefers. A peer whose count cannot be
+// read therefore *attracted* traffic instead of being passed over. The key read
+// here is the one `recordResult` stored, so the two sides have to agree on it;
+// "cannot be read" must not collapse into "idle".
+test "LoadBalancer least_connections: an unreadable count is not read as idle" {
+    const allocator = std.testing.allocator;
+    var disco = PeerDiscovery.init(allocator, .{});
+    defer disco.deinit();
+
+    // Registered first, so "index 0" and "the least loaded peer" differ: the
+    // long-hosted peer carries the higher count and must not be chosen.
+    const long_host = try allocator.alloc(u8, 200);
+    defer allocator.free(long_host);
+    @memset(long_host, 'h');
+
+    try disco.registerService("api", .{ .id = "long", .host = long_host, .port = 8080 });
+    try disco.registerService("api", .{ .id = "short", .host = "10.0.0.1", .port = 8080 });
+
+    var lb = LoadBalancer.init(allocator, .least_connections, &disco);
+    defer lb.deinit();
+
+    const long_key = try std.fmt.allocPrint(allocator, "{s}:8080", .{long_host});
+    defer allocator.free(long_key);
+    for (0..7) |_| try lb.recordResult(long_key, true);
+    try lb.recordResult("10.0.0.1:8080", true);
+
+    // The owning-key fallback is the only allocation left in `next`, and it is
+    // denied: the count is then genuinely unknowable.
+    var probing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    lb.allocator = probing.allocator();
+
+    const picked = lb.next("api") orelse return error.NoPeer;
+    try std.testing.expect(std.mem.eql(u8, picked.host, "10.0.0.1"));
 }

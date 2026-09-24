@@ -114,14 +114,28 @@ pub const ModuleRuntime = struct {
 
     /// Release one bulkhead slot after execution.
     pub fn release(self: *Self) void {
-        self.mu.lock(self.io) catch return;
+        // Uncancelable: this is the hand-back half of `tryEnter`, and an early
+        // `return` here drops the slot it was meant to return. Bulkhead capacity
+        // is finite, so enough canceled releases turn the module into a permanent
+        // "overloaded" that rejects everything — the same shape `pool/Pool.zig`'s
+        // `release` and `im/BufferPool.zig`'s `release` were changed to fix. There
+        // is no error channel (`void`) and the critical section is one decrement.
+        // Red: `core.ModuleRuntime.test.canceled lock wait does not lose a
+        // bulkhead slot` fails on the old `catch return` with `expected 0, found 1`.
+        self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
 
         if (self.bulkhead) |*bh| bh.release();
     }
 
     pub fn recordSuccess(self: *Self) void {
-        self.mu.lock(self.io) catch return;
+        // Uncancelable: a dropped success record is not a skipped bookkeeping
+        // update — the breaker counts it, and in HALF_OPEN that success budget is
+        // what closes the circuit again, so enough dropped records keep the
+        // module rejecting traffic that is in fact succeeding. This runs from the
+        // handler path (`void`, no error channel), where a `defer`/`errdefer` in
+        // an already-canceled task is exactly when a canceled `lock` returns.
+        self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
 
         if (self.circuit_breaker) |*cb| {
@@ -130,7 +144,12 @@ pub const ModuleRuntime = struct {
     }
 
     pub fn recordFailure(self: *Self) void {
-        self.mu.lock(self.io) catch return;
+        // Uncancelable, the mirror of `recordSuccess`: a dropped failure record is
+        // a failure the breaker never sees, so it stays CLOSED (or keeps granting
+        // HALF_OPEN probes) while the dependency is failing. `void`, no error
+        // channel, called on the handler path where a cancellation may already be
+        // pending.
+        self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
 
         if (self.circuit_breaker) |*cb| {
@@ -171,7 +190,12 @@ pub const ModuleRuntime = struct {
     }
 
     pub fn getStats(self: *Self) Stats {
-        self.mu.lock(self.io) catch return .{};
+        // Uncancelable: `return .{}` fabricates an all-healthy reading — "nothing
+        // active, nothing ever rejected, breaker CLOSED, no worker pool" — which
+        // an operator or a scrape hook acts on and which cannot be told apart
+        // from the truth. Red: `core.ModuleRuntime.test.canceled lock wait does
+        // not fabricate an all-idle stats reading` (`expected 1, found 0`).
+        self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
 
         var stats: Stats = .{};
@@ -366,4 +390,122 @@ test "ModuleRuntime creates worker pool from worker_count" {
     while (Ctx.counter.load(.monotonic) < 1) {
         std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
+}
+
+// `release` is the handler handing its bulkhead slot back — the caller pairs every
+// successful `tryEnter` with it, usually from a `defer`. A canceled lock wait that
+// answers with `catch return` does not just skip a bookkeeping update: the slot is
+// never returned, so `bulkhead_active` stays up until the module's bulkhead
+// rejects everything (capacity is finite). Same shape as `pool/Pool.zig`'s
+// `release` and `im/BufferPool.zig`'s `release`.
+//
+// Red evidence: with the old `self.mu.lock(self.io) catch return` the assertion
+// below fails with `expected 0, found 1` — the slot is still taken. The lock wait
+// is the cancelation point: the task is parked on `rt.mu` (held by the test
+// thread) with a cancel request already placed on its thread.
+test "canceled lock wait does not lose a bulkhead slot" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var rt = try ModuleRuntime.init(allocator, io, "canceled-release", .{
+        .max_concurrent = 1,
+        .cb_failure_threshold = 0,
+    });
+    defer rt.deinit();
+
+    try std.testing.expect(rt.tryEnter());
+    try std.testing.expectEqual(@as(u32, 1), rt.bulkhead.?.getActiveCount());
+
+    const Harness = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+
+        fn release(r: *ModuleRuntime) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            r.release();
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Harness.entered.store(false, .monotonic);
+    Harness.open.store(false, .monotonic);
+
+    try rt.mu.lock(io);
+
+    var task_fut = try io.concurrent(Harness.release, .{&rt});
+    while (!Harness.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Harness.cancel, .{ io, &task_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Harness.open.store(true, .release);
+    while (rt.mu.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    rt.mu.unlock(io);
+
+    cancel_fut.await(io);
+    task_fut.await(io);
+
+    // Read through the bulkhead itself, not `getStats`: `getStats` has the same
+    // defect and answers a canceled wait with an all-zero struct, which would hide
+    // both the leak and the fix.
+    try std.testing.expectEqual(@as(u32, 0), rt.bulkhead.?.getActiveCount());
+}
+
+// `getStats` answering a canceled lock wait with `return .{}` fabricates
+// "nothing is active, no rejection was ever counted, the breaker is CLOSED" — a
+// reading an operator or a scrape hook acts on, and one that cannot be told apart
+// from a healthy module. The module holds one active slot here.
+//
+// Red evidence: with the old `self.mu.lock(self.io) catch return .{}` this fails
+// with `expected 1, found 0`.
+test "canceled lock wait does not fabricate an all-idle stats reading" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var rt = try ModuleRuntime.init(allocator, io, "canceled-stats", .{
+        .max_concurrent = 2,
+        .cb_failure_threshold = 0,
+    });
+    defer rt.deinit();
+
+    try std.testing.expect(rt.tryEnter());
+
+    const Harness = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+        var seen_active: u32 = 0;
+
+        fn read(r: *ModuleRuntime) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            seen_active = r.getStats().bulkhead_active;
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Harness.entered.store(false, .monotonic);
+    Harness.open.store(false, .monotonic);
+    Harness.seen_active = 0;
+
+    try rt.mu.lock(io);
+
+    var read_fut = try io.concurrent(Harness.read, .{&rt});
+    while (!Harness.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Harness.cancel, .{ io, &read_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Harness.open.store(true, .release);
+    while (rt.mu.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    rt.mu.unlock(io);
+
+    cancel_fut.await(io);
+    read_fut.await(io);
+
+    try std.testing.expectEqual(@as(u32, 1), Harness.seen_active);
 }

@@ -402,7 +402,10 @@ WS：`pub const ws_routes = [_]http.WsSpec(State){ .{ .path = "ws", .on_connect 
 源自 `docs/ISSUES_FROM_ZAPI.md`（zapi 落地反馈）：
 
 - **Catalog 是唯一 bypass 真相（M1/M3）**：`authFromCatalog(&slot, backend, .{})` 包住任意
-  `AuthBackend`（`verifyFn(ctx) → ?Identity`），只有 `RouteMeta.auth == .public`（或 legacy
+  `AuthBackend`（真实签名 `verifyFn(ctx, user_data) anyerror!bool` —— 返回 `true` 表示凭证有效、
+  `false` 表示**可判定的**无效凭证（401），返回**错误**表示"我们这侧无法完成校验"（分配失败、
+  后端存储故障 → 5xx）；内置 `jwtBackend` 对未知 `kid` 仍回 `false` 但会打一条 warn），
+  只有 `RouteMeta.auth == .public`（或 legacy
   skip-prefix）才跳过验签 —— 消费端**不要再维护** `public_paths.zig` 之类的并行清单。
   内置 `http.jwtBackend(&sec)` / `http.jwtBackendWithPermissions(&sec, loader)`（≡
   `jwtAuthFromCatalogWithPermissions`）；Redis/token-service 等自定义后端实现同一形状即可。
