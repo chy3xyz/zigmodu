@@ -228,12 +228,26 @@ pub const Scheduler = struct {
     /// `error.Canceled`, never as a lock-machinery name, because that is the only
     /// way `std.Io.Mutex.lock` fails. Nothing is allocated before the lock is
     /// held, so a canceled wait leaves nothing behind.
+    ///
+    /// A failed copy unwinds the whole call: the names already written into the
+    /// slice are freed along with it, because a caller that only sees
+    /// `error.OutOfMemory` cannot reach a prefix it was never handed. Red:
+    /// `scheduler.Cron.test.listJobNames frees the names it already copied when a
+    /// later copy fails` leaks the 5-byte name and reads `expected 37, found 32`
+    /// on `allocated_bytes`.
     pub fn listJobNames(self: *Scheduler, allocator: std.mem.Allocator) ![][]const u8 {
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
         const out = try allocator.alloc([]const u8, self.jobs.items.len);
-        errdefer allocator.free(out);
-        for (self.jobs.items, 0..) |job, i| out[i] = try allocator.dupe(u8, job.name);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |name| allocator.free(name);
+            allocator.free(out);
+        }
+        for (self.jobs.items, 0..) |job, i| {
+            out[i] = try allocator.dupe(u8, job.name);
+            filled = i + 1;
+        }
         return out;
     }
 
@@ -778,4 +792,45 @@ test "canceled lock wait does not skip a due tick" {
     task_fut.await(io);
 
     try std.testing.expectEqual(@as(usize, 1), Task.runs.load(.monotonic));
+}
+
+// `listJobNames` freed the result slice when a name copy failed but not the
+// names already copied into it. With two jobs, a failure on the second copy left
+// "alpha" allocated in a slice the caller never received: `error.OutOfMemory` is
+// all it got back, so it had nothing to free and no way to reach the name — a
+// leak on every failable call.
+//
+// Allocation #0 is the result slice and #1..#N the name copies, so failing #2 is
+// exactly "one name was already in the list". Red evidence: without the loop
+// `errdefer` this test fails twice over: `[SafeAllocator] (err): leaked [addr:
+// …, len: 5 (0x5) align: 1]` points at the copy in this function, and the byte
+// check below reads `expected 37, found 32`.
+test "listJobNames frees the names it already copied when a later copy fails" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const Noop = struct {
+        fn run(_: *anyopaque) void {}
+    };
+
+    var sched = Scheduler.init(allocator, io);
+    defer sched.deinit();
+    var ctx_a: u8 = 0;
+    var ctx_b: u8 = 0;
+    const schedule = try Expression.parse("* * * * *");
+    try sched.addJob("alpha", schedule, Noop.run, &ctx_a);
+    try sched.addJob("bravo", schedule, Noop.run, &ctx_b);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 2 });
+    try std.testing.expectError(error.OutOfMemory, sched.listJobNames(failing.allocator()));
+    try std.testing.expect(failing.has_induced_failure);
+    // The name copied before the failure and the slice holding it are both back,
+    // so the caller owes nothing and the harness finds nothing.
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+
+    // The failed read left the scheduler alone: both jobs still list.
+    const names = try sched.listJobNames(allocator);
+    defer allocator.free(names);
+    defer for (names) |n| allocator.free(n);
+    try std.testing.expectEqual(@as(usize, 2), names.len);
 }

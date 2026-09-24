@@ -2,6 +2,99 @@
 
 ## [Unreleased]
 
+### 第 23 批：`src/ai/*` 的 `LockFailed` 家族清零（24 处）、未知节点的 `.leave` 被当成 join、`nodesSnapshot` 的截断改成确定性、publish span 的**无界增长**（128 次发布＝128 个活 span）、`RouteParams.MAX` 改成注册期报错（**破坏性：否**，但错误集与两处行为变了）
+
+全量 `-Ddb=all` **1914/1972（58 skipped，0 failed）**；`-Ddb=sqlite`（脚本默认）**1913/1972（59 skipped，0 failed）**；
+CI 的示例清单本机 16/16；Redis 门控真机 5/5（`addNode` 的真机往返用例）。
+
+**`src/ai/*` 里那批自造的错误名全部删掉，改为 `error.Canceled`（24 处）。** `std.Io.Mutex.lock` **唯一**的错误
+就是 `error.Canceled`，而把取消答成 `error.LockFailed`/`RegistryLockFailed`/`QuotaLockFailed`/
+`RateLimitLockFailed` 是在报告"锁机制坏了"。逐处判定后：23 处**传播** `error.Canceled`（这些函数都有错误
+通道，且取消发生在进入临界区**之前**，什么都没丢），1 处（`approval_api.count`，返回 `usize`、伪造的 `0`
+读作"没有待审批"）改为**不可取消的等待**。八个文件都是先红后绿，红证据形如
+```
+ai.key_pool.test.acquire, enableKey and snapshot report a canceled lock wait as error.Canceled...expected error.Canceled, found error.LockFailed
+（另七个文件同形；quota/skill/provider 各是自己那个名字）
+```
+顺带**两处新缺陷**：`audit.snapshot` 的两个**泄漏**（`out` 没有 `errdefer`；同一个 struct literal 里
+`.tool_name`/`.detail` 两个 dupe，后者失败会孤立前者 —— 第一版修复被新用例当场打红，`leaked [len: 14]`，
+才改对）；`approval_api.count` 的伪造 `0`。
+> **兼容成本**：错误集都是**推断**的，所以仓内零改动、外部按名字 `catch` 旧标签的代码会编译不过
+> （诚实）。`UPGRADING` 已把这四组旧名字与替换后的 `error.Canceled` 写清楚。
+
+**`key_pool.zig:128` 的泄漏（上一批点名的那条）。** `try owned.append(allocator, .{ .key = try allocator.dupe(u8, k) })`：
+`dupe` 成功而 `append` 扩容失败时，那把 key 还没进 `owned.items`，它的 `errdefer` 看不到它。改为把拷贝提到
+局部变量并先挂 `errdefer`。红证据（`fail_index 8/33`、`leaked [len: 4]`，栈顶 `key_pool.zig:128 →
+provider_registry.zig:189 KeyPool.init`）。同时把那个为了保持绿而留空的 `api_keys` 参数**重新填上**。
+
+**未知节点的 `.leave` 不再被当成 join。** `handleGossipEvent` 的未知节点分支先以 `.healthy` 插入（**触发
+join 回调 + `bus.connectToNode`**），随后 leave 块再翻成 `.leaving` —— 于是 census 永久多一个"只说过再见的
+对端"、虚发一次 join 回调、并向一个**已经离开**的节点拨号。红证据：
+`a leave from an unknown node is not a join...expected 1, found 2`（census 被塞了鬼影）。
+修法：未知 + `.leave` **提前返回**（记一条 info、`bus.disconnectNode` 幂等清理显式 seed 建的连接），
+**不记录、不计数、不回调、不拨号**；leave 处理移进"已知节点"分支。**语义决定是"完全不记录"而不是记成
+`.leaving`**，理由里最硬的一条：留下条目会让该 id 之后**真正的 join** 走"已知节点"分支 —— 只翻状态、
+**不触发 join 回调、不 `connectToNode`**，于是"视图说它健康、总线却没连它"；忽略才保留完整 join 路径
+（用例专门钉住这一点）。顺带把 failure detector 的 `fd.heartbeat` 对 `.leave` 关掉（道别不是存活样本）。
+
+**`nodesSnapshot` 的截断从"任意子集"改成确定性选择 —— 这是本批最锋利的一处。** 先纠正一个前提：
+`MembershipView.sync` 里那个 `@min(..., max_members)` 是**空操作**（`nodesSnapshot` 的缓冲区本身就是
+`[max_members]ClusterNode`），真正的截断在 `nodesSnapshot` 内部，而且是 **hash 迭代顺序**的任意子集 ——
+不是"随机"，而是"与谁活着完全无关"：census 没变、被挤掉的人却会换。
+后果不是理论上的：`pick`/`pickRanked` 只对**视图里的** healthy 成员做 rendezvous，所以**被截掉的健康节点
+永远收不到请求**，极端情况下视图里全是 dead 而 `pick` 返回 null，尽管集群里有健康节点。
+红证据（容量 2、census 里 3 个成员含 1 个 `.failed`）：`sync over capacity keeps the healthy
+members...expected 2, found 1`（任意子集**确凿地**把健康成员挤掉、换上一个 `.failed`）、
+`sync over capacity counts the drop instead of refusing...expected 2, found 0`（丢弃完全静默）。
+修法：`nodesSnapshot` 改为**有界插入排序**（先 healthy、再 suspect、再 failed/leaving，同类内 id 升序，
+O(census × out.len)、零分配），`out` 的顺序**就是**选择结果；`MembershipView` 去掉那个 no-op 的 `@min`，
+用 census 计数算出 `dropped`，**首次**打一条 warn（含 census/容量/发布数/丢弃数与 sizing 建议）并把
+`dropped`/`truncated_ticks` 暴露出来。
+> 为什么不"像 `publishNodes` 那样拒绝"：`ClusterBootstrap.tick` 会把非 `ReadersBusy` 错误往外抛，
+> 而 census 永不缩小 ⇒ 每个 tick 都失败、视图冻结在过期代上而 `pick` 继续把流量发给已死的对端。
+
+**`AutoInstrumentation` 的 publish span 是**无界增长**（不是那张 map）。** 上一批把"那张 map 从不删条目"
+记为待办，这次测准了事实：map 的界是"不同 `event:module` 对数"（由源码写死），**真正随流量长的是 tracer**
+—— 每次 publish 都造一个新 span 追加进 `tracer.active_spans`，`put` 覆盖 map 的值、被换下来的 span 一直
+挂着：**128 次同 pair 发布 → tracer 里 128 个活 span**（红证据 `expected 0, found 128`），而且第 2 次起每次
+还把旧的 **key 泄掉**（`leaked [len: 20]`）。修法：publish 结束时**当场 `endSpan`**（publish 到这儿本来就
+结束了；`startSpan` 按值 copy trace/span id，已结束的 span 仍是合法 parent），用 `getPtr`+`put` 替换条目，
+两类条目加显式 key 前缀，`deinit` 只释放 publish 那一类。测试钉住：同一 pair 发 128 次 + 再加 2 个 pair →
+map 恰好 3 条、tracer 0 个 span，且 consume 仍带非空 `parent_span_id`（证明结束 parent 没毁掉调用链）。
+> 中途踩的坑值得记：第一版用 `fetchPut` 并释放"被替换的 key"，结果 panic —— `fetchPutContext` 对**已存在**
+> 的条目只写 value、**不写 key**，它返回的是 map 仍持有的那把 key，free 它等于 free 活指针。
+
+**`PrometheusMetrics` 的锁失败分支：`&family.overflow` 既说了错话、又是隐形的。** 两处 `get` 都没有错误
+通道，老代码 `catch return &self.overflow` 把"调用方被取消"说成 `__other__`（该序列的文档含义是"这个 label
+值开不出自己的序列"），**而且那条路径从不置 `overflow_used`** —— 这次计数落进一个根本不渲染的计数器。
+`std.Io.Mutex.lock` 唯一的错误是 `error.Canceled`，临界区只是 dupe/create/hash-put、内部没有 io 等待，
+所以改为 `lockUncancelable`（与仓库既有家规一致）。红证据：
+`a canceled lock wait does not answer with the overflow series...FAIL (TestUnexpectedResult)`。
+
+**`RouteParams.MAX = 8` 从"每请求 404"改成"注册期报错"。** 超过 8 个参数的路径以前永远匹配不上（静默 404），
+现在 `Router.addRoute` 在**碰 trie 之前**数 `{…}` 段并返回 `error.TooManyRouteParams` —— 启动失败而不是
+运行期永久 404。红证据（临时注释掉那条检查）：
+`registering a route with more parameters than RouteParams.MAX is refused...expected error.TooManyRouteParams, found void`。
+依据：全仓扫过所有路由字面量，最宽的是 **2** 个参数（`/users/{id}/posts/{post}`，`Server.zig` 里的一个测试），
+0 个 ≥3 —— 8 已经是它的 4 倍，不需要扩表（扩表要给每个请求的栈都加宽，只为覆盖当前无人使用的形状）。
+> 没有采纳"删掉 `MatchedRoute.deinit` 这个 no-op"：试过并**回退**了 —— 它是**两个**真实调用点
+> （`ComptimeRouter` 的 catalog 测试 + `examples/ai-ops/src/main.zig:227` 的 `defer`），删掉后编译错正是从
+> **示例**里冒出来的（`no field or member function named 'deinit'`）。注释已改成点名两个调用点。
+
+**另两处泄漏（上一批点名的）**：`Cron.listJobNames`（`errdefer` 只释放外层切片，已复制进去的名字会漏；
+红：`leaked [len: 5]` + `expected 37, found 32`）、`web4.challenge.issue`（`did` 与 challenge 两个 dupe 是
+`put` 的实参，任一失败或插入增长失败都会把它们悬在那里；红：`leaked [len: 13]`）。
+
+> **未修（有依据地）**：`EventRegistry.busCount()` 的**数据竞争已核实为真**（无锁读 `buses.count()` 的
+> `size`，而 `bus()` 在锁内自增；仓内无调用者，外部可用）—— 不在本批的编辑范围；
+> `memory.forget` 里 `storageKey(...) catch return` 的 OOM 会静默丢掉一次删除（含隐私删除，`void` 无通道）；
+> 未知 id 的 `.suspect`/`.leader_election` **仍**走 join 路径（判断：宣布"某人可疑/选举"本身就蕴含成员身份，
+> 且本文件对远端 suspect 判决从不采信）；对端从 `.failed` 恢复时只翻状态**不重连**（与 `checkNodeHealth`
+> 失败时的 `disconnectNode` 不对称）。
+> **未复现**：有 agent 报告 `test-fast.sh` 默认（`-Ddb=sqlite`）**两次**在 `[stress] RESULT: PASS` 之后卡住；
+> 我跑了 `test-fast.sh` 默认一次（1913/1972 全绿、exit 0）与 `zig build runtime-stress` **10 次**（0 挂、0 失败），
+> **未能复现** —— 当时的并发编辑是更可能的原因，但这条不能算"已解释"。
+
 ### 第 22 批：`ProviderLease` 的 use-after-free（真红，`0x55` 就是被释放内存）、`RedisCluster.addNode` 的 OOM 清理（顺带查出同路径第二个泄漏）、失败节点退役的决策、无类型 `EventBus` 的 `AssumeCapacity` 写越界（**破坏性：是**，1 处公开签名）
 
 全量 `-Ddb=all` **1897/1955（58 skipped，0 failed）**；CI 的示例清单本机 **16/16** 构建通过；Redis 门控真机 20/20。
@@ -135,8 +228,13 @@ thread … panic: integer overflow    @ src/core/EventBus.zig:139 … in subscri
 `match` 现在填一个固定的 ≤8 对参数表，**借用** trie 里的参数名（router 所有，只在 `Router.deinit` 释放）
 与路径的子切片 —— **不分配，所以不可能失败**，`null` 重新只表示"没有这条路由"；"复制成自有"移到**有错误
 通道的调用方**（`connFiber` 回 500）。请求路径的总分配数不变，只是从 `match` 移到了能报告它的那一层。
-`MatchedRoute.deinit` 保留为显式 no-op，只为不动那个出范围的 `ComptimeRouter.zig` 调用点。
-> 记录：`RouteParams.MAX = 8` 仍是"超过 8 个参数的路径会 404"（既有，已就地写明）。
+`MatchedRoute.deinit` 保留为显式 no-op：**它有两个**真实的调用点（`ComptimeRouter.zig` 的 catalog
+> 测试，以及 `examples/ai-ops/src/main.zig:227` 的 `defer`），删它要先动那个示例（第 23 批试过并回退了 ——
+> 编译错正是从示例里冒出来的）。
+> **已跟进（第 23 批）**：`RouteParams.MAX = 8` 不再表现为"每请求 404" —— `Router.addRoute` 现在在**注册期**就
+> 数路径里的 `{…}` 段，超过 8 个返回 `error.TooManyRouteParams`（**启动失败**而不是静默的永久 404）。
+> 依据：全仓扫过所有路由字面量，最宽的是 **2** 个参数（`/users/{id}/posts/{post}`，`Server.zig` 的一个测试），
+> 8 已经是它的 4 倍，所以不需要扩表；而扩表会把每个请求的栈都撑大，只为覆盖当前无人使用的形状。
 
 **两处 metrics 缺陷。** ① **`ModuleMetricsCollector` 的同一个桩时钟**（上一批刚修过
 `AutoInstrumentation`）：`module_start_time = 0` 且 `getUptimeSeconds()` 返回 `0 - start` = **恒 0**，

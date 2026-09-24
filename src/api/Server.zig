@@ -1917,6 +1917,18 @@ fn normalizeRoutePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "/{s}", .{trimmed});
 }
 
+/// How many `{name}` segments a route path carries — the parameters a match
+/// would have to capture, counted the way the trie counts them (`TrieNode.init`
+/// treats a segment as a parameter when it starts with `{`).
+fn countPathParams(path: []const u8) usize {
+    var count: usize = 0;
+    var parts = std.mem.splitScalar(u8, path, '/');
+    while (parts.next()) |part| {
+        if (part.len > 0 and part[0] == '{') count += 1;
+    }
+    return count;
+}
+
 /// Router for matching routes using a trie
 const Router = struct {
     allocator: std.mem.Allocator,
@@ -1948,6 +1960,12 @@ const Router = struct {
         self.* = undefined;
     }
 
+    /// Register a route. A path with more parameters than `RouteParams` can hold
+    /// is refused here rather than at match time: it is a property of the route,
+    /// known while it is being registered, and the request path has no way to
+    /// report it — `match` answers `null`, i.e. a 404 for a route the caller
+    /// believes it registered. Registration runs at startup, so the refusal is a
+    /// startup error (and `Router.addRoute` already returns an error union).
     pub fn addRoute(self: *Router, route: Route) !void {
         // Wildcard route: catch-all for any path under this method
         if (std.mem.eql(u8, route.path, "*")) {
@@ -1957,6 +1975,10 @@ const Router = struct {
             try self.wildcards.put(route.method, r);
             return;
         }
+
+        // Before the trie is touched: a rejection must not leave the partial
+        // node chain of a route that will never be usable.
+        if (countPathParams(route.path) > RouteParams.MAX) return error.TooManyRouteParams;
 
         const root = try self.getOrCreateRoot(route.method);
 
@@ -2041,9 +2063,11 @@ const Router = struct {
                 }
                 return null;
             } else if (current.findParamChild()) |param_child| {
-                // A route with more parameters than `RouteParams` can hold is
-                // not expressible; that limit has always answered `null`, and it
-                // is a property of the route, not of this request's memory.
+                // Unreachable for anything `addRoute` accepted — it refuses a
+                // path with more than `RouteParams.MAX` parameters, at
+                // registration, where the limit is knowable. Kept as the bound
+                // on the arrays below so an insert that skips that check cannot
+                // write past them.
                 if (params.count >= RouteParams.MAX) return null;
                 params.keys[params.count] = param_child.param_name.?;
                 params.values[params.count] = part;
@@ -2110,6 +2134,12 @@ fn collectRoutes(
 /// There is nothing to release and nothing here that can fail — see
 /// `Router.match` for why that is the point.
 const RouteParams = struct {
+    /// The most parameters one route may carry. It bounds the two arrays below
+    /// and therefore the size of every `MatchedRoute`, which `match` returns by
+    /// value — that is why it is a limit rather than a fallback allocation on a
+    /// per-request path. `Router.addRoute` refuses a longer path up front
+    /// (`error.TooManyRouteParams`, at startup), and the widest route in this
+    /// repo uses two (`/users/{id}/posts/{post}`, this file's `match` test).
     pub const MAX = 8;
 
     keys: [MAX][]const u8 = undefined,
@@ -2150,10 +2180,11 @@ const MatchedRoute = struct {
 
     /// Releases nothing, and there is nothing a caller could forget to do:
     /// `params` borrows the trie's node names and slices of the path it was
-    /// matched against, and the route belongs to the router. It stays because
-    /// callers tear a match down through it — `ComptimeRouter`'s catalog test
-    /// does — and removing it would be a compile break for a step that was
-    /// already a no-op in effect.
+    /// matched against, and the route belongs to the router. It is not
+    /// call-site-free: `ComptimeRouter`'s catalog test and
+    /// `examples/ai-ops/src/main.zig` tear a match down through it, and the
+    /// example list is built in CI — deleting it breaks an application that
+    /// copied the shape. Kept as the explicit "there is nothing here" answer.
     pub fn deinit(self: *MatchedRoute, allocator: std.mem.Allocator) void {
         _ = self;
         _ = allocator;
@@ -3871,6 +3902,45 @@ test "Router match answers from the tree and the path, not the heap" {
         // channel, so the fix is to make none of them happen.
         try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     }
+}
+
+// A route with more parameters than `RouteParams.MAX` cannot ever match: the
+// trie accepted the path, registration reported nothing, and `match` answered
+// `null` for every request — a 404 for a route the application believes it
+// registered. The limit is a property of the route and registration is where it
+// is knowable, so it is refused there, before the trie is touched.
+//
+// Red evidence: with the `addRoute` check removed, the `expectError` below reads
+// `expected error.TooManyRouteParams, found void` — the route registers — and the
+// nine-segment request that follows matches nothing.
+test "registering a route with more parameters than RouteParams.MAX is refused" {
+    const allocator = std.testing.allocator;
+    const Handle = struct {
+        fn handle(_: *Context) anyerror!void {}
+    };
+
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    // `MAX` itself still registers and matches: the limit is exclusive.
+    try router.addRoute(.{
+        .method = .GET,
+        .path = "/a/{p1}/b/{p2}/c/{p3}/d/{p4}/e/{p5}/f/{p6}/g/{p7}/h/{p8}",
+        .handler = Handle.handle,
+    });
+    const matched = router.match(allocator, .GET, "/a/v1/b/v2/c/v3/d/v4/e/v5/f/v6/g/v7/h/v8");
+    try std.testing.expectEqual(@as(usize, 8), matched.?.params.count);
+    try std.testing.expectEqualStrings("v8", matched.?.params.get("p8").?);
+
+    // One past it is a startup error, not a per-request 404.
+    try std.testing.expectError(error.TooManyRouteParams, router.addRoute(.{
+        .method = .GET,
+        .path = "/a/{p1}/b/{p2}/c/{p3}/d/{p4}/e/{p5}/f/{p6}/g/{p7}/h/{p8}/i/{p9}",
+        .handler = Handle.handle,
+    }));
+    // Refused before the trie was touched, so the rejection leaves no half-built
+    // route behind.
+    try std.testing.expect(router.match(allocator, .GET, "/a/v1/b/v2/c/v3/d/v4/e/v5/f/v6/g/v7/h/v8/i/v9") == null);
 }
 
 test "http methods" {

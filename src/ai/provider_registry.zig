@@ -149,7 +149,7 @@ pub const ProviderRegistry = struct {
         api_keys: []const []const u8,
         opts: ProviderOpts,
     ) !void {
-        self.mutex.lock(io) catch return error.LockFailed;
+        try self.mutex.lock(io);
         defer self.mutex.unlock(io);
         try self.registerLocked(io, name, endpoint, api_keys, opts);
     }
@@ -226,7 +226,7 @@ pub const ProviderRegistry = struct {
     /// pool it was taken from) until `deinit`, whether or not the provider is
     /// replaced in the meantime.
     pub fn acquire(self: *Self, io: std.Io, model: []const u8) !ProviderLease {
-        self.mutex.lock(io) catch return error.LockFailed;
+        try self.mutex.lock(io);
         defer self.mutex.unlock(io);
         const lease = try self.acquireLocked(io, model);
         return lease;
@@ -286,14 +286,14 @@ pub const ProviderRegistry = struct {
     }
 
     pub fn enableProvider(self: *Self, io: std.Io, name: []const u8, enabled: bool) !void {
-        self.mutex.lock(io) catch return error.LockFailed;
+        try self.mutex.lock(io);
         defer self.mutex.unlock(io);
         const idx = self.by_name.get(name) orelse return error.ProviderNotFound;
         self.providers.items[idx].enabled = enabled;
     }
 
     pub fn enableKey(self: *Self, io: std.Io, provider: []const u8, key_index: usize) !void {
-        self.mutex.lock(io) catch return error.LockFailed;
+        try self.mutex.lock(io);
         defer self.mutex.unlock(io);
         const idx = self.by_name.get(provider) orelse return error.ProviderNotFound;
         try self.providers.items[idx].pool.enableKey(io, key_index);
@@ -302,7 +302,7 @@ pub const ProviderRegistry = struct {
     /// Snapshot the provider table (owned by the caller). Live providers only —
     /// a replaced one is retired, not registered (see `register`).
     pub fn listProviders(self: *Self, io: std.Io, allocator: std.mem.Allocator) ![]ProviderInfo {
-        self.mutex.lock(io) catch return error.LockFailed;
+        try self.mutex.lock(io);
         defer self.mutex.unlock(io);
 
         var out = std.ArrayList(ProviderInfo).empty;
@@ -489,34 +489,169 @@ test "a lease survives a registration that moves the provider list" {
 }
 
 test "every allocation failure inside register and deinit is reported and leaks nothing" {
-    // `api_keys` is empty on purpose: a failed `register` in the *keyed* case
-    // currently leaks the key string inside `key_pool.KeyPool.init`
-    // (`owned.append(allocator, .{ .key = try allocator.dupe(u8, k) })` — the
-    // dupe succeeds, the append's growth fails, and the errdefer only knows
-    // about `owned.items`). That is a pre-existing defect in `key_pool.zig`,
-    // not in this file, and it would mask the ownership paths this test is for.
+    // `api_keys` is non-empty on purpose: the keyed register is the only path
+    // that reaches `KeyPool.init`'s two-statement `try owned.append(allocator,
+    // .{ .key = try allocator.dupe(u8, k) })`. The dupe succeeds while the append
+    // grows, and only then can the append fail — at which point the duplicated
+    // key is not yet in `owned.items` and the pool's `errdefer` cannot see it
+    // (red: this test with `api_keys` empty passed, with one key it reported
+    // `leaked [len: 4]` through the fail index that lands on the append).
     const Scan = struct {
         fn run(allocator: std.mem.Allocator) !void {
             var reg = ProviderRegistry.init(allocator);
             defer reg.deinit();
-            // New provider: strings, pool, entry box, list slot, by_name entry.
-            try reg.register(std.testing.io, "p", "https://p/v1/chat/completions", &.{}, .{
+            // New provider: strings, pool (with its owned keys), entry box, list
+            // slot, by_name entry.
+            try reg.register(std.testing.io, "p", "https://p/v1/chat/completions", &.{"sk-p"}, .{
                 .models = &.{ "m1", "m2" },
                 .fallback_providers = &.{"q"},
             });
             // Replacement: the replaced box must reach `retired` (or be freed
             // when the move to `retired` itself fails) and be freed by `deinit`.
-            try reg.register(std.testing.io, "p", "https://p2/v1/chat/completions", &.{}, .{
+            try reg.register(std.testing.io, "p", "https://p2/v1/chat/completions", &.{"sk-p2"}, .{
                 .models = &.{"m1"},
             });
             // A second provider: the append + by_name path for a name that is
             // not a replacement.
-            try reg.register(std.testing.io, "q", "https://q/v1/chat/completions", &.{}, .{
+            try reg.register(std.testing.io, "q", "https://q/v1/chat/completions", &.{ "sk-q1", "sk-q2" }, .{
                 .models = &.{"m1"},
             });
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Scan.run, .{});
+}
+
+/// Park `read` on `mutex` with a cancel request already placed on its thread, then
+/// let it through: the lock wait becomes the cancelation point. `std.Io.Mutex.lock`'s
+/// uncontended fast path does not check for cancellation, so it is the contended
+/// wait that can come back canceled.
+fn readUnderCanceledLockWait(
+    comptime T: type,
+    target: *T,
+    mutex: *std.Io.Mutex,
+    io: std.Io,
+    comptime read: fn (*T) void,
+) !void {
+    const Gate = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+
+        fn run(t: *T) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            read(t);
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Gate.entered.store(false, .monotonic);
+    Gate.open.store(false, .monotonic);
+
+    try mutex.lock(io);
+
+    var read_fut = try io.concurrent(Gate.run, .{target});
+    while (!Gate.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Gate.cancel, .{ io, &read_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Gate.open.store(true, .release);
+    while (mutex.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    mutex.unlock(io);
+
+    cancel_fut.await(io);
+    read_fut.await(io);
+}
+
+// The five registry waits that have an error channel: `register`, `acquire`,
+// `enableProvider`, `enableKey` and `listProviders` all return errors and abandon
+// nothing when the wait is canceled *before* the critical section (no provider is
+// registered, retired or copied; no key is enabled; no lease is issued), so the
+// cancelation is propagated as `error.Canceled`. The old `error.LockFailed` named
+// lock-machinery failure for it. (`retiredCount` above returns `usize`, so it
+// waits.)
+//
+// Red evidence: with `catch return error.LockFailed` the first assertion below
+// reads `expected error.Canceled, found error.LockFailed`. The rest are the same
+// lock shape; a `try` ends the test at the first failure, so they are only
+// exercised green.
+test "register, acquire, enableProvider, enableKey and listProviders report a canceled lock wait as error.Canceled" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var reg = ProviderRegistry.init(allocator);
+    defer reg.deinit();
+    try reg.register(io, "p", "https://p/v1/chat/completions", &.{"sk-p"}, .{ .models = &.{"m"} });
+
+    const RegisterRead = struct {
+        var seen: ?anyerror = null;
+        fn read(r: *ProviderRegistry) void {
+            seen = null;
+            r.register(std.testing.io, "q", "https://q/v1/chat/completions", &.{}, .{}) catch |err| {
+                seen = err;
+            };
+        }
+    };
+    RegisterRead.seen = null;
+    try readUnderCanceledLockWait(ProviderRegistry, &reg, &reg.mutex, io, RegisterRead.read);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), RegisterRead.seen);
+
+    const AcquireRead = struct {
+        var seen: ?anyerror = null;
+        fn read(r: *ProviderRegistry) void {
+            seen = null;
+            _ = r.acquire(std.testing.io, "m") catch |err| {
+                seen = err;
+                return;
+            };
+        }
+    };
+    AcquireRead.seen = null;
+    try readUnderCanceledLockWait(ProviderRegistry, &reg, &reg.mutex, io, AcquireRead.read);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), AcquireRead.seen);
+
+    const EnableProviderRead = struct {
+        var seen: ?anyerror = null;
+        fn read(r: *ProviderRegistry) void {
+            seen = null;
+            r.enableProvider(std.testing.io, "p", false) catch |err| {
+                seen = err;
+            };
+        }
+    };
+    EnableProviderRead.seen = null;
+    try readUnderCanceledLockWait(ProviderRegistry, &reg, &reg.mutex, io, EnableProviderRead.read);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), EnableProviderRead.seen);
+
+    const EnableKeyRead = struct {
+        var seen: ?anyerror = null;
+        fn read(r: *ProviderRegistry) void {
+            seen = null;
+            r.enableKey(std.testing.io, "p", 0) catch |err| {
+                seen = err;
+            };
+        }
+    };
+    EnableKeyRead.seen = null;
+    try readUnderCanceledLockWait(ProviderRegistry, &reg, &reg.mutex, io, EnableKeyRead.read);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), EnableKeyRead.seen);
+
+    const ListRead = struct {
+        var seen: ?anyerror = null;
+        fn read(r: *ProviderRegistry) void {
+            seen = null;
+            const infos = r.listProviders(std.testing.io, std.testing.allocator) catch |err| {
+                seen = err;
+                return;
+            };
+            for (infos) |*p| p.deinit(std.testing.allocator);
+            std.testing.allocator.free(infos);
+        }
+    };
+    ListRead.seen = null;
+    try readUnderCanceledLockWait(ProviderRegistry, &reg, &reg.mutex, io, ListRead.read);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), ListRead.seen);
 }
 
 var fake_now: i64 = 1_000_000;

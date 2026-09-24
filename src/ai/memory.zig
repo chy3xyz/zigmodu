@@ -66,7 +66,7 @@ pub const MemoryStore = struct {
         // success it cannot trust (the old `catch return` returned success
         // without storing anything). Red: `ai.memory.test.canceled lock wait does
         // not lose a remember, forget or count`.
-        self.mutex.lock(self.io) catch return error.LockFailed;
+        try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
 
         if (self.entries.count() >= self.max_entries) {
@@ -116,7 +116,7 @@ pub const MemoryStore = struct {
         tenant_id: i64,
         user_id: i64,
     ) !std.ArrayList(MemoryEntry) {
-        self.mutex.lock(self.io) catch return error.LockFailed;
+        try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
 
         const now = Time.monotonicNowSeconds();
@@ -280,7 +280,7 @@ pub const MemoryStore = struct {
 
     /// Snapshot all entries as JSON array (for simple file persistence). Caller frees.
     pub fn dumpJson(self: *MemoryStore, allocator: std.mem.Allocator) ![]u8 {
-        self.mutex.lock(self.io) catch return error.LockFailed;
+        try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
 
         const Dump = struct {
@@ -594,11 +594,12 @@ fn readUnderCanceledLockWait(
     read_fut.await(io);
 }
 
-// The three lock-wait sites the inventory flagged, and why each is answered
-// differently:
+// Three of the store's lock-wait sites, and why each is answered differently:
 //   - `remember` returns `!void`, so the canceled wait is *propagated*
-//     (`error.LockFailed`) — the caller learns the fact was not stored instead of
-//     being told a success it cannot trust;
+//     (`error.Canceled` — the only error `std.Io.Mutex.lock` has, where the old
+//     `error.LockFailed` named lock-machinery failure for a cancelation) — the
+//     caller learns the fact was not stored instead of being told a success it
+//     cannot trust;
 //   - `forget` returns `void` and has no error channel, so it *waits*
 //     (`lockUncancelable`): the skipped call would leave data that was asked to be
 //     deleted (privacy deletions included) in the store, invisibly;
@@ -606,10 +607,10 @@ fn readUnderCanceledLockWait(
 //     empty", so it waits too. Each critical section is a map operation.
 //
 // Red evidence: with the old shapes the first assertion below fails —
-// `expected error.LockFailed, found null`, because the canceled `remember`
-// returned success without storing. The `forget` and `count` assertions after it
-// are the same lock shape; a `try` ends the test at the first failure, so those
-// two are only exercised green.
+// `expected error.Canceled, found null`, because the canceled `remember` returned
+// success without storing. The `forget` and `count` assertions after it are the
+// same lock shape; a `try` ends the test at the first failure, so those two are
+// only exercised green.
 test "canceled lock wait does not lose a remember, forget or count" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -627,7 +628,7 @@ test "canceled lock wait does not lose a remember, forget or count" {
     };
     RememberRead.seen = null;
     try readUnderCanceledLockWait(MemoryStore, &store, &store.mutex, io, RememberRead.read);
-    try std.testing.expectEqual(@as(?anyerror, error.LockFailed), RememberRead.seen);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), RememberRead.seen);
     try std.testing.expectEqual(@as(usize, 0), store.count());
 
     try store.remember("gone", "x", 0, 0);
@@ -651,4 +652,55 @@ test "canceled lock wait does not lose a remember, forget or count" {
     CountRead.seen = 0;
     try readUnderCanceledLockWait(MemoryStore, &store, &store.mutex, io, CountRead.read);
     try std.testing.expectEqual(@as(usize, 1), CountRead.seen);
+}
+
+// The other two allocation-returning readers: `recall` and `dumpJson` both return
+// errors, so the cancelation is propagated as `error.Canceled` rather than named
+// lock-machinery failure. Nothing is stored, dropped or marked as accessed by a
+// wait that never entered the critical section.
+//
+// Red evidence: with `catch return error.LockFailed` the first assertion below
+// reads `expected error.Canceled, found error.LockFailed`. The `dumpJson`
+// assertion after it is the same lock shape; a `try` ends the test at the first
+// failure, so it is only exercised green.
+test "recall and dumpJson report a canceled lock wait as error.Canceled" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var store = MemoryStore.init(a, io);
+    defer store.deinit();
+    try store.remember("user:pref:lang", "zh", 1, 42);
+
+    const RecallRead = struct {
+        var seen: ?anyerror = null;
+        fn read(s: *MemoryStore) void {
+            seen = null;
+            var res = s.recall(std.testing.allocator, "user:pref", 1, 42) catch |err| {
+                seen = err;
+                return;
+            };
+            for (res.items) |e| {
+                std.testing.allocator.free(e.key);
+                std.testing.allocator.free(e.value);
+            }
+            res.deinit(std.testing.allocator);
+        }
+    };
+    RecallRead.seen = null;
+    try readUnderCanceledLockWait(MemoryStore, &store, &store.mutex, io, RecallRead.read);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), RecallRead.seen);
+
+    const DumpRead = struct {
+        var seen: ?anyerror = null;
+        fn read(s: *MemoryStore) void {
+            seen = null;
+            const json = s.dumpJson(std.testing.allocator) catch |err| {
+                seen = err;
+                return;
+            };
+            std.testing.allocator.free(json);
+        }
+    };
+    DumpRead.seen = null;
+    try readUnderCanceledLockWait(MemoryStore, &store, &store.mutex, io, DumpRead.read);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), DumpRead.seen);
 }

@@ -31,7 +31,7 @@ pub const TokenQuota = struct {
     }
 
     pub fn setLimit(self: *TokenQuota, tenant_id: i64, limit: usize) !void {
-        self.mutex.lock(self.io) catch return error.QuotaLockFailed;
+        try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
         const gop = try self.buckets.getOrPut(tenant_id);
         if (!gop.found_existing) {
@@ -44,7 +44,7 @@ pub const TokenQuota = struct {
     /// Consume tokens for a tenant. Returns `error.QuotaExceeded` when over limit.
     pub fn tryConsume(self: *TokenQuota, tenant_id: i64, tokens: usize) !void {
         if (tokens == 0) return;
-        self.mutex.lock(self.io) catch return error.QuotaLockFailed;
+        try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
 
         const gop = try self.buckets.getOrPut(tenant_id);
@@ -84,7 +84,7 @@ pub const TokenQuota = struct {
     }
 
     pub fn toPrometheusFormat(self: *TokenQuota, allocator: std.mem.Allocator) ![]u8 {
-        self.mutex.lock(self.io) catch return error.QuotaLockFailed;
+        try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
 
         var buf: std.ArrayList(u8) = .empty;
@@ -204,4 +204,65 @@ test "canceled lock wait does not fabricate used 0 or remaining 0" {
     RemainingRead.seen = 0;
     try readUnderCanceledLockWait(TokenQuota, &q, &q.mutex, io, RemainingRead.read);
     try std.testing.expectEqual(@as(usize, 20), RemainingRead.seen);
+}
+
+// The three quota calls that return errors report the cancelation as
+// `error.Canceled` (the only error `std.Io.Mutex.lock` has). A canceled wait
+// abandons the critical section *before* it is entered, so no bucket is created,
+// raised or printed — nothing is at stake, and `error.QuotaLockFailed` named
+// lock-machinery failure for a cancelation, which a caller cannot tell from "this
+// quota's lock is broken". (`used`/`remaining` above are `usize`-returning, so they
+// wait instead.)
+//
+// Red evidence: with `catch return error.QuotaLockFailed` the first assertion
+// below reads `expected error.Canceled, found error.QuotaLockFailed`. The
+// `tryConsume` and `toPrometheusFormat` assertions after it are the same lock
+// shape; a `try` ends the test at the first failure, so those two are only
+// exercised green.
+test "setLimit, tryConsume and toPrometheusFormat report a canceled lock wait as error.Canceled" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var q = TokenQuota.init(a, io, 100);
+    defer q.deinit();
+
+    const SetLimitRead = struct {
+        var seen: ?anyerror = null;
+        fn read(qq: *TokenQuota) void {
+            seen = null;
+            qq.setLimit(7, 200) catch |err| {
+                seen = err;
+            };
+        }
+    };
+    SetLimitRead.seen = null;
+    try readUnderCanceledLockWait(TokenQuota, &q, &q.mutex, io, SetLimitRead.read);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), SetLimitRead.seen);
+
+    const ConsumeRead = struct {
+        var seen: ?anyerror = null;
+        fn read(qq: *TokenQuota) void {
+            seen = null;
+            qq.tryConsume(7, 1) catch |err| {
+                seen = err;
+            };
+        }
+    };
+    ConsumeRead.seen = null;
+    try readUnderCanceledLockWait(TokenQuota, &q, &q.mutex, io, ConsumeRead.read);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), ConsumeRead.seen);
+
+    const PromRead = struct {
+        var seen: ?anyerror = null;
+        fn read(qq: *TokenQuota) void {
+            seen = null;
+            const out = qq.toPrometheusFormat(std.testing.allocator) catch |err| {
+                seen = err;
+                return;
+            };
+            std.testing.allocator.free(out);
+        }
+    };
+    PromRead.seen = null;
+    try readUnderCanceledLockWait(TokenQuota, &q, &q.mutex, io, PromRead.read);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), PromRead.seen);
 }

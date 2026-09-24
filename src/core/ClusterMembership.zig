@@ -19,11 +19,16 @@
 //!    membership dies would turn that copy into a use-after-free.
 //!  * The read side wants the dead peer *visible*: `MembershipView.sync` publishes
 //!    it with `healthy = false`, which keeps it out of `ClusterView.pick` while
-//!    still showing an operator that it exists.
+//!    still showing an operator that it exists. A dead peer is only left *out* of
+//!    the read side when its buffer cannot hold the whole census, and then it goes
+//!    last — the drop order is `nodesSnapshot`'s.
 //!  * A peer that comes back is the *same* entry — `handleGossipEvent` resets any
 //!    non-healthy state to `.healthy` on its next heartbeat. So there is no re-add
 //!    path that could double-count, and no join callback for a peer that merely
-//!    returned.
+//!    returned. The mirror image is the stranger that only says goodbye: a `.leave`
+//!    for an id that is not in the census is dropped without a trace, because
+//!    there is no member to retire — and inventing one would also make that peer's
+//!    *real* join later look like a return (state flip, no callback, no dial).
 //!
 //! Consequences to read the accessors by: `getNodeCount` is the **census** (dead
 //! peers included, so it is not the live cluster size), `getHealthyNodeCount` is
@@ -352,14 +357,49 @@ pub const ClusterMembership = struct {
         // (`connectToSeed`) — those carry their real address and are unaffected.
         const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = event.port } };
 
-        // Record heartbeat in failure detector if available
-        if (self.failure_detector) |fd| {
-            fd.heartbeat(event.node_id) catch |err| std.log.warn("[ClusterMembership] failure detector heartbeat failed: {}", .{err});
+        // A `.leave` from an id this process has never recorded is **not** a join:
+        // the peer is saying it is out. Handling it as one (what this used to do)
+        // inserted it as `.healthy` — firing the join callback and
+        // `bus.connectToNode` — and only *then* flipped the entry to `.leaving`, so
+        // the census kept a peer that only ever said goodbye, an app saw a join it
+        // could never match with a membership, and we dialled a node that had
+        // already left. Deciding it here, before anything is recorded, is also what
+        // keeps that peer's *later*, real join on the join path below: an entry
+        // left behind as `.leaving` counts as "known", and that branch flips the
+        // state *without* the callback or the dial. "Nothing is retired" (see the
+        // top of this file) is about peers observed *as members*; a goodbye from a
+        // stranger is not a fact about this cluster. The one side effect an
+        // unrecorded id can have is a connection made by an explicit seed
+        // (`connectToSeed` deliberately does not touch the census), so the
+        // transport is still torn down — `disconnectNode` ignores an id it does not
+        // know.
+        const seen = self.nodes.getPtr(event.node_id);
+        if (seen == null and event.event_type == .leave) {
+            std.log.info("[ClusterMembership] Ignoring leave from unknown node {s}", .{event.node_id});
+            self.bus.disconnectNode(event.node_id);
+            return;
         }
 
-        if (self.nodes.getPtr(event.node_id)) |node| {
+        // Record heartbeat in failure detector if available. A `.leave` is not a
+        // liveness sample — it says the opposite — so it is skipped for a known
+        // peer too: recording it would both contradict the state this call writes
+        // and give the detector an entry for an id whose samples nothing reads
+        // (the detector's history map only grows).
+        if (self.failure_detector) |fd| {
+            if (event.event_type != .leave) {
+                fd.heartbeat(event.node_id) catch |err| std.log.warn("[ClusterMembership] failure detector heartbeat failed: {}", .{err});
+            }
+        }
+
+        if (seen) |node| {
             node.last_seen = now;
-            if (node.state == .suspect or node.state == .failed or node.state == .leaving) {
+            if (event.event_type == .leave) {
+                node.state = .leaving;
+                if (self.on_node_leave_cb) |cb| {
+                    cb(event.node_id);
+                }
+                self.bus.disconnectNode(event.node_id);
+            } else if (node.state == .suspect or node.state == .failed or node.state == .leaving) {
                 node.state = .healthy;
                 std.log.info("[ClusterMembership] Node {s} is back healthy", .{event.node_id});
             }
@@ -391,16 +431,6 @@ pub const ClusterMembership = struct {
             self.bus.connectToNode(event.node_id, addr) catch |err| {
                 std.log.err("[ClusterMembership] Failed to connect event bus to node {s}: {}", .{ event.node_id, err });
             };
-        }
-
-        if (event.event_type == .leave) {
-            if (self.nodes.getPtr(event.node_id)) |node| {
-                node.state = .leaving;
-            }
-            if (self.on_node_leave_cb) |cb| {
-                cb(event.node_id);
-            }
-            self.bus.disconnectNode(event.node_id);
         }
 
         if (event.event_type == .leader_election) {
@@ -484,8 +514,20 @@ pub const ClusterMembership = struct {
     /// (`MembershipView.sync` publishes it as `healthy = false`; `ClusterView.pick`
     /// skips it) instead of losing the operator's only record that it exists. The
     /// list therefore cannot shrink under a consumer — `deinit` is the only thing
-    /// that drops an entry. Truncation is bounded by `out.len`; the copy stops
-    /// there rather than writing past it.
+    /// that drops an entry.
+    ///
+    /// When the census is larger than `out`, *which* entries a bounded copy keeps
+    /// has to be a choice, and it is made here rather than by hash order: liveness
+    /// first — `healthy`, then `suspect`, then `failed`/`leaving` — and ascending
+    /// `id` inside each class (`snapshotPrecedes`). The order `out` comes back in
+    /// **is** that selection, and three properties follow from it: the same census
+    /// always yields the same subset (a bounded view does not flutter as unrelated
+    /// peers are discovered), a peer that is down can never displace one that is up
+    /// (an arbitrary subset could hand a routing view nothing but dead members),
+    /// and one growth step can only evict the highest `id` of a class. Note that
+    /// `written == out.len` does not by itself say whether anything was left out —
+    /// compare against `getNodeCount()` when that matters (the census only grows,
+    /// so the comparison is conservative).
     pub fn nodesSnapshot(self: *Self, out: []ClusterNode) usize {
         // Uncancelable: `0` is a published reading, not a placeholder — this is
         // the snapshot the read side is fed from (`cluster/MembershipView.zig`),
@@ -495,14 +537,44 @@ pub const ClusterMembership = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        var n: usize = 0;
+        // Bounded insertion sort: `out[0..written]` stays in selection order, so an
+        // entry that makes the cut costs at most `out.len` moves and the walk is
+        // O(census × out.len) with no allocation.
+        var written: usize = 0;
         var iter = self.nodes.iterator();
         while (iter.next()) |entry| {
-            if (n >= out.len) break;
-            out[n] = entry.value_ptr.*;
-            n += 1;
+            const node = entry.value_ptr.*;
+            var pos: usize = written;
+            while (pos > 0 and snapshotPrecedes(node, out[pos - 1])) : (pos -= 1) {}
+            if (pos >= out.len) continue; // weaker than everything already kept
+            if (written < out.len) written += 1;
+            var j: usize = written - 1;
+            while (j > pos) : (j -= 1) {
+                out[j] = out[j - 1];
+            }
+            out[pos] = node;
         }
-        return n;
+        return written;
+    }
+
+    /// What a bounded `nodesSnapshot` keeps first, and in what order: routing
+    /// candidates, then the peer that might come back, then the ones kept only so
+    /// an operator can see them. Ascending `id` decides inside a class, so the
+    /// selection is a function of the census alone (not of hash order, insertion
+    /// history or the map's table size).
+    fn snapshotPrecedes(a: ClusterNode, b: ClusterNode) bool {
+        const rank_a = snapshotRank(a.state);
+        const rank_b = snapshotRank(b.state);
+        if (rank_a != rank_b) return rank_a < rank_b;
+        return std.mem.lessThan(u8, a.id, b.id);
+    }
+
+    fn snapshotRank(state: NodeState) u8 {
+        return switch (state) {
+            .healthy => 0,
+            .suspect => 1,
+            .failed, .leaving => 2,
+        };
     }
 
     pub fn getLeader(self: *Self) ?[]const u8 {
@@ -736,6 +808,75 @@ test "ClusterMembership node leave and rejoin" {
         .timestamp = 0,
     });
     try std.testing.expectEqual(@as(usize, 3), cluster.getHealthyNodeCount());
+}
+
+// A `.leave` for a node this process has never recorded used to be handled as a
+// join first: the unknown-node branch inserted the peer as `.healthy` (join
+// callback + `bus.connectToNode`) and only then did the leave branch flip it to
+// `.leaving`. Three consequences, all pinned here: the census kept a peer that
+// only ever said goodbye (published to the read side as a member), an app got a
+// join callback for a node it never had, and we dialled a node that had already
+// left. "Nothing is retired" (see "What `nodes` is" at the top) is about peers
+// observed *as members* — a goodbye from a stranger is not a membership fact, so
+// the census stays as it is. That is also what keeps the peer's *later*, real
+// join on the full join path: an entry left behind as `.leaving` would send it
+// down the "known node" branch, a state flip with no join callback and no dial.
+test "ClusterMembership a leave from an unknown node is not a join" {
+    const allocator = std.testing.allocator;
+
+    var bus = try DistributedEventBus.init(allocator, std.testing.io, "leave-stranger");
+    defer bus.deinit();
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 18230);
+    var cluster = try ClusterMembership.init(allocator, std.testing.io, "node-m", addr, &bus);
+    defer cluster.deinit();
+
+    const Counters = struct {
+        var joins: usize = 0;
+        var leaves: usize = 0;
+
+        fn onJoin(_: []const u8, _: std.Io.net.IpAddress) void {
+            joins += 1;
+        }
+
+        fn onLeave(_: []const u8) void {
+            leaves += 1;
+        }
+    };
+    Counters.joins = 0;
+    Counters.leaves = 0;
+    cluster.onNodeJoin(Counters.onJoin);
+    cluster.onNodeLeave(Counters.onLeave);
+
+    cluster.handleGossipEvent(.{
+        .event_type = .leave,
+        .node_id = "ghost",
+        .host = "127.0.0.1",
+        .port = 18231,
+        .timestamp = 0,
+    });
+
+    // The census is still just this node — nothing to publish that "only ever
+    // said goodbye" — and neither callback fired: there was no join to announce
+    // and no member to retire.
+    try std.testing.expectEqual(@as(usize, 1), cluster.getNodeCount());
+    try std.testing.expectEqual(@as(usize, 1), cluster.getHealthyNodeCount());
+    try std.testing.expectEqual(@as(usize, 0), Counters.joins);
+    try std.testing.expectEqual(@as(usize, 0), Counters.leaves);
+
+    // The peer's real join afterwards takes the join path, callback and bus dial
+    // included — the entry the old code left behind would have swallowed both.
+    cluster.handleGossipEvent(.{
+        .event_type = .join,
+        .node_id = "ghost",
+        .host = "127.0.0.1",
+        .port = 18231,
+        .timestamp = 0,
+    });
+    try std.testing.expectEqual(@as(usize, 1), Counters.joins);
+    try std.testing.expectEqual(@as(usize, 0), Counters.leaves);
+    try std.testing.expectEqual(@as(usize, 2), cluster.getNodeCount());
+    try std.testing.expectEqual(ClusterMembership.NodeState.healthy, cluster.nodes.get("ghost").?.state);
 }
 
 // `current_leader` is owned memory, and both writers below free the old copy

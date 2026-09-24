@@ -125,7 +125,17 @@ pub const KeyPool = struct {
         }
         for (keys) |k| {
             if (k.len == 0) return error.EmptyApiKey;
-            try owned.append(allocator, .{ .key = try allocator.dupe(u8, k) });
+            // The copy is hoisted out of the append on purpose: as
+            // `owned.append(allocator, .{ .key = try allocator.dupe(u8, k) })` the
+            // dupe succeeds while the append grows, so an append failure left a
+            // copy that no `errdefer` could see (it is not in `owned.items` yet).
+            // Here the per-iteration `errdefer` owns it until the append takes it
+            // over. Red: `ai.provider_registry.test.every allocation failure
+            // inside register and deinit is reported and leaks nothing` with
+            // `api_keys` non-empty — `fail_index: 8/33`, `leaked [len: 4]`.
+            const owned_key = try allocator.dupe(u8, k);
+            errdefer allocator.free(owned_key);
+            try owned.append(allocator, .{ .key = owned_key });
         }
         if (opts.shared_store) |shared| {
             return .{
@@ -176,7 +186,7 @@ pub const KeyPool = struct {
     /// cooling or disabled — the caller should back off or use a fallback
     /// provider.
     pub fn acquire(self: *Self, io: std.Io) !?KeyLease {
-        self.mutex.lock(io) catch return error.LockFailed;
+        try self.mutex.lock(io);
         defer self.mutex.unlock(io);
         const klen = self.keys.items.len;
         if (klen == 0) return null;
@@ -251,7 +261,7 @@ pub const KeyPool = struct {
 
     /// Manually (re)enable a key that was disabled by auth failures.
     pub fn enableKey(self: *Self, io: std.Io, key_index: usize) !void {
-        self.mutex.lock(io) catch return error.LockFailed;
+        try self.mutex.lock(io);
         defer self.mutex.unlock(io);
         const key = self.keyPtrLocked(key_index) orelse return error.KeyNotFound;
         key.status = .healthy;
@@ -262,7 +272,7 @@ pub const KeyPool = struct {
 
     /// Snapshot per-key stats (owned by the caller).
     pub fn snapshot(self: *Self, io: std.Io, allocator: std.mem.Allocator) ![]KeyStats {
-        self.mutex.lock(io) catch return error.LockFailed;
+        try self.mutex.lock(io);
         defer self.mutex.unlock(io);
         const out = try allocator.alloc(KeyStats, self.keys.items.len);
         errdefer allocator.free(out);
@@ -566,4 +576,66 @@ test "canceled lock wait does not lose an onError cooldown or onSuccess reset" {
     };
     try readUnderCanceledLockWait(KeyPool, &pool, &pool.mutex, io, SuccessRead.read);
     try std.testing.expectEqualStrings("sk-a", (try pool.acquire(io)).?.key);
+}
+
+// The three waits a caller *can* be told about: `acquire`, `enableKey` and
+// `snapshot` return errors, so the cancelation is propagated as
+// `error.Canceled` — the only error `std.Io.Mutex.lock` has. The old
+// `catch return error.LockFailed` reported lock-machinery failure for a
+// cancelation, and a caller cannot tell "unwind, you were canceled" from "this
+// pool's lock is broken". Nothing is at risk in an abandoned critical section: no
+// key is rotated, enabled or copied. (`onError`/`onSuccess` above are the same
+// lock shape in the other direction — `void`, so they wait.)
+//
+// Red evidence: with `catch return error.LockFailed` the first assertion below
+// reads `expected error.Canceled, found error.LockFailed`. The `enableKey` and
+// `snapshot` assertions after it are the same lock shape; a `try` ends the test at
+// the first failure, so those two are only exercised green.
+test "acquire, enableKey and snapshot report a canceled lock wait as error.Canceled" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    fake_now = 1_000_000;
+    var pool = try testPool(allocator, &.{"sk-a"});
+    defer pool.deinit();
+
+    const AcquireRead = struct {
+        var seen: ?anyerror = null;
+        fn read(p: *KeyPool) void {
+            seen = null;
+            _ = p.acquire(std.testing.io) catch |err| {
+                seen = err;
+            };
+        }
+    };
+    AcquireRead.seen = null;
+    try readUnderCanceledLockWait(KeyPool, &pool, &pool.mutex, io, AcquireRead.read);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), AcquireRead.seen);
+
+    const EnableRead = struct {
+        var seen: ?anyerror = null;
+        fn read(p: *KeyPool) void {
+            seen = null;
+            p.enableKey(std.testing.io, 0) catch |err| {
+                seen = err;
+            };
+        }
+    };
+    EnableRead.seen = null;
+    try readUnderCanceledLockWait(KeyPool, &pool, &pool.mutex, io, EnableRead.read);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), EnableRead.seen);
+
+    const SnapshotRead = struct {
+        var seen: ?anyerror = null;
+        fn read(p: *KeyPool) void {
+            seen = null;
+            const stats = p.snapshot(std.testing.io, std.testing.allocator) catch |err| {
+                seen = err;
+                return;
+            };
+            std.testing.allocator.free(stats);
+        }
+    };
+    SnapshotRead.seen = null;
+    try readUnderCanceledLockWait(KeyPool, &pool, &pool.mutex, io, SnapshotRead.read);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), SnapshotRead.seen);
 }

@@ -209,10 +209,20 @@ pub const PrometheusMetrics = struct {
         overflow_used: bool = false,
 
         /// Series handle for `label_value` (creates it on first use, up to
-        /// `max_series`). Never fails: on allocation pressure it degrades to
-        /// the shared overflow counter.
+        /// `max_series`). Never fails: the cap and allocation pressure both
+        /// degrade to the shared overflow counter.
+        ///
+        /// The mutex is taken without a cancelation point. `lock`'s only failure
+        /// is `error.Canceled`, and there is no error channel here to report it
+        /// through, so the old `lock(io) catch return &self.overflow` answered a
+        /// canceled caller with the overflow counter: it misattributed the
+        /// sample to `__other__` (which means "this label value could not open a
+        /// series of its own") and, because that path never set `overflow_used`,
+        /// the sample did not even reach the scrape. The critical section is a
+        /// `dupe` + `create` + hash `put` with no io wait inside it, so waiting
+        /// for it uncancelably is bounded by that work.
         pub fn get(self: *CounterFamily, label_value: []const u8) *Counter {
-            self.mutex.lock(self.io) catch return &self.overflow;
+            self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             if (self.series.get(label_value)) |c| return c;
             if (self.series.count() >= self.max_series) {
@@ -291,8 +301,12 @@ pub const PrometheusMetrics = struct {
         overflow: Histogram,
         overflow_used: bool = false,
 
+        /// Series handle for `label_value`; same contract as
+        /// `CounterFamily.get`, including the uncancelable lock (a cancelation
+        /// is not an overflow, and there is no error channel here to report it
+        /// through).
         pub fn get(self: *HistogramFamily, label_value: []const u8) *Histogram {
-            self.mutex.lock(self.io) catch return &self.overflow;
+            self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             if (self.series.get(label_value)) |h| return h;
             if (self.series.count() >= self.max_series) {
@@ -1008,6 +1022,74 @@ test "counter family caps cardinality and collapses the overflow" {
     try std.testing.expect(std.mem.indexOf(u8, text, "http_requests_total{route=\"__other__\"} 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "route=\"/c\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "route=\"/d\"") == null);
+}
+
+// A failed lock used to hand the caller the overflow counter, which renders as
+// `__other__` — the series documented as "this label value could not open a
+// series of its own" (cap reached, or allocation pressure). A canceled lock
+// wait is neither, and the sample did not even reach the scrape: that branch
+// never set `overflow_used`, so the count landed in a counter nothing printed.
+// Both families now take the mutex uncancelably — the critical section is a
+// `dupe` + `create` + hash `put` with no io wait inside it — so the sample
+// reaches the label it asked for. Same cancelation window as the
+// canceled-lock-wait tests in `core/EventRegistry.zig`: the test thread holds
+// the family mutex, so the task parks in the lock wait and the cancelation is
+// delivered there.
+test "counter family: a canceled lock wait does not answer with the overflow series" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var m = PrometheusMetrics.init(allocator);
+    defer m.deinit();
+
+    const family = try m.createCounterFamily("http_requests_total", "Total requests", "route", 8, io);
+
+    const Task = struct {
+        var got: ?*PrometheusMetrics.Counter = null;
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+
+        fn get(f: *PrometheusMetrics.CounterFamily) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            got = f.get("/orders/{id}");
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+
+    Task.got = null;
+    Task.entered.store(false, .monotonic);
+    Task.open.store(false, .monotonic);
+
+    family.mutex.lockUncancelable(io);
+
+    var task_fut = try io.concurrent(Task.get, .{family});
+    while (!Task.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Task.cancel, .{ io, &task_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Task.open.store(true, .release);
+    while (family.mutex.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    family.mutex.unlock(io);
+
+    cancel_fut.await(io);
+    task_fut.await(io);
+
+    // The sample is attributed to the label that was asked for, and it is
+    // rendered there — not folded into `__other__`, which is what the old
+    // `catch return &self.overflow` did.
+    const counter = Task.got orelse return error.NoCounter;
+    try std.testing.expect(counter != &family.overflow);
+    counter.inc();
+
+    const text = try m.toPrometheusFormat(allocator);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "http_requests_total{route=\"/orders/{id}\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "__other__") == null);
 }
 
 test "histogram family renders per-label buckets" {

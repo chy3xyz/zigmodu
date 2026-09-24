@@ -116,18 +116,43 @@ pub const AgentAuditLog = struct {
 
     /// Newest-first copy. Caller frees tool_name/detail and the slice.
     pub fn snapshot(self: *AgentAuditLog, allocator: std.mem.Allocator) ![]AuditEvent {
-        self.mutex.lock(self.io) catch return error.LockFailed;
+        // `snapshot` copies the ring out, so it has an error channel: a canceled
+        // wait is reported as `error.Canceled` (the only error `std.Io.Mutex.lock`
+        // has), where the old `catch return error.LockFailed` named lock-machinery
+        // failure for a cancelation. `record` above is the other direction — `void`
+        // and an entry that must not be dropped, so it waits.
+        try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
 
+        // Both the slice and the copies made so far belong to this call until it
+        // returns, so a failing copy hands them back: the loop had no `errdefer`,
+        // and everything it had copied before the failure (plus `out` itself)
+        // leaked.
         var out = try allocator.alloc(AuditEvent, self.count);
+        errdefer allocator.free(out);
         var i: usize = 0;
+        errdefer {
+            for (out[0..i]) |e| {
+                allocator.free(e.tool_name);
+                allocator.free(e.detail);
+            }
+        }
         while (i < self.count) : (i += 1) {
             const idx = (self.next + self.events.len - 1 - i) % self.events.len;
             const e = self.events[idx];
+            // Both copies are hoisted out of the initializer so each one owns
+            // itself between the two allocations: as one
+            // `.tool_name = try …, .detail = try …` expression a failing `detail`
+            // copy leaves the `tool_name` copy with no owner — same shape as the
+            // append in `key_pool.KeyPool.init`.
+            const name_copy = try allocator.dupe(u8, e.tool_name);
+            errdefer allocator.free(name_copy);
+            const detail_copy = try allocator.dupe(u8, e.detail);
+            errdefer allocator.free(detail_copy);
             out[i] = .{
                 .kind = e.kind,
-                .tool_name = try allocator.dupe(u8, e.tool_name),
-                .detail = try allocator.dupe(u8, e.detail),
+                .tool_name = name_copy,
+                .detail = detail_copy,
                 .tenant_id = e.tenant_id,
                 .user_id = e.user_id,
                 .at_ms = e.at_ms,
@@ -263,4 +288,58 @@ test "an audit entry whose copies cannot be allocated is visibly not real" {
     try std.testing.expectEqualStrings("(unallocated)", snap[0].tool_name);
     try std.testing.expectEqualStrings("(unallocated)", snap[0].detail);
     try std.testing.expectEqualStrings("(unallocated)", snap[1].tool_name);
+}
+
+// `snapshot` copies the ring out, so it has an error channel: the cancelation is
+// propagated as `error.Canceled` (the only error `std.Io.Mutex.lock` has), and
+// nothing is abandoned — no entry is copied. `record` above is the other
+// direction: `void`, and an entry that was refused by a guard must not be dropped,
+// so it waits.
+//
+// Red evidence: with `catch return error.LockFailed` the assertion below reads
+// `expected error.Canceled, found error.LockFailed`.
+test "snapshot reports a canceled lock wait as error.Canceled" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var log = try AgentAuditLog.init(a, io, 4);
+    defer log.deinit();
+    log.record(.tool_ok, "ping", "pong", 1, 2);
+
+    const SnapshotRead = struct {
+        var seen: ?anyerror = null;
+        fn read(l: *AgentAuditLog) void {
+            seen = null;
+            const snap = l.snapshot(std.testing.allocator) catch |err| {
+                seen = err;
+                return;
+            };
+            AgentAuditLog.freeSnapshot(std.testing.allocator, snap);
+        }
+    };
+    SnapshotRead.seen = null;
+    try readUnderCanceledLockWait(AgentAuditLog, &log, &log.mutex, io, SnapshotRead.read);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), SnapshotRead.seen);
+}
+
+// The copies `snapshot` makes belong to the call until it returns: an allocation
+// failure inside the loop hands back both the slice and every copy made so far.
+// Before that it leaked the lot — the loop copied into `out`, and nothing freed
+// `out` or the entries already written. `checkAllAllocationFailures` injects each
+// fail index in turn, so the failure is covered at the first copy, in the middle
+// and on the last entry.
+test "snapshot hands back its copies when an allocation fails" {
+    const a = std.testing.allocator;
+    var log = try AgentAuditLog.init(a, std.testing.io, 4);
+    defer log.deinit();
+    log.record(.tool_ok, "ping", "pong", 1, 2);
+    log.record(.tool_err, "x", "ToolTimeout", 1, 2);
+    log.record(.tool_denied, "dangerous_tool", "denied_execute_class", 1, 2);
+
+    const Scan = struct {
+        fn run(allocator: std.mem.Allocator, l: *AgentAuditLog) !void {
+            const snap = try l.snapshot(allocator);
+            AgentAuditLog.freeSnapshot(allocator, snap);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Scan.run, .{&log});
 }

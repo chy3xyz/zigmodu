@@ -104,8 +104,11 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 `Runtime.shutdown`/`Mailbox`（关停与唤醒不再被取消吞掉）、`redis` 的池释放/逐出（池槽不再永久丢失）、
 `ai` 的 `key_pool.onError`/`onSuccess`、`memory.remember`/`forget`/`count`、`skill.register`/`get`/`count`/`names`、
 `audit.record`、`quota.used`/`remaining`。**错误集变化**（用 `try` 的调用方不受影响，只有穷举错误集匹配
-需要加一支）：`MemoryStore.remember` 增 `error.LockFailed`、`SkillRegistry.register` 增
-`error.RegistryLockFailed`、`Lru.set` 与 `EventBus.subscribe(Async)` 增 `error.Canceled`。
+需要加/改一支）：`Lru.set`、`EventBus.subscribe(Async)` 增 `error.Canceled`；**`src/ai/*` 里那批自造的名字
+已经删掉** —— `MemoryStore.remember` 的 `error.LockFailed`、`SkillRegistry.register` 的
+`error.RegistryLockFailed`、`Quota` 的 `error.QuotaLockFailed`、`AiProvider` 的
+`error.RateLimitLockFailed` 全部换成 `error.Canceled`（`std.Io.Mutex.lock` 唯一的错误就是它；
+把取消说成"锁机制失败"是撒谎）。**按名字 `catch` 这些旧标签的代码会编译不过**（仓内没有，外部可能有）。
 **结构变化**：`AgentAuditLog` 新增公开字段 `owned: []bool`（用字面量构造会编译不过；请用
 `AgentAuditLog.init`）。另外 `Preflight` 的失败计数改为**先计数后记录**，所以"有致命失败却
 `report.ok() == true`"这条不再可能。

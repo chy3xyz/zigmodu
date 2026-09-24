@@ -59,8 +59,19 @@ pub const ChallengeStore = struct {
             allocator.free(old.key);
             allocator.free(old.value.challenge);
         }
-        try self.map.put(try allocator.dupe(u8, did), .{
-            .challenge = try allocator.dupe(u8, challenge),
+        // Both copies are made before the insert, and either one failing (or the
+        // insert's own growth) would strand whatever was already copied: the key
+        // a caller cannot name, because the call only reports `error.OutOfMemory`.
+        // Red: `web4.challenge.test.ChallengeStore.issue frees the partial copies
+        // when an allocation fails` reports `leaked [addr: …, len: 13 (0xd)]` (the
+        // `did`) and the byte check reads `expected 181, found 168` on the old
+        // inline shape.
+        const key = try allocator.dupe(u8, did);
+        errdefer allocator.free(key);
+        const stored = try allocator.dupe(u8, challenge);
+        errdefer allocator.free(stored);
+        try self.map.put(key, .{
+            .challenge = stored,
             .expires_at = Time.monotonicNowSeconds() + self.ttl_s,
         });
         return challenge;
@@ -123,6 +134,40 @@ test "ChallengeStore re-issuing for the same DID yields a different challenge" {
     const second = try store.issue(allocator, did);
     defer allocator.free(second);
     try std.testing.expect(!std.mem.eql(u8, first, second));
+}
+
+// `issue` built the entry's two copies inline in the `put` call, so the DID key
+// was reachable only through that call's argument list: when the second dupe or
+// the insert itself failed, `error.OutOfMemory` was all the caller saw and the
+// already-copied key stayed allocated with nobody left to free it. Held in
+// locals, each copy has an error path that releases it.
+//
+// The loop walks every allocation of the call — the printed challenge, the two
+// copies, and the map's own storage (the store is built on the failing allocator
+// so its bucket array can fail too) — and asserts after each attempt that the
+// call gave every byte back. Red evidence: without the two `errdefer`s the
+// iteration whose failure lands on the second copy reports
+// `leaked [addr: …, len: 13 (0xd) align: 1]` (the `did`) and the byte check reads
+// `expected 181, found 168`.
+test "ChallengeStore.issue frees the partial copies when an allocation fails" {
+    const did = "did:key:z6MkA";
+
+    for (0..8) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var store = ChallengeStore.init(failing.allocator(), std.testing.io);
+        if (store.issue(failing.allocator(), did)) |challenge| {
+            failing.allocator().free(challenge);
+        } else |err| {
+            try std.testing.expectEqual(@as(anyerror, error.OutOfMemory), err);
+            // A failed issue wrote nothing, so the DID is left without a
+            // challenge rather than with half an entry.
+            try std.testing.expectEqual(@as(usize, 0), store.map.count());
+        }
+        store.deinit();
+        // The challenge string, the key/challenge copies and the map's storage
+        // all went back — nothing of this attempt is left to the harness.
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
 }
 
 // `issue` answered a canceled lock with `error.LockFailed`. Nothing is fabricated

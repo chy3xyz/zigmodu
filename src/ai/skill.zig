@@ -194,7 +194,7 @@ pub const SkillRegistry = struct {
         // `agent.zig` reads the registry before the guard judges a call).
         // Red: `ai.skill.test.canceled lock wait does not lose a register, get,
         // count or names`.
-        self.mutex.lock(self.io) catch return error.RegistryLockFailed;
+        try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
 
         const key = try self.allocator.dupe(u8, tool.name);
@@ -290,7 +290,7 @@ pub const SkillRegistry = struct {
         allocator: std.mem.Allocator,
         permissions: guard_mod.Permissions,
     ) !PolicyHealth {
-        self.mutex.lock(self.io) catch return error.RegistryLockFailed;
+        try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
 
         var health = PolicyHealth{};
@@ -318,7 +318,7 @@ pub const SkillRegistry = struct {
 
     /// Generate OpenAI-compatible tools JSON (owned slice).
     pub fn toOpenAiFunctionsAlloc(self: *Self, allocator: std.mem.Allocator) ![]u8 {
-        self.mutex.lock(self.io) catch return error.RegistryLockFailed;
+        try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
 
         var buf = std.ArrayList(u8).empty;
@@ -402,7 +402,7 @@ pub const SkillRegistry = struct {
             if (!ok) return error.ToolNotAllowed;
         }
 
-        self.mutex.lock(self.io) catch return error.RegistryLockFailed;
+        try self.mutex.lock(self.io);
         const tool = self.tools.get(name) orelse {
             self.mutex.unlock(self.io);
             return error.ToolNotFound;
@@ -810,22 +810,23 @@ fn readUnderCanceledLockWait(
     read_fut.await(io);
 }
 
-// The registry's four lock-wait sites, split by whether the caller can be told:
+// The lock-wait sites this test pins, split by whether the caller can be told:
 //   - `register` returns `!void`, so the canceled wait is *propagated*
-//     (`error.RegistryLockFailed`, the name `dispatchWith`/`auditPolicy` already
-//     use) — a silent success would mean a tool the caller believes is registered
-//     never reaches the model, and `agent.zig` reads the registry to decide
-//     whether a tool even exists before the guard judges it;
+//     (`error.Canceled`, the only error `std.Io.Mutex.lock` has — the old
+//     `error.RegistryLockFailed` named lock-machinery failure for a cancelation) —
+//     a silent success would mean a tool the caller believes is registered never
+//     reaches the model, and `agent.zig` reads the registry to decide whether a
+//     tool even exists before the guard judges it;
 //   - `get`, `count` and `names` return `?Tool`/`usize`, where `null`/`0` read as
 //     "no such tool"/"empty registry" — the registry cannot fabricate those, and
 //     `get`'s signature is fixed by its caller (`agent.zig:481`), so they wait
 //     (`lockUncancelable`); each critical section is a map lookup or a walk.
 //
 // Red evidence: with the old shapes the first assertion below fails —
-// `expected error.RegistryLockFailed, found null`, because the canceled `register`
-// returned success without registering anything. The `get`/`count`/`names`
-// assertions after it are the same lock shape; a `try` ends the test at the first
-// failure, so those three are only exercised green.
+// `expected error.Canceled, found null`, because the canceled `register` returned
+// success without registering anything. The `get`/`count`/`names` assertions after
+// it are the same lock shape; a `try` ends the test at the first failure, so those
+// three are only exercised green.
 test "canceled lock wait does not lose a register, get, count or names" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -848,7 +849,7 @@ test "canceled lock wait does not lose a register, get, count or names" {
     };
     RegisterRead.seen = null;
     try readUnderCanceledLockWait(SkillRegistry, &reg, &reg.mutex, io, RegisterRead.read);
-    try std.testing.expectEqual(@as(?anyerror, error.RegistryLockFailed), RegisterRead.seen);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), RegisterRead.seen);
     try std.testing.expectEqual(@as(usize, 0), reg.count());
 
     try reg.register(.{
@@ -888,4 +889,67 @@ test "canceled lock wait does not lose a register, get, count or names" {
     NamesRead.seen = 0;
     try readUnderCanceledLockWait(SkillRegistry, &reg, &reg.mutex, io, NamesRead.read);
     try std.testing.expectEqual(@as(usize, 1), NamesRead.seen);
+}
+
+// The registry's three other waits-with-a-channel: `auditPolicy`,
+// `toOpenAiFunctionsAlloc` and `dispatchWith` return errors, so the cancelation is
+// propagated as `error.Canceled` (the only error `std.Io.Mutex.lock` has) instead
+// of `error.RegistryLockFailed`, which named lock-machinery failure for it. A
+// canceled wait never enters the critical section: no policy is audited, no JSON
+// is printed and no handler runs.
+//
+// Red evidence: with `catch return error.RegistryLockFailed` the first assertion
+// below reads `expected error.Canceled, found error.RegistryLockFailed`. The other
+// two assertions are the same lock shape; a `try` ends the test at the first
+// failure, so they are only exercised green.
+test "auditPolicy, toOpenAiFunctionsAlloc and dispatchWith report a canceled lock wait as error.Canceled" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var reg = SkillRegistry.init(allocator, io);
+    defer reg.deinit();
+    try reg.register(.{ .name = "ping", .description = "Returns pong", .parameters = &.{}, .handler = pingHandler });
+
+    const AuditRead = struct {
+        var seen: ?anyerror = null;
+        fn read(r: *SkillRegistry) void {
+            seen = null;
+            var health = r.auditPolicy(std.testing.allocator, .{}) catch |err| {
+                seen = err;
+                return;
+            };
+            health.deinit(std.testing.allocator);
+        }
+    };
+    AuditRead.seen = null;
+    try readUnderCanceledLockWait(SkillRegistry, &reg, &reg.mutex, io, AuditRead.read);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), AuditRead.seen);
+
+    const FunctionsRead = struct {
+        var seen: ?anyerror = null;
+        fn read(r: *SkillRegistry) void {
+            seen = null;
+            const json = r.toOpenAiFunctionsAlloc(std.testing.allocator) catch |err| {
+                seen = err;
+                return;
+            };
+            std.testing.allocator.free(json);
+        }
+    };
+    FunctionsRead.seen = null;
+    try readUnderCanceledLockWait(SkillRegistry, &reg, &reg.mutex, io, FunctionsRead.read);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), FunctionsRead.seen);
+
+    const DispatchRead = struct {
+        var seen: ?anyerror = null;
+        var ctx: SkillContext = .{ .allocator = std.testing.allocator };
+        fn read(r: *SkillRegistry) void {
+            seen = null;
+            _ = r.dispatchWith("ping", &ctx, .null, .{}) catch |err| {
+                seen = err;
+            };
+        }
+    };
+    DispatchRead.seen = null;
+    try readUnderCanceledLockWait(SkillRegistry, &reg, &reg.mutex, io, DispatchRead.read);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), DispatchRead.seen);
 }

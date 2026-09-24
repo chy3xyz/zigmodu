@@ -49,7 +49,7 @@ pub const ApprovalQueue = struct {
     }
 
     pub fn push(self: *Self, item: PendingApproval) !void {
-        self.mu.lock(self.io) catch return error.LockFailed;
+        try self.mu.lock(self.io);
         defer self.mu.unlock(self.io);
         try self.items.append(self.allocator, item);
     }
@@ -57,7 +57,7 @@ pub const ApprovalQueue = struct {
     /// Resolve an item by run_id: returns true when found and removed.
     pub fn resolve(self: *Self, run_id: []const u8, _tenant_id: ?i64) !bool {
         _ = _tenant_id;
-        self.mu.lock(self.io) catch return error.LockFailed;
+        try self.mu.lock(self.io);
         defer self.mu.unlock(self.io);
         for (self.items.items, 0..) |item, i| {
             if (std.mem.eql(u8, item.run_id, run_id)) {
@@ -73,7 +73,12 @@ pub const ApprovalQueue = struct {
     }
 
     pub fn count(self: *Self) usize {
-        self.mu.lock(self.io) catch return 0;
+        // Uncancelable: a fabricated `0` reads as "nothing is pending approval" —
+        // the reading the approvals dashboard and the API's own list endpoint are
+        // built from — and `usize` has no error channel to report the cancelation
+        // in. One list length. Red: `ai.approval_api.test.push, resolve,
+        // listPending and count answer a canceled lock wait honestly`.
+        self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         return self.items.items.len;
     }
@@ -81,7 +86,7 @@ pub const ApprovalQueue = struct {
     /// Copy pending items into `out` (caller owns the strings).
     pub fn listPending(self: *Self, allocator: std.mem.Allocator, out: *std.ArrayList(PendingApproval), _tenant_id: ?i64) !void {
         _ = _tenant_id;
-        self.mu.lock(self.io) catch return error.LockFailed;
+        try self.mu.lock(self.io);
         defer self.mu.unlock(self.io);
         for (self.items.items) |item| {
             try out.append(allocator, .{
@@ -376,4 +381,140 @@ test "approval.request skill submits and reports the chain status" {
     try std.testing.expectEqualStrings("pending_human", res.object.get("status").?.string);
     try std.testing.expectEqual(@as(usize, 1), queue.count());
     try std.testing.expectEqualStrings("order-7", queue.items.items[0].run_id);
+}
+
+/// Park `read` on `mutex` with a cancel request already placed on its thread, then
+/// let it through: the lock wait becomes the cancelation point. `std.Io.Mutex.lock`'s
+/// uncontended fast path does not check for cancellation, so it is the contended
+/// wait that can come back canceled.
+fn readUnderCanceledLockWait(
+    comptime T: type,
+    target: *T,
+    mutex: *std.Io.Mutex,
+    io: std.Io,
+    comptime read: fn (*T) void,
+) !void {
+    const Gate = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+
+        fn run(t: *T) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            read(t);
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Gate.entered.store(false, .monotonic);
+    Gate.open.store(false, .monotonic);
+
+    try mutex.lock(io);
+
+    var read_fut = try io.concurrent(Gate.run, .{target});
+    while (!Gate.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Gate.cancel, .{ io, &read_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Gate.open.store(true, .release);
+    while (mutex.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    mutex.unlock(io);
+
+    cancel_fut.await(io);
+    read_fut.await(io);
+}
+
+// Four lock waits, answered by whether the caller can be told:
+//   - `push`, `resolve` and `listPending` return errors and abandon nothing (the
+//     queue is untouched), so the cancelation is *propagated* as `error.Canceled`
+//     — the only error `std.Io.Mutex.lock` has. `error.LockFailed` named
+//     lock-machinery failure for it, which a caller cannot tell from "this
+//     queue's lock is broken";
+//   - `count` returns `usize`, and a fabricated `0` reads as "nothing is pending
+//     approval" — the reading an operator dashboard is built from — so it *waits*
+//     (`lockUncancelable`). One list length.
+//
+// Red evidence: with the old shapes the first assertion below reads `expected
+// error.Canceled, found error.LockFailed` (and the `count` one reads
+// `expected 1, found 0`). Each `try` ends the test at the first failure, so the
+// later assertions are only exercised green.
+test "push, resolve, listPending and count answer a canceled lock wait honestly" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var queue = ApprovalQueue.init(allocator, io);
+    defer queue.deinit();
+
+    // Empty strings on purpose: a `push` that goes through hands the item to the
+    // queue, whose `deinit` frees those fields — a literal would be a bad free.
+    const PushRead = struct {
+        var seen: ?anyerror = null;
+        fn read(q: *ApprovalQueue) void {
+            seen = null;
+            q.push(.{ .run_id = "", .subject = "", .amount = 1, .note = "", .step_name = "" }) catch |err| {
+                seen = err;
+            };
+        }
+    };
+    PushRead.seen = null;
+    try readUnderCanceledLockWait(ApprovalQueue, &queue, &queue.mu, io, PushRead.read);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), PushRead.seen);
+
+    const ResolveRead = struct {
+        var seen: ?anyerror = null;
+        fn read(q: *ApprovalQueue) void {
+            seen = null;
+            _ = q.resolve("ap-none", null) catch |err| {
+                seen = err;
+                return;
+            };
+        }
+    };
+    ResolveRead.seen = null;
+    try readUnderCanceledLockWait(ApprovalQueue, &queue, &queue.mu, io, ResolveRead.read);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), ResolveRead.seen);
+
+    const ListRead = struct {
+        var seen: ?anyerror = null;
+        fn read(q: *ApprovalQueue) void {
+            seen = null;
+            var out = std.ArrayList(PendingApproval).empty;
+            defer {
+                for (out.items) |item| {
+                    std.testing.allocator.free(item.run_id);
+                    std.testing.allocator.free(item.subject);
+                    std.testing.allocator.free(item.note);
+                    std.testing.allocator.free(item.step_name);
+                }
+                out.deinit(std.testing.allocator);
+            }
+            q.listPending(std.testing.allocator, &out, null) catch |err| {
+                seen = err;
+            };
+        }
+    };
+    ListRead.seen = null;
+    try readUnderCanceledLockWait(ApprovalQueue, &queue, &queue.mu, io, ListRead.read);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), ListRead.seen);
+
+    // Seeded on this thread (the queue frees these), so `1` is unambiguous
+    // evidence that the canceled wait was answered with a fabricated `0`.
+    try queue.push(.{
+        .run_id = try allocator.dupe(u8, "ap-1"),
+        .subject = try allocator.dupe(u8, "order-1"),
+        .amount = 1,
+        .note = try allocator.dupe(u8, "needs CFO"),
+        .step_name = try allocator.dupe(u8, "finance"),
+    });
+    const CountRead = struct {
+        var seen: usize = 0;
+        fn read(q: *ApprovalQueue) void {
+            seen = q.count();
+        }
+    };
+    CountRead.seen = 0;
+    try readUnderCanceledLockWait(ApprovalQueue, &queue, &queue.mu, io, CountRead.read);
+    try std.testing.expectEqual(@as(usize, 1), CountRead.seen);
 }

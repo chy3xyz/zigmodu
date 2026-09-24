@@ -351,8 +351,25 @@ pub const InstrumentedEventListener = struct {
     const Self = @This();
 
     instrumentation: *AutoInstrumentation,
+    /// Two entry families share this map, told apart by their key prefix (this
+    /// file is the only writer of both):
+    ///
+    /// - `publish:` — one entry per distinct `event:module` pair, holding a span
+    ///   `onEventPublished` has already ended. It is the consume half's parent
+    ///   reference; its storage is this listener's, replaced (and freed) by the
+    ///   next publish of the same pair, and freed by `deinit`.
+    /// - `consume:` — one entry per in-flight consume, holding a span the
+    ///   *tracer* still lists. `onEventConsumeEnd` ends it and frees it, or
+    ///   `tracer.deinit()` frees one that is never ended.
+    ///
+    /// That makes the map bounded by `distinct publish pairs + consumes in
+    /// flight`; the pairs are fixed by the app's source (its event types × the
+    /// modules publishing them), not by traffic. The tests below assert it.
     event_processing_spans: std.StringHashMap(*DistributedTracer.Span),
     event_start_times: std.StringHashMap(i64),
+
+    const publish_key_prefix = "publish:";
+    const consume_key_prefix = "consume:";
 
     pub fn init(allocator: std.mem.Allocator, instrumentation: *AutoInstrumentation) Self {
         return .{
@@ -362,15 +379,20 @@ pub const InstrumentedEventListener = struct {
         };
     }
 
-    /// Frees the map keys (one allocation per map — see `onEventConsumeStart`).
-    /// Span values are not touched: the listener holds no span that it also
-    /// released, because an ended span is freed by `onEventConsumeEnd` and an
-    /// un-ended one is still in the tracer's active list, which frees it at
-    /// `tracer.deinit()`.
+    /// Frees one key per entry, plus the span of every `publish:` entry — those
+    /// are ended by `onEventPublished`, so this listener owns them. `consume:`
+    /// spans are left alone: an in-flight consume is still in the tracer's
+    /// active list, which is what frees it at `tracer.deinit()`.
     pub fn deinit(self: *Self) void {
+        const allocator = self.event_processing_spans.allocator;
         var span_iter = self.event_processing_spans.iterator();
         while (span_iter.next()) |entry| {
-            self.event_processing_spans.allocator.free(entry.key_ptr.*);
+            const key = entry.key_ptr.*;
+            if (std.mem.startsWith(u8, key, publish_key_prefix)) {
+                entry.value_ptr.*.deinit(allocator);
+                allocator.destroy(entry.value_ptr.*);
+            }
+            allocator.free(key);
         }
         self.event_processing_spans.deinit();
 
@@ -383,12 +405,47 @@ pub const InstrumentedEventListener = struct {
     }
 
     /// Called on event publish
+    ///
+    /// The span is ended here: the publish is what it measures, and the publish
+    /// is over when this returns. `endSpan` only un-lists it, and an ended span
+    /// is still a usable parent for the consume half (`startSpan` copies
+    /// `trace_id` / `span_id` out of it). Leaving it un-ended put one span in
+    /// the tracer's active list per *published event*, forever — the map entry
+    /// was overwritten by the next publish of the pair, the span it replaced
+    /// stayed listed.
     pub fn onEventPublished(self: *Self, event_name: []const u8, module_name: []const u8) !void {
         const span = try self.instrumentation.recordEventPublished(event_name, module_name);
         if (span) |s| {
-            const key = try std.fmt.allocPrint(self.event_processing_spans.allocator, "{s}:{s}", .{ event_name, module_name });
-            errdefer self.event_processing_spans.allocator.free(key);
-            try self.event_processing_spans.put(key, s);
+            const allocator = self.event_processing_spans.allocator;
+            const key = try std.fmt.allocPrint(allocator, publish_key_prefix ++ "{s}:{s}", .{ event_name, module_name });
+            errdefer allocator.free(key);
+
+            self.instrumentation.tracer.endSpan(s);
+            // Past `endSpan` the storage is this listener's, so the last
+            // fallible step has to release it if it fails — otherwise nobody
+            // would (`deinit` only frees the spans it can still find).
+            errdefer {
+                s.deinit(allocator);
+                allocator.destroy(s);
+            }
+
+            // `getPtr` first, because the two cases need opposite key handling:
+            // the map keeps the key a slot already has and stores the one it is
+            // given for a fresh slot, so on the replace path the *fresh* key is
+            // the orphan (`fetchPut` hands back the stored key instead — freeing
+            // that one frees what the map still points at).
+            if (self.event_processing_spans.getPtr(key)) |slot| {
+                // Nth publish of this pair: the parent being replaced is ended
+                // and this listener's, so its storage goes as the new one takes
+                // the slot.
+                const old = slot.*;
+                allocator.free(key);
+                slot.* = s;
+                old.deinit(allocator);
+                allocator.destroy(old);
+            } else {
+                try self.event_processing_spans.put(key, s);
+            }
         }
     }
 
@@ -400,15 +457,17 @@ pub const InstrumentedEventListener = struct {
     pub fn onEventConsumeStart(self: *Self, event_name: []const u8, module_name: []const u8) !void {
         const allocator = self.event_processing_spans.allocator;
 
-        // Look up publish-time span as parent
-        const pub_key = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ event_name, module_name });
+        // Look up publish-time span as parent. That key is the publish-format
+        // one; the consume entry below gets its own prefix, so `deinit` can tell
+        // the two families apart by key alone.
+        const pub_key = try std.fmt.allocPrint(allocator, publish_key_prefix ++ "{s}:{s}", .{ event_name, module_name });
         defer allocator.free(pub_key);
         const parent_span = self.event_processing_spans.get(pub_key);
 
         const span = try self.instrumentation.recordEventConsumed(event_name, module_name, parent_span);
 
         if (span) |s| {
-            const key = try std.fmt.allocPrint(allocator, "consume:{s}:{s}", .{ event_name, module_name });
+            const key = try std.fmt.allocPrint(allocator, consume_key_prefix ++ "{s}:{s}", .{ event_name, module_name });
             errdefer allocator.free(key);
             const start_key = try allocator.dupe(u8, key);
             errdefer allocator.free(start_key);
@@ -424,18 +483,18 @@ pub const InstrumentedEventListener = struct {
     /// Best-effort by design, and reported rather than swallowed: this is the
     /// metrics/tracing side of an event whose handling already happened in the
     /// caller, so it can never be worth failing the work it describes. Giving up
-    /// here costs one duration sample and leaves the span's map entry to
-    /// `deinit` — the same trade `recordApiRequestEnd` makes for a dropped span
-    /// event, which is why it logs at the same level.
+    /// here costs one duration sample and leaves the entry's key to `deinit`
+    /// — the span is still un-ended, so the tracer keeps it and frees it at
+    /// `tracer.deinit()`. Same trade `recordApiRequestEnd` makes for a dropped
+    /// span event, which is why it logs at the same level.
     ///
     /// On the happy path the span is also released here: `recordEventProcessed`
     /// ends it, which un-lists it from the tracer, so from that point the
-    /// listener is the only owner. A span left in the map by an early return is
-    /// still listed in the tracer, which frees it at `tracer.deinit()`.
+    /// listener is the only owner.
     pub fn onEventConsumeEnd(self: *Self, event_name: []const u8, module_name: []const u8, success: bool) void {
         const allocator = self.event_start_times.allocator;
 
-        const key = std.fmt.allocPrint(allocator, "consume:{s}:{s}", .{ event_name, module_name }) catch |err| {
+        const key = std.fmt.allocPrint(allocator, consume_key_prefix ++ "{s}:{s}", .{ event_name, module_name }) catch |err| {
             std.log.debug("[metrics] event consume end dropped ({s}); the span stays un-ended", .{@errorName(err)});
             return;
         };
@@ -609,15 +668,68 @@ test "InstrumentedEventListener deinit releases an unended consume" {
     var listener = InstrumentedEventListener.init(allocator, &instrumentation);
     defer listener.deinit();
 
-    // Published and never consumed: `deinit` frees the publish key, and the
-    // span is still in the tracer's active list, which is what frees it.
+    // Published and never consumed: the publish span is ended by
+    // `onEventPublished` (the publish is over by then) and kept in the map as
+    // the consume half's parent reference, so `deinit` releases that entry's
+    // key *and* the span — nothing else owns it.
     try listener.onEventPublished("order.created", "orders");
 
     // Consumed and never ended: both maps hold a `consume:…` key, one
     // allocation each, so `deinit` frees two keys and never the same one twice.
-    // The span stays un-ended, so the tracer still owns it.
+    // The consume span is still un-ended, so the tracer owns it — which is the
+    // observable half of the split `deinit` makes (ended publish span → this
+    // listener, un-ended consume span → the tracer).
     try listener.onEventConsumeStart("order.created", "orders");
-    try testing.expectEqual(@as(usize, 2), tracer.active_spans.items.len);
+    try testing.expectEqual(@as(usize, 1), tracer.active_spans.items.len);
+    try testing.expectEqual(@as(usize, 2), listener.event_processing_spans.count());
+}
+
+// What the publish side of `event_processing_spans` costs on a long-lived
+// listener.
+//
+// The map is keyed by the `event:module` pair, so *it* is bounded by how many
+// distinct pairs an app publishes — a number fixed by the app's source (its
+// event types × the modules publishing them), not by traffic, and asserted
+// below. The span behind the entry was unbounded in the other direction:
+// every `onEventPublished` built a fresh span with `startTrace` and left the
+// previous one listed in `tracer.active_spans` (`put` replaced the map value,
+// nothing ended the old span), so a process publishing for months collected
+// one span per published event — one map entry, but a tracer list that grew
+// with the event volume. Both halves are asserted here.
+test "InstrumentedEventListener publish side is bounded by distinct pairs, not by volume" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var metrics = PrometheusMetrics.init(allocator);
+    defer metrics.deinit();
+
+    var tracer = try DistributedTracer.init(allocator, "test_tracer", "test_service");
+    defer tracer.deinit();
+
+    var instrumentation = try AutoInstrumentation.init(allocator, &metrics, &tracer);
+
+    var listener = InstrumentedEventListener.init(allocator, &instrumentation);
+    defer listener.deinit();
+
+    const publishes = 128;
+    for (0..publishes) |_| try listener.onEventPublished("order.created", "orders");
+
+    try testing.expectEqual(@as(usize, 1), listener.event_processing_spans.count());
+    try testing.expectEqual(@as(usize, 0), tracer.active_spans.items.len);
+
+    // A second module on the same event name, and a second event name, cost
+    // one entry each — that is the bound the map does have — and still no span.
+    try listener.onEventPublished("order.created", "billing");
+    try listener.onEventPublished("order.shipped", "orders");
+    try testing.expectEqual(@as(usize, 3), listener.event_processing_spans.count());
+    try testing.expectEqual(@as(usize, 0), tracer.active_spans.items.len);
+
+    // The ended parent is still usable as one: `startSpan` copies `trace_id` /
+    // `span_id` by value, so ending the publish span (rather than parking it in
+    // the tracer's list) does not orphan the consume half of the trace.
+    try listener.onEventConsumeStart("order.created", "orders");
+    try testing.expectEqual(@as(usize, 1), tracer.active_spans.items.len);
+    try testing.expect(tracer.active_spans.items[0].parent_span_id != null);
 }
 
 const FunctionProbe = struct {

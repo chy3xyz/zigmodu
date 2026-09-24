@@ -948,6 +948,13 @@ pub const RedisCluster = struct {
     /// one step: both buffers are grown up front, and the two appends after
     /// `Redis.new` cannot fail. Nothing falls between them, so no config can
     /// outlive its node and no partially built node can be left behind.
+    ///
+    /// There is deliberately no `errdefer redis.deinit()` after `Redis.new`:
+    /// `appendAssumeCapacity` has no error path (it asserts capacity, and an
+    /// assertion is not an error), so nothing past that point can return an
+    /// error here, and an unwind no input can reach is a safety claim no test
+    /// can exercise. A fallible step added between `Redis.new` and the appends
+    /// has to reinstate that unwinding with itself.
     pub fn addNode(self: *Self, host: []const u8, port: u16) !void {
         const host_copy = try self.allocator.dupe(u8, host);
         errdefer self.allocator.free(host_copy);
@@ -956,8 +963,9 @@ pub const RedisCluster = struct {
         try self.node_configs.ensureUnusedCapacity(self.allocator, 1);
         try self.nodes.ensureUnusedCapacity(self.allocator, 1);
 
-        var redis = try Redis.new(self.allocator, self.io, cfg);
-        errdefer redis.deinit();
+        // `const`: nothing after this can mutate it (there is no unwind left to
+        // run against it — see the doc comment above).
+        const redis = try Redis.new(self.allocator, self.io, cfg);
 
         self.node_configs.appendAssumeCapacity(cfg);
         self.nodes.appendAssumeCapacity(redis);

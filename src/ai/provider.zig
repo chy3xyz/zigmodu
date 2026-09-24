@@ -235,7 +235,7 @@ pub const AiProvider = struct {
 
     pub fn chatWith(self: *AiProvider, messages: []const ChatMsg, opts: ChatOpts) !ChatResponse {
         if (self.rate_limiter) |*rl| {
-            rl.mutex.lock(rl.io) catch return error.RateLimitLockFailed;
+            try rl.mutex.lock(rl.io);
             defer rl.mutex.unlock(rl.io);
             if (!rl.limiter.tryAcquire()) {
                 _ = self.metrics.rate_limited_count.fetchAdd(1, .monotonic);
@@ -304,7 +304,7 @@ pub const AiProvider = struct {
         on_delta: OnDelta,
     ) !ChatResponse {
         if (self.rate_limiter) |*rl| {
-            rl.mutex.lock(rl.io) catch return error.RateLimitLockFailed;
+            try rl.mutex.lock(rl.io);
             defer rl.mutex.unlock(rl.io);
             if (!rl.limiter.tryAcquire()) {
                 _ = self.metrics.rate_limited_count.fetchAdd(1, .monotonic);
@@ -1243,4 +1243,97 @@ test "AiProvider metrics toPrometheusFormat" {
     defer a.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "zigmodu_ai_provider_requests_total") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "provider=\"main\"") != null);
+}
+
+/// Park `read` on `mutex` with a cancel request already placed on its thread, then
+/// let it through: the lock wait becomes the cancelation point. `std.Io.Mutex.lock`'s
+/// uncontended fast path does not check for cancellation, so it is the contended
+/// wait that can come back canceled.
+fn readUnderCanceledLockWait(
+    comptime T: type,
+    target: *T,
+    mutex: *std.Io.Mutex,
+    io: std.Io,
+    comptime read: fn (*T) void,
+) !void {
+    const Gate = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+
+        fn run(t: *T) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            read(t);
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Gate.entered.store(false, .monotonic);
+    Gate.open.store(false, .monotonic);
+
+    try mutex.lock(io);
+
+    var read_fut = try io.concurrent(Gate.run, .{target});
+    while (!Gate.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Gate.cancel, .{ io, &read_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Gate.open.store(true, .release);
+    while (mutex.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    mutex.unlock(io);
+
+    cancel_fut.await(io);
+    read_fut.await(io);
+}
+
+// Both rate-limit waits report the cancelation as `error.Canceled` instead of
+// `error.RateLimitLockFailed`. The lock guards one `tryAcquire` (a token is
+// consumed or not, and a canceled wait consumes nothing), and both functions
+// return errors, so the honest answer is the cancelation — a caller cannot tell
+// "unwind, you were canceled" from "this provider's limiter lock is broken".
+//
+// Red evidence: with `catch return error.RateLimitLockFailed` the first assertion
+// below reads `expected error.Canceled, found error.RateLimitLockFailed`. The
+// `chatStream` assertion after it is the same lock shape; a `try` ends the test at
+// the first failure, so it is only exercised green.
+test "chatWith and chatStream report a canceled rate-limit lock wait as error.Canceled" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var http = http_client.HttpClient.init(a, io, 1, 5000);
+    defer http.deinit();
+    var p = AiProvider.init(a, &http, "https://api.test/v1", "Bearer sk-xxx", "deepseek-v4-flash");
+    try p.enableRateLimit(io, 100);
+    defer p.deinit(); // frees the limiter's name copy
+    const rl = if (p.rate_limiter) |*state| state else unreachable;
+
+    const ChatRead = struct {
+        var seen: ?anyerror = null;
+        fn read(pp: *AiProvider) void {
+            seen = null;
+            _ = pp.chatWith(&[_]AiProvider.ChatMsg{.{ .role = "user", .content = "hi" }}, .{}) catch |err| {
+                seen = err;
+            };
+        }
+    };
+    ChatRead.seen = null;
+    try readUnderCanceledLockWait(AiProvider, &p, &rl.mutex, io, ChatRead.read);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), ChatRead.seen);
+
+    const StreamRead = struct {
+        var seen: ?anyerror = null;
+        var cb_ctx: u8 = 0;
+        fn nopDelta(_: *anyopaque, _: AiProvider.StreamDelta) anyerror!void {}
+        fn read(pp: *AiProvider) void {
+            seen = null;
+            _ = pp.chatStream(&[_]AiProvider.ChatMsg{.{ .role = "user", .content = "hi" }}, .{}, &cb_ctx, nopDelta) catch |err| {
+                seen = err;
+            };
+        }
+    };
+    StreamRead.seen = null;
+    try readUnderCanceledLockWait(AiProvider, &p, &rl.mutex, io, StreamRead.read);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), StreamRead.seen);
 }
