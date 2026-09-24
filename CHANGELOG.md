@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.33.3] - 2026-09-24
 
 ### 第 14 批：H2 上 gRPC 路由的 `HEAD` 仍会发 DATA 帧（真红）、sqlite 把 OOM 与 SQL NULL 混成一个 `null` 并顺带修掉一个真泄漏（**破坏性：否**）
 
