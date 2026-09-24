@@ -318,43 +318,109 @@ pub const OpenApiFromCatalogConfig = struct {
     bearer_auth: bool = true,
 };
 
-/// Live OpenAPI JSON handler: regenerates from `CatalogSlot` on each request.
-/// Register after `catalog_slot.set(try router.finish())`.
-/// Runtime backing store for the OpenAPI catalog handler. Hoisted to
-/// container level so the handler fn itself stays comptime-known (required by
-/// `wrapHandler`); one OpenAPI endpoint per app, so a single store is enough.
-/// NOTE: registering `openApiFromCatalog` twice overwrites the first — one
-/// catalog slot per application by design (module Gate is app-wide anyway).
-const OpenApiRouteStore = struct {
-    var catalog_slot: *CatalogSlot = undefined;
-    var title: []const u8 = "";
-    var version: []const u8 = "";
-    var description: []const u8 = "";
-    var bearer_auth: bool = true;
+/// Runtime binding of one OpenAPI endpoint: the slot it documents plus the
+/// document header. Regenerated from `CatalogSlot` on each request, so the slot
+/// may be filled after registration — only the first request needs it set.
+const OpenApiBinding = struct {
+    catalog_slot: *CatalogSlot,
+    title: []const u8,
+    version: []const u8,
+    description: []const u8,
+    bearer_auth: bool,
 };
 
-fn openApiCatalogHandler(ctx: *Context) anyerror!void {
-    const cat = OpenApiRouteStore.catalog_slot.get() orelse {
-        try ctx.sendError(503, "Route catalog not ready");
-        return;
+/// Number of independently-bound OpenAPI endpoints one process may build.
+///
+/// A `HandlerFn` is a bare function pointer and carries no context, so the
+/// binding has to be reached through *the function itself*: every registration
+/// claims one slot and returns that slot's own trampoline, which reads its own
+/// slot + config and nothing else. Hoisting the state to one module-level store
+/// (the shape this replaced) makes it process-wide instead — the second
+/// `openApiFromCatalog` overwrote the first, so with two apps in one binary
+/// app A's `/openapi.json` served app B's catalog. Both documents are valid
+/// JSON, so nothing downstream noticed.
+///
+/// Slots are claimed at wiring time and never released, so this bounds how many
+/// OpenAPI endpoints an application *builds*, not how many requests it serves.
+pub const max_openapi_bindings = 16;
+
+const OpenApiBindings = struct {
+    /// One binding per claimed slot; unclaimed slots stay `null` and are not
+    /// reachable — their trampolines are never handed out.
+    var bindings: [max_openapi_bindings]?OpenApiBinding = @splat(null);
+    /// Atomic so two threads wiring apps concurrently cannot claim one slot
+    /// (which would put two apps on one binding again).
+    var claimed: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+};
+
+/// Claim the binding for `slot`, reusing the existing slot when the same
+/// `CatalogSlot` registers twice: a re-registration updates that app's config,
+/// as it always did, and leaves every other app alone.
+fn claimOpenApiBinding(slot: *CatalogSlot, config: OpenApiFromCatalogConfig) usize {
+    const binding: OpenApiBinding = .{
+        .catalog_slot = slot,
+        .title = config.title,
+        .version = config.version,
+        .description = config.description,
+        .bearer_auth = config.bearer_auth,
     };
-    var gen = OpenApi.OpenApiGenerator.init(ctx.allocator, OpenApiRouteStore.title, OpenApiRouteStore.version, OpenApiRouteStore.description);
-    defer gen.deinit();
-    gen.bearer_auth = OpenApiRouteStore.bearer_auth;
-    try cat.exportOpenApi(&gen);
-    const json = try gen.generate();
-    defer ctx.allocator.free(json);
-    try ctx.setHeader("Content-Type", "application/json");
-    try ctx.json(200, json);
+    const claimed = OpenApiBindings.claimed.load(.seq_cst);
+    for (0..claimed) |i| {
+        if (OpenApiBindings.bindings[i]) |existing| {
+            if (existing.catalog_slot == slot) {
+                OpenApiBindings.bindings[i] = binding;
+                return i;
+            }
+        }
+    }
+    const index = OpenApiBindings.claimed.fetchAdd(1, .seq_cst);
+    if (index >= max_openapi_bindings) {
+        @panic("openApiFromCatalog: OpenAPI binding pool exhausted — raise max_openapi_bindings");
+    }
+    OpenApiBindings.bindings[index] = binding;
+    return index;
 }
 
+fn OpenApiHandler(comptime index: usize) type {
+    return struct {
+        fn handle(ctx: *Context) anyerror!void {
+            // Fail closed rather than guess: `null` or an unready slot is not a
+            // document we know anything about.
+            const binding = OpenApiBindings.bindings[index] orelse {
+                try ctx.sendError(503, "Route catalog not ready");
+                return;
+            };
+            const cat = binding.catalog_slot.get() orelse {
+                try ctx.sendError(503, "Route catalog not ready");
+                return;
+            };
+            var gen = OpenApi.OpenApiGenerator.init(ctx.allocator, binding.title, binding.version, binding.description);
+            defer gen.deinit();
+            gen.bearer_auth = binding.bearer_auth;
+            try cat.exportOpenApi(&gen);
+            const json = try gen.generate();
+            defer ctx.allocator.free(json);
+            try ctx.setHeader("Content-Type", "application/json");
+            try ctx.json(200, json);
+        }
+    };
+}
+
+/// One distinct function pointer per binding — the identity a bare fn pointer
+/// cannot otherwise carry. Every entry reads a different binding, so they are
+/// not interchangeable and no optimizer may fold them into one.
+const openapi_handlers: [max_openapi_bindings]HandlerFn = blk: {
+    var table: [max_openapi_bindings]HandlerFn = undefined;
+    for (0..max_openapi_bindings) |i| table[i] = OpenApiHandler(i).handle;
+    break :blk table;
+};
+
+/// Live OpenAPI JSON handler served from this app's `CatalogSlot`, with this
+/// app's title/version/description. Register after
+/// `catalog_slot.set(try router.finish())` (the handler reads the slot per
+/// request, so only requests before `set` see 503).
 pub fn openApiFromCatalog(slot: *CatalogSlot, config: OpenApiFromCatalogConfig) HandlerFn {
-    OpenApiRouteStore.catalog_slot = slot;
-    OpenApiRouteStore.title = config.title;
-    OpenApiRouteStore.version = config.version;
-    OpenApiRouteStore.description = config.description;
-    OpenApiRouteStore.bearer_auth = config.bearer_auth;
-    return openApiCatalogHandler;
+    return openapi_handlers[claimOpenApiBinding(slot, config)];
 }
 
 /// Standalone handler serving an interactive Swagger UI HTML page pointing to `spec_url`.
@@ -435,9 +501,27 @@ pub fn openApiRoutes(
     slot: *CatalogSlot,
     config: OpenApiFromCatalogConfig,
 ) [3]RouteSpec(State) {
-    _ = openApiFromCatalog(slot, config); // fills OpenApiRouteStore at runtime
+    const index = claimOpenApiBinding(slot, config);
+    // `RouteSpec(State).handler` is a `TypedHandler(State)`, and the binding
+    // index is a runtime value, so the adapter that bridges to the slot's
+    // `HandlerFn` has to exist per (State, slot) — one distinct fn per binding,
+    // same reason as `openapi_handlers`.
+    const Adapter = struct {
+        fn forSlot(comptime i: usize) TypedHandler(State) {
+            return struct {
+                fn adapter(ctx: *Context, _: *State) anyerror!void {
+                    return openapi_handlers[i](ctx);
+                }
+            }.adapter;
+        }
+        const table: [max_openapi_bindings]TypedHandler(State) = blk: {
+            var t: [max_openapi_bindings]TypedHandler(State) = undefined;
+            for (0..max_openapi_bindings) |i| t[i] = forSlot(i);
+            break :blk t;
+        };
+    };
     return [_]RouteSpec(State){
-        .{ .method = .GET, .path = "openapi.json", .handler = wrapHandler(State, openApiCatalogHandler), .meta = .{ .auth = .public } },
+        .{ .method = .GET, .path = "openapi.json", .handler = Adapter.table[index], .meta = .{ .auth = .public } },
         .{ .method = .GET, .path = "docs", .handler = wrapHandler(State, swaggerUiHandler("openapi.json")), .meta = .{ .auth = .public } },
         .{ .method = .GET, .path = "scalar", .handler = wrapHandler(State, scalarUiHandler("openapi.json")), .meta = .{ .auth = .public } },
     };
@@ -1109,6 +1193,113 @@ test "openApiRoutes generates 3 public UI and spec routes" {
     try std.testing.expect(routes[0].meta.auth == .public);
     try std.testing.expect(routes[1].meta.auth == .public);
     try std.testing.expect(routes[2].meta.auth == .public);
+}
+
+test "one process, two servers: each /openapi.json serves its own catalog" {
+    const allocator = std.testing.allocator;
+    const Testkit = @import("../http/Testkit.zig");
+
+    // Two apps in one binary, each with its own `Router`, `CatalogSlot` and
+    // OpenAPI title, registered in production order (`openApiFromCatalog`
+    // before the slot is filled). A single process-wide store would make the
+    // second registration overwrite the first, so app A's documentation
+    // endpoint would answer with app B's catalog — a valid document describing
+    // the wrong service, which is why nothing downstream would complain.
+    const AppState = struct {};
+    const CartApi = struct {
+        pub const module_name = "cart";
+        pub const nest = .{};
+        pub const State = @This();
+        pub const routes = [_]RouteSpec(State){
+            .{ .method = .GET, .path = "carts", .handler = noop, .meta = .{ .auth = .public } },
+        };
+        fn noop(ctx: *Context, _: *State) !void {
+            try ctx.jsonStruct(200, .{});
+        }
+    };
+    const UserApi = struct {
+        pub const module_name = "user";
+        pub const nest = .{};
+        pub const State = @This();
+        pub const routes = [_]RouteSpec(State){
+            .{ .method = .GET, .path = "users", .handler = noop, .meta = .{ .auth = .public } },
+        };
+        fn noop(ctx: *Context, _: *State) !void {
+            try ctx.jsonStruct(200, .{});
+        }
+    };
+
+    var shop_srv = Server.init(std.testing.io, allocator, 0);
+    defer shop_srv.deinit();
+    var shop_slot: CatalogSlot = .{};
+    defer shop_slot.deinit();
+    var admin_srv = Server.init(std.testing.io, allocator, 0);
+    defer admin_srv.deinit();
+    var admin_slot: CatalogSlot = .{};
+    defer admin_slot.deinit();
+
+    var shop_state: AppState = .{};
+    var shop_mod: CartApi = .{};
+    var shop_router = Router(AppState).init(std.testing.io, allocator, &shop_srv, &shop_state);
+    defer shop_router.deinit();
+    var admin_state: AppState = .{};
+    var admin_mod: UserApi = .{};
+    var admin_router = Router(AppState).init(std.testing.io, allocator, &admin_srv, &admin_state);
+    defer admin_router.deinit();
+
+    // Handlers first (the app registers its docs route while wiring), then the
+    // routes, then the catalog slot — same order as the examples.
+    try shop_srv.addRoute(.{
+        .method = .GET,
+        .path = "openapi.json",
+        .handler = openApiFromCatalog(&shop_slot, .{ .title = "Shop App" }),
+    });
+    try admin_srv.addRoute(.{
+        .method = .GET,
+        .path = "openapi.json",
+        .handler = openApiFromCatalog(&admin_slot, .{ .title = "Admin App" }),
+    });
+    {
+        var shop_root = shop_router.scope("");
+        try shop_root.mount(CartApi, &shop_mod);
+    }
+    {
+        var admin_root = admin_router.scope("");
+        try admin_root.mount(UserApi, &admin_mod);
+    }
+    shop_slot.set(try shop_router.finish());
+    admin_slot.set(try admin_router.finish());
+
+    {
+        var resp = try Testkit.dispatch(&shop_srv, .GET, "/openapi.json", null);
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+        // The leak, asserted first: this document must not describe the other
+        // app. (With a process-wide store it does, and every later assertion
+        // would be checking the wrong app's document.)
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "Admin App") == null);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "/users") == null);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "Shop App") != null);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "/carts") != null);
+    }
+    {
+        var resp = try Testkit.dispatch(&admin_srv, .GET, "/openapi.json", null);
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "Admin App") != null);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "/users") != null);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "Shop App") == null);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "/carts") == null);
+    }
+    // …and back to the first app: a binding overwritten while answering admin
+    // shows up right here.
+    {
+        var resp = try Testkit.dispatch(&shop_srv, .GET, "/openapi.json", null);
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "Shop App") != null);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "/carts") != null);
+    }
 }
 
 test "wrapHandler captures each handler independently (no shared store)" {

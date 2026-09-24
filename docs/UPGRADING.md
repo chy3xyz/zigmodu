@@ -101,6 +101,22 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 已有规则一致）。若你的 handler 依赖"自己写的 `Content-Length` 一定会原样发出"，而它与实际 body 不符，
 这条之后会被服务端自己的值替换。
 
+**行为变化（非破坏，但值得确认你的接线方式）**：**一个进程里跑两个 `Server` 现在真的互不干扰了。**
+`openApiFromCatalog` 的结果以前写在一份**进程级** store 里（第二个注册覆盖第一个 → A 的
+`/openapi.json` 会服务 B 的 catalog），`catalogLoaderFromTable` 以前用模块级的 `Holder.tbl`
+（第二个 loader 会改掉**第一个** app 的授权表，是执法路径）。现在分别按 `*CatalogSlot` 与
+`RolePermissionTable` 指针去重：同一 slot / 同一张表仍是同一份状态（**有意共享**），不同则完全隔离。
+**你要确认的只有一件事**：这两个入口现在都是**接线期** API —— `catalogLoaderFromTable` 有 64 个槽、
+`openApiFromCatalog` 有 16 个，**耗尽即 panic**（panic 文本会告诉你抬高哪个常量）。
+一次性接线（每个 app 一张表 / 一个 slot）不受影响；如果你的代码在**循环或请求路径**里反复调用它们
+（旧版会静默互相覆盖，所以那样用本来也没对），请改成接线期各领取一次。
+
+**修复（非破坏）**：PG 上"分配失败"与"驱动失败"以前都表现为 `?*PGresult` 的 `null`，于是 OOM 会被报成
+`error.DatabaseError`（`toErrorContext` 落到 `UnknownError`、metrics 记的错误名也是错的）。现在
+`null` 只表示"驱动没有交回 `PGresult`"，分配失败一律如实抛 `error.OutOfMemory`。两个可见的副作用：
+① OOM 下 PG 查询的错误名变了；② 语句缓存键/插入的分配失败**不再**回退到"未缓存路径"再执行一次。
+公开签名未变。
+
 ---
 
 ## v0.33.1

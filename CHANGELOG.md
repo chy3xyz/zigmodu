@@ -2,6 +2,66 @@
 
 ## [Unreleased]
 
+### 第 13 批：PG `?*PGresult` 的 null 语义收敛（上一批只给了评估、这次真做）、一个进程两个 server 的全局状态彻底按实例隔离（**破坏性：否**，公开签名未动）
+
+全量 `-Ddb=all` **1780/1833（53 skipped，0 failed）**；PG 门控真机 `allocation` 组 38 passed / 9 skipped，
+MySQL 门控真机 33 passed / 13 skipped（均 0 failed）。三个调用 `openApiFromCatalog` 的示例
+（`tenant-mgmt` / `tenant-shop` / `zent-modulith`）本机 `zig build` 通过。
+
+**PG 的 `?*PGresult` 里，`null` 同时表示"分配失败"和"驱动失败" —— 已收敛。** 上一批只给出了评估并
+**明确没有开始**（怕把真驱动错误吞成 OOM），这批做完并**更正了那份评估的两处事实**：
+- 调用点不是"约 22 个外部"：`execPrepared → execParamsDirect` 是 **7** 个、`→ execPreparedStmt` 是 **5**
+  个（合计 12 个内部），外部只有 **2** 个（`queryFn`、`execFn`；流式游标与 `copyFrom` 不走这两个）。
+- **`convertPlaceholders` 从来不用 `null` 表示"无需转换"** —— `count == 0` 时它返回的是一份 `allocZ`
+  副本，那里的 `null` 本来就只表示分配失败。真正的"三方纠缠"在**调用方**的读法里
+  （`orelse return execParamsDirect(...)` / `orelse return error.DatabaseError`）。
+- 评估还**漏了两个 PG 口袋**：`queryCursorFn` 把 `convertPlaceholders` 的 OOM 映射成 `DatabaseError`；
+  以及 **`PostgresStmt.execParamsPrepared` 是同一个缺陷的结构复制**（5 处 arena `catch return null`
+  与 `conn == null`、`PQexecPrepared` 返回 null 混在一起）。所以"PG 侧最后一个大口袋"这句是错的，
+  这次一并修掉。
+
+改法：`execPrepared` / `execParamsDirect` / `execPreparedStmt` / `execParamsPrepared` 改为
+`errors.ResultT(?*libpq_c.PGresult)`，`convertPlaceholders` 改为 `errors.ResultT(?[:0]u8)` 且
+**`null` 只表示"没有需要改写的内容"**；所有分配点一律 `try`。规则写进文档注释：**`null` 只表示"驱动
+没有交回 `PGresult`"**。红证据（真机 PG）：
+```
+... postgres query walk reports connection-side allocation failures as OutOfMemory...
+  expected error.OutOfMemory, found error.DatabaseError   (queryFn / execFn 各一条)
+```
+新增 8 条用例、全部在真机 PG 17.10 上跑（query walk / exec walk / 无参查询 / 缓存语句复执行 /
+驱动失败是"有结果"而非 null / 绑定参数 walk / 预处理绑定 walk / `convertPlaceholders` OOM）。
+> **行为变化**：OOM 下 PG 查询现在报 `error.OutOfMemory`（以前是 `DatabaseError`）；缓存键或缓存插入
+> 分配失败时**不再**回退到"未缓存路径"再执行一次（旧行为会带着一个失效的缓存名继续跑）。公开签名
+> 一个没动。
+> **未验证**：`execPreparedStmt` 的**缓存命中**路径只有代码级红（那轮 filter 没选中它）；
+> `execParamsDirect` 的绑定参数数组与 `convertPlaceholders` 只有**签名级**红 —— 旧签名下那些直接调用
+> 的测试根编译不过，所以不存在运行时红证据。另：`PostgresStmt.prepare` 不经过 `convertPlaceholders`，
+> 所以走 `PostgresStmt` 的用户必须自己写 `$N`（新用例因此用 `$1::int`）。
+
+**一个进程里两个 server 的全局状态：`OpenApiRouteStore` 与 `catalogLoaderFromTable` 都改成按实例隔离。**
+上一批的结论是"权限门（gate）本身正确，但旁边有两块**真**的进程级状态，且都未改"—— 这批改掉：
+- **`OpenApiRouteStore`（文档端点）**：单份 store → 按 **`*CatalogSlot` 去重**的绑定槽（上限 16），每个槽
+  有自己的函数指针；同一 slot 再注册只更新该 app 的 config（"重复注册覆盖"这个行为只对同一个 app 保留）。
+  红证据：**shop 的 `/openapi.json` 里出现了 `"Admin App"`**（后注册的 admin 覆盖了唯一那份 store，
+  文档本身仍是合法 JSON，所以没有任何东西报错）。
+- **`catalogLoaderFromTable`（执法路径）**：模块级 `Holder.tbl` → 按 **`RolePermissionTable` 指针去重**
+  的 trampoline 槽池（上限 64）。红证据（同一个 reader token，A 表授 `report:read`、B 表授
+  `report:audit`）：第二个 loader 把**第一个 app 的 loader** 也重定向到了 B 表，A 按一张它自己从未声明的
+  表执法 → **`expected 200, found 403`**。
+- **两次变异各只打红对应的那一个用例**（证明归因是测出来的）：① `claimOpenApiBinding` 的
+  `if (existing.catalog_slot == slot)` 改成恒真（回到"一份进程级 store、后写覆盖"）→ 只有 openapi 那条红；
+  ② 把 `catalogLoaderFromTable` 换回单槽（= 模块级 Holder）→ 只有 loader 那条红（`expected 200, found 403`）。
+  既有那条 `one process, two servers: each gate enforces its own catalog` 在红/绿/变异三种运行里始终 OK，
+  **没有被削弱**（只改了一处已失效的注释措辞）。
+- **代价（有意接受并记录）**：`CatalogPermissionLoader` 与 `HandlerFn` 都是**裸函数指针**、`Context` 里
+  也没有 app 身份，所以共享 handler 在请求期无法自证属于哪个 app；在不动这些公开类型的前提下，per-instance
+  状态只能用"一个槽一个专属函数指针"实现 —— 于是有了**固定且不回收的槽预算**（表 loader 64、OpenAPI 16），
+  **接线期**领取，耗尽即 panic（panic 文本直接告诉你抬高哪个常量）。去重的语义边界是：同一张表指针 / 同一个
+  slot 的两个 app **有意**共享这份状态（与它们共享表/目录的事实一致）。
+- **未验证**：槽耗尽与 `error.LoaderSlotEmpty` 两条错误路径没有用例（fail-closed 的 503/500 语义未动）；
+  `examples/**`、`tools/zmodu`、`scripts/ci-integration.sh` 没有整跑（本机单独 build 了三个用
+  `openApiFromCatalog` 的示例，通过；`tools/zmodu` 生成代码里的签名未变）。
+
 ### 第 12 批：夜间 soak 在 Linux 上编译不过（已修）、SSE 不再给 HEAD 写事件、sqlx OOM 误标第二批并修掉一个真泄漏（**破坏性：否**）
 
 全量 `-Ddb=all` **1777/1823（46 skipped，0 failed）**；MySQL 门控真机 `allocation failure` 组 18 passed /
@@ -335,9 +395,10 @@ Zig 惰性分析函数体，而这个工厂**没有任何 in-tree 调用者**，
 进程全局 slot（两个 server 共用最后一个构造的 catalog）→ 立刻红（`expected 200, found 403`），已还原，
 生产代码一行未动。原因是设计使然：slot 指针与 config 在**每次构造**时拷进 per-call `Store`、
 catalog **每请求**读，中间没有进程级状态。
-> **顺带查出两个真的进程全局**（都**未改**，且都是既有文档化的单实例假设）：
+> **顺带查出两个真的进程全局**（当时都**未改**，且都是既有文档化的单实例假设）：
 > `OpenApiRouteStore`（第二个 server 注册会覆盖第一个 → A 的 `/openapi.json` 会服务 B 的 catalog，
-> 只影响文档端点不影响执法）；`catalogLoaderFromTable` 的模块级 `Holder.tbl`。要隔离得按 slot 指针分状态。
+> 只影响文档端点不影响执法）；`catalogLoaderFromTable` 的模块级 `Holder.tbl`。
+> **两者已在第 13 批修掉**（分别按 `*CatalogSlot` 与 `RolePermissionTable` 指针分状态）。
 
 **H2 的 `ctx.io` / 请求预算**（上一批只修了流式拒绝，这批补齐）：H2 路径此前不 arm `ctx.io` 与
 `setDeadline`，于是 `ctx.io` 为 null（`jwtAuth` 会静默降级到没有 CSPRNG 句柄的 `SecurityModule.init`、

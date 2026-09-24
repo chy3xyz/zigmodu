@@ -551,20 +551,77 @@ pub fn jwtAuthFromCatalogWithPermissions(
 
 /// Build a `CatalogPermissionLoader` from a static `RolePermissionTable`.
 /// Ignores `sub`/`aud` (role→permission map only).
-/// Note: a `CatalogPermissionLoader` is a plain fn (no user_data context), so
-/// this keeps a module-level table reference — safe in practice because the
-/// table is a process-wide singleton. For multi-instance isolation pass a
-/// custom loader closure instead.
+///
+/// Each table gets its own loader: two loaders built from two tables read their
+/// own table and never each other's. See `max_table_loader_slots` for how that
+/// is possible for a bare function pointer.
 pub fn catalogLoaderFromTable(table: *const Rbac.RolePermissionTable) CatalogPermissionLoader {
-    const Holder = struct {
-        var tbl: *const Rbac.RolePermissionTable = undefined;
+    const claimed = TableLoaderSlots.tables_claimed.load(.seq_cst);
+    for (0..claimed) |i| {
+        if (TableLoaderSlots.tables[i]) |existing| {
+            // Same table → same loader. Apps sharing one RBAC table must not
+            // eat a slot each, and the tables are immutable (`*const`).
+            if (existing == table) return table_loader_trampolines[i];
+        }
+    }
+    const slot = TableLoaderSlots.tables_claimed.fetchAdd(1, .seq_cst);
+    if (slot >= max_table_loader_slots) {
+        @panic("catalogLoaderFromTable: loader slot pool exhausted — raise max_table_loader_slots");
+    }
+    TableLoaderSlots.tables[slot] = table;
+    return table_loader_trampolines[slot];
+}
+
+/// Number of independently-bound table loaders one process may build.
+///
+/// `CatalogPermissionLoader` is a bare `*const fn(allocator, input)`, and a Zig
+/// function pointer carries no context — so the table has to be reached through
+/// *the function itself*. Each `catalogLoaderFromTable` call claims one slot and
+/// returns that slot's own trampoline, which resolves its own table and nothing
+/// else.
+///
+/// A module-level `Holder.tbl` (the shape this replaced) is process-wide
+/// instead: the second `catalogLoaderFromTable` retargeted the first loader too,
+/// so two apps with two tables enforced whichever table was registered last —
+/// silently, and inside the permission check rather than beside it. Giving the
+/// loader a context-carrying type would fix it without a bound, but
+/// `CatalogPermissionLoader` is public API (passed as a bare fn pointer by the
+/// example apps, the CLI template and `docs/ROUTE_TABLE.md`), so the bound is
+/// the price of leaving that type — and every call site — alone.
+///
+/// Slots are claimed at wiring time and never released, so this bounds how many
+/// loaders an application *builds*, not how many requests it serves.
+pub const max_table_loader_slots = 64;
+
+const TableLoaderSlots = struct {
+    /// One table per claimed slot; unclaimed slots stay `null` and are not
+    /// reachable — their trampolines are never handed out.
+    var tables: [max_table_loader_slots]?*const Rbac.RolePermissionTable = @splat(null);
+    /// Atomic so two threads wiring loaders concurrently cannot claim one slot
+    /// (which would put two loaders on one table again).
+    var tables_claimed: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+};
+
+fn TableLoaderTrampoline(comptime slot: usize) type {
+    return struct {
         fn load(allocator: std.mem.Allocator, input: CatalogPermLoadInput) anyerror![]u8 {
-            return @This().tbl.permissionsCsv(allocator, input.roles);
+            // Fail closed rather than guess: reaching this means the pointer was
+            // used without claiming a slot. The caller
+            // (`verifyJwtLoadPermsAndNext`) turns a loader error into a 500.
+            const table = TableLoaderSlots.tables[slot] orelse return error.LoaderSlotEmpty;
+            return table.permissionsCsv(allocator, input.roles);
         }
     };
-    Holder.tbl = table;
-    return Holder.load;
 }
+
+/// One distinct function pointer per slot — the identity a bare fn pointer
+/// cannot otherwise carry. Every entry reads a different slot, so they are not
+/// interchangeable and no optimizer may fold them into one.
+const table_loader_trampolines: [max_table_loader_slots]CatalogPermissionLoader = blk: {
+    var table: [max_table_loader_slots]CatalogPermissionLoader = undefined;
+    for (0..max_table_loader_slots) |i| table[i] = TableLoaderTrampoline(i).load;
+    break :blk table;
+};
 
 // ==== §5  Pluggable auth backends ====
 
@@ -1002,7 +1059,7 @@ pub fn permissionGateWith(slot: *comptime_router.CatalogSlot, config: Permission
                     // has no token to require, so it refuses instead. 503 (and
                     // not 403) keeps a wiring mistake from being read as a
                     // genuine permission denial — same status and wording as
-                    // `openApiCatalogHandler` for the same condition.
+                    // `openApiFromCatalog` for the same condition.
                     try st.cfg.reject(ctx, 503, "Route catalog not ready");
                     return;
                 };
@@ -2522,8 +2579,11 @@ test "one process, two servers: each gate enforces its own catalog" {
     defer sec.deinit();
 
     // Role → permission grants, identical in both apps (one RBAC table behind
-    // one auth service). A custom loader on purpose: `catalogLoaderFromTable`
-    // keeps a module-level holder and is documented single-instance-only.
+    // one auth service). A custom loader on purpose: this test is about the
+    // gate's own slot/config, so the permission source is a fn that cannot
+    // itself be the process-global thing under test. Per-app loader isolation
+    // is `catalogLoaderFromTable`'s own test. That is also why the grants are
+    // identical here and differ there.
     const load: CatalogPermissionLoader = struct {
         fn load_(al: std.mem.Allocator, input: CatalogPermLoadInput) anyerror![]u8 {
             for (input.roles) |role| {
@@ -2700,6 +2760,108 @@ test "one process, two servers: each gate enforces its own catalog" {
         var resp = try Hit.get(&admin_srv, "/audit", reader_bearer);
         defer resp.deinit(allocator);
         try std.testing.expectEqual(@as(u16, 404), resp.status_code);
+    }
+}
+
+test "one process, two servers: each loader table feeds only its own app" {
+    const allocator = std.testing.allocator;
+    const Testkit = @import("../http/Testkit.zig");
+    const cr = @import("ComptimeRouter.zig");
+
+    // Two apps in one binary, two role→permission tables, one auth service (one
+    // JWT secret, so one token means the same thing to both). Each app builds
+    // its loader with `catalogLoaderFromTable` — the one call shape that used to
+    // share a module-level holder, so building app B's loader retargeted app A's
+    // loader at B's table and A silently enforced a table it never declared.
+    // Unlike the OpenAPI endpoint this is the permission check itself.
+    var sec = SecurityModule.init(allocator, "two-table-loader-secret", 3600);
+    defer sec.deinit();
+
+    const table_a = Rbac.RolePermissionTable{ .rows = &.{
+        .{ .role = "reader", .permissions = &.{"report:read"} },
+    } };
+    // Grants a code no route in either app demands: "reader" is authorised for
+    // nothing that matters here, so app B must refuse.
+    const table_b = Rbac.RolePermissionTable{ .rows = &.{
+        .{ .role = "reader", .permissions = &.{"report:audit"} },
+    } };
+
+    const AppState = struct {};
+    const ReportApi = struct {
+        pub const module_name = "report";
+        pub const nest = .{};
+        pub const State = @This();
+        pub const routes = [_]cr.RouteSpec(State){
+            .{ .method = .GET, .path = "reports", .handler = echo, .meta = .{ .auth = .jwt, .permission = "report:read" } },
+        };
+        fn echo(ctx: *api.Context, _: *State) !void {
+            try ctx.jsonStruct(200, .{ .app = module_name, .perm = ctx.getAttr("permission") });
+        }
+    };
+
+    var srv_a = api.Server.init(std.testing.io, allocator, 0);
+    defer srv_a.deinit();
+    var slot_a: cr.CatalogSlot = .{};
+    defer slot_a.deinit();
+    var srv_b = api.Server.init(std.testing.io, allocator, 0);
+    defer srv_b.deinit();
+    var slot_b: cr.CatalogSlot = .{};
+    defer slot_b.deinit();
+
+    try srv_a.addMiddleware(jwtAuthFromCatalogWithPermissions(&sec, &slot_a, catalogLoaderFromTable(&table_a), .{}));
+    try srv_a.addMiddleware(permissionGateWith(&slot_a, .{ .mode = .rbac }));
+    try srv_b.addMiddleware(jwtAuthFromCatalogWithPermissions(&sec, &slot_b, catalogLoaderFromTable(&table_b), .{}));
+    try srv_b.addMiddleware(permissionGateWith(&slot_b, .{ .mode = .rbac }));
+
+    var state_a: AppState = .{};
+    var mod_a: ReportApi = .{};
+    var state_b: AppState = .{};
+    var mod_b: ReportApi = .{};
+    var router_a = cr.Router(AppState).init(std.testing.io, allocator, &srv_a, &state_a);
+    defer router_a.deinit();
+    var router_b = cr.Router(AppState).init(std.testing.io, allocator, &srv_b, &state_b);
+    defer router_b.deinit();
+    {
+        var root_a = router_a.scope("");
+        try root_a.mount(ReportApi, &mod_a);
+    }
+    {
+        var root_b = router_b.scope("");
+        try root_b.mount(ReportApi, &mod_b);
+    }
+    slot_a.set(try router_a.finish());
+    slot_b.set(try router_b.finish());
+
+    const reader_tok = try sec.generateTokenWithTenant("reader-1", &.{"reader"}, "tenant-a");
+    defer allocator.free(reader_tok);
+    const bearer = try std.fmt.allocPrint(allocator, "Bearer {s}", .{reader_tok});
+    defer allocator.free(bearer);
+
+    const Hit = struct {
+        fn get(srv: *api.Server, auth: []const u8) !Testkit.TestResponse {
+            const headers = [1]Testkit.HeaderPair{.{ "authorization", auth }};
+            return Testkit.dispatchOpts(srv, .GET, "/reports", .{ .headers = &headers });
+        }
+    };
+
+    // A's own table grants `report:read`, which is what A's route demands.
+    {
+        var resp = try Hit.get(&srv_a, bearer);
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"perm\":\"report:read\"") != null);
+    }
+    // B's table does not.
+    {
+        var resp = try Hit.get(&srv_b, bearer);
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 403), resp.status_code);
+    }
+    // …and back to A: an A-transparent share of B's table would show up here.
+    {
+        var resp = try Hit.get(&srv_a, bearer);
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
     }
 }
 

@@ -2284,7 +2284,11 @@ pub const PostgresConn = struct {
         errdefer arena.deinit();
         const arena_alloc = arena.allocator();
 
-        const res = execPrepared(self, sql_str, args);
+        // Only a driver that declines to hand back a result is `null` here —
+        // this process's allocation failures inside `execPrepared` (and the two
+        // helpers under it) come back as `error.OutOfMemory` through the error
+        // channel and are not relabelled as the server's doing.
+        const res = try execPrepared(self, sql_str, args);
         if (res == null) {
             std.log.err("PG queryFn: execPrepared returned null sql={s}", .{sql_str});
             return error.DatabaseError;
@@ -2335,7 +2339,7 @@ pub const PostgresConn = struct {
     fn execFn(ptr: *anyopaque, sql_str: []const u8, args: []const Value) errors.ResultT(ExecResult) {
         const self = @as(*PostgresConn, @ptrCast(@alignCast(ptr)));
         self.guard();
-        const res = execPrepared(self, sql_str, args);
+        const res = try execPrepared(self, sql_str, args);
         if (res == null) {
             std.log.err("PG execFn: execPrepared returned null sql={s}", .{sql_str});
             return error.DatabaseError;
@@ -2362,7 +2366,12 @@ pub const PostgresConn = struct {
     /// Execute with prepared statement caching. First call prepares and caches;
     /// subsequent calls reuse via PQexecPrepared (server-side).
     /// Falls back to `execParamsDirect` on prepare failure or zero-arg queries.
-    fn execPrepared(self: *PostgresConn, sql_str: []const u8, args: []const Value) ?*libpq_c.PGresult {
+    ///
+    /// `null` in the result is the driver declining to hand back a `PGresult`
+    /// (each caller logs which statement); this process's own allocation
+    /// failures leave through the error channel as `error.OutOfMemory`, so the
+    /// two no longer share one answer.
+    fn execPrepared(self: *PostgresConn, sql_str: []const u8, args: []const Value) errors.ResultT(?*libpq_c.PGresult) {
         // No bind params → PQexec is enough (and avoids polluting the stmt cache).
         if (args.len == 0) {
             return execParamsDirect(self, sql_str, args);
@@ -2372,7 +2381,7 @@ pub const PostgresConn = struct {
         if (self.stmt_cache.getPtr(sql_str)) |entry| {
             self.stmt_counter += 1;
             entry.last_used = self.stmt_counter;
-            if (self.execPreparedStmt(entry.value, args)) |res| return res;
+            if (try self.execPreparedStmt(entry.value, args)) |res| return res;
             // Cached name may be stale after reconnect; drop and re-prepare below.
             if (self.stmt_cache.fetchRemove(sql_str)) |kv| {
                 self.allocator.free(kv.key);
@@ -2380,7 +2389,9 @@ pub const PostgresConn = struct {
             }
         }
 
-        const pg_sql = convertPlaceholders(self.allocator, sql_str) orelse return execParamsDirect(self, sql_str, args);
+        // `null` = the SQL carries no `?` to rewrite, so the cache key and the
+        // statement are the SQL as written.
+        const pg_sql = (try convertPlaceholders(self.allocator, sql_str)) orelse return execParamsDirect(self, sql_str, args);
         defer self.allocator.free(pg_sql);
 
         // Evict LRU entry when at capacity.
@@ -2414,29 +2425,38 @@ pub const PostgresConn = struct {
             return execParamsDirect(self, sql_str, args);
         }
 
-        const sql_dup = self.allocator.dupe(u8, sql_str) catch {
-            return self.execPreparedStmt(stmt_name_z, args) orelse execParamsDirect(self, sql_str, args);
-        };
-        const stmt_name_dup = allocZ(self.allocator, stmt_name_z) catch {
+        // The statement is prepared, so the only failures left are this
+        // process's own allocations — the two cache copies and whatever the run
+        // needs. They surface as `error.OutOfMemory`; retrying through the
+        // uncached path on a failed allocation is what used to turn an
+        // out-of-memory into the server's `error.DatabaseError`. Once `put`
+        // returns, the cache owns both strings and nothing here frees them.
+        const sql_dup = try self.allocator.dupe(u8, sql_str);
+        const stmt_name_dup = allocZ(self.allocator, stmt_name_z) catch |err| {
             self.allocator.free(sql_dup);
-            return self.execPreparedStmt(stmt_name_z, args) orelse execParamsDirect(self, sql_str, args);
+            return err;
         };
         self.stmt_counter += 1;
-        self.stmt_cache.put(sql_dup, .{ .value = stmt_name_dup, .last_used = self.stmt_counter }) catch {
+        self.stmt_cache.put(sql_dup, .{ .value = stmt_name_dup, .last_used = self.stmt_counter }) catch |err| {
             self.allocator.free(sql_dup);
             self.allocator.free(stmt_name_dup);
-            return self.execPreparedStmt(stmt_name_z, args) orelse execParamsDirect(self, sql_str, args);
+            return err;
         };
 
         return self.execPreparedStmt(stmt_name_dup, args);
     }
 
     /// Direct PQexecParams (no prepared statement cache).
-    fn execParamsDirect(self: *PostgresConn, sql_str: []const u8, args: []const Value) ?*libpq_c.PGresult {
+    /// Direct PQexecParams (no prepared statement cache).
+    ///
+    /// `null` is the driver handing back nothing — `PQexec` / `PQexecParams`
+    /// returned null, or the status was neither `TUPLES_OK` nor `COMMAND_OK` —
+    /// while every allocation failure below is `error.OutOfMemory`.
+    fn execParamsDirect(self: *PostgresConn, sql_str: []const u8, args: []const Value) errors.ResultT(?*libpq_c.PGresult) {
         // Use PQexec (simple query, no params) for queries without args
         // Must null-terminate the SQL string for libpq
         if (args.len == 0) {
-            const pg_sql_simple = allocZ(self.allocator, sql_str) catch return null;
+            const pg_sql_simple = try allocZ(self.allocator, sql_str);
             defer self.allocator.free(pg_sql_simple);
             const res = libpq_c.PQexec(self.conn, @ptrCast(pg_sql_simple.ptr));
             if (res == null) {
@@ -2453,30 +2473,26 @@ pub const PostgresConn = struct {
             return res.?;
         }
 
-        // Convert ? → $1,$2,...
-        const pg_sql = convertPlaceholders(self.allocator, sql_str) orelse return null;
+        // Convert ? → $1,$2,...; `null` is "no `?` to convert", not a failure —
+        // the SQL goes to the driver exactly as the caller wrote it.
+        const pg_sql_conv = try convertPlaceholders(self.allocator, sql_str);
+        const pg_sql = pg_sql_conv orelse (try allocZ(self.allocator, sql_str));
         defer self.allocator.free(pg_sql);
 
         const param_count = args.len;
-        const paramValues = self.allocator.alloc(?[*]const u8, param_count) catch return null;
-        errdefer self.allocator.free(paramValues);
-        const paramLengths = self.allocator.alloc(c_int, param_count) catch {
-            self.allocator.free(paramValues);
-            return null;
-        };
-        errdefer self.allocator.free(paramLengths);
-        const paramAllocs = self.allocator.alloc(?[:0]const u8, param_count) catch {
-            self.allocator.free(paramValues);
-            self.allocator.free(paramLengths);
-            return null;
-        };
+        // Each `defer` is registered next to its own allocation, so a failure
+        // here — this process's memory, and `error.OutOfMemory` — frees the
+        // half-built parameter arrays on the way out.
+        const paramValues = try self.allocator.alloc(?[*]const u8, param_count);
+        defer self.allocator.free(paramValues);
+        const paramLengths = try self.allocator.alloc(c_int, param_count);
+        defer self.allocator.free(paramLengths);
+        const paramAllocs = try self.allocator.alloc(?[:0]const u8, param_count);
         defer {
             for (paramAllocs) |maybe_alloc| {
                 if (maybe_alloc) |a| self.allocator.free(a);
             }
             self.allocator.free(paramAllocs);
-            self.allocator.free(paramLengths);
-            self.allocator.free(paramValues);
         }
         @memset(paramAllocs, null);
 
@@ -2487,19 +2503,19 @@ pub const PostgresConn = struct {
                     break :blk null;
                 },
                 .int => |v| blk: {
-                    const s = allocPrintZ(self.allocator, "{d}", .{v}) catch return null;
+                    const s = try allocPrintZ(self.allocator, "{d}", .{v});
                     paramAllocs[i] = s;
                     paramLengths[i] = @intCast(s.len);
                     break :blk @ptrCast(s.ptr);
                 },
                 .float => |v| blk: {
-                    const s = allocPrintZ(self.allocator, "{d}", .{v}) catch return null;
+                    const s = try allocPrintZ(self.allocator, "{d}", .{v});
                     paramAllocs[i] = s;
                     paramLengths[i] = @intCast(s.len);
                     break :blk @ptrCast(s.ptr);
                 },
                 .string => |v| blk: {
-                    const s = allocZ(self.allocator, v) catch return null;
+                    const s = try allocZ(self.allocator, v);
                     paramAllocs[i] = s;
                     paramLengths[i] = @intCast(s.len);
                     break :blk @ptrCast(s.ptr);
@@ -2522,13 +2538,17 @@ pub const PostgresConn = struct {
     /// Execute already-prepared statement.
     /// Param strings live in a local arena until `PQexecPrepared` returns (heysen §1.1/§1.2).
     /// `stmt_name` must be null-terminated (`[:0]const u8` or a `bufPrintZ` stack name).
-    fn execPreparedStmt(self: *PostgresConn, stmt_name: [:0]const u8, args: []const Value) ?*libpq_c.PGresult {
+    ///
+    /// `null` is `PQexecPrepared` handing back no result; a failure of the arena
+    /// below is this process's memory and leaves as `error.OutOfMemory` instead
+    /// of sharing that answer.
+    fn execPreparedStmt(self: *PostgresConn, stmt_name: [:0]const u8, args: []const Value) errors.ResultT(?*libpq_c.PGresult) {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const aa = arena.allocator();
 
-        const paramValues = aa.alloc(?[*:0]const u8, args.len) catch return null;
-        const paramLengths = aa.alloc(c_int, args.len) catch return null;
+        const paramValues = try aa.alloc(?[*:0]const u8, args.len);
+        const paramLengths = try aa.alloc(c_int, args.len);
 
         for (args, 0..) |arg, i| {
             paramValues[i] = switch (arg) {
@@ -2537,17 +2557,17 @@ pub const PostgresConn = struct {
                     break :blk null;
                 },
                 .int => |v| blk: {
-                    const s = allocPrintZ(aa, "{d}", .{v}) catch return null;
+                    const s = try allocPrintZ(aa, "{d}", .{v});
                     paramLengths[i] = @intCast(s.len);
                     break :blk s.ptr;
                 },
                 .float => |v| blk: {
-                    const s = allocPrintZ(aa, "{d}", .{v}) catch return null;
+                    const s = try allocPrintZ(aa, "{d}", .{v});
                     paramLengths[i] = @intCast(s.len);
                     break :blk s.ptr;
                 },
                 .string => |v| blk: {
-                    const s = allocZ(aa, v) catch return null;
+                    const s = try allocZ(aa, v);
                     paramLengths[i] = @intCast(s.len);
                     break :blk s.ptr;
                 },
@@ -2617,13 +2637,40 @@ pub const PostgresConn = struct {
         return j - i - 1;
     }
 
+    /// Enough for `$` plus the 20 decimal digits of a 64-bit `usize`.
+    const dollar_buf_len = 21;
+
+    /// Write `$N` for a placeholder number into `buf` and return the slice. It
+    /// is total by construction — a `usize` never needs the 21st byte — so the
+    /// only failure left in `convertPlaceholders` is its allocator, which is
+    /// what separates "could not allocate" from "nothing to rewrite".
+    fn dollarPlaceholder(buf: *[dollar_buf_len]u8, n: usize) []const u8 {
+        var digits: [20]u8 = undefined;
+        var first: usize = digits.len;
+        var v = n;
+        while (true) {
+            first -= 1;
+            digits[first] = '0' + @as(u8, @intCast(v % 10));
+            v /= 10;
+            if (v == 0) break;
+        }
+        const len = digits.len - first;
+        buf[0] = '$';
+        @memcpy(buf[1 .. 1 + len], digits[first..]);
+        return buf[0 .. 1 + len];
+    }
+
     /// Converts sqlite-style `?` / `?N` placeholders to PostgreSQL `$N`.
     ///
     /// Every placeholder is numbered sequentially in order of appearance and
     /// trailing digits are consumed, so `?`, `?2`, `?` become `$1`, `$2`, `$3`.
     /// Quoted strings, quoted identifiers, `--` comments and `/* */` comments
     /// are skipped so `?` inside literals is never rewritten.
-    fn convertPlaceholders(allocator: std.mem.Allocator, sql: []const u8) ?[:0]u8 {
+    ///
+    /// `null` means there was nothing to rewrite — the callers send the SQL as
+    /// it stands — and the buffer's allocation is the only thing that can fail,
+    /// as `error.OutOfMemory` rather than that same `null`.
+    fn convertPlaceholders(allocator: std.mem.Allocator, sql: []const u8) errors.ResultT(?[:0]u8) {
         // Pass 1: count placeholders and compute the exact output size.
         var count: usize = 0;
         var removed: usize = 0;
@@ -2639,18 +2686,17 @@ pub const PostgresConn = struct {
                 count += 1;
                 const digits = placeholderDigits(sql, i);
                 removed += 1 + digits;
-                var tmp: [24]u8 = undefined;
-                const s = std.fmt.bufPrint(&tmp, "${d}", .{count}) catch return null;
-                added += s.len;
+                var tmp: [dollar_buf_len]u8 = undefined;
+                added += dollarPlaceholder(&tmp, count).len;
                 i += 1 + digits;
             } else {
                 i += 1;
             }
         }
-        if (count == 0) return allocZ(allocator, sql) catch null;
+        if (count == 0) return null;
 
         // Pass 2: emit `$N`, consuming `?N` digits verbatim-skipped elsewhere.
-        const buf = allocator.allocSentinel(u8, sql.len - removed + added, 0) catch return null;
+        const buf = try allocator.allocSentinel(u8, sql.len - removed + added, 0);
         var pos: usize = 0;
         var n: usize = 0;
         i = 0;
@@ -2664,11 +2710,8 @@ pub const PostgresConn = struct {
             }
             if (sql[i] == '?') {
                 n += 1;
-                var tmp: [24]u8 = undefined;
-                const s = std.fmt.bufPrint(&tmp, "${d}", .{n}) catch {
-                    allocator.free(buf);
-                    return null;
-                };
+                var tmp: [dollar_buf_len]u8 = undefined;
+                const s = dollarPlaceholder(&tmp, n);
                 @memcpy(buf[pos .. pos + s.len], s);
                 pos += s.len;
                 i += 1 + placeholderDigits(sql, i);
@@ -2761,17 +2804,20 @@ pub const PostgresConn = struct {
         // Convert ? → $1,$2,... then null-terminate for libpq.
         // Keep branches separate: `if (a) []u8 else [:0]u8` coerces to []u8 and
         // `free` then drops the sentinel (alloc=N+1 / free=N SafeAllocator panic).
-        // Every buffer below is the caller's allocator, i.e. this process's
-        // memory: a failure to get one is `error.OutOfMemory`, while
-        // `convertPlaceholders` returning null and `PQsendQueryParams`
-        // returning 0 stay `error.DatabaseError` (those are the driver paths).
+        // Every buffer below is this process's memory, so a failure to get one —
+        // the rewrite included — is `error.OutOfMemory`, while
+        // `PQsendQueryParams` returning 0 stays `error.DatabaseError` (that is
+        // the driver path). `null` from `convertPlaceholders` is not a failure:
+        // it means the SQL has no `?` to rewrite and goes out as written.
         const sql_z: [:0]u8 = blk: {
             if (args.len == 0) {
                 break :blk try allocZ(allocator, sql_str);
             }
-            const pg_sql = convertPlaceholders(self.allocator, sql_str) orelse return error.DatabaseError;
-            defer self.allocator.free(pg_sql);
-            break :blk try allocZ(allocator, pg_sql);
+            const maybe_pg_sql = try convertPlaceholders(self.allocator, sql_str);
+            defer {
+                if (maybe_pg_sql) |pg_sql| self.allocator.free(pg_sql);
+            }
+            break :blk try allocZ(allocator, maybe_pg_sql orelse sql_str);
         };
         defer allocator.free(sql_z);
 
@@ -4085,7 +4131,12 @@ pub const PostgresStmt = struct {
         return .{ .conn = conn, .name = name_copy, .allocator = allocator };
     }
 
-    fn execParamsPrepared(self: *PostgresStmt, args: []const Value) ?*libpq_c.PGresult {
+    /// Bind and run the prepared statement. The parameter arrays and the text
+    /// copies live in a local arena until `PQexecPrepared` returns, so `null`
+    /// here is only the driver's answer — a missing connection (or no result)
+    /// — while a failure of that arena is this process's memory and leaves as
+    /// `error.OutOfMemory`. Both callers below used to read the two as one.
+    fn execParamsPrepared(self: *PostgresStmt, args: []const Value) errors.ResultT(?*libpq_c.PGresult) {
         if (self.conn == null) return null;
 
         // Arena holds all null-terminated string copies alive until PQexecPrepared completes
@@ -4093,19 +4144,13 @@ pub const PostgresStmt = struct {
         defer arena.deinit();
         const aa = arena.allocator();
 
-        const paramValues = aa.alloc(?[*:0]const u8, args.len) catch return null;
+        const paramValues = try aa.alloc(?[*:0]const u8, args.len);
         for (args, 0..) |arg, i| {
             paramValues[i] = switch (arg) {
                 .null => null,
-                .int => |v| allocPrintZ(aa, "{d}", .{v}) catch {
-                    return null;
-                },
-                .float => |v| allocPrintZ(aa, "{d}", .{v}) catch {
-                    return null;
-                },
-                .string => |v| allocZ(aa, v) catch {
-                    return null;
-                },
+                .int => |v| try allocPrintZ(aa, "{d}", .{v}),
+                .float => |v| try allocPrintZ(aa, "{d}", .{v}),
+                .string => |v| try allocZ(aa, v),
                 .bool => |v| if (v) @as(?[*:0]const u8, @ptrCast("t")) else @ptrCast("f"),
             };
         }
@@ -4119,7 +4164,7 @@ pub const PostgresStmt = struct {
         errdefer arena.deinit();
         const arena_alloc = arena.allocator();
 
-        const res = execParamsPrepared(self, args) orelse return error.DatabaseError;
+        const res = (try execParamsPrepared(self, args)) orelse return error.DatabaseError;
         defer libpq_c.PQclear(res);
         if (libpq_c.PQresultStatus(res) != libpq_c.ExecStatusType.PGRES_TUPLES_OK) return error.DatabaseError;
 
@@ -4150,7 +4195,7 @@ pub const PostgresStmt = struct {
 
     fn execFn(ptr: *anyopaque, args: []const Value) errors.ResultT(ExecResult) {
         const self = @as(*PostgresStmt, @ptrCast(@alignCast(ptr)));
-        const res = execParamsPrepared(self, args) orelse return error.DatabaseError;
+        const res = (try execParamsPrepared(self, args)) orelse return error.DatabaseError;
         defer libpq_c.PQclear(res);
         const status = libpq_c.PQresultStatus(res);
         if (status != libpq_c.ExecStatusType.PGRES_COMMAND_OK and status != libpq_c.ExecStatusType.PGRES_TUPLES_OK) return error.DatabaseError;
@@ -9659,9 +9704,13 @@ test "convertPlaceholders maps ? and ?N to sequential $N" {
         .{ .in = "SELECT * FROM t", .want = "SELECT * FROM t" },
     };
     for (cases) |case| {
-        const got = PostgresConn.convertPlaceholders(allocator, case.in) orelse return error.TestUnexpectedResult;
-        defer allocator.free(got);
-        try std.testing.expectEqualStrings(case.want, got);
+        // `null` = nothing to rewrite, and then the input is what the driver
+        // gets; only an allocation failure leaves through the error channel.
+        const maybe_got = try PostgresConn.convertPlaceholders(allocator, case.in);
+        defer {
+            if (maybe_got) |got| allocator.free(got);
+        }
+        try std.testing.expectEqualStrings(case.want, maybe_got orelse case.in);
     }
 }
 
@@ -9675,9 +9724,11 @@ test "convertPlaceholders skips ? inside literals and comments" {
         .{ .in = "SELECT '?', 'a''b?c' WHERE x = ?1", .want = "SELECT '?', 'a''b?c' WHERE x = $1" },
     };
     for (cases) |case| {
-        const got = PostgresConn.convertPlaceholders(allocator, case.in) orelse return error.TestUnexpectedResult;
-        defer allocator.free(got);
-        try std.testing.expectEqualStrings(case.want, got);
+        const maybe_got = try PostgresConn.convertPlaceholders(allocator, case.in);
+        defer {
+            if (maybe_got) |got| allocator.free(got);
+        }
+        try std.testing.expectEqualStrings(case.want, maybe_got orelse case.in);
     }
 }
 
@@ -10594,6 +10645,284 @@ test "postgres copy-from reports allocation failures as OutOfMemory" {
             succeeded = true;
             break;
         } else |err| {
+            try std.testing.expectEqual(@as(errors.Error, error.OutOfMemory), err);
+            try std.testing.expect(failing.has_induced_failure);
+            failures += 1;
+        }
+    }
+    try std.testing.expect(succeeded);
+    try std.testing.expect(failures > 0);
+}
+
+// ==== Allocation failures on the PG parameter-binding path ====
+//
+// `execPrepared` / `execParamsDirect` / `execPreparedStmt` answered `null` for
+// two unrelated things — "this process could not allocate" and "the driver did
+// not hand back a `PGresult`" — and every caller read `null` as the second, so
+// an out-of-memory inside them was reported as `error.DatabaseError` (which
+// `toErrorContext` degrades to `UnknownError`, and the metrics callback records
+// by name). They now take the split the row-scanning paths above already use:
+// the answer is an error union, `null` is only the driver declining, and this
+// process's memory is `error.OutOfMemory`.
+//
+// The seam is the connection's *own* allocator — these functions ignore the
+// allocator their caller passes — so the `FailingAllocator` goes under
+// `PostgresConn.connect` and the walks follow the same shape as the streaming
+// cursor and copy-from tests.
+
+test "postgres query walk reports connection-side allocation failures as OutOfMemory" {
+    try skipUnlessLivePg();
+    const allocator = std.testing.allocator;
+
+    // Every tag is bound, so the walk also passes the per-parameter copies
+    // (`allocPrintZ` for the numeric tags, `allocZ` for the string).
+    const args = [_]Value{ .{ .int = 7 }, .{ .float = 1.5 }, .{ .string = "x" }, .{ .bool = true }, .null };
+    const sql = "SELECT ?::int AS a, ?::float AS b, ?::text AS c, ?::bool AS d, ?::int AS e";
+
+    var idx: usize = 0;
+    var failures: usize = 0;
+    var succeeded = false;
+    while (idx < 32) : (idx += 1) {
+        // A fresh connection per attempt: an attempt that dies after
+        // `PQprepare` leaves a statement on the server with nobody here to
+        // deallocate it, and the session is thrown away with it.
+        var failing = std.testing.FailingAllocator.init(allocator, .{});
+        var conn = try PostgresConn.connect(failing.allocator(), pgTestConninfo(), 0);
+        defer closeStackPostgresConn(&conn);
+        failing.fail_index = failing.alloc_index + idx;
+        failing.resize_fail_index = 0;
+
+        const res = PostgresConn.queryFn(&conn, allocator, sql, &args);
+        if (res) |rows| {
+            var r = rows;
+            r.deinit();
+            succeeded = true;
+            break;
+        } else |err| {
+            // Before the split this was `error.DatabaseError` for every index
+            // that failed an allocation in one of the three functions.
+            try std.testing.expectEqual(@as(errors.Error, error.OutOfMemory), err);
+            try std.testing.expect(failing.has_induced_failure);
+            failures += 1;
+        }
+    }
+    try std.testing.expect(succeeded);
+    try std.testing.expect(failures > 0);
+}
+
+test "postgres exec walk reports connection-side allocation failures as OutOfMemory" {
+    try skipUnlessLivePg();
+    const allocator = std.testing.allocator;
+    const args = [_]Value{.{ .int = 7 }};
+    const sql = "SELECT ?::int AS a";
+
+    var idx: usize = 0;
+    var failures: usize = 0;
+    var succeeded = false;
+    while (idx < 24) : (idx += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{});
+        var conn = try PostgresConn.connect(failing.allocator(), pgTestConninfo(), 0);
+        defer closeStackPostgresConn(&conn);
+        failing.fail_index = failing.alloc_index + idx;
+        failing.resize_fail_index = 0;
+
+        const res = PostgresConn.execFn(&conn, sql, &args);
+        if (res) |_| {
+            succeeded = true;
+            break;
+        } else |err| {
+            try std.testing.expectEqual(@as(errors.Error, error.OutOfMemory), err);
+            try std.testing.expect(failing.has_induced_failure);
+            failures += 1;
+        }
+    }
+    try std.testing.expect(succeeded);
+    try std.testing.expect(failures > 0);
+}
+
+test "postgres no-argument query reports a connection-side allocation failure as OutOfMemory" {
+    try skipUnlessLivePg();
+    const allocator = std.testing.allocator;
+
+    // No arguments: `execPrepared` hands the statement straight to
+    // `execParamsDirect`, whose only allocation before `PQexec` is the
+    // null-terminated copy of the SQL.
+    var idx: usize = 0;
+    var failures: usize = 0;
+    var succeeded = false;
+    while (idx < 8) : (idx += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{});
+        var conn = try PostgresConn.connect(failing.allocator(), pgTestConninfo(), 0);
+        defer closeStackPostgresConn(&conn);
+        failing.fail_index = failing.alloc_index + idx;
+        failing.resize_fail_index = 0;
+
+        const res = PostgresConn.queryFn(&conn, allocator, "SELECT 42 AS n", &.{});
+        if (res) |rows| {
+            var r = rows;
+            r.deinit();
+            succeeded = true;
+            break;
+        } else |err| {
+            try std.testing.expectEqual(@as(errors.Error, error.OutOfMemory), err);
+            try std.testing.expect(failing.has_induced_failure);
+            failures += 1;
+        }
+    }
+    try std.testing.expect(succeeded);
+    try std.testing.expect(failures > 0);
+}
+
+test "postgres cached-statement re-execution reports an allocation failure as OutOfMemory" {
+    try skipUnlessLivePg();
+    const allocator = std.testing.allocator;
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{});
+    var conn = try PostgresConn.connect(failing.allocator(), pgTestConninfo(), 0);
+    defer closeStackPostgresConn(&conn);
+
+    const sql = "SELECT ?::int AS q";
+    const args = [_]Value{.{ .int = 7 }};
+
+    // Warm the statement cache while the connection's allocator still works.
+    {
+        var warm = try PostgresConn.queryFn(&conn, allocator, sql, &args);
+        warm.deinit();
+        try std.testing.expectEqual(@as(usize, 1), conn.stmt_cache.count());
+    }
+
+    // The cached name is valid, so this run is `execPreparedStmt`'s parameter
+    // arena — not a re-prepare — and every allocation on it now fails.
+    pinAllocatorLimit(&failing);
+    try std.testing.expectError(error.OutOfMemory, PostgresConn.queryFn(&conn, allocator, sql, &args));
+    try std.testing.expect(failing.has_induced_failure);
+
+    // What failed was the allocator, not the connection: the cache entry
+    // survived and the next statement runs on it.
+    failing.fail_index = std.math.maxInt(usize);
+    var after = try PostgresConn.queryFn(&conn, allocator, sql, &args);
+    defer after.deinit();
+    try std.testing.expectEqual(@as(usize, 1), after.rows.len);
+}
+
+test "postgres driver failure is a returned result, not an allocation failure" {
+    try skipUnlessLivePg();
+    const allocator = std.testing.allocator;
+
+    var conn = try PostgresConn.connect(allocator, pgTestConninfo(), 0);
+    defer closeStackPostgresConn(&conn);
+
+    // The other direction of the same split, which the shared `null` used to
+    // make unrepresentable: a statement name the server does not know is the
+    // *driver* answering, and it comes back as a `PGresult` carrying the
+    // failure — not as `error.OutOfMemory`, and not as a bare `null`.
+    const maybe_pg = try PostgresConn.execPreparedStmt(&conn, "zm_no_such_statement_oom_probe", &.{});
+    try std.testing.expect(maybe_pg != null);
+    const pg = maybe_pg.?;
+    defer libpq_c.PQclear(pg);
+    try std.testing.expectEqual(libpq_c.ExecStatusType.PGRES_FATAL_ERROR, libpq_c.PQresultStatus(pg));
+
+    // A driver failure that does come back as `null` is still `null` on the
+    // statement path: `conn == null` is an answer, not this process's memory
+    // (and it costs no allocation to say it).
+    var orphan = PostgresStmt{ .conn = null, .name = "zm_orphan", .allocator = allocator };
+    try std.testing.expect((try orphan.execParamsPrepared(&.{.{ .int = 1 }})) == null);
+
+    // The connection is still usable: the driver's refusal was not a state
+    // change on this side.
+    var after = try PostgresConn.queryFn(&conn, allocator, "SELECT 1 AS n", &.{});
+    defer after.deinit();
+    try std.testing.expectEqual(@as(usize, 1), after.rows.len);
+}
+
+test "postgres execParamsDirect reports bound-parameter allocation failures as OutOfMemory" {
+    try skipUnlessLivePg();
+    const allocator = std.testing.allocator;
+    const args = [_]Value{ .{ .int = 1 }, .{ .string = "x" } };
+
+    // Called directly with two parameters against SQL that uses none: the walk
+    // steps through this function's own parameter arrays and the per-parameter
+    // copies, and the driver is reached only past every one of them.
+    var idx: usize = 0;
+    var failures: usize = 0;
+    var succeeded = false;
+    while (idx < 16) : (idx += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{});
+        var conn = try PostgresConn.connect(failing.allocator(), pgTestConninfo(), 0);
+        defer closeStackPostgresConn(&conn);
+        failing.fail_index = failing.alloc_index + idx;
+        failing.resize_fail_index = 0;
+
+        const res = PostgresConn.execParamsDirect(&conn, "SELECT 1 AS n", &args);
+        if (res) |maybe_pg| {
+            // The driver does answer — with a `FATAL_ERROR` result, the bind
+            // count not matching the statement — and that is only reachable
+            // once every allocation below succeeded.
+            if (maybe_pg) |pg| libpq_c.PQclear(pg);
+            succeeded = true;
+            break;
+        } else |err| {
+            try std.testing.expectEqual(@as(errors.Error, error.OutOfMemory), err);
+            try std.testing.expect(failing.has_induced_failure);
+            failures += 1;
+        }
+    }
+    // How many allocations the path makes is an implementation detail of the
+    // helpers it uses (`allocPrintZ` alone asks for two buffers); what the walk
+    // proves is that the driver is reached only past the last of them, so every
+    // allocation site on the path was visited — the SQL copy, the three
+    // parameter arrays and the two parameter copies among them.
+    try std.testing.expect(succeeded);
+    try std.testing.expect(failures > 0);
+}
+
+test "convertPlaceholders reports an allocation failure as OutOfMemory" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, PostgresConn.convertPlaceholders(failing.allocator(), "SELECT ? AS a"));
+    try std.testing.expect(failing.has_induced_failure);
+
+    // "Nothing to rewrite" is not a failure and asks for no allocation at all —
+    // not for SQL without a `?`, and not for a `?` that only sits inside a
+    // literal. Callers send the SQL as it stands.
+    const allocator = std.testing.allocator;
+    try std.testing.expect((try PostgresConn.convertPlaceholders(allocator, "SELECT 1")) == null);
+    try std.testing.expect((try PostgresConn.convertPlaceholders(allocator, "SELECT '?' AS q")) == null);
+}
+
+test "postgres prepared-statement bind walk reports allocation failures as OutOfMemory" {
+    try skipUnlessLivePg();
+    const allocator = std.testing.allocator;
+    const args = [_]Value{ .{ .int = 1 }, .{ .float = 1.5 }, .{ .string = "x" } };
+    // `PostgresStmt.prepare` hands the SQL to `PQprepare` as written, so the
+    // placeholders here are PostgreSQL's own `$N` (it does not rewrite `?`).
+    const sql = "SELECT $1::int AS a, $2::float AS b, $3::text AS c";
+
+    var idx: usize = 0;
+    var failures: usize = 0;
+    var succeeded = false;
+    while (idx < 24) : (idx += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{});
+        var conn = try PostgresConn.connect(allocator, pgTestConninfo(), 0);
+        defer closeStackPostgresConn(&conn);
+
+        // The statement carries the allocator its bind arena is built from, so
+        // the failure is pinned after `prepare` — itself an allocation site on
+        // that same allocator.
+        var stmt = try PostgresConn.prepareFn(&conn, failing.allocator(), sql);
+        defer stmt.close();
+
+        failing.fail_index = failing.alloc_index + idx;
+        failing.resize_fail_index = 0;
+
+        const res = stmt.query(allocator, &args);
+        if (res) |rows| {
+            var r = rows;
+            r.deinit();
+            succeeded = true;
+            break;
+        } else |err| {
+            // Before the split this was `error.DatabaseError` at every index
+            // that failed the bind arena's allocation.
             try std.testing.expectEqual(@as(errors.Error, error.OutOfMemory), err);
             try std.testing.expect(failing.has_induced_failure);
             failures += 1;
