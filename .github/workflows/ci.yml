@@ -804,18 +804,30 @@ jobs:
         # proves nothing yet. The fallback below dumps every artifact's size and
         # first 32 bytes on failure, so the next run keeps its evidence; it is not
         # a fix and does not suppress the failure.
+        # TEMPORARY DIAGNOSTIC (2026-09-25, third round). What is established:
+        #   * not a stale artifact from the runner's cache (a step deletes
+        #     `.zig-cache/v` first, and it still fails);
+        #   * not the runner's filesystem (pointing `ZIG_LOCAL_CACHE_DIR` at
+        #     `${{ runner.temp }}` moved the directory and the same 24-byte
+        #     artifact appeared there);
+        #   * the artifact is a **truncated write**: its header declares 6025
+        #     PCs and the file ends after 24 bytes, and the build system's
+        #     `corrupted coverage file …: pcs_len was zero` is therefore a
+        #     *secondary* symptom that replaces the real failure;
+        #   * the real failure is a test binary exiting non-zero **without
+        #     printing anything at all** — no assertion, no panic, no trace.
+        # A silent non-zero exit that leaves a half-written coverage file is the
+        # shape of the process being *killed*, and the one resource this suite
+        # can exhaust on a 2-core runner under `--fuzz=2000` (coverage
+        # instrumented, every test run with fuzzing) is memory. So this round
+        # lowers the bound and prints `free -m` on both sides of it: if the lower
+        # bound passes, the nightly gets a bound that completes on that runner
+        # (with the open question recorded), and if it still dies silently, the
+        # bound is not the variable.
         run: |
-          # `--summary all` is the diagnostic: the failure below is a *secondary*
-          # symptom. In the run of 2026-09-25 the step printed
-          # `failed command: …/o/9d1d363de09ba3c108584c4fdf369565/test --seed=…`
-          # (a test binary that exited non-zero **without printing anything**),
-          # and the artifact left behind was 24 bytes long while its header
-          # declares 6025 PCs — a truncated write. The merge then dies on that
-          # file and reports `corrupted coverage file …: pcs_len was zero`,
-          # which *replaces* whatever the binary's real failure said. The
-          # summary attributes the failing step by name; the dump keeps the
-          # artifact's bytes.
-          if ! zig build test --fuzz=2000 -Ddb=all --test-timeout 300s --summary all; then
+          echo "--- memory before: "; free -m || true
+          if ! zig build test --fuzz=200 -Ddb=all --test-timeout 300s --summary all; then
+            echo "--- memory after the failure: "; free -m || true
             echo "=== zig-fuzz: coverage artifacts after the failure ==="
             ls -la .zig-cache/v 2>/dev/null | tail -20 || echo "(no v/ there)"
             for f in .zig-cache/v/*; do
@@ -825,6 +837,7 @@ jobs:
             done
             exit 1
           fi
+          echo "--- memory after a clean run: "; free -m || true
 
   benchmark:
     name: Benchmark
