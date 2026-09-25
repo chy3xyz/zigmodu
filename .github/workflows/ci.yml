@@ -787,7 +787,36 @@ jobs:
         # `--fuzz` with no limit opens the webui and never exits, so the bound is
         # mandatory. It is also incompatible with `-Dtest-filter` (the filter
         # runner panics in fuzz mode by design) — this runs the whole suite.
-        run: zig build test --fuzz=2000 -Ddb=all --test-timeout 300s
+        #
+        # TEMPORARY DIAGNOSTIC (2026-09-25, remove once answered). This step has
+        # failed twice with `error: step run test: corrupted coverage file
+        # .zig-cache/v/<hash>: pcs_len was zero` — the *same* hash both times —
+        # while the identical command locally is green. Two hypotheses remain,
+        # and this step is shaped to tell them apart in one run:
+        #   1. the runner's filesystem truncates the coverage write;
+        #   2. fuzz mode's own subprocess/merge shape on that runner leaves an
+        #      empty artifact.
+        # `ZIG_LOCAL_CACHE_DIR` moves the local cache (and with it the coverage
+        # directory) onto the runner's temp filesystem — if the failure follows
+        # the directory, it is (1); if it stays put, it is (2). The fallback
+        # dumps every artifact's size and first 32 bytes either way, so even a
+        # green run leaves evidence about what was written.
+        env:
+          ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/zig-fuzz-cache
+        run: |
+          if ! zig build test --fuzz=2000 -Ddb=all --test-timeout 300s; then
+            echo "=== zig-fuzz: coverage artifacts after the failure ==="
+            echo "--- under ZIG_LOCAL_CACHE_DIR ($ZIG_LOCAL_CACHE_DIR)"
+            ls -la "$ZIG_LOCAL_CACHE_DIR/v" 2>/dev/null | tail -20 || echo "(no v/ there)"
+            echo "--- under .zig-cache"
+            ls -la .zig-cache/v 2>/dev/null | tail -20 || echo "(no v/ there)"
+            for f in "$ZIG_LOCAL_CACHE_DIR"/v/* .zig-cache/v/*; do
+              [ -f "$f" ] || continue
+              echo "--- $f ($(wc -c <"$f") bytes)"
+              od -An -tx1 -N32 "$f" || true
+            done
+            exit 1
+          fi
 
   benchmark:
     name: Benchmark
