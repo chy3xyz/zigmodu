@@ -805,10 +805,18 @@ jobs:
         # first 32 bytes on failure, so the next run keeps its evidence; it is not
         # a fix and does not suppress the failure.
         run: |
-          if ! zig build test --fuzz=2000 -Ddb=all --test-timeout 300s; then
+          # `--summary all` is the diagnostic: the failure below is a *secondary*
+          # symptom. In the run of 2026-09-25 the step printed
+          # `failed command: …/o/9d1d363de09ba3c108584c4fdf369565/test --seed=…`
+          # (a test binary that exited non-zero **without printing anything**),
+          # and the artifact left behind was 24 bytes long while its header
+          # declares 6025 PCs — a truncated write. The merge then dies on that
+          # file and reports `corrupted coverage file …: pcs_len was zero`,
+          # which *replaces* whatever the binary's real failure said. The
+          # summary attributes the failing step by name; the dump keeps the
+          # artifact's bytes.
+          if ! zig build test --fuzz=2000 -Ddb=all --test-timeout 300s --summary all; then
             echo "=== zig-fuzz: coverage artifacts after the failure ==="
-            echo "--- build summary (a `compile test debug native failure` line here"
-            echo "--- is expected: it also shows up in steps that pass)"
             ls -la .zig-cache/v 2>/dev/null | tail -20 || echo "(no v/ there)"
             for f in .zig-cache/v/*; do
               [ -f "$f" ] || continue
