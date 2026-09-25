@@ -2,6 +2,72 @@
 
 ## [Unreleased]
 
+### 第 29 批：四个"真实存在但没导出"的符号补齐、新的亚毫秒 `PrecisionTimer`（实测 p50 = 0 vs wheel 4.67 ms）、`IpAddress.ConnectOptions.timeout` 是**陷阱**（实测 SIGABRT）并补上有界 dial（**破坏性：否**，均为新增公开 API）
+
+全量 `-Ddb=all` **1966/2025（59 skipped，0 failed）**；CI 示例清单本机 16/16。
+
+**文档里那 5 个"没有公开导入路径"的符号，四个判定为公开并补上导出，一个判定为内部。**
+- 补上（`src/root.zig`）：`Params`（它本来就是公开字段 `Context.query`/`Context.form` 的类型，消费者连名字都写不出来）、
+  `ScopedContainer`（邻居 `Container` 早就导出了）、`SlidingWindowRateLimiter`（与已导出的 `RateLimiter` 同族的真实现）、
+  `ConfigManager`（真实实现，且其唯一树内消费者 `TomlLoader` 以 `*ConfigManager` 为参数 —— store 必须可命名）。
+  文档里对应的 4 处路径同步改掉（`zigmodu.di.*`/`zigmodu.config.*`/`zigmodu.resilience.*`/`zigmodu.http.Params`）。
+- **判定为内部、不导出**：`TransactionalEvent` —— 它是个**空壳**（`stageEvent`/`addEvent` 都是 `_ = event;`、
+  `commit` 只改状态并留着 `// In real implementation:`、事件载荷 `alloc(u8, 0)`），而真身早已导出为
+  `zigmodu.outbox.*` 与 `zigmodu.SagaOrchestrator`。文档那一节整段删除，换成"**internal, not importable**"并指向真身；
+  `README.md` 里也去掉了它。
+- **新增导入证明测试**（`src/test/DocsConsistency.zig`）：跨文件 `@import("../root.zig")`，与消费者
+  `@import("zigmodu")` 的可见性完全一致 —— 漏加或没写 `pub` 就编译失败，而不是等到用户调用处才炸；四个符号都真跑了调用链。
+  同时保留了"文档里出现的符号必须在 `src/` 存在"那条硬门。
+> **顺带发现、未做（已列）**：`TomlLoader` 也没导出 ⇒ 公开面能用 `ConfigManager` 读 JSON/手工 `set`，但**读不了 TOML**；
+> `ScopedContainer` 相比 `Container` 缺 `remove`/`serviceCount`；`TransactionalEvent` 这个空壳该删（连带 `tests.zig`
+> 的编译门与 dead-code 基线项）或该被实现掉。
+
+**新的 `src/runtime/precision_timer.zig`（P2 里那项"亚毫秒定时"—— 刻意**不**动原来那个 wheel）。**
+调用方提供缓冲的**二叉最小堆**（绝对单调纳秒 deadline + token，`schedule` 满则 `error.Full`，**类型里没有任何
+allocator**：一个 guard 测试直接断言 `!@hasField(PrecisionTimer, "allocator")` 并跑了 20 万次 schedule/popDue），
+wait 循环 = 分块 sleep + 最后窗口 busy-poll。
+**实测（本机，单位 ns，CPU = 一个核的比例）**：
+
+| deadline | p50 | p99 | max | CPU | 窗口**关**掉时的 p50 |
+|---|---|---|---|---|---|
+| 100 µs | 0 | 0 | 22 000 | **100.0 %** | 57 000 |
+| 500 µs | 0 | 0 | 1 000 | **8.2 %** | 258 000 |
+| 1 ms | 0 | 0 | 4 000 | **17.0 %** | 513 000 |
+| 10 ms | 0 | 1 000 | 1 000 | **1.0 %** | 5 022 000 |
+
+对照组是**原 wheel 的实测**：p50 **4.67 ms**（`slot_ms = 10`、`tick_interval_ms = 5`），且几乎不花 CPU。
+100 µs 那行要烧满一个核，是因为那个 deadline 就落在窗口内 —— 没有值得睡的部分，纯自旋。
+**"窗口买到了什么"就是用例的牙**：`teeth: 4 of 4 deadlines break the 10000 ns median bound with the window off,
+0 of 4 with it on`，并且断言里还要求每一行的 coarse.p50 ≥ precise.p50（窗口什么都不做就会红）。
+另外测出 **`nanosleep` 的过冲随请求增长**（100 µs→55 µs、1 ms→508 µs、50 ms→8.1 ms），所以有一个
+**500 µs 的 chunk 上限**：一个 200 ms 的 deadline 加它 / 不加它分别是 **1 µs / 4.86 ms** 的延迟（这条就是断言）。
+> **它的边界，写清楚**：p50 是 0，但**不是抢占无关**（在同时编译的机器上见过 p99 641 µs、max 12.9 ms），
+> 所以**断言的是中位数**（10 µs），p99/max 只打印；macOS 这条路径**没有** timer coalescing（读 std 确认：走
+> `nanosleep(2)`，因为 `use_parking_sleep` 只列 windows/netbsd/illumos）；**永不提前、可任意晚**；单写者、无锁，
+> `cancel` 是 O(n)（刻意，不肯为它多留一个索引）；**这不是通用调度器**（长超时没有 O(1) cascade、没有 payload 语义、
+> 没有扇出）。**没加** affinity / 线程优先级 / TSC / kernel-bypass（按 `docs/RUNTIME.md` §12.7 明确延期，注释里写了）。
+> Linux 未实测（所有数字都是 Apple Silicon macOS）。
+
+**`IpAddress.ConnectOptions.timeout` 是陷阱，不是"未实现" —— 实测 SIGABRT。**
+`std/Io/Threaded.zig:12358` 是 `if (options.timeout != .none) @panic("TODO implement netConnectIpPosix with timeout")`，
+而且它在**创建 socket 之前**，所以任何地址（哪怕 loopback 上有监听）都会 abort 进程；macOS 的 Kqueue 后端同样是
+`@panic("TODO")`。实测：一个只调 `addr.connect(init.io, .{ .timeout = … })` 的程序 → `panic: TODO implement …` →
+`Abort trap: 6`、`exit=134`。**所以那个字段是陷阱而不是旋钮**，`dialTo` 仍然不传它。
+补上的是 `RaftTransport.connectTimeout(io, addr, timeout_ms)`：raw socket + `O_NONBLOCK` connect +
+`poll(POLLOUT)` + 单调时钟 deadline + `getsockopt(SO_ERROR)` 还原真实错误名（**走 raw 系统调用而不是
+`std.posix.poll`** —— 后者把 `.FAULT/.INVAL` 映射成 `unreachable`，与 `sockread` 存在的理由同一个），成功后清回阻塞
+（`sockread` 的前提）。三处生产 dial 全部改走它。
+**红证据是有界的、而且黑洞地址是量出来的**：`192.0.2.1`/`198.51.100.1`/`10.255.255.1` 等在这台机器上 0–7 ms 就
+"连上"（透明代理），只有 `169.254.255.254` 悬住（探针实测 `still pending after 25001ms`）；改动前的 dial 行逐字
+复刻后 `timeout 15` 跑 → `exit=124`、从未返回；同一地址走新实现 → **702 ms 返回 `error.ConnectTimeout`**。
+`timeout_ms = 0` 回落无界（老配置 `rpc_timeout_ms = 0` 行为不变）；**界只覆盖 POSIX**（Windows 回落无界，
+`poll` 在那里不存在）。两处文档（`dialTo`、`handleConnection`）改成说实话；`docs/DISTRIBUTED.md` 那节
+"未修的一半是 dial"也一并更新 —— 并补了一句仍然成立的：**有界的 IO 在 spin lock 下仍是有界 IO 在 spin lock 下**，
+`rpc_timeout_ms` 照样能被持锁烧满。
+> **未验证**：非 macOS 完全没跑（poll + `SO_ERROR` + 非阻塞 connect 是标准 POSIX，Linux 上 errno 都有，但一次
+> 都没运行；`EINTR` 后连接仍在后台推进是**假设**）；IPv6 路径没测；`error.Timeout`/`error.AccessDenied` 两条
+> SO_ERROR 映射无可触发手段、未被任何测试覆盖；"内核默认 ≥25 s"是这台机器 + 该地址的单点观测。
+
 ### 第 28 批：WebSocket 的写失败改名与 `broadcast` 持锁跨写（含引用计数快照）、集群的静默 put 失败与回调改边沿触发、metrics 拒绝跨种类重名（**破坏性：否**，三处错误集/回调语义变化）
 
 全量 `-Ddb=all` **1955/2013（58 skipped，0 failed）**；CI 示例清单本机 16/16。

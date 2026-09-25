@@ -42,7 +42,7 @@ ZigModu provides two complementary execution models. Adopt either one, or both:
 - **Module System** — Declarative module definition with compile-time dependency validation
 - **Lifecycle Management** — Automatic init/deinit orchestration in dependency order; modules opt into framework facilities via `initWith(ctx)`
 - **Dependency Injection** — Type-safe container built into `Application`: register at startup (`withService` / `registerBorrowed`), frozen after `start()`, lock-free reads thereafter
-- **Event System** — Application-wide `EventRegistry` hands out thread-safe per-type buses (`app.eventBus(T)`); plus TypedEventBus, TransactionalEvent + Outbox pattern
+- **Event System** — Application-wide `EventRegistry` hands out thread-safe per-type buses (`app.eventBus(T)`); plus TypedEventBus and the transactional outbox pattern (`zigmodu.outbox.*`)
 - **Application Builder** — Fluent API with shutdown hooks and graceful termination
 
 ### HTTP & API

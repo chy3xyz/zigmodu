@@ -219,12 +219,18 @@ const db = container.get(Database, "main_db");
 
 ### Scoped Container
 
-#### `zigmodu.di.ScopedContainer`
+#### `zigmodu.ScopedContainer`
 
-Scoped dependency container with parent resolution.
+Scoped dependency container with parent resolution. Hoisted like `zigmodu.Container`
+(there is no `zigmodu.di` namespace); own registrations win, misses fall through to
+`parent`.
 
 ```zig
 pub fn init(allocator: std.mem.Allocator, scope_name: []const u8, parent: ?*Container) Self
+pub fn deinit(self: *Self) void
+pub fn register(self: *Self, comptime T: type, name: []const u8, instance: *T) !void
+pub fn get(self: *Self, comptime T: type, name: []const u8) ?*T
+pub fn contains(self: *Self, name: []const u8) bool
 ```
 
 ---
@@ -233,9 +239,11 @@ pub fn init(allocator: std.mem.Allocator, scope_name: []const u8, parent: ?*Cont
 
 ### ConfigManager
 
-#### `zigmodu.config.ConfigManager`
+#### `zigmodu.ConfigManager`
 
-Centralized configuration management.
+Centralized configuration management. Hoisted from `src/config/ConfigManager.zig`
+(there is no `zigmodu.config` namespace); `ModuleConfig` gives one module a key
+prefix over the same store.
 
 ```zig
 pub fn init(allocator: std.mem.Allocator) Self
@@ -377,20 +385,15 @@ pub fn getConnectedNodes(self: *Self) []const *Node
 pub fn getNodeCount(self: *Self) usize
 ```
 
-### TransactionalEvent
+### TransactionalEvent — internal, not importable
 
-#### `zigmodu.core.TransactionalEvent`
-
-Event with saga transaction support.
-
-```zig
-pub fn TransactionManager.init(allocator: std.mem.Allocator) TM
-pub fn begin(self: *TM) Transaction
-pub fn stageEvent(self: *TM, event: anytype) !void
-
-pub fn Transaction.commit(self: *Transaction) !void
-pub fn Transaction.rollback(self: *Transaction) void
-```
+`src/core/TransactionalEvent.zig` has **no** `root.zig` export and should not get
+one: it is a stub. `TransactionManager.stageEvent` and `Transaction.addEvent`
+discard their argument (`_ = event;`), `commit` only flips a local state field, and
+`EventOutbox.store` allocates a zero-length payload. The working implementations
+are the outbox (`zigmodu.outbox.OutboxPublisher` / `OutboxPoller`, plus
+`docs/API.md` § Outbox) and, for compensating long-running flows,
+`zigmodu.SagaOrchestrator`.
 
 ---
 
@@ -480,9 +483,10 @@ the registry.
 
 ### SlidingWindowRateLimiter
 
-#### `zigmodu.resilience.SlidingWindowRateLimiter`
+#### `zigmodu.SlidingWindowRateLimiter`
 
-窗口内计数限流；**线程安全**。
+窗口内计数限流；**线程安全**。Hoisted like `zigmodu.RateLimiter` (there is no
+`zigmodu.resilience` namespace).
 
 ```zig
 pub fn init(allocator: std.mem.Allocator, name: []const u8, window_size_seconds: u64, max_requests: u32) !Self
@@ -753,7 +757,10 @@ comes from a supervisor (`Restart=always`, k8s `restartPolicy: Always`); see
 [`BEST_PRACTICES.md`](BEST_PRACTICES.md)「韧性」and
 [`PRODUCTION_ROADMAP.md`](PRODUCTION_ROADMAP.md) for the prefork boundary.
 
-### `zigmodu.http.Params` (multi-value query/form)
+### `zigmodu.Params` (multi-value query/form)
+
+Hoisted to the root (there is no `zigmodu.http.Params` alias; `PageParams` stays
+under `zigmodu.http`).
 
 `ctx.query` and `ctx.form` are `Params`, not `StringHashMap`: HTML's two native
 "several values for one name" shapes are kept.

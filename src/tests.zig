@@ -151,6 +151,11 @@ test "compile all source files" {
     _ = @import("runtime/scheduler.zig");
     // Allocation contract for the L0 hot paths (docs/RUNTIME.md §4–§6)
     _ = @import("runtime/alloc_contract_test.zig");
+    // Precision deadline timer: the sleep-then-spin alternative to the wheel for
+    // sub-millisecond deadlines. Its tests are the *measurement* — the lateness
+    // and spin-cost tables are printed, and the bound is asserted — so reaching
+    // this file from here is what makes the numbers below run at all.
+    _ = @import("runtime/precision_timer.zig");
 
     // IM domain. `im/ConnectionRegistry.zig`'s own tests were never wired here:
     // the file is reached only through `im/im.zig`, which `root.zig` exports and

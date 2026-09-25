@@ -149,6 +149,17 @@ gauge 同名）与 **histogram 的生成名**（`createHistogram("x")` 之后再
 返回 —— 那个指针指向已失效的栈帧。只影响直接用这个测试工具的类型（`IntegrationTest.instrumentation` 字段也变成
 `?*InstrumentationContext`）。
 
+**新增公开 API（additive，无破坏性）**：`zigmodu.Params`、`zigmodu.ScopedContainer`、
+`zigmodu.SlidingWindowRateLimiter`、`zigmodu.ConfigManager` 四个符号以前**只存在于 `src/` 里、没有公开导入路径**
+（文档写了它们但消费者 import 不到），现在从 `root.zig` 再导出，文档路径同步改正。
+`zigmodu.TransactionalEvent` **不再**是公开 API（那一节从文档里删掉了）：它是个空壳，真身是 `zigmodu.outbox.*` 与
+`zigmodu.SagaOrchestrator`。另新增 `zigmodu.runtime.PrecisionTimer`（亚毫秒 deadline 队列，调用方提供缓冲、
+类型内零分配；不要用它替代普通定时器 —— 10 ms 以上的 deadline 仍旧用 scheduler 的 wheel，后者几乎不花 CPU）
+与 `RaftTransport.connectTimeout`（POSIX 有界 dial）。
+**顺带一条给所有人的警告**：`IpAddress.ConnectOptions.timeout` 在本工具链上会让进程**直接 abort**
+（`std/Io/Threaded.zig` 里的 `@panic("TODO implement netConnectIpPosix with timeout")`，实测 `exit=134`），
+所以既不要传它、也不要指望它 —— 要界就用 `connectTimeout`。
+
 **行为变化（非破坏）⑨：一批"取消被当成成功/默认值"的路径改成等待或报错。** 涉及 `EventBus`
 （`publish`/`unsubscribe`/`subscriberCount`/`publishedCount` 改不可取消的等待；**`subscribe`/`subscribeAsync`
 现在会返回 `error.Canceled`** —— 以前它们**返回成功却没注册**）、`EventStore`

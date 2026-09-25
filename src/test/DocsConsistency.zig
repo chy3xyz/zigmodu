@@ -95,6 +95,47 @@ test "every symbol documented in docs/ exists in src/" {
     }
 }
 
+// A documented root alias must be *importable*, not merely present in `src/`:
+// `zigmodu.<Name>` is what a consumer writes, and it resolves only through
+// `root.zig`. Importing the root file from here sees exactly what
+// `@import("zigmodu")` sees — `pub` declarations only — so dropping one of
+// these aliases fails this test at compile time, not at the user's call site.
+test "documented root aliases are importable" {
+    const zigmodu = @import("../root.zig");
+    const allocator = std.testing.allocator;
+
+    const Params = zigmodu.Params;
+    var params = Params.init(allocator);
+    defer params.deinit();
+    try params.put("ids", "1");
+    try params.put("ids", "2");
+    try std.testing.expectEqualStrings("2", params.get("ids").?);
+    try std.testing.expectEqual(@as(usize, 2), params.totalValues());
+
+    const ScopedContainer = zigmodu.ScopedContainer;
+    var scoped = ScopedContainer.init(allocator, "request", null);
+    defer scoped.deinit();
+    const Service = struct { n: u32 = 7 };
+    const service = try allocator.create(Service);
+    service.* = .{};
+    try scoped.register(Service, "svc", service);
+    try std.testing.expectEqual(@as(u32, 7), scoped.get(Service, "svc").?.n);
+
+    const SlidingWindowRateLimiter = zigmodu.SlidingWindowRateLimiter;
+    var window = try SlidingWindowRateLimiter.init(allocator, "api", 60, 1);
+    defer window.deinit();
+    try std.testing.expect(window.tryAcquire());
+    try std.testing.expect(!window.tryAcquire());
+    try std.testing.expectEqual(@as(usize, 1), window.currentCount());
+
+    const ConfigManager = zigmodu.ConfigManager;
+    var config = ConfigManager.init(allocator);
+    defer config.deinit();
+    try config.set("app.name", .{ .string = "demo" });
+    try std.testing.expectEqualStrings("demo", config.getString("app.name").?);
+    try std.testing.expect(config.has("app.name"));
+}
+
 fn scanDir(
     io: std.Io,
     dir: std.Io.Dir,

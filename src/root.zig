@@ -97,6 +97,8 @@ pub const EventRegistry = @import("core/EventRegistry.zig").EventRegistry;
 pub const ModuleContext = @import("core/ModuleContext.zig").ModuleContext;
 /// Dependency-injection container: register and resolve services by type.
 pub const Container = @import("di/Container.zig").Container;
+/// Child container: its own registrations, falling back to the parent.
+pub const ScopedContainer = @import("di/Container.zig").ScopedContainer;
 /// Build-then-freeze map: fill at startup, read concurrently afterwards.
 pub const FrozenMap = @import("core/FrozenMap.zig").FrozenMap;
 /// String-keyed variant of `FrozenMap`.
@@ -111,6 +113,8 @@ pub const panicHook = @import("api/PanicHook.zig").hook;
 // ============================================================
 /// HTTP domain: server, router, middleware, client, OpenAPI, SSE.
 pub const http = @import("http.zig");
+/// Multi-value map behind `ctx.query` / `ctx.form` (`getAll`, `getPath`, …).
+pub const Params = @import("http/Params.zig").Params;
 /// Data domain: SQLx, Redis, ORM, cache, pool, migrations.
 pub const data = @import("data.zig");
 /// Security domain: auth, RBAC, API keys, secrets, passwords, JWT.
@@ -127,10 +131,12 @@ pub const migration = @import("migration/Migration.zig");
 // ============================================================
 /// Stops calling a failing dependency: CLOSED / OPEN / HALF_OPEN per service.
 pub const CircuitBreaker = @import("resilience/CircuitBreaker.zig").CircuitBreaker;
-/// Token-bucket / sliding-window limiter for one key.
+/// Token-bucket limiter for one key: burst size plus sustained refill rate.
 pub const RateLimiter = @import("resilience/RateLimiter.zig").RateLimiter;
 /// Named limiters, so endpoints do not fight over a single bucket.
 pub const RateLimiterRegistry = @import("resilience/RateLimiter.zig").RateLimiterRegistry;
+/// Counts requests inside a fixed window; allocation-free `tryAcquire`.
+pub const SlidingWindowRateLimiter = @import("resilience/RateLimiter.zig").SlidingWindowRateLimiter;
 /// Semaphore isolation: cap concurrency per group so one failure starves none.
 pub const Bulkhead = @import("resilience/Bulkhead.zig").Bulkhead;
 /// Named bulkheads, created on demand and then reused.
@@ -375,6 +381,12 @@ pub const Validator = @import("validation/ObjectValidator.zig").Validator;
 // ============================================================
 /// Config from env / files / custom loaders, with optional hot reload.
 pub const ExternalizedConfig = @import("config/ExternalizedConfig.zig").ExternalizedConfig;
+/// Typed key/value config store: JSON loading, `ModuleConfig` key prefixes.
+///
+/// Positioning: user-facing; its only in-tree consumer is
+/// `config/TomlLoader.zig` (also not re-exported), which fills a store passed in
+/// by the application. The alias below is what makes the store nameable.
+pub const ConfigManager = @import("config/ConfigManager.zig").ConfigManager;
 /// Feature flags: percentage rollout, allowlists, per-tenant targeting.
 pub const FeatureFlagManager = @import("core/FeatureFlags.zig").FeatureFlagManager;
 /// One flag's definition (key, default, rollout).

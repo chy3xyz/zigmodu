@@ -22,6 +22,9 @@ pub const ring = @import("runtime/ring.zig");
 pub const clock = @import("runtime/clock.zig");
 /// Timer wheel module: `Wheel` plus its geometry constants (`slot_ms`).
 pub const timer_wheel = @import("runtime/timer_wheel.zig");
+/// Precision deadline timer: a pre-sized deadline queue with a sleep-then-spin
+/// wait loop, for sub-millisecond lateness at a CPU cost (`precision_timer`).
+pub const precision_timer = @import("runtime/precision_timer.zig");
 /// Object pool module: `ObjectPool` for bounded reuse over allocator churn.
 pub const object_pool = @import("runtime/object_pool.zig");
 /// Mailbox module: the bounded hand-off queue between threads.
@@ -48,6 +51,16 @@ pub const MpscRing = ring.MpscRing;
 pub const Clock = clock.Clock;
 /// Hierarchical timer wheel (O(1) schedule/cancel, `timer_wheel.slot_ms` ticks).
 pub const Wheel = timer_wheel.Wheel;
+/// Precision deadline timer: sub-microsecond lateness, paid for in CPU
+/// (`default_spin_window_ns` of busy-poll per wait). Not a wheel replacement —
+/// see the module doc comment for when each one is the right tool.
+pub const PrecisionTimer = precision_timer.PrecisionTimer;
+/// Default spin window of `PrecisionTimer` (the last N ns before a deadline are
+/// busy-polled), derived from a measured `nanosleep`-overshoot distribution.
+pub const default_spin_window_ns = precision_timer.default_spin_window_ns;
+/// Longest single sleep `PrecisionTimer` will take, likewise derived from the
+/// measured overshoot ladder (the overshoot grows with the request).
+pub const default_max_sleep_chunk_ns = precision_timer.default_max_sleep_chunk_ns;
 /// Fixed-capacity object pool — bounded reuse instead of allocator churn.
 pub const ObjectPool = object_pool.ObjectPool;
 /// Bounded blocking mailbox (the worker hand-off).

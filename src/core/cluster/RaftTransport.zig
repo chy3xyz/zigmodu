@@ -24,6 +24,7 @@
 //! elections and sends heartbeats, so keep calling it from your loop.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const NetworkTransport = @import("NetworkTransport.zig");
 const sockread = @import("../sockread.zig");
 const ClusterAuth = @import("TlsTransport.zig").ClusterAuth;
@@ -38,6 +39,7 @@ const InstallSnapshotRequest = @import("RaftElection.zig").InstallSnapshotReques
 const InstallSnapshotResponse = @import("RaftElection.zig").InstallSnapshotResponse;
 const LogEntry = @import("RaftElection.zig").LogEntry;
 const RaftState = @import("RaftElection.zig").RaftState;
+const Time = @import("../Time.zig");
 
 const log = std.log.scoped(.raft_transport);
 
@@ -404,31 +406,185 @@ fn readFrameAuth(secret: ?[32]u8, conn: *NetworkTransport.ClusterConnection, buf
     return conn.recv(buf);
 }
 
-/// Dial a peer. `NetworkTransport.connect` is unreferenced in-tree and does not
-/// compile against this Zig (`IpAddress.ConnectOptions` now requires `.mode`), so
-/// the three lines live here; it can go back to calling that helper once fixed.
+/// Dial a peer, with the dial itself bounded by `timeout_ms` (`0` = no bound).
 ///
-/// **The connect cannot be bounded here, and that is a std limitation rather
-/// than a choice.** `IpAddress.ConnectOptions` advertises `.timeout`, but on the
-/// `std.Io.Threaded` backend Zig 0.17 (the version CI pins) has not implemented
-/// it — `netConnectIpPosix` is `if (options.timeout != .none) @panic("TODO
-/// implement netConnectIpPosix with timeout")`, measured, not read. Passing one
-/// would turn every dial into a process abort.
+/// `NetworkTransport.connect` is unreferenced in-tree and does not compile
+/// against this Zig (`IpAddress.ConnectOptions` now requires `.mode`), so the
+/// two lines live here; it can go back to calling that helper once fixed.
 ///
-/// So a peer whose SYN is dropped still costs this dial the OS default. What
-/// *is* bounded is the reply wait (`sockread.setRecvTimeout` in
-/// `TransportImpl.sendAppendEntries`), which covers the other black-hole — a
-/// peer that completes the handshake and then never answers. That one is worth
-/// more than it looks: a wedged peer (long GC pause, saturated accept queue,
-/// overloaded box) is far more common in production than a routing black hole,
-/// and it is the case no connect-side bound could ever have covered.
+/// **The bound cannot come from `IpAddress.ConnectOptions.timeout`.** The field
+/// exists (`std/Io/net.zig:341`) but neither `std.Io` backend implements it:
+/// `std/Io/Threaded.zig:12358` is
 ///
-/// Closing the remaining gap means a hand-rolled non-blocking `connect` + `poll`
-/// with a deadline; `endpoint/server` plumbing is not the place for it.
-fn dialTo(allocator: std.mem.Allocator, io: std.Io, ep: Endpoint) !NetworkTransport.ClusterConnection {
+///     if (options.timeout != .none) @panic("TODO implement netConnectIpPosix with timeout");
+///
+/// and `netConnectIpWindows` one function below is the same. Measured on
+/// 0.17.0-dev.2151+2ec5523d5: passing a `.timeout` and dialling loopback
+/// `127.0.0.1:1` aborts the process (`panic: TODO implement netConnectIpPosix
+/// with timeout`, SIGABRT). So the field is a trap rather than a knob, and the
+/// bound is built here out of non-blocking `connect` + `poll`.
+///
+/// It is worth having: without it a peer whose SYNs are dropped (a firewall, a
+/// wedged box) costs the kernel's default — measured on macOS, a link-local
+/// address with nothing listening for it is still unanswered after 25 s — and
+/// `RaftElection.tick`'s replication round dials from inside `RaftLock`. The
+/// write and the reply wait were already bounded (`sockread.setSendTimeout` /
+/// `setRecvTimeout`); this is the third side of the same RPC.
+fn dialTo(allocator: std.mem.Allocator, io: std.Io, ep: Endpoint, timeout_ms: u32) !NetworkTransport.ClusterConnection {
     const addr = try std.Io.net.IpAddress.parse(ep.host, ep.port);
-    const stream = try addr.connect(io, .{ .mode = .stream });
+    const stream = try connectTimeout(io, addr, timeout_ms);
     return NetworkTransport.ClusterConnection.init(allocator, stream, io);
+}
+
+/// `IpAddress.ConnectError` plus the one error std's connect cannot report on
+/// this toolchain, because it never reaches the kernel to find out.
+pub const ConnectTimeoutError = std.Io.net.IpAddress.ConnectError || error{ConnectTimeout};
+
+/// Connect to `addr`, giving up `timeout_ms` after the call starts. `0` means
+/// no bound — `sockread.setRecvTimeout`'s convention, and what lets a pre-fix
+/// `rpc_timeout_ms = 0` config keep the unbounded behaviour.
+///
+/// The returned stream is **blocking**, like every other socket `std.Io` hands
+/// out: `sockread.readSome` is a bare `read` and `writeFull` a bare `write`, so
+/// a non-blocking socket would come back `EAGAIN` — which the WebSocket write
+/// path, for one, treats as a programmer bug and panics on in debug builds.
+///
+/// POSIX only: on Windows, where `std.posix.system` has no `poll`, this falls
+/// back to the unbounded `IpAddress.connect`. The raw-syscall layer it is built
+/// on (`sockread`) is POSIX-only already.
+pub fn connectTimeout(io: std.Io, addr: std.Io.net.IpAddress, timeout_ms: u32) ConnectTimeoutError!std.Io.net.Stream {
+    if (builtin.os.tag == .windows or timeout_ms == 0) {
+        return addr.connect(io, .{ .mode = .stream });
+    }
+
+    var storage: std.Io.Threaded.PosixAddress = undefined;
+    const addr_len = std.Io.Threaded.addressToPosix(&addr, &storage);
+
+    // Raw syscalls, not the `std.posix.*` wrappers: this call has to be able to
+    // *return* an error, and the wrappers map several errno values onto
+    // `unreachable` (`std.posix.poll`'s `.FAULT`/`.INVAL`, `setsockopt`'s
+    // `.INVAL` — the reason `sockread` exists at all). Same shape as
+    // `sockread.applyTimeout`.
+    const rc = std.posix.system.socket(std.Io.Threaded.posixAddressFamily(&addr), std.posix.SOCK.STREAM, 0);
+    const fd: std.posix.socket_t = switch (std.posix.errno(rc)) {
+        .SUCCESS => @intCast(rc),
+        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+        .INVAL => return error.ProtocolUnsupportedBySystem,
+        .MFILE => return error.ProcessFdQuotaExceeded,
+        .NFILE => return error.SystemFdQuotaExceeded,
+        .NOBUFS, .NOMEM => return error.SystemResources,
+        .PROTONOSUPPORT => return error.ProtocolUnsupportedByAddressFamily,
+        .PROTOTYPE => return error.SocketModeUnsupported,
+        else => |e| return std.posix.unexpectedErrno(e),
+    };
+    errdefer std.Io.Threaded.closeFd(fd);
+
+    // Neither of these can be a `socket()` flag: macOS rejects `SOCK.NONBLOCK`
+    // there (measured: `socket()` → `EINVAL`), which is why std sets
+    // `FD_CLOEXEC` by hand on darwin too.
+    if (fcntlSet(fd, std.posix.F.SETFD, std.posix.FD_CLOEXEC)) |e| return std.posix.unexpectedErrno(e);
+    if (setNonblock(fd, true)) |e| return std.posix.unexpectedErrno(e);
+
+    switch (std.posix.errno(std.posix.system.connect(fd, &storage.any, addr_len))) {
+        // Immediate: loopback, or a listener on this host. That is the common
+        // case between nodes in one rack, and every case in these tests.
+        .SUCCESS => {},
+        // The SYN is out and the kernel reports the outcome as writability plus
+        // `SO_ERROR`. `EINTR` is the same state reached with a signal on the
+        // way in: the attempt is still in flight and must not be retried.
+        .INPROGRESS, .AGAIN, .INTR => try awaitConnect(fd, timeout_ms),
+        .ADDRNOTAVAIL => return error.AddressUnavailable,
+        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+        .ALREADY => return error.ConnectionPending,
+        .CONNREFUSED => return error.ConnectionRefused,
+        .CONNRESET => return error.ConnectionResetByPeer,
+        .HOSTUNREACH => return error.HostUnreachable,
+        .NETUNREACH => return error.NetworkUnreachable,
+        .TIMEDOUT => return error.Timeout,
+        .ACCES => return error.AccessDenied,
+        .NETDOWN => return error.NetworkDown,
+        else => |e| return std.posix.unexpectedErrno(e),
+    }
+
+    // Hand back the same state `netConnectIpPosix` does: a blocking socket
+    // whose `address` is the *local* endpoint `getsockname` reports (i.e. the
+    // ephemeral port). The name is best-effort there too — a failure leaves a
+    // perfectly usable stream.
+    if (setNonblock(fd, false)) |e| return std.posix.unexpectedErrno(e);
+    var local: std.Io.Threaded.PosixAddress = undefined;
+    var local_len: std.posix.socklen_t = @sizeOf(std.Io.Threaded.PosixAddress);
+    const local_addr = if (std.posix.errno(std.posix.system.getsockname(fd, &local.any, &local_len)) == .SUCCESS)
+        std.Io.Threaded.addressFromPosix(&local)
+    else
+        addr;
+    return .{ .socket = .{ .handle = fd, .address = local_addr } };
+}
+
+/// Wait out an in-flight `connect` (`EINPROGRESS`), up to `timeout_ms` from
+/// *now*.
+///
+/// `poll(POLLOUT)` means "the kernel is done with the attempt", not "it
+/// worked": `SO_ERROR` carries the verdict, and a refused connection arrives
+/// exactly that way — writable, then `ECONNREFUSED`.
+fn awaitConnect(fd: std.posix.socket_t, timeout_ms: u32) ConnectTimeoutError!void {
+    const started = Time.monotonicNowMilliseconds();
+    var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
+    while (true) {
+        const elapsed = Time.monotonicNowMilliseconds() - started;
+        if (elapsed >= timeout_ms) return error.ConnectTimeout;
+        const prc = std.posix.system.poll(&fds, 1, @intCast(timeout_ms - elapsed));
+        switch (std.posix.errno(prc)) {
+            .SUCCESS => {},
+            // A signal, not an answer: recompute what is left and wait again.
+            .INTR => continue,
+            else => |e| return std.posix.unexpectedErrno(e),
+        }
+        if (prc == 0) return error.ConnectTimeout;
+        break;
+    }
+
+    var so_error: i32 = 0;
+    var len: std.posix.socklen_t = @sizeOf(i32);
+    switch (std.posix.errno(std.posix.system.getsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.ERROR, @ptrCast(&so_error), &len))) {
+        .SUCCESS => {},
+        else => |e| return std.posix.unexpectedErrno(e),
+    }
+    // The mapping `std.Io.Threaded.posixConnect` applies to the blocking form,
+    // so a caller cannot tell which of the two dialled.
+    switch (so_error) {
+        0 => {},
+        @backingInt(std.posix.E.ADDRNOTAVAIL) => return error.AddressUnavailable,
+        @backingInt(std.posix.E.CONNREFUSED) => return error.ConnectionRefused,
+        @backingInt(std.posix.E.CONNRESET) => return error.ConnectionResetByPeer,
+        @backingInt(std.posix.E.HOSTUNREACH) => return error.HostUnreachable,
+        @backingInt(std.posix.E.NETUNREACH) => return error.NetworkUnreachable,
+        @backingInt(std.posix.E.TIMEDOUT) => return error.Timeout,
+        @backingInt(std.posix.E.ACCES), @backingInt(std.posix.E.PERM) => return error.AccessDenied,
+        @backingInt(std.posix.E.NETDOWN) => return error.NetworkDown,
+        else => |e| {
+            log.debug("[raft] connect failed with errno {d}", .{e});
+            return error.Unexpected;
+        },
+    }
+}
+
+/// Set or clear `O_NONBLOCK`; returns the errno when the kernel refuses.
+///
+/// Not a `socket()` flag: macOS rejects `SOCK.NONBLOCK` there (measured:
+/// `socket()` → `EINVAL`). `F_SETFL` cannot touch the access-mode bits, so `0`
+/// clears exactly `O_NONBLOCK` — the standard way to make a socket blocking
+/// again.
+fn setNonblock(fd: std.posix.socket_t, on: bool) ?std.posix.E {
+    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
+    return fcntlSet(fd, std.posix.F.SETFL, if (on) nonblock else 0);
+}
+
+/// `fcntl` with the error reported as a value — `std.posix` has no `fcntl`
+/// wrapper in this toolchain, and the raw call is what `sockread.applyTimeout`
+/// does for `setsockopt` for the same reason.
+fn fcntlSet(fd: std.posix.socket_t, cmd: i32, arg: u32) ?std.posix.E {
+    const e = std.posix.errno(std.posix.system.fcntl(fd, cmd, @as(usize, arg)));
+    return if (e == .SUCCESS) null else e;
 }
 
 // ── Address book ────────────────────────────────────────────────────────────
@@ -577,7 +733,7 @@ pub fn TransportImpl(comptime slot: usize) type {
         /// Dial + write once. A failure here is a lost message (Raft re-sends),
         /// so it is worth a debug line and nothing more.
         pub fn sendFrame(self: *Self, ep: Endpoint, frame: []const u8) void {
-            var conn = dialTo(self.allocator, self.io, ep) catch |err| {
+            var conn = dialTo(self.allocator, self.io, ep, self.rpcTimeoutMs()) catch |err| {
                 log.debug("[raft] connect {s}:{d} failed, message dropped ({})", .{ ep.host, ep.port, err });
                 return;
             };
@@ -621,7 +777,7 @@ pub fn TransportImpl(comptime slot: usize) type {
                 return lost;
             };
 
-            var conn = dialTo(self.allocator, self.io, ep) catch return lost;
+            var conn = dialTo(self.allocator, self.io, ep, self.rpcTimeoutMs()) catch return lost;
             defer conn.deinit();
             sockread.setSendTimeout(conn.stream, self.rpcTimeoutMs());
             writeFrameAuth(self.raft.config.cluster_secret, &conn, frame.items) catch return lost;
@@ -690,9 +846,11 @@ pub const ElectionTransportImpl = TransportImpl(0);
 ///
 /// **This paragraph states a principle the outbound half does not yet follow:**
 /// `RaftElection.tick`'s replication round calls `sendAppendEntries` below
-/// *inside* `RaftLock`. The reply wait there is bounded now
-/// (`sockread.setRecvTimeout`, `ElectionConfig.rpc_timeout_ms`), but the dial is
-/// not, and a bounded IO under a spin lock is still IO under a spin lock.
+/// *inside* `RaftLock`. Both ends of that RPC are bounded now — the dial
+/// (`dialTo` → `connectTimeout`) and the reply wait (`sockread.setRecvTimeout`,
+/// `ElectionConfig.rpc_timeout_ms`) — but a *bounded* IO under a spin lock is
+/// still IO under a spin lock, and `rpc_timeout_ms` is a budget a busy node can
+/// still spend in full with the lock held.
 /// `docs/DISTRIBUTED.md` §"出站 IO 与锁" holds the three-phase design that closes
 /// it, with the obligations (self-contained requests, stale-response guard) any
 /// implementation has to meet.
@@ -787,7 +945,7 @@ pub fn handleConnection(raft: *RaftElection, addresses: ?*const AddressBook, con
     if (relay_candidate) |candidate| {
         const ep = if (addresses) |book| book.lookup(candidate) else null;
         if (ep) |endpoint| {
-            var conn_out = dialTo(conn.allocator, conn.io, endpoint) catch |err| {
+            var conn_out = dialTo(conn.allocator, conn.io, endpoint, raft.config.rpc_timeout_ms) catch |err| {
                 log.debug("[raft] relaying the vote response to {s}:{d} failed ({})", .{ endpoint.host, endpoint.port, err });
                 return;
             };
@@ -860,7 +1018,11 @@ pub const InboundServer = struct {
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
-const Time = @import("../Time.zig");
+
+/// Loopback dials below complete in the kernel's listen backlog even when the
+/// peer's accept loop is busy, so this only has to be long enough not to fire
+/// spuriously.
+const test_dial_timeout_ms: u32 = 2000;
 
 test "TransportImpl keeps distinct statics per slot" {
     // Regression guard for the comptime-generic memoization trap: on this Zig
@@ -1374,7 +1536,7 @@ fn startInbound(
 fn stopInbound(io: std.Io, inbound: *InboundServer, thread: *std.Thread) void {
     inbound.stop();
     // Wake the blocked accept with a connection that closes without a frame.
-    if (dialTo(testing.allocator, io, .{ .host = "127.0.0.1", .port = inbound.server.port })) |conn| {
+    if (dialTo(testing.allocator, io, .{ .host = "127.0.0.1", .port = inbound.server.port }, test_dial_timeout_ms)) |conn| {
         var c = conn;
         c.deinit();
     } else |_| {}
@@ -1581,7 +1743,7 @@ test "real loopback replication: sync AppendEntries and same-connection replies"
     // 2. Same-connection reply to a vote request: read the frame the inbound
     //    handler wrote, not a helper's return value.
     {
-        var conn = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = b_port });
+        var conn = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = b_port }, test_dial_timeout_ms);
         defer conn.deinit();
         var frame = std.ArrayList(u8).empty;
         defer frame.deinit(allocator);
@@ -1827,7 +1989,7 @@ test "a peer that accepts and never replies costs rpc_timeout_ms, not the peer's
     // (which is the whole point of the change above), and closing the listener
     // does not reliably wake that. Same wake-up connection the inbound-server
     // teardown uses.
-    if (dialTo(allocator, io, .{ .host = "127.0.0.1", .port = server.port })) |wake| {
+    if (dialTo(allocator, io, .{ .host = "127.0.0.1", .port = server.port }, test_dial_timeout_ms)) |wake| {
         var c = wake;
         c.deinit();
     } else |err| {
@@ -1875,7 +2037,7 @@ test "a half-frame on the inbound side costs rpc_timeout_ms, not the whole node"
     // Peer A: a length prefix promising 64 bytes, then silence. Four bytes. A
     // completed its handshake before B existed, so it is the connection whose
     // handler is stalled on the body if anything serializes the two.
-    var peer_a = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = port });
+    var peer_a = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = port }, test_dial_timeout_ms);
     defer peer_a.deinit();
     sockread.setRecvTimeout(peer_a.stream, stalled_peer_patience_ms);
     var prefix: [4]u8 = undefined;
@@ -1884,7 +2046,7 @@ test "a half-frame on the inbound side costs rpc_timeout_ms, not the whole node"
 
     // Peer B: a complete frame whose tag is not a Raft message, i.e. one
     // `handleConnection` answers by closing without a reply.
-    var peer_b = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = port });
+    var peer_b = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = port }, test_dial_timeout_ms);
     defer peer_b.deinit();
     sockread.setRecvTimeout(peer_b.stream, stalled_peer_patience_ms);
     var junk: [8]u8 = @splat(0);
@@ -1961,9 +2123,9 @@ test "two stalled peers do not stop a third connection from being answered" {
 
     // Two peers that connect and then send a length prefix with no body: each
     // holds a handler until `rpc_timeout_ms` releases it.
-    var slow_a = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = port });
+    var slow_a = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = port }, test_dial_timeout_ms);
     defer slow_a.deinit();
-    var slow_b = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = port });
+    var slow_b = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = port }, test_dial_timeout_ms);
     defer slow_b.deinit();
     for ([_]*NetworkTransport.ClusterConnection{ &slow_a, &slow_b }) |stalled| {
         var prefix: [4]u8 = undefined;
@@ -1973,7 +2135,7 @@ test "two stalled peers do not stop a third connection from being answered" {
 
     // The third peer sends a complete frame and has to be answered while both of
     // the above are still inside their handler.
-    var fast = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = port });
+    var fast = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = port }, test_dial_timeout_ms);
     defer fast.deinit();
     sockread.setRecvTimeout(fast.stream, stalled_peer_patience_ms);
 
@@ -2077,7 +2239,7 @@ test "with a cluster_secret, a loopback AppendEntries round-trip is signed end t
     // 2. A peer without the secret is dropped at the verifier: node-b is
     //    listening, the frame is well-formed, and the raft must not see it.
     {
-        var conn = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = b_port });
+        var conn = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = b_port }, test_dial_timeout_ms);
         defer conn.deinit();
         sockread.setRecvTimeout(conn.stream, stalled_peer_patience_ms);
 
@@ -2094,4 +2256,96 @@ test "with a cluster_secret, a loopback AppendEntries round-trip is signed end t
     }
     try testing.expect(b_raft.getTerm() < 42);
     try testing.expectEqualStrings("node-a", b_raft.getLeader().?);
+}
+
+// ── Bounded dial ────────────────────────────────────────────────────────────
+
+/// `O_NONBLOCK` as the *kernel* sees it on `fd`, read back with `fcntl` — the
+/// assertion is about the socket's real state rather than about what we meant
+/// to ask for.
+fn nonblockSet(fd: std.posix.socket_t) bool {
+    const rc = std.posix.system.fcntl(fd, std.posix.F.GETFL, @as(usize, 0));
+    if (std.posix.errno(rc) != .SUCCESS) return false;
+    const bits: u32 = @truncate(@as(u64, @bitCast(@as(i64, @intCast(rc)))));
+    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
+    return bits & nonblock != 0;
+}
+
+// Verified red: with the bound removed (the pre-fix `dialTo`, i.e. a plain
+// `IpAddress.connect`) this dial does not return — the SYN to a link-local
+// address that has no responder is never answered and macOS keeps the socket in
+// SYN_SENT (measured: still pending after 25 s). Green: it returns on the
+// configured bound, and the elapsed time proves the bound was *reached* rather
+// than the dial failing early for some other reason.
+//
+// The bound is the assertion; the address is not. `169.254.255.254` is RFC 3927
+// link-local with nothing on the link, which is what this machine black-holes
+// today (and what the 25 s measurement above used). Another environment may
+// answer it, or refuse it outright — hence the probe: without a black hole to
+// dial there is nothing to assert, and skipping says so.
+test "a black-holed dial returns on the bound, not on the kernel's default" {
+    const io = testing.io;
+    if (!@import("../../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    const black_hole = try std.Io.net.IpAddress.parse("169.254.255.254", 80);
+
+    if (connectTimeout(io, black_hole, 150)) |stream| {
+        stream.close(io); // something on this link answers: no black hole here
+        return error.SkipZigTest;
+    } else |err| switch (err) {
+        error.ConnectTimeout => {},
+        else => {
+            std.log.info("[raft] {s}:80 does not black-hole here ({s}) — skipping the connect-bound test", .{ "169.254.255.254", @errorName(err) });
+            return error.SkipZigTest;
+        },
+    }
+
+    const bound_ms: u32 = 700;
+    const started = Time.monotonicNowMilliseconds();
+    const result = connectTimeout(io, black_hole, bound_ms);
+    const elapsed = Time.monotonicNowMilliseconds() - started;
+    if (result) |stream| {
+        stream.close(io);
+        return error.SkipZigTest; // answered inside the bound after all
+    } else |err| {
+        try testing.expectEqual(error.ConnectTimeout, err);
+    }
+
+    // The bound, and not something shorter: `ConnectionRefused` and friends
+    // would mean the dial was never hanging, which is the case this test is not
+    // about. The upper end is the real assertion — the kernel's own default for
+    // this address is the >25 s measured above.
+    try testing.expect(elapsed >= @as(i64, bound_ms) - 150);
+    try testing.expect(elapsed < 5_000);
+}
+
+test "connectTimeout hands back a blocking stream the sockread helpers can use" {
+    const io = testing.io;
+    if (!@import("../../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    const bind = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try bind.listen(io, .{});
+    defer server.deinit(io);
+    var client = try connectTimeout(io, try std.Io.net.IpAddress.parse("127.0.0.1", server.socket.address.getPort()), test_dial_timeout_ms);
+    defer client.close(io);
+    var accepted = try server.accept(io);
+    defer accepted.close(io);
+
+    // The invariant `sockread` is built on: a socket left non-blocking would
+    // come back `EAGAIN` from these, and the WebSocket write path treats `EAGAIN`
+    // as a programmer bug and panics on it in debug builds. Then the helpers
+    // themselves, which is what the cluster transport actually calls.
+    try testing.expect(!nonblockSet(client.socket.handle));
+    try sockread.writeFull(client, "ping");
+    var buf: [4]u8 = undefined;
+    try sockread.readFull(accepted, &buf);
+    try testing.expectEqualStrings("ping", &buf);
+
+    // A dial that really fails is still reported as itself: `SO_ERROR` is read
+    // even though `poll` said "ready", so a refused port is not folded into the
+    // timeout.
+    var gone = try bind.listen(io, .{});
+    const gone_port = gone.socket.address.getPort();
+    gone.deinit(io);
+    try testing.expectError(error.ConnectionRefused, connectTimeout(io, try std.Io.net.IpAddress.parse("127.0.0.1", gone_port), test_dial_timeout_ms));
 }

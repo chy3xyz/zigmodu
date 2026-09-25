@@ -227,14 +227,19 @@ defer allocator.free(json);               // 挂到 /cluster/health 或 metrics 
     —— 一个"收下请求、绝不回复、把连接按住 2 秒"的监听者，断言调用在
     `rpc_timeout_ms` 内以"消息丢失"返回、**且真的到达过对端**（证明等的是回包而不是握手），
     并把上界卡在 1500 ms（无界时会等到对方那 2 秒）。变异（`rpc_timeout_ms = 0`）验过红。
-  * **未修的一半是 dial**：`IpAddress.ConnectOptions` 声称有 `.timeout`，但 CI 锁定的 Zig 0.17 里
+  * **dial 一半现在也补上了（第 29 批）**：`IpAddress.ConnectOptions` 声称有 `.timeout`，但 CI 锁定的 Zig 0.17 里
     `std.Io.Threaded` 的 `netConnectIpPosix` 是
     `if (options.timeout != .none) @panic("TODO implement netConnectIpPosix with timeout")`
-    —— **实测**，不是读来的。传进去等于让每次 dial 直接 abort 进程，所以 `dialTo` 没传。
-    SYN 被丢的对端仍然要付 OS 默认的 connect 超时。要补这一半得自己写带 deadline 的
-    非阻塞 connect + poll（平台相关），不是 endpoint 接线该放的东西。
+    —— **实测**，不是读来的：传进去等于让每次 dial 直接 abort 进程（`exit=134`），所以那个字段是**陷阱而不是旋钮**，
+    `dialTo` 仍然不传它。界改由 `RaftTransport.connectTimeout(io, addr, timeout_ms)` 提供：raw socket +
+    `O_NONBLOCK` connect + `poll(POLLOUT)` + 单调时钟 deadline + `getsockopt(SO_ERROR)` 还原真实错误名
+    （走 raw 系统调用而非 `std.posix.poll`，后者把 `.FAULT/.INVAL` 映射成 `unreachable` —— 与 `sockread` 同一个理由）。
+    三处生产 dial 都走它。实测：SYN 被丢的对端（`169.254.255.254`，本机 OS 默认 ≥25 s 不返回）现在
+    **702 ms 返回 `error.ConnectTimeout`**；回落约定是 `timeout_ms = 0` → 无界，老配置 `rpc_timeout_ms = 0` 行为不变。
+    界只覆盖 POSIX（Windows 回落无界，`poll` 在那里不存在）。
   * **锁范围本身仍未收窄**（见下面"出站 IO 与锁"一节的设计）：上面两条只是把代价**有界化**，
-    没有把 IO 挪出锁。
+    没有把 IO 挪出锁 —— 而且这一条对 dial 同样成立：**有界的** IO 在 spin lock 下仍是有界 IO 在 spin lock 下，
+    `rpc_timeout_ms` 照样能被持锁烧满。
   不这么做的实际症状是**进程级 ABRT**（`voted_for` 的 read-then-free 交错 →
   `double free of [addr: …]`，两边都是 `RaftElection.zig` 的 `handleVoteRequest` / `startElection`），
   另一种交错顺序只是漏掉那一小段（`SafeAllocator` 报 leaked）—— 两种都在 12 次里各撞到过。
