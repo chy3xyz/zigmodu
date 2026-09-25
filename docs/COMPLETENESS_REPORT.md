@@ -1,5 +1,16 @@
 # ZigModu 代码完整性评估报告
 
+> **这是 2026-05-08 / v0.8.0 的历史快照，不是当前状态。** 它按当时的树逐模块打勾，从那以后
+> 代码只增不减地演进过（`docs/dev/final-assessment.md` 也把"本文件待同步"记为 Low）。
+> 已知**已经不再成立**的条目（看到就别照着做）：
+>
+> | 本文件里的说法 | 现状 |
+> |---|---|
+> | `TransactionalEvent` / `TransactionalEvent.zig` ✅ 完成 | **文件已删除**（v0.33.6）。它当时就是个空壳（`stageEvent`/`addEvent` 都是 `_ = event;`），真身是 `zigmodu.outbox.*` 与 `zigmodu.SagaOrchestrator`。 |
+> | 行数 ~32,000 / 模块 75+ / Zig 0.16.0 / v0.8.0 | 现为 ~115,000 行 / Zig 0.17.0 / v0.33.x；当前版本与测试数以 `build.zig.zon`、`AGENTS.md` 与 `CHANGELOG.md` 为准。 |
+>
+> 分数与百分比请当作**当时**的读数读，不要用来判断今天该不该采用。
+
 **评估日期**: 2026-05-08
 **框架版本**: v0.8.0
 **Zig 版本**: 0.16.0
