@@ -2,6 +2,45 @@
 
 ## [Unreleased]
 
+### 第 37 批：cluster soak 在 Linux 上卡住 —— 先让它**卡住也能从日志判读**（心跳 + 相位地标 + 采样器上界），并修掉 `soak.zig` 失败时挂死（**破坏性：否**，只加可观测性；断言与阈值一字未改）
+
+全量 `-Ddb=all` 见下；`zig build soak-smoke` 本机 16 s 绿；fmt / check / check-deadcode 全绿。
+
+**本批的动机是上一批那个新门禁自己撞出来的**：第 36 批加进 push 的 `soak-smoke` 在 **Linux 腿跑不完** ——
+`11:35:27 → 11:40:40` 正好 **5 分 13 秒**（撞它自己的 `timeout-minutes: 5`），然后同一 job 的 `Run tests`
+被**跳过**（整条 CI 因此红）。而**本机 macOS 同一预算 16 秒跑完**。也就是说：夜间那 28 分钟静默与这次
+5 分钟卡死是**同一个 Linux-only 缺陷**，现在它被压到 5 分钟量级、每次 push 都能复现。
+
+**① `src/soak.zig`：失败路径挂死，已修。** `server.stop()` 在成功路径末尾，而 `defer th.join()` 比它先注册
+—— 任一 `try` 失败就永远卡在 join 上（实测：注入后打印了红行、随后 `timeout 45` 得 `EXIT=124`，
+`--test-timeout` 对 `.mode = .simple` runner 无效）。改成 `defer server.stop();` **排在 join 之后**
+（defer LIFO ⇒ stop 先跑，join 才能返回）。**红证据**：同一个注入，改前是"红行 + 45 s 被 kill"，
+改后是 **5 秒 `zig-exit=1`**；还原后逐字节一致（`cmp`）。
+
+**② `src/soak_cluster.zig`：只加"判读能力"，不改任何语义。**
+
+* **相位地标**：`startNode` 的四个（`init+start begin` → `raft listener up` → `bus start begin` →
+  `bus listener up`）、boot/mesh/settle 的起止与重试计数、发布相入口、`loop done: samples=… reason=…`、
+  quiesce→join→census→teardown 各阶段、`asserting invariants`。
+* **采样前后各一行** + 定期读数行（`sample N: begin (t=…ms published=…)` / `sample N: fds=… rss=… threads=…`），
+  速率 ≈3 行/秒（默认预算下整份日志 39 → **273 行**，不是几万行）；启动时另打一行**采样可用性**
+  （Linux 的 `/proc` 三件套是否真拿到值）。
+* **deadline 检查前置**（原来排在采样之后 ⇒ 采样一慢就永远到不了 deadline）。
+* **`linuxFdCount` 加上界**：`reclen < @sizeOf(dirent64)`（本工具链实测为 24）时返回 `null` 并只打印一次，
+  `getdents64` 循环另加 4096 次上界。**这是防御不是修复**（`reclen` 的最小合法值就是 24，内核写出的条目
+  不会违反），理由写在模块 doc 里；另外两个采样器是定长缓冲 + `tokenizeScalar`，不可能打转（同处审计）。
+* **语义未变的证据**：改前 1 次 / 改后 6 次的读数对照 —— `samples=133`（±1 的 drain 边界）、`presence=100%`、
+  `transitions/leaderless/two_leader` 全 0、`recv` 矩阵 6 次全部 18/18 行 `2400/2400`、`fds:` 与 `rss MiB:`
+  **逐字相同**、`1 passed / 0 leaked` 每次。默认预算墙钟 81.7 → 84.6 s（噪声内）。
+
+**③ CI 步骤换位。** `soak-smoke` 从 `Run tests` **之前**挪到**之后**：它在 Linux 上会挂，挂的时候下面所有
+步骤都被跳过 —— 而 suite 是 push 最不能丢的东西。`timeout-minutes: 5` 保留（卡死兜底，且现在日志里有心跳）。
+
+**④ 最强嫌疑（假设，未证实，本批的日志就是用来判它的）**：CI 日志里框架自己打的
+`[DEB] SO_SNDTIMEO (5000 ms) not applied (errno INVAL): a peer that stops reading can park a writer, and every
+teardown of this node waits for it` —— 这条 warn 描述的正是"teardown 会一直等"。判读表（最后一行 ⇒ 卡在哪）
+写在 agent 报告与模块 doc 里；下一份带心跳的 CI 日志会把它落到某个相位上。
+
 ### 第 36 批：soak 的断言终于进了 push（`zig build soak-smoke`）、拆掉"带 codec 的轨不能内存重放"这条**过时**限制；顺带查明两件真事：`soak.zig` 失败时会挂死，以及**夜间 `soak-cluster` 在 Linux runner 上跑不完**（**破坏性：否**，`BindError` 少一个成员，调用方留着它会编译错）
 
 全量 `-Ddb=all` **1999/2057（58 skipped，0 failed）**；CI 示例清单本机 **16/16 构建 + 7 个 `build test` 步骤全绿**；fmt / check / check-api / check-deadcode / check-tenant-scope / check-version 全绿。

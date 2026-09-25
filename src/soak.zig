@@ -152,6 +152,13 @@ test "soak: N clients x M tenants — zero cross-tenant reads" {
         }
     }.run, .{&server});
     defer th.join();
+    // Registered *after* the join on purpose (defers run LIFO): `stop()` is what
+    // lets the accept thread return, so the join above needs it to have run
+    // first. With the only `stop()` sitting at the end of the success path, any
+    // `try` in between left the process hung instead of failing the test —
+    // measured: the red line printed and then `timeout 45` had to kill it
+    // (EXIT=124), and `--test-timeout` does not reach the harness's runner.
+    defer server.stop();
 
     var port: u16 = 0;
     var tries: usize = 0;
@@ -189,8 +196,9 @@ test "soak: N clients x M tenants — zero cross-tenant reads" {
     }
     try std.testing.expectEqual(@as(u64, 0), server.active_connections.load(.monotonic));
 
-    // The deferred th.join() runs before server.deinit().
-    server.stop();
+    // No `server.stop()` here: it is a `defer` registered after the join, so it
+    // has already run by the time this line is reached — and it is the reason a
+    // failure *above* this line now exits instead of hanging.
 }
 
 const MapCtx = struct {

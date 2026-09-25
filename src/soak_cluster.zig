@@ -85,6 +85,55 @@
 //! `SOAK_CLUSTER_MAX_LEADER_TRANSITIONS` (default 3),
 //! `SOAK_CLUSTER_MIN_LEADER_PRESENCE_PCT` (default 90).
 //!
+//! ## Reading a run that stops moving (heartbeats, and why they exist)
+//!
+//! A cancelled CI job used to end with the last boot line and nothing else: a
+//! 30-minute runner timeout whose log could not say *where* the 28 silent
+//! minutes went. The harness now narrates its phases at warn level (the test
+//! runner's `testing.log_level` is `.warn`, so anything quieter is invisible),
+//! and every phase has an entry/exit pair:
+//!
+//!   * **boot** — per node, one line before `ClusterBootstrap.init/start` and
+//!     one after, plus one around `bus.start(port)`. A stall inside the
+//!     bootstrap or the bus listener therefore leaves the *enter* line as the
+//!     last line of the log.
+//!   * **mesh / settle** — one line per mesh retry, and one per 10 settle tries
+//!     with the live leader count, so a cluster that never converges is
+//!     distinguishable from one still trying. (The per-bus entry/live census
+//!     rides along on `probeBusState`, which prints whenever it changes.)
+//!   * **sampling** — one line *before* the sampler runs (sample index +
+//!     elapsed time + publish progress) and one *after* it returns (index +
+//!     `fds` / `rss` / `threads` / `leaders` / `steady` / `published` /
+//!     `publishers_remaining`). The pair is the load-bearing part: a log whose
+//!     last line is `sample N: begin` is stuck *inside* `osInfo()`/the peer
+//!     snapshots, while a log whose last line is a completed `sample N:` never
+//!     reached the next sample. That second reading is exact at the default
+//!     500 ms (the entry line is printed every round there, so a missing one
+//!     means the round never started); with a `-Dsoak-cluster-sample-ms` dense
+//!     enough to move the entry line to every `begin_every` rounds, it holds
+//!     within that many rounds. The two lines use two cadences, both derived
+//!     from `sample_ms` so the *rate* — not the count — is fixed: the reading
+//!     line is the periodic health signal (~1 per second; 500 ms sampling →
+//!     every 2nd sample, the smoke run's 50 ms → every 20th), and the entry
+//!     line is denser (`begin_every`, every sample at the default 500 ms, capped
+//!     at ~4/s for unusual intervals), because an entry line that was never
+//!     printed cannot witness a stall. First 5 samples always get both. A
+//!     default run lands at a few hundred lines instead of the tens of
+//!     thousands a per-sample pair would produce.
+//!   * **post-load** — quiesce, thread joins, the log-convergence read, the
+//!     report and teardown each announce themselves, so a stall after the
+//!     sampling loop is not a blank tail either.
+//!
+//! The sampler itself is defended, not repaired: `linuxFdCount` bounds both its
+//! `getdents64` loop and the per-entry `reclen` walk (a `reclen` of 0 — an
+//! entry shape the kernel does not produce — would otherwise spin forever
+//! inside `off += ent.reclen`), and the drain deadline is checked *before* the
+//! sampler as well as after it, so a sampler that takes minutes can no longer
+//! postpone the exit by minutes. Neither changes what any check concludes: the
+//! bounded walk returns "no reading" (the null the harness already models) in
+//! the shape that cannot happen, and the extra deadline check only fires on a
+//! run that was going to time out anyway.
+//!
 //! Usage: `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build soak-cluster`
 
 const std = @import("std");
@@ -117,6 +166,32 @@ const publishers_per_node: usize = 2;
 /// under the publish pace costs nothing. Clamped low so a tiny
 /// `-Dsoak-cluster-publish-ms` cannot turn the loop into a busy spin.
 const publish_poll_ms: u64 = @max(@min(publish_ms, 5), 1);
+
+/// The first few samples always log (the run is still ramping, and those are the
+/// lines a human reads when it fails early).
+const heartbeat_always_samples: usize = 5;
+/// Every how many samples the sampling loop prints its **reading** line (the
+/// one with `fds` / `rss` / `threads` / `leaders` / `published`), after the
+/// first `heartbeat_always_samples`. Derived from `sample_ms` so the *rate* is
+/// fixed rather than the count: ~1 line per second whether the harness samples
+/// at 500 ms (default → every 2nd sample) or at the smoke run's 50 ms (→ every
+/// 20th). A run's line count then tracks its duration, not its sampling
+/// interval — which is what keeps a default run in the hundreds of lines
+/// instead of the tens of thousands a per-sample pair would produce.
+const heartbeat_every: usize = @intCast(@max(@as(u64, 1000) / @max(sample_ms, 1), 1));
+/// Every how many samples it prints the **entry** line (`sample N: begin`).
+///
+/// Deliberately denser than the reading line, and a separate constant because
+/// the two serve different purposes: the reading line is the periodic health
+/// signal (rate-limited by log volume), while the entry line is the diagnostic
+/// — a `begin` with no matching reading line is what says "this sampler call
+/// never returned". Printing the entry line only on the reading line's schedule
+/// would leave the *other* half of the samples unable to answer that question,
+/// so at the default 500 ms sampling the entry line is printed on every round
+/// (the sampler's entry is never more than one sample away from the log). The
+/// `250 / sample_ms` divisor keeps even an unusual `-Dsoak-cluster-sample-ms`
+/// bounded at ~4 entry lines per second instead of one per sample.
+const begin_every: usize = @intCast(@max(@as(u64, 250) / @max(sample_ms, 1), 1));
 
 // ── topology ────────────────────────────────────────────────────────────────
 
@@ -213,6 +288,14 @@ var publishing = std.atomic.Value(bool).init(false);
 /// Writers still owing messages — `node_count × publishers_per_node`, not one
 /// per node (the drain waits on every writer thread, not every node).
 var publishers_remaining = std.atomic.Value(usize).init(node_count * publishers_per_node);
+/// Messages every writer has attempted so far, across all writers — the
+/// publish-phase progress the sampling heartbeat reports. **Observability only:
+/// nothing asserts on it**, and it is deliberately an *attempt* count (a
+/// `publish` that errored still moves its writer's stream forward, which is
+/// exactly what `publish_failures` + the gap check are there to see). Without
+/// it a stuck publish phase reads as `published=0/14400` forever with no way to
+/// tell "no writer started" from "writers are crawling".
+var published_total = std.atomic.Value(u64).init(0);
 
 /// Per (destination, source, writer): the writer dimension is what makes the
 /// contiguity check meaningful with more than one writer per node — two writers
@@ -251,6 +334,7 @@ fn initSharedState() void {
     appends_enabled.store(false, .monotonic);
     publishing.store(false, .monotonic);
     publishers_remaining.store(node_count * publishers_per_node, .monotonic);
+    published_total.store(0, .monotonic);
     for (0..node_count) |i| stopped[i] = false;
     for (0..node_count) |d| {
         for (0..node_count) |s| {
@@ -533,6 +617,25 @@ fn transportRef(comptime i: usize) *SoakTransport(i) {
 // because a leak the cluster's own counters cannot express has to be caught
 // from outside. Either reading may be null on an unsupported platform — the
 // caller then says so instead of pretending it measured.
+//
+// **Every sampler here is bounded, on purpose** (this is where the platform
+// fork lives — `proc_pidinfo` on macOS, `/proc` on Linux — so it is also the
+// only code whose cost is not the same on both). The audit, so the next reader
+// does not have to redo it:
+//
+//   * `linuxFdCount` — the only *loop over kernel-returned bytes*. Its
+//     `getdents64` loop is bounded by `max_getdents_calls` (each 8 KiB call
+//     covers ~250 fds; the bound is ~1M entries, i.e. unreachable for a soak
+//     harness) and its per-entry walk refuses a `reclen` smaller than a
+//     `dirent64` instead of advancing by it — see the comment there.
+//   * `linuxRssBytes` / `linuxThreadCount` — `tokenizeScalar` over one fixed
+//     buffer, with a `return null` on exhaustion: at most `buf.len` tokens and
+//     no arithmetic on kernel-supplied lengths, so neither can fail to
+//     terminate.
+//   * `macosTaskInfo` / `macosFdCount` — one `proc_pidinfo` call each into a
+//     static buffer. No loop.
+//   * `readProcFile` — one `openat` + one `read` into a caller-fixed buffer.
+//     `posix.read` cannot return more than the buffer length.
 
 const OsInfo = struct {
     fd_count: ?u32,
@@ -630,22 +733,68 @@ fn linuxThreadCount() ?u32 {
     return null;
 }
 
+/// Upper bound on `getdents64` calls for one fd count: 4096 calls × 8 KiB ≈ 1M
+/// directory entries, orders of magnitude past any soak harness's fd count (a
+/// default run holds ~23). Pure defence — without it the loop's only exit is
+/// the kernel's `n <= 0`, which is unreachable to *verify* from here; with it,
+/// a kernel that somehow never reports exhaustion ends the loop at a known
+/// point instead of holding the sampler (and the run) forever.
+const max_getdents_calls: usize = 4096;
+
+/// Set the first time the defensive bound below fires. The sampler runs once
+/// per sample out of a loop whose whole job is to keep going, so a persistent
+/// bail has to be announced once (and surfaced by the report's existing
+/// "unavailable" line) rather than logged ~1x/s for the rest of the run.
+var fd_sampler_defensive_bail: bool = false;
+
 fn linuxFdCount() ?u32 {
     const dir_fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/self/fd", .{ .ACCMODE = .RDONLY }, 0) catch return null;
     defer _ = std.posix.system.close(dir_fd);
     var buf: [8192]u8 = undefined;
     var count: u32 = 0;
-    while (true) {
+    var calls: usize = 0;
+    while (calls < max_getdents_calls) : (calls += 1) {
         const rc = std.os.linux.syscall3(.getdents64, @as(usize, @intCast(dir_fd)), @intFromPtr(&buf), buf.len);
         const n: isize = @bitCast(rc);
         if (n <= 0) break;
+        const got: usize = @intCast(n);
         var off: usize = 0;
-        while (off + @sizeOf(std.os.linux.dirent64) <= @as(usize, @intCast(n))) {
+        while (off + @sizeOf(std.os.linux.dirent64) <= got) {
             const ent: *align(1) const std.os.linux.dirent64 = @ptrCast(&buf[off]);
+            // **Defence, not a fix**: every `reclen` the kernel can emit here is
+            // at least `@sizeOf(dirent64)` (`struct linux_dirent64`'s own size
+            // plus the name), so `off` always advances and the walk always ends.
+            // The check exists because the loop's termination argument rests on
+            // that kernel guarantee and on nothing this process can observe: if
+            // it ever did not hold, `off += 0` spins forever *inside the
+            // sampler* — which is exactly the shape a stuck run's log cannot
+            // currently describe. A malformed entry means the reading is not
+            // trustworthy either way, so bail out to "no reading" (the null this
+            // sampler already models and the report already prints) rather than
+            // count a partial directory.
+            if (ent.reclen < @sizeOf(std.os.linux.dirent64)) {
+                if (!fd_sampler_defensive_bail) {
+                    fd_sampler_defensive_bail = true;
+                    std.log.warn(
+                        "[soak-cluster] /proc/self/fd: dirent reclen {d} < {d}; giving up on this sampler (defensive bound, not a diagnosed fault)",
+                        .{ ent.reclen, @sizeOf(std.os.linux.dirent64) },
+                    );
+                }
+                return null;
+            }
             const name = std.mem.sliceTo(&ent.name, 0);
             if (!std.mem.eql(u8, name, ".") and !std.mem.eql(u8, name, "..")) count += 1;
             off += ent.reclen;
         }
+    }
+    if (calls >= max_getdents_calls) {
+        // Same reasoning as the reclen bail: the bound is defensive, and a run
+        // that reaches it must not read as a real fd count.
+        if (!fd_sampler_defensive_bail) {
+            fd_sampler_defensive_bail = true;
+            std.log.warn("[soak-cluster] /proc/self/fd: {d} getdents64 calls without exhaustion; giving up on this sampler (defensive bound)", .{calls});
+        }
+        return null;
     }
     return count;
 }
@@ -773,6 +922,16 @@ fn buildTopology() void {
 }
 
 fn startNode(comptime i: usize, allocator: std.mem.Allocator) !void {
+    // Boot landmarks. `ClusterBootstrap.init` is pure wiring, `start()` brings
+    // up raft (its listener + the membership tick) and `bus.start(port)` brings
+    // up the bus listener — three different stalls, and before these lines a
+    // cancelled run's log could not tell them apart: the last line was the
+    // *previous* node's peer list. One enter/exit pair per step, so the log ends
+    // on the step it died in.
+    const boot_t0 = Time.monotonicNowMilliseconds();
+    std.log.warn("[soak-cluster] boot: node {s} init+start begin (raft port {d}, bus port {d})", .{
+        ids[i], raft_ports[i], bus_ports[i],
+    });
     const t = transportRef(i);
     t.init(allocator, cluster_secret, raft_rpc_timeout_ms, peer_addrs[i][0..], ids[i]);
     cluster_storage[i] = try ClusterBootstrap.init(allocator, io, .{
@@ -784,6 +943,9 @@ fn startNode(comptime i: usize, allocator: std.mem.Allocator) !void {
         .cluster_secret = cluster_secret,
     });
     try cluster_storage[i].start();
+    std.log.warn("[soak-cluster] boot: node {s} raft listener up after {d}ms", .{
+        ids[i], Time.monotonicNowMilliseconds() - boot_t0,
+    });
     const bus = cluster_storage[i].getEventBus().?;
     // The bus is a separate inbound surface with its own handshake: the
     // cluster secret selects the authenticated path (set by `start()`), and
@@ -795,7 +957,11 @@ fn startNode(comptime i: usize, allocator: std.mem.Allocator) !void {
         try bus.setPeerKey(ids[j], bus_keys[j]);
     }
     try bus.subscribe(topic, subscriberFor(i));
+    std.log.warn("[soak-cluster] boot: node {s} bus start begin (port {d})", .{ ids[i], bus_ports[i] });
     try bus.start(bus_ports[i]);
+    std.log.warn("[soak-cluster] boot: node {s} bus listener up after {d}ms total", .{
+        ids[i], Time.monotonicNowMilliseconds() - boot_t0,
+    });
     // Boot-time truth for the report: which peers did the raft actually get?
     // (A wrong peer set here — e.g. self in the list — explains votes the
     // transport cannot resolve.)
@@ -1000,6 +1166,10 @@ fn publisherMain(ctx: *Publisher) void {
                     };
                     last_publish_ms = now;
                     published += 1;
+                    // Heartbeat progress only — see `published_total`. Counted
+                    // as an attempt, so a failing publish still advances it and
+                    // the failure stays where it belongs (`publish_failures`).
+                    _ = published_total.fetchAdd(1, .monotonic);
                     if (published == iterations) {
                         _ = publishers_remaining.fetchSub(1, .acq_rel);
                     }
@@ -1205,6 +1375,41 @@ fn reconnectMissingMeshPeers() void {
     }
 }
 
+// ── heartbeat helpers (observability only) ──────────────────────────────────
+//
+// Neither of these decides anything; both exist so a cancelled run's log names
+// the phase it stopped in and how far the load had got. The deadline check in
+// particular is the *same* predicate the loop used inline before — moved into a
+// function so the pre-sampling and post-sampling call sites cannot drift apart
+// (two copies of a "did the deadline pass, and if so dump the recv matrix"
+// block is how one of them ends up silently not dumping).
+
+/// True when the drain deadline has passed, logging the recv matrix first.
+/// `when` names which of the two check positions fired, so a log whose last
+/// line is this message also says whether the sampler had run in that
+/// iteration.
+fn drainDeadlineHit(deadline_ms: i64, when: []const u8) bool {
+    if (Time.monotonicNowMilliseconds() <= deadline_ms) return false;
+    std.log.warn("[soak-cluster] drain deadline hit ({s}); recv matrix follows", .{when});
+    for (0..node_count) |d| {
+        for (0..node_count) |s| {
+            for (0..publishers_per_node) |w| {
+                std.log.warn("[soak-cluster]   recv {s}<-{s}#{d}: {d}/{d} (last_seq {d})", .{
+                    ids[d],                               ids[s],     w,
+                    recv_count[d][s][w].load(.monotonic), iterations, last_seq[d][s][w].load(.monotonic),
+                });
+            }
+        }
+    }
+    return true;
+}
+
+/// Bytes → MiB for the heartbeat line, preserving "no reading" as `null` so an
+/// unavailable sampler prints as `null` instead of a plausible-looking `0`.
+fn mib(bytes: ?u64) ?u64 {
+    return if (bytes) |b| b / 1024 / 1024 else null;
+}
+
 test "soak: 3-node cluster — raft + event bus, leader/fd/RSS invariants" {
     // The leak-checked root below, not `std.testing.allocator`: see `soak_gpa`
     // for the measurements. Safer in every way this test cares about, and it
@@ -1217,17 +1422,37 @@ test "soak: 3-node cluster — raft + event bus, leader/fd/RSS invariants" {
     buildTopology();
 
     const baseline = osInfo();
+    // Which samplers this OS actually answered, once, at boot rather than only
+    // in the end-of-run report. The report's "unavailable on this platform"
+    // line arrives after everything has finished, which is no help to someone
+    // reading a *stuck* log — and the Linux `/proc` path is the one place this
+    // harness behaves differently per platform, so "did `/proc/self/fd` answer
+    // at all on this runner" is exactly the question a stuck log needs answered
+    // from its first lines.
+    {
+        var available: u8 = 0;
+        if (baseline.fd_count != null) available += 1;
+        if (baseline.rss_bytes != null) available += 1;
+        if (baseline.threads != null) available += 1;
+        std.log.warn("[soak-cluster] os samplers ({s}): {d}/3 readings present (fds={?d} rss={?d} threads={?d})", .{
+            @tagName(builtin.os.tag), available, baseline.fd_count, baseline.rss_bytes, baseline.threads,
+        });
+    }
 
     // Boot the cluster. Sequential on purpose: each `start()` blocks until the
     // node's own raft listener is live, so by the last node every raft port in
     // the topology is accepting. A failure after any `start()` must not strand
     // the started nodes (their threads/fibers would hold the process open), so
     // teardown hangs off a defer; the normal path below runs the same stops.
+    std.log.warn("[soak-cluster] boot: starting {d} nodes (port_base={d}, pinned={})", .{
+        node_count, port_base, std.c.getenv("SOAK_CLUSTER_PORT_BASE") != null,
+    });
     var nodes_started: usize = 0;
     inline for (0..node_count) |i| {
         try startNode(i, allocator);
         nodes_started = i + 1;
     }
+    std.log.warn("[soak-cluster] boot: {d}/{d} nodes up", .{ nodes_started, node_count });
     // Failure-path cleanup (the normal path runs the same stops and joins, at
     // which point the counters are zeroed so the defer no-ops): the load threads
     // must stop before their clusters go away (a writer holds a bus pointer, and
@@ -1236,6 +1461,7 @@ test "soak: 3-node cluster — raft + event bus, leader/fd/RSS invariants" {
     var drivers_spawned: usize = 0;
     var writers_spawned: usize = 0;
     defer {
+        std.log.warn("[soak-cluster] defer: cleanup entry (a no-op when the run reached its own teardown)", .{});
         stop_threads.store(true, .release);
         joinWriters(writers_spawned);
         writers_spawned = 0;
@@ -1247,14 +1473,20 @@ test "soak: 3-node cluster — raft + event bus, leader/fd/RSS invariants" {
     }
 
     var mesh_ok = true;
+    var mesh_tries: usize = 0;
     {
-        var tries: usize = 0;
-        while (!meshReady() and tries < 25) : (tries += 1) {
-            if (tries > 0) reconnectMissingMeshPeers();
+        while (!meshReady() and mesh_tries < 25) : (mesh_tries += 1) {
+            // One line per retry (bounded at 25, and normally zero): a mesh that
+            // never forms and a mesh still forming are different findings, and
+            // the readiness call count is unchanged — this only reports what the
+            // loop condition already evaluated.
+            std.log.warn("[soak-cluster] mesh: retry {d}/25 (not every node is connected to every peer)", .{mesh_tries + 1});
+            if (mesh_tries > 0) reconnectMissingMeshPeers();
             soakSleep(200);
         }
         mesh_ok = meshReady();
     }
+    std.log.warn("[soak-cluster] mesh: formed={} after {d} retries", .{ mesh_ok, mesh_tries });
     probeBusState("mesh");
     if (!mesh_ok) {
         std.log.warn("[soak-cluster] mesh never formed; tearing down and failing", .{});
@@ -1294,23 +1526,38 @@ test "soak: 3-node cluster — raft + event bus, leader/fd/RSS invariants" {
     // every writer in it, instead of a staggered warm-up.
     writers_spawned = spawnWriters();
     const writers_started = writers_spawned;
+    var settle_tries: usize = 0;
     {
-        var tries: usize = 0;
-        while (tries < 100 and !settle_leader_observed) : (tries += 1) {
+        while (settle_tries < 100 and !settle_leader_observed) : (settle_tries += 1) {
             var leaders: u8 = 0;
             inline for (0..node_count) |i| {
                 if (fixtures[i].raft.getState() == .leader) leaders += 1;
             }
             settle_leader_observed = leaders == 1;
+            // One line per 10 tries (bounded at 10 lines, normally 1): the
+            // leader count is the thing that decides when load starts, and a
+            // stuck settle window previously left nothing between "drivers
+            // spawned" and the first sample.
+            if (settle_tries % 10 == 0) {
+                std.log.warn("[soak-cluster] settle: try {d}/100 leaders={d}", .{ settle_tries + 1, leaders });
+            }
             if (!settle_leader_observed) soakSleep(50);
         }
     }
     probeBusState("settled");
+    std.log.warn("[soak-cluster] settle: one leader observed={} after {d} tries", .{ settle_leader_observed, settle_tries + 1 });
     if (!settle_leader_observed) {
         std.log.warn("[soak-cluster] no stable leader after settle window; proceeding (leader checks will fail)", .{});
     }
     appends_enabled.store(true, .release);
     publishing.store(true, .release);
+    std.log.warn("[soak-cluster] load: appends and publications enabled — {d} writers x {d} messages at {d}ms (~{d}s), sampling every {d}ms", .{
+        node_count * publishers_per_node,
+        iterations,
+        publish_ms,
+        @as(u64, iterations) * publish_ms / 1000,
+        sample_ms,
+    });
 
     // Sample the invariants until the traffic has fully drained, then quiesce
     // replication before freezing the load threads for the log snapshot.
@@ -1322,6 +1569,7 @@ test "soak: 3-node cluster — raft + event bus, leader/fd/RSS invariants" {
     var leaderless_after_steady: u64 = 0;
     var post_steady_samples: u64 = 0;
     var drain_timed_out = false;
+    var break_reason: []const u8 = "none";
     // The bus's own per-peer write-failure counter, watermarked: any value
     // above zero means a send actually errored (as opposed to a frame being
     // dropped by the replay gate), which the no-loss invariant forbids.
@@ -1329,9 +1577,35 @@ test "soak: 3-node cluster — raft + event bus, leader/fd/RSS invariants" {
 
     const publish_phase_ms: u64 = @as(u64, iterations) * publish_ms + 5000;
     const deadline_ms = Time.monotonicNowMilliseconds() + @as(i64, @intCast(publish_phase_ms + 30_000));
+    const loop_start_ms = Time.monotonicNowMilliseconds();
 
     while (true) {
+        // The deadline, checked **before** the sampler as well as after it (the
+        // original position, kept below). The check used to sit only after the
+        // sample was taken, so a sampler that blocks — `/proc` on a loaded
+        // runner, a peer snapshot waiting on `nodes_lock` — postponed the
+        // deadline by exactly as long as it blocked, and an unbounded wait never
+        // reached it at all. Nothing about the verdict changes: the deadline is
+        // a wall-clock assertion on a red path either way, and a run that
+        // finishes inside its budget never reaches this branch.
+        if (drainDeadlineHit(deadline_ms, "before sampling")) {
+            drain_timed_out = true;
+            break_reason = "deadline-before-sampling";
+            break;
+        }
         soakSleep(sample_ms);
+        const sample_index = samples;
+        const log_sample = sample_index < heartbeat_always_samples or sample_index % heartbeat_every == 0;
+        const log_begin = sample_index < heartbeat_always_samples or sample_index % begin_every == 0;
+        if (log_begin) {
+            std.log.warn("[soak-cluster] sample {d}: begin (t={d}ms published={d}/{d} publishers_remaining={d})", .{
+                sample_index,
+                Time.monotonicNowMilliseconds() - loop_start_ms,
+                published_total.load(.monotonic),
+                node_count * publishers_per_node * iterations,
+                publishers_remaining.load(.acquire),
+            });
+        }
         const info = osInfo();
         var leaders: u8 = 0;
         var leader_idx: i8 = -1;
@@ -1341,10 +1615,29 @@ test "soak: 3-node cluster — raft + event bus, leader/fd/RSS invariants" {
                 leader_idx = @intCast(i);
             }
         }
+        // The reading line: it existing means the sampler returned. `begin`
+        // without it is the whole diagnosis (see the module doc), which is why
+        // `begin` is on the denser `begin_every` schedule — the absence is only
+        // meaningful if the entry line was actually printed for the round that
+        // stalled.
+        if (log_sample) {
+            std.log.warn("[soak-cluster] sample {d}: fds={?d} rss={?d}MiB threads={?d} leaders={d} steady={} published={d}/{d} publishers_remaining={d}", .{
+                sample_index,
+                info.fd_count,
+                mib(info.rss_bytes),
+                info.threads,
+                leaders,
+                steady,
+                published_total.load(.monotonic),
+                node_count * publishers_per_node * iterations,
+                publishers_remaining.load(.acquire),
+            });
+        }
         if (samples >= max_samples) {
             // The series is full; keep the run correct by failing it loudly
             // at the end rather than overwriting early samples.
             drain_timed_out = true;
+            break_reason = "series-exhausted";
             std.log.warn("[soak-cluster] sample series exhausted ({d} samples)", .{max_samples});
             break;
         }
@@ -1384,32 +1677,38 @@ test "soak: 3-node cluster — raft + event bus, leader/fd/RSS invariants" {
             }
         }
 
-        if (publishers_remaining.load(.acquire) == 0 and allPairsFull()) break;
+        if (publishers_remaining.load(.acquire) == 0 and allPairsFull()) {
+            break_reason = "drained";
+            break;
+        }
         probeBusState("run");
-        if (Time.monotonicNowMilliseconds() > deadline_ms) {
+        if (drainDeadlineHit(deadline_ms, "after sampling")) {
             drain_timed_out = true;
-            std.log.warn("[soak-cluster] drain deadline hit; recv matrix follows", .{});
-            for (0..node_count) |d| {
-                for (0..node_count) |s| {
-                    for (0..publishers_per_node) |w| {
-                        std.log.warn("[soak-cluster]   recv {s}<-{s}#{d}: {d}/{d} (last_seq {d})", .{
-                            ids[d],                               ids[s],     w,
-                            recv_count[d][s][w].load(.monotonic), iterations, last_seq[d][s][w].load(.monotonic),
-                        });
-                    }
-                }
-            }
+            break_reason = "deadline-after-sampling";
             break;
         }
     }
 
+    // Phase markers for everything after the sampling loop: quiesce, the thread
+    // joins, the log read, the report and teardown are all capable of blocking,
+    // and each one announces itself before it can, so a log that stops here
+    // names the phase it stopped in instead of ending on the last sample.
+    std.log.warn("[soak-cluster] loop done: samples={d} reason={s} (t={d}ms)", .{
+        samples, break_reason, Time.monotonicNowMilliseconds() - loop_start_ms,
+    });
+    std.log.warn("[soak-cluster] quiesce: appends off, sleeping {d}ms", .{quiesce_ms});
     appends_enabled.store(false, .release);
     soakSleep(quiesce_ms);
+    std.log.warn("[soak-cluster] quiesce done: stopping load threads ({d} writers, {d} drivers)", .{
+        writers_spawned, drivers_spawned,
+    });
     stop_threads.store(true, .release);
     inline for (0..node_count) |i| fixtures[i].driver.join();
     drivers_spawned = 0;
+    std.log.warn("[soak-cluster] drivers joined; joining {d} writers", .{writers_spawned});
     joinWriters(writers_spawned);
     writers_spawned = 0;
+    std.log.warn("[soak-cluster] load threads joined; reading logs and bus census", .{});
 
     // Log convergence: with the load threads frozen no raft state moves, and the
     // quiesce gave every in-flight entry time to land. Any divergence here —
@@ -1453,13 +1752,18 @@ test "soak: 3-node cluster — raft + event bus, leader/fd/RSS invariants" {
         }
     }
 
+    std.log.warn("[soak-cluster] teardown: stopping {d} nodes (reverse order, per-node marker each)", .{node_count});
     inline for (0..node_count) |k| {
-        stopNode(node_count - 1 - k);
+        const node = node_count - 1 - k;
+        std.log.warn("[soak-cluster] teardown: node {s} stopping", .{ids[node]});
+        stopNode(node);
     }
 
     // Let the last closes land, then re-count: teardown must give the fds back.
+    std.log.warn("[soak-cluster] teardown done: sleeping 200ms before the post-teardown fd read", .{});
     soakSleep(200);
     const after_teardown = osInfo();
+    std.log.warn("[soak-cluster] report: fds after teardown={?d} baseline={?d}", .{ after_teardown.fd_count, baseline.fd_count });
 
     // ── report ────────────────────────────────────────────────────────────
     var fd_min: u64 = std.math.maxInt(u64);
@@ -1549,6 +1853,7 @@ test "soak: 3-node cluster — raft + event bus, leader/fd/RSS invariants" {
     // ── the invariants ────────────────────────────────────────────────────
     // All expects live here, after full teardown: a failure panics, and a
     // panic mid-run would strand load threads and the whole cluster.
+    std.log.warn("[soak-cluster] asserting invariants (a panic from here is a finding, not a hang)", .{});
     try std.testing.expect(mesh_ok);
     try std.testing.expect(!drain_timed_out);
     try std.testing.expectEqual(@as(u64, 0), publish_failures.load(.monotonic));

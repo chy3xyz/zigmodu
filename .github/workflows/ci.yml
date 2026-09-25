@@ -134,6 +134,24 @@ jobs:
         timeout-minutes: 10
         run: zig build soak-compile
 
+      - name: Run tests
+        # The step's status must be the *suite's*, not `tee`'s — see the comment
+        # on `scripts/ci-run-logged.sh`, which is what this step now runs.
+        #
+        # `timeout-minutes`: a *hanging* test used to burn the run's full 6-hour
+        # default before anyone learned anything. The script writes the suite's
+        # output to a file as it goes, so the artifact names the last test that
+        # ran even when the step is cut off.
+        # The step normally takes ~6 minutes; 25 leaves generous headroom while
+        # still failing fast on a hang.
+        timeout-minutes: 25
+        run: |
+          bash scripts/ci-run-logged.sh "$RUNNER_TEMP/test-output.log" zig build test --test-timeout 300s
+
+      # Placed *after* the suite on purpose: this step is the one that hangs on
+      # the Linux runner today (5:13 against its own 5-minute bound, measured
+      # 2026-09-25), and while it does, everything below it is skipped. The suite
+      # is the thing a push must never lose.
       - name: Soak smoke (the soak assertions a push never reached)
         # `soak-compile` above proves the two hard-to-reach harnesses still
         # *build*; it runs neither, and `zig build test` cannot reach them
@@ -152,11 +170,13 @@ jobs:
         # it, and reaching its real 3-window floor needs a sustained run whose
         # window coverage depends on the runner's core count.
         #
-        # 5 minutes is a hang backstop, not the budget. It is needed because a
-        # *failing* `src/soak.zig` blocks in its deferred server-thread join
-        # (`server.stop()` sits only on the success path), so a red HTTP soak
-        # hangs rather than reporting; `--test-timeout` does not reach a
-        # `.mode = .simple` runner. A timeout is still a red step.
+        # 5 minutes is a hang backstop, not the budget. A *failing* `src/soak.zig`
+        # used to block in its deferred server-thread join, so a red HTTP soak
+        # hung rather than reporting (fixed: `server.stop()` is now a defer
+        # registered after the join); `--test-timeout` does not reach a
+        # `.mode = .simple` runner. A timeout is still a red step — and the
+        # harness now prints a heartbeat per sample, so the log says which phase
+        # it stopped in.
         #
         # Linux only, same as `soak-compile` and for the same reason: the
         # linux-gated branches are not analysed on macOS.
@@ -170,20 +190,6 @@ jobs:
         env:
           SOAK_CLUSTER_RSS_BUDGET_MIB: "192"
         run: zig build soak-smoke
-
-      - name: Run tests
-        # The step's status must be the *suite's*, not `tee`'s — see the comment
-        # on `scripts/ci-run-logged.sh`, which is what this step now runs.
-        #
-        # `timeout-minutes`: a *hanging* test used to burn the run's full 6-hour
-        # default before anyone learned anything. The script writes the suite's
-        # output to a file as it goes, so the artifact names the last test that
-        # ran even when the step is cut off.
-        # The step normally takes ~6 minutes; 25 leaves generous headroom while
-        # still failing fast on a hang.
-        timeout-minutes: 25
-        run: |
-          bash scripts/ci-run-logged.sh "$RUNNER_TEMP/test-output.log" zig build test --test-timeout 300s
 
       # Log download via API needs admin rights; artifacts are the reliable
       # way to inspect failures from automation.
