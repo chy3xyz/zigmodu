@@ -2,6 +2,44 @@
 
 ## [Unreleased]
 
+### 第 42 批：同一挂死机制的第二批 —— `WebSocket` 框架侧两处 + 两个 example 的两处，全部改成 `Group.concurrent` + 响亮失败；`src/` 内的同族已清空（**破坏性：否**，两个 `start()` 各多一个错误成员）
+
+全量 `-Ddb=all` **2013/2072（59 skipped，0 failed）**（同一棵树两次运行在 58↔59 的 skip 上±1，`0 failed` 不变）；
+`WebSocket` 17/17（含 3 条新增）、`im.` 47/47；两个改动过的 example 照旧 `zig build` 绿；
+`zig build soak-smoke` ~20 s 绿；fmt / check / check-api / check-deadcode 全绿。
+
+**机制（第 39 批已定论，本批只是把同族清干净）**：`Group.async` 在 `busy_count >= async_limit`
+（默认 `.limited(cpu_count - 1)`）时**在调用者线程上把任务体跑完**（eager 回落），而 `busy_count` 只在任务体
+返回后递减 —— 所以"用 `async` 起一个永不返回的循环"在池被占满的机器上等于**永久征用调用者线程**。
+
+**本批修掉的四处**：
+
+| 位置 | 循环 | 修法 |
+|---|---|---|
+| `src/extensions/WebSocket.zig:92`（改后 `:117`） | `WebSocketServer.acceptLoop` | `concurrent` + 新增 `abortStart` 回滚 |
+| `src/extensions/WebSocket.zig:722`（改后 `:777`） | `WebSocketMonitor.updateLoop` | `concurrent` + 新增 `abortStart`（含把 server 半边收回来） |
+| `examples/http-stress-test/src/main.zig:134` | `Server.start()` 的 accept 循环 | `concurrent` + 返回错误（listener 在任务体内部创建 ⇒ 派发失败 = 从未监听，无需回滚，理由写在注释里） |
+| `examples/tenant-shop/src/main.zig:214` | `outbox.Poller.runLoop` | 同上（`Poller.init` 不起线程，`defer` 链已覆盖清理） |
+
+`Group.await` 无需改动：它的文档与实现都覆盖 `async` **与** `concurrent` 成员，`stop()`/`deinit()` 一行未改。
+
+> **红证据是"真的挂死"，不是"测试红了"** —— 把 `async_limit` 钉成 `.limited(0)` 让 eager 回落必然发生：
+> * WebSocket 的"真实客户端握手 + 收到 metrics 帧"那条：`timeout 150 … ` → **`EXIT 124`**，测试从未打印 OK（旧写法）；
+> * `examples/http-stress-test` 真实二进制：**`EXIT=124`**，日志冻结在 `Server listening on port 18099`（`=== Stress Test Results ===` 从未出现）；
+> * `examples/tenant-shop` 真实二进制：**`EXIT=124`**，冻结在 `ROUTE: GET health/live`，`listening` 一行从未打印（也就证明了它后面那行 `server.start()` 与 `defer` 里的 `poller.stop()` 都到不了）。
+> 修后在**同样条件**下全绿：WebSocket 17/17（含"派发不到 → `start()` 报错 + 刚失败的端口能立刻重新 bind"）、
+> http-stress-test `EXIT=0 / Completed: 1600 / Errors: 0 / 1443–1744 rps`、tenant-shop 起监听且 `/health/live` 200。
+
+**同族收口**：`src/` 内除测试外**再无** `Group.async` 长循环（`api/Server.zig:2983`、`WebSocket.zig:170`、
+`DistributedEventBus` 的连接级 fiber 早已是 `concurrent`；`WebMonitor`/`HotReloader`/`Cron`/`WorkerPool`
+走裸 `std.Thread`，不占 io 单元）。`examples/` 里最后一处 `client_group.async`
+（`http-stress-test/src/main.zig:203`）**不属同族**：任务有界 + 随后轮询完成计数，且**有直接证据** ——
+`async_limit = 0` 让它全部串行 eager 执行时整例仍 `EXIT=0`、1600/1600。
+
+**新出现的失败面（设计目标，不是回归）**：`WebSocketServer.start()` 与 `WebSocketMonitor.start()`
+的推断错误集各多一个 `error.ConcurrencyUnavailable`；宿主线程资源真枯竭时你会看到
+`Server start fiber not dispatched` / `outbox poller fiber not dispatched` 并**带错误退出**，而不是静默挂住。
+
 ### 第 41 批：夜间 `Fuzz` 步的 `corrupted coverage file` —— 我按"缓存里的覆盖产物"修了一版，**实验把这个假设否掉了**；记下否掉的证据与剩下两个候选（**破坏性：否**，只动 CI 步骤）
 
 **先记这个失败是怎么冒出来的**：它是上一批修复"送出来"的 —— 夜间 job 的第 8 步 `Fuzz (bounded)` 在

@@ -1,5 +1,6 @@
 const std = @import("std");
 const sockread = @import("../core/sockread.zig");
+const Time = @import("../core/Time.zig");
 const ApplicationModules = @import("../core/Module.zig").ApplicationModules;
 
 /// WebSocket support for real-time monitoring
@@ -79,6 +80,29 @@ pub const WebSocketServer = struct {
         self.clients.deinit();
     }
 
+    /// Start listening, dispatching `acceptLoop` as a member of `fiber_group`.
+    ///
+    /// `concurrent`, **not** `async`, and that is load-bearing rather than
+    /// stylistic. `std.Io.Threaded`'s `groupAsync` answers an exhausted
+    /// `async_limit` by running the task body on the **calling** thread
+    /// (`std/Io/Threaded.zig:2188-2191` → `groupAsyncEager`, `:2222-2226`; the
+    /// limit itself defaults to `cpu_count - 1`, `:1641`). `acceptLoop` is a
+    /// `while (self.is_running)` that only ever returns because *another* thread
+    /// called `stop()` — so on a machine whose async pool is spent (a 2-core CI
+    /// runner: one unit), the eager fallback makes this `start()` itself become
+    /// the accept loop, and the caller never gets to call `stop()`: the WebSocket
+    /// endpoint does not come up and the whole application hangs with it.
+    /// `groupConcurrent` (`:2245-2270`) has no eager path — past
+    /// `concurrent_limit` (`.unlimited` by default, `:40`) it returns
+    /// `error.ConcurrencyUnavailable`, which is propagated here through
+    /// `abortStart`, so a server that cannot be dispatched says so instead of
+    /// stealing the caller.
+    ///
+    /// The other half: `Threaded` decrements `busy_count` only once a task body
+    /// *returns* (`:1800-1802`), so a never-returning loop occupies its unit for
+    /// the life of the process. Under the eager fallback that unit is the
+    /// *caller's* thread, which is the hang above. Same reasoning as
+    /// `DistributedEventBus.start()`.
     pub fn start(self: *Self) !void {
         if (self.is_running) return;
 
@@ -88,8 +112,31 @@ pub const WebSocketServer = struct {
         self.accept_fiber_started = true;
 
         std.log.info("[WebSocketServer] Started on ws://0.0.0.0:{d}", .{self.port});
-        // Start accept loop asynchronously as a member of `fiber_group`.
-        self.fiber_group.async(self.io, acceptLoop, .{self});
+        // A member of `fiber_group` for the reason in this function's header:
+        // the loop never returns on its own.
+        self.fiber_group.concurrent(self.io, acceptLoop, .{self}) catch |err| return self.abortStart(err);
+    }
+
+    /// Unwind a `start()` that could not dispatch the accept loop, so a failed
+    /// `start()` leaves the server exactly as it was found: not running, no
+    /// listener, and the port it had bound free again for the next `start()` (or
+    /// for whoever else wants it).
+    fn abortStart(self: *Self, err: std.Io.ConcurrentError) std.Io.ConcurrentError {
+        self.is_running = false;
+        self.accept_fiber_started = false;
+        if (self.server) |*s| {
+            sockread.closeListener(self.io, s);
+            self.server = null;
+        }
+        self.fiber_group.await(self.io) catch |await_err| {
+            std.log.err("[ws] fiber drain after a failed start: {}", .{await_err});
+        };
+        // `warn`, not `err`, for the same reason the rejected-connection log in
+        // `acceptLoop` is: the caller has the error in hand and is the party that
+        // can act on it, and Zig's test runner fails the whole run when a test
+        // logs at `err` — so an `err` here would make this path untestable.
+        std.log.warn("[WebSocketServer] accept loop not dispatched: {}", .{err});
+        return err;
     }
 
     pub fn stop(self: *Self) void {
@@ -712,14 +759,38 @@ pub const WebSocketMonitor = struct {
         self.* = undefined;
     }
 
+    /// Start the WebSocket server and dispatch the metrics `updateLoop` as a
+    /// member of `update_group`.
+    ///
+    /// Both halves are `concurrent` (see `WebSocketServer.start` for why the
+    /// dispatch must not be `async`): `updateLoop` is a `while (self.is_running)`
+    /// that only returns once *another* thread has called `stop()`, so an eager
+    /// `async` fallback would run it on whatever thread called `start()` — that
+    /// thread then never returns, and the monitor becomes un-stoppable from the
+    /// only party that was going to stop it. A dispatch that cannot happen is
+    /// reported instead, with the server half rolled back.
     pub fn start(self: *Self, modules: *ApplicationModules) !void {
         self.modules = modules;
         try self.ws_server.start();
         self.is_running = true;
         self.update_thread = null;
-        // Run update loop asynchronously, owned by `update_group` so its
-        // future gets released on shutdown.
-        self.update_group.async(self.ws_server.io, updateLoop, .{self});
+        self.update_group.concurrent(self.ws_server.io, updateLoop, .{self}) catch |err| return self.abortStart(err);
+    }
+
+    /// Unwind a `start()` that could not dispatch `updateLoop`. The WebSocket
+    /// server half *was* started by then, so rolling back means stopping it —
+    /// `stop()` closes the listener, and the accept loop (its own group's only
+    /// member) exits on the flag, which is what frees the port again.
+    fn abortStart(self: *Self, err: std.Io.ConcurrentError) std.Io.ConcurrentError {
+        self.is_running = false;
+        self.modules = null;
+        self.ws_server.stop();
+        self.update_group.await(self.ws_server.io) catch |await_err| {
+            std.log.err("[ws] update fiber drain after a failed start: {}", .{await_err});
+        };
+        // `warn` for the reason given in `WebSocketServer.abortStart`.
+        std.log.warn("[WebSocketMonitor] update loop not dispatched: {}", .{err});
+        return err;
     }
 
     pub fn stop(self: *Self) void {
@@ -1030,6 +1101,170 @@ test "WebSocketServer: a live client is handshaken, pushed to, and dropped" {
     w.interface.flush() catch return error.CloseWriteFailed;
     waitForClientCount(&server, 0);
     try std.testing.expectEqual(@as(usize, 0), server.clientCount());
+}
+
+// ── Dispatching the loops must not depend on the io's async pool ─────────────
+//
+// `Group.async` has a backpressure fallback that runs the task body on the
+// *calling* thread once `async_limit` is reached (`std/Io/Threaded.zig:2188-2191`
+// → `groupAsyncEager`, `:2222-2226`; the limit defaults to `cpu_count - 1`,
+// `:1641`), and `Threaded` releases the unit only when the body *returns*
+// (`:1800-1802`). Both loops in this file — `acceptLoop` and `updateLoop` — are
+// `while (self.is_running)` loops that only ever return because some *other*
+// thread called `stop()`, so under that fallback the thread that called
+// `start()` becomes the loop and never comes back to call `stop()`: the endpoint
+// never serves and nothing can shut it down. On a 2-core runner the pool is one
+// unit, which is why the runner hits this and a 10-core laptop does not.
+//
+// The tests below pin the limit on the io instead of hoping for the hardware:
+// one pins the failure (a dispatch that cannot happen is reported and rolled
+// back), one pins each loop's unit, and one runs a real client on an io whose
+// async pool is empty — the runner's shape, on any machine.
+
+/// A loopback port that was free a moment ago: bind port 0, read back the number
+/// the kernel granted, close. The "the port is reusable again" assertions below
+/// need the number a failed `start()` had bound, and a fixed literal would be a
+/// resource shared with every other run and process.
+fn freeLoopbackPort(io: std.Io) !u16 {
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    return listener.socket.address.getPort();
+}
+
+/// `readUntilSeen` with an explicit wall-clock budget. The 60×100 ms it uses is
+/// tuned for a handshake (milliseconds); the monitor's update loop only
+/// re-broadcasts every 5 s, so its test needs a budget that spans a period and
+/// still gives in instead of hanging the suite.
+fn readUntilSeenWithin(stream: *std.Io.net.Stream, out: []u8, want: []const u8, budget_ms: i64) usize {
+    const deadline = Time.monotonicNowMilliseconds() + budget_ms;
+    var got: usize = 0;
+    while (got < out.len and Time.monotonicNowMilliseconds() < deadline) {
+        var pfds = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        if ((std.posix.poll(&pfds, 100) catch 0) == 0) continue;
+        const n = std.posix.read(stream.socket.handle, out[got..]) catch break;
+        if (n == 0) break;
+        got += n;
+        if (std.mem.indexOf(u8, out[0..got], want) != null) break;
+    }
+    return got;
+}
+
+test "WebSocketServer: a start() that cannot dispatch the accept loop reports it and rolls back" {
+    const allocator = std.testing.allocator;
+    // Not one concurrent unit available, so every dispatch answers
+    // `error.ConcurrencyUnavailable` — the failure the eager `async` fallback
+    // used to hide by running the accept loop on this thread instead.
+    var threaded = std.Io.Threaded.init(allocator, .{ .concurrent_limit = .nothing });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const port = try freeLoopbackPort(io);
+    var server = WebSocketServer.init(allocator, io, port);
+    defer server.deinit();
+
+    try std.testing.expectError(error.ConcurrencyUnavailable, server.start());
+    // Rolled back rather than half-started: down, no listener, and it says so
+    // instead of quietly pretending to serve.
+    try std.testing.expect(!server.is_running);
+    try std.testing.expect(server.server == null);
+
+    // The listener really is closed: the number the failed `start()` had bound
+    // (on 0.0.0.0) is bindable again.
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+}
+
+test "WebSocketMonitor: an update loop that cannot be dispatched fails start(), and the server half comes back down" {
+    const allocator = std.testing.allocator;
+    // Exactly one concurrent unit, and the WebSocket server's accept loop takes
+    // it (a never-returning body holds its unit until it returns,
+    // `std/Io/Threaded.zig:1800-1802`), so the monitor's own dispatch is the one
+    // that cannot happen. That ordering is also the assertion that each loop
+    // occupies a unit of its own rather than sharing the caller.
+    var threaded = std.Io.Threaded.init(allocator, .{ .concurrent_limit = .limited(1) });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const port = try freeLoopbackPort(io);
+    var modules = ApplicationModules.init(allocator);
+    defer modules.deinit();
+
+    var monitor = WebSocketMonitor.init(allocator, io, port);
+    defer monitor.deinit();
+
+    try std.testing.expectError(error.ConcurrencyUnavailable, monitor.start(&modules));
+    // The server half *had* started, so unwinding that is the whole job of the
+    // rollback: the accept loop is told to stop and the listener is closed.
+    try std.testing.expect(!monitor.is_running);
+    try std.testing.expect(!monitor.ws_server.is_running);
+    try std.testing.expect(monitor.ws_server.server == null);
+    try std.testing.expect(monitor.modules == null);
+
+    // `stop()` really did terminate the accept loop — it is blocked in `accept`,
+    // and nothing else can have released the port.
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+}
+
+test "WebSocketMonitor: a real client is handshaken and receives the update loop's metrics frame" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    // A 2-core runner's default (`async_limit = cpu_count - 1`,
+    // `std/Io/Threaded.zig:1641`) taken all the way down to nothing left over:
+    // `Group.async` would have no choice but to run the loop on this thread, so
+    // this test *is* the runner's shape, on a laptop that cannot reach the
+    // limit by accident.
+    var threaded = std.Io.Threaded.init(allocator, .{ .async_limit = .limited(0) });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var modules = ApplicationModules.init(allocator);
+    defer modules.deinit();
+
+    var monitor = WebSocketMonitor.init(allocator, io, 0);
+    defer monitor.deinit();
+    // Returns at all: with the eager fallback this call would still be inside
+    // the accept loop.
+    try monitor.start(&modules);
+    defer monitor.stop();
+
+    const port = if (monitor.ws_server.server) |*s| s.socket.address.getPort() else 0;
+    try std.testing.expect(port != 0);
+
+    var addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+    var stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    // A minimal RFC 6455 upgrade request, one write (see the live-client test
+    // above for why both sides have to flush).
+    const handshake = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+    var wbuf: [256]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    _ = w.interface.writeAll(handshake) catch return error.HandshakeWriteFailed;
+    w.interface.flush() catch return error.HandshakeWriteFailed;
+
+    // The accept path is live: the connection is registered.
+    waitForClientCount(&monitor.ws_server, 1);
+    try std.testing.expectEqual(@as(usize, 1), monitor.ws_server.clientCount());
+
+    // The update path is live: its payload reaches this socket. The loop's first
+    // broadcast can precede this client's registration — it runs at dispatch,
+    // and nobody is connected yet — so the budget has to span one period of 5 s.
+    // A frame is the only proof the loop is *running*, as opposed to dispatched.
+    var frame_buf: [256]u8 = undefined;
+    const want = "\"type\":\"metrics\"";
+    const frame_len = readUntilSeenWithin(&stream, &frame_buf, want, 15_000);
+    if (std.mem.indexOf(u8, frame_buf[0..frame_len], want) == null) {
+        std.debug.print("[test] metrics frame was {d} bytes: {any}\n", .{ frame_len, frame_buf[0..frame_len] });
+        return error.MetricsFrameMissing;
+    }
+    // It reached a client, so nothing was dropped on the way.
+    try std.testing.expectEqual(@as(u64, 0), monitor.ws_server.droppedBroadcasts());
 }
 
 // ── The client's socket, and the registry lock across a fan-out ──────────────

@@ -211,7 +211,24 @@ pub fn main(init: std.process.Init) !void {
         bg_group.await(io) catch |err| std.log.warn("[main] bg_group await: {}", .{err});
     }
     if (!is_memory) {
-        bg_group.async(io, outbox.Poller.runLoop, .{&outbox_poller});
+        // `concurrent`, NOT `async`: `runLoop` is a `while (self.running.load(...))`
+        // polling loop that only returns once another thread calls
+        // `outbox_poller.stop()`. `Group.async` is a *bounded* queue — past
+        // `async_limit` (default `cpu_count - 1`) it runs the body on the
+        // **calling** thread (`groupAsyncEager`, `std/Io/Threaded.zig`), so on a
+        // busy machine this line would poll forever here: `server.start()` on the
+        // next lines would never run and the `stop()` in the `defer` above would
+        // never be reached (measured: `timeout 20` → `EXIT=124`, log frozen at the
+        // last `ROUTE:` line, zero "listening" lines). `concurrent` never falls
+        // back to eager execution — it returns `error.ConcurrencyUnavailable` —
+        // so an undispatchable poller is an error the caller sees.
+        bg_group.concurrent(io, outbox.Poller.runLoop, .{&outbox_poller}) catch |err| {
+            // Nothing to roll back here: the listener belongs to `server.start()`
+            // below and the poller starts no thread of its own — the `defer`
+            // above (`stop()` + `await`) is still the only cleanup it needs.
+            std.log.err("[main] outbox poller fiber not dispatched: {}", .{err});
+            return err;
+        };
         std.log.info("[main] outbox background poller every {d}ms", .{poll_ms});
     } else {
         std.log.info("[main] :memory: — use POST /api/v1/outbox/drain to publish", .{});

@@ -131,11 +131,27 @@ fn mainFiber(io: *std.Io, allocator: std.mem.Allocator, environ: *const std.proc
     var client_group: std.Io.Group = .init;
     defer client_group.await(io.*) catch {};
 
-    server_group.async(io.*, struct {
+    // `concurrent`, NOT `async`: the dispatched body is `Server.start()`, whose
+    // accept loop is a `while (self.running.load(...))` that only returns once
+    // another thread calls `server.stop()`. `Group.async` is a *bounded* queue —
+    // past `async_limit` it runs the body on the **calling** thread
+    // (`groupAsyncEager`, `std/Io/Threaded.zig`), so on a machine where the pool
+    // is already saturated this line would run the accept loop here and `main`
+    // would never reach the clients, the stop, or the results (measured:
+    // `timeout 25` → `EXIT=124`, log frozen at "Server listening on port ...").
+    // `concurrent` has no eager path: if it cannot be dispatched at all it
+    // returns `error.ConcurrencyUnavailable` and we fail loudly.
+    server_group.concurrent(io.*, struct {
         fn run(s: *Server) void {
             s.start() catch |err| std.log.err("Server error: {}", .{err});
         }
-    }.run, .{&server});
+    }.run, .{&server}) catch |err| {
+        // Nothing to roll back: the listener is created *inside* the body, so a
+        // dispatch that never happened left the server unstarted and the port
+        // unbound. `defer server.deinit()` and the group awaits below still hold.
+        std.log.err("Server start fiber not dispatched: {}", .{err});
+        return err;
+    };
 
     const port = server.port;
     std.log.info("Server listening on port {} (http2/h2c enabled)", .{port});
