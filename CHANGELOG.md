@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.33.5] - 2026-09-25
 
 ### 第 27 批：WebSocket 的帧死在缓冲里（缺 flush）与 fd 被关两次、`IntegrationTest` 的悬垂（地址级红证据）、同名重复 `create*` 泄漏、`parseEvent` 把 OOM 判成"帧格式错"、集群恢复补上对称回调（**破坏性：否**，但错误集与回调语义有变化）
 
