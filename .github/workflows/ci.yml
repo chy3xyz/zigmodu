@@ -736,6 +736,22 @@ jobs:
       - name: Install deps
         run: sudo apt-get install -y libpq-dev libmariadb-dev libmariadb-dev-compat libsqlite3-dev
 
+      - name: Drop cached coverage artifacts
+        # `zig build test --fuzz` below is the only step in this workflow that
+        # runs with coverage instrumentation, and a coverage file is
+        # machine-state rather than reusable output: it embeds paths from the run
+        # that produced it, and a run that instrumented nothing still leaves one
+        # behind. This runner's `actions/cache` entry (1.7 GB on Linux, keyed only
+        # on `build.zig.zon`, with a `zig-${runner.os}-` restore fallback)
+        # therefore carries them across commits — and one zero-PC leftover makes
+        # the *next* fuzz run die with `error: step run test: corrupted coverage
+        # file .zig-cache/v/…: pcs_len was zero`. Measured 2026-09-25, on the
+        # first nightly that ever reached the fuzz step (the two steps above it
+        # had hung for days); the same command locally, with a fresh coverage dir,
+        # is green — so it is the artifacts, not the suite, that this removes.
+        # No cache value is lost: nothing else in this workflow consumes coverage.
+        run: rm -rf .zig-cache/v
+
       - name: Soak (cross-tenant leak assertions + frozen-registry concurrency)
         # Larger than the local defaults: the point of running this nightly is
         # to widen the window, not to re-run the fast suite.

@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### 第 41 批：夜间 `Fuzz` 步的 `corrupted coverage file` 是**缓存里的覆盖产物**，不是测试失败 —— 跑之前先丢掉 `.zig-cache/v`（**破坏性：否**，只动 CI 步骤）
+
+**这个失败是上一批的修复"送出来"的**：夜间 job 的第 8 步 `Fuzz (bounded)` 在 2026-09-25 第一次真正被执行
+（第 6 步 `Cluster soak` 过去几天一直卡死，第 7/8 步从来没轮到过）。它的红不是某个用例红了，而是构建系统在
+收尾时拒绝一个覆盖文件：
+
+```
+error: step run test: corrupted coverage file .zig-cache/v/59e4bde28e630904: pcs_len was zero
+```
+
+**判别（本机复现 + 缓存证据）**：同一条命令在本机、**先清掉覆盖目录**的情况下 **exit=0 全绿**；而那个哈希
+在本机 `v/` 下不存在，Linux 那份 `actions/cache` 是 **1.7 GB**、key 只跟 `build.zig.zon` 走、还有
+`zig-${runner.os}-` 的兜底恢复 —— 也就是覆盖产物会**跨 commit 一直躺在缓存里**，一个零 PC 的残渣足以让
+下一次 fuzz 死在收尾。覆盖文件是**机器状态**（里面是产出那次运行的路径），本来就不该被缓存复用。
+
+**修法**：夜间 job 在 `Install deps` 之后、任何构建之前加一步 `rm -rf .zig-cache/v`。不丢任何缓存价值：
+这个 workflow 里只有 `--fuzz` 会产生覆盖输出，没有任何步骤消费它（注释里写清了这段因果）。
+
 ### 第 40 批：弃用别名表变成**可执行门禁**（`ApiFreeze`，9 条测试），并按事实把它与现实对齐 —— `Simplified` 其实早就被移除、"记录成承诺"被改掉，三处代码里的 `DEPRECATED` 补进表（**破坏性：否**，只加门禁与文档）
 
 全量 `-Ddb=all` **2011/2069（58 skipped，0 failed，207 s）**；`ApiFreeze` 9/9；fmt / check / check-deadcode 全绿。
