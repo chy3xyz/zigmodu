@@ -1,5 +1,81 @@
 # Changelog
 
+## [Unreleased]
+
+### 第 28 批：WebSocket 的写失败改名与 `broadcast` 持锁跨写（含引用计数快照）、集群的静默 put 失败与回调改边沿触发、metrics 拒绝跨种类重名（**破坏性：否**，三处错误集/回调语义变化）
+
+全量 `-Ddb=all` **1955/2013（58 skipped，0 failed）**；CI 示例清单本机 16/16。
+
+**WebSocket 三处收尾（其中两处是"能修但要说清代价"的）。**
+① **`sendFrame` 把三种写失败一律报成 `error.NotConnected`，而且不清 `is_connected`** —— 调用方分不清"对端没了"
+与"一次瞬时写错误"，而对象还一直声称自己连着。现在只有"已知死了、一个字节都没试"是 `NotConnected`；
+真正的写路径走新的 `writeFrame`/`writeFailed`：返回 `error.WriteFailed`、把 **writer 上暂存的真实原因**记下来、
+并置 `is_connected = false`。**清标志不是记账洁癖**：写到一半失败会让流停在帧中间，重试会把第二个头拼在半截帧上。
+错误集因此变宽（`sendText`/`sendJson` 现在推断 `{NotConnected, WriteFailed}`）—— 仓内无调用者，外部若有穷举
+switch 会**编译错**（响亮而不是静默）。
+② **`broadcast` 原本持 `clients_mutex` 跨每一个 socket 写**，于是一个不读数据的对端会把整个注册表（增删计数）
+**无限期卡住**（而 `addClient`/`removeClient` 用的是不可取消的等待，于是卡住的是 acceptor 的 fiber）。现在锁只
+覆盖**选取**：锁内 `ensureTotalCapacity` + 逐个 `acquire()` 进快照，随后**在锁外**写，每个收件人一把
+`write_mutex`（避免两个并发扇出把半截帧交错到同一个 socket 上）**加一个引用计数**——只要还有在飞的写持有引用，
+对象与 fd 就不会被释放，所以"边写边被移除"不是 UAF。快照分配失败走既有的响亮丢弃路径并计数。
+③ **`deinit` 的 `tryLock` 分支是内存不安全**：两个分支做的是同一件事，所以它买不到任何东西，却在争用时**在别人
+持锁、正在改这张表的时候**释放整张客户端表与每个客户端。改用 `lockUncancelable`（与 `im/BufferPool.zig`、
+`cache/Lru.zig` 的 `deinit` 同一规则）。
+> **刻意没做"有界写"**：这个文件走 `std.Io.net.Stream.Writer`，而 posix 后端把 `EAGAIN`/`EBADF` 当**程序员 bug**
+> （`errnoBug`，**debug 构建直接 panic**）。所以用 `SO_SNDTIMEO` 限时不会返回超时、而是 panic —— 要做得走裸
+> `sockread.writeFull` 路径。这也是"为什么不顺手给写加超时"的答案。
+> **另一处行为变化**：pong 写失败现在**立刻**清 `is_connected`，循环在下次检查时退出，而不是一直等到读错误 ——
+> 与代码自己声明的意图一致。
+
+**集群两处收尾（第二处还修掉一个同形邻居）。**
+① `handleGossipEvent` 里 `nodes.put` 的失败是**静默**返回（上一行的 `dupe` 却会 warn）—— 抽成
+`trackNewNodeLocked`（`dupe` + `put` 全或无，一个 `errdefer` 管住），调用方记**真实原因**并写成
+"本地分配失败（不是畸形事件），对端下次心跳会重试"，让运维不会把本机 OOM 读成"对端在胡说"。
+**并且查清了上一个 agent 为什么测不出来**：`std.StringHashMap` **在 `init` 时就捕获自己的分配器**，所以像邻居
+测试那样替换 `cluster.allocator` **永远到不了** `put` 的增长路径（那条路走 map 自己的分配器）。测试必须**用
+`FailingAllocator` 建 cluster**、并把 census 填到 `available == 0`，然后允许 id 拷贝、拒绝那次增长。
+> **红证据的诚实说明**：这条**拿不到运行时红** —— 旧代码与新代码留下的 census、回调、时间戳**逐字节相同**，
+> 这正是它当初不可见的原因；测试钉住的是**通道**（错误 + 报告），不是那个 sink。红只有"接缝"级的编译错
+> （测试引用了尚不存在的 `trackNewNodeLocked`）。
+② **`on_leader_change_cb` 在每个 `.leader_election` 事件上都触发，哪怕 leader 没变** —— 一个名字叫
+`onLeaderChange` 的回调按**状态**而非**变化**触发，是在对"数领导权变更次数/按 leader 重新初始化"的消费者撒谎。
+改成**边沿触发**（拷贝与回调都只在真变化时发生），与 `electLeaderLocked`（本来就只在变化时宣告）一致。
+仓内**没有任何调用者**（`ClusterBootstrap` 只有一句注释；`MembershipView` 是轮询读侧），所以这是纯粹的语义修正。
+> **同形邻居（顺带修）**：`.leave` 分支以前按**状态**触发 `on_node_leave_cb` —— 一个已经 `.failed`（健康扫描
+> 已宣告过）或已经 `.leaving` 的对端再说一次再见，会**宣告两次离开**，直接破坏本文件刚立的
+> "**一次 `leave` 对应一次 `join`**"契约。现在只有从"在役"（`.healthy`/`.suspect`）转出去才回调，状态翻转与
+> `disconnectNode` 保持无条件（那一半是幂等的）。三处回调的语义现在统一写成 "**edge-triggered — the state
+> transition, not the state**"。
+
+**metrics：拒绝跨种类重名，而且检查覆盖 histogram 的生成名。** 上一批只挡了**同名**并把这个缺口留在文档里
+（"只挡同名是不完整的保证"）。这次把三种形态都核实了：① `createCounter("x")` + `createGauge("x")` —— 两个
+`# TYPE` 同名，Prometheus **整份拒收**；② **`createHistogram("x")` 之后 `createCounter("x_count")`** —— 冲突
+发生在 histogram **生成的**名字上，创建时两者根本不同名；③ 反序同样冲突。
+红证据（只加测试、不改行为时）：`one name, one metric: ...expected error.DuplicateName, found .{ .name = .. }`
+—— 即 `createGauge("shared_total", …)` 被接受、返回了一个真的 Gauge。
+**选 (a) 注册期拒绝**：②证明"按同名检查"**原理上不可能**正确，所以"只文档化"等于把一份已知非法的 exposition
+固定下来；而选"抓取期报错"会把发现推迟到生产（`registerMetricsRoutePath` 的 handler 就是
+`try m.toPrometheusFormat`）。本仓库的注册全是启动期接线、首次抓取即封条，于是**拒绝 = 启动失败**，能在本地和
+CI 被抓住。**刻意改了**那个"一个名字注册四种 kind"的既有用例（改成四个名字，注释写明旧语义与原因）。
+`CreateError` 本身没变，16 个示例全部照旧构建。
+> **未验证/未做**：规则只覆盖 `_bucket`/`_sum`/`_count` 三个后缀，且 `Summary` 只声称自己的名字 —— 将来若给
+> summary 加渲染（按惯例会输出 `x_sum`/`x_count`），那些名字**没有**预留（没为此加推测性断言）；
+> 容器字段本身仍是 `pub`，直接 `m.counters.put(...)` 能绕过规则（未加固、未测试）。
+
+**文档：`zigmodu.<ns>.<Symbol>` 有一半是编出来的路径。** 逐个核对 `root.zig` 的 **158 个导出**与各域 barrel 后：
+真实存在的命名空间只有 `ai · api · cluster_health · cron · csv · data · datapermission · fx · http · im ·
+load_shedder · migration · observability · outbox · retry · runtime · security · time · util · web4` 加上扁平的
+大写符号；而 **`core` / `di` / `test` / `config` / `metrics` / `tracing` / `log` / `resilience` / `extensions`
+全都是编出来的**（没有 `src/core.zig`、没有 `pub const core`）。修了 21 行（`zigmodu.core.EventBus` →
+`zigmodu.EventBus`、`zigmodu.metrics.PrometheusMetrics` → `zigmodu.observability.PrometheusMetrics`、
+`zigmodu.di.Container` → `zigmodu.Container` …）。两处非显然的：
+**`zigmodu.security.JwtModule` 里的 `JwtModule` 在 `src/` 里根本不存在**（那段 API 正是 `SecurityModule`），
+以及 `RetryPolicy` 其实是**嵌套**在 `HttpClient` 里的。
+> **留下 5 处需要源码决定**（不加是刻意的）：`ScopedContainer`、`ConfigManager`、`TransactionalEvent`、
+> `SlidingWindowRateLimiter`、`Params` 都是**真实存在但没有公开导入路径**的符号（从没接进 `root.zig`）。
+> 加一个 `zigmodu.core` 别名**也修不好**它们 —— 这不是"文档写错了前缀"，而是"这些符号压根没被导出"。
+> 要么补上 root 再导出（源码改动），要么接受内部文件路径/删掉那几节。
+
 ## [0.33.5] - 2026-09-25
 
 ### 第 27 批：WebSocket 的帧死在缓冲里（缺 flush）与 fd 被关两次、`IntegrationTest` 的悬垂（地址级红证据）、同名重复 `create*` 泄漏、`parseEvent` 把 OOM 判成"帧格式错"、集群恢复补上对称回调（**破坏性：否**，但错误集与回调语义有变化）
