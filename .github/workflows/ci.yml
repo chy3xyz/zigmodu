@@ -737,39 +737,19 @@ jobs:
         run: sudo apt-get install -y libpq-dev libmariadb-dev libmariadb-dev-compat libsqlite3-dev
 
       - name: Drop cached coverage artifacts
-        # Hygiene, and **not** a fix — do not read this step as one. It was added
-        # on the hypothesis that a zero-PC coverage file from an earlier build was
-        # riding in this runner's `actions/cache` entry (1.7 GB, keyed only on
-        # `build.zig.zon`, with a `zig-${runner.os}-` restore fallback) and making
-        # `zig build test --fuzz` die with
-        # `error: step run test: corrupted coverage file .zig-cache/v/…: pcs_len
-        # was zero`. The hypothesis was **refuted by experiment**: with this step
-        # in place the very next run failed identically, on the same hash
-        # (`59e4bde28e630904`, 2026-09-25) — so the artifact is written *by* that
-        # run, and the build system rejects it while merging. The cause is still
-        # open; see the CHANGELOG entry for that batch.
+        # Hygiene. A coverage file is machine-state — it embeds paths from the run
+        # that produced it and is never reusable — while the `actions/cache` entry
+        # for this runner (1.7 GB, keyed only on `build.zig.zon`, with a
+        # `zig-${runner.os}-` restore fallback) carries `.zig-cache` across
+        # commits. Nothing in this workflow *consumes* coverage output, so there
+        # is nothing to lose by starting the run without last time's leftovers.
         #
-        # The step stays because deleting coverage output before a build is
-        # harmless and correct on its own terms (a coverage file is machine-state,
-        # never reusable across runs, and nothing in this workflow consumes it).
+        # This was added while chasing the `Fuzz (bounded)` failure on the
+        # hypothesis that a stale artifact caused it; that hypothesis was refuted
+        # by experiment (the step in place, the failure unchanged), and the real
+        # cause turned out to be elsewhere entirely — see the `Fuzz (bounded)`
+        # comment. It stays on the narrow grounds above, not as a fix.
         run: rm -rf .zig-cache/v
-
-      - name: Fuzz smoke (before the soak steps — TEMPORARY DIAGNOSTIC)
-        # The `Fuzz (bounded)` step at the end of this job fails on every run, and
-        # five hypotheses have been refuted (see its comment). This is the *same*
-        # command at a smaller bound, run **before** the soak steps of the same
-        # job: if it passes here while the one at the end fails, the trigger is an
-        # interaction with what the soak steps leave behind (the build cache they
-        # populate, ports, leftover processes in the same sandbox) rather than
-        # `--fuzz` on this runner as such. If it fails too, the position is
-        # irrelevant. Delete this step once that is known.
-        continue-on-error: true
-        run: |
-          if ! zig build test --fuzz=200 -Ddb=all --test-timeout 300s; then
-            echo "=== fuzz-smoke (early) failed: artifacts ==="
-            ls -la .zig-cache/v 2>/dev/null | tail -10 || echo "(no v/ there)"
-            exit 1
-          fi
 
       - name: Soak (cross-tenant leak assertions + frozen-registry concurrency)
         # Larger than the local defaults: the point of running this nightly is
@@ -805,38 +785,29 @@ jobs:
         # mandatory. It is also incompatible with `-Dtest-filter` (the filter
         # runner panics in fuzz mode by design) — this runs the whole suite.
         #
-        # OPEN FINDING (2026-09-25). This step has failed on every run since it
-        # first executed, and four experiments have ruled out the obvious causes:
-        #   * NOT a stale artifact — a step above deletes `.zig-cache/v` first,
-        #     and it still fails;
-        #   * NOT the runner's filesystem — pointing `ZIG_LOCAL_CACHE_DIR` at
-        #     `${{ runner.temp }}` moved the coverage directory and the same
-        #     24-byte artifact appeared there, under the same hash;
-        #   * NOT memory — identical failure at `--fuzz=200` with ~11.8 GB free;
-        #   * NOT the bound — `--fuzz=200` fails exactly as `--fuzz=2000` does.
-        # What it *is*: the test binaries run and print their normal output
-        # (`[stress] RESULT: PASS` for one, the sqlx warnings for the main
-        # suite), then **die while writing coverage at exit**. The build system
-        # reports `failed command` for them with no other text, the leftover
-        # artifact is a truncated write (its header declares 6025 PCs, the file
-        # ends at 24 bytes), and the merge's `corrupted coverage file …: pcs_len
-        # was zero` is the *secondary* symptom that replaces what the process
-        # died of. The same command locally leaves one 1.25 MB merged artifact and
-        # is green; the push pipeline's `zig build test` on this same Linux runner
-        # is green — the difference is `--fuzz`'s coverage path.
+        # `-Dtest-llvm=true` is the load-bearing flag, and it is stated here
+        # rather than left to `build.zig`'s platform default so the intent is
+        # visible: **on x86_64, Zig's default backend emits no `--fuzz` coverage
+        # sections** (measured with the pinned toolchain: a `-ffuzz` object for
+        # `x86_64-linux` carries 0 sancov sections, the same object with `-fllvm`
+        # carries 2 — and for this repo's root, 0 PCs versus 156,398). Without
+        # them `fuzzer_init` sees zero coverage, the coverage file degenerates to
+        # exactly its header (`24` bytes: `n_runs` = 6025, `pcs_len` = 0) and the
+        # merge then fails the step with
+        # `error: step run test: corrupted coverage file …: pcs_len was zero`.
+        # That was the whole failure — this step had been red since it first ran.
         #
-        # `continue-on-error` is a **visibility decision, not a fix**: a step that
-        # is red on every run keeps the whole nightly red and hides the three
-        # steps above it failing for real — the same masking this workflow was
-        # just fixed for in the push leg. Be precise about what is still visible:
-        # the step's *conclusion* reads `success` in the run summary (GitHub
-        # reports the job as the annotation's "continue-on-error" outcome), so the
-        # surviving evidence is the step's log — the `failed command` lines, the
-        # `--summary all` output and the artifact dump below. The finding is in
-        # the CHANGELOG. Drop this flag when the cause is known.
-        continue-on-error: true
+        # `ZIG_BUILD_ERROR_STYLE=minimal` is cosmetic and deliberate: the summary
+        # prints a `failed command:` line for any run step whose child wrote to
+        # stderr, *including steps that pass* (two artifact families here do:
+        # the stress smoke's `[stress] …` output and the main suite's sqlx
+        # warnings). In a log that is supposed to be read, that noise looks like
+        # failures; with the style at `minimal` the step's own status is the
+        # signal. It changes no test.
+        env:
+          ZIG_BUILD_ERROR_STYLE: minimal
         run: |
-          if ! zig build test --fuzz=2000 -Ddb=all --test-timeout 300s --summary all; then
+          if ! zig build test --fuzz=2000 -Ddb=all -Dtest-llvm=true --test-timeout 300s --summary all; then
             echo "=== zig-fuzz: coverage artifacts after the failure ==="
             ls -la .zig-cache/v 2>/dev/null | tail -20 || echo "(no v/ there)"
             for f in .zig-cache/v/*; do

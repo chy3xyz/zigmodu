@@ -88,8 +88,29 @@ pub fn build(b: *std.Build) void {
     const test_filter = b.option([]const u8, "test-filter", "Only run tests whose fully qualified name contains this substring (runtime filter via scripts/test-runner.zig; see scripts/test-fast.sh)");
     const test_force_run = b.option(bool, "test-force-run", "Re-execute test binaries even when Zig has a cached run result for them") orelse false;
 
+    // `--fuzz` needs the coverage sections `fuzzer_init` reads through the
+    // linker-provided `__start___sancov_{cntrs,pcs1}` / `__stop_…` symbols. On
+    // x86_64 the default backend emits none of that data: measured with this
+    // toolchain (0.17.0-dev.2151+2ec5523d5) on a one-function object and on a
+    // linked test binary —
+    //   build-obj -ffuzz -target x86_64-linux         → no `__sancov*` section at all
+    //   build-obj -ffuzz -target x86_64-linux -fllvm  → `__sancov_cntrs` + `__sancov_pcs1`
+    // the linked binary keeps the same split, and without `-fllvm` its
+    // `__start___sancov_cntrs` is an *undefined* weak symbol. The fuzz phase then
+    // has no PCs to work with, and the build runner rejects the resulting
+    // coverage file (`corrupted coverage file …: pcs_len was zero`) — which is
+    // exactly what made the nightly `Fuzz (bounded)` step red on the x86_64
+    // ubuntu runner from the day it was added. So test artifacts go through LLVM
+    // on x86_64-linux; every other target keeps the default backend, and
+    // `-Dtest-llvm=` overrides either way. A *new* test root that contains
+    // `std.testing.fuzz` must be attached through `addTest` below, or `--fuzz`
+    // loses coverage for it again.
+    const test_llvm = b.option(bool, "test-llvm", "Force the LLVM backend for the `test` step's artifacts (default: true on x86_64-linux, where the default backend emits no `--fuzz` coverage sections)") orelse
+        (target.result.cpu.arch == .x86_64 and target.result.os.tag == .linux);
+
     // Attach a test artifact to the `test` step. Kept as one helper so the
-    // filter, the runner and the side-effect flag cannot drift apart.
+    // filter, the runner, the backend choice and the side-effect flag cannot
+    // drift apart.
     const addTest = struct {
         fn add(
             b_: *std.Build,
@@ -97,6 +118,7 @@ pub fn build(b: *std.Build) void {
             artifact: *std.Build.Step.Compile,
             filter: ?[]const u8,
             force_run: bool,
+            use_llvm: bool,
         ) void {
             if (filter != null) {
                 artifact.test_runner = .{
@@ -104,6 +126,7 @@ pub fn build(b: *std.Build) void {
                     .mode = .simple,
                 };
             }
+            if (use_llvm) artifact.use_llvm = true;
             const run = b_.addRunArtifact(artifact);
             if (filter) |f| run.addArg(b_.fmt("--filter={s}", .{f}));
             if (filter != null or force_run) run.has_side_effects = true;
@@ -123,7 +146,7 @@ pub fn build(b: *std.Build) void {
     const lib_tests = b.addTest(.{
         .root_module = lib_test_mod,
     });
-    addTest(b, test_step, lib_tests, test_filter, test_force_run);
+    addTest(b, test_step, lib_tests, test_filter, test_force_run, test_llvm);
 
     // Test log_level.zig separately (needs build_options module)
     const log_level_test_mod = b.createModule(.{
@@ -135,7 +158,7 @@ pub fn build(b: *std.Build) void {
     const log_level_tests = b.addTest(.{
         .root_module = log_level_test_mod,
     });
-    addTest(b, test_step, log_level_tests, test_filter, test_force_run);
+    addTest(b, test_step, log_level_tests, test_filter, test_force_run, test_llvm);
 
     // Benchmark step
     const benchmark_mod = b.createModule(.{
@@ -278,7 +301,7 @@ pub fn build(b: *std.Build) void {
     const zmodu_tests = b.addTest(.{
         .root_module = zmodu_cli_mod,
     });
-    addTest(b, test_step, zmodu_tests, test_filter, test_force_run);
+    addTest(b, test_step, zmodu_tests, test_filter, test_force_run, test_llvm);
 
     // Dead-code analyzer unit tests live in the deadcode/ submodule; include
     // them explicitly so `zig build test` covers the analyzer itself.
@@ -288,14 +311,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const dc_analyze_tests = b.addTest(.{ .root_module = dc_analyze_mod });
-    addTest(b, test_step, dc_analyze_tests, test_filter, test_force_run);
+    addTest(b, test_step, dc_analyze_tests, test_filter, test_force_run, test_llvm);
     const dc_scanner_mod = b.createModule(.{
         .root_source_file = b.path("tools/zmodu/src/deadcode/scanner.zig"),
         .target = target,
         .optimize = optimize,
     });
     const dc_scanner_tests = b.addTest(.{ .root_module = dc_scanner_mod });
-    addTest(b, test_step, dc_scanner_tests, test_filter, test_force_run);
+    addTest(b, test_step, dc_scanner_tests, test_filter, test_force_run, test_llvm);
 
     // Concurrency soak (`zig build soak`) — real sockets, N clients x M
     // tenants, cross-tenant leak assertions. Kept out of `zig build test` so
@@ -450,7 +473,7 @@ pub fn build(b: *std.Build) void {
     db_link.link(stress_smoke_mod, b, features);
 
     const stress_smoke_tests = b.addTest(.{ .root_module = stress_smoke_mod });
-    addTest(b, test_step, stress_smoke_tests, test_filter, test_force_run);
+    addTest(b, test_step, stress_smoke_tests, test_filter, test_force_run, test_llvm);
 
     // ── `soak-smoke`: the push-gate slice of the nightly soaks ─────────────
     //

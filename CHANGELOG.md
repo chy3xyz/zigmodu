@@ -2,6 +2,37 @@
 
 ## [Unreleased]
 
+### 第 49 批：夜间 `Fuzz` 的真正根因找到了 —— **x86_64 上 Zig 的默认后端不发射 `--fuzz` 的覆盖 section**（`-fllvm` 才发）；同时**更正我在第 45 批写错的两处**
+
+`Fuzz (bounded)` 自第一次执行起一直红，前六条候选（陈旧缓存、runner 文件系统、内存、bound、CI 的关闭 stdin、位置/前序步骤）
+全被实验逐一排除。本批**定案**：
+
+**根因**：x86_64 上默认后端对 `-ffuzz` **一个 sancov section 都不发**。用 CI 锁定的同一份工具链交叉编译实测：
+`-ffuzz` 的 `x86_64-linux` 对象**0 个** sancov section，同一对象加 `-fllvm` 是 **2 个**；对**本仓的 root**
+则是 **0 个 PC vs 156 398 个 PC**。于是 ubuntu runner 上 `fuzzer_init` 拿到的是零覆盖 → 覆盖文件退化成**恰好头部那么大**
+（`24` 字节：`n_runs` = 6025、`pcs_len` = 0）→ 归并时报
+`error: step run test: corrupted coverage file …: pcs_len was zero`。**这才是那个步骤真正的失败。**
+
+**修法**：`build.zig` 增加 `-Dtest-llvm`，**在 `x86_64-linux` 上默认为 true**，经统一助手给 6 个 test artifact 设
+`use_llvm = true`（本机实测同一 root：5.2 s / 635 MB → 26.3 s / 2.04 GB）；ci.yml 的 fuzz 步把这个 flag
+**显式写出来**（让意图可见、不依赖平台默认，也便于在慢 runner 上退回）。本机 `zig build test --fuzz=20` 因此
+**覆盖率非零**（`Coverage: 1159/155320`）且绿；`-Dtarget=x86_64-linux` 下编译器调用里出现 **6 处 `-fllvm`**，
+`-Dtest-llvm=false` 时为 **0 处**（两条都实测）。
+
+**同时更正第 45 批里我写错的两处**（文档不能留假话）：
+
+* 我说"某个 test 二进制**静默非零退出**、一行输出都没有" —— **错**。那两行 `failed command:` 是 Zig 构建系统的
+  **装饰性输出**：任何往 stderr 写过字的 run step（**包括成功的**）都会在摘要里被补打一行。本机一次**绿**运行
+  里就有同样的两行（同 artifact hash、seed 不同）。也就是说那条线索本身就是噪音，我把噪音当成了现场。
+* 我说覆盖文件是"**半写/截断**"、头部"声明了 6025 个 PC" —— **错**。24 字节是**完整的**头部
+  （`Build/abi.zig` 的顺序是 `{n_runs, unique_runs, pcs_len}`，offset 0 的 6025 是 **`n_runs`**、`unique_runs` 恒 0
+  正因没有 PC），文件并没有被截断。
+
+**其余收尾**：fuzz 步的 `continue-on-error` **已删除**（原因已定案，不需要可见性兜底）；`ZIG_BUILD_ERROR_STYLE=minimal`
+让日志里不再出现那些装饰性 `failed command:` 行；临时加进去的"跑在 soak 之前的那份 fuzz 诊断步"**已删除**；
+"Drop cached coverage artifacts" 保留但注释缩成一句卫生说明（它的原始假设已被实验否掉，真实原因在别处）。
+**仍未验证的一步**：本机没有 x86_64-linux 主机，所以"ubuntu 上真跑完并绿"要靠下一次 dispatch 确认。
+
 ### 第 48 批：查出一条**我自己写进仓库的 flake** —— `PrecisionTimer` 的"窗口不劣于内核 sleep"断言在负载机上是噪声比较，改成"只在窗口真能起作用时才断言"
 
 **触发**：第 45 批那次 push（`7bd9624`，只改了 `ci.yml` 注释与 CHANGELOG，树与刚通过的 `61f82fb` 实质相同）
