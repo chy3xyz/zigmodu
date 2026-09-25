@@ -44,6 +44,17 @@
 //!    census is dropped without a trace, because there is no member to retire —
 //!    and inventing one would also make that peer's *real* join later look like a
 //!    return (state flip, callback, dial).
+//!  * Both callbacks are **edge-triggered** — the state transition, not the
+//!    state. `leave` is announced once per departure (a second `.leave` from a
+//!    peer already `.failed` or `.leaving` says nothing new, and re-announcing it
+//!    would break the "one `join` per `leave`" count above), and
+//!    `on_leader_change_cb` runs when the leader this process holds actually
+//!    changes, not on every `.leader_election` event: a leader re-states itself
+//!    on every election round (`checkNodeHealth` and `electLeader` both
+//!    broadcast), so a level-triggered callback would have a consumer that counts
+//!    leadership changes, or rebuilds per-leader state (a lock, a lease, a
+//!    partition map) on each one, re-derive the same fact every round. Both
+//!    writers of `current_leader` announce on the edge and on nothing else.
 //!
 //! Consequences to read the accessors by: `getNodeCount` is the **census** (dead
 //! peers included, so it is not the live cluster size), `getHealthyNodeCount` is
@@ -414,10 +425,27 @@ pub const ClusterMembership = struct {
         if (seen) |node| {
             node.last_seen = now;
             if (event.event_type == .leave) {
+                // The announcement belongs to the *transition* into
+                // out-of-service, not to the state. `.failed` was already
+                // announced — the sweep fires `on_node_leave_cb` and disconnects
+                // in the branch that marks it — and `.leaving` was announced by
+                // the goodbye that got here first, so a `.leave` from either is
+                // the same fact again: the callback pair this file documents is
+                // "one `join` per `leave`", and a consumer mirroring its peer set
+                // from these callbacks would tear the same peer down twice and
+                // count two departures for one peer. `.suspect` was never
+                // announced (nothing was taken out of service), so its goodbye is
+                // the announcement.
+                const was_in_service = node.state == .healthy or node.state == .suspect;
                 node.state = .leaving;
-                if (self.on_node_leave_cb) |cb| {
-                    cb(event.node_id);
+                if (was_in_service) {
+                    if (self.on_node_leave_cb) |cb| {
+                        cb(event.node_id);
+                    }
                 }
+                // Unconditional: the transport half of the departure is
+                // idempotent (`disconnectNode` ignores an id it does not hold),
+                // and a peer that said goodbye twice is no less gone.
                 self.bus.disconnectNode(event.node_id);
             } else if (node.state == .suspect or node.state == .failed or node.state == .leaving) {
                 // What this recovery has to do about callbacks depends on what
@@ -472,23 +500,22 @@ pub const ClusterMembership = struct {
                 };
             }
         } else {
-            const id_copy = self.allocator.dupe(u8, event.node_id) catch |err| {
-                // Reported, never swallowed: the node stays untracked (its next
-                // heartbeat re-attempts the join, so this is recoverable), and the
-                // caller is the event bus — `onBusEvent` is `void`, so a log is
-                // the only channel there is. The same rule as the leader copy
-                // below.
-                std.log.warn("[ClusterMembership] cannot track joining node {s}: {}", .{ event.node_id, err });
-                return;
-            };
-            self.nodes.put(id_copy, .{
-                .id = id_copy,
-                .address = addr,
-                .state = .healthy,
-                .last_seen = now,
-                .joined_at = now,
-            }) catch {
-                self.allocator.free(id_copy);
+            self.trackNewNodeLocked(event.node_id, addr, now) catch |err| {
+                // Reported, never swallowed — and now one report for *both*
+                // allocations on this path (the id copy and the table insert),
+                // where the insert used to return in silence. The node stays
+                // untracked (its next heartbeat walks this path again, so this is
+                // recoverable), and the caller here is the event bus —
+                // `onBusEvent` is `void`, so a log is the only channel there is.
+                //
+                // Named for what it is, because the two things an operator could
+                // attribute this drop to are not the same defect: this one is
+                // local memory pressure, while a payload that cannot be parsed is
+                // rejected earlier, in `onBusEvent`, under the "malformed gossip
+                // payload" message. Reading the absence of that message as "the
+                // peer sent nonsense" would send whoever is on call after the
+                // wrong node.
+                std.log.warn("[ClusterMembership] cannot track joining node {s}: local allocation failed ({}), not a malformed event — its next heartbeat retries", .{ event.node_id, err });
                 return;
             };
 
@@ -502,29 +529,75 @@ pub const ClusterMembership = struct {
         }
 
         if (event.event_type == .leader_election) {
-            // Own the copy *before* dropping the old one. Freeing first and
-            // copying after leaves `current_leader` pointing at freed memory
-            // when the copy fails, and the only signal left (`return`) reads
-            // as "nothing to do" — while `getLeader`/`isLeader`, the callback
-            // below and `deinit` all keep reading that pointer.
+            // The edge, not the level. Every node re-announces the leader it holds
+            // on every election round (`checkNodeHealth` and `electLeader` both
+            // broadcast), so an event naming the leader this process already
+            // recorded is a heartbeat about a fact that has not moved — and a
+            // callback fired on it tells a consumer that counts leadership
+            // changes, or rebuilds per-leader state (a lock, a lease, a partition
+            // map) on each one, something untrue. `onLeaderChange` is named for
+            // the edge, and the election branch below
+            // (`electLeaderLocked`) already announces on nothing but a change;
+            // this makes the two writers of `current_leader` agree.
             //
-            // The copy cannot be propagated: this runs inside the bus callback
-            // (`onBusEvent` is `void`), where an error has no channel and the
-            // caller is the event bus, not a request. Keeping the previously
-            // elected leader is the honest no-op — the alternative, nulling the
-            // field, makes `isLeader` fall back to "single node ⇒ leader".
-            const new_leader = self.allocator.dupe(u8, event.node_id) catch |err| {
-                std.log.warn("[ClusterMembership] Leader copy for {s} failed, keeping the current leader: {}", .{ event.node_id, err });
-                return;
-            };
-            if (self.current_leader) |leader| {
-                self.allocator.free(leader);
-            }
-            self.current_leader = new_leader;
-            if (self.on_leader_change_cb) |cb| {
-                cb(self.current_leader);
+            // Skipping the copy too, not just the callback: the id the census
+            // already holds is the same string, so replacing it would free and
+            // re-allocate the owned copy on every round to end up with what we
+            // had (`getLeader`'s pointer is stable across a heartbeat).
+            const unchanged = self.current_leader != null and
+                std.mem.eql(u8, self.current_leader.?, event.node_id);
+            if (!unchanged) {
+                // Own the copy *before* dropping the old one. Freeing first and
+                // copying after leaves `current_leader` pointing at freed memory
+                // when the copy fails, and the only signal left (`return`) reads
+                // as "nothing to do" — while `getLeader`/`isLeader`, the callback
+                // below and `deinit` all keep reading that pointer.
+                //
+                // The copy cannot be propagated: this runs inside the bus callback
+                // (`onBusEvent` is `void`), where an error has no channel and the
+                // caller is the event bus, not a request. Keeping the previously
+                // elected leader is the honest no-op — the alternative, nulling the
+                // field, makes `isLeader` fall back to "single node ⇒ leader".
+                const new_leader = self.allocator.dupe(u8, event.node_id) catch |err| {
+                    std.log.warn("[ClusterMembership] Leader copy for {s} failed, keeping the current leader: {}", .{ event.node_id, err });
+                    return;
+                };
+                if (self.current_leader) |leader| {
+                    self.allocator.free(leader);
+                }
+                self.current_leader = new_leader;
+                if (self.on_leader_change_cb) |cb| {
+                    cb(self.current_leader);
+                }
             }
         }
+    }
+
+    /// Record a node this process has not seen before: the id copy the census
+    /// owns plus the insert that takes it, as one fallible step. Called with the
+    /// mutex held (`handleGossipEvent`), like `electLeaderLocked`.
+    ///
+    /// The helper exists so the insert's allocation failure has somewhere to go
+    /// at all: `put` only allocates when the table is full, and the branch used
+    /// to answer that with a silent return, so the peer was dropped with nothing
+    /// on the record. Both allocations mean the same thing to the caller — the
+    /// peer stays untracked and its next heartbeat retries — and the one report
+    /// for either lives in `handleGossipEvent` (the only caller whose caller,
+    /// `onBusEvent`, is `void` and can only log).
+    ///
+    /// All-or-nothing: a failed insert frees the copy, so the census is exactly
+    /// as it was and nothing leaks.
+    fn trackNewNodeLocked(self: *Self, node_id: []const u8, addr: std.Io.net.IpAddress, now: i64) std.mem.Allocator.Error!void {
+        const id_copy = try self.allocator.dupe(u8, node_id);
+        errdefer self.allocator.free(id_copy);
+
+        try self.nodes.put(id_copy, .{
+            .id = id_copy,
+            .address = addr,
+            .state = .healthy,
+            .last_seen = now,
+            .joined_at = now,
+        });
     }
 
     pub fn connectToSeed(self: *Self, node_id: []const u8, address: std.Io.net.IpAddress) !void {
@@ -761,12 +834,25 @@ pub const ClusterMembership = struct {
     /// Called when a peer leaves the set this process should hold state for —
     /// written off by the health sweep, or gone by its own `.leave` (the
     /// `disconnectNode` that comes with both is this file's, not the callback's
-    /// job). The peer's return fires `onNodeJoin` again; the census entry itself
-    /// is never removed.
+    /// job). Announced once per departure, on the transition out of service: a
+    /// second `.leave` from a peer that is already `.failed` or `.leaving`
+    /// restates a fact the app has acted on and is not announced again, so the
+    /// "one `join` per `leave`" pairing holds for a consumer that counts. The
+    /// peer's return fires `onNodeJoin` again; the census entry itself is never
+    /// removed.
     pub fn onNodeLeave(self: *Self, callback: *const fn ([]const u8) void) void {
         self.on_node_leave_cb = callback;
     }
 
+    /// Called when the leader this process holds **changes** — the edge, not the
+    /// level. A `.leader_election` event is also how a leader re-states itself on
+    /// every election round, so an event naming the id already recorded (or an
+    /// election that re-derives the same winner) is a heartbeat, not a change, and
+    /// does not fire this. The argument is this membership's own copy of the
+    /// leader id, valid while it holds that leader (it is freed when a different
+    /// leader replaces it, or at `deinit`) — and it is optional because the field
+    /// is: both call sites in this file pass the copy they just made, right after
+    /// installing it, so a callback delivered by this version never sees `null`.
     pub fn onLeaderChange(self: *Self, callback: *const fn (?[]const u8) void) void {
         self.on_leader_change_cb = callback;
     }
@@ -1067,6 +1153,200 @@ test "ClusterMembership electLeader keeps a live leader when the copy fails" {
     cluster.electLeader();
 
     try std.testing.expectEqualStrings("node-z", cluster.getLeader().?);
+}
+
+// `on_leader_change_cb` fired on *every* `.leader_election` gossip event: that
+// branch replaced `current_leader` unconditionally and announced the result,
+// while the election branch next door (`electLeaderLocked`) announces only when
+// the winner differs. Every node re-announces the leader it holds on every
+// election round, so a node in a steady cluster heard one "leadership change"
+// per round with nothing changing — a consumer that counts leadership changes,
+// or rebuilds per-leader state on each one (a lock, a lease, a partition map),
+// was being lied to. The callback is named for the edge, so this pins the edge:
+// the same id again is a heartbeat.
+//
+// Red on the old shape: the second event below fired the callback a second
+// time, `expected 1, found 2`.
+const LeaderLog = struct {
+    var calls: usize = 0;
+    var last: ?[]const u8 = null;
+
+    fn onLeaderChange(leader: ?[]const u8) void {
+        calls += 1;
+        last = leader;
+    }
+};
+
+test "ClusterMembership announces the leader on the edge, not on every election event" {
+    const allocator = std.testing.allocator;
+
+    LeaderLog.calls = 0;
+    LeaderLog.last = null;
+
+    var bus = try DistributedEventBus.init(allocator, std.testing.io, "leader-edge-bus");
+    defer bus.deinit();
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 18250);
+    var cluster = try ClusterMembership.init(allocator, std.testing.io, "node-z", addr, &bus);
+    defer cluster.deinit();
+    cluster.onLeaderChange(LeaderLog.onLeaderChange);
+
+    // Peers written straight into the table: a gossiped id this process does not
+    // hold takes the join path, which dials a socket — not what this test is
+    // about.
+    const peer_a = try allocator.dupe(u8, "node-a");
+    try cluster.nodes.put(peer_a, .{
+        .id = peer_a,
+        .address = addr,
+        .state = .healthy,
+        .last_seen = 0,
+        .joined_at = 0,
+    });
+    const peer_m = try allocator.dupe(u8, "node-m");
+    try cluster.nodes.put(peer_m, .{
+        .id = peer_m,
+        .address = addr,
+        .state = .healthy,
+        .last_seen = 0,
+        .joined_at = 0,
+    });
+
+    // The first announcement of a leader this process did not have.
+    cluster.handleGossipEvent(.{
+        .event_type = .leader_election,
+        .node_id = "node-a",
+        .host = "127.0.0.1",
+        .port = 18251,
+        .timestamp = 0,
+    });
+    try std.testing.expectEqual(@as(usize, 1), LeaderLog.calls);
+    try std.testing.expectEqualStrings("node-a", LeaderLog.last.?);
+    try std.testing.expectEqualStrings("node-a", cluster.getLeader().?);
+
+    // The same leader again: a heartbeat about a fact that has not moved, and a
+    // notification for it is the lie this pins. The reading is unchanged, and the
+    // owned copy is not churned either (same pointer, nothing freed and
+    // re-copied) — the id the census already holds *is* the string.
+    const held = cluster.getLeader().?;
+    cluster.handleGossipEvent(.{
+        .event_type = .leader_election,
+        .node_id = "node-a",
+        .host = "127.0.0.1",
+        .port = 18252,
+        .timestamp = 0,
+    });
+    try std.testing.expectEqual(@as(usize, 1), LeaderLog.calls);
+    try std.testing.expectEqualStrings("node-a", cluster.getLeader().?);
+    try std.testing.expectEqual(held.ptr, cluster.getLeader().?.ptr);
+
+    // A different id is an edge, and it is announced.
+    cluster.handleGossipEvent(.{
+        .event_type = .leader_election,
+        .node_id = "node-m",
+        .host = "127.0.0.1",
+        .port = 18253,
+        .timestamp = 0,
+    });
+    try std.testing.expectEqual(@as(usize, 2), LeaderLog.calls);
+    try std.testing.expectEqualStrings("node-m", LeaderLog.last.?);
+    try std.testing.expectEqualStrings("node-m", cluster.getLeader().?);
+}
+
+// Drive `nodes` to the state where the next `put` has to grow the table.
+// `available` is the map's own count of inserts left before a grow, so zero is
+// exactly the condition `put` allocates on — and the state an insert's
+// allocation is reachable from at all: a table with a free slot answers `put`
+// without touching the allocator, which is why the two-entry cluster the first
+// report used could not reach that branch. The filler keys come from the
+// cluster's allocator, the same one the census frees them with. Returns the next
+// unused filler index so a second call after a growth keeps the ids distinct.
+fn fillCensusToCapacity(cluster: *ClusterMembership, first_index: usize) !usize {
+    var i = first_index;
+    while (cluster.nodes.unmanaged.available != 0) : (i += 1) {
+        if (i - first_index > 4096) return error.TestUnexpectedResult; // the rule moved
+        var name_buf: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "filler-{d}", .{i});
+        const key = try cluster.allocator.dupe(u8, name);
+        try cluster.nodes.put(key, .{
+            .id = key,
+            .address = cluster.address,
+            .state = .healthy,
+            .last_seen = 0,
+            .joined_at = 0,
+        });
+    }
+    return i;
+}
+
+// The join path makes two allocations — the id copy the census will own, then
+// the table insert — and only the first one was reported: the `dupe` logged a
+// `warn`, the `put` above it returned in silence (`catch { free; return; }`), so
+// a node this process could not record was dropped with nothing on the record
+// that the cause was *local* (the same event dropped for an unparseable payload
+// is rejected earlier, in `onBusEvent`, under its own "malformed gossip payload"
+// message — an operator reading only the absence of that message would look at
+// the wrong node). `put` only allocates when the table is full, so this drives
+// the census there first and then denies exactly the allocation that follows the
+// id copy: the growth.
+//
+// The failure is induced through an allocator the cluster is *built* from, not
+// by swapping `cluster.allocator` the way the leader-copy tests next door do:
+// `StringHashMap.init` captures the allocator it is handed and the table grows
+// through that one, so the map's allocator is a second field
+// (`nodes.allocator`) and swapping the first never reaches this branch — which
+// is the other half of why the insert's failure looked unreachable.
+//
+// Two phases, because "which allocation failed" is the whole question: with the
+// failure disarmed the same call on the same full table costs exactly two
+// allocations (copy, growth), which is the measurement the armed run reads.
+// What must hold either way: nothing half-recorded, nothing leaked, and the
+// failure arriving at the caller as `error.OutOfMemory` instead of as silence.
+test "ClusterMembership reports a join it cannot record instead of dropping it" {
+    const allocator = std.testing.allocator;
+
+    var bus = try DistributedEventBus.init(allocator, std.testing.io, "track-fail-bus");
+    defer bus.deinit();
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{});
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 18290);
+    var cluster = try ClusterMembership.init(failing.allocator(), std.testing.io, "node-t", addr, &bus);
+    defer cluster.deinit();
+
+    var next_filler = try fillCensusToCapacity(&cluster, 0);
+    try std.testing.expectEqual(@as(usize, 0), cluster.nodes.unmanaged.available);
+
+    // Phase 1 — the measurement. On a full table the insert is the id copy plus
+    // exactly one more allocation, the table growth.
+    const census_before = cluster.getNodeCount();
+    const allocs_before = failing.alloc_index;
+    try cluster.trackNewNodeLocked("node-added", addr, 0);
+    try std.testing.expectEqual(allocs_before + 2, failing.alloc_index);
+    try std.testing.expectEqual(census_before + 1, cluster.getNodeCount());
+
+    // Fill the grown table up again, then deny the allocation right after the id
+    // copy.
+    next_filler = try fillCensusToCapacity(&cluster, next_filler);
+    try std.testing.expectEqual(@as(usize, 0), cluster.nodes.unmanaged.available);
+
+    const allocs_armed = failing.alloc_index;
+    const freed_armed = failing.freed_bytes;
+    const census_armed = cluster.getNodeCount();
+    failing.fail_index = failing.alloc_index + 1;
+    try std.testing.expectError(error.OutOfMemory, cluster.trackNewNodeLocked("node-rejected", addr, 0));
+
+    // The failure is the growth, not the copy: one allocation succeeded (the
+    // copy — `alloc_index` does not advance on the denied one), the denied one
+    // was the next, and the copy came back (`freed_bytes` is where a free shows
+    // up in this allocator; `allocated_bytes` only ever grows). Nothing
+    // half-recorded either: the census is exactly as it was — the second fill
+    // above added its own fillers, so the reading to compare against is the one
+    // taken just before the armed call — and the id is not in it.
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(allocs_armed + 1, failing.alloc_index);
+    try std.testing.expectEqual(freed_armed + "node-rejected".len, failing.freed_bytes);
+    try std.testing.expectEqual(census_armed, cluster.getNodeCount());
+    try std.testing.expect(!cluster.nodes.contains("node-rejected"));
 }
 
 // `checkNodeHealth` drops the failed leader (`free` + `current_leader = null`)
@@ -1533,4 +1813,127 @@ test "ClusterMembership announces a peer that comes back through the join callba
         try std.testing.expectEqual(want, got.kind);
         try std.testing.expectEqualStrings("node-a", got.id);
     }
+}
+
+// The departure callback is one half of the pair ("one `join` per `leave`, see
+// "What `nodes` is" at the top), and the `.leave` branch fired it on the *state*
+// rather than on the transition into it: a peer the health sweep had already
+// written off (announced through `leave` there, and disconnected there) that
+// then sent its own goodbye was announced a second time, and so was a peer
+// whose goodbye had already been handled, on a retransmission. The consumer this
+// callback exists for — one that mirrors its peer set from it (a connection
+// pool, a shard map, a metrics label) — was told to tear the same peer down
+// twice, and the pairing only holds if the second goodbye says nothing new.
+//
+// Red on the old shape: the first assertion after the failed peer's goodbye read
+// `expected 0, found 1`.
+test "ClusterMembership announces a departure once, not on every goodbye" {
+    const allocator = std.testing.allocator;
+
+    NodeCallbackLog.reset();
+
+    var bus = try DistributedEventBus.init(allocator, std.testing.io, "leave-once-bus");
+    defer bus.deinit();
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 18270);
+    var cluster = try ClusterMembership.init(allocator, std.testing.io, "node-l", addr, &bus);
+    defer cluster.deinit();
+    cluster.onNodeLeave(NodeCallbackLog.onLeave);
+
+    // Peers written straight into the table in the two states that were *already*
+    // announced: `.failed` is what the health sweep leaves behind (it fires
+    // `leave` and disconnects in the same branch), `.leaving` is what an earlier
+    // goodbye left. Neither is a transition into out-of-service, so neither
+    // goodbye is an announcement.
+    const written_off = try allocator.dupe(u8, "node-f");
+    try cluster.nodes.put(written_off, .{
+        .id = written_off,
+        .address = addr,
+        .state = .failed,
+        .last_seen = 0,
+        .joined_at = 0,
+    });
+    const gone = try allocator.dupe(u8, "node-g");
+    try cluster.nodes.put(gone, .{
+        .id = gone,
+        .address = addr,
+        .state = .leaving,
+        .last_seen = 0,
+        .joined_at = 0,
+    });
+
+    // A late goodbye from the peer the sweep already wrote off.
+    cluster.handleGossipEvent(.{
+        .event_type = .leave,
+        .node_id = "node-f",
+        .host = "127.0.0.1",
+        .port = 18271,
+        .timestamp = 0,
+    });
+    try std.testing.expectEqual(ClusterMembership.NodeState.leaving, cluster.nodes.get("node-f").?.state);
+    try std.testing.expectEqual(@as(usize, 0), NodeCallbackLog.len);
+
+    // A retransmitted goodbye, and then a third: the first one was the
+    // announcement, and the state was already `.leaving` before the pair.
+    cluster.handleGossipEvent(.{
+        .event_type = .leave,
+        .node_id = "node-g",
+        .host = "127.0.0.1",
+        .port = 18272,
+        .timestamp = 0,
+    });
+    try std.testing.expectEqual(@as(usize, 0), NodeCallbackLog.len);
+    cluster.handleGossipEvent(.{
+        .event_type = .leave,
+        .node_id = "node-g",
+        .host = "127.0.0.1",
+        .port = 18272,
+        .timestamp = 0,
+    });
+    try std.testing.expectEqual(@as(usize, 0), NodeCallbackLog.len);
+
+    // A peer still in service: its goodbye *is* the transition, so it is
+    // announced — once. The suppressed pairs above are the ones with no state
+    // left to tear down.
+    const up = try allocator.dupe(u8, "node-u");
+    try cluster.nodes.put(up, .{
+        .id = up,
+        .address = addr,
+        .state = .healthy,
+        .last_seen = 0,
+        .joined_at = 0,
+    });
+    cluster.handleGossipEvent(.{
+        .event_type = .leave,
+        .node_id = "node-u",
+        .host = "127.0.0.1",
+        .port = 18273,
+        .timestamp = 0,
+    });
+    try std.testing.expectEqual(ClusterMembership.NodeState.leaving, cluster.nodes.get("node-u").?.state);
+    try std.testing.expectEqual(@as(usize, 1), NodeCallbackLog.len);
+    try std.testing.expectEqual(NodeCallbackLog.Kind.leave, NodeCallbackLog.entries[0].kind);
+    try std.testing.expectEqualStrings("node-u", NodeCallbackLog.entries[0].id);
+
+    // And `.suspect` counts as in service on purpose: the sweep announces the
+    // peer only on the `.failed` step, so nothing was torn down for a suspected
+    // peer and its goodbye is the announcement, not a repeat of one.
+    const shaky = try allocator.dupe(u8, "node-s");
+    try cluster.nodes.put(shaky, .{
+        .id = shaky,
+        .address = addr,
+        .state = .suspect,
+        .last_seen = 0,
+        .joined_at = 0,
+    });
+    cluster.handleGossipEvent(.{
+        .event_type = .leave,
+        .node_id = "node-s",
+        .host = "127.0.0.1",
+        .port = 18274,
+        .timestamp = 0,
+    });
+    try std.testing.expectEqual(ClusterMembership.NodeState.leaving, cluster.nodes.get("node-s").?.state);
+    try std.testing.expectEqual(@as(usize, 2), NodeCallbackLog.len);
+    try std.testing.expectEqualStrings("node-s", NodeCallbackLog.entries[1].id);
 }

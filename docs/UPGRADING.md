@@ -119,10 +119,24 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 **行为变化（非破坏）⑩：同名重复的 `create*` 现在是错误，抓取后的注册也是错误。** `PrometheusMetrics` 的六个
 `create*` 现在返回 `CreateError`（`error.Frozen` | `error.DuplicateName` | `std.mem.Allocator.Error`）：
 ① 注册（第一次抓取或 `freeze()` 之后）被封 —— 晚期注册返回 `error.Frozen` 且不插入任何东西；
-② **同一个名字（同一种类）注册第二次返回 `error.DuplicateName`**，而不是像以前那样把第一个对象留在堆上没人释放、
-把已发出的旧句柄变成孤儿。若你以前依赖"重复注册就换一个"，请改成在首次抓取之前注册一次，或用
+② **一个名字在整个 exposition 命名空间里只能用一次** —— 不只是"同一种类注册第二次"，**跨种类**（counter 与
+gauge 同名）与 **histogram 的生成名**（`createHistogram("x")` 之后再 `createCounter("x_count")`）都会返回
+`error.DuplicateName`。以前这些都会被接受，然后渲染出 Prometheus **整份拒收**的抓取；以前同种类重复注册还会把
+第一个对象留在堆上没人释放、把已发出的旧句柄变成孤儿。若你以前依赖"重复注册就换一个"，请改成在首次抓取之前注册一次，或用
 `getCounter`/`getGauge` 追加 label 值。`Counter.labels`/`Gauge.labels` 与 `Summary` 的
 `quantiles`/`max_age_seconds`/`age_buckets` 三个"声明了没人读"的字段已删除。
+
+**行为变化（非破坏）：`WebSocketClient` 的写失败不再叫 `NotConnected`，且 pong 失败即断连。**
+`sendText`/`sendJson` 的推断错误集现在是 `{error.NotConnected, error.WriteFailed}`：前者只表示"这个客户端已经
+已知是死的、一个字节都没写"，后者是真正的写失败（真实原因记在日志里）并会**立刻**把 `is_connected` 置 false。
+若你的代码穷举匹配旧错误集，会**编译错**（响亮）；若你把任何失败都当"对端断了"处理，那条路径现在的语义更准确。
+另外：pong 写失败现在会让读循环在下一次检查时退出，而不是一直等到一个读错误。
+
+**行为变化（非破坏）：集群的节点回调是**边沿触发**的。** `on_leader_change_cb` 只在 leader **真的变化**时触发
+（以前每个 `.leader_election` 事件都触发，即使 leader 没变）；`on_node_leave_cb` 只在从"在役"
+（`.healthy`/`.suspect`）转出去时触发一次（以前按状态触发，一个已宣告失败或已 `.leaving` 的对端再说一次再见会
+**宣告两次**）。与既有契约一致：**一次 `leave` 对应一次 `join`**。如果你的回调以前依赖"每次选举心跳也来一次"，
+那正是这条要修掉的。
 
 **行为变化（非破坏）：集群恢复现在会触发 `on_node_join_cb`。** `ClusterMembership` 以前只在失败/`leave` 时发
 `on_node_leave_cb`，恢复只翻状态、不发回调。现在**一次 `leave` 对应一次 `join`**（`join` 是 "这个 peer 是你应当持有

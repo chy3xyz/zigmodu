@@ -55,15 +55,15 @@ pub const PrometheusMetrics = struct {
     /// scrape.
     pub const FrozenError = error{Frozen};
 
-    /// Raised by `create*` when `name` is already registered **for that kind** —
-    /// the plain collector or the labeled family that renders that name (a
-    /// `Counter` and a `CounterFamily` both render `name`, so they are one
-    /// kind). The registry is unchanged: the object registered first is still
-    /// the one `get*` and the scrape reach, and it is still the one the caller
-    /// holds — no second object was allocated and no handle was orphaned.
-    /// (The kinds keep separate containers, so `createCounter("x")` followed by
-    /// `createGauge("x")` still succeeds; see the note on `toPrometheusFormat`
-    /// about what that pair does to the exposition.)
+    /// Raised by `create*` when the name, or a name the metric would
+    /// *generate*, is already on the wire: `name` itself for a `Counter`,
+    /// `Gauge`, `CounterFamily` and `Summary`, plus
+    /// `name_bucket`/`name_sum`/`name_count` for a `Histogram`/
+    /// `HistogramFamily`. The registry is unchanged: the object registered
+    /// first is still the one `get*` and the scrape reach, and it is still the
+    /// one the caller holds — no second object was allocated and no handle was
+    /// orphaned. The rule — the whole *exposition* namespace rather than the
+    /// container a metric lives in — is on `claimTaken` below.
     pub const DuplicateError = error{DuplicateName};
 
     /// The full failure set of every `create*`.
@@ -662,18 +662,129 @@ pub const PrometheusMetrics = struct {
         self.* = undefined;
     }
 
+    /// # The exposition namespace is closed at registration
+    ///
+    /// A name identifies one metric *on the wire*, which is not the same thing
+    /// as one container in this struct. Per metric, the scrape prints:
+    ///
+    ///   * a `# HELP`/`# TYPE` block under the metric's own name — for every
+    ///     kind, including `Histogram`/`HistogramFamily`, whose block is headed
+    ///     by the histogram's name even though its *values* are the generated
+    ///     `_bucket`/`_sum`/`_count` series;
+    ///   * the series: `name` for a `Counter`, `Gauge` and `CounterFamily`
+    ///     (once per label value), plus the three generated names for a
+    ///     histogram. The one exception is `Summary`, which no kind of this
+    ///     scrape renders at all — see the tripwire test at the bottom of this
+    ///     file.
+    ///
+    /// Two registrations that overlap on any of those names render an exposition
+    /// Prometheus rejects *whole*: one name twice in a `# TYPE`, or a series of
+    /// one metric inside another's namespace. So the registry refuses the
+    /// second registration instead. Checking the registration name alone cannot
+    /// express this — `createHistogram("x")` followed by
+    /// `createCounter("x_count")` shares no name at creation time and still
+    /// collides — which is why `claimTaken` compares against the *generated*
+    /// names too.
+    ///
+    /// One deliberate step past "appears twice on the wire": a `Summary` claims
+    /// its own name even though the current scrape has no reader for summaries.
+    /// "A name no kind may reuse" is the simpler contract, and a future summary
+    /// reader (the tripwire test describes it) will want that name free.
+    const histogram_suffixes = [_][]const u8{ "_bucket", "_sum", "_count" };
+
+    /// `long == short ++ suffix`, without building the concatenation. The
+    /// length test is what keeps near misses out: `latency_seconds_buckets` is
+    /// not the `_bucket` series of `latency_seconds`, and
+    /// `latency_seconds_count2` is not its `_count` series.
+    fn isGeneratedSeries(long: []const u8, short: []const u8, suffix: []const u8) bool {
+        return long.len == short.len + suffix.len and
+            std.mem.startsWith(u8, long, short) and
+            std.mem.endsWith(u8, long, suffix);
+    }
+
+    /// Would the exposition already carry the name `base ++ suffix`? An empty
+    /// `suffix` asks about `base` itself, which is what a `Counter`, `Gauge`,
+    /// `CounterFamily` and `Summary` render.
+    ///
+    /// Registration is startup-only (see the lifecycle note on the type), so
+    /// the linear scans are the price of never having to build `base ++ suffix`:
+    /// a check that allocated would break the "a refused registration allocates
+    /// nothing" property the `create*` contract and its test rely on.
+    fn claimTaken(self: *const Self, base: []const u8, suffix: []const u8) bool {
+        // A plain metric renders exactly its own name, so it matches only when
+        // that name is the candidate.
+        var counter_iter = self.counters.keyIterator();
+        while (counter_iter.next()) |registered| {
+            if (isGeneratedSeries(registered.*, base, suffix)) return true;
+        }
+        var gauge_iter = self.gauges.keyIterator();
+        while (gauge_iter.next()) |registered| {
+            if (isGeneratedSeries(registered.*, base, suffix)) return true;
+        }
+        var summary_iter = self.summaries.keyIterator();
+        while (summary_iter.next()) |registered| {
+            if (isGeneratedSeries(registered.*, base, suffix)) return true;
+        }
+        for (self.counter_families.items) |f| {
+            if (isGeneratedSeries(f.name, base, suffix)) return true;
+        }
+
+        // A histogram claims four names: its own, and the three it generates.
+        var histogram_iter = self.histograms.iterator();
+        while (histogram_iter.next()) |entry| {
+            if (histogramClaimTaken(entry.key_ptr.*, base, suffix)) return true;
+        }
+        for (self.histogram_families.items) |f| {
+            if (histogramClaimTaken(f.name, base, suffix)) return true;
+        }
+        return false;
+    }
+
+    /// The histogram arm of `claimTaken`, for a registered histogram named `h`.
+    /// Its claim on the candidate `base ++ suffix` has two shapes:
+    ///
+    ///   * `h`'s own name is the candidate: `h == base ++ suffix`;
+    ///   * `h` generates the candidate: `h ++ s == base ++ suffix` for one of
+    ///     the three suffixes.
+    ///
+    /// `_bucket`, `_sum` and `_count` cannot both be a suffix of the same
+    /// string (aligned at the end, `_bucket` and `_count` disagree one
+    /// character in, `u` against `e`, and `_sum` ends in `m` where the other
+    /// two end in `t`): the second shape forces `s == suffix` and `h == base`.
+    /// With an empty `suffix` the second shape is `h ++ s == base` (the
+    /// candidate *is* a generated name), which is why the loop below only runs
+    /// then.
+    fn histogramClaimTaken(h: []const u8, base: []const u8, suffix: []const u8) bool {
+        if (isGeneratedSeries(h, base, suffix)) return true;
+        if (suffix.len == 0) {
+            for (histogram_suffixes) |s| {
+                if (isGeneratedSeries(base, h, s)) return true;
+            }
+            return false;
+        }
+        return std.mem.eql(u8, h, base);
+    }
+
+    /// Refuse a registration whose names the exposition already carries.
+    /// `histogram` widens the claim set from `name` to
+    /// `name_bucket`/`name_sum`/`name_count` as well.
+    fn ensureUnclaimed(self: *const Self, name: []const u8, histogram: bool) DuplicateError!void {
+        if (self.claimTaken(name, "")) return error.DuplicateName;
+        if (!histogram) return;
+        for (histogram_suffixes) |suffix| {
+            if (self.claimTaken(name, suffix)) return error.DuplicateName;
+        }
+    }
+
     /// Create Counter. Fails with `error.Frozen` once the registry is sealed
-    /// (a scrape has run) and with `error.DuplicateName` if this name is
-    /// already registered as a counter — see the lifecycle note on the type.
+    /// (a scrape has run) and with `error.DuplicateName` if the exposition
+    /// already carries this name — see `claimTaken` for the rule.
     pub fn createCounter(self: *Self, name: []const u8, help: []const u8) CreateError!*Counter {
         if (self.isFrozen()) return error.Frozen;
         // Checked before anything is allocated, so a refused registration
         // allocates nothing and the object registered first keeps both the map
         // entry and the handle the caller already holds.
-        if (self.counters.contains(name)) return error.DuplicateName;
-        for (self.counter_families.items) |f| {
-            if (std.mem.eql(u8, f.name, name)) return error.DuplicateName;
-        }
+        try self.ensureUnclaimed(name, false);
         const counter = try self.allocator.create(Counter);
         errdefer self.allocator.destroy(counter);
         const name_copy = try self.allocator.dupe(u8, name);
@@ -692,10 +803,10 @@ pub const PrometheusMetrics = struct {
     }
 
     /// Create Gauge. Fails with `error.Frozen` once the registry is sealed and
-    /// with `error.DuplicateName` if the name is already a gauge.
+    /// with `error.DuplicateName` if the exposition already carries this name.
     pub fn createGauge(self: *Self, name: []const u8, help: []const u8) CreateError!*Gauge {
         if (self.isFrozen()) return error.Frozen;
-        if (self.gauges.contains(name)) return error.DuplicateName;
+        try self.ensureUnclaimed(name, false);
         const gauge = try self.allocator.create(Gauge);
         errdefer self.allocator.destroy(gauge);
         const name_copy = try self.allocator.dupe(u8, name);
@@ -713,16 +824,12 @@ pub const PrometheusMetrics = struct {
     }
 
     /// Create Histogram. Fails with `error.Frozen` once the registry is sealed
-    /// and with `error.DuplicateName` if the name is already a histogram.
-    /// The pairs with a `HistogramFamily` of the same name count as one kind:
-    /// both render the same `name_bucket`/`name_sum`/`name_count` series, so
-    /// they are refused together.
+    /// and with `error.DuplicateName` if the exposition already carries the
+    /// histogram's name or any of the three series it generates
+    /// (`name_bucket`/`name_sum`/`name_count`) — see `claimTaken`.
     pub fn createHistogram(self: *Self, name: []const u8, help: []const u8, buckets: []const f64) CreateError!*Histogram {
         if (self.isFrozen()) return error.Frozen;
-        if (self.histograms.contains(name)) return error.DuplicateName;
-        for (self.histogram_families.items) |f| {
-            if (std.mem.eql(u8, f.name, name)) return error.DuplicateName;
-        }
+        try self.ensureUnclaimed(name, true);
         const histogram = try self.allocator.create(Histogram);
         errdefer self.allocator.destroy(histogram);
 
@@ -753,10 +860,12 @@ pub const PrometheusMetrics = struct {
     }
 
     /// Create Summary. Fails with `error.Frozen` once the registry is sealed
-    /// and with `error.DuplicateName` if the name is already a summary.
+    /// and with `error.DuplicateName` if the exposition already carries this
+    /// name. A summary claims its own name although today's scrape renders no
+    /// summary reader at all — see `claimTaken`.
     pub fn createSummary(self: *Self, name: []const u8, help: []const u8) CreateError!*Summary {
         if (self.isFrozen()) return error.Frozen;
-        if (self.summaries.contains(name)) return error.DuplicateName;
+        try self.ensureUnclaimed(name, false);
         const summary = try self.allocator.create(Summary);
         errdefer self.allocator.destroy(summary);
 
@@ -796,15 +905,10 @@ pub const PrometheusMetrics = struct {
     /// only work on the first scrape and be refused on every later one, which
     /// is a worse contract than refusing it outright.
     ///
-    /// Name uniqueness here is **per kind**, which is all `create*` enforces:
-    /// one name can still be registered as a counter *and* a gauge (separate
-    /// containers), and this pass then prints two `# TYPE <name>` blocks — an
-    /// exposition Prometheus rejects. Sealing that needs a decision this type
-    /// has not taken: full name uniqueness also has to cover the series a
-    /// histogram *generates* (`<name>_bucket`/`_sum`/`_count`), or it would
-    /// block `x` twice while letting `x` and `x_count` through — partial
-    /// enforcement that reads like a guarantee. Until then: unique per kind is
-    /// what you get, and cross-kind reuse is on the caller.
+    /// Name uniqueness is settled at registration, not here: `create*` refuses
+    /// any name the exposition already carries — including the three series a
+    /// histogram generates — so a scrape that renders at all carries each name
+    /// once (`claimTaken` is the rule). This pass only renders.
     pub fn toPrometheusFormat(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
         self.freeze();
         if (self.scrape_hook) |hook| hook(self.scrape_userdata);
@@ -985,15 +1089,12 @@ pub const PrometheusMetrics = struct {
     ///
     /// Fails with `error.Frozen` once the registry is sealed (a scrape has run)
     /// — see the lifecycle note on the type — and with `error.DuplicateName` if
-    /// that name is already a counter (plain or family; both render `name`). The
-    /// per-label series a request thread wants do not come through here: they
-    /// come from `CounterFamily.get`.
+    /// the exposition already carries that name. The per-label series a request
+    /// thread wants do not come through here: they come from
+    /// `CounterFamily.get`.
     pub fn createCounterFamily(self: *Self, name: []const u8, help: []const u8, label: []const u8, max_series: usize, io: std.Io) CreateError!*CounterFamily {
         if (self.isFrozen()) return error.Frozen;
-        if (self.counters.contains(name)) return error.DuplicateName;
-        for (self.counter_families.items) |f| {
-            if (std.mem.eql(u8, f.name, name)) return error.DuplicateName;
-        }
+        try self.ensureUnclaimed(name, false);
         const f = try self.allocator.create(CounterFamily);
         errdefer self.allocator.destroy(f);
         const name_copy = try self.allocator.dupe(u8, name);
@@ -1022,14 +1123,12 @@ pub const PrometheusMetrics = struct {
 
     /// Bounded-cardinality histogram split by a single label. Fails with
     /// `error.Frozen` once the registry is sealed (a scrape has run) and with
-    /// `error.DuplicateName` if that name is already a histogram (plain or
-    /// family; both render `name_bucket`/`name_sum`/`name_count`).
+    /// `error.DuplicateName` if the exposition already carries the name or any
+    /// of `name_bucket`/`name_sum`/`name_count` it generates — see
+    /// `claimTaken`.
     pub fn createHistogramFamily(self: *Self, name: []const u8, help: []const u8, label: []const u8, max_series: usize, buckets: []const f64, io: std.Io) CreateError!*HistogramFamily {
         if (self.isFrozen()) return error.Frozen;
-        if (self.histograms.contains(name)) return error.DuplicateName;
-        for (self.histogram_families.items) |f| {
-            if (std.mem.eql(u8, f.name, name)) return error.DuplicateName;
-        }
+        try self.ensureUnclaimed(name, true);
         const f = try self.allocator.create(HistogramFamily);
         errdefer self.allocator.destroy(f);
         const name_copy = try self.allocator.dupe(u8, name);
@@ -1368,21 +1467,32 @@ test "issued metric handles survive registry growth" {
     // rehashes several times. A handle issued before a rehash is the only way
     // callers (and the MetricsBackend vtable) ever touch a metric, so it must
     // keep pointing at a live object.
+    //
+    // Each kind gets its own name here. This test used to register *one* name
+    // across all four kinds, which was legal while uniqueness was per kind; a
+    // name now identifies one metric in the exposition (see `claimTaken`), so
+    // the four names differ — the growth the test is about is unchanged.
     const count = 64;
 
-    var names: [count][40]u8 = undefined;
-    var name_slices: [count][]const u8 = undefined;
+    var names: [count][4][40]u8 = undefined;
+    var gauge_names: [count][]const u8 = undefined;
+    var counter_names: [count][]const u8 = undefined;
+    var histogram_names: [count][]const u8 = undefined;
+    var summary_names: [count][]const u8 = undefined;
     var gauge_handles: [count]*PrometheusMetrics.Gauge = undefined;
     var counter_handles: [count]*PrometheusMetrics.Counter = undefined;
     var histogram_handles: [count]*PrometheusMetrics.Histogram = undefined;
     var summary_handles: [count]*PrometheusMetrics.Summary = undefined;
 
     for (0..count) |i| {
-        name_slices[i] = try std.fmt.bufPrint(&names[i], "growth_probe_{d}", .{i});
-        gauge_handles[i] = try metrics.createGauge(name_slices[i], "growth probe");
-        counter_handles[i] = try metrics.createCounter(name_slices[i], "growth probe");
-        histogram_handles[i] = try metrics.createHistogram(name_slices[i], "growth probe", &.{ 1, 10 });
-        summary_handles[i] = try metrics.createSummary(name_slices[i], "growth probe");
+        gauge_names[i] = try std.fmt.bufPrint(&names[i][0], "growth_probe_{d}", .{i});
+        counter_names[i] = try std.fmt.bufPrint(&names[i][1], "growth_probe_{d}_total", .{i});
+        histogram_names[i] = try std.fmt.bufPrint(&names[i][2], "growth_probe_{d}_seconds", .{i});
+        summary_names[i] = try std.fmt.bufPrint(&names[i][3], "growth_probe_{d}_summary", .{i});
+        gauge_handles[i] = try metrics.createGauge(gauge_names[i], "growth probe");
+        counter_handles[i] = try metrics.createCounter(counter_names[i], "growth probe");
+        histogram_handles[i] = try metrics.createHistogram(histogram_names[i], "growth probe", &.{ 1, 10 });
+        summary_handles[i] = try metrics.createSummary(summary_names[i], "growth probe");
     }
 
     // Only now write through the handles issued before the final rehash.
@@ -1398,24 +1508,24 @@ test "issued metric handles survive registry growth" {
     for (0..count) |i| {
         try std.testing.expectEqual(
             @as(f64, @floatFromInt(i)),
-            metrics.getGauge(name_slices[i]).?.get(),
+            metrics.getGauge(gauge_names[i]).?.get(),
         );
         try std.testing.expectEqual(
             @as(u64, @intCast(i)),
-            metrics.getCounter(name_slices[i]).?.get(),
+            metrics.getCounter(counter_names[i]).?.get(),
         );
         try std.testing.expectEqual(@as(u64, 1), summary_handles[i].totalCount());
         try std.testing.expectEqual(@as(f64, @floatFromInt(i)), summary_handles[i].totalSum());
 
         // The handles above must be the same objects the registry looks up by
         // name, and the scrape must render every one of them.
-        const gauge_line = try std.fmt.bufPrint(&scratch, "{s} {d:.6}\n", .{ name_slices[i], @as(f64, @floatFromInt(i)) });
+        const gauge_line = try std.fmt.bufPrint(&scratch, "{s} {d:.6}\n", .{ gauge_names[i], @as(f64, @floatFromInt(i)) });
         try std.testing.expect(std.mem.indexOf(u8, text, gauge_line) != null);
 
-        const counter_line = try std.fmt.bufPrint(&scratch, "{s} {d}\n", .{ name_slices[i], i });
+        const counter_line = try std.fmt.bufPrint(&scratch, "{s} {d}\n", .{ counter_names[i], i });
         try std.testing.expect(std.mem.indexOf(u8, text, counter_line) != null);
 
-        const histogram_line = try std.fmt.bufPrint(&scratch, "{s}_count {d}\n", .{ name_slices[i], 1 });
+        const histogram_line = try std.fmt.bufPrint(&scratch, "{s}_count {d}\n", .{ histogram_names[i], 1 });
         try std.testing.expect(std.mem.indexOf(u8, text, histogram_line) != null);
     }
 }
@@ -1718,6 +1828,87 @@ test "a duplicate registration is refused, leaving the first handle as the regis
     const text = try m.toPrometheusFormat(allocator);
     defer allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "dup_total 1") != null);
+}
+
+// The unit of name identity is the **series name on the wire**, not the
+// container a metric happens to live in. The per-kind check this file used to
+// have could not see three of the four collisions below: none of them shares a
+// *registration* name, because a histogram publishes a `# HELP`/`# TYPE` block
+// under its own name plus three names it *generated* (`_bucket`, `_sum`,
+// `_count`). A scrape carrying any of those twice is rejected whole by
+// Prometheus, and no same-name check can catch it — so the registry closes the
+// exposition namespace at registration (see `DuplicateError`). That is still
+// startup: every `create*` call site in the tree is startup wiring, and the
+// first scrape seals the registry anyway.
+//
+// This test is the evidence for that decision. It pins each collision shape in
+// both registration orders, the near misses the string comparison must not
+// over-reject, and the property the rule exists to protect — read off the
+// rendered output, not off the registry's containers.
+test "one name, one metric: the exposition namespace is closed at registration" {
+    const allocator = std.testing.allocator;
+    var m = PrometheusMetrics.init(allocator);
+    defer m.deinit();
+
+    // Shape 1 — same name, different kind. Both render `name` itself, so the
+    // scrape carries two typed blocks under one name.
+    const counter = try m.createCounter("shared_total", "counter");
+    counter.inc();
+    try std.testing.expectError(error.DuplicateName, m.createGauge("shared_total", "gauge, same name"));
+    try std.testing.expectError(error.DuplicateName, m.createSummary("shared_total", "summary, same name"));
+    try std.testing.expectError(error.DuplicateName, m.createCounterFamily("shared_total", "family, same name", "route", 4, std.testing.io));
+    // The refusals changed nothing: the counter is still the registry's object
+    // under that name, and no half-registered object answers for another kind.
+    try std.testing.expectEqual(counter, m.getCounter("shared_total").?);
+    try std.testing.expectEqual(@as(?*PrometheusMetrics.Gauge, null), m.getGauge("shared_total"));
+    try std.testing.expectEqual(@as(u64, 1), counter.get());
+
+    // Shape 2 — a name a histogram *generated* is already on the wire. The
+    // plain collector never shares a registration name with the histogram, so
+    // only a check that knows the suffixes can refuse it.
+    _ = try m.createHistogram("latency_seconds", "histogram", &.{ 0.1, 1.0 });
+    try std.testing.expectError(error.DuplicateName, m.createCounter("latency_seconds_count", "collides with the generated count series"));
+    try std.testing.expectError(error.DuplicateName, m.createGauge("latency_seconds_sum", "collides with the generated sum series"));
+    try std.testing.expectError(error.DuplicateName, m.createCounterFamily("latency_seconds_bucket", "collides with the generated bucket series", "route", 4, std.testing.io));
+
+    // Shape 3 — the same collision with the plain collector registered first,
+    // and with a `HistogramFamily`, so the rule depends on neither the
+    // registration order nor which histogram flavor came first.
+    _ = try m.createCounter("render_seconds_count", "registered before the histogram that would generate this name");
+    try std.testing.expectError(error.DuplicateName, m.createHistogram("render_seconds", "would generate render_seconds_count", &.{1}));
+    _ = try m.createHistogramFamily("worker_seconds", "family histogram", "worker", 4, &.{1}, std.testing.io);
+    try std.testing.expectError(error.DuplicateName, m.createGauge("worker_seconds_sum", "generated by the family above"));
+
+    // A histogram's own name heads its block, so it is claimed like any other.
+    _ = try m.createHistogram("cache_seconds", "histogram", &.{1});
+    try std.testing.expectError(error.DuplicateName, m.createGauge("cache_seconds", "the histogram's own name heads its block"));
+    // ... which also means the *base* of a later histogram may not be the
+    // generated series of an earlier one.
+    try std.testing.expectError(error.DuplicateName, m.createHistogram("cache_seconds_count", "base name is the `cache_seconds` histogram's generated count series", &.{1}));
+
+    // Near misses: the comparison is exact (length + prefix + suffix), so all
+    // of these are distinct names and must still register.
+    _ = try m.createCounter("latency_seconds_count2", "not the generated name");
+    _ = try m.createGauge("latency_seconds_buckets", "plural, not the generated name");
+    _ = try m.createGauge("xlatency_seconds_count", "prefix is not the histogram name");
+    _ = try m.createCounter("other_seconds_count", "no `other_seconds` histogram exists");
+
+    const text = try m.toPrometheusFormat(allocator);
+    defer allocator.free(text);
+
+    // The property all of the above protects, read off the output: no name is
+    // typed twice. Labeled series legitimately repeat their name with different
+    // label values, so the check is on `# TYPE`, one per metric.
+    var typed = std.StringHashMap(void).init(allocator);
+    defer typed.deinit();
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "# TYPE ")) continue;
+        const rest = line["# TYPE ".len..];
+        const name = rest[0 .. std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len];
+        const entry = try typed.getOrPut(name);
+        try std.testing.expect(!entry.found_existing);
+    }
 }
 
 // `max_samples` is the summary's whole configuration surface, and this is the

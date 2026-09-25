@@ -194,7 +194,7 @@ var app = try builder
 
 ### Container
 
-#### `zigmodu.di.Container`
+#### `zigmodu.Container`
 
 Service container for dependency injection.
 
@@ -210,7 +210,7 @@ pub fn serviceCount(self: *Self) usize
 
 **Example:**
 ```zig
-var container = zigmodu.di.Container.init(allocator);
+var container = zigmodu.Container.init(allocator);
 defer container.deinit();
 
 try container.register(Database, "main_db", &db_instance);
@@ -250,7 +250,7 @@ pub fn has(self: *Self, key: []const u8) bool
 
 ### ExternalizedConfig
 
-#### `zigmodu.config.ExternalizedConfig`
+#### `zigmodu.ExternalizedConfig`
 
 External configuration with priority-based loading.
 
@@ -279,7 +279,7 @@ pub fn parseFile(self: *Self, path: []const u8) !std.StringHashMap([]const u8)
 
 ### EventBus
 
-#### `zigmodu.core.EventBus(T)`
+#### `zigmodu.EventBus(T)`
 
 **无类型事件总线**：`T` 是**事件类型键**（枚举等可哈希类型），payload 以
 `*anyopaque` 传递、由回调自己转回来；一个实例可挂任意多个事件类型。
@@ -306,7 +306,7 @@ pub fn totalSubscriberCount(self: *Self) usize
 const Topic = enum { order_created };
 const OrderEvent = struct { order_id: u64, status: []const u8 };
 
-const Bus = zigmodu.core.EventBus(Topic);
+const Bus = zigmodu.EventBus(Topic);
 
 var bus = Bus.init(allocator);
 defer bus.deinit();
@@ -324,7 +324,7 @@ fn onOrderCreated(topic: Topic, payload: *anyopaque) void {
 
 ### TypedEventBus
 
-#### `zigmodu.core.TypedEventBus(T)`
+#### `zigmodu.TypedEventBus(T)`
 
 单事件类型的简化总线：payload **按值**传递（`fn (T) void`），不用 `*anyopaque`
 转换。同样**非线程安全**。
@@ -347,7 +347,7 @@ pub fn droppedAsyncCount(self: *Self) u64           // 异步投递因分配/派
 **Example:**
 ```zig
 const OrderEvent = struct { order_id: u64, status: []const u8 };
-const Bus = zigmodu.core.TypedEventBus(OrderEvent);
+const Bus = zigmodu.TypedEventBus(OrderEvent);
 
 var bus = Bus.init(allocator);
 defer bus.deinit();
@@ -358,7 +358,7 @@ bus.publish(.{ .order_id = 123, .status = "completed" });
 
 ### DistributedEventBus
 
-#### `zigmodu.core.DistributedEventBus`
+#### `zigmodu.DistributedEventBus`
 
 Cross-node event communication.
 
@@ -398,7 +398,7 @@ pub fn Transaction.rollback(self: *Transaction) void
 
 ### CircuitBreaker
 
-#### `zigmodu.resilience.CircuitBreaker`
+#### `zigmodu.CircuitBreaker`
 
 Prevent cascade failures with circuit breaker pattern.
 
@@ -442,7 +442,7 @@ pub fn resetAll(self: *Self) void
 
 ### RateLimiter
 
-#### `zigmodu.resilience.RateLimiter`
+#### `zigmodu.RateLimiter`
 
 Token bucket rate limiting. **线程安全**（内部短自旋守卫），可跨线程共享。
 
@@ -493,7 +493,7 @@ pub fn currentCount(self: *Self) usize
 
 ### Retry Policy
 
-#### `zigmodu.http.RetryPolicy`
+#### `zigmodu.http.HttpClient.RetryPolicy`
 
 Exponential backoff retry strategy.
 
@@ -508,7 +508,7 @@ pub fn calculateDelay(self: RetryPolicy, attempt: u32) u64
 
 ### Distributed Tracing
 
-#### `zigmodu.tracing.DistributedTracer`
+#### `zigmodu.observability.DistributedTracer`
 
 OpenTelemetry-compatible distributed tracing.
 
@@ -533,7 +533,7 @@ pub fn end(self: *Span) void
 
 ### Prometheus Metrics
 
-#### `zigmodu.metrics.PrometheusMetrics`
+#### `zigmodu.observability.PrometheusMetrics`
 
 Prometheus-compatible metrics collection.
 
@@ -578,7 +578,7 @@ pub fn observe(self: *Histogram, value: f64) void
 
 ### Auto Instrumentation
 
-#### `zigmodu.metrics.AutoInstrumentation`
+#### `zigmodu.observability.AutoInstrumentation`
 
 Automatic instrumentation for modules.
 
@@ -592,7 +592,7 @@ pub fn recordApiRequestStart(self: *Self, api_name: []const u8, module_name: []c
 
 ### Structured Logging
 
-#### `zigmodu.log.StructuredLogger`
+#### `zigmodu.observability.StructuredLogger`
 
 JSON-formatted structured logging.
 
@@ -700,7 +700,7 @@ Thresholds, PromQL and the Grafana dashboard: [`OBSERVABILITY.md`](OBSERVABILITY
 | `applyHttpDefaults(server, ProfileConfig, *HttpProfileState)` | CORS / request-id / recover / access log / in-memory metrics middleware only |
 | `ResilienceProfileState.init(allocator, deps)` / `applyResilienceDefaults` | per-dependency `CircuitBreaker` + `RateLimiter` holders — nothing is enforced until handlers use `breaker(name)` / `limiter(name)` |
 
-### `zigmodu.metrics.PrometheusMetrics`（HTTP profile 接线）
+### `zigmodu.observability.PrometheusMetrics`（HTTP profile 接线）
 
 与上文是**同一个类型**，这里只列 HTTP profile 侧用到的入口。
 
@@ -1512,7 +1512,7 @@ pub const ModuleGateConfig = struct { reject: AuthRejectFn = defaultReject, ... 
 
 ### JWT Authentication
 
-#### `zigmodu.security.JwtModule`
+#### `zigmodu.security.SecurityModule`
 
 JWT token generation and verification.
 
@@ -1574,7 +1574,7 @@ pub fn isSecure(self: *Self, result: *const ScanResult) bool
 
 ### Module Testing
 
-#### `zigmodu.test.ModuleTestContext`
+#### `zigmodu.ModuleTestContext`
 
 Testing context for module testing.
 
@@ -1588,7 +1588,7 @@ pub fn stop(self: *Self) void
 
 ### Integration Testing
 
-#### `zigmodu.test.IntegrationTest`
+#### `zigmodu.IntegrationTest`
 
 Full integration test framework.
 
@@ -1603,7 +1603,7 @@ pub fn waitFor(self: *Self, condition: fn () bool, timeout_ms: u64) !void
 
 ### Benchmark
 
-#### `zigmodu.test.Benchmark`
+#### `zigmodu.Benchmark`
 
 Performance benchmarking utilities.
 

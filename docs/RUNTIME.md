@@ -411,7 +411,7 @@ const s = rt.stats();
 **接进 `/metrics`**：`RuntimeStats` 有现成的桥，起服务时接一次即可，抓取时采样（无后台线程）：
 
 ```zig
-var bridge = try zigmodu.Runtime.MetricsBridge(PrometheusMetrics).init(&rt, metrics);
+var bridge = try zigmodu.runtime.Runtime.MetricsBridge(PrometheusMetrics).init(&rt, metrics);
 metrics.setScrapeHook(@TypeOf(bridge).sample, &bridge);
 ```
 

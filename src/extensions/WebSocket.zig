@@ -54,23 +54,29 @@ pub const WebSocketServer = struct {
         self.max_frame_size = size;
     }
 
+    /// Tear down the registry. `stop()` has already drained the connection
+    /// fibers, so the only possible holder of the registry lock is a concurrent
+    /// `broadcast` — and the previous shape answered that contention with
+    /// `tryLock`, then freed the client list anyway (both branches did the same
+    /// work). That is memory unsafety dressed up as a teardown: the holder's
+    /// next `clients` access reads freed storage, and a client could be freed
+    /// twice. A destructor has to run to completion, so it waits — the rule
+    /// `im/BufferPool.zig`, `cache/Lru.zig` and `pool/Pool.zig` follow. Red:
+    /// `WebSocketServer: deinit waits for the registry lock instead of freeing
+    /// underneath it`.
     pub fn deinit(self: *Self) void {
         self.stop();
 
-        if (self.clients_mutex.tryLock()) {
-            defer self.clients_mutex.unlock(self.io);
-            for (self.clients.items) |client| {
-                client.deinit();
-                self.allocator.destroy(client);
-            }
-            self.clients.deinit();
-        } else {
-            for (self.clients.items) |client| {
-                client.deinit();
-                self.allocator.destroy(client);
-            }
-            self.clients.deinit();
+        self.clients_mutex.lockUncancelable(self.io);
+        defer self.clients_mutex.unlock(self.io);
+        for (self.clients.items) |client| {
+            // `release`, not `deinit` + `destroy`: a fan-out that selected this
+            // client before the lock was taken may still be writing to it, and
+            // it holds a reference. The last reference out closes the socket and
+            // frees the client (see `WebSocketClient.release`).
+            client.release();
         }
+        self.clients.deinit();
     }
 
     pub fn start(self: *Self) !void {
@@ -124,7 +130,16 @@ pub const WebSocketServer = struct {
     }
 
     fn handleConnection(self: *Self, conn: std.Io.net.Stream) void {
-        defer conn.close(self.io);
+        // The socket changes hands once the client is registered: from then on
+        // the client owns it, and only its *last* reference closes it
+        // (`WebSocketClient.release`) — a fan-out that already selected this
+        // client may still be writing to that socket, and closing it underneath
+        // the write would hand the number to whatever opens next. Every early
+        // return before registration closes it here.
+        var frame_owns_socket = true;
+        defer {
+            if (frame_owns_socket) conn.close(self.io);
+        }
 
         var buf: [4096]u8 = undefined;
         // Raw posix read, like `WebSocketClient.readFull`: this is a
@@ -243,11 +258,13 @@ pub const WebSocketServer = struct {
         // could never fire.)
         self.addClient(client) catch |err| {
             std.log.err("[WebSocketServer] Failed to add client: {}", .{err});
-            // The socket belongs to this frame's `defer conn.close` above;
-            // `client.deinit()` here would close the same fd twice.
+            // Still this frame's socket (`frame_owns_socket` is untouched), so
+            // the `defer` above closes it; `client.deinit()` here would close the
+            // same fd twice.
             self.allocator.destroy(client);
             return;
         };
+        frame_owns_socket = false;
 
         if (self.on_connect_cb) |cb| {
             cb(client);
@@ -255,17 +272,16 @@ pub const WebSocketServer = struct {
 
         client.run();
 
-        // Remove client after disconnect, and free it — but do *not* call
-        // `client.deinit()`: `client.stream` is this frame's `conn` (passed by
-        // value), so the `defer conn.close` above is the one that closes the fd.
-        // Closing it twice is not a duplicate-close no-op — once the number is
-        // reusable it closes whatever got the same fd next (the platform's Io
-        // raises `recoverableOsBugDetected` for exactly this in debug builds).
-        // The ownership split is: the frame owns the fd until it returns;
-        // `client.deinit` is for clients the *server* still owns (see
-        // `WebSocketServer.deinit`), where this frame is long gone.
+        // Unregister, then drop this fiber's reference. That reference is
+        // usually the last one, so it is what closes the socket and frees the
+        // client — but not necessarily: a fan-out that selected this client just
+        // before `removeClient` holds a reference of its own and may still be
+        // writing. Then the fan-out closes and frees, after the write (see
+        // `WebSocketClient.release`). Either way the fd is closed exactly once,
+        // after the last write to it, and never while this frame is still using
+        // it.
         self.removeClient(client);
-        self.allocator.destroy(client);
+        client.release();
     }
 
     fn extractHeaderValue(request: []const u8, header_name: []const u8) ?[]const u8 {
@@ -323,12 +339,25 @@ pub const WebSocketServer = struct {
     /// (`droppedBroadcasts`) and logged — a loud drop rather than an error nobody
     /// reads or a silent no-op.
     ///
-    /// The lock stays cancelable here, unlike the registry paths: a cancel means
-    /// the publishing task is being torn down, and waiting uncancelably would
-    /// hold that teardown open for a full fan-out. The loss is recoverable for
-    /// the caller that matters most (`WebSocketMonitor` re-broadcasts every 5s),
-    /// whereas a lost registry entry never comes back on its own.
+    /// The registry lock covers the **selection** of recipients only. It used to
+    /// be held across every socket write, so one peer that stopped reading (a
+    /// full send buffer parks the writing thread) froze the whole registry:
+    /// `addClient`, `removeClient` and `clientCount` all wait on that lock, and
+    /// the first two wait *uncancelably*. The recipients are snapshotted under
+    /// the lock, each holding a reference that keeps it alive while the write
+    /// runs outside it. Red: `WebSocketServer: broadcast keeps the registry lock
+    /// off the socket write`.
+    ///
+    /// The registry lock stays cancelable here, unlike the registry paths: a
+    /// cancel means the publishing task is being torn down, and waiting
+    /// uncancelably would hold that teardown open for a full fan-out. The loss is
+    /// recoverable for the caller that matters most (`WebSocketMonitor`
+    /// re-broadcasts every 5s), whereas a lost registry entry never comes back on
+    /// its own.
     pub fn broadcast(self: *Self, message: []const u8) void {
+        var recipients = std.array_list.Managed(*WebSocketClient).init(self.allocator);
+        defer recipients.deinit();
+
         self.clients_mutex.lock(self.io) catch |err| {
             // Counted, not just logged: this is the one path that loses a whole
             // message, and `void` gives the caller nowhere else to look. (`.warn`,
@@ -339,9 +368,41 @@ pub const WebSocketServer = struct {
             std.log.warn("[ws] broadcast of {d} bytes dropped: {s} (it reached no client)", .{ message.len, @errorName(err) });
             return;
         };
-        defer self.clients_mutex.unlock(self.io);
+        {
+            defer self.clients_mutex.unlock(self.io);
 
-        for (self.clients.items) |client| {
+            // Sized up front, while the lock is held: a partial snapshot would
+            // silently skip recipients, and `void` has no channel to report
+            // that. Failing here reaches nobody, so it is a dropped broadcast.
+            recipients.ensureTotalCapacity(self.clients.items.len) catch {
+                _ = self.dropped_broadcasts.fetchAdd(1, .monotonic);
+                std.log.warn("[ws] broadcast of {d} bytes dropped: no memory for {d} recipient(s)", .{ message.len, self.clients.items.len });
+                return;
+            };
+
+            for (self.clients.items) |client| {
+                // A client the owner has already released is on its way out;
+                // there is nothing to write to.
+                if (!client.acquire()) continue;
+                recipients.appendAssumeCapacity(client);
+            }
+        }
+
+        // Outside the lock: this is the part that can park (a slow peer's socket
+        // buffer), and the registry has to stay usable while it does.
+        for (recipients.items) |client| {
+            defer client.release();
+
+            // One writer per client, or two fan-outs would interleave
+            // half-frames on the same socket. Cancelable for the same reason the
+            // registry lock is: a canceled publisher must not stay parked on
+            // someone else's peer.
+            client.write_mutex.lock(self.io) catch |err| {
+                std.log.debug("[ws] broadcast to a client abandoned: {s}", .{@errorName(err)});
+                continue;
+            };
+            defer client.write_mutex.unlock(self.io);
+
             client.sendText(message) catch |err| {
                 std.log.err("[WebSocketServer] Broadcast error to client: {}", .{err});
             };
@@ -386,6 +447,21 @@ pub const WebSocketClient = struct {
     io: std.Io,
     server: *WebSocketServer,
     is_connected: bool,
+    /// Serializes frame writes. `writeFrame` issues more than one syscall once
+    /// the payload outgrows its 4096-byte writer buffer, so two concurrent
+    /// fan-outs to the same client would otherwise interleave half-frames on its
+    /// socket (before `broadcast` was changed to write outside the registry
+    /// lock, that lock serialized them by accident).
+    write_mutex: std.Io.Mutex,
+    /// How many places may still touch this client: 1 for the connection fiber
+    /// that owns it, +1 for every fan-out that selected it for a write.
+    ///
+    /// This is what makes "snapshot under the registry lock, write outside it"
+    /// safe: a client removed (and its socket handed to `release`) while a
+    /// fan-out is writing to it cannot be freed yet, because the fan-out holds a
+    /// reference. Before that, the registry lock was held across the write, so
+    /// removal could not start until the write finished.
+    refs: std.atomic.Value(u32),
 
     pub fn init(allocator: std.mem.Allocator, stream: std.Io.net.Stream, io: std.Io, server: *WebSocketServer) Self {
         return .{
@@ -394,13 +470,46 @@ pub const WebSocketClient = struct {
             .io = io,
             .server = server,
             .is_connected = true,
+            .write_mutex = std.Io.Mutex.init,
+            .refs = std.atomic.Value(u32).init(1),
         };
     }
 
+    /// Mark the client dead and close its socket. Frees nothing: the object is
+    /// freed by whoever drops the last reference (`release`).
     pub fn deinit(self: *Self) void {
         self.is_connected = false;
         self.stream.close(self.io);
         self.* = undefined;
+    }
+
+    /// Take a reference for an in-flight write, so this client cannot be freed
+    /// underneath it. False once the owner has released (refs == 0): the client
+    /// is being torn down and the caller must skip it.
+    ///
+    /// Only called while holding `WebSocketServer.clients_mutex`, and the
+    /// owner's own release happens after `removeClient` — which takes that same
+    /// lock — so this load-then-increment cannot race the transition to 0.
+    fn acquire(self: *Self) bool {
+        var cur = self.refs.load(.acquire);
+        while (cur != 0) {
+            if (self.refs.cmpxchgWeak(cur, cur + 1, .acquire, .monotonic)) |actual| {
+                cur = actual;
+                continue;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    /// Drop a reference. The last one out closes the socket and frees the
+    /// client — whoever it is: the connection fiber on its way out, a fan-out
+    /// that outlived the registration, or `WebSocketServer.deinit`.
+    fn release(self: *Self) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        const allocator = self.allocator;
+        self.deinit();
+        allocator.destroy(self);
     }
 
     pub fn run(self: *Self) void {
@@ -432,9 +541,12 @@ pub const WebSocketClient = struct {
                     break;
                 },
                 0x9 => { // Ping
-                    // A failed pong means the connection is dead; the next
-                    // read/heartbeat will surface it — no recovery possible
-                    // here, but log it so operators see flapping links.
+                    // A failed pong means the connection is dead, and the write
+                    // path says so: `sendFrame` has already cleared
+                    // `is_connected` by the time this returns, so the loop ends
+                    // at its next check instead of waiting for the read to
+                    // notice. No recovery is possible here; log it so operators
+                    // see flapping links.
                     self.sendPong() catch |err| {
                         std.log.debug("[ws] pong send failed: {}", .{err});
                     };
@@ -506,9 +618,30 @@ pub const WebSocketClient = struct {
         try self.sendFrame(0xA, &[_]u8{});
     }
 
+    /// Send one frame.
+    ///
+    /// Two failures with two different names, so a caller can act:
+    ///  * `error.NotConnected` — this client was *already* known dead, so not a
+    ///    byte was attempted (the guard below). Nothing to do but drop it.
+    ///  * `error.WriteFailed` — the write itself failed. The client is marked
+    ///    disconnected before returning, because a frame that fails partway
+    ///    through leaves the stream **mid-frame**: a retry would prepend a second
+    ///    header to the partial one and the peer's parser would see garbage. So
+    ///    the client is unusable whatever the cause was (peer gone, buffer full,
+    ///    task canceled) — and the cause is in the debug log.
+    ///
+    /// The old shape reported *every* write failure as `error.NotConnected`
+    /// (`BrokenPipe`, `SocketUnconnected`, a cancel — all the same name) and left
+    /// `is_connected` true, so a caller could not tell "the peer is gone" from
+    /// "try again", and the object went on advertising a connection that had
+    /// already failed. Red: `WebSocketClient: a write failure is named for the
+    /// write, and the flag stops lying`.
     fn sendFrame(self: *Self, opcode: u8, payload: []const u8) !void {
         if (!self.is_connected) return error.NotConnected;
+        try self.writeFrame(opcode, payload);
+    }
 
+    fn writeFrame(self: *Self, opcode: u8, payload: []const u8) error{WriteFailed}!void {
         var header_buf: [14]u8 = undefined;
         var header_len: usize = 2;
 
@@ -528,15 +661,26 @@ pub const WebSocketClient = struct {
 
         var write_buf: [4096]u8 = undefined;
         var w = self.stream.writer(self.io, &write_buf);
-        _ = w.interface.writeAll(header_buf[0..header_len]) catch return error.NotConnected;
-        _ = w.interface.writeAll(payload) catch return error.NotConnected;
+        _ = w.interface.writeAll(header_buf[0..header_len]) catch return self.writeFailed(&w);
+        _ = w.interface.writeAll(payload) catch return self.writeFailed(&w);
         // **The flush is the delivery.** `writeAll` returns as soon as the bytes
         // are copied into `write_buf` (4096 bytes here) and never touches the
         // socket; without this, every frame smaller than the buffer is dropped
         // when `w` goes out of scope — the client receives nothing, no error is
         // returned, and `broadcast` cannot tell. Red: `WebSocketServer: a live
         // client is handshaken, pushed to, and dropped` (the push times out).
-        w.interface.flush() catch return error.NotConnected;
+        w.interface.flush() catch return self.writeFailed(&w);
+    }
+
+    /// The one exit for a failed frame write: keep the writer's own cause (the
+    /// `WriteFailed` the `Io.Writer` interface returns hides it — `w.err` is
+    /// where the `Io` puts the real one), stop claiming to be connected, and name
+    /// the failure for what it is.
+    fn writeFailed(self: *Self, w: *std.Io.net.Stream.Writer) error{WriteFailed} {
+        self.is_connected = false;
+        const cause = if (w.err) |c| @errorName(c) else "unreported";
+        std.log.debug("[ws] frame write failed ({s}); the client is now marked disconnected", .{cause});
+        return error.WriteFailed;
     }
 };
 
@@ -671,7 +815,7 @@ test "WebSocketServer: cancelation cannot strand a client at register" {
     var server = WebSocketServer.init(std.testing.allocator, io, 19003);
     defer deinitWithStandInClients(&server, io);
 
-    var stand_in: WebSocketClient = undefined;
+    var stand_in = standInClient(&server, io);
 
     const Probe = struct {
         var add_err: ?anyerror = null;
@@ -706,7 +850,7 @@ test "WebSocketServer: cancelation cannot strand a client at removal" {
     var server = WebSocketServer.init(std.testing.allocator, io, 19004);
     defer deinitWithStandInClients(&server, io);
 
-    var stand_in: WebSocketClient = undefined;
+    var stand_in = standInClient(&server, io);
     try server.addClient(&stand_in);
     try std.testing.expectEqual(@as(usize, 1), server.clientCount());
 
@@ -739,7 +883,7 @@ test "WebSocketServer: clientCount reports the live count, not a lock verdict" {
     var server = WebSocketServer.init(std.testing.allocator, io, 19005);
     defer deinitWithStandInClients(&server, io);
 
-    var stand_in: WebSocketClient = undefined;
+    var stand_in = standInClient(&server, io);
     try server.addClient(&stand_in);
 
     const Probe = struct {
@@ -886,4 +1030,192 @@ test "WebSocketServer: a live client is handshaken, pushed to, and dropped" {
     w.interface.flush() catch return error.CloseWriteFailed;
     waitForClientCount(&server, 0);
     try std.testing.expectEqual(@as(usize, 0), server.clientCount());
+}
+
+// ── The client's socket, and the registry lock across a fan-out ──────────────
+
+/// A socket that was never connected to anything, as a `std.Io.net.Stream`.
+/// Writing to it fails *in the syscall* (`ENOTCONN` → `error.SocketUnconnected`),
+/// which is the write failure `sendFrame` has to name. `null` when the platform
+/// refuses the socket, and the caller skips.
+fn unconnectedStream() ?struct { stream: std.Io.net.Stream, fd: std.posix.socket_t } {
+    const rc = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    if (std.posix.errno(rc) != .SUCCESS) return null;
+    const fd: std.posix.socket_t = @intCast(rc);
+    return .{
+        .stream = .{ .socket = .{ .handle = fd, .address = undefined } },
+        .fd = fd,
+    };
+}
+
+/// One end of a `socketpair` (the client's side) plus the peer end, so a test can
+/// drive a client's socket with no network and no port to collide on.
+const TestSocketPair = struct {
+    stream: std.Io.net.Stream,
+    peer_fd: std.posix.socket_t,
+
+    fn open() ?TestSocketPair {
+        var fds: [2]std.posix.socket_t = undefined;
+        const rc = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => {},
+            else => return null,
+        }
+        return .{
+            .stream = .{ .socket = .{ .handle = fds[0], .address = undefined } },
+            .peer_fd = fds[1],
+        };
+    }
+
+    /// Close the peer end. The client's end is owned by whoever took `stream`
+    /// (the server, once the client is registered; the test otherwise).
+    fn closePeer(self: *const TestSocketPair) void {
+        _ = std.posix.system.close(self.peer_fd);
+    }
+
+    /// Read up to `want` bytes off the peer end (bounded, so a wedged writer
+    /// fails the test instead of hanging the suite).
+    fn drain(self: *const TestSocketPair, want: usize) usize {
+        var got: usize = 0;
+        var buf: [4096]u8 = undefined;
+        var idle: usize = 0;
+        while (got < want and idle < 500) : (idle += 1) {
+            var pfds = [_]std.posix.pollfd{.{ .fd = self.peer_fd, .events = std.posix.POLL.IN, .revents = 0 }};
+            if ((std.posix.poll(&pfds, 20) catch 0) == 0) continue;
+            const n = std.posix.read(self.peer_fd, &buf) catch break;
+            if (n == 0) break;
+            got += n;
+        }
+        return got;
+    }
+};
+
+/// A registered client that exists only for the registry — identity and
+/// placement, never a write. `WebSocketClient.init` has to run because registry
+/// paths read the client's own state (`refs` and `write_mutex`), which an
+/// `undefined` stand-in leaves as garbage.
+fn standInClient(server: *WebSocketServer, io: std.Io) WebSocketClient {
+    return WebSocketClient.init(std.testing.allocator, .{ .socket = .{ .handle = -1, .address = undefined } }, io, server);
+}
+
+test "WebSocketClient: a write failure is named for the write, and the flag stops lying" {
+    const io = std.testing.io;
+    const sock = unconnectedStream() orelse return error.SkipZigTest;
+    defer _ = std.posix.system.close(sock.fd);
+
+    var server = WebSocketServer.init(std.testing.allocator, io, 0);
+    defer server.deinit();
+
+    var client = WebSocketClient.init(std.testing.allocator, sock.stream, io, &server);
+    try std.testing.expect(client.is_connected);
+
+    // The write itself fails (`SocketUnconnected`, not `NotConnected`): the peer
+    // never went away, the socket was never usable. Naming that "not connected"
+    // leaves the caller unable to tell a dead peer from a transient failure.
+    const result: anyerror!void = client.sendText("hello");
+    try std.testing.expectError(error.WriteFailed, result);
+
+    // ... and the object must stop claiming to be connected: the header may
+    // already be on the wire, so the stream is mid-frame and unusable for a
+    // later frame. A caller that retries on a still-`is_connected` client is
+    // writing into a socket that has already failed.
+    try std.testing.expect(!client.is_connected);
+}
+
+test "WebSocketServer: broadcast keeps the registry lock off the socket write" {
+    const io = std.testing.io;
+    const pair = TestSocketPair.open() orelse return error.SkipZigTest;
+    defer pair.closePeer();
+    var server = WebSocketServer.init(std.testing.allocator, io, 0);
+    // `deinit` releases the registered client, which is what closes its end.
+    defer server.deinit();
+
+    const client = try std.testing.allocator.create(WebSocketClient);
+    client.* = WebSocketClient.init(std.testing.allocator, pair.stream, io, &server);
+    try server.addClient(client);
+    try std.testing.expectEqual(@as(usize, 1), server.clientCount());
+
+    const payload = try std.testing.allocator.alloc(u8, 128 * 1024);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 'p');
+
+    const Probe = struct {
+        var cast_started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+        var probe_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+        var observed: usize = 0;
+
+        fn cast(s: *WebSocketServer, message: []const u8) void {
+            cast_started.store(true, .release);
+            s.broadcast(message);
+        }
+        fn count(s: *WebSocketServer) void {
+            observed = s.clientCount();
+            probe_done.store(true, .release);
+        }
+    };
+    Probe.cast_started.store(false, .release);
+    Probe.probe_done.store(false, .release);
+    Probe.observed = 0;
+
+    // The peer never reads, so the fan-out parks in the socket write once the
+    // send buffer fills (macOS socketpair: 8 KiB). This is the window in which
+    // the registry lock used to be held — the peer is slow, and add/remove/count
+    // all wait on that same lock, `addClient`/`removeClient` uncancelably.
+    var cast_fut = try io.concurrent(Probe.cast, .{ &server, payload });
+    var spins: usize = 0;
+    while (spins < wait_for_parked_fiber_rounds and !Probe.cast_started.load(.acquire)) : (spins += 1) {
+        std.atomic.spinLoopHint();
+    }
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(300), .awake);
+
+    var count_fut = try io.concurrent(Probe.count, .{&server});
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(400), .awake);
+    // Read before the drain: under the old shape the count fiber is still parked
+    // behind the lock the fan-out holds for the whole write.
+    const counted_while_writing = Probe.probe_done.load(.acquire);
+
+    // Drain the peer end so the writer can finish — a fiber parked in a socket
+    // write must never outlive the test. The frame is a 10-byte header (opcode +
+    // 127 + u64 length, since the payload needs more than 16 bits) plus payload.
+    const frame_len = payload.len + 10;
+    const drained = pair.drain(frame_len);
+    cast_fut.await(io);
+    count_fut.await(io);
+
+    try std.testing.expectEqual(@as(usize, frame_len), drained);
+    try std.testing.expect(counted_while_writing);
+    try std.testing.expectEqual(@as(usize, 1), Probe.observed);
+}
+
+test "WebSocketServer: deinit waits for the registry lock instead of freeing underneath it" {
+    const io = std.testing.io;
+    var server = WebSocketServer.init(std.testing.allocator, io, 0);
+
+    const Probe = struct {
+        var deinit_returned: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+        fn drop(s: *WebSocketServer) void {
+            s.deinit();
+            deinit_returned.store(true, .release);
+        }
+        fn unlock(s: *WebSocketServer, owner_io: std.Io) void {
+            s.clients_mutex.unlock(owner_io);
+        }
+    };
+    Probe.deinit_returned.store(false, .release);
+
+    server.clients_mutex.lockUncancelable(io);
+    var drop_fut = try io.concurrent(Probe.drop, .{&server});
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(200), .awake);
+    const returned_under_the_lock = Probe.deinit_returned.load(.acquire);
+    var unlock_fut = try io.concurrent(Probe.unlock, .{ &server, io });
+    unlock_fut.await(io);
+    drop_fut.await(io);
+
+    // A destructor has to run to completion. Answering "someone holds the
+    // registry" with `tryLock` and then freeing the client list anyway is memory
+    // unsafety, not a teardown — `im/BufferPool.zig`'s and `cache/Lru.zig`'s
+    // rule is that it waits.
+    try std.testing.expect(!returned_under_the_lock);
+    try std.testing.expect(Probe.deinit_returned.load(.acquire));
 }
