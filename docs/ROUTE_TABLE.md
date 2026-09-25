@@ -204,6 +204,17 @@ fn assertNoDupes(comptime modules: anytype) void {
 
 调用：`comptime assertNoDupes(.{ CrmCustomer, InsuranceAgents, ... });`
 
+### 4.6 路径参数上限：8 个（注册期错误，不是 404）
+
+一条路由最多带 **8** 个 `{…}` 段（`RouteParams.MAX`；`{id}` 计 1 个，`*` 通配路由不参与计数）。
+超限不再表现为「匹配不上」，而是**注册期**错误：`Router.addRoute` /
+`Server.addRoute` 在动 trie **之前**返回 `error.TooManyRouteParams`
+（`src/api/Server.zig`），所以 `mountAll` 里的启动期 `try` 会直接把它拦下来。
+
+这条错误是「启动期失败」而不是「请求期失败」是刻意的：`match` 没有错误通道，
+过去它只能对一条永远匹配不上的路由返回 `null` —— 也就是一个**每个请求都 404**、
+却看起来注册成功的路由（`Server.zig` 里有对应用例）。
+
 ---
 
 ## 5. `std.Io` 用在哪

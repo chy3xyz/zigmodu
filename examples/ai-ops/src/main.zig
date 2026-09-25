@@ -224,7 +224,6 @@ fn runDemo(allocator: std.mem.Allocator, io: std.Io, verbose: bool, serve: bool)
     } else {
         try std.testing.expect(catalog.findEntry(.GET, "api/approvals/pending") != null);
         var matched = server.router.match(allocator, .POST, "/api/approvals/order-2/approve") orelse return error.RouteNotFound;
-        defer matched.deinit(allocator);
         var http_ctx = try http.Context.init(allocator, .POST, "/api/approvals/order-2/approve");
         defer http_ctx.deinit();
         http_ctx.user_data = matched.route.user_data;

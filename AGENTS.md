@@ -210,6 +210,7 @@ const now_ms = Time.monotonicNowMilliseconds();
 
 ### HTTP routing (ComptimeRouter — preferred)
 - Modules declare `pub const routes` + `module_name` + `nest`; wire with `http.Router.scope.mountAll`
+- **Path params**: 每条路由最多 8 个 `{…}` 段（`RouteParams.MAX`）；超了是**注册期** `error.TooManyRouteParams`（`Router.addRoute`/`Server.addRoute`，过去是静默 404）
 - Auth stack (Path A): `jwtAuthFromCatalogWithPermissions` + `permissionGateWith(.{ .mode = .rbac })` + optional `moduleGate`
 - Auth (v0.15.31+, §7.2): 非 JWT 后端用 `authFromCatalog(slot, backend)` + `AuthBackend`（内置 `jwtBackend`）；拒绝信封 `AuthRejectFn` / `envelopeReject(.thinkphp)`；handler 读 `ctx.userId()/requireUserId()/tenantId()`；信封方言 `ctx.setEnvelope` + `ok/fail/unauth/paginated`；租户 `tenantResolver`；路由级 `RouteMeta.roles`；token 提取 `extractTokenAny`；CI 审计 `Testkit.auditAuthCoverage`
 - Permissions: `catalogLoaderFromTable` / `CatalogPermDb.loaderFromClient`，或多主体自定义 loader（`CatalogPermLoadInput{ sub, aud, roles }`）

@@ -997,11 +997,8 @@ test "Router mount expands routes into catalog" {
     try std.testing.expectEqualStrings("crm", catalog.moduleFor("/admin-api/crm/customer/page").?);
 
     // Handler wired: match + invoke. Nothing is released — the match borrows the
-    // trie's parameter names and slices of the path it was given — but the
-    // teardown stays: `examples/ai-ops/src/main.zig` calls it, and that example
-    // is part of the list CI builds.
+    // trie's parameter names and slices of the path it was given.
     var matched = server.router.match(std.testing.allocator, .GET, "/admin-api/crm/customer/page");
-    defer if (matched) |*m| m.deinit(std.testing.allocator);
     try std.testing.expect(matched != null);
     var ctx = try Context.init(std.testing.allocator, .GET, "/admin-api/crm/customer/page");
     defer ctx.deinit();

@@ -572,6 +572,12 @@ pub fn group(self: *Server, prefix: []const u8) RouteGroup
 pub fn withGracefulDrain(self: *Server, counter: *std.atomic.Value(u64)) void
 ```
 
+`addRoute` returns `error.TooManyRouteParams` when a path carries more than
+**8** `{…}` segments (`RouteParams.MAX`, `{id}` counts as one). The check runs at
+registration, before the trie is touched, and `router.mountAll` propagates it —
+so a too-wide route fails at startup. It used to register and then 404 every
+request (details: `docs/ROUTE_TABLE.md` §4.6).
+
 #### `Server.Config`
 
 | Field | Default | Meaning |

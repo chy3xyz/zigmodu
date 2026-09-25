@@ -477,6 +477,10 @@ fn timingSafeSliceEql(a: []const u8, b: []const u8) bool {
 fn base64UrlEncode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     const encoder = std.base64.Base64Encoder.init(std.base64.standard_alphabet_chars, '=');
     const encoded = try allocator.alloc(u8, encoder.calcSize(data.len));
+    // The shrink below is a second allocation point: if it fails, `encoded` is
+    // still live and nobody else can free it — same class as the `errdefer` in
+    // `base64UrlDecode`, and the same way of not leaking.
+    errdefer allocator.free(encoded);
     _ = encoder.encode(encoded, data);
 
     // Replace + with -, / with _, remove =

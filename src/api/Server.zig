@@ -2177,18 +2177,6 @@ const RouteParams = struct {
 const MatchedRoute = struct {
     route: Route,
     params: RouteParams,
-
-    /// Releases nothing, and there is nothing a caller could forget to do:
-    /// `params` borrows the trie's node names and slices of the path it was
-    /// matched against, and the route belongs to the router. It is not
-    /// call-site-free: `ComptimeRouter`'s catalog test and
-    /// `examples/ai-ops/src/main.zig` tear a match down through it, and the
-    /// example list is built in CI — deleting it breaks an application that
-    /// copied the shape. Kept as the explicit "there is nothing here" answer.
-    pub fn deinit(self: *MatchedRoute, allocator: std.mem.Allocator) void {
-        _ = self;
-        _ = allocator;
-    }
 };
 
 /// Copy a match's borrowed parameters into a map the caller owns — the step

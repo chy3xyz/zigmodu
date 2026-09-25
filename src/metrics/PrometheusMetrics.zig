@@ -3,12 +3,47 @@ const Time = @import("../core/Time.zig");
 
 /// Prometheus metrics collector
 /// Supports Counter, Gauge, Histogram, Summary
+///
+/// # Lifecycle: every registration happens before the first scrape
+///
+/// The *values* are thread-safe (atomics, plus a mutex per labeled family),
+/// but *registration* is not: the containers below are hash maps and array
+/// lists, and `create*` inserts into them. `toPrometheusFormat` iterates them,
+/// and a `put` that rehashes mid-scrape frees the bucket array that iteration
+/// is walking — a use-after-free, the same shape the per-family `render` had
+/// before `SeriesSnapshot`.
+///
+/// In-tree, every `create*` call site is startup wiring: `productionProfile`,
+/// `Runtime.MetricsBridge.init`, `OutboxConsumer.setMetrics`,
+/// `AutoInstrumentation.init`, `ModuleMetricsCollector.init` (plus app startup
+/// code and test harnesses). The per-label series a request thread creates goes
+/// through `CounterFamily.get` / `HistogramFamily.get` — mutex-guarded and
+/// rendered from a snapshot — never through `create*`. `toBackend()` is the one
+/// path that hands these creators to a *consumer* who might call them at
+/// request time; it is subject to the same seal, and it has no in-tree
+/// production caller.
+///
+/// Instead of leaving "registration is startup-only" as an assumption, the
+/// registry states it: the first scrape (or an explicit `freeze()`) seals the
+/// containers, and a later `create*` returns `error.Frozen` without touching
+/// them. Same contract and error as `zmodu.FrozenStringMap` / `Container.freeze`.
 pub const PrometheusMetrics = struct {
     const Self = @This();
+
+    /// Raised by `create*` once the registry is sealed. The registration did
+    /// not happen — nothing was inserted, so there is no half-written entry —
+    /// and the caller either drops it or moves it earlier, before the first
+    /// scrape.
+    pub const FrozenError = error{Frozen};
 
     allocator: std.mem.Allocator,
     scrape_hook: ?ScrapeHook,
     scrape_userdata: ?*anyopaque,
+    /// Set by the first `toPrometheusFormat` (or `freeze()`), never cleared:
+    /// once `true`, the containers below are immutable and a scrape may read
+    /// them without a lock. `toPrometheusFormat` is the first point at which a
+    /// scrape can run concurrently with a registrar, so it is the deadline.
+    frozen: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Bounded-cardinality labeled series (see `createCounterFamily`).
     counter_families: std.ArrayList(*CounterFamily),
     histogram_families: std.ArrayList(*HistogramFamily),
@@ -113,10 +148,32 @@ pub const PrometheusMetrics = struct {
         }
     };
 
+    /// Summary: `sum_bits`/`count` are atomic, but the sample buffer is **not**
+    /// synchronized — it is the one container in this file that is neither
+    /// atomic nor lock-protected, and it is deliberately called out here rather
+    /// than left to be discovered:
+    ///
+    /// * `observe` appends to `values` (or writes one slot) without a lock, so
+    ///   two threads observing the same summary concurrently can lose an append
+    ///   or write through a reallocated buffer. `Counter.inc`, `Gauge.set` and
+    ///   `Histogram.observe` are thread-safe; this one is not.
+    /// * `getQuantile` reads *and swaps* the same buffer in place, so it must not
+    ///   run concurrently with an `observe`.
+    ///
+    /// It is unreachable from the scrape today, and both halves of that are
+    /// pinned by tests: `toPrometheusFormat` renders no summary lines at all
+    /// (counters, gauges and histograms only), and `createSummary` has no
+    /// in-tree caller outside tests. If a summary line is ever added to a
+    /// scrape (or a summary is observed from request threads), this buffer
+    /// needs the treatment the labeled families got — a mutex plus a snapshot
+    /// copy taken under it (`SeriesSnapshot`), or a fixed-capacity reservoir of
+    /// atomic slots — before it is shared.
     pub const Summary = struct {
         name: []const u8,
         help: []const u8,
         quantiles: std.array_list.Managed(f64),
+        /// Not thread-safe: see the note on `Summary`. `observe` writes it
+        /// unlocked, `getQuantile` reads it unlocked.
         values: std.array_list.Managed(f64),
         /// Thread-safe f64 sum via bitcast u64 + CAS (same pattern as Gauge).
         sum_bits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -178,7 +235,15 @@ pub const PrometheusMetrics = struct {
                     if (i <= j) {
                         std.mem.swap(f64, &items[i], &items[j]);
                         i += 1;
-                        j -= 1;
+                        // Saturating, not `j -= 1`: this branch is reached with
+                        // `j == 0` exactly when `lo == 0` and `i == 0`, where the
+                        // swap above is a no-op and the partition is done. A plain
+                        // decrement underflows `usize` there — Debug panics with
+                        // "integer overflow", ReleaseFast wraps to a huge index so
+                        // the narrowing below reads `items[j]` out of bounds. In
+                        // the signed form of this loop `j` becomes -1; saturated
+                        // at 0 the narrowing takes the same branch (`lo = i`).
+                        j -|= 1;
                     }
                 }
                 if (target <= j) {
@@ -474,9 +539,33 @@ pub const PrometheusMetrics = struct {
         };
     }
 
+    /// Wire the scrape hook. Do it during startup wiring, **before** the first
+    /// scrape: the two fields are a pair (a hook is only meaningful with the
+    /// userdata it was written for), and a `setScrapeHook` that lands while a
+    /// scrape is in flight can be read torn — the new hook with the old
+    /// userdata. Unlike `create*`, this is not gated on `freeze()`; the hook
+    /// runs on the scrape thread and only refreshes existing handles, so it
+    /// cannot reach the registry containers the seal protects.
     pub fn setScrapeHook(self: *Self, hook: ?ScrapeHook, userdata: ?*anyopaque) void {
         self.scrape_hook = hook;
         self.scrape_userdata = userdata;
+    }
+
+    /// Seal the registry: from here on `create*` fails with `error.Frozen`, and
+    /// the containers are never mutated again — which is what lets a scrape
+    /// read them without a lock.
+    ///
+    /// `toPrometheusFormat` calls this itself before it reads anything, so an
+    /// explicit call is only for a deployment that wants the seal (and the
+    /// late-registration failures) to start earlier than the first scrape.
+    /// Idempotent; there is no `unfreeze` — the containers cannot be made
+    /// mutable again safely once any thread may be reading them.
+    pub fn freeze(self: *Self) void {
+        self.frozen.store(true, .release);
+    }
+
+    pub fn isFrozen(self: *const Self) bool {
+        return self.frozen.load(.acquire);
     }
 
     pub fn deinit(self: *Self) void {
@@ -530,8 +619,10 @@ pub const PrometheusMetrics = struct {
         self.* = undefined;
     }
 
-    /// Create Counter
-    pub fn createCounter(self: *Self, name: []const u8, help: []const u8) !*Counter {
+    /// Create Counter. Fails with `error.Frozen` once the registry is sealed
+    /// (a scrape has run) — see the lifecycle note on the type.
+    pub fn createCounter(self: *Self, name: []const u8, help: []const u8) (FrozenError || std.mem.Allocator.Error)!*Counter {
+        if (self.isFrozen()) return error.Frozen;
         const counter = try self.allocator.create(Counter);
         errdefer self.allocator.destroy(counter);
         const name_copy = try self.allocator.dupe(u8, name);
@@ -550,8 +641,9 @@ pub const PrometheusMetrics = struct {
         return counter;
     }
 
-    /// Create Gauge
-    pub fn createGauge(self: *Self, name: []const u8, help: []const u8) !*Gauge {
+    /// Create Gauge. Fails with `error.Frozen` once the registry is sealed.
+    pub fn createGauge(self: *Self, name: []const u8, help: []const u8) (FrozenError || std.mem.Allocator.Error)!*Gauge {
+        if (self.isFrozen()) return error.Frozen;
         const gauge = try self.allocator.create(Gauge);
         errdefer self.allocator.destroy(gauge);
         const name_copy = try self.allocator.dupe(u8, name);
@@ -569,8 +661,9 @@ pub const PrometheusMetrics = struct {
         return gauge;
     }
 
-    /// Create Histogram
-    pub fn createHistogram(self: *Self, name: []const u8, help: []const u8, buckets: []const f64) !*Histogram {
+    /// Create Histogram. Fails with `error.Frozen` once the registry is sealed.
+    pub fn createHistogram(self: *Self, name: []const u8, help: []const u8, buckets: []const f64) (FrozenError || std.mem.Allocator.Error)!*Histogram {
+        if (self.isFrozen()) return error.Frozen;
         const histogram = try self.allocator.create(Histogram);
         errdefer self.allocator.destroy(histogram);
 
@@ -600,8 +693,9 @@ pub const PrometheusMetrics = struct {
         return histogram;
     }
 
-    /// Create Summary
-    pub fn createSummary(self: *Self, name: []const u8, help: []const u8) !*Summary {
+    /// Create Summary. Fails with `error.Frozen` once the registry is sealed.
+    pub fn createSummary(self: *Self, name: []const u8, help: []const u8) (FrozenError || std.mem.Allocator.Error)!*Summary {
+        if (self.isFrozen()) return error.Frozen;
         const summary = try self.allocator.create(Summary);
         errdefer self.allocator.destroy(summary);
 
@@ -631,8 +725,18 @@ pub const PrometheusMetrics = struct {
         return self.gauges.get(name);
     }
 
-    /// Generate Prometheus-format metrics output
+    /// Generate Prometheus-format metrics output.
+    ///
+    /// Seals the registry first: the loops below iterate the registry-level
+    /// containers, which `create*` inserts into (a rehash frees the bucket
+    /// array this pass is walking), so from here on a registration is refused
+    /// with `error.Frozen` instead of racing the scrape. The seal goes down
+    /// before the hook too: the hook is part of the scrape and its job is to
+    /// refresh handles that already exist — a registration from there would
+    /// only work on the first scrape and be refused on every later one, which
+    /// is a worse contract than refusing it outright.
     pub fn toPrometheusFormat(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
+        self.freeze();
         if (self.scrape_hook) |hook| hook(self.scrape_userdata);
         var buf = std.array_list.Managed(u8).init(allocator);
         defer buf.deinit();
@@ -808,7 +912,12 @@ pub const PrometheusMetrics = struct {
 
     /// Bounded-cardinality counter split by a single label.
     /// `max_series` caps distinct label values; extra ones share `__other__`.
-    pub fn createCounterFamily(self: *Self, name: []const u8, help: []const u8, label: []const u8, max_series: usize, io: std.Io) !*CounterFamily {
+    ///
+    /// Fails with `error.Frozen` once the registry is sealed (a scrape has run)
+    /// — see the lifecycle note on the type. The per-label series a request
+    /// thread wants do not come through here: they come from `CounterFamily.get`.
+    pub fn createCounterFamily(self: *Self, name: []const u8, help: []const u8, label: []const u8, max_series: usize, io: std.Io) (FrozenError || std.mem.Allocator.Error)!*CounterFamily {
+        if (self.isFrozen()) return error.Frozen;
         const f = try self.allocator.create(CounterFamily);
         errdefer self.allocator.destroy(f);
         const name_copy = try self.allocator.dupe(u8, name);
@@ -836,8 +945,10 @@ pub const PrometheusMetrics = struct {
         return f;
     }
 
-    /// Bounded-cardinality histogram split by a single label.
-    pub fn createHistogramFamily(self: *Self, name: []const u8, help: []const u8, label: []const u8, max_series: usize, buckets: []const f64, io: std.Io) !*HistogramFamily {
+    /// Bounded-cardinality histogram split by a single label. Fails with
+    /// `error.Frozen` once the registry is sealed (a scrape has run).
+    pub fn createHistogramFamily(self: *Self, name: []const u8, help: []const u8, label: []const u8, max_series: usize, buckets: []const f64, io: std.Io) (FrozenError || std.mem.Allocator.Error)!*HistogramFamily {
+        if (self.isFrozen()) return error.Frozen;
         const f = try self.allocator.create(HistogramFamily);
         errdefer self.allocator.destroy(f);
         const name_copy = try self.allocator.dupe(u8, name);
@@ -1327,4 +1438,178 @@ test "family render takes the family mutex (a scrape never walks the series map 
     histogram_task.await(io);
     try std.testing.expect(Task.done.load(.acquire));
     try std.testing.expectEqual(@as(?anyerror, null), Task.err);
+}
+
+// `toPrometheusFormat` iterates the registry-level container (`counters` /
+// `gauges` / `histograms` / `summaries` and the two family lists) while
+// `create*` inserts into them; `put` rehashes and frees the bucket array the
+// iteration is walking, so a registration that arrives during a scrape is the
+// same use-after-free the per-family `render` had — not a stale line in one
+// scrape. Every in-tree `create*` call site is startup wiring (the per-label
+// series a request thread creates goes through `family.get`, which is
+// mutex-guarded and snapshot-rendered), so the registry now states that
+// contract instead of assuming it: the first scrape seals it, and a later
+// registration is refused.
+test "a scrape seals the registry: late registration fails with error.Frozen" {
+    const allocator = std.testing.allocator;
+    var m = PrometheusMetrics.init(allocator);
+    defer m.deinit();
+
+    const early = try m.createCounter("early_total", "Registered before serving");
+    early.inc();
+
+    const text = try m.toPrometheusFormat(allocator);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "early_total 1") != null);
+
+    try std.testing.expectError(error.Frozen, m.createCounter("late_total", "Registered after the first scrape"));
+    try std.testing.expectError(error.Frozen, m.createGauge("late_gauge", "ditto"));
+    try std.testing.expectError(error.Frozen, m.createHistogram("late_histogram", "ditto", &.{1}));
+    try std.testing.expectError(error.Frozen, m.createSummary("late_summary", "ditto"));
+    try std.testing.expectError(error.Frozen, m.createCounterFamily("late_family", "ditto", "route", 4, std.testing.io));
+    try std.testing.expectError(error.Frozen, m.createHistogramFamily("late_histogram_family", "ditto", "route", 4, &.{1}, std.testing.io));
+
+    // The refused registrations left the registry untouched — a refused write
+    // is not a half-write — so the scrape still works and still shows exactly
+    // what was registered in time.
+    const after = try m.toPrometheusFormat(allocator);
+    defer allocator.free(after);
+    try std.testing.expect(std.mem.indexOf(u8, after, "early_total 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "late_total") == null);
+    try std.testing.expectEqual(@as(?*PrometheusMetrics.Counter, null), m.getCounter("late_total"));
+}
+
+// The seal is not only a consequence of scraping — a deployment can take it
+// earlier with `freeze()`, and sealing a registry does not stop it from
+// rendering: `create*` is what becomes unavailable, not `inc`/`observe`/the
+// scrape itself.
+test "freeze() seals the registry before the first scrape, and a sealed registry still renders" {
+    const allocator = std.testing.allocator;
+    var m = PrometheusMetrics.init(allocator);
+    defer m.deinit();
+
+    const counter = try m.createCounter("early_total", "Registered before serving");
+    counter.inc();
+
+    try std.testing.expect(!m.isFrozen());
+    m.freeze();
+    m.freeze(); // idempotent
+    try std.testing.expect(m.isFrozen());
+
+    try std.testing.expectError(error.Frozen, m.createCounter("late_total", "Registered after freeze()"));
+    try std.testing.expectError(error.Frozen, m.createCounterFamily("late_family", "ditto", "route", 4, std.testing.io));
+
+    // The handles issued in time keep working, and the scrape still renders
+    // them — the seal freezes the containers, not the metrics in them.
+    counter.inc();
+    const text = try m.toPrometheusFormat(allocator);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "early_total 2") != null);
+}
+
+// The seal has to be down before the first container is read, and the only
+// point inside a scrape that user code can observe is the hook — so the hook is
+// where the ordering is pinned. A scrape hook runs on the scrape thread and its
+// job is to refresh handles that already exist (`Gauge.set`); a registration
+// from there would work on the first scrape and be refused on every later one,
+// which is why the seal goes down before the hook rather than after it.
+test "the registry is already sealed when the scrape hook runs" {
+    const allocator = std.testing.allocator;
+    var m = PrometheusMetrics.init(allocator);
+    defer m.deinit();
+
+    const gauge = try m.createGauge("db_pool_active", "Active pooled connections");
+
+    const Hook = struct {
+        var metrics: ?*PrometheusMetrics = null;
+        var refused_by_freeze: bool = false;
+        var accepted: bool = false;
+
+        fn run(ud: ?*anyopaque) void {
+            const g: *PrometheusMetrics.Gauge = @ptrCast(@alignCast(ud.?));
+            g.set(3);
+            const result = metrics.?.createCounter("registered_from_the_hook_total", "late");
+            if (result) |_| {
+                accepted = true;
+            } else |err| {
+                refused_by_freeze = err == error.Frozen;
+            }
+        }
+    };
+    Hook.metrics = &m;
+    Hook.refused_by_freeze = false;
+    Hook.accepted = false;
+    m.setScrapeHook(Hook.run, gauge);
+
+    const text = try m.toPrometheusFormat(allocator);
+    defer allocator.free(text);
+
+    try std.testing.expect(Hook.refused_by_freeze);
+    try std.testing.expect(!Hook.accepted);
+    try std.testing.expectEqual(@as(?*PrometheusMetrics.Counter, null), m.getCounter("registered_from_the_hook_total"));
+    // The hook still did its documented job.
+    try std.testing.expect(std.mem.indexOf(u8, text, "db_pool_active 3.000000") != null);
+}
+
+// `Summary` is the registry's one container that is neither atomic nor
+// lock-protected (see the note on the type). Its exposed surface is pinned from
+// both sides here: the scrape has no reader for `Summary.values`, and
+// `createSummary` has no in-tree caller outside tests. This is a tripwire, not a
+// feature assertion — adding a summary line to `toPrometheusFormat` (a natural
+// change: every other metric type is rendered) breaks it on purpose, forcing
+// the buffer to be made concurrent-safe first.
+test "the scrape has no summary reader, so Summary.values stays unreachable from it" {
+    const allocator = std.testing.allocator;
+    var m = PrometheusMetrics.init(allocator);
+    defer m.deinit();
+
+    const summary = try m.createSummary("response_size", "Response size");
+    try summary.observe(100.0);
+    try summary.observe(300.0);
+
+    const text = try m.toPrometheusFormat(allocator);
+    defer allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "response_size") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE response_size") == null);
+
+    // Sealing the registry does not reach into a summary's own accessors: they
+    // are hot-path buffer readers/writers, not registrations.
+    try std.testing.expect(m.isFrozen());
+    try summary.observe(200.0);
+    try std.testing.expectEqual(@as(f64, 200.0), summary.getQuantile(0.5));
+    try std.testing.expectEqual(@as(u64, 3), summary.totalCount());
+}
+
+// `getQuantile`'s QuickSelect decremented its high cursor with a plain
+// `j -= 1`, which underflows `usize` whenever the partition closes with the low
+// cursor at 0 — Debug panics with "integer overflow", ReleaseFast wraps to a
+// huge index and the next `items[j]` comparison reads out of bounds. No test
+// reached it before: the only summary test fed `{100, 200, 300}` in ascending
+// order, and a descending/unsorted buffer is what lands in that state. The
+// accessor now saturates instead, and this pins it over every ordering of the
+// same three samples at the three quantiles that pin the ends.
+test "Summary.getQuantile is correct for every ordering of the sample buffer" {
+    const allocator = std.testing.allocator;
+    const orders = [_][3]f64{
+        .{ 100.0, 200.0, 300.0 },
+        .{ 100.0, 300.0, 200.0 }, // partition closes at j == 0: the underflow case
+        .{ 200.0, 100.0, 300.0 },
+        .{ 200.0, 300.0, 100.0 },
+        .{ 300.0, 100.0, 200.0 },
+        .{ 300.0, 200.0, 100.0 },
+    };
+    for (orders) |order| {
+        var m = PrometheusMetrics.init(allocator);
+        defer m.deinit();
+        const summary = try m.createSummary("response_size", "Response size");
+        for (order) |value| try summary.observe(value);
+
+        // min / median / max of the same three samples, whatever the arrival
+        // order. `getQuantile` partially reorders the buffer in place, so the
+        // later calls also cover a buffer the earlier ones permuted.
+        try std.testing.expectEqual(@as(f64, 100.0), summary.getQuantile(0.0));
+        try std.testing.expectEqual(@as(f64, 200.0), summary.getQuantile(0.5));
+        try std.testing.expectEqual(@as(f64, 300.0), summary.getQuantile(1.0));
+    }
 }

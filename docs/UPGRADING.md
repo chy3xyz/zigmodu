@@ -104,6 +104,18 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 现在会整份失败并逐条 warn 出下标/字段/实际类型，请修好那一行（或删掉该条目）再加载。
 **Breaking?** 否（`loadJson` 的声明签名未变，只是推断错误集多了一个成员；仓内没有按错误名分支的调用方）。
 
+**行为变化（非破坏，但会改变晚期注册的行为）**：`PrometheusMetrics` 的注册现在**在首次抓取后被封**：
+`toPrometheusFormat` 一跑（或你显式 `freeze()`），之后所有 `createCounter`/`createGauge`/`createHistogram`/
+`createSummary`/`createCounterFamily`/`createHistogramFamily` 都返回 **`error.Frozen`** 且不插入任何东西。
+原因：注册级容器是无锁遍历的，而 `create*` 会 `put`（rehash 会释放遍历正走着的 bucket 数组）——与上一批
+修掉的 per-family `render` 是同一个 use-after-free。**树内的注册全是启动期接线**（`productionProfile`、
+`MetricsBridge.init`、`OutboxConsumer.setMetrics`、`AutoInstrumentation.init`、`ModuleMetricsCollector.init`），
+请求线程创建的 per-label series 走 `CounterFamily.get`（有锁），所以正常应用不受影响。若你在**运行期**
+懒创建指标，请把它移到第一次抓取之前，或改用 `getCounter`/`getGauge`（追加 label 值）而不是 `create*`。
+`freeze()`/`isFrozen()` 是新增的公开方法。
+**注意这层封条不是互斥**：它把"启动期注册"从假设变成会报错的契约，但在封条落定前通过检查的 `create*`
+仍可能与第一次抓取交错；真正的互斥需要一把锁，本版没有加。
+
 **行为变化（非破坏）⑨：一批"取消被当成成功/默认值"的路径改成等待或报错。** 涉及 `EventBus`
 （`publish`/`unsubscribe`/`subscriberCount`/`publishedCount` 改不可取消的等待；**`subscribe`/`subscribeAsync`
 现在会返回 `error.Canceled`** —— 以前它们**返回成功却没注册**）、`EventStore`

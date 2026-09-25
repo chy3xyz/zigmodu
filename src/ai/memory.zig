@@ -71,7 +71,41 @@ pub const MemoryStore = struct {
         // not lose a remember, forget or count`.
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
+        // No history: a fact being stored now has no past to restore, so the row
+        // is stamped from the clock.
+        try self.putLocked(key, value, tenant_id, user_id, null);
+    }
 
+    /// An entry's past — the three fields `dumpJson` writes that are neither the
+    /// entry's identity nor its content. A `null` history means "not stated", and
+    /// the entry is stamped as new.
+    const EntryHistory = struct {
+        created_at: i64,
+        access_count: usize,
+        last_accessed_at: i64,
+    };
+
+    /// Insert-or-replace one entry under the write lock. Both insert paths go
+    /// through here so the map key's shape and the ownership rules cannot drift:
+    /// `remember` (a live fact) and `loadJson` (a restored snapshot).
+    ///
+    /// `history` is the one thing the two callers state differently, and each
+    /// branch reads it for itself:
+    ///   - an entry already stored has its value replaced and keeps its
+    ///     `created_at`; with a history the whole row *is* the snapshot that was
+    ///     loaded, without one the re-store counts as an access (`remember` on an
+    ///     existing key is an update, so the fact's recency is now);
+    ///   - a new entry takes the history as given, or is stamped as new.
+    ///
+    /// `key` and `value` are copied; the caller keeps its own slices.
+    fn putLocked(
+        self: *MemoryStore,
+        key: []const u8,
+        value: []const u8,
+        tenant_id: i64,
+        user_id: i64,
+        history: ?EntryHistory,
+    ) !void {
         if (self.entries.count() >= self.max_entries) {
             self.evictOldestLocked();
         }
@@ -85,8 +119,14 @@ pub const MemoryStore = struct {
             const owned_value = try self.allocator.dupe(u8, value);
             self.allocator.free(existing.value);
             existing.value = owned_value;
-            existing.access_count += 1;
-            existing.last_accessed_at = now;
+            if (history) |h| {
+                existing.created_at = h.created_at;
+                existing.access_count = h.access_count;
+                existing.last_accessed_at = h.last_accessed_at;
+            } else {
+                existing.access_count += 1;
+                existing.last_accessed_at = now;
+            }
             return;
         }
 
@@ -95,14 +135,19 @@ pub const MemoryStore = struct {
         const owned_value = try self.allocator.dupe(u8, value);
         errdefer self.allocator.free(owned_value);
 
+        const h = history orelse EntryHistory{
+            .created_at = now,
+            .access_count = 0,
+            .last_accessed_at = now,
+        };
         try self.entries.put(sk, .{
             .key = owned_logical,
             .value = owned_value,
             .tenant_id = tenant_id,
             .user_id = user_id,
-            .created_at = now,
-            .access_count = 0,
-            .last_accessed_at = now,
+            .created_at = h.created_at,
+            .access_count = h.access_count,
+            .last_accessed_at = h.last_accessed_at,
         });
     }
 
@@ -309,6 +354,10 @@ pub const MemoryStore = struct {
     }
 
     /// Snapshot all entries as JSON array (for simple file persistence). Caller frees.
+    ///
+    /// Every field of an entry is written. A `[]const u8` value that is not valid
+    /// UTF-8 goes out in the array form `std.json` picks for it (one number per
+    /// byte); `loadJson` reads that back, so the snapshot is lossless.
     pub fn dumpJson(self: *MemoryStore, allocator: std.mem.Allocator) ![]u8 {
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
@@ -347,7 +396,7 @@ pub const MemoryStore = struct {
     /// input get two answers, because only one of them can change what a stored
     /// memory means:
     ///
-    ///   - an item that is not a row — not an object, or without a string
+    ///   - an item that is not a row — not an object, or without a readable
     ///     `key`/`value` — was never readable as a memory, so it is skipped, with
     ///     a `warn` naming its index and the reason. The skip is the answer; being
     ///     silent about it was the defect;
@@ -365,12 +414,24 @@ pub const MemoryStore = struct {
     /// `remember(..., 0, 0)` is a scope this store supports): only a *missing* or
     /// mistyped field is corrupt.
     ///
+    /// `key` and `value` each have two readable shapes, because the writer picks
+    /// by content: a JSON string, and — for a `[]const u8` that is not valid UTF-8
+    /// — an array of one number per byte (see `byteArrayValue`). Both come back, so
+    /// a snapshot survives this pair byte-for-byte instead of dropping the rows
+    /// whose key or value is binary.
+    ///
+    /// `created_at`, `access_count` and `last_accessed_at` are restored as the dump
+    /// states them (`EntryHistory`) — a snapshot of state has to bring the state
+    /// back, and it is what lets `evictOldestLocked` go on picking the genuinely
+    /// oldest row after a restore. A history the dump does *not* state leaves the
+    /// row restored with `remember`'s fresh stamp, warned (see `dumpRowHistory`):
+    /// the row's content is readable, and a timestamp is not a scope, so the
+    /// refusal `dumpRowScope` makes would be the wrong instrument here.
+    ///
     /// Rows are read before any of them is applied, so a refused load leaves the
     /// store exactly as it was — a half-merged store *plus* an error is the one
     /// outcome a caller cannot act on. (An allocation failure while applying
-    /// still leaves a partial merge; a refused file does not.) `created_at`,
-    /// `access_count` and `last_accessed_at` in the dump are not restored: the
-    /// row goes through `remember`, which stamps the entry as new.
+    /// still leaves a partial merge; a refused file does not.)
     pub fn loadJson(self: *MemoryStore, json: []const u8) !void {
         const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, json, .{});
         defer parsed.deinit();
@@ -379,15 +440,23 @@ pub const MemoryStore = struct {
             else => return error.InvalidMemoryDump,
         };
 
+        // The bytes a byte-array `key`/`value` decodes to must outlive the read
+        // pass — the slices below are handed to `putLocked` in the apply pass, and
+        // a row is read before anything is applied. An arena owns them for the
+        // length of the load. Slices into `parsed` need no copy: it outlives both
+        // passes, and `putLocked` copies whatever it keeps.
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+
         const Row = struct {
             key: []const u8,
             value: []const u8,
             tenant_id: i64,
             user_id: i64,
+            history: ?EntryHistory,
         };
 
-        // Pass 1: read. The slices below point into `parsed`, which outlives the
-        // apply pass; `remember` copies what it keeps.
+        // Pass 1: read.
         var rows = std.ArrayList(Row).empty;
         defer rows.deinit(self.allocator);
         for (arr.items, 0..) |item, index| {
@@ -398,38 +467,128 @@ pub const MemoryStore = struct {
                     continue;
                 },
             };
-            const key = switch (obj.get("key") orelse {
-                std.log.warn("[ai.memory] dump item {d} skipped: no `key`", .{index});
-                continue;
-            }) {
-                .string => |s| s,
-                else => |other| {
-                    std.log.warn("[ai.memory] dump item {d} skipped: `key` is {s}, not a string", .{ index, @tagName(other) });
-                    continue;
-                },
-            };
-            const value = switch (obj.get("value") orelse {
-                std.log.warn("[ai.memory] dump item {d} skipped: no `value`", .{index});
-                continue;
-            }) {
-                .string => |s| s,
-                else => |other| {
-                    std.log.warn("[ai.memory] dump item {d} skipped: `value` is {s}, not a string", .{ index, @tagName(other) });
-                    continue;
-                },
-            };
+            const key = (try dumpRowBytes(obj, index, "key", arena.allocator())) orelse continue;
+            const value = (try dumpRowBytes(obj, index, "value", arena.allocator())) orelse continue;
             try rows.append(self.allocator, .{
                 .key = key,
                 .value = value,
                 .tenant_id = try dumpRowScope(obj, index, "tenant_id"),
                 .user_id = try dumpRowScope(obj, index, "user_id"),
+                .history = dumpRowHistory(obj, index),
             });
         }
 
-        // Pass 2: apply.
+        // Pass 2: apply. One critical section for the whole restore — every row in
+        // `rows` has already been read and validated, and `putLocked` is exactly
+        // what `remember` would have done for each of them.
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
         for (rows.items) |row| {
-            try self.remember(row.key, row.value, row.tenant_id, row.user_id);
+            try self.putLocked(row.key, row.value, row.tenant_id, row.user_id, row.history);
         }
+    }
+
+    /// The bytes a dump row states for `name` — `key` or `value`, the two fields
+    /// the writer can emit in either shape (a JSON string, or the array form for a
+    /// `[]const u8` that is not valid UTF-8). `null` means the field cannot be read
+    /// as bytes at all, the reason warned here; the caller then skips the item,
+    /// which is the same answer every unreadable item gets, for the same reason:
+    /// the row was never readable as a memory, so it is not repaired.
+    ///
+    /// A scope is the one field read strictly (`dumpRowScope`), and the difference
+    /// is what the field decides: a scope decides who *else* can read the row, so
+    /// there is nothing to fall back to, while `key`/`value` are the row's own
+    /// content.
+    fn dumpRowBytes(
+        obj: std.json.ObjectMap,
+        index: usize,
+        name: []const u8,
+        allocator: std.mem.Allocator,
+    ) !?[]const u8 {
+        const v = obj.get(name) orelse {
+            std.log.warn("[ai.memory] dump item {d} skipped: no `{s}`", .{ index, name });
+            return null;
+        };
+        return switch (v) {
+            .string => |s| s,
+            .array => |items| byteArrayValue(allocator, index, name, items.items),
+            else => |other| {
+                std.log.warn("[ai.memory] dump item {d} skipped: `{s}` is {s}, not a string or a byte array", .{ index, name, @tagName(other) });
+                return null;
+            },
+        };
+    }
+
+    /// The bytes behind the array form `std.json` writes for a `[]const u8` that
+    /// is not valid UTF-8: one integer per byte, each in `0..255` (the writer takes
+    /// its string branch only `if (... and std.unicode.utf8ValidateSlice(slice))`,
+    /// and otherwise writes the slice as an array of its elements).
+    ///
+    /// The dump's own bytes, rebuilt in `allocator`. `null` means the array is not
+    /// that form — a member that is not an integer, or one outside byte range — and
+    /// the caller skips the item with the warning logged here: a shape this pair
+    /// never wrote is not repaired, and no scope is in question, so nothing about
+    /// it justifies refusing a whole file the way an unstated `tenant_id` does.
+    fn byteArrayValue(
+        allocator: std.mem.Allocator,
+        index: usize,
+        name: []const u8,
+        items: []const std.json.Value,
+    ) !?[]const u8 {
+        const bytes = try allocator.alloc(u8, items.len);
+        for (items, 0..) |item, at| {
+            const n = switch (item) {
+                .integer => |n| n,
+                else => |other| {
+                    std.log.warn("[ai.memory] dump item {d} skipped: `{s}` member {d} is {s}, not an integer", .{ index, name, at, @tagName(other) });
+                    return null;
+                },
+            };
+            bytes[at] = std.math.cast(u8, n) orelse {
+                std.log.warn("[ai.memory] dump item {d} skipped: `{s}` member {d} is {d}, outside 0..255", .{ index, name, at, n });
+                return null;
+            };
+        }
+        return bytes;
+    }
+
+    /// The history a dump row states, or `null` when it is not stated. The three
+    /// fields are read as one unit, so a row whose `created_at` is mistyped cannot
+    /// keep a stale `last_accessed_at` from the same file driving eviction.
+    ///
+    /// Unlike `dumpRowScope` this has a fallback, and the difference is not
+    /// convenience: a scope the dump does not state cannot be filled in without
+    /// widening who may read the row (`0` is `recall`'s "any"), while a history only
+    /// decides *when* the row is evicted. So an unusable field is warned and the
+    /// row is still restored, stamped as new — which is what every restored row got
+    /// before, except that now it is the fallback rather than the rule.
+    fn dumpRowHistory(obj: std.json.ObjectMap, index: usize) ?EntryHistory {
+        const created_at = dumpRowHistoryField(obj, index, "created_at") orelse return null;
+        const stated_count = dumpRowHistoryField(obj, index, "access_count") orelse return null;
+        const last_accessed_at = dumpRowHistoryField(obj, index, "last_accessed_at") orelse return null;
+        const access_count = std.math.cast(usize, stated_count) orelse {
+            std.log.warn("[ai.memory] dump item {d}: `access_count` is {d}, not a count; the row is restored with a fresh stamp", .{ index, stated_count });
+            return null;
+        };
+        return .{
+            .created_at = created_at,
+            .access_count = access_count,
+            .last_accessed_at = last_accessed_at,
+        };
+    }
+
+    fn dumpRowHistoryField(obj: std.json.ObjectMap, index: usize, name: []const u8) ?i64 {
+        const v = obj.get(name) orelse {
+            std.log.warn("[ai.memory] dump item {d}: `{s}` is not stated; the row is restored with a fresh stamp", .{ index, name });
+            return null;
+        };
+        return switch (v) {
+            .integer => |n| n,
+            else => |other| {
+                std.log.warn("[ai.memory] dump item {d}: `{s}` is {s}, not an integer; the row is restored with a fresh stamp", .{ index, name, @tagName(other) });
+                return null;
+            },
+        };
     }
 
     /// The scope a dump row states, or `error.InvalidMemoryScope` with the reason
@@ -817,7 +976,7 @@ test "loadJson keeps a scope the dump states explicitly, including 0" {
     try std.testing.expectEqual(@as(usize, 2), any.items.len);
 }
 
-// An item that is not a row at all — not an object, or without a string
+// An item that is not a row at all — not an object, or without a readable
 // `key`/`value` — carries nothing that could be admitted, so skipping it stays
 // the answer (that part of the contract does not change). What changes is that
 // the skip is no longer silent: each one is warned with its index and the reason,
@@ -855,34 +1014,52 @@ test "loadJson names each item it skips" {
     try std.testing.expectEqualStrings("kept", got.items[0].value);
 }
 
-// A listed asymmetry, not a fix (see the report): `dumpJson` writes a `[]const u8`
-// that is not valid UTF-8 as an *array of bytes* rather than a JSON string
-// (`std/json/stringify.zig`: `if (!self.options.emit_strings_as_arrays and
-// std.unicode.utf8ValidateSlice(slice))`), and `loadJson` reads only the string
-// form — so a binary memory value is written by the pair and not read back. It is
-// skipped rather than repaired, and the skip is warned like any other; decoding
-// the array form would be the lossless answer.
+// `dumpJson` writes a `[]const u8` that is not valid UTF-8 as an *array of byte
+// values* rather than a JSON string (`std/json/stringify.zig`: the string branch
+// is `if (!self.options.emit_strings_as_arrays and std.unicode.utf8ValidateSlice(slice))`),
+// and `loadJson` used to read only the string form — so a binary memory was
+// written by the pair and dropped on restore (silently before the last batch,
+// with a `value is array, not a string` warning after it). A dump is a snapshot:
+// what it states has to come back. The array form is rebuilt byte-for-byte and
+// owned like every other value the reader hands to the store, and the entry is an
+// ordinary entry afterwards — `recall` returns it and `formatContext` takes it.
 //
-// The dump below is produced by `dumpJson`, so this is the pair's own output and
-// not a hand-written file: the assertion on the dump is what pins the shape, and
-// it stops holding the day the array form is decoded.
-test "loadJson does not read back a non-UTF-8 value that dumpJson writes" {
+// `key` is the same `[]const u8` and the same asymmetry (`remember` never
+// validated it as text), so it is read the same way; the third row below has a
+// binary key and exercises that.
+//
+// The dump below is produced by `dumpJson`, so the shape assertions pin the pair's
+// own output rather than a hand-written expectation of it.
+//
+// Red on the old shape: `expected 3, found 1` — both binary rows never arrived.
+test "dumpJson and loadJson round trip bytes that are not valid UTF-8" {
     const a = std.testing.allocator;
+    const binary = [_]u8{ 0xFF, 0xFE, 0x00, 0x6F, 0x6B };
+    const binary_key = [_]u8{ 0xC3, 0x28 };
     var store = MemoryStore.init(a, std.testing.io);
     defer store.deinit();
-    try store.remember("user:fact:bin", "\xff\xfe\x00ok", 3, 4);
+    try store.remember("user:fact:bin", &binary, 3, 4);
     try store.remember("user:fact:text", "ok", 3, 4);
+    try store.remember(&binary_key, "binary key", 3, 4);
 
     const json = try store.dumpJson(a);
     defer a.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "[255,254,0,111,107]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "[195,40]") != null);
 
     var store2 = MemoryStore.init(a, std.testing.io);
     defer store2.deinit();
     try store2.loadJson(json);
-    try std.testing.expectEqual(@as(usize, 1), store2.count());
+    try std.testing.expectEqual(@as(usize, 3), store2.count());
 
-    var got = try store2.recall(a, "user:", 3, 4);
+    // The whole snapshot survives: the same rows, with the same bytes — the binary
+    // key and value back in the array form the writer picks for them, so
+    // `dumpJson` → `loadJson` → `dumpJson` is byte-identical.
+    const redumped = try store2.dumpJson(a);
+    defer a.free(redumped);
+    try std.testing.expectEqualStrings(json, redumped);
+
+    var got = try store2.recall(a, "user:fact:bin", 3, 4);
     defer {
         for (got.items) |e| {
             a.free(e.key);
@@ -891,7 +1068,176 @@ test "loadJson does not read back a non-UTF-8 value that dumpJson writes" {
         got.deinit(a);
     }
     try std.testing.expectEqual(@as(usize, 1), got.items.len);
-    try std.testing.expectEqualStrings("ok", got.items[0].value);
+    try std.testing.expectEqualSlices(u8, &binary, got.items[0].value);
+
+    // The key came back as bytes too, and is addressable as a key: a binary prefix
+    // still finds it, and the row's own key is the exact byte sequence.
+    var by_key = try store2.recall(a, &binary_key, 3, 4);
+    defer {
+        for (by_key.items) |e| {
+            a.free(e.key);
+            a.free(e.value);
+        }
+        by_key.deinit(a);
+    }
+    try std.testing.expectEqual(@as(usize, 1), by_key.items.len);
+    try std.testing.expectEqualSlices(u8, &binary_key, by_key.items[0].key);
+    try std.testing.expectEqualStrings("binary key", by_key.items[0].value);
+
+    const ctx = try store2.formatContext(a, "user:fact:bin", 3, 4, 4);
+    defer a.free(ctx);
+    try std.testing.expect(std.mem.indexOf(u8, ctx, "- ") != null);
+}
+
+// The array form is read as bytes only when it *is* one: every member an integer
+// in `0..255`. Anything else did not come from this pair's writer, so the item is
+// skipped with a warning — the same answer a `key`/`value` of the wrong type gets.
+// It is deliberately not a whole-file refusal: nothing here makes a claim about a
+// scope (which is what `dumpRowScope` refuses over), it is one row's content that
+// cannot be read, and forcing the operator to repair the file to lose one
+// unreadable row is a disproportionate answer. The last two items are a malformed
+// array in `key` rather than `value`: the same shape rule, read by the same helper.
+//
+// Red on the old shape: `expected 1, found 0` — even the readable byte-array row
+// was skipped.
+test "loadJson reads the byte-array form and skips arrays that are not one" {
+    const a = std.testing.allocator;
+    var store = MemoryStore.init(a, std.testing.io);
+    defer store.deinit();
+
+    const mixed =
+        \\[{"key":"user:fact:bytes","value":[104,105],"tenant_id":1,"user_id":2},
+        \\ {"key":"user:fact:text-member","value":[104,"i"],"tenant_id":1,"user_id":2},
+        \\ {"key":"user:fact:high","value":[104,300],"tenant_id":1,"user_id":2},
+        \\ {"key":"user:fact:negative","value":[104,-1],"tenant_id":1,"user_id":2},
+        \\ {"key":"user:fact:float","value":[104,1.5],"tenant_id":1,"user_id":2},
+        \\ {"key":[104,"i"],"value":"v","tenant_id":1,"user_id":2},
+        \\ {"key":[104,300],"value":"v","tenant_id":1,"user_id":2}]
+    ;
+    try store.loadJson(mixed);
+    try std.testing.expectEqual(@as(usize, 1), store.count());
+
+    var got = try store.recall(a, "user:fact:bytes", 1, 2);
+    defer {
+        for (got.items) |e| {
+            a.free(e.key);
+            a.free(e.value);
+        }
+        got.deinit(a);
+    }
+    try std.testing.expectEqual(@as(usize, 1), got.items.len);
+    try std.testing.expectEqualStrings("hi", got.items[0].value);
+}
+
+// A dump is a snapshot of an entry's *state*, and `dumpJson` writes all of it —
+// `created_at`, `access_count`, `last_accessed_at` next to the identity and the
+// value. The reader used to take only identity and value: every restored row went
+// through `remember`, which stamps a row as new. The consequence is not cosmetic
+// — `evictOldestLocked` picks the smallest `last_accessed_at`, so after a restore
+// every row compared equal and eviction fell back to hash-iteration order: the
+// store threw away an arbitrary row while claiming to throw away the oldest one.
+//
+// Red on the old shape: the re-dump below carries the clock instead of the stated
+// `"created_at":100` / `"last_accessed_at":1000`, and the eviction assertion finds
+// the wrong row gone.
+test "loadJson restores the row's own recency so eviction can pick the oldest" {
+    const a = std.testing.allocator;
+    var store = MemoryStore.init(a, std.testing.io);
+    defer store.deinit();
+    store.max_entries = 3;
+
+    const dump =
+        \\[{"key":"user:fact:old","value":"old","tenant_id":1,"user_id":2,"created_at":100,"access_count":7,"last_accessed_at":1000},
+        \\ {"key":"user:fact:mid","value":"mid","tenant_id":1,"user_id":2,"created_at":200,"access_count":3,"last_accessed_at":2000},
+        \\ {"key":"user:fact:new","value":"new","tenant_id":1,"user_id":2,"created_at":300,"access_count":1,"last_accessed_at":3000}]
+    ;
+    try store.loadJson(dump);
+
+    const redumped = try store.dumpJson(a);
+    defer a.free(redumped);
+    try std.testing.expect(std.mem.indexOf(u8, redumped, "\"created_at\":100,\"access_count\":7,\"last_accessed_at\":1000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, redumped, "\"created_at\":300,\"access_count\":1,\"last_accessed_at\":3000") != null);
+
+    // One more fact overflows `max_entries`: the row that goes must be the one the
+    // dump says is oldest, not whichever row the hash order happens to visit first.
+    try store.remember("user:fact:fourth", "fourth", 1, 2);
+    try std.testing.expectEqual(@as(usize, 3), store.count());
+    const after = try store.dumpJson(a);
+    defer a.free(after);
+    try std.testing.expect(std.mem.indexOf(u8, after, "user:fact:old") == null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "user:fact:mid") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "user:fact:new") != null);
+}
+
+// Not every file is one this class wrote, and a row whose history is unreadable is
+// still a memory whose key, value and scope *are* readable — dropping it would
+// destroy content over a timestamp. So an unreadable history is taken as unstated
+// and the row is stamped the way `remember` stamps it, which is what every
+// restored row did before. What the reader must not do is half-trust a snapshot:
+// the three fields are read as a unit, so one mistyped field leaves no stale
+// `last_accessed_at` behind to drive eviction.
+test "loadJson keeps a row whose history is not stated, stamped as new" {
+    const a = std.testing.allocator;
+
+    const dumps = [_][]const u8{
+        // nothing stated at all
+        \\[{"key":"user:fact:v","value":"v","tenant_id":1,"user_id":2}]
+        ,
+        // one of the three mistyped
+        \\[{"key":"user:fact:v","value":"v","tenant_id":1,"user_id":2,"created_at":"100","access_count":7,"last_accessed_at":1000}]
+        ,
+        // a count that cannot be a count
+        \\[{"key":"user:fact:v","value":"v","tenant_id":1,"user_id":2,"created_at":100,"access_count":-1,"last_accessed_at":1000}]
+        ,
+    };
+
+    for (dumps) |dump| {
+        var store = MemoryStore.init(a, std.testing.io);
+        defer store.deinit();
+        try store.loadJson(dump);
+        try std.testing.expectEqual(@as(usize, 1), store.count());
+
+        const redumped = try store.dumpJson(a);
+        defer a.free(redumped);
+        // Fresh stamp: the numbers the file states are not what the row states now,
+        // and the unusable one is not half-kept either.
+        try std.testing.expect(std.mem.indexOf(u8, redumped, "\"created_at\":100,") == null);
+        try std.testing.expect(std.mem.indexOf(u8, redumped, "\"last_accessed_at\":1000") == null);
+    }
+}
+
+// Loading over a row the store already holds replaces the whole row: the dump is
+// the snapshot, so its value *and* its history win. This is the branch `putLocked`
+// takes when the composite key is already present, and it is where `loadJson`
+// parts company with `remember` — re-remembering a fact counts as an access
+// (`access_count + 1`, recency now, `created_at` kept), while a restored one
+// becomes what the file says. The recalls below are what makes "the dump won"
+// visible in the numbers rather than looking like a fresh stamp.
+test "loadJson overwrites an existing row with the dump's value and history" {
+    const a = std.testing.allocator;
+    var store = MemoryStore.init(a, std.testing.io);
+    defer store.deinit();
+    try store.remember("user:fact:k", "live", 1, 2);
+
+    for (0..2) |_| {
+        var seen = try store.recall(a, "user:fact:k", 1, 2);
+        for (seen.items) |e| {
+            a.free(e.key);
+            a.free(e.value);
+        }
+        seen.deinit(a);
+    }
+
+    const dump =
+        \\[{"key":"user:fact:k","value":"from-dump","tenant_id":1,"user_id":2,"created_at":500,"access_count":9,"last_accessed_at":900}]
+    ;
+    try store.loadJson(dump);
+
+    // Overwritten, not duplicated — and the row a re-dump states is the file's row.
+    try std.testing.expectEqual(@as(usize, 1), store.count());
+    const after = try store.dumpJson(a);
+    defer a.free(after);
+    try std.testing.expectEqualStrings(dump, after);
 }
 
 test "recall leaves the store untouched when an allocation fails" {
