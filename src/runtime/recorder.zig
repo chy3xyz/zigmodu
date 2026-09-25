@@ -74,10 +74,12 @@
 //!   mailbox are not reproduced either: what a log holds is *one* legal
 //!   interleaving at its record points (§11.3 Q2), not the interleaving a run
 //!   happened to observe.
-//! - **No codec, anywhere.** Two heterogeneous workers are logged as two
-//!   single-typed tracks merged by their sequence numbers, not as encoded
-//!   bytes — which is why a delivery log is in-process only (`TrackRef`
-//!   reserves the codec slot for the tier that changes that, §13.3 Q4).
+//! - **No codec on the record path.** Two heterogeneous workers are logged as
+//!   two single-typed tracks merged by their sequence numbers, and `record` still
+//!   stores the value itself: turning a value into bytes is a caller-supplied
+//!   `Codec(E)` that runs in `drainTo`, where allocating is allowed (§13.9
+//!   D1/D2). What is still missing is the other direction — replaying *from*
+//!   those bytes is the next slice (§13.9 D5).
 //! - **Not a `HotBus` subscriber.** A sink consumes a comptime subscriber slot,
 //!   and a log too small for the traffic would come back as `deliver ==
 //!   false` → counted as a *drop* while the event kept flowing. Both record
@@ -91,8 +93,13 @@
 
 const std = @import("std");
 const mbox = @import("mailbox.zig");
+const dlog = @import("delivery_log.zig");
 const Sequencer = @import("sequencer.zig").Sequencer;
 const Clock = @import("clock.zig").Clock;
+
+/// "This log has no hole" in `DeliveryLog.first_hole_seq`. Not 0: seq 0 is a
+/// perfectly good delivery, and a hole can be at it.
+const NO_HOLE: u64 = std.math.maxInt(u64);
 
 /// Errors `record` reports.
 pub const RecordError = error{
@@ -292,12 +299,28 @@ pub const TrackSpec = struct {
 /// the payload inside the track's ring (valid until the track is destroyed).
 ///
 /// The payload is a pointer to the recorded value rather than encoded bytes on
-/// purpose: v1 has no codec (§13.5), and the value is already in memory — the
-/// typed half is re-attached by the target handle's own thunk in `Replayer.bind`.
+/// purpose: replaying *in memory* hands the value over (§13.9 D5 reads bytes back
+/// instead, and is not this file's), so the typed half is re-attached by the
+/// target handle's own thunk in `Replayer.bind`.
 pub const TrackEntry = struct {
     seq: u64,
     clock_ms: i64,
     payload: *const anyopaque,
+};
+
+/// One track's ring in **claim space**, which is where the drain tells "an entry
+/// I can write" from "a delivery the ring could not keep" (`docs/RUNTIME.md`
+/// §13.9 D3). Claims are what the ring's own counter hands out, in order, and
+/// today's `Track` refuses a claim it has no room for rather than overwriting
+/// the slot the drain has not read yet.
+pub const TrackClaims = struct {
+    /// Claims the ring has made. Claim `i` is slot `i` while `i < slots`.
+    claimed: u64,
+    /// The claim index where the ring runs out of room — its comptime capacity.
+    /// A delivery claimed at or above it is one the ring did not keep, and it is
+    /// counted as a hole whether the ring refused it (`Track`) or overwrote it
+    /// (a ring that wrapped would lose exactly the same deliveries).
+    slots: u64,
 };
 
 /// The type-erased view of one worker's track: what a `Handle` holds on the send
@@ -311,10 +334,9 @@ pub const TrackRef = struct {
     message_type: []const u8,
     /// Reserved for §13.3 Q4's second storage tier: a track persisted across
     /// processes needs a payload codec, and an entry then has to say which one
-    /// wrote it. v1 records values in memory and leaves this `null`; `bind`
-    /// refuses a track that declares one, so the interface does not have to
-    /// change when that tier lands — the payload pointer stops being the answer
-    /// at exactly that point.
+    /// wrote it. Attached by `DeliveryLog.setCodec` (§13.9 D2) — the caller's
+    /// `Codec(E).name` — and `null` for a track that only ever held live values,
+    /// which is what makes `drainTo` refuse it *by name* instead of skipping it.
     payload_codec: ?[]const u8 = null,
 
     /// Append one delivery. `event` points at the sender's value, which the track
@@ -325,20 +347,43 @@ pub const TrackRef = struct {
     len: *const fn (track: *const TrackRef) usize,
     has_overflowed: *const fn (track: *const TrackRef) bool,
     destroy: *const fn (track: *TrackRef, allocator: std.mem.Allocator) void,
+    /// This track's ring in claim space — what `drainTo` reads (§13.9 D3).
+    claims: *const fn (track: *const TrackRef) TrackClaims,
+
+    /// §13.9 D2: how this track turns one of its entries into bytes — the
+    /// codec's `encode`, monomorphised for this track's own `E`. Installed by
+    /// `setCodec`; `null` when the track declared no codec, which is the whole
+    /// reason `drainTo` can refuse it rather than guess.
+    encode: ?*const fn (allocator: std.mem.Allocator, payload: *const anyopaque) anyerror![]u8 = null,
+    /// The same codec's `decode`, for the codec that will read these bytes back.
+    /// `out` must point at an aligned `E` — the erased side cannot name it, and
+    /// the typed side is the only one that can (reading a segment back is the
+    /// next slice, §13.9 D5).
+    decode: ?*const fn (allocator: std.mem.Allocator, bytes: []const u8, out: *anyopaque) anyerror!void = null,
 
     /// Replay state, owned by this descriptor (see `DeliveryLog.replayer`): the
     /// next entry to hand out, and — once bound — where its payloads go back to.
     cursor: usize = 0,
     target: ?*anyopaque = null,
     post: ?*const fn (target: *anyopaque, payload: *const anyopaque) mbox.SendError!void = null,
+
+    /// **The drain's** cursor: entries already appended to a segment file
+    /// (§13.9 D4). `cursor` above belongs to the replay and `replayer()` rewinds
+    /// it; this one only ever moves forward, so an entry reaches the file at
+    /// most once and a second drain writes only what the first did not.
+    drained_slots: usize = 0,
+    /// The last global seq `drainTo` wrote from this track, or `null` while it
+    /// has written none (§13.9 D4). Read back with `DeliveryLog.drainedUpto`.
+    drained_upto: ?u64 = null,
 };
 
 /// One worker's delivery track: a bounded ring of that worker's own `Message`
 /// type whose entries carry sequence numbers from the log's shared `Sequencer`.
 ///
 /// That is the whole trick of §13.2 — each track stays single-typed, so it is
-/// still zero-allocation and value-semantic and needs no codec, while the shared
-/// sequence makes the tracks mergeable into one replay order.
+/// still zero-allocation and value-semantic on the record path, while the shared
+/// sequence makes the tracks mergeable into one replay order. A codec is only
+/// ever needed to *drain* it (§13.9), never to record into it.
 pub fn Track(comptime E: type, comptime capacity: usize) type {
     if (capacity < 1) @compileError("Track needs capacity >= 1");
     if (@sizeOf(E) == 0) @compileError("Track stores messages by value; " ++ @typeName(E) ++ " has no size");
@@ -349,7 +394,10 @@ pub fn Track(comptime E: type, comptime capacity: usize) type {
         pub const Event = E;
         /// Comptime storage budget.
         pub const max_entries = capacity;
-        /// See `TrackRef.payload_codec`: v1 records values, so there is none.
+        /// Statically no codec: whether this track can be drained to bytes is a
+        /// per-track declaration the caller makes later
+        /// (`DeliveryLog.setCodec` sets `TrackRef.payload_codec`), which a
+        /// `const` on the type cannot say.
         pub const codec: ?[]const u8 = null;
 
         /// One recorded delivery, in this track's ring: the *global* sequence
@@ -386,6 +434,7 @@ pub fn Track(comptime E: type, comptime capacity: usize) type {
             .len = lenErased,
             .has_overflowed = overflowedErased,
             .destroy = destroyErased,
+            .claims = claimsErased,
         },
 
         /// Append one delivery. Zero allocation, lock-free. `error.Full` when the
@@ -398,6 +447,12 @@ pub fn Track(comptime E: type, comptime capacity: usize) type {
             if (n >= capacity) {
                 self.overflowed.store(true, .release);
                 _ = self.log.refused.fetchAdd(1, .monotonic);
+                // The refused delivery's seq is the one thing nobody can
+                // reconstruct later: it was handed out and never stored, so the
+                // drain's read-out would have to say "there is a hole, somewhere"
+                // (§13.9 D3). It costs this branch — the error path, not the hot
+                // one — one atomic min.
+                self.log.noteHoleSeq(seq);
                 return RecordError.Full;
             }
             self.slots.publish(@intCast(n), .{
@@ -426,6 +481,13 @@ pub fn Track(comptime E: type, comptime capacity: usize) type {
         /// incomplete from then on.
         pub fn hasOverflowed(self: *const Self) bool {
             return self.overflowed.load(.acquire);
+        }
+
+        /// This track's ring in claim space (§13.9 D3): what `drainTo` reads from
+        /// a track it only knows erased, to tell an entry it can write from a
+        /// delivery the ring could not keep.
+        pub fn claimState(self: *const Self) TrackClaims {
+            return .{ .claimed = self.writes.peek(), .slots = capacity };
         }
 
         /// Entry `i` in erased form (see `TrackEntry`).
@@ -464,10 +526,110 @@ pub fn Track(comptime E: type, comptime capacity: usize) type {
             return fromConstRef(ref).hasOverflowed();
         }
 
+        fn claimsErased(ref: *const TrackRef) TrackClaims {
+            return fromConstRef(ref).claimState();
+        }
+
         fn destroyErased(ref: *TrackRef, allocator: std.mem.Allocator) void {
             allocator.destroy(fromRef(ref));
         }
     };
+}
+
+/// §13.9 D2: what a track has to declare before `drainTo` can put its payloads
+/// in a file, expressed as a **shape rather than a format**. The framework reads
+/// none of the payload: these four declarations are the whole contract, and
+/// `DeliveryLog.setCodec` checks a caller's codec against them at compile time.
+///
+/// `E` is the track's own `Message`, so the codec of one track cannot be attached
+/// to a track whose ring holds something else: the mismatch fails where the codec
+/// is called, with the ordinary type error, instead of reinterpreting memory.
+///
+/// The declarations below are deliberately not usable — a codec is the caller's
+/// (`encode`/`decode` here would have to know the payload). They are what the
+/// names and types *are*, and the calls that read them are in `drainTo` and the
+/// codec's own reader.
+pub fn Codec(comptime E: type) type {
+    return struct {
+        /// Stable identity of the payload format: written verbatim into
+        /// `TrackRef.payload_codec`, and the key whoever reads the file picks the
+        /// codec back up with. Empty here — filling it in is the implementation's.
+        pub const name: []const u8 = "";
+        /// The caller's own payload version, for the codec's compatibility
+        /// checks. Nothing to do with the segment file's `format_version`, which
+        /// belongs to `delivery_log.zig`.
+        pub const version: u16 = 1;
+        /// The value as bytes. Owned by the caller, who frees them (`drainTo`
+        /// writes them and gives them straight back — §13.9 D6).
+        pub fn encode(allocator: std.mem.Allocator, value: E) anyerror![]u8 {
+            _ = allocator;
+            _ = value;
+            return error.CodecNotImplemented;
+        }
+        /// The bytes back into a value, with the same allocator that read them.
+        pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) anyerror!E {
+            _ = allocator;
+            _ = bytes;
+            return error.CodecNotImplemented;
+        }
+    };
+}
+
+/// Is `C` a `Codec(E)`? A comptime check, so a codec that is missing a piece
+/// never reaches a build, and the message names the piece.
+///
+/// The checklist is read out of `Codec(E)` itself rather than written down twice
+/// — a second copy of a shape is how the two drift apart. `encode`/`decode` are
+/// only checked for existence here: whether they take *this* track's `E` is
+/// decided by the call `setCodec` makes, which is a better error than any
+/// signature comparison could give.
+fn checkCodec(comptime E: type, comptime C: type) void {
+    const Contract = Codec(E);
+    const required = [_][]const u8{ "name", "version", "encode", "decode" };
+    inline for (required) |decl| {
+        if (!@hasDecl(C, decl)) @compileError(
+            "the codec for " ++ @typeName(E) ++ " declares no `" ++ decl ++
+                "` — docs/RUNTIME.md §13.9 D2's contract is `Codec(" ++ @typeName(E) ++ ")`",
+        );
+    }
+    const name: []const u8 = C.name;
+    const version: u16 = C.version;
+    _ = name;
+    _ = version;
+    const contract_name: []const u8 = Contract.name;
+    const contract_version: u16 = Contract.version;
+    const contract_encode = &Contract.encode;
+    const contract_decode = &Contract.decode;
+    _ = contract_name;
+    _ = contract_version;
+    _ = contract_encode;
+    _ = contract_decode;
+}
+
+/// What one `drainTo` call wrote, and what the file it wrote is missing
+/// (docs/RUNTIME.md §13.9 D3).
+pub const DrainReport = struct {
+    /// Records this call appended.
+    records: usize,
+    /// Deliveries that are not in the file and never will be: a full ring refused
+    /// them, or the drain met an entry whose seq the file had already gone past.
+    /// Cumulative and sticky, like `DeliveryLog.refusedCount` — it describes the
+    /// file, so it never goes down and a later call reports the same holes.
+    holes: u64,
+    /// The lowest global seq among them, or `null` while the file has none.
+    /// Sticky for the same reason. It is the one thing a reader cannot work out
+    /// for itself: a gap in the records shows that something is missing, and this
+    /// says where the missing starts.
+    first_hole_seq: ?u64,
+};
+
+/// A track's stamp in milliseconds to a segment frame's nanosecond clock
+/// (`delivery_log.Record.recorded_ns`). Exact for every stamp a clock hands out
+/// in this process's lifetime; one that would not fit saturates, because a stamp
+/// orders records rather than being arithmetic.
+fn stampsToNs(clock_ms: i64) i64 {
+    return std.math.mul(i64, clock_ms, std.time.ns_per_ms) catch
+        if (clock_ms < 0) std.math.minInt(i64) else std.math.maxInt(i64);
 }
 
 /// The delivery log: one `Track` per worker that declared `.record = …`, plus the
@@ -492,6 +654,18 @@ pub const DeliveryLog = struct {
     /// Deliveries some full track refused. Non-zero means the log has a hole in
     /// it, which `Replayer.step` refuses to replay (see `hasOverflowed`).
     refused: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Entries a drain met and could not write, because the file had already
+    /// moved past their `seq` (see `drainTo`). The half of `holesKnown` that is
+    /// not the rings' business, and like `refused` it only ever grows.
+    skipped_entries: u64 = 0,
+    /// The lowest global seq that never reached a file, or `NO_HOLE`. Written
+    /// from the refusal half of `Track.record` (any producer thread) and from a
+    /// drain stepping over an entry, so it is an atomic min (`noteHoleSeq`)
+    /// rather than an assignment.
+    first_hole_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(NO_HOLE),
+    /// The track the last `drainTo` refused *by name*, or `null` when it refused
+    /// none (`drainRefusal`).
+    drain_refusal: ?[]const u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, clock: Clock) Self {
         return .{ .allocator = allocator, .clock = clock };
@@ -557,6 +731,213 @@ pub const DeliveryLog = struct {
         var total: usize = 0;
         for (self.tracks.items) |track| total += track.len(track);
         return total;
+    }
+
+    /// Attach a payload codec to a declared track (docs/RUNTIME.md §13.9 D2):
+    /// from here on `drainTo` can turn its entries into bytes, and
+    /// `TrackRef.payload_codec` records which codec's bytes they are.
+    ///
+    /// A separate call rather than a `TrackSpec` field or a type parameter on
+    /// `Track(E, capacity)`: the codec is a *type*, and pushing it into the
+    /// declaration would make every runtime worker's signature carry a
+    /// serialization question it may have no answer to. `C` is checked against
+    /// `Codec(E)` at compile time, where `E` is this track's own `Message` —
+    /// so the codec of one track cannot be attached to another's.
+    ///
+    /// `track` must be this log's own (`error.UnknownTrack` otherwise): a codec
+    /// attached to a track of a different log would be a wiring mistake that
+    /// only shows up as a drain writing another log's entries.
+    pub fn setCodec(self: *Self, track: anytype, comptime C: type) error{UnknownTrack}!void {
+        const T = @TypeOf(track.*);
+        if (!@hasField(T, "ref") or !@hasDecl(T, "Event"))
+            @compileError("DeliveryLog.setCodec expects a track (*Track(E, capacity)) — pass " ++
+                "what `addTrack` returned (docs/RUNTIME.md §13.9 D2)");
+        if (self.find(track.ref.id) != &track.ref) return error.UnknownTrack;
+        const E = T.Event;
+        comptime checkCodec(E, C);
+
+        track.ref.payload_codec = C.name;
+        track.ref.encode = struct {
+            fn encode(allocator: std.mem.Allocator, payload: *const anyopaque) anyerror![]u8 {
+                const value: *const E = @ptrCast(@alignCast(payload));
+                return C.encode(allocator, value.*);
+            }
+        }.encode;
+        track.ref.decode = struct {
+            fn decode(allocator: std.mem.Allocator, bytes: []const u8, out: *anyopaque) anyerror!void {
+                const value: *E = @ptrCast(@alignCast(out));
+                value.* = try C.decode(allocator, bytes);
+            }
+        }.decode;
+    }
+
+    /// Append every track's not-yet-drained entries to a segment file, oldest
+    /// global `seq` first (docs/RUNTIME.md §13.9). Returns what this call wrote
+    /// and what the file is missing.
+    ///
+    /// * **The hot path is untouched.** Values become bytes here and nowhere
+    ///   else: `Track.record` — what `Handle.send*` calls — still copies the value
+    ///   into its ring with no allocator and no codec (§13.9 D1). Allocating is
+    ///   this call's privilege, and every buffer a codec hands back is freed
+    ///   before the next entry (§13.9 D6).
+    /// * **A track with entries and no codec is refused by name** —
+    ///   `error.CodecRequired`, plus `drainRefusal()` for the id — and nothing is
+    ///   written by that call (§13.9 D2). A track quietly left out of a file would
+    ///   read as a worker that delivered nothing, which is the lie this whole log
+    ///   exists to avoid. A track with nothing to write needs no codec: there is
+    ///   nothing to encode.
+    /// * **The cursor is per track and only moves forward** (`TrackRef.drained_slots`),
+    ///   so an entry reaches the file at most once and a second call writes only
+    ///   what the first did not (§13.9 D4).
+    /// * **What cannot go in is counted, not written out of order** (§13.9 D3):
+    ///   a delivery the ring refused, and one whose seq the file has already
+    ///   moved past. Both are in the report's `holes` / `first_hole_seq`, so a
+    ///   file that is not whole says so instead of looking whole.
+    ///
+    /// Errors: `error.CodecRequired` (named above), whatever the codec's `encode`
+    /// returns, and whatever the writer's `append` returns — including
+    /// `error.SeqNotIncreasing`, which can only come from a track whose entries
+    /// are not in `seq` order by slot (concurrent producers; the same boundary
+    /// `Replayer.step`'s merge has, §13.8) *and* the ring never refused.
+    /// A failed call leaves the cursors exactly where the writer got to, so it
+    /// can be retried.
+    ///
+    /// **One drain at a time per log**: the cursors are plain fields and the
+    /// `Writer` is one-per-directory (see `delivery_log.zig`), so this is a
+    /// maintenance loop's call, not a producer's.
+    pub fn drainTo(self: *Self, writer: *dlog.Writer) !DrainReport {
+        self.drain_refusal = null;
+        // Nothing at all is written until everything can be: a half-drained log
+        // would have some cursors past entries that the next call tries to append
+        // again, and the writer refuses a seq that does not increase — a log that
+        // could never be drained again.
+        for (self.tracks.items) |track| {
+            if (track.drained_slots >= track.len(track)) continue;
+            if (track.encode == null) {
+                self.drain_refusal = track.id;
+                return error.CodecRequired;
+            }
+        }
+
+        var written: usize = 0;
+        while (self.nextToDrain()) |track| {
+            const slot = track.drained_slots;
+            const entry = track.entry(track, slot);
+            const bytes = try track.encode.?(self.allocator, entry.payload);
+            defer self.allocator.free(bytes);
+
+            writer.append(.{
+                .seq = entry.seq,
+                .track_id = track.id,
+                // The in-memory track keeps the stamps and the payload, not the
+                // delivery kind: `Handle.send*` and `Handle.after`'s timer
+                // delivery land in the same ring and are indistinguishable there
+                // (§13.7). Carrying the kind means a parameter through the
+                // delivery funnel, which §13.9 D1 rules out for this slice — so
+                // frames are written as `message`, and this comment is the honest
+                // half of that.
+                .kind = .message,
+                .recorded_ns = stampsToNs(entry.clock_ms),
+                .payload = bytes,
+            }) catch |err| switch (err) {
+                // The file is already past this seq (an earlier drain wrote a
+                // later one, e.g. a producer that published out of order). The
+                // format's order *is* the file's order, so this delivery can
+                // never be in it: step over it and count it, rather than fail the
+                // whole drain — or worse, write it out of order.
+                error.SeqNotIncreasing => {
+                    track.drained_slots += 1;
+                    self.skipped_entries += 1;
+                    self.noteHoleSeq(entry.seq);
+                    continue;
+                },
+                else => return err,
+            };
+
+            track.drained_slots = slot + 1;
+            track.drained_upto = entry.seq;
+            written += 1;
+        }
+
+        return .{
+            .records = written,
+            .holes = self.holesKnown(),
+            .first_hole_seq = self.firstHoleSeq(),
+        };
+    }
+
+    /// The track the last `drainTo` refused by name — `error.CodecRequired` says
+    /// a track has entries to write and no codec; this says *which* (§13.9 D2).
+    /// Cleared at the start of every drain, so it is never stale.
+    pub fn drainRefusal(self: *const Self) ?[]const u8 {
+        return self.drain_refusal;
+    }
+
+    /// The lowest global seq that never reached a file, or `null` while there is
+    /// none. Sticky: what is missing does not stop being missing.
+    pub fn firstHoleSeq(self: *const Self) ?u64 {
+        const seq = self.first_hole_seq.load(.acquire);
+        return if (seq == NO_HOLE) null else seq;
+    }
+
+    /// The last global seq `drainTo` wrote from the track declared under `id`, or
+    /// null while it has written none — unknown ids included (§13.9 D4; the
+    /// "how much" half is `TrackRef.drained_slots`).
+    pub fn drainedUpto(self: *const Self, id: []const u8) ?u64 {
+        const track = self.find(id) orelse return null;
+        return track.drained_upto;
+    }
+
+    /// Fold one missing seq into `first_hole_seq`. Two paths write it: the
+    /// refusal half of `Track.record`, which any producer thread runs, and a
+    /// drain stepping over an entry — so it is a lock-free min.
+    fn noteHoleSeq(self: *Self, seq: u64) void {
+        var current = self.first_hole_seq.load(.monotonic);
+        while (seq < current) {
+            if (self.first_hole_seq.cmpxchgWeak(current, seq, .release, .monotonic)) |actual| {
+                current = actual;
+                continue;
+            }
+            current = seq;
+        }
+    }
+
+    /// Deliveries that are not in the file, across every track: claims the rings
+    /// made that no slot could hold, plus what a drain stepped over because the
+    /// file was already past it.
+    ///
+    /// Counted from the rings' own claim counters rather than from
+    /// `hasOverflowed`: a boolean cannot say *how many* were lost, and the
+    /// counter is what tells a refused claim apart from one the track simply has
+    /// not published yet. Those counters are also where §13.9 D3's second source
+    /// of holes lives — a cursor that fell behind the ring loses claims in
+    /// exactly this arithmetic, whether the ring refused them or overwrote them.
+    fn holesKnown(self: *const Self) u64 {
+        var holes: u64 = self.skipped_entries;
+        for (self.tracks.items) |track| {
+            const claims = track.claims(track);
+            if (claims.claimed > claims.slots) holes += claims.claimed - claims.slots;
+        }
+        return holes;
+    }
+
+    /// The track whose next undrained entry has the smallest global seq, or null
+    /// when every track is drained. The same merge `Replayer.step` does, for the
+    /// same reason: the file's order has to be the log's `seq` order, which is
+    /// what lets it be read back in that order.
+    fn nextToDrain(self: *Self) ?*TrackRef {
+        var next: ?*TrackRef = null;
+        var next_seq: u64 = std.math.maxInt(u64);
+        for (self.tracks.items) |track| {
+            const slot = track.drained_slots;
+            if (slot >= track.len(track)) continue;
+            const seq = track.entry(track, slot).seq;
+            if (seq < next_seq) {
+                next_seq = seq;
+                next = track;
+            }
+        }
+        return next;
     }
 
     /// A driver over this log's entries in global `seq` order, moving `manual`.
@@ -1582,4 +1963,458 @@ test "Replayer: narrowing and stepping take no allocator, so they cannot allocat
     // …and the walk really ran: a green result cannot mean "nothing happened".
     try std.testing.expectEqual(@as(usize, 2), delivered);
     try std.testing.expectEqualSlices(u32, &.{ 2, 4 }, target.taken());
+}
+
+// ─────────────────────────────────────────────────
+// §13.9 — the codec contract, and draining a track to a segment file
+// ─────────────────────────────────────────────────
+
+/// A throwaway segment directory, unique per test call. `std.testing.tmpDir`
+/// names it from random bytes under `.zig-cache/tmp`, so the test binaries
+/// `zig build test` runs in parallel cannot collide on it; `cleanup` removes the
+/// tree, including the subdirectory `Writer.open` creates under it.
+const DrainDir = struct {
+    tmp: std.testing.TmpDir,
+    path_buf: [160]u8 = undefined,
+
+    fn init() DrainDir {
+        return .{ .tmp = std.testing.tmpDir(.{}) };
+    }
+
+    fn path(self: *DrainDir) ![]const u8 {
+        return std.fmt.bufPrint(&self.path_buf, ".zig-cache/tmp/{s}/drain", .{self.tmp.sub_path[0..]});
+    }
+
+    fn deinit(self: *DrainDir) void {
+        self.tmp.cleanup();
+    }
+};
+
+/// §13.9 D2 in practice: a `u32` message as four little-endian bytes. The shape
+/// — `name`, `version`, `encode`, `decode` — is the whole contract, and nothing
+/// in the runtime reads the payload.
+const U32Codec = struct {
+    pub const name: []const u8 = "test:u32";
+    pub const version: u16 = 1;
+
+    pub fn encode(allocator: std.mem.Allocator, value: u32) ![]u8 {
+        const bytes = try allocator.alloc(u8, @sizeOf(u32));
+        std.mem.writeInt(u32, bytes[0..4], value, .little);
+        return bytes;
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !u32 {
+        _ = allocator;
+        if (bytes.len != @sizeOf(u32)) return error.BadPayloadLength;
+        return std.mem.readInt(u32, bytes[0..4], .little);
+    }
+};
+
+/// A second codec for a second `Message`: one track's bytes are not another's,
+/// and `payload_codec` is the only thing that says which is which.
+const I64Codec = struct {
+    pub const name: []const u8 = "test:i64";
+    pub const version: u16 = 1;
+
+    pub fn encode(allocator: std.mem.Allocator, value: i64) ![]u8 {
+        const bytes = try allocator.alloc(u8, @sizeOf(i64));
+        std.mem.writeInt(i64, bytes[0..8], value, .little);
+        return bytes;
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !i64 {
+        _ = allocator;
+        if (bytes.len != @sizeOf(i64)) return error.BadPayloadLength;
+        return std.mem.readInt(i64, bytes[0..8], .little);
+    }
+};
+
+test "drainTo: two tracks reach a segment file, encoded, in one global seq order" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var dir = DrainDir.init();
+    defer dir.deinit();
+    const config: dlog.Config = .{
+        .dir_path = try dir.path(),
+        // 40-byte frames against a 512-byte ceiling: the ceiling really rotates,
+        // so reading the records back below is a cross-segment read.
+        .max_segment_bytes = 512,
+        .max_record_bytes = 4096,
+        .sync_mode = .none,
+    };
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var log = DeliveryLog.init(allocator, clk.clock());
+    defer log.deinit();
+
+    const book = try log.addTrack(.{ .id = "book", .capacity = 4 }, u32, 4);
+    const risk = try log.addTrack(.{ .id = "risk", .capacity = 16 }, i64, 16);
+    try log.setCodec(book, U32Codec);
+    try log.setCodec(risk, I64Codec);
+
+    // §13.9 D2's identity lands on the erased view — which is all a drain holds.
+    try std.testing.expectEqualStrings(U32Codec.name, log.find("book").?.payload_codec.?);
+    try std.testing.expectEqualStrings(I64Codec.name, log.find("risk").?.payload_codec.?);
+
+    // 24 deliveries, one per `i`: every third goes to the short track, so it
+    // overflows while the long one keeps all sixteen of its own. Each delivery's
+    // seq *is* its `i` — the log hands out one number per record attempt — which
+    // is what makes the file assertable record by record below.
+    for (0..24) |i| {
+        clk.set(@intCast(i));
+        if (i % 3 == 0) {
+            book.record(@intCast(i)) catch |err| try std.testing.expectEqual(error.Full, err);
+        } else {
+            try risk.record(@intCast(i));
+        }
+    }
+    try std.testing.expect(book.hasOverflowed());
+    try std.testing.expectEqual(@as(usize, 4), book.len());
+    try std.testing.expectEqual(@as(usize, 16), risk.len());
+    try std.testing.expectEqual(@as(u64, 4), log.refusedCount());
+
+    var writer = try dlog.Writer.open(allocator, io, config);
+    const report = try log.drainTo(&writer);
+    const segments = writer.segmentCount();
+    writer.deinit();
+
+    // Everything the rings kept, and nothing else: twenty records, four holes.
+    try std.testing.expectEqual(@as(usize, 20), report.records);
+    try std.testing.expectEqual(@as(u64, 4), report.holes);
+    // The same number by the rings' own arithmetic: the counter `Track.record`
+    // bumps and the claim arithmetic `drainTo` reads are two views of one fact.
+    try std.testing.expectEqual(log.refusedCount(), report.holes);
+    // The short track's 5th..8th attempts are i = 12, 15, 18, 21, so the file's
+    // completeness ends at 12.
+    try std.testing.expectEqual(@as(?u64, 12), report.first_hole_seq);
+    // §13.9 D4: the cursor is per track, and it knows how far it got.
+    try std.testing.expectEqual(@as(?u64, 9), log.drainedUpto("book")); // its last kept seq
+    try std.testing.expectEqual(@as(?u64, 23), log.drainedUpto("risk"));
+    try std.testing.expectEqual(@as(?u64, null), log.drainedUpto("nope"));
+    try std.testing.expect(segments > 1); // the ceiling rotated
+
+    var scanned = try dlog.scan(allocator, io, config);
+    defer scanned.deinit(allocator);
+    // The storage layer's own verdict: no torn tail, no corrupt frame.
+    try scanned.expectClean();
+    try std.testing.expectEqual(@as(usize, 20), scanned.records.len);
+
+    const refused_seqs = [_]u64{ 12, 15, 18, 21 };
+    var seen: [24]bool = @splat(false);
+    var previous: ?u64 = null;
+    for (scanned.records) |record| {
+        try std.testing.expect(record.seq < 24);
+        try std.testing.expect(!seen[record.seq]); // once each, not twice
+        seen[record.seq] = true;
+        if (previous) |p| try std.testing.expect(record.seq > p); // file order is seq order
+        previous = record.seq;
+
+        // The stamps: the clock was moved to `i` before each delivery, and a frame
+        // carries nanoseconds while a track carries milliseconds.
+        try std.testing.expectEqual(@as(i64, @intCast(record.seq)) * std.time.ns_per_ms, record.recorded_ns);
+
+        // The bytes decode back through the track's *own* erased codec thunk, and
+        // the delivery was the value `seq`, so a round trip is exact.
+        if (std.mem.eql(u8, record.track_id, "book")) {
+            var value: u32 = 0;
+            try log.find("book").?.decode.?(allocator, record.payload, @ptrCast(&value));
+            try std.testing.expectEqual(@as(u32, @intCast(record.seq)), value);
+        } else {
+            try std.testing.expectEqualStrings("risk", record.track_id);
+            var value: i64 = 0;
+            try log.find("risk").?.decode.?(allocator, record.payload, @ptrCast(&value));
+            try std.testing.expectEqual(@as(i64, @intCast(record.seq)), value);
+        }
+    }
+    for (0..24) |i| {
+        const refused = std.mem.indexOfScalar(u64, &refused_seqs, @intCast(i)) != null;
+        try std.testing.expectEqual(!refused, seen[i]);
+    }
+    // Both ends of the hole: the read-out named seq 12, and the records really do
+    // not have it — while its neighbours are there, so this is not "the file is
+    // empty" in disguise either.
+    try std.testing.expect(!seen[report.first_hole_seq.?]);
+    try std.testing.expect(seen[report.first_hole_seq.? - 1]);
+    try std.testing.expect(seen[report.first_hole_seq.? + 1]);
+}
+
+test "drainTo: the second call writes only what the first one left" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var dir = DrainDir.init();
+    defer dir.deinit();
+    const config: dlog.Config = .{
+        .dir_path = try dir.path(),
+        .max_segment_bytes = 1 << 20,
+        .max_record_bytes = 4096,
+        .sync_mode = .none,
+    };
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var log = DeliveryLog.init(allocator, clk.clock());
+    defer log.deinit();
+    const tape = try log.addTrack(.{ .id = "tape", .capacity = 16 }, u32, 16);
+    try log.setCodec(tape, U32Codec);
+
+    var writer = try dlog.Writer.open(allocator, io, config);
+
+    for (0..3) |i| {
+        clk.set(@intCast(i * 10));
+        try tape.record(@intCast(100 + i));
+    }
+    const first = try log.drainTo(&writer);
+    try std.testing.expectEqual(@as(usize, 3), first.records); // exact, not "at least"
+    try std.testing.expectEqual(@as(u64, 2), writer.lastSeq());
+    try std.testing.expectEqual(@as(?u64, 2), log.drainedUpto("tape"));
+    try std.testing.expectEqual(@as(u64, 0), first.holes);
+    try std.testing.expectEqual(@as(?u64, null), first.first_hole_seq);
+
+    for (0..4) |i| {
+        clk.set(@intCast(100 + i * 10));
+        try tape.record(@intCast(200 + i));
+    }
+    const second = try log.drainTo(&writer);
+    // Four — not seven: the three entries the first call wrote are behind the
+    // cursor. Rewriting them is not merely wasteful; the writer would refuse the
+    // seq, because it does not increase.
+    try std.testing.expectEqual(@as(usize, 4), second.records);
+    try std.testing.expectEqual(@as(u64, 6), writer.lastSeq());
+    try std.testing.expectEqual(@as(u64, 6), log.drainedUpto("tape").?);
+
+    // A third call with nothing new is a no-op, not a rewrite.
+    const third = try log.drainTo(&writer);
+    try std.testing.expectEqual(@as(usize, 0), third.records);
+    try std.testing.expectEqual(@as(u64, 6), writer.lastSeq());
+    writer.deinit();
+
+    var scanned = try dlog.scan(allocator, io, config);
+    defer scanned.deinit(allocator);
+    try scanned.expectClean();
+    try std.testing.expectEqual(@as(usize, 7), scanned.records.len);
+    for (scanned.records, 0..) |record, i| {
+        try std.testing.expectEqual(@as(u64, @intCast(i)), record.seq);
+        var value: u32 = 0;
+        try log.find("tape").?.decode.?(allocator, record.payload, @ptrCast(&value));
+        const expected: u32 = if (i < 3) @intCast(100 + i) else @intCast(200 + (i - 3));
+        try std.testing.expectEqual(expected, value);
+    }
+}
+
+test "drainTo: a track with no codec is refused by name, and the other track is untouched" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var dir = DrainDir.init();
+    defer dir.deinit();
+    const config: dlog.Config = .{
+        .dir_path = try dir.path(),
+        .max_segment_bytes = 1 << 20,
+        .max_record_bytes = 4096,
+        .sync_mode = .none,
+    };
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var log = DeliveryLog.init(allocator, clk.clock());
+    defer log.deinit();
+    const raw = try log.addTrack(.{ .id = "raw", .capacity = 8 }, u32, 8);
+    const book = try log.addTrack(.{ .id = "book", .capacity = 8 }, u32, 8);
+    try log.setCodec(book, U32Codec);
+    try std.testing.expectEqual(@as(?[]const u8, null), log.find("raw").?.payload_codec);
+
+    // A codec is attached to a track of *this* log, and refused for another's: a
+    // codec on a foreign track would only show up as a drain writing another
+    // log's entries.
+    var other = DeliveryLog.init(allocator, .monotonic);
+    defer other.deinit();
+    try std.testing.expectError(error.UnknownTrack, other.setCodec(raw, U32Codec));
+
+    try raw.record(1);
+    try book.record(2);
+
+    var writer = try dlog.Writer.open(allocator, io, config);
+    // Refused, and named: `raw` has something to write and no way to write it.
+    try std.testing.expectError(error.CodecRequired, log.drainTo(&writer));
+    try std.testing.expectEqualStrings("raw", log.drainRefusal().?);
+
+    // Nothing went out — not even from `book`, which *can* be drained. A
+    // half-drained log would be one whose cursor sits past entries the writer
+    // would then refuse to take a second time.
+    try std.testing.expectEqual(@as(u64, 0), writer.lastSeq());
+    try std.testing.expectEqual(@as(?u64, null), log.drainedUpto("book"));
+    try std.testing.expectEqual(@as(usize, 0), book.ref.drained_slots);
+
+    // The declaration can still be fixed, and then both tracks go out together:
+    // the refusal cost the log a call, not an entry.
+    try log.setCodec(raw, U32Codec);
+    const report = try log.drainTo(&writer);
+    try std.testing.expectEqual(@as(usize, 2), report.records);
+    try std.testing.expectEqual(@as(?[]const u8, null), log.drainRefusal());
+    try std.testing.expectEqual(@as(u64, 1), writer.lastSeq());
+    writer.deinit();
+
+    var scanned = try dlog.scan(allocator, io, config);
+    defer scanned.deinit(allocator);
+    try scanned.expectClean();
+    try std.testing.expectEqual(@as(usize, 2), scanned.records.len);
+    try std.testing.expectEqualStrings("raw", scanned.records[0].track_id);
+    try std.testing.expectEqualStrings("book", scanned.records[1].track_id);
+    var value: u32 = 0;
+    try log.find("book").?.decode.?(allocator, scanned.records[1].payload, @ptrCast(&value));
+    try std.testing.expectEqual(@as(u32, 2), value);
+}
+
+test "drainTo: an overflow is a hole, with a seq the file really does not have" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var dir = DrainDir.init();
+    defer dir.deinit();
+    const config: dlog.Config = .{
+        .dir_path = try dir.path(),
+        .max_segment_bytes = 1 << 20,
+        .max_record_bytes = 4096,
+        .sync_mode = .none,
+    };
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var log = DeliveryLog.init(allocator, clk.clock());
+    defer log.deinit();
+    const tape = try log.addTrack(.{ .id = "tape", .capacity = 4 }, u32, 4);
+    try log.setCodec(tape, U32Codec);
+
+    // Six deliveries into a ring of four: seq 0..3 are kept, 4 and 5 are refused.
+    for (0..6) |i| {
+        clk.set(@intCast(i));
+        tape.record(@intCast(i)) catch |err| try std.testing.expectEqual(error.Full, err);
+    }
+    try std.testing.expectEqual(@as(usize, 4), tape.len());
+    try std.testing.expect(tape.hasOverflowed());
+
+    var writer = try dlog.Writer.open(allocator, io, config);
+    const report = try log.drainTo(&writer);
+    writer.deinit();
+
+    // What the read-out says…
+    try std.testing.expectEqual(@as(usize, 4), report.records);
+    try std.testing.expect(report.holes > 0);
+    try std.testing.expectEqual(@as(u64, 2), report.holes);
+    try std.testing.expectEqual(@as(?u64, 4), report.first_hole_seq);
+    try std.testing.expectEqual(log.refusedCount(), report.holes);
+
+    // …and what the file has. The two ends have to agree, or a hole count is a
+    // number nobody can act on: the refused seqs are exactly the missing ones,
+    // and the one the read-out named is among them.
+    var scanned = try dlog.scan(allocator, io, config);
+    defer scanned.deinit(allocator);
+    try scanned.expectClean();
+    try std.testing.expectEqual(@as(usize, 4), scanned.records.len);
+    var seen: [6]bool = @splat(false);
+    for (scanned.records) |record| {
+        try std.testing.expect(record.seq < 6);
+        try std.testing.expect(!seen[record.seq]);
+        seen[record.seq] = true;
+    }
+    for (0..4) |i| try std.testing.expect(seen[i]);
+    try std.testing.expect(!seen[report.first_hole_seq.?]);
+    try std.testing.expect(!seen[5]);
+}
+
+test "drainTo: an entry the file has already moved past is counted, not written back" {
+    // A directory that already holds a later seq — a log an earlier run drained
+    // into, or (the shape that matters in production) a track whose entry became
+    // readable only after a higher seq had gone out. The format's order *is* the
+    // file's order: `Writer.append` refuses a seq that does not increase, because
+    // otherwise the file could no longer be read back in `seq` order. So these
+    // deliveries can never be in the file — the drain steps over them and counts
+    // them, instead of failing, and instead of writing them out of order.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var dir = DrainDir.init();
+    defer dir.deinit();
+    const config: dlog.Config = .{
+        .dir_path = try dir.path(),
+        .max_segment_bytes = 1 << 20,
+        .max_record_bytes = 4096,
+        .sync_mode = .none,
+    };
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var log = DeliveryLog.init(allocator, clk.clock());
+    defer log.deinit();
+
+    var writer = try dlog.Writer.open(allocator, io, config);
+    try writer.append(.{ .seq = 500, .track_id = "tape", .kind = .message, .recorded_ns = 0, .payload = "" });
+
+    const tape = try log.addTrack(.{ .id = "tape", .capacity = 4 }, u32, 4);
+    try log.setCodec(tape, U32Codec);
+    try tape.record(0);
+    try tape.record(1);
+
+    const report = try log.drainTo(&writer);
+    try std.testing.expectEqual(@as(usize, 0), report.records);
+    try std.testing.expectEqual(@as(u64, 2), report.holes);
+    // Seq 0 *is* a hole here, and the read-out says 0 rather than "none" — which
+    // is why "no hole" is not spelled `0` on the field.
+    try std.testing.expectEqual(@as(?u64, 0), report.first_hole_seq);
+    // The cursor moved past both, so a retry does not chase them again.
+    try std.testing.expectEqual(@as(usize, 2), tape.ref.drained_slots);
+    try std.testing.expectEqual(@as(?u64, null), log.drainedUpto("tape"));
+    try std.testing.expectEqual(@as(u64, 500), writer.lastSeq());
+    writer.deinit();
+
+    // The file still holds exactly what it did, in its own order.
+    var scanned = try dlog.scan(allocator, io, config);
+    defer scanned.deinit(allocator);
+    try scanned.expectClean();
+    try std.testing.expectEqual(@as(usize, 1), scanned.records.len);
+    try std.testing.expectEqual(@as(u64, 500), scanned.records[0].seq);
+}
+
+test "drainTo: the codec's buffers all come back, and record never takes one" {
+    // §13.9 D6, measured rather than promised: `drainTo` hands the log's
+    // allocator to the codec's `encode` and frees what comes back, while the
+    // record path — `Handle.send*`, the hot path — never sees it at all (§13.9
+    // D1). The instrument is the counting allocator `alloc_contract_test.zig`
+    // uses for the runtime's other producer paths.
+    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var dir = DrainDir.init();
+    defer dir.deinit();
+    const config: dlog.Config = .{
+        .dir_path = try dir.path(),
+        .max_segment_bytes = 1 << 20,
+        .max_record_bytes = 4096,
+        .sync_mode = .none,
+    };
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var log = DeliveryLog.init(probe.allocator(), clk.clock());
+    const tape = try log.addTrack(.{ .id = "tape", .capacity = 8 }, u32, 8);
+    try log.setCodec(tape, U32Codec);
+
+    const live_before = probe.allocations - probe.deallocations;
+    var value: u32 = 0;
+    while (value < 6) : (value += 1) {
+        clk.set(@intCast(value));
+        try tape.record(value);
+    }
+    try std.testing.expectEqual(live_before, probe.allocations - probe.deallocations);
+
+    // The writer is not this test's subject, so it gets the real allocator.
+    var writer = try dlog.Writer.open(std.testing.allocator, std.testing.io, config);
+    const allocs_before = probe.allocations;
+    const frees_before = probe.deallocations;
+    const live = allocs_before - frees_before;
+
+    const report = try log.drainTo(&writer);
+    try std.testing.expectEqual(@as(usize, 6), report.records);
+
+    // Six entries, one buffer each: the encodes ran …
+    try std.testing.expectEqual(@as(usize, 6), probe.allocations - allocs_before);
+    // … and every buffer was given back before the next entry.
+    try std.testing.expectEqual(@as(usize, 6), probe.deallocations - frees_before);
+    try std.testing.expectEqual(live, probe.allocations - probe.deallocations);
+    writer.deinit();
+
+    // The whole log balances too, once the log's own storage is given back: no
+    // leak, and nothing the drain left behind.
+    log.deinit();
+    try std.testing.expectEqual(probe.allocations, probe.deallocations);
 }

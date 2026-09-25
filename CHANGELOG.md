@@ -2,6 +2,52 @@
 
 ## [Unreleased]
 
+### 第 32 批：Replay v2 第一刀 —— `Codec` 契约 + `drainTo`（投递轨终于能进盘；"有洞必须看得见"）（**破坏性：否**，新增可选 API；但 `setCodec` 与内存重放**二选一**，见下）
+
+全量 `-Ddb=all` **1987/2045（58 skipped，0 failed，191 s）**；CI 示例清单本机 **16/16 构建 + 7 个 `build test` 步骤全绿**；fmt / check / check-api / check-deadcode / check-tenant-scope / check-version 全绿。
+
+**设计在 `docs/RUNTIME.md` §13.9（D1–D6），实现按设计做，没有边写边改契约。** 上一批落了存储层
+（`delivery_log.zig`：分段 + magic + 版本 + 每帧 CRC + 撕裂尾部可判可修），这一刀把**投递轨接上去**。
+
+**D1 —— codec 跑在 `drainTo` 里，不在 `record` 里。** 热路径（`Handle.send*` → `Track.record`）的
+"零分配 + 值语义"一个字没动：环里仍然放值，把值变成字节发生在**显式 drain**（调用方的维护循环驱动）。
+代价写在明面上：环有界，**两次 drain 之间的溢出会变成盘上的洞**。
+
+**D2 —— 契约是接口，不是格式。** `zigmodu.runtime.Codec(E)`（`name` / `version` / `encode` /
+`decode`）；框架只要求这个形状并通过擦除 thunk 把它挂到 `TrackRef.encode`/`decode` 上，
+**标识落到为这件事预留的 `TrackRef.payload_codec`**。`addTrack(spec, E, capacity)` 与 `Track.record`
+的签名一字未动（§13.2 拒绝"定义一套通用序列化协议"那条大路，这一点不变）。
+**没有 codec 的轨不能让 drain 静默跳过**：`error.CodecRequired` + `drainRefusal()` 给出 track id，
+且**那次调用什么都不写**（校验先于任何 append）—— 静默忽略的声明比没有声明更坏。
+
+**D3 —— 有洞必须看得见。** `DrainReport{ records, holes, first_hole_seq }`：两个洞来源都覆盖 ——
+环溢出（`Track.record` 的 refusal 分支现在记下"第一个没进盘的 seq"）与**游标落后**（`Writer.append`
+的 `error.SeqNotIncreasing` 被当作"文件已越过 → 记一个洞 + 光标跨过去"，**不写乱序、也不整次失败**，
+可重试）。`holes` / `first_hole_seq` 是**累积**读数（描述文件，不因 drain 归零），`records` 是本次的；
+`first_hole_seq` 用 `maxInt` 哨兵而非 0 —— **因为 seq 0 可以是真的洞**。
+
+**D4 —— 每轨一个单调游标**：`TrackRef.drained_slots`（只前进，与重放侧的 `cursor` 分开）+
+`drained_upto`；第二次 drain 只写上次之后的条目。
+
+> **⚠ 消费方必须知道的一条（会咬人）**：`Replayer.bind` 对 `payload_codec != null` 的轨返回
+> `error.CodecRequired`（`recorder.zig:1076`，§13.7 的原决策，本次未动）。所以**给一条轨挂了 codec
+> 就等于放弃了它的内存重放** —— 在"读盘重放"落地之前，`setCodec` 与 `log.replayer()` 是**二选一**。
+> 这不是笔误：`bind` 拿不到解码后的值就无法把指针塞进 mailbox。两条都要得等下一刀。
+> **并且这条边界没有测试盖到**（6 条 `drainTo` 用例都不经过 `bind`），它是写在文档与代码注释里的，
+> 不是被断言钉住的 —— 说清楚，免得被当成已验证（`docs/RUNTIME.md` §13.9 状态行同样这么写）。
+
+**另一条刻意留的缺口**：盘上每条都写 `Kind.message` —— 内存轨不记投递种类（`send*` 与 `after` 的定时
+投递落进同一条环），带上它要往 `Handle.enqueue` 的漏斗加参数，与 D1"不动热路径"冲突，所以
+"定时器投递在盘上冒充 message"是写在代码注释里的已知缺口，与读盘重放一起做更自然。
+
+**测试（6 条，全绿；每条都验过红）**：两条轨编码后在同一全局 seq 顺序进盘 · 第二次 drain 只写新条目
+（精确条数）· 无 codec 的轨被**指名**拒绝且另一条轨不受牵连 · 溢出是洞且那个 seq **在文件里真的没有** ·
+"文件已越过"的条目算洞而不写回 · codec 的缓冲全部还回且 `record` 一次分配都不取。
+**变异验红 5 处**（真实输出，不是"看着红"）：静默跳过无 codec 的轨 → `expected error.CodecRequired,
+found .{ .records = 1, .holes = 0, .first_hole_seq = null }`；`holes` 的溢出那一半恒 0 →
+`expected 4, found 0`；游标不前进 → 第三次 drain `expected 0, found 3`；encode 缓冲不还 →
+`expected 6, found 0` + **1 leaked**；refusal 不记 seq → `expected 12, found 0`。
+
 ### 第 31 批：投递轨落盘的**存储层**（`delivery_log.zig`，12 条测试；既有 `eventbus/WAL.zig` 的磁盘格式一字未动）、以及公平性与 `batch` 的**实测收口**（"不饿死"的界恰好 = 一个 batch；结论：`batch` 保持 16）（**破坏性：否**，无公开 API 变化）
 
 全量 `-Ddb=all` **1981/2039（58 skipped，0 failed，194 s）**；CI 示例清单本机 **16/16 构建 + 7 个 `build test` 步骤全绿**；fmt / check / check-api / check-deadcode / check-tenant-scope / check-version 全绿。

@@ -83,7 +83,6 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 （或设 `0` 明确表示不要这个精度）。`Runtime` 的 5 ms 时间轮不受影响。详见 `docs/RUNTIME.md` §12.15。
 
 **第 31 批（同样无公开 API 变化，但有两件你应当知道的事）**
-
 - **`batch` 的默认值保持不变，而且现在有实测依据。** `docs/RUNTIME.md` §12.16 把设计期那句
   "批量 16 是起点不是结论"收口了：6 个点 × 3 种形状、每点 27 轮，结论是 **保持 16**
   （1 是唯一被数据否掉的默认值；8/16/32/64 落在同一片噪声带里，16 是这片平台上最小的一点）。
@@ -97,6 +96,13 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
   `root.zig` 导出，也还没有任何消费者** —— 把一条投递记录变成字节的 **codec 契约**与 recorder 侧的接线
   **仍未做**，所以 `Runtime Replay` 现在**依然不能跨进程/跨重启**（§13.5 的边界没变，只是 Q4 第 2 档
   从"未动"变成"存储层已落地"）。不要按"已经能落盘重放了"去设计你的回测。
+- **投递轨的 codec 契约与 `drainTo` 已落地（第 32 批，仍是新增、可选、无破坏）**，而且有一条**会咬人的组合**：
+  `DeliveryLog.setCodec(track, MyCodec)` 之后，**该轨的内存重放就不能用了** —— `Replayer.bind` 对带 codec 的轨
+  返回 `error.CodecRequired`（`src/runtime/recorder.zig:1076`），因为 `bind` 拿不到解码后的值就无法把指针
+  塞进 mailbox。在"读盘重放"落地之前，**`setCodec` 与 `log.replayer()` 是二选一**。若你两条都要，现在别开
+  codec；将来那一刀会把这条路接上。契约本身是 `zigmodu.runtime.Codec(E)`（`name`/`version`/
+  `encode`/`decode`），框架只规定接口，不规定格式；`drainTo` 的返回值带 `holes` / `first_hole_seq`
+  （环溢出与游标落后都会变成**看得见的洞**，而不是一份看起来完整的 log）。
 
 ---
 

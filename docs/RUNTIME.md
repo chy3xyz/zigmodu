@@ -1987,3 +1987,92 @@ counted` / `Replayer: a window inside a filtered log leaves no entry unaccounted
 **变异验过红**：把 `to` 边界从 `>=` 改成 `>`，3 条断言以 `TestExpectedEqual` 变红（`expected 4, found 5`），
 不是编译错。
 
+
+### 13.9 Replay v2（第一刀）：codec 契约与 `drainTo` —— 设计已定，实现见本节末尾状态行
+
+§13.8 把"落盘 / WAL / codec"留在未做里。第 31 批先落了**存储层**（`src/runtime/delivery_log.zig`：
+分段、magic + 版本 + 每帧 CRC、撕裂尾部可判可修、`append` 零分配）。这一节定的是**接线**那一半：
+投递轨怎么把"活值"变成"盘上的字节"。四个决策，实现按此做，不要再重新设计。
+
+**D1 —— codec 跑在 `drainTo` 里，不在 `record` 里。** `Track.record` 是 `Handle.send*` 的热路径，
+它的契约是**零分配 + 值语义**，一条测试盯着（`append allocates nothing` 那个家族的同类断言）。
+所以：环里仍然放值，把值变成字节发生在**显式 drain**（由调用方的维护循环/线程驱动），那里分配是允许的。
+代价必须写在明面上：环是有界的，**两次 drain 之间的溢出会变成盘上的洞** —— 见 D3。
+
+**D2 —— 契约是调用方提供的类型，不是一个格式。** §13.2 拒绝"定义一套通用序列化协议"这条大路，
+这一点不变：框架只要求一个**接口**，payload 里是什么它一个字都不读。
+
+```zig
+/// 一条轨声明它怎么把自己变成字节。`E` 就是这条轨的 `Message`。
+pub fn Codec(comptime E: type) type {
+    return struct {
+        /// 稳定标识：写进 `TrackRef.payload_codec`，也是重放侧认负载的键。
+        pub const name: []const u8;
+        /// 调用方自己的负载版本（与段文件头的 `format_version` 无关）。
+        pub const version: u16 = 1;
+        /// 编码结果归调用方（`drainTo` 写完就 free）。
+        pub fn encode(allocator: std.mem.Allocator, value: E) ![]u8;
+        pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !E;
+    };
+}
+```
+
+**运行时不做猜测**（与 §13.6 Q3 同一条纪律）：没有声明 codec 的轨**不能**被 drain ——
+`drainTo` 返回一个**指名到 track id** 的独立错误（`error.CodecRequired` 一族），
+**不是**静默跳过。家规照旧：静默忽略的声明比没有声明更坏。
+
+**D3 —— 有洞的 log 必须看得见。** 洞有两个来源，两个都要报：
+1. **环溢出**：`Track.hasOverflowed()`（已有）说明这条轨在两次 drain 之间丢过条目；
+2. **drain 游标落后**：环绕了一圈、游标指向的槽已被覆盖。
+
+`drainTo` 返回的读数里必须有 `holes`（条数）与 `first_hole_seq`（第一个没进盘的全局 seq，
+没有则 `null`）。**不要求**它拒绝写 —— 把已有的写下去是正确行为，把它**说成完整**才是错的。
+读侧靠记录的全局 `seq` 自己就能看出缺口（记录里就有 seq），但自动判定"这是洞还是没记"需要
+`first_hole_seq` 这一条，所以它必须在读数里。
+
+**D4 —— 游标是每轨一个、单调的。** 一次 drain 之后，下一次只写**上次之后**的条目。
+第一次 drain 从头开始。`DeliveryLog` 因此多一个每轨 `drained_upto: u64`（最后写出去的全局 seq）。
+
+**D5 —— 这一刀不做**：从盘上重放（`Replayer` 侧读 `delivery_log` 段 + `decode` 投回 handle：
+**下一刀**）、CLI、保留策略/压实、压缩与加密、跨进程传输。段文件本身的格式也不动。
+
+**D6 —— 分配契约。** `drainTo` 允许分配，但必须**全部还回去**：测试用数分配的分配器（本文件
+`Replayer: narrowing and stepping take no allocator` 用的同款手法），drain 前后 `allocations ==
+deallocations`，并且**热路径那一侧**（`record`）仍然一条分配都不许有。
+
+**状态**：D1–D6 是本节定下的契约；**实现与测试的状态见本节末尾追加的状态行**（写代码的人负责追加，
+不要改上面这些决策）。段文件的格式在 `src/runtime/delivery_log.zig` 的文件头，逐字节。
+
+**实现状态（`src/runtime/recorder.zig`，6 条测试全绿）**。**已做**：`pub fn Codec(E)`（D2 的形状，
+`setCodec` 拿它做编译期检查，缺哪个声明就报哪个名）、`DeliveryLog.setCodec(track, C)`（擦除 thunk ——
+`TrackRef.payload_codec` / `encode` / `decode` 由 comptime 单态化生成，`addTrack(spec, E, capacity)`
+签名一字未动）、`DrainReport{ records, holes, first_hole_seq }`、`drainTo(writer)`（每轨单调游标
+`TrackRef.drained_slots` + `drained_upto`，按全局 `seq` 归并后逐条 `append`，编码缓冲读完即 free）、
+`drainRefusal()` / `firstHoleSeq()` / `drainedUpto(id)`；无 codec 的轨报 `error.CodecRequired` 并**指名**
+（`drainRefusal()`），且那次调用**什么都不写**。环溢出仍由 `Track.record` 走 refusal 分支，新增的只有
+"第一个没进盘的 seq"（`noteHoleSeq`，原子 min）。**没做**（D5 照旧）：盘上重放、CLI、压实/保留、压缩
+加密、跨进程。两条**刻意留的边界**：① 盘上每条都写 `Kind.message` —— 内存轨不记投递种类（`send*` 与
+`after` 的定时投递落进同一条环），带上它要往 `Handle.enqueue` 的漏斗加参数，D1 明说不动热路径，所以
+"定时器投递在盘上冒充 message"是写在代码注释里的已知缺口；② `holes` / `first_hole_seq` 是**累积**读数
+（描述文件、不因 drain 归零，`records` 才是本次的），且 `holes` 把"文件已经越过的那条"也算了进去
+（`Writer.append` 的 `error.SeqNotIncreasing` → 记一个洞 + 光标跨过去，而不是让整次 drain 失败：不写
+乱序，也不装作完整）。
+**③ 第三条边界，消费方最容易踩**：`Replayer.bind` 对 `payload_codec != null` 的轨返回 `error.CodecRequired`
+（`recorder.zig:1076`，§13.7 的原决策，本次未动）。也就是说**给一条轨挂了 codec 就等于放弃了它的内存重放**
+—— 在"读盘重放"这一刀落地之前，`setCodec` 与 `log.replayer()` 是**二选一**。这不是笔误，是当前的形状：
+`bind` 拿不到解码后的值，就不能把指针塞进 mailbox。要同时要，得等 D5 的下一刀。
+（`src/runtime/recorder.zig` 的 6 条 `drainTo` 用例都不经过 `bind`，所以这条边界没有测试盖到，
+它是**写在文档与代码注释里的**，不是被断言钉住的 —— 说清楚免得被当成已验证。）
+**测试名**：`drainTo: two tracks reach a segment file, encoded, in one global seq order` ·
+`drainTo: the second call writes only what the first one left` · `drainTo: a track with no codec is refused
+by name, and the other track is untouched` · `drainTo: an overflow is a hole, with a seq the file really
+does not have` · `drainTo: an entry the file has already moved past is counted, not written back` ·
+`drainTo: the codec's buffers all come back, and record never takes one`。**读数**：聚焦跑
+`zm-test-count: aggregate 6/2045 selected passed=6 skipped=0 failed=0 leaked=0 binaries=6 db=all
+filter=drainTo`；全量 `--force-run --db all`：`Build Summary: 15/15 steps succeeded; 1987/2045 tests
+passed (58 skipped)`（无其它用例被带红）。**变异验红 5 处**（改弱实现后的真实输出，不是"看着红"）：
+静默跳过无 codec 的轨 → `expected error.CodecRequired, found .{ .records = 1, .holes = 0,
+.first_hole_seq = null }`；`holes` 的溢出那一半恒 0 → `expected 4, found 0`；游标不前进 → 第三次 drain
+`expected 0, found 3`（重写）；encode 缓冲不还 → `expected 6, found 0`；refusal 不记 `seq` →
+`expected 12, found 0`（`first_hole_seq` 用 `maxInt` 而非 0 表示"没有洞"，正是因为 seq 0 可以是洞）；
+去掉"文件已越过"那一支 → `FAIL (SeqNotIncreasing)`。
