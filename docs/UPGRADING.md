@@ -115,6 +115,13 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
   —— 后者在第 32 批之后是**必需**的：`setCodec` 要 typed `*Track(E, capacity)`，而 `Runtime.spawn` 只留
   erased 的 `Handle.track: ?*TrackRef`，所以在它出现之前，**运行时用 `.record` 声明的轨根本挂不上 codec**，
   `drainTo` 对这类 worker 不可达（第 32 批的"能进盘"只对直接 `addTrack` 的用户成立）。
+- **投递种类（`Kind`）现在是真的（第 34 批）**：`Handle.after(...)` 的定时投递在轨里与段文件里都记成
+  **`.timer`**，`send*` 记成 `.message`（此前一律写 `.message`，是 §13.9 明写的缺口）。调用方要自己指定
+  种类就用新增的 `Track.recordKind(event, kind)` —— **`Track.record(event)` 的签名一个字没动**
+  （它现在等价于 `recordKind(..., .message)`），所以直调 `record` 的代码不用改。环的每槽增量是**实测**的：
+  `u32` 消息 **+0 字节**（种类落进原本就有的尾部 padding）、`u64` 消息 **+8**。
+  另有一条**决定**：从盘重放（`ReplayFromLog`）的投递不照抄帧里的 kind，仍以 `.message` 进目标 runtime
+  —— 录下来的 kind 描述"被录那一次"，重放做的是"这一次的一条普通 send"；真值在 `LogStep.kind` 上。
 
 ---
 

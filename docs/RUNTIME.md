@@ -2053,7 +2053,9 @@ deallocations`，并且**热路径那一侧**（`record`）仍然一条分配都
 "第一个没进盘的 seq"（`noteHoleSeq`，原子 min）。**没做**（D5 照旧）：盘上重放、CLI、压实/保留、压缩
 加密、跨进程。两条**刻意留的边界**：① 盘上每条都写 `Kind.message` —— 内存轨不记投递种类（`send*` 与
 `after` 的定时投递落进同一条环），带上它要往 `Handle.enqueue` 的漏斗加参数，D1 明说不动热路径，所以
-"定时器投递在盘上冒充 message"是写在代码注释里的已知缺口；② `holes` / `first_hole_seq` 是**累积**读数
+"定时器投递在盘上冒充 message"是写在代码注释里的已知缺口 —— **这一条已补（§13.11）**：种类随条目进环
+（`Track.recordKind`），`drainTo` 写的是它，D1 的零分配没有被违反（种类是漏斗上的一个值参数，
+`recordKind` 与 `record` 一样零分配）；② `holes` / `first_hole_seq` 是**累积**读数
 （描述文件、不因 drain 归零，`records` 才是本次的），且 `holes` 把"文件已经越过的那条"也算了进去
 （`Writer.append` 的 `error.SeqNotIncreasing` → 记一个洞 + 光标跨过去，而不是让整次 drain 失败：不写
 乱序，也不装作完整）。
@@ -2168,3 +2170,83 @@ found void`；`setCodecRef` 的类型检查去掉 → `expected error.MessageTyp
 被复用之后（D5 的反面）→ `expected 295990755014133383820138010460325856212, found 113705285682452570882479431272`。
 **没有单独验红的两处**：`CodecRequired` 与 `UnboundTrack` 的**区分**（两条都只由 `refuse` 记 id 那条变异覆盖到"指名"
 这一半）、`CodecNameMismatch` 同理 —— 这三种错误各自的**独立**红线没有取到，不编。
+
+### 13.11 投递种类（kind）从漏斗到盘：已补
+
+§13.9 状态行的边界 ① 是本文件里唯一一处"盘上写的是假的"：内存轨不记投递种类，`drainTo` 只能把每条都
+写成 `Kind.message`。§13.10 已经把帧里的 kind 读出来给读者看（`LogStep.kind`），于是缺的只剩"盘上那个值
+本身要是真的"这一半。§13.10 的 D7 当时把它记成"**允许**顺手补，但要动 `Handle.enqueue` 的漏斗参数，与 D1
+冲突时以 D1 为准"——本节是那条判断的结果：**动漏斗不等于违反 D1**，因为带下去的是一个值参数
+（`dlog.Kind`，`enum(u16)`，2 字节），不是一次分配，也不是一个格式。
+
+**改了什么**（`src/runtime/recorder.zig` · `src/runtime/runtime.zig`）：
+
+- `Track.recordKind(self, event, kind)`：真正的实现，种类随条目进环 —— 它出现在 `Track.Entry.kind`、
+  `TrackEntry.kind` 和 `TrackRef.record` thunk 的第三个参数上。**`Track.record(self, event)` 签名一字未动**，
+  等价于 `recordKind(..., .message)`；`Recorder(E).record`（HotBus 发布流那本账）同样一字未动 —— 它记的是
+  *发布*，不是*投递*，给它加种类是另一个问题。
+- `drainTo` 写 `entry.kind`，不再硬编码 `.message`。
+- 三个来源各自归位：`Handle.send*` → `.message`；定时器投递 → **`.timer`**（`Handle.enqueue` /
+  `enqueueBlocking` / `noteDelivery` 多带一个种类参数，`Handle.after` 的 `Delivery.post` 传 `.timer`）；
+  重放投递 → `.message`。**重放为什么不用文件里的 kind**：录下来的 kind 说的是**被录那次运行**里发生的事
+  （那里真的有一个定时器到期），而重放做的是**这次**运行里的一条普通 `send`；照抄等于让目标运行时声称自己
+  arm 过一个它没 arm 的定时器。信息没丢 —— 它就在 `LogStep.kind` 里，读者看得见（理由写在
+  `ReplayFromLog.bindDecoded` 的 `post` thunk 上）。重放也**不往目标 runtime 的轨里写东西**：目标图照旧按
+  "不声明 `.record`"建，e2e 里断言 `deliveryLog() == null`。
+- 契约不变：`recordKind` 与 `record` 一样**零分配、值语义**；`Handle.after`"一次调用一个 `Delivery` 分配"
+  也没变（`src/runtime/alloc_contract_test.zig` 的断言全绿）。
+
+**环的每槽增量（真实数字，`@sizeOf`）**：`Entry` 现在是 `{ seq: u64, clock_ms: i64, kind: dlog.Kind, event: E }`。
+增量由 `E` 的对齐决定，实测两档：`E = u32` 时 **24 → 24** 字节（**+0**，种类落进原本就有的尾部 padding）；
+`E = u64` 时 **24 → 32** 字节（**+8**）。`{ x: i32, y: i32 }` 这类 4 字节对齐、8 字节大小的 `Message` 与
+`u64` 同档。**怎么量的**：不是估算 —— `Track.recordKind: the ring carries the kind, and record() means
+.message` 里对 `@sizeOf(Track(u32, 4).Entry)` / `@sizeOf(Track(u64, 4).Entry)` 以及它们各自与
+`{ seq, clock_ms, event }` 的差值做了四条 `expectEqual` 断言，下面这些数字就是那四条断言钉住的值；
+差值 +0 / +8 来自"种类落在尾部 padding 里 / 把 8 字节对齐的载荷推到下一个 8 字节边界"这两件事。
+（§13.2 记的 `Σ(capacity × sizeof(Message))` 是同一件事的粗略写法：条目的 `seq`/`clock_ms`/`kind` 一直是外加的。）
+
+**测试名**（4 条：`runtime.zig` 3 条 + `recorder.zig` 1 条）：
+`Delivery kind (§13.9): a timer delivery is written as .timer`（先写红的那条：定时投递 → 环里
+`entry.kind == .timer`，且 `drainTo` 出来的帧 `records[0].kind == .timer`）·
+`Delivery kind (§13.9): send and sendBlocking are written as .message`（反向守卫，防"全写 timer"）·
+`Delivery kind (§13.9) e2e: a mixed track keeps every kind, entry for entry, on disk`（定时 + 直投混一条轨，
+4 条投递 → `drainTo` → `scan`，**逐条**比对 kind（不是只看一条）→ `ReplayFromLog` 的 `LogStep.kind` 同为
+`.message/.timer/.message/.timer`，且目标 runtime 不声明轨）·
+`Track.recordKind: the ring carries the kind, and record() means .message`（值语义 + 擦除视图 + 上面两条尺寸差值）。
+
+**读数**：聚焦（全部 `--force-run --db all`，`source=zm-test-runner`）：
+`zm-test-count: aggregate 3/2056 selected passed=3 skipped=0 failed=0 leaked=0 binaries=6 db=all filter=Delivery kind`；
+`aggregate 1/2056 selected passed=1 ... filter=recordKind`；
+`aggregate 8/2056 selected passed=8 ... filter=alloc contract`（零分配契约那一批，含 `Handle.send*` 家族；
+`recordKind` 是 `record` 的多一个值参数，本条是它"没有偷偷开始分配"的读数）；
+`aggregate 6/2056 selected passed=6 ... filter=drainTo`（§13.9 的 6 条原样绿）；
+`aggregate 7/2056 selected passed=7 ... filter=ReplayFromLog`（§13.10 的 6 条 + e2e 原样绿）；
+`aggregate 15/2056 selected passed=15 ... filter=Replay`（整个重放家族）；`filter=Recorder` 3/3。
+全量 `--force-run --db all` 在同一棵树上跑了三遍，**失败数三遍都是 0**：
+`1998/2056 tests passed (58 skipped) in 182s`（改动落地后）、`1997/2056 tests passed (59 skipped) in 160s`
+（文档定稿后）、`1998/2056 tests passed (58 skipped) in 200s`（最终树，`source=build-summary`）。
+三遍之间的差异**只在 skip 计数里**（58 ↔ 59 抖动，门控用例，§13.10 记过同一种抖动），
+比 §13.10 记的 `1994/2052` 多 4 条，正是本节新增的 4 条。`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache
+zig build check` → `check-production: OK`（exit 0）；`zig build check-api` → exit 0；`scripts/check-deadcode.sh` →
+`OK: src+tools dead-code count within baseline (28).` / `OK: examples/** dead-code count within baseline (0).`；
+`zig fmt --check src tools examples` → exit 0。
+
+**红证据**（先写红的那条，加上之后改弱实现拿到的真实输出 —— 不是"看着红"）：
+① 改实现之前，`Delivery kind (§13.9): a timer delivery is written as .timer` 在旧实现（`drainTo` 硬编码
+`.message`）上：`599/1938 runtime.runtime.test.Delivery kind (§13.9): a timer delivery is written as .timer...
+expected .timer, found .message`，栈顶是那条 `expectEqual(delivery_log_mod.Kind.timer, scanned.records[0].kind)`。
+② `drainTo` 回到硬编码 → 定时用例仍 `expected .timer, found .message`，e2e 也 `expected .timer, found .message`
+（栈顶 `expectEqual(kind, scanned.records[i].kind)`，逐条比对那条）。
+③ `LogStep.kind` 硬编码成 `.message`（文件里是真的）→ 定时用例与 `.message` 用例**绿**，只有 e2e 红：
+`expected .timer, found .message`（栈顶 `expectEqual(kind, step.kind)`）—— 说明"读者看得见 kind"有自己的一条线，
+不是被别的断言顺带盖住的。
+④ `Handle.send` 改传 `.timer` → `expected .message, found .timer`（栈顶环里 `track.entry(track, 0).kind` 那条；
+e2e 同报 `expected .message, found .timer`）。
+⑤ 擦除 thunk 丢掉种类（`recordErased` 传 `.message`）→ 定时用例 `expected .timer, found .message`
+（栈顶环里 `entry.kind` 那条）。顺带测到一处**编译期**红线：把 `kind` 参数写成不用，构建直接
+`src/runtime/recorder.zig:543:66: error: unused function parameter` —— 种类在这条路上是必须传下去的，
+不是可以悄悄丢掉的参数。
+
+**没做什么**：CLI / 保留 / 压实 / 加密压缩 / 跨进程（§13.9 D5、§13.10 D7 照旧）；`Recorder(E)`（HotBus
+发布流）不加种类；重放不把文件里的 kind 回写成目标运行时的投递种类（见上，这是决定不是遗漏）；
+`drainTo` 不对 kind 做额外校验 —— 它是 `enum(u16)`，能进 `Writer.append` 就一定是格式认识的值。

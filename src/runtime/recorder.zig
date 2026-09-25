@@ -290,13 +290,17 @@ pub const TrackSpec = struct {
     /// Stable identity of this worker inside its log. Must be unique — two tracks
     /// under one id would split a worker's deliveries and replay them as one.
     id: []const u8,
-    /// Track capacity in messages. Memory is `capacity × sizeof(Message)`, held
-    /// for the life of the runtime.
+    /// Track capacity in messages. Memory is `capacity × (sizeof(Message) + the
+    /// entry's overhead)` — `seq`, `clock_ms` and the delivery `kind` ride along
+    /// per slot, and the struct's alignment rounds the total up (real numbers for
+    /// the message sizes in use: `docs/RUNTIME.md` §13.11) — held for the life of
+    /// the runtime.
     capacity: usize,
 };
 
-/// One entry as the *erased* side sees it: the ordering stamps, plus a pointer to
-/// the payload inside the track's ring (valid until the track is destroyed).
+/// One entry as the *erased* side sees it: the ordering stamps, the kind of
+/// delivery it was, plus a pointer to the payload inside the track's ring (valid
+/// until the track is destroyed).
 ///
 /// The payload is a pointer to the recorded value rather than encoded bytes on
 /// purpose: replaying *in memory* hands the value over (§13.9 D5 reads bytes back
@@ -305,6 +309,12 @@ pub const TrackSpec = struct {
 pub const TrackEntry = struct {
     seq: u64,
     clock_ms: i64,
+    /// What the delivery *was* — `dlog.Kind.message` for a `Handle.send*`, or
+    /// `dlog.Kind.timer` for one a timer's `post` handed over. Carried through
+    /// the ring rather than re-derived here: the two land in one ring and are
+    /// indistinguishable from the payload alone, so guessing is what used to make
+    /// every drained frame claim `.message` (§13.9, and §13.11 for the fix).
+    kind: dlog.Kind,
     payload: *const anyopaque,
 };
 
@@ -339,9 +349,10 @@ pub const TrackRef = struct {
     /// which is what makes `drainTo` refuse it *by name* instead of skipping it.
     payload_codec: ?[]const u8 = null,
 
-    /// Append one delivery. `event` points at the sender's value, which the track
-    /// copies into its ring — no allocation, and the sender's copy is not kept.
-    record: *const fn (track: *TrackRef, event: *const anyopaque) RecordError!void,
+    /// Append one delivery of `kind`. `event` points at the sender's value, which
+    /// the track copies into its ring — no allocation, and the sender's copy is
+    /// not kept.
+    record: *const fn (track: *TrackRef, event: *const anyopaque, kind: dlog.Kind) RecordError!void,
     /// Entry `i`, which must be below `len`.
     entry: *const fn (track: *const TrackRef, i: usize) TrackEntry,
     len: *const fn (track: *const TrackRef) usize,
@@ -401,11 +412,16 @@ pub fn Track(comptime E: type, comptime capacity: usize) type {
         pub const codec: ?[]const u8 = null;
 
         /// One recorded delivery, in this track's ring: the *global* sequence
-        /// number, the injected clock reading at the record point, and the
-        /// message itself.
+        /// number, the injected clock reading at the record point, the kind of
+        /// delivery it was, and the message itself.
         pub const Entry = struct {
             seq: u64,
             clock_ms: i64,
+            /// `dlog.Kind.message` for `Handle.send*`, `dlog.Kind.timer` for one
+            /// `Handle.after(...)` handed over (§13.9). Stored per entry because
+            /// the ring is where the difference is lost otherwise: both arrive at
+            /// the same funnel with the same payload type.
+            kind: dlog.Kind,
             event: E,
         };
 
@@ -437,11 +453,24 @@ pub fn Track(comptime E: type, comptime capacity: usize) type {
             .claims = claimsErased,
         },
 
-        /// Append one delivery. Zero allocation, lock-free. `error.Full` when the
-        /// track has no room left: the delivery *happened* (the message is in the
-        /// mailbox), the log just cannot keep it — which is why the runtime counts
-        /// the refusal instead of failing the send (see `DeliveryLog.refused`).
+        /// Append one delivery, read as a `Handle.send*` delivery (`.message`).
+        /// The signature the send path has always used; a delivery whose kind is
+        /// known to be something else goes through `recordKind`.
+        ///
+        /// Zero allocation, lock-free. `error.Full` when the track has no room
+        /// left: the delivery *happened* (the message is in the mailbox), the log
+        /// just cannot keep it — which is why the runtime counts the refusal
+        /// instead of failing the send (see `DeliveryLog.refused`).
         pub fn record(self: *Self, event: E) RecordError!void {
+            return self.recordKind(event, .message);
+        }
+
+        /// `record`, with the kind the delivery really was (§13.9): `Handle.send*`
+        /// passes `.message`, a timer's delivery passes `.timer`. Same contract as
+        /// `record` — zero allocation, by value, `error.Full` when the ring is
+        /// full — and the same entry point, because what a drain writes is exactly
+        /// the kind it is handed here.
+        pub fn recordKind(self: *Self, event: E, kind: dlog.Kind) RecordError!void {
             const seq = self.log.sequencer.next();
             const n = self.writes.next();
             if (n >= capacity) {
@@ -458,6 +487,7 @@ pub fn Track(comptime E: type, comptime capacity: usize) type {
             self.slots.publish(@intCast(n), .{
                 .seq = seq,
                 .clock_ms = self.log.clock.nowMs(),
+                .kind = kind,
                 .event = event,
             });
         }
@@ -495,6 +525,7 @@ pub fn Track(comptime E: type, comptime capacity: usize) type {
             return .{
                 .seq = self.slots.buf[i].seq,
                 .clock_ms = self.slots.buf[i].clock_ms,
+                .kind = self.slots.buf[i].kind,
                 .payload = @ptrCast(&self.slots.buf[i].event),
             };
         }
@@ -509,9 +540,9 @@ pub fn Track(comptime E: type, comptime capacity: usize) type {
             return @fieldParentPtr("ref", ref);
         }
 
-        fn recordErased(ref: *TrackRef, event: *const anyopaque) RecordError!void {
+        fn recordErased(ref: *TrackRef, event: *const anyopaque, kind: dlog.Kind) RecordError!void {
             const value: *const E = @ptrCast(@alignCast(event));
-            return fromRef(ref).record(value.*);
+            return fromRef(ref).recordKind(value.*, kind);
         }
 
         fn entryErased(ref: *const TrackRef, i: usize) TrackEntry {
@@ -865,14 +896,12 @@ pub const DeliveryLog = struct {
             writer.append(.{
                 .seq = entry.seq,
                 .track_id = track.id,
-                // The in-memory track keeps the stamps and the payload, not the
-                // delivery kind: `Handle.send*` and `Handle.after`'s timer
-                // delivery land in the same ring and are indistinguishable there
-                // (§13.7). Carrying the kind means a parameter through the
-                // delivery funnel, which §13.9 D1 rules out for this slice — so
-                // frames are written as `message`, and this comment is the honest
-                // half of that.
-                .kind = .message,
+                // The kind the ring recorded, not a guess: `Handle.send*` records
+                // `.message` and a timer's delivery records `.timer`
+                // (`Handle.noteDelivery`). A frame that said `.message` for a
+                // timer delivery — which is what this line did before §13.11 —
+                // made the file disagree with the run it describes.
+                .kind = entry.kind,
                 .recorded_ns = stampsToNs(entry.clock_ms),
                 .payload = bytes,
             }) catch |err| switch (err) {
@@ -1338,10 +1367,11 @@ pub const Replayer = struct {
 
 /// One delivery as a replay *from a file* hands it over: the same read-out
 /// `Step` gives — the global seq, the recorded stamp, the track it belongs to —
-/// plus the frame's own `kind`. A frame carries one and an in-memory track does
-/// not (§13.9's known gap), so a reader can see what a live replay cannot; it is
-/// reported rather than acted on, since a message and a timer delivery go to the
-/// same mailbox either way.
+/// plus the frame's own `kind`. The kind is the one the track recorded when it
+/// was drained (§13.11), so this is the reader's *checked* view of it rather than
+/// the only one: an in-memory `TrackEntry` carries the same value. It is reported
+/// rather than acted on, since a message and a timer delivery go to the same
+/// mailbox either way.
 pub const LogStep = struct {
     seq: u64,
     clock_ms: i64,
@@ -1604,6 +1634,15 @@ pub const ReplayFromLog = struct {
             fn post(target: *anyopaque, payload: *const anyopaque) mbox.SendError!void {
                 const h: *H = @ptrCast(@alignCast(target));
                 const msg: *const H.Message = @ptrCast(@alignCast(payload));
+                // A replay is a `send`, whatever the frame's `kind` said: the file
+                // records that a timer *fired in the recorded run*, and this line
+                // makes a fresh, ordinary delivery in the target runtime. Copying
+                // the frame's kind would be the target claiming a timer it never
+                // armed — and the reader that wants the recorded kind has it, in
+                // `LogStep.kind` (§13.11). The target is normally a graph spawned
+                // without `.record` (nothing to record into); the delivery kind of
+                // a target that did declare one is this runtime's own, recorded by
+                // `Handle.enqueue` like every other send.
                 return h.send(msg.*);
             }
         }.post;
@@ -2103,13 +2142,60 @@ test "Track: entries carry the log's global sequence, not their slot index" {
     try std.testing.expect(!erased.has_overflowed(erased));
     const entry = erased.entry(erased, 1);
     try std.testing.expectEqual(@as(u64, 2), entry.seq);
+    // A `record` with no kind is a `send`-shaped delivery, and the erased view
+    // says so — the kind is one of the stamps it hands out (§13.11).
+    try std.testing.expectEqual(dlog.Kind.message, entry.kind);
     const payload: *const u32 = @ptrCast(@alignCast(entry.payload));
     try std.testing.expectEqual(@as(u32, 11), payload.*);
 
-    // ...and the erased `record` thunk is the whole send-path cost of a track.
+    // ...and the erased `record` thunk is the whole send-path cost of a track. It
+    // carries the kind as its third argument: `.timer` here, so the assertion
+    // below cannot pass by the thunk dropping it and defaulting to `.message`.
     var value: u32 = 12;
-    try erased.record(erased, @ptrCast(&value));
+    try erased.record(erased, @ptrCast(&value), .timer);
     try std.testing.expectEqual(@as(u32, 12), A.entries()[2].event);
+    try std.testing.expectEqual(dlog.Kind.timer, A.entries()[2].kind);
+    try std.testing.expectEqual(dlog.Kind.message, A.entries()[0].kind);
+}
+
+test "Track.recordKind: the ring carries the kind, and record() means .message" {
+    var log = DeliveryLog.init(std.testing.allocator, .monotonic);
+    defer log.deinit();
+    const track = try log.addTrack(.{ .id = "a", .capacity = 4 }, u32, 4);
+
+    // The one-argument `record` is the `send*` shape, and it says so (§13.11);
+    // the kind is a per-slot field, so the two can differ within one ring.
+    try track.record(1);
+    try track.recordKind(2, .timer);
+    try track.record(3);
+
+    try std.testing.expectEqualSlices(dlog.Kind, &.{ .message, .timer, .message }, &.{
+        track.entries()[0].kind,
+        track.entries()[1].kind,
+        track.entries()[2].kind,
+    });
+    // The erased view hands the same value out — it is what `drainTo` reads.
+    try std.testing.expectEqual(dlog.Kind.timer, track.ref.entry(&track.ref, 1).kind);
+
+    // What the field costs, measured rather than promised: the entry is
+    // `{ seq: u64, clock_ms: i64, kind: Kind, event: E }`, so the kind lands in
+    // the padding a small `E` already had (0 extra bytes for a `u32` message) and
+    // pushes an 8-byte-aligned `E` onto the next 8-byte boundary (+8 for a `u64`).
+    // An `E` of any alignment in between behaves like one of these two. The
+    // absolute sizes are asserted too, so the numbers `docs/RUNTIME.md` §13.11
+    // publishes are the ones this test measures rather than a reading of them.
+    const WithoutKind = struct { seq: u64, clock_ms: i64, event: u32 };
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(Track(u32, 4).Entry));
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        @sizeOf(Track(u32, 4).Entry) - @sizeOf(WithoutKind),
+    );
+    const WithoutKind64 = struct { seq: u64, clock_ms: i64, event: u64 };
+    try std.testing.expectEqual(@as(usize, 32), @sizeOf(Track(u64, 4).Entry));
+    try std.testing.expectEqual(
+        @as(usize, 8),
+        @sizeOf(Track(u64, 4).Entry) - @sizeOf(WithoutKind64),
+    );
 }
 
 test "DeliveryLog: a refusal is counted, and a full track stops instead of overwriting" {

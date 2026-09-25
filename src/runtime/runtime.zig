@@ -91,6 +91,7 @@
 
 const std = @import("std");
 const mbox = @import("mailbox.zig");
+const delivery_log_mod = @import("delivery_log.zig");
 const wheel_mod = @import("timer_wheel.zig");
 const clock_mod = @import("clock.zig");
 const ring_mod = @import("ring.zig");
@@ -632,27 +633,33 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         /// than "what some caller posted" (§13.1). A timer's message never passes
         /// through `HotBus.publish`, so a log taken there would be missing it.
         ///
+        /// `kind` is each caller's own: `send*` passes `.message`, a timer's
+        /// `post` passes `.timer`. The funnel is the last place the difference is
+        /// known — the mailbox below it takes the message and nothing else — so
+        /// this parameter is what puts the kind in the ring instead of leaving the
+        /// drain to guess it (§13.11).
+        ///
         /// The record point is *after* the mailbox accepted the message on purpose:
         /// the track holds deliveries, so an `error.Full`/`error.Closed` from the
         /// mailbox must not produce an entry for a message nobody received.
-        fn enqueue(self: *Self, envelope: Envelope) mbox.SendError!void {
+        fn enqueue(self: *Self, envelope: Envelope, kind: delivery_log_mod.Kind) mbox.SendError!void {
             try self.mailbox.send(envelope);
-            self.noteDelivery(envelope.message);
+            self.noteDelivery(envelope.message, kind);
         }
 
         /// `enqueue` for the producer that would rather wait for room than drop.
-        fn enqueueBlocking(self: *Self, envelope: Envelope, timeout_ms: u32) mbox.SendError!void {
+        fn enqueueBlocking(self: *Self, envelope: Envelope, timeout_ms: u32, kind: delivery_log_mod.Kind) mbox.SendError!void {
             try self.mailbox.sendBlocking(envelope, timeout_ms);
-            self.noteDelivery(envelope.message);
+            self.noteDelivery(envelope.message, kind);
         }
 
         /// Log one delivered message. Zero allocation: the track copies the value
         /// into its pre-allocated ring (§13.2). A refusal does not fail the send —
         /// the message *is* in the mailbox — it marks the log incomplete, which the
         /// runtime counts and the replay refuses.
-        fn noteDelivery(self: *Self, message: Message) void {
+        fn noteDelivery(self: *Self, message: Message, kind: delivery_log_mod.Kind) void {
             const track = self.track orelse return;
-            track.record(track, @ptrCast(&message)) catch |err| {
+            track.record(track, @ptrCast(&message), kind) catch |err| {
                 std.log.warn(
                     "[runtime] delivery to {s} (track {s}) not recorded: {s} — the log is incomplete from here",
                     .{ self.context.name, track.id, @errorName(err) },
@@ -661,12 +668,12 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         }
 
         pub fn send(self: *Self, message: Message) mbox.SendError!void {
-            try self.enqueue(.{ .message = message });
+            try self.enqueue(.{ .message = message }, .message);
             self.announceReady();
         }
 
         pub fn sendBlocking(self: *Self, message: Message, timeout_ms: u32) mbox.SendError!void {
-            try self.enqueueBlocking(.{ .message = message }, timeout_ms);
+            try self.enqueueBlocking(.{ .message = message }, timeout_ms, .message);
             self.announceReady();
         }
 
@@ -675,7 +682,7 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         /// handles *this* message: the value travels in the mailbox slot, so two
         /// producers sending different traces cannot overwrite each other's.
         pub fn sendTraced(self: *Self, message: Message, trace: TraceId) mbox.SendError!void {
-            try self.enqueue(.{ .trace = trace, .message = message });
+            try self.enqueue(.{ .trace = trace, .message = message }, .message);
             self.announceReady();
         }
 
@@ -684,7 +691,7 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         /// the trace hurts most: the messages that arrive late are the ones you
         /// want to attribute.
         pub fn sendBlockingTraced(self: *Self, message: Message, trace: TraceId, timeout_ms: u32) mbox.SendError!void {
-            try self.enqueueBlocking(.{ .trace = trace, .message = message }, timeout_ms);
+            try self.enqueueBlocking(.{ .trace = trace, .message = message }, timeout_ms, .message);
             self.announceReady();
         }
 
@@ -761,7 +768,9 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
                     // Through `enqueue`, not `mailbox.send`: a timer's message is
                     // a delivery like any other, and §13.1's whole point is that
                     // these are in the track (they never pass `HotBus.publish`).
-                    d.handle.enqueue(.{ .trace = d.trace, .message = d.message }) catch |err| {
+                    // `.timer` is the one thing that separates it from a `send*`
+                    // at this point, and it rides the funnel into the ring (§13.11).
+                    d.handle.enqueue(.{ .trace = d.trace, .message = d.message }, .timer) catch |err| {
                         _ = d.handle.runtime.timer_deliveries_dropped.fetchAdd(1, .monotonic);
                         std.log.debug(
                             "[runtime] timer delivery to {s} dropped: {s}",
@@ -5958,6 +5967,239 @@ test "Runtime Replay: replayAll hands a whole log to a fresh graph, in order" {
 
     recorded.stop();
     recorded.join();
+}
+
+// ─────────────────────────────────────────────────
+// Delivery kinds (docs/RUNTIME.md §13.9): what a track — and the file it
+// drains to — says each delivery was
+// ─────────────────────────────────────────────────
+
+/// The `u32` payload format the kind tests drain with. The framework reads no
+/// payload (§13.9 D2): this is only what turns a value into bytes and back.
+const U32KindCodec = struct {
+    pub const name: []const u8 = "kind:u32";
+    pub const version: u16 = 1;
+
+    pub fn encode(allocator: std.mem.Allocator, value: u32) ![]u8 {
+        const bytes = try allocator.alloc(u8, @sizeOf(u32));
+        std.mem.writeInt(u32, bytes[0..4], value, .little);
+        return bytes;
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !u32 {
+        _ = allocator;
+        if (bytes.len != @sizeOf(u32)) return error.BadPayloadLength;
+        return std.mem.readInt(u32, bytes[0..4], .little);
+    }
+};
+
+/// Segment-file config for the kind tests: a throwaway directory under
+/// `.zig-cache/tmp` (unique per `std.testing.tmpDir`, so parallel test binaries
+/// cannot collide) and no fsync — these tests are about what the frames say,
+/// not about durability.
+fn kindConfig(tmp: *std.testing.TmpDir, buf: []u8) !delivery_log_mod.Config {
+    const path = try std.fmt.bufPrint(buf, ".zig-cache/tmp/{s}/kind", .{tmp.sub_path[0..]});
+    return .{
+        .dir_path = path,
+        .max_segment_bytes = 1 << 20,
+        .max_record_bytes = 4096,
+        .sync_mode = .none,
+    };
+}
+
+/// Bounded wait for the *track* side of a delivery. `Handle.enqueue` records
+/// after the mailbox accepted the message, so a handler having run is not yet
+/// proof that the entry landed — an assertion about a kind has to wait on the
+/// track itself.
+fn awaitTrackLen(track: *recorder_mod.TrackRef, want: usize) !void {
+    const Time = @import("../core/Time.zig");
+    const deadline = Time.monotonicNowMilliseconds() + 5_000;
+    while (track.len(track) < want) {
+        if (Time.monotonicNowMilliseconds() > deadline) return error.TrackNeverGrew;
+        std.atomic.spinLoopHint();
+    }
+}
+
+/// A worker with one atomic counter and no state of its own: what these tests
+/// assert on is the track, not the handler.
+const KindProbe = struct {
+    pub const Message = u32;
+    seen: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    pub fn handle(self: *@This(), msg: u32, ctx: anytype) anyerror!void {
+        _ = ctx;
+        _ = msg;
+        _ = self.seen.fetchAdd(1, .monotonic);
+    }
+};
+
+test "Delivery kind (§13.9): a timer delivery is written as .timer" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(allocator, io, clk.clock());
+    defer rt.deinit();
+    // The ticker is the half of `after` that turns an armed timer into a
+    // delivery, and that delivery is the one this test is about (§13.1: it never
+    // passes `Handle.send*`, which is exactly why a log taken at the bus would
+    // miss it).
+    try rt.start();
+
+    const handle = try rt.spawn(KindProbe, .{}, .{ .capacity = 8, .record = .{ .id = "tape", .capacity = 8 } });
+    const track = handle.track orelse return error.NoDeliveryTrack;
+
+    clk.set(1_000);
+    _ = try handle.after(50, 7);
+    clk.set(1_060); // past the deadline: the ticker fires on its next tick
+    try awaitTrackLen(track, 1);
+    handle.stop();
+    handle.join();
+    try std.testing.expectEqual(@as(u64, 1), handle.state.seen.load(.acquire));
+
+    // The ring says what that delivery was...
+    try std.testing.expectEqual(@as(usize, 1), track.len(track));
+    try std.testing.expectEqual(delivery_log_mod.Kind.timer, track.entry(track, 0).kind);
+
+    // The frame `drainTo` writes from that entry says what the delivery was.
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    var path_buf: [160]u8 = undefined;
+    const config = try kindConfig(&dir, &path_buf);
+
+    const log = rt.deliveryLog() orelse return error.NoDeliveryLog;
+    try log.setCodecRef(track, U32KindCodec, u32);
+    var writer = try delivery_log_mod.Writer.open(allocator, io, config);
+    _ = try log.drainTo(&writer);
+    writer.deinit();
+
+    var scanned = try delivery_log_mod.scan(allocator, io, config);
+    defer scanned.deinit(allocator);
+    try scanned.expectClean();
+    try std.testing.expectEqual(@as(usize, 1), scanned.records.len);
+    try std.testing.expectEqual(delivery_log_mod.Kind.timer, scanned.records[0].kind);
+}
+
+test "Delivery kind (§13.9): send and sendBlocking are written as .message" {
+    // The other direction: a fix that called every delivery a timer would pass
+    // the test above and lie about every `send*` there is.
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, clk.clock());
+    defer rt.deinit();
+
+    const handle = try rt.spawn(KindProbe, .{}, .{ .capacity = 8, .record = .{ .id = "tape", .capacity = 8 } });
+    const track = handle.track orelse return error.NoDeliveryTrack;
+
+    // No `rt.start()`: `send*` is the direct path, and leaving the ticker out
+    // means nothing here could be a timer delivery even by accident.
+    try handle.send(1);
+    try awaitTrackLen(track, 1);
+    try handle.sendBlocking(2, 5);
+    try awaitTrackLen(track, 2);
+    handle.stop();
+    handle.join();
+    try std.testing.expectEqual(@as(u64, 2), handle.state.seen.load(.acquire));
+
+    try std.testing.expectEqual(delivery_log_mod.Kind.message, track.entry(track, 0).kind);
+    try std.testing.expectEqual(delivery_log_mod.Kind.message, track.entry(track, 1).kind);
+}
+
+test "Delivery kind (§13.9) e2e: a mixed track keeps every kind, entry for entry, on disk" {
+    // Timer deliveries and direct sends in one ring, the way a real worker gets
+    // them: the file has to agree with the ring record for record, and the reader
+    // has to see the same kinds. One track (no `seq` gaps), walked in order.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Kind = delivery_log_mod.Kind;
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(allocator, io, clk.clock());
+    defer rt.deinit();
+    try rt.start();
+
+    const handle = try rt.spawn(KindProbe, .{}, .{ .capacity = 8, .record = .{ .id = "tape", .capacity = 8 } });
+    const track = handle.track orelse return error.NoDeliveryTrack;
+
+    // Each delivery is awaited before the next is made, so slot order is seq
+    // order and "entry i" means the same thing on both sides of the drain.
+    clk.set(100);
+    try handle.send(1);
+    try awaitTrackLen(track, 1);
+    clk.set(200);
+    _ = try handle.after(50, 2);
+    clk.set(260); // past the deadline
+    try awaitTrackLen(track, 2);
+    clk.set(300);
+    try handle.sendBlocking(3, 5);
+    try awaitTrackLen(track, 3);
+    clk.set(400);
+    _ = try handle.after(10, 4);
+    clk.set(415);
+    try awaitTrackLen(track, 4);
+    handle.stop();
+    handle.join();
+    try std.testing.expectEqual(@as(u64, 4), handle.state.seen.load(.acquire));
+
+    const want: [4]Kind = .{ .message, .timer, .message, .timer };
+    for (want, 0..) |kind, i| {
+        try std.testing.expectEqual(kind, track.entry(track, i).kind);
+    }
+
+    // ── the drain, and the file ─────────────────────────────────────────
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    var path_buf: [160]u8 = undefined;
+    const config = try kindConfig(&dir, &path_buf);
+
+    const log = rt.deliveryLog() orelse return error.NoDeliveryLog;
+    try log.setCodecRef(track, U32KindCodec, u32);
+    var writer = try delivery_log_mod.Writer.open(allocator, io, config);
+    const report = try log.drainTo(&writer);
+    writer.deinit();
+    try std.testing.expectEqual(@as(usize, 4), report.records);
+    try std.testing.expectEqual(@as(u64, 0), report.holes);
+
+    var scanned = try delivery_log_mod.scan(allocator, io, config);
+    defer scanned.deinit(allocator);
+    try scanned.expectClean();
+    try std.testing.expectEqual(@as(usize, 4), scanned.records.len);
+    // Entry for entry — not "one of them is right": the whole point of carrying
+    // the kind is that a per-delivery difference survives the drain.
+    for (want, 0..) |kind, i| {
+        try std.testing.expectEqual(kind, scanned.records[i].kind);
+        try std.testing.expectEqual(kind, track.entry(track, i).kind);
+    }
+
+    // ── the reader sees the same kinds ──────────────────────────────────
+    // A fresh graph, no tracks of its own: nothing a replay delivers can be
+    // recorded back (there is no log here to record into).
+    var replay_clock = Clock.Manual{ .now_ms = 0 };
+    var rt_rep = Runtime.init(allocator, io, replay_clock.clock());
+    defer rt_rep.deinit();
+    try std.testing.expectEqual(@as(?*DeliveryLog, null), rt_rep.deliveryLog());
+    const fresh = try rt_rep.spawn(KindProbe, .{}, 8);
+
+    var loader = try ReplayFromLog.init(allocator, &replay_clock, scanned.records);
+    defer loader.deinit();
+    try loader.setCodec("tape", U32KindCodec, u32);
+    try loader.bindDecoded("tape", fresh);
+
+    for (want, 0..) |kind, i| {
+        const step = (try loader.step()).?;
+        try std.testing.expectEqual(@as(u64, @intCast(i)), step.seq);
+        try std.testing.expectEqual(kind, step.kind);
+    }
+    try std.testing.expectEqual(@as(?recorder_mod.LogStep, null), try loader.step());
+
+    // The replay really delivered: four ordinary sends into the fresh worker,
+    // i.e. `.message` there whatever the file said — the file's kind is the
+    // recorded run's, and `LogStep.kind` is where a reader reads it.
+    try waitUntil(Published(@TypeOf(fresh.mailbox.received), u64){ .value = &fresh.mailbox.received, .want = 4 }, 5_000);
+    try std.testing.expectEqual(@as(u64, 4), fresh.stats().received);
+    try std.testing.expectEqual(@as(?*DeliveryLog, null), rt_rep.deliveryLog());
+
+    fresh.stop();
+    fresh.join();
 }
 
 test "ReplayFromLog e2e (§13.10): a drained delivery log replays into a fresh runtime's handlers" {

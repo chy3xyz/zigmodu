@@ -2,6 +2,42 @@
 
 ## [Unreleased]
 
+### 第 34 批：投递种类（`Kind`）从漏斗一路到段文件 —— §13.9 那条"定时器投递在盘上冒充 message"的缺口收掉（**破坏性：否**，`Track.record` 签名未动）
+
+全量 `-Ddb=all` **1998/2056（58 skipped，0 failed）**；CI 示例清单本机 **16/16 构建 + 7 个 `build test` 步骤全绿**；fmt / check / check-api / check-deadcode / check-tenant-scope / check-version 全绿。
+
+**缺口从哪来**：§13.1 说投递轨记的是"每个 worker **收到了什么**"，而它同时收两样 —— `Handle.send*`
+直投，和 `Handle.after(...)` 的**定时器投递**（timer → ticker → post → handle）。§13.9 落地时**每条都写
+`Kind.message`**，因为内存轨根本不记种类，注释与状态行都把这条缺口明写着。上一批（§13.10）让
+`LogStep.kind` 能从帧里读出真值，于是缺口只剩"**盘上写的 kind 是假的**"这一半。
+
+**修法**：`Kind` 真正落进内存轨（`Track.Entry.kind` / 擦除视图 `TrackEntry.kind` / 擦除 thunk 多一个参数），
+新增 `Track.recordKind(event, kind)`，而 `record` 等价于 `recordKind(..., .message)` —— **`record` 的签名
+一个字没动**，直调它的用户不受影响。`Handle` 的三个**私有**漏斗（`enqueue` / `enqueueBlocking` /
+`noteDelivery`）加一个 kind 参数：四个 `send*` 传 `.message`，**定时器 `post` 传 `.timer`**。
+`drainTo` 写 `entry.kind`，不再硬编码。
+
+**环的每槽增量是实测量的、不是估计的**（测试里直接断言 `@sizeOf`）：`u32` 消息 24 → **24 字节（+0**，
+种类落进原本就有的尾部 padding**）**；`u64` 消息 24 → **32 字节（+8）**。也就是常见的小消息类型
+**一分钱不涨**，只有"消息恰好占满 24 字节"的类型每槽 +8。
+
+**重放那条是决定，不是遗漏**：`ReplayFromLog` 的投递**不照抄**帧里的 kind，仍以 `.message` 进目标
+runtime —— 录下来的 kind 描述的是"被录那一次"，重放做的是"这一次的一条普通 send"；真值留在
+`LogStep.kind` 上给调用方读。同时确认**重放不往目标 runtime 的轨里写东西**（端到端用例断言
+`deliveryLog() == null`）。
+
+> **红证据是"先写红的那条"**（这一批的重点）：测试先写好、在旧实现上跑 ——
+> `Delivery kind (§13.9): a timer delivery is written as .timer...expected .timer, found .message` /
+> `FAIL (TestExpectedEqual)`，栈顶直指 `expectEqual(delivery_log_mod.Kind.timer, scanned.records[0].kind)`，
+> 那一跑是 `0 passed; 1 failed`。**另有 4 组变异红**，各自独立：`drainTo` 回到硬编码（定时用例与 e2e 都红）·
+> `LogStep.kind` 硬编码成 `.message`（只有 e2e 红，证明"读者看得见"是一条独立的线）· `Handle.send` 改传
+> `.timer`（`expected .message, found .timer`）· 擦除 thunk 丢种类（环里那条红；把参数写成不用则是
+> 编译期的 `unused function parameter`）。**没有一条守卫拿不到红。**
+
+**既有套件一条都没被削弱**：`drainTo` **6/6**、`ReplayFromLog` **7/7**、`Replay` **15/15**、`Recorder` **3/3**、
+`alloc contract` **8/8**（含 `Handle.send / sendBlocking / sendTraced allocate nothing`）—— 全程只加断言、
+没有为迁就实现改过任何既有断言。
+
 ### 第 33 批：Replay v2 第二刀 —— 从盘上重放（`ReplayFromLog`），并补掉上一批"有 codec 却挂不上"的缺口（`DeliveryLog.setCodecRef`）（**破坏性：否**，新增可选 API）
 
 全量 `-Ddb=all` **1994/2052（58 skipped，0 failed）**；CI 示例清单本机 **16/16 构建 + 7 个 `build test` 步骤全绿**；fmt / check / check-api / check-deadcode / check-tenant-scope / check-version 全绿。
