@@ -198,6 +198,7 @@ test "compile all source files" {
 
     // Validation
     _ = @import("validation/ObjectValidator.zig");
+    _ = @import("validation/FieldRules.zig");
 
     // Cache
     _ = @import("cache/CacheManager.zig");

@@ -3,6 +3,13 @@
 //! ⚠️ DEPRECATED — use `zigmodu.Validator` (validation/ObjectValidator.zig) instead.
 //! This GoZero-style validator will be removed in v1.0.
 //!
+//! `FieldRules` is *no longer* one of the reasons it survives: the canonical
+//! declaration moved to `validation/FieldRules.zig`, which `http.FieldRules`
+//! reads directly. What is still load-bearing here is the `validateStruct` /
+//! `validateStructCollect` entry points called by `http.validateRequest`
+//! (`api/middleware/Validation.zig`) and `http.extractJsonValidated`
+//! (`api/Extract.zig`), plus the `Validator.*` spellings themselves.
+//!
 //! Provides input validation aligned with go-zero's validate patterns.
 
 const std = @import("std");
@@ -99,24 +106,13 @@ pub fn url(value: []const u8) Result {
     return Result.ok();
 }
 
-/// Field validation rules for comptime struct validation.
-/// Only fields relevant to the value type are enforced.
-pub const FieldRules = struct {
-    required: bool = false,
-    min_len: ?usize = null,
-    max_len: ?usize = null,
-    min: ?i64 = null,
-    max: ?i64 = null,
-    email: bool = false,
-    uuid: bool = false,
-    phone: bool = false,
-    url: bool = false,
-    one_of: ?[]const u8 = null,
-    /// Replaces the failure message for this field **verbatim** (no field-name
-    /// prefix added). Use it to phrase the error for the end user. It covers any
-    /// rule on that field, not one specific rule.
-    message: ?[]const u8 = null,
-};
+/// Field validation rules for comptime struct validation. The canonical
+/// declaration lives in `validation/FieldRules.zig`, because `http.FieldRules`
+/// resolves there now and the http domain must not be reached from this
+/// deprecated file. This is the compatibility alias for consumers who wrote
+/// `Validator.FieldRules`; the dependency runs one way only (deprecated file →
+/// new home, never the reverse).
+pub const FieldRules = @import("FieldRules.zig").FieldRules;
 
 /// Failure message for one violated rule.
 ///

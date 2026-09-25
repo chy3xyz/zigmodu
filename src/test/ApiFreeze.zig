@@ -33,8 +33,9 @@
 //! 4. **File-level banners** — two files mark the *whole module* deprecated
 //!    without a consumer-writable `zigmodu.<name>` having left, so they are
 //!    neither rows nor removals. The gate pins the banner and — for the one that
-//!    is still load-bearing — the public spelling (`http.FieldRules`) that keeps
-//!    saying "this file cannot be deleted as the banner promises".
+//!    is still load-bearing — the dependency direction of the public spelling
+//!    (`http.FieldRules` must resolve to `validation/FieldRules.zig`, and that
+//!    file must not reach back into the deprecated `validation/Validator.zig`).
 //! 5. **Anchor resolution** — every anchor `docs/API_FREEZE.md` names resolves
 //!    (`@hasDecl`, data-driven from the doc's own rows, so the check follows the
 //!    doc rather than a hand-written list of calls).
@@ -210,11 +211,13 @@ const REMOVED = [_]Removed{
 /// * `src/extensions.zig` — its `zigmodu.extensions` namespace is gone (see
 ///   `REMOVED`); what is left is a type-alias shim, path-reachable only.
 /// * `src/validation/Validator.zig` — its banner says "will be removed in v1.0",
-///   but the file is still the live implementation behind `http.FieldRules`, so
-///   that sentence is a plan with a prerequisite: move the public spelling
-///   first. That half is asserted explicitly (it is the one entry here whose
-///   *reachability* is part of the claim), so deleting the file as the banner
-///   promises cannot happen silently.
+///   and today that is still a plan with a prerequisite: the `validateStruct*`
+///   entry points behind `http.validateRequest` / `http.extractJsonValidated`
+///   are live. What is *not* a prerequisite any more is `http.FieldRules` — the
+///   canonical `FieldRules` moved to `validation/FieldRules.zig` (see
+///   `FIELD_RULES_HOME`), so the spelling no longer resolves through this file.
+///   Both halves are asserted: the banner text, and the direction of the
+///   dependency that used to justify the sentence.
 const Banner = struct {
     file: []const u8,
     /// Rule-1 text the banner has to keep. Checked inside `banner_window` bytes
@@ -226,9 +229,9 @@ const Banner = struct {
 const BANNERS = [_]Banner{
     .{
         .file = "src/validation/Validator.zig",
-        // The replacement the banner names, and the module it points at. This is
-        // the live entry: the test also asserts `http.FieldRules` still resolves
-        // to this file's `FieldRules`.
+        // The replacement the banner names. The public-spelling half of this
+        // entry moved to `FIELD_RULES_HOME`: the gate now asserts the spelling
+        // resolves to the new home rather than to this file.
         .must_contain = &.{ "DEPRECATED", "ObjectValidator.zig" },
     },
     .{
@@ -239,6 +242,23 @@ const BANNERS = [_]Banner{
         .must_contain = &.{ "DEPRECATED", "zigmodu.http.http_server" },
     },
 };
+
+/// Where the canonical `FieldRules` declaration lives. `http.FieldRules` is the
+/// spelling consumers write, and it has to resolve here rather than through the
+/// deprecated `validation/Validator.zig` — otherwise deleting that file, as its
+/// banner promises, would take a frozen public spelling with it.
+///
+/// The two files are pinned as a pair, in both directions: the home declares the
+/// type and does *not* name the deprecated file, while the deprecated file keeps
+/// only an alias and *does* name the home. Type equality (`http.FieldRules ==
+/// home.FieldRules`) proves the spelling resolves there; the source scans prove
+/// no `@import` path can pull the deprecated file back in.
+const FIELD_RULES_HOME_PATH = "src/validation/FieldRules.zig";
+const FIELD_RULES_DEPRECATED_PATH = "src/validation/Validator.zig";
+/// The canonical declaration, verbatim — the evidence that the home really does
+/// declare the struct, and (by its absence elsewhere) that it is not a second
+/// alias. The deprecated file must not contain this string any more.
+const FIELD_RULES_CANONICAL_DECL = "pub const FieldRules = struct {";
 
 /// How far into a file its banner has to sit to count as one.
 const banner_window = 1500;
@@ -536,7 +556,7 @@ test "removed: docs/UPGRADING.md records the same removals this gate pins" {
 // 1c. File-level banners
 // ============================================================
 
-test "banners: the whole-file DEPRECATED notices are still at the top, and the live one is still live" {
+test "banners: the whole-file DEPRECATED notices are still at the top, and http.FieldRules is decoupled from the deprecated one" {
     const allocator = std.testing.allocator;
 
     var problems: usize = 0;
@@ -559,28 +579,96 @@ test "banners: the whole-file DEPRECATED notices are still at the top, and the l
         }
     }
 
-    // The still-live one: `src/validation/Validator.zig` says "removed in v1.0",
-    // but `http.FieldRules` *is* its `FieldRules` today, so the sentence is a plan
-    // with a prerequisite. Both halves are pinned — the public spelling consumers
-    // use, and the file it resolves to — so the file cannot be deleted as the
-    // banner promises without this gate going red first.
+    // The `http.FieldRules` decoupling, in three parts.
+    //
+    // `src/validation/Validator.zig` still says "removed in v1.0" and that is
+    // still a plan with a prerequisite — but the prerequisite is now the
+    // `validateStruct*` entry points (`http.validateRequest`, below), not the
+    // public spelling. `http.FieldRules` must resolve to the canonical home in
+    // `validation/FieldRules.zig`, and the home must have no way back into the
+    // deprecated file: otherwise deleting it, as the banner promises, would take
+    // a frozen public spelling with it.
+    const FieldRulesHome = @import("../validation/FieldRules.zig");
     const DeprecatedValidator = @import("../validation/Validator.zig");
     const ObjectValidator = @import("../validation/ObjectValidator.zig");
+    const Extract = @import("../api/Extract.zig");
 
     try std.testing.expect(@hasDecl(http, "FieldRules"));
     try std.testing.expect(@hasDecl(http, "validateRequest"));
-    try std.testing.expect(http.FieldRules == DeprecatedValidator.FieldRules);
+    // (a) The public spelling, the http-domain re-export and the compatibility
+    //     alias on the deprecated file are all one type — and that type is the
+    //     canonical one, so "this is the same struct that moved" is asserted, not
+    //     assumed.
+    try std.testing.expect(FieldRulesHome.FieldRules == Extract.FieldRules);
+    try std.testing.expect(http.FieldRules == FieldRulesHome.FieldRules);
+    try std.testing.expect(DeprecatedValidator.FieldRules == FieldRulesHome.FieldRules);
+
+    // (b) The canonical *declaration* sits in the home and nowhere else: the
+    //     deprecated file keeps an alias, not the struct. Without this, a
+    //     "move" that left the struct behind and re-exported it from the home
+    //     would satisfy (a) while decoupling nothing.
+    const home_src = readDoc(allocator, FIELD_RULES_HOME_PATH) catch |err| {
+        std.debug.print("[api-freeze] cannot read {s} ({s}) — that file is the canonical home of `http.FieldRules`\n", .{ FIELD_RULES_HOME_PATH, @errorName(err) });
+        return error.FieldRulesHomeUnreadable;
+    };
+    defer allocator.free(home_src);
+    const deprecated_src = readDoc(allocator, FIELD_RULES_DEPRECATED_PATH) catch |err| {
+        std.debug.print("[api-freeze] cannot read {s} ({s}) — that file carries the banner the gate is checking\n", .{ FIELD_RULES_DEPRECATED_PATH, @errorName(err) });
+        return error.FieldRulesDeprecatedUnreadable;
+    };
+    defer allocator.free(deprecated_src);
+
+    if (std.mem.indexOf(u8, home_src, FIELD_RULES_CANONICAL_DECL) == null) {
+        std.debug.print("[api-freeze] {s} no longer contains `{s}` — `http.FieldRules` is supposed to be declared there\n", .{ FIELD_RULES_HOME_PATH, FIELD_RULES_CANONICAL_DECL });
+        problems += 1;
+    }
+    if (std.mem.indexOf(u8, deprecated_src, FIELD_RULES_CANONICAL_DECL) != null) {
+        std.debug.print("[api-freeze] {s} declares `{s}` again — the canonical declaration is back in the deprecated file, so deleting it would break `http.FieldRules`\n", .{ FIELD_RULES_DEPRECATED_PATH, FIELD_RULES_CANONICAL_DECL });
+        problems += 1;
+    }
+
+    // (c) The dependency direction: the home must not reach the deprecated file,
+    //     while the deprecated file must still name the home (its alias would
+    //     otherwise be a stale second copy). Matched as the tail of the import
+    //     path (`Validator.zig")`), which covers both the sibling spelling and any
+    //     path-qualified one, while a mention in prose — including the "deprecated
+    //     file" wording in this very test's messages — does not count.
+    const ValidatorImport = "Validator.zig\")";
+    if (std.mem.indexOf(u8, home_src, ValidatorImport) != null) {
+        std.debug.print("[api-freeze] {s} contains {s} — the direction is backwards: the deprecated file must depend on the home, never the other way round, or deleting it breaks `http.FieldRules`\n", .{ FIELD_RULES_HOME_PATH, ValidatorImport });
+        problems += 1;
+    }
+    const FieldRulesImport = "FieldRules.zig\")";
+    if (std.mem.indexOf(u8, deprecated_src, FieldRulesImport) == null) {
+        std.debug.print("[api-freeze] {s} no longer contains {s} — its `FieldRules` alias must point at the canonical home\n", .{ FIELD_RULES_DEPRECATED_PATH, FieldRulesImport });
+        problems += 1;
+    }
+    // …and the http-domain re-export reads the home directly, so the `http.*`
+    // chain does not pass through the deprecated file at all.
+    const extract_src = try readDoc(allocator, "src/api/Extract.zig");
+    defer allocator.free(extract_src);
+    if (std.mem.indexOf(u8, extract_src, FieldRulesImport) == null) {
+        std.debug.print("[api-freeze] src/api/Extract.zig no longer contains {s} — `http.FieldRules` would resolve through the deprecated file again\n", .{FieldRulesImport});
+        problems += 1;
+    }
 
     // …and the replacement the banner names is a *different* type, so "use
     // `zigmodu.Validator` instead" is a real migration and not a self-reference.
     try std.testing.expect(@hasDecl(zmodu, "Validator"));
     try std.testing.expect(zmodu.Validator == ObjectValidator.Validator);
     try std.testing.expect(zmodu.Validator != DeprecatedValidator.Validator);
+    try std.testing.expect(zmodu.Validator != FieldRulesHome.FieldRules);
 
     // Called for real: Zig's lazy analysis would let the file's signatures rot
-    // as long as nothing ever calls them.
+    // as long as nothing ever calls them. `validateStruct` is the part of the
+    // deprecated file that is still load-bearing, so it is the part exercised.
     const empty = DeprecatedValidator.notEmpty("");
     try std.testing.expect(!empty.valid);
+    const ProbeDto = struct { name: []const u8 };
+    const probe_rules = .{ .name = DeprecatedValidator.FieldRules{ .required = true } };
+    const err_msg = try DeprecatedValidator.validateStruct(allocator, ProbeDto{ .name = "" }, probe_rules);
+    defer if (err_msg) |msg| allocator.free(msg);
+    try std.testing.expect(err_msg != null);
 
     // The other half of the banner the gate checks: the replacements it lists for
     // the extensions shim's first line of exports still resolve.

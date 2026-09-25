@@ -10,12 +10,17 @@ const std = @import("std");
 const Server = @import("Server.zig");
 const ProblemDetails = @import("../http/ProblemDetails.zig").ProblemDetails;
 const Validator = @import("../validation/Validator.zig");
+const FieldRulesFile = @import("../validation/FieldRules.zig");
 const OpenApi = @import("../http/OpenApi.zig");
 const Multipart = @import("../http/Multipart.zig");
 const UploadGuard = @import("../http/UploadGuard.zig");
 
 pub const Context = Server.Context;
-pub const FieldRules = Validator.FieldRules;
+/// Field validation rules used by `extractJsonValidated`. Read straight from the
+/// canonical home (`validation/FieldRules.zig`), not through the deprecated
+/// `validation/Validator.zig` — so the `http.FieldRules` spelling survives that
+/// file's deletion.
+pub const FieldRules = FieldRulesFile.FieldRules;
 
 /// Parse a `multipart/form-data` body, rendering failures as ProblemDetails.
 ///

@@ -8,7 +8,7 @@
 
 | 口径 | 出处 |
 |---|---|
-| 弃用别名**不早于 1.0** 删除 | `docs/UPGRADING.md:8-10`（统一口径），表在 `:12-22`、已移除记录在 `:43-71`（本文件不抄第二份） |
+| 弃用别名**不早于 1.0** 删除 | `docs/UPGRADING.md:8-10`（统一口径），表在 `:12-22`、已移除记录在 `:51-80`（本文件不抄第二份） |
 | `Application` / `Module` / `DI` / `EventBus` / HTTP 公开契约**只增不改** | `docs/RUNTIME.md:58`（§2 第 1–4 条见 `:37-40`，第 9 条见 `:46`） |
 | `runtime.*` 在 0.x **允许 breaking** | `docs/RUNTIME.md:47-49`（§2 第 10 条）+ `:54-61`（"0.x 不破坏"不成立）；先例 `:537`（v0.28.0 删掉 `Runtime.cancelTimer(id) bool`） |
 | 每次 runtime breaking 要**同时**进 §9 路线图与 `UPGRADING.md` 对应版本段 | `docs/RUNTIME.md:59-61` |
@@ -59,7 +59,7 @@
 - 该行代码里的 `DEPRECATED` 标注与"指向新名"也要在（`docs/UPGRADING.md` 的规则 1）；
 - **表 ↔ 门禁双向同步**：表里加一行而门禁没跟上是红，门禁里留着一行而表删了也是红。
 
-### 已移除的记录（`docs/UPGRADING.md:43-71`）
+### 已移除的记录（`docs/UPGRADING.md:51-80`）
 
 表只承诺**还活着**的别名。已经删掉的名字进不了表 —— 给它写"不早于 1.0 删除"等于告诉读者它今天还能用；
 它们记在表下方的「已移除」小节里，门禁对它们的断言方向**相反**：**不得**重新出现在顶层。
@@ -75,21 +75,27 @@
 
 ### 整模块级弃用横幅（第三类：既不进表，也不进「已移除」）
 
-`docs/UPGRADING.md:24-41` 写着这两处为什么两边都不进。门禁（`src/test/ApiFreeze.zig` 的 `BANNERS`）钉的是：
+`docs/UPGRADING.md:24-49` 写着这两处为什么两边都不进。门禁（`src/test/ApiFreeze.zig` 的 `BANNERS`）钉的是：
 
 - 横幅仍在**文件头 1500 字节**内，且仍点名替代路径；
 - `src/extensions.zig` 仍被 `src/tests.zig` 的编译门禁 import；`src/validation/Validator.zig` 不在那份直接
-  import 名单里（那里 import 的是 `validation/ObjectValidator.zig`），由门禁自己 `@import` 并**真调一次**
-  （`notEmpty`），所以它的签名同样不会静默烂掉；
-- `src/validation/Validator.zig` 的"还活着"证据：`http.FieldRules` 与 `http.validateRequest` 仍在，
-  且 `http.FieldRules == Validator.zig 的 FieldRules`；替代品 `zigmodu.Validator` 解析到
-  `validation/ObjectValidator.zig` 的**另一个**类型（`!=` 是断言的一部分：那是真迁移，不是自指）。
-  这半条是刻意钉住的 —— 横幅写着"v1.0 删除"，但删之前必须先把 `http.FieldRules` 这个公开拼写迁走。
+  import 名单里（那里 import 的是 `validation/ObjectValidator.zig` 与 `validation/FieldRules.zig`），由门禁自己
+  `@import` 并**真调两次**（`notEmpty` 与 `validateStruct`），所以它的签名同样不会静默烂掉；
+- `src/validation/Validator.zig` 与 `http.FieldRules` 的**依赖方向**（本批起，从"钉住耦合"改成"钉住解耦"）：
+  `http.FieldRules` 与 `http.validateRequest` 仍在；`FieldRules` 的**规范声明**在
+  `src/validation/FieldRules.zig`，且 `http.FieldRules` / `src/api/Extract.zig` 的再导出 / 弃用文件上的
+  `Validator.FieldRules` 别名**三处是同一个类型**；新家**不得** `@import` 弃用文件，弃用文件**必须**仍指向新家；
+  弃用文件里**不得**再出现规范声明本身。三条合起来证明"删掉 `Validator.zig` 不会再打断 `http.FieldRules`"。
+  （`@import` 匹配用的是带引号的拼写，所以散文里提到文件名不算依赖 —— 反向的假绿堵住了。）
+  替代品 `zigmodu.Validator` 仍解析到 `validation/ObjectValidator.zig` 的**另一个**类型（`!=` 是断言的一部分：
+  那是真迁移，不是自指）。
+  这半条现在说明的是**还剩什么挡着 v1.0 删除** —— `validateStruct` / `validateStructCollect` 这条链
+  （`http.validateRequest`、`http.extractJsonValidated`）与 `Validator.*` 越路径拼写本身，不再是 `http.FieldRules`。
 
 ## 覆盖不到的部分（只能人工看）
 
 1. **已移除的块只钉"回不到顶层"，不钉"用不了"。** `Simplified` 整块（`App` / `ModuleImpl` / `Module`）已从顶层移除
-   （`docs/UPGRADING.md:43-71`）。门禁钉的是 `zigmodu.App` / `zigmodu.ModuleImpl` **不**在顶层、且 `src/api/Simplified.zig`
+   （`docs/UPGRADING.md:51-80`）。门禁钉的是 `zigmodu.App` / `zigmodu.ModuleImpl` **不**在顶层、且 `src/api/Simplified.zig`
    仍在树上并被 `src/tests.zig` 的编译门禁 import —— 这不是"整块 API 仍受支持"的承诺：门禁**不断言**里面的签名，
    也不断言越路径 `@import("zigmodu/src/api/Simplified.zig")` 在下一个版本还能用（越包内路径不受支持）。
    门禁确实跑 `App.init` → `register(ModuleImpl(T).interface(…))` → `start` / `stop` 的 before 流程，但那是**走越路径 import**
@@ -109,9 +115,16 @@
      （表在 `docs/UPGRADING.md:18-22`）。四条 `send*` 是**一族**：`scripts/check-production.sh` 的"信封泄漏"
      扫描把它们当同一形状处理。
    - **整模块横幅已归类，不在这张表里**：`src/validation/Validator.zig` 与 `src/extensions.zig`
-     （见上面「整模块级弃用横幅」一节）。前者**还活着**（`http.FieldRules` 就是它的），所以按"可达"处理而不是
-     "已移除"；后者是**命名空间级**的移除，已记进「已移除」的记录并由门禁钉住 `@hasDecl(zmodu, "extensions")` 为假。
+     （见上面「整模块级弃用横幅」一节）。前者**还活着**，但理由在本批换了：`http.FieldRules` 已经解耦（规范声明
+     搬去 `src/validation/FieldRules.zig`），现在挡着删除的是 `validateStruct*` 这条链（`http.validateRequest`、
+     `http.extractJsonValidated`）与 `Validator.*` 越路径拼写；所以按"可达"处理而不是"已移除"；
+     后者是**命名空间级**的移除，已记进「已移除」的记录并由门禁钉住 `@hasDecl(zmodu, "extensions")` 为假。
    - **仍未收口**：没有。四处都已在文档与门禁里各就各位；下次再发现表外标记，照同样的三步走（归类 → 入表/入档 → 加断言）。
+   - **规则 3（回指本节）的逐条现状**写在 `docs/UPGRADING.md`（表下方"规则 3 的现状"）：只有 `ctx.paramPath`
+     （`:929` 起那节，`v0.15.46`）与 `RateLimiter.acquire`（`v0.15.45` 那节）能回指 —— 两条都已完成；其余四组
+     要么记录只存在于 `CHANGELOG.md`（`startAll`/`stopAll` → `[0.15.12]`；`http_server` → 只有 `[0.15.8]` 的示例清理，
+     而 `src/http.zig:13` 自称的 `v0.14.0` 在 `CHANGELOG.md` 里**没有对应段落**），要么根本找不到弃用条目
+     （四个 `ctx.send*`）。本文件不镜像那份逐条说明。
 8. **`zigmodu.stopAll` 的标记检查不独立。** 门禁的标记看的是声明前 1500 字节（`marker_window`），
    `src/root.zig:63-66` 两条标记只隔一行，所以只删 `stopAll` 那条注释**不会**让它红（`startAll` 的注释里也有
    `Application.stop()`）。要让两条各自独立，得把窗口收窄成"紧邻的 doc comment"—— 那是门禁自己的比较口径，暂不动，人工看。
@@ -129,5 +142,6 @@
    `src/test/ApiFreeze.zig` 的 `REMOVED` 加一项（门禁钉它**不得**回到顶层，也钉记录里的名字、证据与文件路径，
    外加"该文件仍被 `src/tests.zig` 的编译门禁 import"）。
 4. **整文件级的 `DEPRECATED` 横幅（第三种情况）**：既没有"消费者写过的旧名"可进表，又不是移除记录时，
-   标进 `docs/UPGRADING.md:24-41` 与本文件的「整模块级弃用横幅」，并在 `src/test/ApiFreeze.zig` 的 `BANNERS`
-   加一项（横幅位置 + 替代路径 + 是否还承载公开拼写）。`BANNERS` 里的文件必须在本文件里被点到，否则红。
+   标进 `docs/UPGRADING.md:24-49` 与本文件的「整模块级弃用横幅」，并在 `src/test/ApiFreeze.zig` 的 `BANNERS`
+   加一项（横幅位置 + 替代路径 + **方向性断言**：规范声明在新家、新家不得回头 import 弃用文件）。
+   `BANNERS` 里的文件必须在本文件里被点到，否则红。

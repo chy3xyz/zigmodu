@@ -2,6 +2,42 @@
 
 ## [Unreleased]
 
+### 第 46 批：把 `http.FieldRules` 从弃用模块里拆出来（`validation/FieldRules.zig` 成为规范家、`Validator` 变兼容别名）—— 门禁从"钉住耦合"改成"钉住**依赖方向**"；并更正我自己上一批的一处错误（**破坏性：否**，对外拼写与类型一字未变）
+
+全量 `-Ddb=all` **2021/2079（58 skipped，0 failed）**；`ApiFreeze` 14/14、`Validat` 33/33、`FieldRules` 4/4；fmt / check / check-api / check-deadcode 全绿。
+
+**要拆的耦合**：`http.FieldRules` **就是** `src/validation/Validator.zig` 的 `FieldRules`（链路 `src/http.zig:291` →
+`src/api/Extract.zig:16`），所以那条"v1.0 删除"的整模块横幅**根本删不掉**。上一批已如实记账并让门禁把这个事实
+钉住；本批把它拆掉。
+
+**修法**：新建 **`src/validation/FieldRules.zig`（零 import）** 作为规范声明，`Validator.FieldRules` 变成**兼容别名**
+（`Validator.zig:115`），`Extract.zig` 直连新家（`:13`/`:23`）—— 对外的 `http.FieldRules` 拼写与类型**一字未变**，
+四条拼写指向同一个类型（`http` / `Extract` / `Validator` / 新家）。
+**为什么新家不是 `Extract.zig`**：它为了 `extractJsonValidated` 必须 import `Validator.zig`，把规范声明放那里会让
+弃用文件**反向 import http 域** → import 环，而且类型又一次坐在横幅后面。
+
+**门禁从"钉住耦合"改成"钉住方向"** —— 三条缺一即假绿：① 规范声明必须在新家、且**不得**再出现在弃用文件；
+② 新家**不得** import 弃用文件，弃用文件**必须**指向新家；③ `Extract.zig` **必须**直连新家（否则 `http.*` 那条链
+会重新穿过弃用文件）。匹配口径是**带引号的 import 路径尾巴** —— 散文里提到文件名不算依赖（这一条也写进了
+`docs/API_FREEZE.md`）。
+
+> **红证据三组**：① 让新家反向 import → `[api-freeze] … the direction is backwards: the deprecated file must depend
+> on the home, never the other way round, or deleting it breaks `http.FieldRules`` / `FAIL (BannerDrift)`；
+> ② 删掉旧拼写 → `root source file struct 'validation.Validator' has no member named 'FieldRules'`（编译错）；
+> ③ **假搬家**（结构体留在弃用文件、新家只做转发）→ 四条断言同时红。另有一条 agent 自己撞出来的：初版 needle
+> 写成带引号的完整文件名，匹配不上 `Extract.zig` 的路径形 import（`no longer imports "FieldRules.zig"` 红）——
+> 恰好证明"Extract 那一半"不是摆设。
+
+**更正我自己**：上一批我在这份任务书里说 `RateLimiter.acquire` 的规则 3 回指"还没补" —— **那是错的**，它本来就有
+（`docs/UPGRADING.md` 的 `v0.15.45` 段）。执行者按现状保留并记账，而不是照我说的改。其余几行的查证结论是
+**"本文没有对应版本段"或根本没有记录**（`startAll`/`stopAll` 只记在 `CHANGELOG [0.15.12]`、而 UPGRADING 没有那一段；
+`http_server` 自称 v0.14.0 从 root 移除、但 CHANGELOG 里没有 `[0.14.0]` 段；四个 `ctx.send*` 与两个整模块横幅没有
+引入记录）—— **写"找不到"，不编版本号**。
+
+**`Validator.zig` 现在还剩什么挡着删除**（写进 `docs/UPGRADING.md`）：`http.validateRequest`
+（`api/middleware/Validation.zig`）与 `http.extractJsonValidated`（`api/Extract.zig`）用的 `validateStruct*` /
+`Violations` / `MessageHook` 链，以及 `Validator.*` 那些越路径拼写本身。`http.FieldRules` **不再是**阻塞项。
+
 ### 第 45 批：夜间 `Fuzz` 的失败是**进程在退出时写覆盖数据时死掉** —— 四个候选被实验逐个排除；在原因未知期间把这一步改成 `continue-on-error`（**可见性决定，不是修复**）
 
 **这个步骤自 2026-09-25 第一次真正执行起，每一次都红。** 四轮实验排除了所有"明显"的候选：
@@ -12,6 +48,10 @@
 | runner 文件系统截断 | `ZIG_LOCAL_CACHE_DIR` 指到 `${{ runner.temp }}` | 失败跟着目录走、同一哈希 ⇒ **排除** |
 | 内存（OOM） | `--fuzz=200` 时 `free -m` 显示 **11.8 GB 可用** | ⇒ **排除** |
 | bound 太大 | `--fuzz=200` vs `--fuzz=2000` | 一模一样地失败 ⇒ **排除** |
+| CI 的 stdin 是关闭的（`build.zig:349-350` 记着"默认 runner 在 CI 的关闭管上 panic"） | 本机 `zig build test --fuzz=20 -Ddb=all < /dev/null` | **照样绿** ⇒ 也不成立 |
+
+（最后一行是第 46 批补做的：那个假设看上去最像 —— 仓库自己就记着这条 stdin 坑 —— 但用关闭的 stdin 本机没能复现，
+所以它同样是**被实验排除**，不是"看起来像"。）
 
 **它到底是什么（有证据的部分）**：测试二进制**跑完了**、把正常输出打完了（某个打完 `[stress] RESULT: PASS`，
 主套件打完那些 sqlx 警告），然后**在退出时写覆盖数据的过程中死掉** —— 构建系统对它只报一行

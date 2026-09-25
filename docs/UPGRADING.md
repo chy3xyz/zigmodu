@@ -29,16 +29,24 @@
 - **`src/extensions.zig`** —— 旧的 `zigmodu.extensions` 命名空间**已从顶层移除**（记录见下面的「已移除」），
   剩下一个只导出类型别名的 shim，仍被 `src/tests.zig` 的编译门禁 import。
 - **`src/validation/Validator.zig`** —— 横幅写的是"用 `zigmodu.Validator`（`validation/ObjectValidator.zig`）替代，
-  v1.0 删除"，但**今天它仍然是活的**：`http.FieldRules` 就是它的 `FieldRules`（`src/http.zig:291` →
-  `src/api/Extract.zig:16`），`http.validateRequest` 中间件也 import 它。所以这条横幅的后半句**不能直接执行**：
-  先把 `http.FieldRules` 这个公开拼写迁走，否则删文件就是编译错。`src/test/ApiFreeze.zig` 把这条耦合钉住了。
+  v1.0 删除"。它**仍然是活的，但 "`http.FieldRules` 挡着" 这条已经不再是原因**：`FieldRules` 的**规范声明**已搬到
+  `src/validation/FieldRules.zig`（零 import 的新家），`http.FieldRules`（`src/http.zig:291` → `src/api/Extract.zig:23`）
+  现在直接读那个新家，弃用文件里只剩一个**兼容别名**（`Validator.FieldRules` 仍是同一类型），方向是单向的
+  （弃用文件 → 新家，新家不回头）。今天真正挡着 v1.0 删除的是另外两件事：
+  ① `http.validateRequest` 中间件（`src/api/middleware/Validation.zig`）与 `http.extractJsonValidated`
+  （`src/api/Extract.zig:190`）调的 `validateStruct` / `validateStructCollect`（仍在本文件里）；② `Validator.*`
+  这些**越路径拼写**本身（`Validator.notEmpty` / `Email` 系 / `Validator.validate` 等，含门禁自己那次实调用）。
+  `src/test/ApiFreeze.zig` 现在钉的是**解耦**而不是耦合：`http.FieldRules` 必须解析到新家、新家**不得** `@import`
+  弃用文件、弃用文件必须仍指向新家 —— 三条一起才说明"删掉弃用文件不会再打断 `http.FieldRules`"。
 
 门禁对这两处的断言：横幅仍在**文件头 1500 字节**内、横幅点名的替代路径仍可解析（`zigmodu.Validator` /
 `zigmodu.http.http_server` / `zigmodu.data.sqlx` / `zigmodu.data.orm` / `zigmodu.data.redis` / `zigmodu.security.auth`）、
-`http.FieldRules` 仍指向 `validation/Validator.zig`（"它还没死"的证据）、`src/extensions.zig` 仍被 `src/tests.zig`
-的编译门禁 import（`validation/Validator.zig` 不在那份直接 import 名单里 —— `src/tests.zig` 直接 import 的是
-`validation/ObjectValidator.zig`；前者由门禁自己 `@import` 并可执行地调一次，加上 `src/api/Extract.zig` /
-`src/api/middleware/Validation.zig` 这两条链一起编译）。
+`http.FieldRules`（含 `api/Extract.zig` 的再导出与 `Validator.FieldRules` 别名）**与 `validation/FieldRules.zig`
+的规范声明是同一个类型**、新家**不得** `@import` 弃用文件而弃用文件**必须**仍指向新家、`http.validateRequest` 仍在
+（它才是现在还挡着删除的那条链）、`src/extensions.zig` 仍被 `src/tests.zig` 的编译门禁 import
+（`validation/Validator.zig` 不在那份直接 import 名单里 —— `src/tests.zig` 直接 import 的是
+`validation/ObjectValidator.zig` 与本批新增的 `validation/FieldRules.zig`；前者由门禁自己 `@import` 并**真调**一次
+`notEmpty` 与一次 `validateStruct`，加上 `src/api/Extract.zig` / `src/api/middleware/Validation.zig` 这两条链一起编译）。
 
 ### 已移除（记录，不是承诺）
 
@@ -76,11 +84,29 @@
 2. 在**本表**加一行，删除列不要留空；
 3. 在**它自己那版**的条目里指回本节。
 
-规则 3 的现状（逐条写清楚，**不为凑数编版本号**）：`ctx.paramPath` 在 `v0.15.46` 那节已回指、
-`RateLimiter.acquire` 在 `v0.15.45` 那节已回指。其余各项**在本仓找不到可回指的版本段** ——
-`ctx.sendSuccess` / `ctx.sendFail` / `ctx.sendPageResult` / `ctx.sendJsonItems`、`zigmodu.startAll` / `zigmodu.stopAll` /
-`zigmodu.http.http_server`、以及上面两个整模块横幅，在 `CHANGELOG.md` 与本文里都没有"某版本引入/弃用"的条目
-（`docs/API-MIGRATION.md`「HTTP responses」那段是散文，没有版本号），所以不演一个出来。
+规则 3 的现状（逐条写清楚，**不为凑数编版本号**）。先说两条**已经满足**的，再说哪些**落不了地**、为什么：
+
+- `ctx.paramPath` —— `v0.15.46` 那节已回指（`### ctx.paramPath → ctx.nestedParam`）。
+- `RateLimiter.acquire` —— `v0.15.45` 那节已回指（"删除时点与替代名见 § 弃用别名与删除计划"）。
+
+其余各行**在本文里没有可回指的版本段**，逐条给出实际找到的记录（有就引、没有就说没有）：
+
+- `zigmodu.startAll` / `zigmodu.stopAll` —— **找得到版本记录，但不在本文**：`CHANGELOG.md` 的 `[0.15.12]`
+  段（Changed）写着"Lifecycle 文档统一：主 API 改为 `Application.start/stop`，`startAll/stopAll` 标注为底层
+  Lifecycle"。`docs/UPGRADING.md` **没有 `v0.15.12` 段**，所以回指无处可落 —— 不为了让规则 3 好看而新造一个版本段
+  （该段本身不是破坏性变更，本文件只收"会咬人"的条目）。
+- `zigmodu.http.http_server` —— **没有弃用条目**可引：`CHANGELOG.md` 里唯一的版本性记录是 `[0.15.8]`（Changed，
+  "API.md 旧别名清理：`zigmodu.http_server.*` 示例统一为 `zigmodu.http.*`"），那是**示例清理**，不是"某版起弃用"；
+  `src/http.zig:13` 的标记自称 "removed from root in v0.14.0"，而 `CHANGELOG.md` 里**没有 `[0.14.0]` 段**
+  （现存最早的是 `[0.14.13]`）。本文也没有对应版本段。
+- `ctx.sendSuccess` / `ctx.sendFail` / `ctx.sendPageResult` / `ctx.sendJsonItems` —— **找不到**"某版本引入/弃用"的条目：
+  `CHANGELOG.md` 里出现的都是**引用**（`[0.33.0]` 引用 `sendSuccess` 写的 `code: 0` 信封语义、`[0.15.3]` 把 legacy
+  `sendSuccess/sendFail` 列进 `zmodu audit` 的业务规则），不是弃用记录；`docs/API-MIGRATION.md`「HTTP responses」
+  那段是散文，没有版本号。本文也没有对应版本段。
+- 上面两个整模块横幅 —— 同样没有版本段（横幅是本文件顶部这两条，不是某个版本的条目）。
+
+结论：规则 3 在本文里只对 `ctx.paramPath` / `RateLimiter.acquire` 可执行（都已完成）；其余四组要么记录只存在于
+`CHANGELOG.md`（本文不镜像 `CHANGELOG.md` 的历史），要么根本不存在。**这是"找不到"的明确结论，不是省略。**
 
 
 > 每条变更标注 **Breaking?** / **影响面** / **一行改法**。
