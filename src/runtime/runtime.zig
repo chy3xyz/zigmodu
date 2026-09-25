@@ -6467,3 +6467,629 @@ test "Pooled (§12.3): an endlessly busy worker cannot starve a ready one" {
     const served_after = a_when_b.load(.acquire) -| ref_after_sent.load(.acquire);
     try std.testing.expect(served_after < 256);
 }
+
+// ─────────────────────────────────────────────────
+// §12.16  Fairness and `batch`, measured
+// ─────────────────────────────────────────────────
+//
+// The two things the design left open — "does a worker that never runs dry
+// starve a ready peer?" and "what is `batch` worth?" (D3, §12.9-1 shipped 16 as
+// a starting point) — are answered by these runs rather than by argument, and
+// the instruments ship with the numbers so the answers can be re-checked.
+//
+// Both readings are taken by the **handler**, not by a sampler: the producer
+// stamps a message immediately before `send`, the handler reads the clock when
+// it starts, and the difference is one sample of the interval "enqueued →
+// handled". A test thread descheduled between two probes therefore cannot
+// inflate a latency — the shape that flaked when this reading was taken from
+// outside (see the test above), and §12.15's lesson in its timing form.
+
+const time_mod = @import("../core/Time.zig");
+
+/// One message with its producer's stamp on it. `sent_ns` is read immediately
+/// before `send`, so the handler's `now - sent_ns` is one sample of the interval
+/// §12.5's latency claims are about.
+const TimedMessage = struct {
+    seq: u64,
+    sent_ns: i64,
+};
+
+/// The samples one worker collected, plus the count that explains them.
+///
+/// One writer at a time — whichever pool thread holds that worker's claim — so
+/// the samples are plain writes and `handled` is published *after* the sample it
+/// belongs to: a reader that sees the count sees the samples.
+const LatencyLog = struct {
+    samples: []i64,
+    handled: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+    fn record(self: *LatencyLog, sent_ns: i64) usize {
+        const i = self.handled.load(.monotonic);
+        if (i < self.samples.len) self.samples[i] = time_mod.monotonicNow() - sent_ns;
+        self.handled.store(i + 1, .release);
+        return i;
+    }
+
+    fn observed(self: *const LatencyLog) usize {
+        return self.handled.load(.acquire);
+    }
+
+    /// Messages that had no room in the sample buffer. Reported rather than
+    /// hidden: an overflowing log is a *smaller* sample, not a different one.
+    fn overflowed(self: *const LatencyLog) usize {
+        return self.observed() -| self.samples.len;
+    }
+
+    fn reset(self: *LatencyLog) void {
+        self.handled.store(0, .release);
+    }
+};
+
+/// p50 / p99 / max of a log nobody is writing to any more, in nanoseconds. The
+/// samples are sorted in place: their order carries no meaning once the run is
+/// over, and copying a 400k-sample log just to sort it is 3 MB of nothing.
+const Latency = struct { p50: i64, p99: i64, max: i64, n: usize };
+
+fn latencyInPlace(log: *LatencyLog) Latency {
+    const n = @min(log.observed(), log.samples.len);
+    if (n == 0) return .{ .p50 = 0, .p99 = 0, .max = 0, .n = 0 };
+    std.mem.sort(i64, log.samples[0..n], {}, std.sort.asc(i64));
+    return .{
+        .p50 = log.samples[(n - 1) / 2],
+        .p99 = log.samples[@min(n - 1, (n * 99) / 100)],
+        .max = log.samples[n - 1],
+        .n = n,
+    };
+}
+
+/// Nanoseconds → microseconds, for the printed tables.
+fn us(ns: i64) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1000.0;
+}
+
+fn printLatencyRow(label: []const u8, l: Latency) void {
+    std.debug.print(
+        "[§12.16 fairness]   {s:<11} n={d:<7} p50={d:>10.1}us p99={d:>10.1}us max={d:>10.1}us\n",
+        .{ label, l.n, us(l.p50), us(l.p99), us(l.max) },
+    );
+}
+
+/// A worker that times its own messages. The optional `peer`/`witness` pair is
+/// the fairness instrument: when set, the handler also publishes how much work
+/// the *busy* peer had done at the instant this message was handled. That
+/// reading is in the peer's messages, so a loaded host moves the wait's
+/// wall-clock time without moving it — which is what makes it a bound that holds
+/// on a shared runner (§12.15, applied to fairness instead of to a deadline).
+const TimedWorker = struct {
+    pub const Message = TimedMessage;
+    log: *LatencyLog,
+    peer: ?*LatencyLog = null,
+    witness: ?[]std.atomic.Value(u64) = null,
+
+    pub fn handle(self: *@This(), msg: TimedMessage, _: anytype) anyerror!void {
+        const i = self.log.record(msg.sent_ns);
+        if (self.peer) |peer| {
+            if (self.witness) |w| {
+                if (i < w.len) w[i].store(peer.observed(), .release);
+            }
+        }
+    }
+};
+
+/// The busy worker of the fairness run: it times its own messages and, when a
+/// probe round opens, publishes its own count as the reference the probe's wait
+/// is measured **from**.
+const BusyWorker = struct {
+    pub const Message = TimedMessage;
+    log: *LatencyLog,
+    /// Which probe round is outstanding. The test opens a round only after the
+    /// probe message is in the mailbox, so a reference taken here cannot include
+    /// work the test thread's own descheduling let slip by.
+    round: *const std.atomic.Value(u32),
+    opened: []std.atomic.Value(u64),
+    seen_round: u32 = 0,
+
+    pub fn handle(self: *@This(), msg: TimedMessage, _: anytype) anyerror!void {
+        const r = self.round.load(.acquire);
+        if (r > self.seen_round) {
+            self.seen_round = r;
+            if (r <= self.opened.len) self.opened[r - 1].store(self.log.observed(), .release);
+        }
+        _ = self.log.record(msg.sent_ns);
+    }
+};
+
+/// The value an opened-but-unwritten round's reference reads. `maxInt` and not
+/// `0`: a count of 0 is legitimate, and reading "not yet" as a number would make
+/// every round look instantaneously served.
+const round_unopened = std.math.maxInt(u64);
+
+/// Probe: the busy worker has published this round's reference.
+const RoundOpened = struct {
+    slot: *const std.atomic.Value(u64),
+
+    pub fn ready(self: @This()) bool {
+        return self.slot.load(.acquire) != round_unopened;
+    }
+};
+
+/// What one timed run of a shape produced. The latency distributions are taken
+/// from the logs by the caller, after the pool is down — the only moment they
+/// have stopped changing.
+const RunReading = struct {
+    total: usize,
+    handled: usize,
+    elapsed_ns: i64,
+    refused_full: u64,
+    dispatches: u64,
+    claim_misses: u64,
+    ready_high_water: usize,
+    ready_len: usize,
+    ready_push_failures: u64,
+    /// Times a pool thread parked with nothing to run. Printed next to the
+    /// latency tail because the two are related by construction: a parked thread
+    /// wakes on a poll (`idle_wait_ms`), so a token pushed while the pool is idle
+    /// waits that poll out — which is what a ~1 ms `max` column is, and what it
+    /// is *not* is `batch` (§12.16).
+    idle_waits: u64,
+    pool_threads: usize,
+};
+
+/// Drive `workers` timed workers from `producers` threads through a `width`
+/// thread pool that takes `batch` messages per claim, and time the traffic.
+///
+/// The clock starts at a gate the producers wait on and stops when the last
+/// accepted message has been handled, so a reading measures traffic *through the
+/// pool* — not `std.Thread.spawn` and not the harness. A refused send is retried
+/// rather than dropped: `error.Full` is backpressure, and a dropped message
+/// would make the run's denominator a different number.
+fn runShape(
+    allocator: std.mem.Allocator,
+    comptime cap: usize,
+    workers: usize,
+    producers: usize,
+    width: usize,
+    batch: usize,
+    per_producer: usize,
+    logs: []LatencyLog,
+) !RunReading {
+    const H = Handle(TimedWorker, cap);
+
+    var rt = try Runtime.initWithOptions(allocator, std.testing.io, .{
+        .scheduler = .{ .max_pooled_workers = workers, .pool_threads = width, .batch = batch },
+    });
+    defer rt.deinit();
+
+    const handles = try allocator.alloc(*H, workers);
+    defer allocator.free(handles);
+    for (handles, 0..) |*h, i| {
+        h.* = try rt.spawn(TimedWorker, .{ .log = &logs[i] }, .{ .capacity = cap, .mode = .pooled });
+    }
+
+    var gate = std.atomic.Value(bool).init(false);
+    var refused = std.atomic.Value(u64).init(0);
+
+    const Feed = struct {
+        fn run(
+            hs: []const *H,
+            start: usize,
+            n: usize,
+            gate_: *std.atomic.Value(bool),
+            refused_: *std.atomic.Value(u64),
+        ) void {
+            while (!gate_.load(.acquire)) std.atomic.spinLoopHint();
+            for (0..n) |k| {
+                const msg = TimedMessage{ .seq = start + k, .sent_ns = time_mod.monotonicNow() };
+                while (true) {
+                    // `(start + k) % len` rather than `k % len`: with `start`
+                    // being the producer's index, each worker is fed by exactly
+                    // one producer at a time and the load is spread evenly
+                    // whatever the producer count is.
+                    hs[(start + k) % hs.len].send(msg) catch |err| switch (err) {
+                        error.Full => {
+                            _ = refused_.fetchAdd(1, .monotonic);
+                            std.atomic.spinLoopHint();
+                            continue;
+                        },
+                        else => return,
+                    };
+                    break;
+                }
+            }
+        }
+    };
+
+    const threads = try allocator.alloc(std.Thread, producers);
+    defer allocator.free(threads);
+    for (threads, 0..) |*t, i| {
+        t.* = std.Thread.spawn(.{}, Feed.run, .{ handles, i, per_producer, &gate, &refused }) catch |err| {
+            for (threads[0..i]) |up| up.join();
+            return err;
+        };
+    }
+
+    const total = producers * per_producer;
+    const start_ns = time_mod.monotonicNow();
+    gate.store(true, .release);
+    for (threads) |t| t.join();
+
+    // Every accepted message has to be handled before the reading is taken. The
+    // budget is a failure reporter, not a timeout: a stalled pool fails the
+    // caller's identity check instead of hanging the suite.
+    var handled: usize = 0;
+    var idle: usize = 0;
+    while (idle < (1 << 22)) : (idle += 1) {
+        handled = 0;
+        for (logs) |*l| handled += l.observed();
+        if (handled >= total) break;
+        std.atomic.spinLoopHint();
+    }
+    const elapsed_ns = time_mod.monotonicNow() - start_ns;
+
+    const pool = rt.poolStats().?;
+    return .{
+        .total = total,
+        .handled = handled,
+        .elapsed_ns = elapsed_ns,
+        .refused_full = refused.load(.acquire),
+        .dispatches = pool.dispatches,
+        .claim_misses = pool.claim_misses,
+        .ready_high_water = pool.ready_high_water,
+        .ready_len = pool.ready_len,
+        .ready_push_failures = pool.ready_push_failures,
+        .idle_waits = pool.idle_waits,
+        .pool_threads = pool.pool_threads,
+    };
+}
+
+fn median3(v: [3]f64) f64 {
+    const lo = @min(v[0], @min(v[1], v[2]));
+    const hi = @max(v[0], @max(v[1], v[2]));
+    return v[0] + v[1] + v[2] - lo - hi;
+}
+
+test "Pooled (§12.16): a continuously busy worker starves nobody — the wait is one batch of its messages" {
+    const allocator = std.testing.allocator;
+    // Probe messages *per channel*: 2 × this, one at a time, while the busy
+    // worker never stops. Large enough that the *maximum* is a reading rather
+    // than a sample of one: 6 000 probes put some 100k messages through A.
+    const probes = 3000;
+    const a_capacity = 256;
+    const probe_capacity = 8;
+
+    // A's log is sized for the probe phase, which is bounded by the probes rather
+    // than by a message count (the feeder runs until this test stops it). An
+    // overflow is *reported* and not asserted — it shrinks the sample, it does
+    // not change the reading — whereas B's and C's logs are exactly `probes` long
+    // and their fullness is asserted.
+    const a_samples = try allocator.alloc(i64, 400_000);
+    defer allocator.free(a_samples);
+    const probe_samples = try allocator.alloc(i64, probes * 2);
+    defer allocator.free(probe_samples);
+    const witness = try allocator.alloc(std.atomic.Value(u64), probes * 2);
+    defer allocator.free(witness);
+    const opened = try allocator.alloc(std.atomic.Value(u64), probes * 2);
+    defer allocator.free(opened);
+    const ran = try allocator.alloc(u64, probes * 2);
+    defer allocator.free(ran);
+    for (witness) |*w| w.* = std.atomic.Value(u64).init(0);
+    for (opened) |*o| o.* = std.atomic.Value(u64).init(round_unopened);
+
+    var a_log = LatencyLog{ .samples = a_samples };
+    var b_log = LatencyLog{ .samples = probe_samples[0..probes] };
+    var c_log = LatencyLog{ .samples = probe_samples[probes..] };
+
+    var round = std.atomic.Value(u32).init(0);
+    var feeding = std.atomic.Value(bool).init(true);
+    var refused = std.atomic.Value(u64).init(0);
+
+    var rt = try Runtime.initWithOptions(allocator, std.testing.io, .{
+        // **One** pool thread: A, B and C compete for the execution resource
+        // instead of each getting a thread of its own — the only shape in which
+        // "starvation" is a question at all (§12.5).
+        .scheduler = .{ .max_pooled_workers = 4, .pool_threads = 1 },
+    });
+    defer rt.deinit();
+
+    const BusyHandle = Handle(BusyWorker, a_capacity);
+    const ProbeHandle = Handle(TimedWorker, probe_capacity);
+
+    const a = try rt.spawn(BusyWorker, .{
+        .log = &a_log,
+        .round = &round,
+        .opened = opened,
+    }, .{ .capacity = a_capacity, .mode = .pooled });
+    const b = try rt.spawn(TimedWorker, .{
+        .log = &b_log,
+        .peer = &a_log,
+        .witness = witness[0..probes],
+    }, .{ .capacity = probe_capacity, .mode = .pooled });
+    const c = try rt.spawn(TimedWorker, .{
+        .log = &c_log,
+        .peer = &a_log,
+        .witness = witness[probes..],
+    }, .{ .capacity = probe_capacity, .mode = .pooled });
+    try std.testing.expectEqual(@as(usize, 1), rt.poolStats().?.pool_threads);
+
+    const FeedBusy = struct {
+        fn run(
+            h: *BusyHandle,
+            feeding_: *std.atomic.Value(bool),
+            refused_: *std.atomic.Value(u64),
+            seq: *std.atomic.Value(u64),
+        ) void {
+            while (feeding_.load(.acquire)) {
+                const msg = TimedMessage{
+                    .seq = seq.fetchAdd(1, .monotonic),
+                    .sent_ns = time_mod.monotonicNow(),
+                };
+                h.send(msg) catch |err| switch (err) {
+                    // `error.Full` is backpressure, not a reason to stop: the
+                    // shape under test is a worker that never runs dry, and a
+                    // frozen mailbox would end that shape rather than exercise it.
+                    error.Full => {
+                        _ = refused_.fetchAdd(1, .monotonic);
+                        std.atomic.spinLoopHint();
+                    },
+                    else => return,
+                };
+            }
+        }
+    };
+    var a_seq = std.atomic.Value(u64).init(0);
+    const feeder = try std.Thread.spawn(.{}, FeedBusy.run, .{ a, &feeding, &refused, &a_seq });
+
+    // The premise, before the first probe: A is demonstrably mining a backlog.
+    try waitUntil(Published(@TypeOf(a_log.handled), usize){ .value = &a_log.handled, .want = 64 }, 5_000);
+    const a_at_probe_start = a_log.observed();
+
+    const Probes = struct {
+        /// One probe round: send it, open the round, wait for both ends of the
+        /// wait to be on record, and report how many of the busy worker's
+        /// messages ran in between.
+        ///
+        /// `index` is the probe worker's own message index (its witness slot),
+        /// `slot` is the round number in the shared arrays. They differ once the
+        /// third worker takes part.
+        fn once(
+            h: *ProbeHandle,
+            log: *LatencyLog,
+            peer_at: []std.atomic.Value(u64),
+            index: usize,
+            round_: *std.atomic.Value(u32),
+            opened_: []std.atomic.Value(u64),
+            slot: usize,
+            refused_: *std.atomic.Value(u64),
+        ) !u64 {
+            const msg = TimedMessage{ .seq = slot, .sent_ns = time_mod.monotonicNow() };
+            var spins: usize = 0;
+            while (true) {
+                h.send(msg) catch |err| switch (err) {
+                    error.Full => {
+                        _ = refused_.fetchAdd(1, .monotonic);
+                        spins += 1;
+                        if (spins > (1 << 22)) return error.ProbeMailboxNeverDrained;
+                        std.atomic.spinLoopHint();
+                        continue;
+                    },
+                    else => |e| return e,
+                };
+                break;
+            }
+            // Open the round **after** the send. A reference taken before it
+            // would count the messages the busy worker ran while this thread was
+            // descheduled between the two — the flake the sibling test above
+            // records, and the reason the reading is taken from inside the two
+            // handlers rather than from out here.
+            round_.store(@intCast(slot + 1), .release);
+            try waitUntil(Published(@TypeOf(log.handled), usize){ .value = &log.handled, .want = index + 1 }, 5_000);
+            try waitUntil(RoundOpened{ .slot = &opened_[slot] }, 5_000);
+            return peer_at[index].load(.acquire) -| opened_[slot].load(.acquire);
+        }
+    };
+
+    for (0..probes) |k| {
+        ran[k] = try Probes.once(b, &b_log, witness[0..probes], k, &round, opened, k, &refused);
+    }
+    const a_after_b = a_log.observed();
+    for (0..probes) |k| {
+        ran[probes + k] = try Probes.once(c, &c_log, witness[probes..], k, &round, opened, probes + k, &refused);
+    }
+    const a_after_probes = a_log.observed();
+
+    // A has no more work coming, so let the pool settle: the counters and the
+    // logs are a settled fact only after a join (§12.12's reading discipline).
+    feeding.store(false, .release);
+    feeder.join();
+    try waitUntil(Drained(BusyHandle){ .handle = a }, 5_000);
+    b.stop();
+    b.join();
+    c.stop();
+    c.join();
+
+    const pool = rt.poolStats().?;
+    const stats = rt.stats();
+    const a_lat = latencyInPlace(&a_log);
+    const b_lat = latencyInPlace(&b_log);
+    const c_lat = latencyInPlace(&c_log);
+    std.mem.sort(u64, ran[0..probes], {}, std.sort.asc(u64));
+    std.mem.sort(u64, ran[probes..], {}, std.sort.asc(u64));
+    const b_ran_p50 = ran[probes / 2];
+    const b_ran_max = ran[probes - 1];
+    const c_ran_p50 = ran[probes + probes / 2];
+    const c_ran_max = ran[ran.len - 1];
+
+    std.debug.print(
+        "[§12.16 fairness] one pool thread; A fed continuously, B and C one message at a time ({d} probes each)\n",
+        .{probes},
+    );
+    std.debug.print(
+        "[§12.16 fairness]   A handled {d} messages during the probes ({d} before the first, {d} through B's, {d} through C's); feeder hit a full mailbox {d} times\n",
+        .{ a_after_probes - a_at_probe_start, a_at_probe_start, a_after_b - a_at_probe_start, a_after_probes - a_at_probe_start, refused.load(.acquire) },
+    );
+    printLatencyRow("A (busy)", a_lat);
+    printLatencyRow("B (probe)", b_lat);
+    printLatencyRow("C (probe)", c_lat);
+    std.debug.print(
+        "[§12.16 fairness] queued→handled latency above (per message, taken by the handler); waits below are in A's messages, which is the host-independent half\n",
+        .{},
+    );
+    std.debug.print(
+        "[§12.16 fairness]   A's messages that ran while a probe waited: B p50={d} max={d}, C p50={d} max={d}\n",
+        .{ b_ran_p50, b_ran_max, c_ran_p50, c_ran_max },
+    );
+    std.debug.print(
+        "[§12.16 pool] dispatches={d} claim_misses={d} ready_len={d} ready_high_water={d} idle_waits={d} push_failures={d} claimed={d} pool_threads={d} spawned={d} ready_capacity={d}\n",
+        .{
+            pool.dispatches,          pool.claim_misses, pool.ready_len,    pool.ready_high_water, pool.idle_waits,
+            pool.ready_push_failures, pool.claimed,      pool.pool_threads, pool.spawned,          pool.ready_capacity,
+        },
+    );
+    std.debug.print(
+        "[§12.16 runtime] sent={d} received={d} dropped={d} discarded_on_stop={d} handler_errors={d} running={d}\n",
+        .{
+            stats.messages_sent,              stats.messages_received, stats.messages_dropped,
+            stats.messages_discarded_on_stop, stats.handler_errors,    stats.running,
+        },
+    );
+    if (a_log.overflowed() != 0) {
+        std.debug.print(
+            "[§12.16 fairness]   note: A's log holds its first {d} of {d} samples (overflow {d}); the distribution is over that prefix\n",
+            .{ a_lat.n, a_log.observed(), a_log.overflowed() },
+        );
+    }
+
+    // The bound, and why it is this number: the design's own figure is **one
+    // batch** — the ring is FIFO, a worker holds at most one token, and a claim
+    // is handed back every `batch` messages — and this reading is in A's
+    // messages, so a slower host moves the microseconds above without moving it.
+    // 4 × batch leaves room for the two batched steps the mechanism can take (A's
+    // claim in flight when the probe arrives, plus A's re-arm winning the race
+    // against the probe's own push) and for the reference window, and it is three
+    // orders of magnitude below "unbounded" — A handled the number printed above
+    // in the same interval.
+    const bound = 4 * @as(u64, scheduler_mod.default_batch);
+    try std.testing.expectEqual(@as(usize, probes), b_lat.n);
+    try std.testing.expectEqual(@as(usize, probes), c_lat.n);
+    // The premise, in two parts: A really was busy, and it stayed busy across
+    // every probe (a run where A ran dry would measure nothing).
+    try std.testing.expect(a_lat.n >= 1_000);
+    try std.testing.expect(a_after_probes > a_after_b and a_after_b > a_at_probe_start);
+    // ...and each channel saw at least one probe genuinely queue behind A, or
+    // "bounded" would be a statement about an idle worker.
+    try std.testing.expect(b_ran_max >= 1);
+    try std.testing.expect(c_ran_max >= 1);
+    try std.testing.expect(b_ran_max <= bound);
+    try std.testing.expect(c_ran_max <= bound);
+    // The rest of the run's health, so a reading taken from a broken shape cannot
+    // pass as a reading: no token refused (that would stop a worker being
+    // scheduled), nothing left in the ring or claimed, and nothing lost.
+    try std.testing.expectEqual(@as(u64, 0), pool.ready_push_failures);
+    try std.testing.expectEqual(@as(usize, 0), pool.ready_len);
+    try std.testing.expectEqual(@as(usize, 0), pool.claimed);
+    try std.testing.expectEqual(@as(usize, 1), pool.pool_threads);
+    // `messages_dropped` counts a `send` the mailbox refused, and this feeder
+    // meets a full mailbox on purpose rather than dropping: every message it was
+    // refused is retried, so "dropped" here is the same set of events the feeder
+    // counted for itself — and every message that got in was handled.
+    try std.testing.expectEqual(refused.load(.acquire), stats.messages_dropped);
+    try std.testing.expectEqual(stats.messages_sent, stats.messages_received);
+    try std.testing.expect(stats.messages_received >= 1_000);
+}
+
+test "Pooled (§12.16): the batch sweep — throughput against latency, measured and printed" {
+    const allocator = std.testing.allocator;
+    const Shape = struct {
+        name: []const u8,
+        workers: usize,
+        producers: usize,
+        width: usize,
+        per_producer: usize,
+    };
+    const shapes = [_]Shape{
+        // Saturated: one worker, two producers, one pool thread. The pool is
+        // always behind the mailbox, so a row is the dispatch cost per message —
+        // the face a larger batch is supposed to buy.
+        .{ .name = "saturated ", .workers = 1, .producers = 2, .width = 1, .per_producer = 12_000 },
+        // Mixed, one pool thread: four ready workers and one consumer, so the
+        // pool is saturated and never parks. This is the face a larger batch
+        // *spends*: a message waits behind the other workers' batches, which is
+        // §12.16's fairness bound seen from the receiving end.
+        .{ .name = "mixed-busy", .workers = 4, .producers = 4, .width = 1, .per_producer = 4_000 },
+        // Mixed, two pool threads: the same workers with enough consumer to drain
+        // the ring faster than the producers refill it. The interesting column
+        // here is the *tail*, and it belongs to the park (`idle_wait_ms`), not to
+        // `batch` — see the section.
+        .{ .name = "mixed-x2  ", .workers = 4, .producers = 4, .width = 2, .per_producer = 4_000 },
+    };
+    const batches = [_]usize{ 1, 4, 8, 16, 32, 64 };
+    const rounds = 3;
+    const cap = 64;
+
+    std.debug.print(
+        "[§12.16 batch] {d} rounds per point; msg/s is measured from the gate to the last handled message\n",
+        .{rounds},
+    );
+    for (shapes) |shape| {
+        const total = shape.producers * shape.per_producer;
+        // Room for every message one worker can see, plus one producer's worth of
+        // skew. Overflow is asserted to be 0 below: a row measured on a partial
+        // sample would be a number about something else.
+        const per_worker = total / shape.workers + shape.per_producer + cap;
+        const logs = try allocator.alloc(LatencyLog, shape.workers);
+        defer allocator.free(logs);
+        const store = try allocator.alloc(i64, per_worker * shape.workers);
+        defer allocator.free(store);
+        for (logs, 0..) |*log, i| log.* = .{ .samples = store[i * per_worker ..][0..per_worker] };
+
+        std.debug.print(
+            "[§12.16 batch] shape {s}: {d} worker(s), {d} producer(s), {d} pool thread(s), {d} messages/run\n",
+            .{ shape.name, shape.workers, shape.producers, shape.width, total },
+        );
+        for (batches) |batch| {
+            var rates: [rounds]f64 = undefined;
+            for (0..rounds) |round| {
+                for (logs) |*log| log.reset();
+                const r = try runShape(
+                    allocator,
+                    cap,
+                    shape.workers,
+                    shape.producers,
+                    shape.width,
+                    batch,
+                    shape.per_producer,
+                    logs,
+                );
+
+                // Every run is checked before it is reported: a row taken from a
+                // run that lost a token or a message would be a number about
+                // something else.
+                try std.testing.expectEqual(r.total, r.handled);
+                try std.testing.expectEqual(@as(u64, 0), r.ready_push_failures);
+                try std.testing.expectEqual(@as(usize, shape.width), r.pool_threads);
+                try std.testing.expectEqual(@as(usize, 0), r.ready_len);
+                try std.testing.expect(r.dispatches >= 1);
+
+                const seconds = @as(f64, @floatFromInt(r.elapsed_ns)) / @as(f64, std.time.ns_per_s);
+                rates[round] = @as(f64, @floatFromInt(r.total)) / seconds;
+                for (logs, 0..) |*log, i| {
+                    try std.testing.expectEqual(@as(usize, 0), log.overflowed());
+                    const l = latencyInPlace(log);
+                    std.debug.print(
+                        "[§12.16 batch]   batch={d:<3} round={d} {d:>10.0} msg/s | w{d} n={d:<6} p50={d:>8.1}us p99={d:>9.1}us max={d:>9.1}us | dispatch={d} miss={d} hw={d} parks={d} refused={d}\n",
+                        .{
+                            batch,          round + 1,      rates[round],       i,
+                            l.n,            us(l.p50),      us(l.p99),          us(l.max),
+                            r.dispatches,   r.claim_misses, r.ready_high_water, r.idle_waits,
+                            r.refused_full,
+                        },
+                    );
+                }
+            }
+            std.debug.print(
+                "[§12.16 batch]   batch={d:<3} -> {d:>10.0} / {d:>10.0} / {d:>10.0} msg/s (min/median/max over {d} rounds)\n",
+                .{ batch, @min(rates[0], @min(rates[1], rates[2])), median3(rates), @max(rates[0], @max(rates[1], rates[2])), rounds },
+            );
+        }
+    }
+}

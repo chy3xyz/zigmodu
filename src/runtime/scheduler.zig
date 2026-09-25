@@ -135,7 +135,12 @@ pub const SchedulerConfig = struct {
     /// D3's starting point. `1` is the latency end (one message per claim, every
     /// message pays a ring round trip), the mailbox capacity the throughput end
     /// (one slow handler starves every other ready worker). 16 is a first
-    /// measurement, not a conclusion — see docs/RUNTIME.md §12.9.
+    /// measurement, not a conclusion — docs/RUNTIME.md §12.9 is the reasoning, and
+    /// §12.16 is the measurement that closes it. It closes it at 16, because
+    /// everything from 8 up sits on one plateau whose round-to-round spread is
+    /// wider than the gap between its points, while a peer's worst-case wait
+    /// behind a busy worker *is* one batch (measured: exactly 16 messages at
+    /// `batch = 16`, 53 118 at `batch = 65 536`).
     batch: usize = default_batch,
     /// How many threads run workers declared `.execution_class = .blocking`, i.e.
     /// whether this runtime has a blocking pool at all (docs/RUNTIME.md §6).

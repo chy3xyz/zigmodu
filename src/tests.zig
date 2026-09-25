@@ -148,6 +148,11 @@ test "compile all source files" {
     _ = @import("runtime.zig");
     // Scheduler: the pooled execution mode of `Runtime.spawn` (docs/RUNTIME.md §12)
     _ = @import("runtime/scheduler.zig");
+    // Delivery-log segments: the storage layer §13.3 Q4 tier 2 builds on. Not
+    // re-exported from `runtime.zig` (nothing consumes it yet), so this import is
+    // the only thing that makes its tests run at all — the same wiring
+    // `im/ConnectionRegistry.zig` above needed.
+    _ = @import("runtime/delivery_log.zig");
     // Allocation contract for the L0 hot paths (docs/RUNTIME.md §4–§6)
     _ = @import("runtime/alloc_contract_test.zig");
     // Precision deadline timer: the sleep-then-spin alternative to the wheel for
