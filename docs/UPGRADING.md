@@ -103,6 +103,18 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
   codec；将来那一刀会把这条路接上。契约本身是 `zigmodu.runtime.Codec(E)`（`name`/`version`/
   `encode`/`decode`），框架只规定接口，不规定格式；`drainTo` 的返回值带 `holes` / `first_hole_seq`
   （环溢出与游标落后都会变成**看得见的洞**，而不是一份看起来完整的 log）。
+- **"读盘重放"这一刀已经到了（第 33 批）**：`zigmodu.runtime.ReplayFromLog`。所以上面那条"二选一"
+  现在的准确说法是 —— **内存重放**（不开 codec，走 `Replayer`）与 **盘上重放**（开 codec +
+  `drainTo`，走 `ReplayFromLog`）二选一；两条路都通的**同一个进程内**切换还不支持。
+  要点：它是 **load-then-replay**（借 `scan` 读到的记录、按全局 `seq` 排一次索引），**不是**跟随一个
+  正在写的 log；**洞默认拒绝**（`error.LogHasHoles`，且不消费那条记录），显式 `allowHoles()` 之后才跨过，
+  跨过多少在 `crossedHoles()` 里**精确**计数；绑定走 `setCodec(id, C, E)` + `bindDecoded(id, handle)`
+  两步（这样"没声明 codec"与"handle 类型不对"才是**能指名到 id 的运行时错误**）；
+  它**持有 allocator**（`Codec.decode` 就是 allocator 版），这是与 `Replayer` 零分配的刻意差别。
+  另有两条**新增公开方法**：`zigmodu.runtime.ReplayFromLog` 本身，以及 `DeliveryLog.setCodecRef(track, C, E)`
+  —— 后者在第 32 批之后是**必需**的：`setCodec` 要 typed `*Track(E, capacity)`，而 `Runtime.spawn` 只留
+  erased 的 `Handle.track: ?*TrackRef`，所以在它出现之前，**运行时用 `.record` 声明的轨根本挂不上 codec**，
+  `drainTo` 对这类 worker 不可达（第 32 批的"能进盘"只对直接 `addTrack` 的用户成立）。
 
 ---
 

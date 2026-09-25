@@ -2,6 +2,53 @@
 
 ## [Unreleased]
 
+### 第 33 批：Replay v2 第二刀 —— 从盘上重放（`ReplayFromLog`），并补掉上一批"有 codec 却挂不上"的缺口（`DeliveryLog.setCodecRef`）（**破坏性：否**，新增可选 API）
+
+全量 `-Ddb=all` **1994/2052（58 skipped，0 failed）**；CI 示例清单本机 **16/16 构建 + 7 个 `build test` 步骤全绿**；fmt / check / check-api / check-deadcode / check-tenant-scope / check-version 全绿。
+
+**设计在 `docs/RUNTIME.md` §13.10（D1–D7），实现按设计做。** 上一刀让投递轨能进盘，代价是挂了 codec 的轨
+不能再做内存重放（`bind` 返回 `error.CodecRequired`）；这一刀把那条路接回来 —— **从段文件重放**。
+
+* **D1 新类型，`Replayer` 一字未动**：它的 4 条既有用例与 `runtime.zig` 里那 4 条（`--filter Replay`
+  共 15 条）原样绿。共享的是契约（轨标识→handle、`post` 按值投递、洞必须看得见的计数纪律），不是实现。
+* **D4 load-then-replay**：段文件的记录借进来、按全局 `seq` 排一次索引再走 —— **不是流式**，不跟随
+  正在写的 log（文档写明，免得被当成 follower）。
+* **D3 洞默认拒绝、显式才跨过、跨过精确计数**：默认 `error.LogHasHoles` 且**不消费**那条记录；
+  `allowHoles()` 之后同一条照常投递；`crossedHoles()` 靠**重算**而非累加，所以重试不会重复计。
+* **五种指名拒绝**：`UnknownTrack`（文件里没这个 id）· `CodecRequired`（绑了 handle 却没声明 codec）·
+  `UnboundTrack`（什么都没绑）· `MessageTypeMismatch`（handle 的 `Message` ≠ 声明的 `E`，
+  两个类型名在 `typeMismatch()` 里）· `CodecNameMismatch`（同一个 id 又声明了一个不同名的 codec）。
+  错误本身不带 payload，"哪个 id"靠 `refusal()`/`refusalSeq()` 访问器 —— 与 `drainRefusal` 同一纪律。
+* **D5 有证据**（不是推理）：`post` thunk 解引用后 `h.send(msg.*)`，而 `send(message: Message)` 按值收，
+  所以栈上的解码临时量安全 —— 一条测试在投递后立刻用 `0xA5` 覆盖那块栈，收端拿到的仍是原值
+  （把它改成"停住指针再投递"就红：`expected 2959…, found 1137…`）。
+* **D6 持有 allocator 是有意的**：`Codec.decode` 就是 allocator 版，类型注释与文档都写明这是与
+  `Replayer` 零分配的**刻意差别**；每条解码缓冲用完即 free，有分配守恒测试（`deinit` 少还一次即红）。
+* **`LogStep.kind` 读自帧** —— 上一批那个"盘上每条都写 `Kind.message`、定时器投递冒充 message"的缺口
+  至少不再隐形：重放侧看得见每条的 kind（缺口本身仍在，补它要动 `Handle.enqueue` 的漏斗参数）。
+
+**顺手补掉上一批一个真正的可用性缺口（值得单独记）：`DeliveryLog.setCodec` 要 typed `*Track(E, capacity)`，
+而 `Runtime.spawn` 只留 erased 的 `Handle.track: ?*TrackRef`** —— 也就是说**运行时用 `.record` 声明的
+轨根本挂不上 codec**，`drainTo` 对"本来要用的那一类 worker"是**够不着的**（只有直接 `addTrack` 的用户
+能走通）。新增 `DeliveryLog.setCodecRef(track, C, E)`（`E` 由调用方指名，并与 `track.message_type` 比对，
+不符报 `error.MessageTypeMismatch`；thunk 抽成共用的 `installCodec`），`setCodec` 的签名与行为不变。
+**上一批写"投递轨能进盘"时，这条路径对 L0 worker 还没接通**；本批的端到端用例是它唯一的验证点。
+
+**测试**：6 条聚焦 + 1 条端到端。端到端那条是整条链路：Runtime A 两条轨（cap 2/8）、8 次投递 →
+alpha 拒 seq 4/6 → `drainTo` 写出 6 条 + 2 个洞（`first_hole_seq = 4`）→ **新** Runtime B 同图、
+**不声明任何轨**（`deliveryLog() == null`，所以不可能被反喂）→ 默认拒洞 → `allowHoles()` →
+6 条重放的 worker / 指纹 / `clock_ms` 与 A **逐条一致**，`crossedHoles() == 2`，段文件
+`scan().expectClean()`，时钟停在 7000 ms 而**一次都没睡**。
+
+> **红证据（8 组，逐条给原始输出）**：洞默认拒绝（去掉 `LogHasHoles` 返回 → `expected error.LogHasHoles,
+> found .{ .seq = 13, … }`）· 跨过计数（`crossed_holes += 0` → `expected 4, found 0`）· 拒绝要指到 id
+> （`refuse` 不存 id → `attempt to use null value`）· `UnknownTrack`（`inFile` 恒真 →
+> `expected error.UnknownTrack, found void`）· `bindDecoded` 与 `setCodecRef` 的类型检查各自关掉 →
+> `expected error.MessageTypeMismatch, found void` · 重复 seq 计数而不重放（去掉分支 →
+> `expected 1, found 0`）· D5 栈覆盖 · D6 分配守恒（`deinit` 少一次 free → `expected 5, found 4` + `1 leaked`）。
+> **一条没拿到并明说**：`CodecRequired` / `UnboundTrack` / `CodecNameMismatch` 三者的**独立性**没有逐个
+> 变异（只变异了它们共用的 `refuse` 路径），它们作为独立错误的区分由测试断言覆盖、**没有**变异证明。
+
 ### 第 32 批：Replay v2 第一刀 —— `Codec` 契约 + `drainTo`（投递轨终于能进盘；"有洞必须看得见"）（**破坏性：否**，新增可选 API；但 `setCodec` 与内存重放**二选一**，见下）
 
 全量 `-Ddb=all` **1987/2045（58 skipped，0 failed，191 s）**；CI 示例清单本机 **16/16 构建 + 7 个 `build test` 步骤全绿**；fmt / check / check-api / check-deadcode / check-tenant-scope / check-version 全绿。

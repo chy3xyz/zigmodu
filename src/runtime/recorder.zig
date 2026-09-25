@@ -606,6 +606,26 @@ fn checkCodec(comptime E: type, comptime C: type) void {
     _ = contract_decode;
 }
 
+/// The erasure half of the codec contract (§13.9 D2): the two thunks a track needs
+/// to become bytes and back, monomorphised for one `(C, E)` pair. Both
+/// `setCodec` (typed track) and `setCodecRef` (erased track) end here, so there is
+/// one place that knows what `TrackRef.encode`/`decode` are.
+fn installCodec(track: *TrackRef, comptime C: type, comptime E: type) void {
+    track.payload_codec = C.name;
+    track.encode = struct {
+        fn encode(allocator: std.mem.Allocator, payload: *const anyopaque) anyerror![]u8 {
+            const value: *const E = @ptrCast(@alignCast(payload));
+            return C.encode(allocator, value.*);
+        }
+    }.encode;
+    track.decode = struct {
+        fn decode(allocator: std.mem.Allocator, bytes: []const u8, out: *anyopaque) anyerror!void {
+            const value: *E = @ptrCast(@alignCast(out));
+            value.* = try C.decode(allocator, bytes);
+        }
+    }.decode;
+}
+
 /// What one `drainTo` call wrote, and what the file it wrote is missing
 /// (docs/RUNTIME.md §13.9 D3).
 pub const DrainReport = struct {
@@ -752,23 +772,39 @@ pub const DeliveryLog = struct {
         if (!@hasField(T, "ref") or !@hasDecl(T, "Event"))
             @compileError("DeliveryLog.setCodec expects a track (*Track(E, capacity)) — pass " ++
                 "what `addTrack` returned (docs/RUNTIME.md §13.9 D2)");
-        if (self.find(track.ref.id) != &track.ref) return error.UnknownTrack;
+        if (!self.owns(&track.ref)) return error.UnknownTrack;
         const E = T.Event;
         comptime checkCodec(E, C);
+        installCodec(&track.ref, C, E);
+    }
 
-        track.ref.payload_codec = C.name;
-        track.ref.encode = struct {
-            fn encode(allocator: std.mem.Allocator, payload: *const anyopaque) anyerror![]u8 {
-                const value: *const E = @ptrCast(@alignCast(payload));
-                return C.encode(allocator, value.*);
-            }
-        }.encode;
-        track.ref.decode = struct {
-            fn decode(allocator: std.mem.Allocator, bytes: []const u8, out: *anyopaque) anyerror!void {
-                const value: *E = @ptrCast(@alignCast(out));
-                value.* = try C.decode(allocator, bytes);
-            }
-        }.decode;
+    /// `setCodec` for a track the caller only holds **erased** — a runtime worker's,
+    /// which is the only shape a spawn site has (`*Handle(W, capacity)` keeps
+    /// `track: ?*TrackRef`; the typed pointer `addTrack` returned is gone by then).
+    /// Without this the drain path would be unreachable for every worker declared
+    /// with `.record = …`, which is exactly who §13.9 was written for.
+    ///
+    /// `E` is named rather than read off the track, for the same reason
+    /// `ReplayFromLog.setCodec` names it: erasure is what an erased pointer lacks.
+    /// That makes one check possible that the typed form does not need — the name is
+    /// compared against the track's own `message_type`, so a codec for the wrong
+    /// kind of `Message` is refused here (`error.MessageTypeMismatch`) instead of
+    /// reinterpreted on the next drain.
+    pub fn setCodecRef(self: *Self, track: *TrackRef, comptime C: type, comptime E: type) error{ UnknownTrack, MessageTypeMismatch }!void {
+        if (!self.owns(track)) return error.UnknownTrack;
+        if (!std.mem.eql(u8, track.message_type, @typeName(E))) return error.MessageTypeMismatch;
+        comptime checkCodec(E, C);
+        installCodec(track, C, E);
+    }
+
+    /// Is `track` this log's own? A codec attached to a track of a different log
+    /// would be a wiring mistake that only shows up as a drain writing another
+    /// log's entries.
+    fn owns(self: *const Self, track: *const TrackRef) bool {
+        for (self.tracks.items) |t| {
+            if (t == track) return true;
+        }
+        return false;
     }
 
     /// Append every track's not-yet-drained entries to a segment file, oldest
@@ -1293,6 +1329,484 @@ pub const Replayer = struct {
         var delivered: usize = 0;
         while (try self.step()) |_| delivered += 1;
         return delivered;
+    }
+};
+
+// ─────────────────────────────────────────────────
+// §13.10 — replay *from a segment file*: the reader half of `drainTo`
+// ─────────────────────────────────────────────────
+
+/// One delivery as a replay *from a file* hands it over: the same read-out
+/// `Step` gives — the global seq, the recorded stamp, the track it belongs to —
+/// plus the frame's own `kind`. A frame carries one and an in-memory track does
+/// not (§13.9's known gap), so a reader can see what a live replay cannot; it is
+/// reported rather than acted on, since a message and a timer delivery go to the
+/// same mailbox either way.
+pub const LogStep = struct {
+    seq: u64,
+    clock_ms: i64,
+    id: []const u8,
+    kind: dlog.Kind,
+};
+
+/// The two type names behind a `MessageTypeMismatch`: what the declared codec's
+/// message type is, and what the handle that was bound for it carries. Both are
+/// `@typeName` readings — the same comparison `Replayer.bind` makes against
+/// `TrackRef.message_type`, and the check that makes the payload hand-off below
+/// a checked cast rather than a reinterpretation.
+pub const TypeMismatch = struct {
+    expected: []const u8,
+    got: []const u8,
+};
+
+/// Why a replay *from a file* refused. Every one of them names the track it is
+/// about (`ReplayFromLog.refusal`) and, when it is about a delivery, the seq
+/// (`refusalSeq`) — so the errors themselves can stay payload-free, which is the
+/// discipline `DeliveryLog.drainRefusal` already uses.
+///
+/// None of these can be answered by the file: it holds `track_id` and payload
+/// bytes, and nothing about which codec wrote them (§13.10 D2 — the
+/// reconciliation key is the id, and the caller owns the codec). So the reader
+/// checks the things it *can* know, and refuses rather than guesses.
+pub const LoadError = error{
+    /// The id appears in no record of this file — a typo, or a file from another
+    /// run. Validated eagerly, like `Replayer.onlyTracks`, so a typo fails here
+    /// instead of reading as "this track delivered nothing".
+    UnknownTrack,
+    /// A delivery is due from a track the caller bound a handle for but declared
+    /// **no codec** for. The bytes cannot become a value without one, and
+    /// skipping them would hand the caller a replay that quietly lost a worker's
+    /// part of the run — the strongest form of the "no silent skip" rule.
+    CodecRequired,
+    /// A delivery is due from a track with no binding at all. Distinct from
+    /// `CodecRequired` on purpose: one says "nothing is bound", the other says
+    /// "a target is bound and its payloads still cannot be read".
+    UnboundTrack,
+    /// The seq chain has a gap — this file does not hold a delivery that the
+    /// global sequence says happened (§13.10 D3). The default is to refuse; a
+    /// caller that knows why may `allowHoles` and have every crossed seq counted.
+    LogHasHoles,
+    /// Two codecs were declared for one id, and their names disagree. The bytes
+    /// of every entry read afterwards would be reinterpreted, so last-declaration-
+    /// wins (the rule `bind` has for targets) is not a thing here.
+    CodecNameMismatch,
+    /// The handle bound for an id carries a different `Message` type than the
+    /// codec declared for it (`mismatch` has both names).
+    MessageTypeMismatch,
+    /// The reader's own bookkeeping had no room — the `seq` order it sorts at
+    /// `init`, or the per-track list. The only allocation failure this type
+    /// reports; everything else a step allocates is the caller's codec's.
+    OutOfMemory,
+};
+
+/// One track of the file, as this reader knows it: what the caller *declared*
+/// (`setCodec`) and where the decoded values go (`bindDecoded`). The two halves
+/// are separate calls because they are separate facts — the codec a file's bytes
+/// were written by, and the handle this run delivers them to — exactly as the
+/// writer side declares a track and then attaches a codec to it.
+///
+/// Either half may come first: a handle bound before its codec is not an error at
+/// bind time (nothing is unknown yet), and the delivery it can never decode is
+/// refused *by name* when it comes due. That is why the two type-name fields are
+/// kept apart instead of collapsed into one.
+const LoadedTrack = struct {
+    /// The caller's id slice (the `setCodec`/`bindDecoded` argument), borrowed for
+    /// the reader's life and the key every lookup compares against.
+    id: []const u8,
+    /// `Codec(E).name` of the codec declared for this id, or `""` while none is.
+    codec_name: []const u8 = "",
+    /// `@typeName(E)` of that codec's message type, or `""` while none is
+    /// declared. Checked against `target_type`.
+    message_type: []const u8 = "",
+    /// `@typeName(H.Message)` of the bound handle, or `""` while none is bound.
+    target_type: []const u8 = "",
+    /// Decode one payload and post it — monomorphised for this track's codec at
+    /// `setCodec`, so `C.decode`'s result *is* the declared `E` (a codec whose
+    /// `decode` returns something else fails to compile right there, which is
+    /// §13.10's answer to "the codec does not match the track").
+    deliver: ?*const fn (state: *LoadedTrack, allocator: std.mem.Allocator, bytes: []const u8) anyerror!void = null,
+    /// Where a decoded payload goes: the bound handle, erased (see `post`).
+    target: ?*anyopaque = null,
+    /// §13.10 D5's by-value hand-off, the same thunk shape `Replayer.bind`
+    /// builds: dereference the pointer and call `send` with the **value**, so the
+    /// value in `deliver`'s frame is copied into the mailbox and the frame may die
+    /// on return. `deliver` is the only caller, and it is the frame that owns the
+    /// decoded value's lifetime.
+    post: ?*const fn (target: *anyopaque, payload: *const anyopaque) mbox.SendError!void = null,
+};
+
+/// Replays a delivery log **from its segment file** (`docs/RUNTIME.md` §13.10):
+/// the reader half of §13.9's `drainTo`, for a track whose payloads left the
+/// process as bytes and have to come back through a codec.
+///
+/// A new type rather than a second mode of `Replayer` (`§13.10 D1`): the data
+/// source is different (segment records plus a decode, not pointers into live
+/// rings), so the window/filter/cursor arithmetic and the
+/// `log.len() == delivered + skipped + …` identity `Replayer` is pinned on do
+/// not carry over. What *is* shared is the contract, and it is deliberately the
+/// same three pieces: an id → handle binding the caller owns, a `post` thunk that
+/// hands the message over **by value**, and a hole that has to be visible.
+///
+/// **Load then replay, not tailing** (§13.10 D4): the records are read once
+/// (`dlog.scan`) and live in memory, ordered by global `seq` here. This cannot
+/// follow a log another process is still writing — a scan is a snapshot.
+///
+/// **It holds an allocator, and that is a deliberate difference from `Replayer`**
+/// (§13.10 D6) rather than a regression. `Replayer` hands over a pointer into a
+/// live ring, which is why it can be pinned by a test that forbids it to
+/// allocate at all. Here the payload is bytes in a file and `Codec.decode` — the
+/// caller's, whose shape §13.9 D2 fixed — takes an allocator and returns a value.
+/// The allocator is used for exactly two things: the `seq` order built once at
+/// `init`, and whatever a codec asks for while a step decodes. Nothing is held
+/// between steps, and `deinit` gives the reader's own two buffers back.
+pub const ReplayFromLog = struct {
+    const Self = @This();
+
+    allocator: std.mem.Allocator,
+    /// The clock every replayed handler reads time off. Moved to a record's stamp
+    /// before its delivery, the same contract `Replayer.step` has — a recorded
+    /// hour replays at CPU speed, with the stamps in their recorded order.
+    manual: *Clock.Manual,
+    /// The file's verified records, **borrowed**: the caller keeps the `Scan` (and
+    /// its payload bytes) alive for as long as it steps this reader.
+    records: []const dlog.Record,
+    /// `records`' indices, ordered by global `seq` (§13.10 D4). The file's own
+    /// order is append order, which is only *usually* `seq` order, and the file is
+    /// the caller's — so the indices are sorted rather than the records.
+    order: []usize,
+    /// Position in `order`.
+    cursor: usize = 0,
+    /// Per-id declarations and bindings, in first-mention order. Indices rather
+    /// than pointers are handed out by the helpers below: the list grows, and a
+    /// pointer into an `ArrayList` would not survive the next `setCodec`.
+    tracks: std.ArrayList(LoadedTrack) = .empty,
+    /// The last `seq` this reader delivered, or null before the first one. Holes
+    /// are gaps in this chain.
+    last_seq: ?u64 = null,
+    /// Missing seqs behind the cursor, counted when the delivery that follows them
+    /// is handed over.
+    crossed_holes: u64 = 0,
+    /// Missing seqs between the cursor's predecessor and the entry at the cursor.
+    /// Recomputed by every `step` rather than accumulated, because a refused hole
+    /// leaves the cursor exactly where it is: the caller may allow holes and step
+    /// again, and the same gap must not be counted twice.
+    pending_holes: u64 = 0,
+    /// Records whose `seq` was already delivered. Unreachable through `drainTo`
+    /// (`Writer.append` refuses a seq that does not increase), but a hand-built
+    /// record slice can hold one, and re-delivering it would make the file look
+    /// like twice the traffic. Counted instead, never silently replayed.
+    duplicates: u64 = 0,
+    /// The lowest missing seq, or null while the file has none. Sticky: what is
+    /// missing does not stop being missing.
+    first_hole_seq: ?u64 = null,
+    /// Whether stepping over a gap is allowed. `false` — refuse — is the default
+    /// (§13.10 D3): a replay that jumps a hole silently is a replay that looks
+    /// complete without being one.
+    allow_holes: bool = false,
+    /// The track id the last refusal was about, or null when there was none. Set
+    /// by every refusing call and cleared where it is set, so it is never stale
+    /// (the discipline `DeliveryLog.drainRefusal` has). Read back with
+    /// `refusal()` — a field and a method cannot share a name.
+    refusal_id: ?[]const u8 = null,
+    /// The seq the last refusal was about, when it was about a delivery: the
+    /// missing seq for `LogHasHoles`, the entry's own seq otherwise.
+    refusal_seq: ?u64 = null,
+    /// The two type names behind a `MessageTypeMismatch`, or null.
+    mismatch: ?TypeMismatch = null,
+
+    /// A reader over `records`, delivering into handles the caller binds. Allocates
+    /// the `seq` order (one index per record, §13.10 D4) and nothing else; a
+    /// record slice with no records is a valid, empty replay.
+    pub fn init(allocator: std.mem.Allocator, manual: *Clock.Manual, records: []const dlog.Record) error{OutOfMemory}!Self {
+        const order = try allocator.alloc(usize, records.len);
+        errdefer allocator.free(order);
+        for (order, 0..) |*slot, i| slot.* = i;
+        // Stable, so two records that claim one seq keep the file's own order —
+        // which is what lets `step` tell "the same delivery twice" from "the next
+        // one" with a single comparison.
+        std.mem.sort(usize, order, records, seqAscending);
+        return .{ .allocator = allocator, .manual = manual, .records = records, .order = order };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.allocator.free(self.order);
+        self.tracks.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    /// Declare the codec this track's payloads were written with — the reader-side
+    /// counterpart of `DeliveryLog.setCodec`, and the only place a payload format
+    /// enters a replay from a file, since the file holds no codec name
+    /// (§13.10 D2).
+    ///
+    /// `E` is named by the caller because the reader has no track object to read
+    /// it off (`addTrack(spec, E, capacity)` did that on the writer side): it goes
+    /// into `message_type` and is what `bindDecoded` checks a handle against. The
+    /// compiler checks it the other way round at the same time — `C.decode`'s
+    /// result is assigned to an `E` here, so a codec for some *other* type does
+    /// not build.
+    pub fn setCodec(self: *Self, id: []const u8, comptime C: type, comptime E: type) LoadError!void {
+        self.reset();
+        comptime checkCodec(E, C);
+        if (!self.inFile(id)) return self.refuse(id, error.UnknownTrack);
+        const slot = try self.slotFor(id);
+        const state = &self.tracks.items[slot];
+        if (state.codec_name.len != 0 and !std.mem.eql(u8, state.codec_name, C.name))
+            return self.refuse(id, error.CodecNameMismatch);
+        if (state.target_type.len != 0 and !std.mem.eql(u8, state.target_type, @typeName(E))) {
+            self.mismatch = .{ .expected = state.target_type, .got = @typeName(E) };
+            return self.refuse(id, error.MessageTypeMismatch);
+        }
+        state.codec_name = C.name;
+        state.message_type = @typeName(E);
+        state.deliver = struct {
+            /// Decode this track's payload and hand it over. §13.10 D5: the decoded
+            /// value is a temporary **in this frame** — the pointer that reaches
+            /// `post` is live for the length of the call, `post` dereferences it,
+            /// and `Handle.send(message: Message)` takes the message by value. The
+            /// frame may therefore be reused the moment this returns.
+            fn deliver(state_: *LoadedTrack, allocator: std.mem.Allocator, bytes: []const u8) anyerror!void {
+                var value: E = try C.decode(allocator, bytes);
+                const post = state_.post orelse return error.UnboundTrack;
+                return post(state_.target.?, @ptrCast(&value));
+            }
+        }.deliver;
+    }
+
+    /// Bind the handle this track's decoded deliveries go to. The handle may be
+    /// freshly spawned on another runtime — this reader only needs its `send`.
+    ///
+    /// A target bound without a codec is accepted and then refused per delivery
+    /// (`error.CodecRequired`): binding order is the caller's business, and a
+    /// refusal that names what is missing is better than a bind that has to guess
+    /// whether a codec is coming.
+    ///
+    /// The `Message` type is checked against the codec's declared `E`
+    /// (`error.MessageTypeMismatch`, both names in `mismatch`): the erased `post`
+    /// thunk dereferences the payload as this handle's `Message`, so this check is
+    /// what makes that cast a checked one.
+    pub fn bindDecoded(self: *Self, id: []const u8, handle: anytype) LoadError!void {
+        const H = @TypeOf(handle.*);
+        if (!@hasField(H, "mailbox") or !@hasField(H, "track") or !@hasDecl(H, "Message"))
+            @compileError("ReplayFromLog.bindDecoded expects a runtime worker handle (*Handle(W, capacity))");
+        self.reset();
+        if (!self.inFile(id)) return self.refuse(id, error.UnknownTrack);
+        const slot = try self.slotFor(id);
+        const state = &self.tracks.items[slot];
+        const handle_type = @typeName(H.Message);
+        if (state.message_type.len != 0 and !std.mem.eql(u8, state.message_type, handle_type)) {
+            self.mismatch = .{ .expected = state.message_type, .got = handle_type };
+            return self.refuse(id, error.MessageTypeMismatch);
+        }
+        state.target_type = handle_type;
+        state.target = @ptrCast(handle);
+        state.post = struct {
+            fn post(target: *anyopaque, payload: *const anyopaque) mbox.SendError!void {
+                const h: *H = @ptrCast(@alignCast(target));
+                const msg: *const H.Message = @ptrCast(@alignCast(payload));
+                return h.send(msg.*);
+            }
+        }.post;
+    }
+
+    /// Deliver the next record in global `seq` order: move the manual clock to
+    /// the stamp it was recorded with and post the decoded payload to the bound
+    /// handle. Null when the file is exhausted.
+    ///
+    /// A refusal consumes nothing, so the same entry is offered again after the
+    /// caller fixes what was missing (binds the handle, declares the codec,
+    /// `allowHoles`) — the same retry shape `Replayer.step` has, and the reason
+    /// the cursor only ever advances on a delivered entry.
+    ///
+    /// The error set is the union of this file's refusals and **whatever the
+    /// callers' codecs raise**: a decode is the caller's code, so `anyerror` is
+    /// the honest bound. Nothing sleeps and no wall clock is read.
+    pub fn step(self: *Self) anyerror!?LogStep {
+        self.reset();
+        self.pending_holes = 0;
+        while (self.cursor < self.order.len) {
+            const record = self.records[self.order[self.cursor]];
+            if (self.last_seq) |last| {
+                if (record.seq <= last) {
+                    // A seq the reader has already delivered. The file's writer
+                    // cannot produce one; a hand-built slice can. Counted, not
+                    // replayed (§13.10 D3's rule, applied to the other direction).
+                    self.duplicates += 1;
+                    self.cursor += 1;
+                    continue;
+                }
+                if (record.seq > last + 1) {
+                    self.pending_holes = record.seq - last - 1;
+                    if (self.first_hole_seq == null) self.first_hole_seq = last + 1;
+                    if (!self.allow_holes) {
+                        // The refusal names the *following* delivery's track: it is
+                        // the one the caller will be asked to deliver next.
+                        self.refusal_seq = last + 1;
+                        return self.refuse(record.track_id, error.LogHasHoles);
+                    }
+                }
+            }
+            const slot = self.slotIndex(record.track_id) orelse {
+                self.refusal_seq = record.seq;
+                return self.refuse(record.track_id, error.UnboundTrack);
+            };
+            const state = &self.tracks.items[slot];
+            if (state.target == null) {
+                self.refusal_seq = record.seq;
+                return self.refuse(record.track_id, error.UnboundTrack);
+            }
+            const deliver = state.deliver orelse {
+                self.refusal_seq = record.seq;
+                return self.refuse(record.track_id, error.CodecRequired);
+            };
+            // A frame's stamp is in nanoseconds (`dlog.Record.recorded_ns`); a
+            // track's and a `Clock`'s are in milliseconds. `drainTo` is the only
+            // place the two meet, and this is the way back.
+            const clock_ms = @divTrunc(record.recorded_ns, std.time.ns_per_ms);
+            self.manual.set(clock_ms);
+            try deliver(state, self.allocator, record.payload);
+
+            self.cursor += 1;
+            self.last_seq = record.seq;
+            self.crossed_holes += self.pending_holes;
+            self.pending_holes = 0;
+            return .{ .seq = record.seq, .clock_ms = clock_ms, .id = record.track_id, .kind = record.kind };
+        }
+        return null;
+    }
+
+    /// `step` until the file is exhausted; returns how many deliveries were handed
+    /// over. The "just replay it" call, for a caller that does not need to inspect
+    /// each one (§13.6 · 3: `step` is the primary driver, this rides along).
+    pub fn replayAll(self: *Self) anyerror!usize {
+        var delivered: usize = 0;
+        while (try self.step()) |_| delivered += 1;
+        return delivered;
+    }
+
+    /// Let the reader step over a gap instead of refusing (`error.LogHasHoles`).
+    /// The gap is still counted (`holesSeen`) and its first seq is still named
+    /// (`refusalSeq`), so a caller that declares "I know this file has holes" pays
+    /// for the declaration with a number — §13.10 D3's whole point.
+    pub fn allowHoles(self: *Self) void {
+        self.allow_holes = true;
+    }
+
+    /// Back to refusing. A reader narrowed by hand is the same reader: nothing is
+    /// silently skipped by default.
+    pub fn refuseHoles(self: *Self) void {
+        self.allow_holes = false;
+    }
+
+    /// Deliveries the file does not hold, seen so far: the gaps the reader has
+    /// walked over, plus the gap (if any) in front of the entry the cursor is at —
+    /// so a refusal reports how much is missing too. A gap *after* the last record
+    /// is invisible here: nothing in the file says the run continued
+    /// (`drainTo`'s report is where that end-of-file hole is named).
+    pub fn holesSeen(self: *const Self) u64 {
+        return self.crossed_holes + self.pending_holes;
+    }
+
+    /// The share of `holesSeen` behind the cursor — what the reader really stepped
+    /// over, as opposed to what it has merely found.
+    pub fn crossedHoles(self: *const Self) u64 {
+        return self.crossed_holes;
+    }
+
+    /// The lowest seq this file does not have, or null while it has none.
+    pub fn firstHoleSeq(self: *const Self) ?u64 {
+        return self.first_hole_seq;
+    }
+
+    /// Records whose seq was already delivered, and which were therefore counted
+    /// instead of replayed.
+    pub fn duplicateSeqs(self: *const Self) u64 {
+        return self.duplicates;
+    }
+
+    /// Deliveries still to hand over.
+    pub fn remaining(self: *const Self) usize {
+        return self.order.len - self.cursor;
+    }
+
+    /// Whether every track that appears in this file has both a codec and a
+    /// target. False means a step will refuse as soon as it reaches a delivery
+    /// from a track that does not — `CodecRequired` for a bound-but-undecodable
+    /// one, `UnboundTrack` for one with nothing bound at all.
+    pub fn isFullyBound(self: *const Self) bool {
+        for (self.records) |record| {
+            const slot = self.slotIndex(record.track_id) orelse return false;
+            const state = &self.tracks.items[slot];
+            if (state.deliver == null or state.target == null) return false;
+        }
+        return true;
+    }
+
+    /// The track id the last refusal was about, or null.
+    pub fn refusal(self: *const Self) ?[]const u8 {
+        return self.refusal_id;
+    }
+
+    /// The seq the last refusal was about, or null when it was not about a
+    /// delivery. For `LogHasHoles` it is the **first missing** seq.
+    pub fn refusalSeq(self: *const Self) ?u64 {
+        return self.refusal_seq;
+    }
+
+    /// The two type names behind a `MessageTypeMismatch`, or null.
+    pub fn typeMismatch(self: *const Self) ?TypeMismatch {
+        return self.mismatch;
+    }
+
+    /// `seq` ascending, with the file's order as the tie-break (`std.mem.sort` is
+    /// stable and the order starts out as `0, 1, 2, …`).
+    fn seqAscending(records: []const dlog.Record, a: usize, b: usize) bool {
+        return records[a].seq < records[b].seq;
+    }
+
+    /// Whether this file holds a delivery from `id` — the check behind
+    /// `error.UnknownTrack`. A reader is a reader *of a file*, so an id the file
+    /// does not mention is a typo or a file from another run, not a track that
+    /// happened to be quiet.
+    fn inFile(self: *const Self, id: []const u8) bool {
+        for (self.records) |record| {
+            if (std.mem.eql(u8, record.track_id, id)) return true;
+        }
+        return false;
+    }
+
+    /// The declared/bound track for `id`, or null.
+    fn slotIndex(self: *const Self, id: []const u8) ?usize {
+        for (self.tracks.items, 0..) |state, i| {
+            if (std.mem.eql(u8, state.id, id)) return i;
+        }
+        return null;
+    }
+
+    /// The index of `id`'s track, appended if this is the first mention. An index
+    /// rather than a pointer: the list grows, and nothing may hold a pointer into
+    /// it across a call that can append.
+    fn slotFor(self: *Self, id: []const u8) error{OutOfMemory}!usize {
+        if (self.slotIndex(id)) |i| return i;
+        try self.tracks.append(self.allocator, .{ .id = id });
+        return self.tracks.items.len - 1;
+    }
+
+    /// Clear the last refusal and name `id` as this one's subject. The errors
+    /// themselves carry no payload — there is no room in an error set — so this is
+    /// the "which track?" half, exactly as `DeliveryLog.drainRefusal` is for
+    /// `error.CodecRequired`.
+    fn refuse(self: *Self, id: []const u8, err: LoadError) LoadError {
+        self.refusal_id = id;
+        return err;
+    }
+
+    /// Start a call with a clean refusal. Same rule as the drain's: a refusal is
+    /// about *this* call, never the last one.
+    fn reset(self: *Self) void {
+        self.refusal_id = null;
+        self.refusal_seq = null;
+        self.mismatch = null;
     }
 };
 
@@ -2416,5 +2930,394 @@ test "drainTo: the codec's buffers all come back, and record never takes one" {
     // The whole log balances too, once the log's own storage is given back: no
     // leak, and nothing the drain left behind.
     log.deinit();
+    try std.testing.expectEqual(probe.allocations, probe.deallocations);
+}
+
+// ─────────────────────────────────────────────────
+// §13.10 — replay from a segment file
+// ─────────────────────────────────────────────────
+
+/// A wide message, for the test that scribbles over the stack its payload was
+/// decoded in: one word would be too small to be sure the scribble landed on it,
+/// and sixteen bytes make a stale read a value that is wrong in every field rather
+/// than a plausible one.
+const WideCodec = struct {
+    pub const name: []const u8 = "test:wide";
+    pub const version: u16 = 1;
+
+    pub fn encode(allocator: std.mem.Allocator, value: u128) ![]u8 {
+        const bytes = try allocator.alloc(u8, @sizeOf(u128));
+        std.mem.writeInt(u128, bytes[0..16], value, .little);
+        return bytes;
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !u128 {
+        _ = allocator;
+        if (bytes.len != @sizeOf(u128)) return error.BadPayloadLength;
+        return std.mem.readInt(u128, bytes[0..16], .little);
+    }
+};
+
+/// A codec whose `decode` genuinely uses the allocator it is handed: one scratch
+/// buffer per call, given back before the value returns. That is what turns the
+/// counting allocator in the test below into a reading about the reader's wiring
+/// (does the reader hand its own allocator down?) instead of about this codec.
+const ScratchCodec = struct {
+    pub const name: []const u8 = "test:scratch";
+    pub const version: u16 = 1;
+
+    pub fn encode(allocator: std.mem.Allocator, value: u32) ![]u8 {
+        const bytes = try allocator.alloc(u8, @sizeOf(u32));
+        std.mem.writeInt(u32, bytes[0..4], value, .little);
+        return bytes;
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !u32 {
+        if (bytes.len != @sizeOf(u32)) return error.BadPayloadLength;
+        const scratch = try allocator.alloc(u8, 64);
+        defer allocator.free(scratch);
+        @memcpy(scratch[0..4], bytes[0..4]);
+        return std.mem.readInt(u32, scratch[0..4], .little);
+    }
+};
+
+/// Overwrite the stack a just-returned call used. Two nested calls, because the
+/// frame that is of interest was a *callee* of the reader's step: the leaf's frame
+/// then lands at the depth the decoder's did, and the buffer is far larger than
+/// the temporary it has to bury.
+fn scribbleStack() void {
+    scribbleLeaf();
+}
+
+fn scribbleLeaf() void {
+    var buf: [1024]u8 = @splat(0xA5);
+    std.mem.doNotOptimizeAway(&buf);
+}
+
+test "ReplayFromLog: a drained file replays in global seq order, and a hole is refused before it is crossed" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var dir = DrainDir.init();
+    defer dir.deinit();
+    const config: dlog.Config = .{
+        .dir_path = try dir.path(),
+        .max_segment_bytes = 512,
+        .max_record_bytes = 4096,
+        .sync_mode = .none,
+    };
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var log = DeliveryLog.init(allocator, clk.clock());
+    defer log.deinit();
+    // The same shape the drain tests use: a short track that overflows *between*
+    // the long track's entries, so the file has interior gaps rather than only a
+    // missing tail — a tail gap is invisible to a reader (nothing in the file says
+    // the run continued), and the hole contract is about what the file can prove.
+    const book = try log.addTrack(.{ .id = "book", .capacity = 4 }, u32, 4);
+    const risk = try log.addTrack(.{ .id = "risk", .capacity = 16 }, i64, 16);
+    try log.setCodec(book, U32Codec);
+    try log.setCodec(risk, I64Codec);
+
+    for (0..24) |i| {
+        clk.set(@intCast(i));
+        if (i % 3 == 0) {
+            book.record(@intCast(i)) catch |err| try std.testing.expectEqual(error.Full, err);
+        } else {
+            try risk.record(@intCast(i));
+        }
+    }
+    // "book" kept seq 0, 3, 6, 9 and refused 12, 15, 18, 21; each delivery's value
+    // is its own seq, which is what lets the targets' readings below be the seqs.
+    try std.testing.expectEqual(@as(u64, 4), log.refusedCount());
+
+    var writer = try dlog.Writer.open(allocator, io, config);
+    const report = try log.drainTo(&writer);
+    writer.deinit();
+    try std.testing.expectEqual(@as(usize, 20), report.records);
+    try std.testing.expectEqual(@as(u64, 4), report.holes);
+    try std.testing.expectEqual(@as(?u64, 12), report.first_hole_seq);
+
+    var scanned = try dlog.scan(allocator, io, config);
+    defer scanned.deinit(allocator);
+    // §13.10's requirement on the file itself: the previous slice's reader still
+    // calls it clean.
+    try scanned.expectClean();
+    try std.testing.expectEqual(@as(usize, 20), scanned.records.len);
+
+    var manual = Clock.Manual{ .now_ms = 0 };
+    var book_target = FakeTarget(u32){};
+    var risk_target = FakeTarget(i64){};
+    var loader = try ReplayFromLog.init(allocator, &manual, scanned.records);
+    defer loader.deinit();
+    try loader.setCodec("book", U32Codec, u32);
+    try loader.setCodec("risk", I64Codec, i64);
+    try loader.bindDecoded("book", &book_target);
+    try loader.bindDecoded("risk", &risk_target);
+    try std.testing.expect(loader.isFullyBound());
+    try std.testing.expectEqual(@as(usize, 20), loader.remaining());
+
+    // ── the hole, refused by default ────────────────────────────────────────
+    // The file's first twelve records are seq 0..11, then seq 12 is not in it (the
+    // short track refused that delivery). Getting to the next record means stepping
+    // over a missing delivery, which the reader will not do on its own — and it
+    // leaves the entry where it is.
+    for (0..12) |_| _ = (try loader.step()).?;
+    try std.testing.expectError(error.LogHasHoles, loader.step());
+    try std.testing.expectEqualStrings("risk", loader.refusal().?); // seq 13's track
+    try std.testing.expectEqual(@as(?u64, 12), loader.refusalSeq()); // the missing seq
+    try std.testing.expectEqual(@as(u64, 1), loader.holesSeen()); // found …
+    try std.testing.expectEqual(@as(u64, 0), loader.crossedHoles()); // … not crossed
+    try std.testing.expectEqual(@as(?u64, 12), loader.firstHoleSeq());
+    // Nothing was consumed by the refusal: the same twelve are behind the cursor and
+    // the entry is still ahead of it.
+    try std.testing.expectEqual(@as(usize, 8), loader.remaining());
+    try std.testing.expectEqual(@as(usize, 12), book_target.n + risk_target.n);
+
+    // … and refusing again changes nothing — a caller that refuses holes after a
+    // retry gets the same answer, and the count is not doubled.
+    loader.refuseHoles();
+    try std.testing.expectError(error.LogHasHoles, loader.step());
+    try std.testing.expectEqual(@as(u64, 1), loader.holesSeen());
+    try std.testing.expectEqual(@as(u64, 0), loader.crossedHoles());
+
+    // ── the hole, crossed on purpose and counted ────────────────────────────
+    loader.allowHoles();
+    const delivered = try loader.replayAll();
+    try std.testing.expectEqual(@as(usize, 8), delivered); // the twenty less the twelve already handed over
+    try std.testing.expectEqual(@as(?LogStep, null), try loader.step());
+    try std.testing.expectEqual(@as(usize, 0), loader.remaining());
+    // Exactly four: the gaps are seq 12, 15, 18 and 21, one each.
+    try std.testing.expectEqual(@as(u64, 4), loader.crossedHoles());
+    try std.testing.expectEqual(@as(u64, 4), loader.holesSeen());
+    try std.testing.expectEqual(@as(u64, 0), loader.duplicateSeqs());
+    // The two ends agree: the drain's read-out and the reader's own walk name the
+    // same four seqs, and they are the ones `drainTo` says were never written.
+    try std.testing.expectEqual(report.first_hole_seq, loader.firstHoleSeq());
+
+    // Order and payloads, per track: the values are the seqs they were sent as.
+    try std.testing.expectEqualSlices(u32, &.{ 0, 3, 6, 9 }, book_target.taken());
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 4, 5, 7, 8, 10, 11, 13, 14, 16, 17, 19, 20, 22, 23 }, risk_target.taken());
+    // The clock rode the stamps to the end (there were no timers here: a track
+    // stamps a delivery when it is recorded, and the clock was at `i` for seq `i`).
+    try std.testing.expectEqual(@as(i64, 23), manual.now_ms);
+}
+
+test "ReplayFromLog: an unknown id, a missing codec and a missing handle are three different refusals" {
+    const allocator = std.testing.allocator;
+    // The reader is handed the records, so this test needs no segment at all: a
+    // file's `scan` is *one* producer of this slice, and the refusals below are
+    // about what the reader was told, not where the bytes came from.
+    const payload_a = [_]u8{ 0xE8, 0x03, 0x00, 0x00 }; // 1000
+    const records = [_]dlog.Record{
+        .{ .seq = 0, .track_id = "a", .kind = .message, .recorded_ns = 0, .payload = &payload_a },
+        .{ .seq = 1, .track_id = "a", .kind = .message, .recorded_ns = 0, .payload = &payload_a },
+    };
+
+    var manual = Clock.Manual{ .now_ms = 0 };
+    var loader = try ReplayFromLog.init(allocator, &manual, &records);
+    defer loader.deinit();
+
+    // 1. An id the file does not hold — a typo, and it is refused at the
+    //    declaration rather than reading as "this track delivered nothing".
+    try std.testing.expectError(error.UnknownTrack, loader.setCodec("nope", U32Codec, u32));
+    try std.testing.expectEqualStrings("nope", loader.refusal().?);
+    var target = FakeTarget(u32){};
+    try std.testing.expectError(error.UnknownTrack, loader.bindDecoded("nope", &target));
+    try std.testing.expectEqualStrings("nope", loader.refusal().?);
+
+    // 2. A handle bound with no codec declared. That is a legal order to bind in
+    //    (the codec may come later), so it is the *delivery* that refuses — by
+    //    name, and with the seq in hand.
+    try loader.bindDecoded("a", &target);
+    try std.testing.expect(!loader.isFullyBound());
+    try std.testing.expectError(error.CodecRequired, loader.step());
+    try std.testing.expectEqualStrings("a", loader.refusal().?);
+    try std.testing.expectEqual(@as(?u64, 0), loader.refusalSeq());
+    try std.testing.expectEqual(@as(usize, 0), target.n); // nothing was delivered
+
+    // 3. An id with a codec and no handle at all — a different mistake, and a
+    //    different error: there is nothing to hand the decoded value to.
+    var unbound_manual = Clock.Manual{ .now_ms = 0 };
+    var unbound = try ReplayFromLog.init(allocator, &unbound_manual, &records);
+    defer unbound.deinit();
+    try unbound.setCodec("a", U32Codec, u32);
+    try std.testing.expect(!unbound.isFullyBound());
+    try std.testing.expectError(error.UnboundTrack, unbound.step());
+    try std.testing.expectEqualStrings("a", unbound.refusal().?);
+    try std.testing.expectEqual(@as(?u64, 0), unbound.refusalSeq());
+
+    // The codec can still arrive after the binding, and then the whole file
+    // replays: the refusal cost the caller a call, not a delivery.
+    try loader.setCodec("a", U32Codec, u32);
+    try std.testing.expect(loader.isFullyBound());
+    try std.testing.expectEqual(@as(usize, 2), try loader.replayAll());
+    try std.testing.expectEqualSlices(u32, &.{ 1000, 1000 }, target.taken());
+}
+
+test "ReplayFromLog: codec name and message type are checked against the id they were declared for" {
+    const allocator = std.testing.allocator;
+    const payload_a = [_]u8{ 0xE8, 0x03, 0x00, 0x00 }; // 1000
+    const payload_b = [_]u8{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }; // i64 0
+    const records = [_]dlog.Record{
+        .{ .seq = 0, .track_id = "a", .kind = .message, .recorded_ns = 0, .payload = &payload_a },
+        .{ .seq = 1, .track_id = "b", .kind = .message, .recorded_ns = 0, .payload = &payload_b },
+    };
+
+    var manual = Clock.Manual{ .now_ms = 0 };
+    var loader = try ReplayFromLog.init(allocator, &manual, &records);
+    defer loader.deinit();
+
+    // The file holds only ids and bytes: which codec wrote them is the caller's
+    // declaration, so a handle of the wrong `Message` type can only be caught
+    // against what was declared (docs/RUNTIME.md §13.10 D2).
+    var wide = FakeTarget(u64){};
+    try loader.setCodec("a", U32Codec, u32);
+    try std.testing.expectError(error.MessageTypeMismatch, loader.bindDecoded("a", &wide));
+    try std.testing.expectEqualStrings("a", loader.refusal().?);
+    const refused = loader.typeMismatch().?;
+    try std.testing.expectEqualStrings("u32", refused.expected);
+    try std.testing.expectEqualStrings("u64", refused.got);
+
+    // …and the other way round, by binding first: the handle is a fact the reader
+    // keeps, so a codec declared afterwards is checked against it too.
+    var late = FakeTarget(u64){};
+    var binding_first = try ReplayFromLog.init(allocator, &manual, &records);
+    defer binding_first.deinit();
+    try binding_first.bindDecoded("a", &late);
+    try std.testing.expectError(error.MessageTypeMismatch, binding_first.setCodec("a", U32Codec, u32));
+    try std.testing.expectEqualStrings("a", binding_first.refusal().?);
+    try std.testing.expectEqualStrings("u64", binding_first.typeMismatch().?.expected);
+    try std.testing.expectEqualStrings("u32", binding_first.typeMismatch().?.got);
+
+    // Two codecs for one id: the bytes of everything read afterwards would be
+    // reinterpreted, so the second declaration is refused rather than taking over.
+    try loader.setCodec("b", I64Codec, i64);
+    try std.testing.expectError(error.CodecNameMismatch, loader.setCodec("b", U32Codec, u32));
+    try std.testing.expectEqualStrings("b", loader.refusal().?);
+    // The declaration that was already there is untouched: `b` still decodes as i64.
+    var narrow = FakeTarget(i64){};
+    const records_b = [_]dlog.Record{
+        .{ .seq = 0, .track_id = "b", .kind = .message, .recorded_ns = 0, .payload = &payload_b },
+    };
+    var bound = try ReplayFromLog.init(allocator, &manual, &records_b);
+    defer bound.deinit();
+    try bound.setCodec("b", I64Codec, i64);
+    try bound.bindDecoded("b", &narrow);
+    try std.testing.expectEqual(@as(usize, 1), try bound.replayAll());
+    try std.testing.expectEqualSlices(i64, &.{0}, narrow.taken());
+}
+
+test "ReplayFromLog: a seq the file holds twice is counted, not replayed" {
+    // Unreachable through `drainTo` (`Writer.append` refuses a seq that does not
+    // increase), but a reader is handed a slice of records, and a hand-built one
+    // can hold the same seq twice. Re-delivering it would make the file look like
+    // twice the traffic it recorded, so it is skipped *and counted*.
+    const allocator = std.testing.allocator;
+    const payload = [_]u8{ 0x01, 0x00, 0x00, 0x00 };
+    const records = [_]dlog.Record{
+        .{ .seq = 0, .track_id = "a", .kind = .message, .recorded_ns = 0, .payload = &payload },
+        .{ .seq = 0, .track_id = "a", .kind = .message, .recorded_ns = 0, .payload = &payload },
+        .{ .seq = 1, .track_id = "a", .kind = .message, .recorded_ns = 0, .payload = &payload },
+    };
+
+    var manual = Clock.Manual{ .now_ms = 0 };
+    var loader = try ReplayFromLog.init(allocator, &manual, &records);
+    defer loader.deinit();
+    try loader.setCodec("a", U32Codec, u32);
+    var target = FakeTarget(u32){};
+    try loader.bindDecoded("a", &target);
+
+    try std.testing.expectEqual(@as(usize, 2), try loader.replayAll());
+    try std.testing.expectEqualSlices(u32, &.{ 1, 1 }, target.taken());
+    try std.testing.expectEqual(@as(u64, 1), loader.duplicateSeqs());
+    // A duplicate is not a hole: the chain is still whole, and nothing is missing.
+    try std.testing.expectEqual(@as(u64, 0), loader.holesSeen());
+    try std.testing.expectEqual(@as(?u64, null), loader.firstHoleSeq());
+}
+
+test "ReplayFromLog: the decoded value is posted by value, so the frame it was decoded in can be reused" {
+    // §13.10 D5, pinned rather than argued: `deliver` decodes into a temporary in
+    // its own frame and hands `post` a pointer to it; `post` dereferences and
+    // `send` takes the message **by value**. So the temporary dies when the call
+    // returns, and the receiver must already have its own copy — which is what a
+    // scribbled-over stack checks.
+    const allocator = std.testing.allocator;
+    const first: u128 = 0xDEADBEEF0000000701020304A1B2C3D4;
+    const second: u128 = 0x88888888777777776666666655555555;
+
+    var payload: [2][16]u8 = undefined;
+    for ([_]u128{ first, second }, 0..) |value, i| {
+        const encoded = try WideCodec.encode(allocator, value);
+        @memcpy(payload[i][0..], encoded);
+        allocator.free(encoded);
+    }
+    const records = [_]dlog.Record{
+        .{ .seq = 0, .track_id = "wide", .kind = .message, .recorded_ns = 0, .payload = &payload[0] },
+        .{ .seq = 1, .track_id = "wide", .kind = .message, .recorded_ns = 1, .payload = &payload[1] },
+    };
+
+    var manual = Clock.Manual{ .now_ms = 0 };
+    var loader = try ReplayFromLog.init(allocator, &manual, &records);
+    defer loader.deinit();
+    try loader.setCodec("wide", WideCodec, u128);
+    var target = FakeTarget(u128){};
+    try loader.bindDecoded("wide", &target);
+
+    const step0 = (try loader.step()).?;
+    try std.testing.expectEqual(@as(u64, 0), step0.seq);
+    try std.testing.expectEqual(@as(usize, 1), target.n);
+    // The frame that held the decoded value is gone. Bury it.
+    scribbleStack();
+    try std.testing.expectEqual(first, target.taken()[0]);
+
+    // And again across the *next* step, which reuses the same stack slot: a reader
+    // that kept a pointer to the earlier temporary (or posted one later) would
+    // have the first delivery overwritten by the second one here.
+    const step1 = (try loader.step()).?;
+    try std.testing.expectEqual(@as(u64, 1), step1.seq);
+    scribbleStack();
+    try std.testing.expectEqual(first, target.taken()[0]);
+    try std.testing.expectEqual(second, target.taken()[1]);
+}
+
+test "ReplayFromLog: the reader's allocator is real, and nothing a step takes survives it" {
+    // §13.10 D6, measured rather than promised: the reader holds an allocator
+    // (deliberately, unlike `Replayer`) because `Codec.decode` is the caller's and
+    // takes one. The counting allocator sees exactly what the reader does with it.
+    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = probe.allocator();
+    const payload = [_]u8{ 0x2A, 0x00, 0x00, 0x00 }; // 42
+    const records = [_]dlog.Record{
+        .{ .seq = 0, .track_id = "a", .kind = .message, .recorded_ns = 0, .payload = &payload },
+        .{ .seq = 1, .track_id = "a", .kind = .message, .recorded_ns = 1, .payload = &payload },
+        .{ .seq = 2, .track_id = "a", .kind = .message, .recorded_ns = 2, .payload = &payload },
+    };
+
+    var manual = Clock.Manual{ .now_ms = 0 };
+    var loader = try ReplayFromLog.init(allocator, &manual, &records);
+    try loader.setCodec("a", ScratchCodec, u32);
+    var target = FakeTarget(u32){};
+    try loader.bindDecoded("a", &target);
+
+    // The reader really did allocate for itself: the `seq` order it sorts at
+    // `init` is its own buffer, and this is where that shows.
+    const built = probe.allocations - probe.deallocations;
+    try std.testing.expect(built > 0);
+    const allocations_before = probe.allocations;
+
+    try std.testing.expectEqual(@as(usize, 3), try loader.replayAll());
+    try std.testing.expectEqualSlices(u32, &.{ 42, 42, 42 }, target.taken());
+
+    // The codec was handed *this* allocator and used it — three decodes, at least
+    // one scratch each …
+    try std.testing.expect(probe.allocations > allocations_before);
+    // … and the live count is exactly where the reader left it: every buffer a
+    // step took came back before the step returned, so nothing accumulates across
+    // a replay of any length.
+    try std.testing.expectEqual(built, probe.allocations - probe.deallocations);
+
+    // And the reader gives back what it took: its two buffers and the codecs'
+    // scratches all balance once it is done.
+    loader.deinit();
     try std.testing.expectEqual(probe.allocations, probe.deallocations);
 }

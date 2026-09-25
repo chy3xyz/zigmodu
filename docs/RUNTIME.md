@@ -2076,3 +2076,95 @@ passed (58 skipped)`（无其它用例被带红）。**变异验红 5 处**（�
 `expected 0, found 3`（重写）；encode 缓冲不还 → `expected 6, found 0`；refusal 不记 `seq` →
 `expected 12, found 0`（`first_hole_seq` 用 `maxInt` 而非 0 表示"没有洞"，正是因为 seq 0 可以是洞）；
 去掉"文件已越过"那一支 → `FAIL (SeqNotIncreasing)`。
+
+### 13.10 Replay v2（第二刀）：从盘上重放 —— 设计已定，实现按此做
+
+§13.9 让投递轨能进盘（`Codec` + `drainTo`），代价是**挂了 codec 的轨不能再做内存重放**
+（`bind` 返回 `error.CodecRequired`）。这一刀把那条路接回来：**从段文件重放**。七个决定。
+
+**D1 —— 新类型，不动 `Replayer`。** `Replayer` 的窗口（`open`）、筛选（`onlyTracks`）、计数
+（`log.len() == delivered + skipped + …`）与 `bind` 语义都是为**内存轨**定的，§13.7/§13.8 的 8 条用例
+钉在上面。读盘重放的数据源不同（段文件 + 解码），把它塞进同一个类型会让那份合同变成两个值域，而它的
+恒等式照搬不过来。所以：**新类型**（名字由实现者定，`ReplayFromLog` 一类），**共享的是契约不是实现** ——
+同一个"轨标识 → handle"的绑定思路、同一个 `post` thunk 手法（按值进 mailbox）、同一条"洞必须看得见"的
+纪律。**`Replayer` 的既有签名与行为一个字都不许改**（它那 8 条用例必须原样绿）。
+
+**D2 —— 对账键只有 `track_id`，这是刻意的一条。** `delivery_log.Record` 里没有 codec 名/版本字段
+（只有 `track_id` / `kind` / `seq` / `recorded_ns` / `payload`）。三个选项：(a) 把 codec 名塞进
+`track_id`（零格式改动，语义藏在字符串里）；(b) 改段格式加字段（**动上一刀刚落地的逐字节格式**，
+它有 12 条测试钉着）；(c) 框架只认 `track_id`，把"负载是哪种字节"交给调用方。**取 (c)** ——
+段格式刚落地、且是"逐字节可依赖"的资产，为一个还没有任何消费者的对账需求去动它，是用错误的方向解决
+正确的问题。要更强对账的调用方把版本放进 `track_id`（文档给出这个建议）。**这条是决定，不是遗漏。**
+
+**D3 —— 洞默认拒绝，允许显式跨过。** 内存侧 `Replayer` 在轨溢出时拒绝重放；盘上同理：默认在发现
+`seq` 不连续时返回一个**指名的**错误（`error.LogHasHoles` 一类），调用方显式声明"我知道有洞"之后
+才继续，并且**跨过多少必须计数可见**（与 §13.8 `skipped` 同一纪律）。**静默跳过是禁止的。**
+
+**D4 —— 顺序按全局 `seq`，不按段。** `scan` 返回的段是追加序，正常情况下跨段 `seq` 连续，但**不假设**：
+按 `seq` 升序投递。这是 **load-then-replay**（段文件先读进内存再重放），**不是流式** —— 要写进文档，
+否则会被当成能跟一个正在写的 log。
+
+**D5 —— 解码值的生命周期：`post` 按值进 mailbox。** `recorder.zig` 的 `post` thunk 解引用后
+`h.send(msg.*)`，而 `Handle.send(message: Message)` 是**按值**收，所以栈上的解码临时量是安全的。
+**这一条要有证据**：一条测试在投递之后立刻覆盖那块栈，收端拿到的必须仍是原值。
+
+**D6 —— `ReplayFromLog` 持有 allocator（与 `Replayer` 的零分配有意不同）。** `Codec.decode` 的签名
+就是 allocator 版，解码必然分配。这是**刻意的差别**，必须写在文档与类型注释里，否则会被读成退化。
+每步的解码缓冲用完即 free（测试数分配守恒）。
+
+**D7 —— 这一刀不做**：边写边读（跟随活跃 log）、压实/保留、CLI、跨进程/跨机、加密压缩。
+`Kind.message` 那个既有缺口（内存轨不记投递种类）**允许**顺手补 —— 它与本刀同属"记录里到底有什么"，
+但要补就得动 `Handle.enqueue` 的漏斗参数，与 §13.9 D1"热路径零分配"冲突时以 D1 为准。
+
+**验收（实现者交付）**：端到端（Runtime A 投递 → `drainTo` → 新 Runtime B 同图 `bindDecoded` →
+重放 → 收端序列与载荷的指纹与 A 逐条一致，含**溢出/洞**那一档的两种模式）· 洞默认拒绝 +
+显式跨过时计数精确 · 未绑定的轨与 log 里不存在的 `track_id` 各自**指名**报错 · D5 的栈覆盖测试 ·
+D6 的分配守恒 · `Replayer` 的既有 8 条用例一字未改仍绿。
+
+**实现状态**（`src/runtime/recorder.zig` §13.10；6 条聚焦用例 + 1 条端到端，全绿）。**已做**：`ReplayFromLog`
+（新类型，D1 —— `Replayer` 的签名与行为**一字未动**，它的 4 条用例与 `runtime.zig` 的 4 条一样原样绿）、
+`init(allocator, manual, records)`（D4 —— 段文件的记录**借**进来、按全局 `seq` 排一次索引再走，**load-then-replay**，
+不跟随活跃 log；D6 —— **它持有 allocator 是有意的**，`Codec.decode` 就是 allocator 版）、
+`setCodec(id, C, E)`（D2 —— 对账键**只有** `track_id`，段格式一字未改；`E` 由调用方指名，编译期同时钉住
+"`C.decode` 确实产出 `E`"）、`bindDecoded(id, handle)`、`step()`/`replayAll()`、`allowHoles()`/`refuseHoles()`、
+`holesSeen()`/`crossedHoles()`/`firstHoleSeq()`/`duplicateSeqs()`/`remaining()`/`isFullyBound()`、
+`refusal()`/`refusalSeq()`/`typeMismatch()`（错误本身不带 payload，"哪个 id"靠这几个访问器，与 `drainRefusal` 同一纪律）、
+`LogStep{ seq, clock_ms, id, kind }`（`kind` 读自帧，所以盘上"定时器投递冒充 message"这件事在重放侧**看得见**）。
+**D3 落点**：`seq` 链上的缺口默认 `error.LogHasHoles`，而且**不消费**那条记录——`allowHoles()` 之后同一条照常投递；
+跨过多少在 `crossedHoles()` 里**精确**（每次交付把"游标前那段缺口"结转到 `crossed_holes`，靠重算而非累加，重试不重复计）。
+**指名错误**：`UnknownTrack`（文件里没有这个 id）· `CodecRequired`（绑了 handle 却没声明 codec）· `UnboundTrack`
+（什么都没绑）· `MessageTypeMismatch`（handle 的 `Message` ≠ 声明的 `E`，两个类型名在 `typeMismatch()`）·
+`CodecNameMismatch`（同一个 id 又声明了一个不同名的 codec）—— 五种都经 `refusal()` 指出 id。
+**这一刀顺手补的一处 §13.9 缺口**：`DeliveryLog.setCodec` 要 **typed** `*Track(E, capacity)`，而 `Runtime.spawn`
+只留 `Handle.track: ?*TrackRef`（erased）—— 运行时声明的 `.record` 轨**根本挂不上 codec**，`drainTo` 于是无从谈起。
+新增 `DeliveryLog.setCodecRef(track, C, E)`（thunk 抽成共用的 `installCodec`；`E` 指名并与 `track.message_type`
+比对，不符报 `error.MessageTypeMismatch`），`setCodec` 的签名/行为不变。端到端那一档是它唯一的验证点（e2e 里两条断言）。
+**D7 照旧没做**：边写边读、压实/保留、CLI、跨进程/跨机、压缩加密；`Kind.message` 那个既有缺口**没补**
+（补它要改 `Handle.enqueue` 的漏斗参数，与 §13.9 D1 冲突）。
+**测试名**：`ReplayFromLog: a drained file replays in global seq order, and a hole is refused before it is crossed` ·
+`ReplayFromLog: an unknown id, a missing codec and a missing handle are three different refusals` ·
+`ReplayFromLog: codec name and message type are checked against the id they were declared for` ·
+`ReplayFromLog: a seq the file holds twice is counted, not replayed` ·
+`ReplayFromLog: the decoded value is posted by value, so the frame it was decoded in can be reused`（D5）·
+`ReplayFromLog: the reader's allocator is real, and nothing a step takes survives it`（D6）·
+`ReplayFromLog e2e (§13.10): a drained delivery log replays into a fresh runtime's handlers`（Runtime A 两条轨 cap 2/8、
+8 次投递 → alpha 拒 seq 4/6 → `drainTo` 6 条 + 2 洞（`first_hole_seq = 4`）→ 新 Runtime B 同图、**不声明轨**
+（`deliveryLog() == null`，不可能反喂）→ 默认拒洞 → `allowHoles()` → 6 条重放的 worker/fingerprint/clock_ms
+与 A 逐条一致，`crossedHoles() == 2`，段文件 `scan().expectClean()`，时钟停在 7000 ms 而没睡）。
+**读数**：聚焦 `zm-test-count: aggregate 7/2052 selected passed=7 skipped=0 failed=0 leaked=0 binaries=6
+db=all filter=ReplayFromLog`；`Replay` 家族（4 条 `Replayer` + 4 条 `Runtime Replay` + 7 条本刀）
+`aggregate 15/2052 selected passed=15 skipped=0 failed=0 leaked=0 binaries=6 db=all filter=Replay`；
+全量 `--force-run --db all`：`test-fast: OK — 1994/2052 tests passed (58 skipped) in 164s (-Ddb=all)`
+（本次改动落地后的读数；同一棵树的前一遍是 `1993/2052 tests passed (59 skipped)`，两遍都**零失败**，
+差的那一条在 skip 计数里，是门控用例）；
+`zig build check` → `check-production: OK`；`zig build check-api` → exit 0；
+`scripts/check-deadcode.sh` → `OK: src+tools dead-code count within baseline (28)` / `OK: examples/** dead-code
+count within baseline (0)`。**变异验红 8 处**（改弱实现后的真实输出）：静默跨过洞 → `expected error.LogHasHoles,
+found .{ .seq = 13, .clock_ms = 13, .id = { 114, 105, 115, 107 }, .kind = .message }`；跨过计数恒 0 →
+`expected 4, found 0`；`refuse` 不记 id → `thread … panic: attempt to use null value`；`inFile` 恒真 →
+`expected error.UnknownTrack, found void`；`bindDecoded` 的类型检查去掉 → `expected error.MessageTypeMismatch,
+found void`；`setCodecRef` 的类型检查去掉 → `expected error.MessageTypeMismatch, found void`；重复 `seq` 照投 →
+`expected 1, found 0`；`deinit` 不还 `order` → `expected 5, found 4`（`1 leaked`）；把 `deliver` 的投递推迟到帧
+被复用之后（D5 的反面）→ `expected 295990755014133383820138010460325856212, found 113705285682452570882479431272`。
+**没有单独验红的两处**：`CodecRequired` 与 `UnboundTrack` 的**区分**（两条都只由 `refuse` 记 id 那条变异覆盖到"指名"
+这一半）、`CodecNameMismatch` 同理 —— 这三种错误各自的**独立**红线没有取到，不编。

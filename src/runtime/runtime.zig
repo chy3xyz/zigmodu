@@ -113,6 +113,10 @@ pub const SchedulerConfig = scheduler_mod.SchedulerConfig;
 pub const DeliveryLog = recorder_mod.DeliveryLog;
 /// A `.record = …` declaration: the worker's stable id and the track's capacity.
 pub const TrackSpec = recorder_mod.TrackSpec;
+/// §13.10: replay a delivery log back **from its segment file** — the reader half
+/// of `DeliveryLog.drainTo` and of `TrackRef.payload_codec`, and the one type that
+/// binds a file's `track_id`s to fresh handles through a caller-declared codec.
+pub const ReplayFromLog = recorder_mod.ReplayFromLog;
 
 /// Who runs a worker's `handle`.
 pub const SpawnMode = enum {
@@ -5954,6 +5958,216 @@ test "Runtime Replay: replayAll hands a whole log to a fresh graph, in order" {
 
     recorded.stop();
     recorded.join();
+}
+
+test "ReplayFromLog e2e (§13.10): a drained delivery log replays into a fresh runtime's handlers" {
+    // §13.10's acceptance, end to end: one runtime records two workers'
+    // deliveries, the tracks are drained to a segment file, and a **new** runtime
+    // with the same worker graph replays that file through its own handlers. The
+    // file is the only thing that crosses — and it has a hole in it on purpose.
+    const dlog = @import("delivery_log.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // The payload format for both tracks' `u32` messages. Written on the drain
+    // side, it is the *reader* that needs it back: the file holds bytes and a
+    // `track_id`, never a codec name (§13.10 D2).
+    const U32Codec = struct {
+        pub const name: []const u8 = "e2e:u32";
+        pub const version: u16 = 1;
+
+        pub fn encode(alloc: std.mem.Allocator, value: u32) ![]u8 {
+            const bytes = try alloc.alloc(u8, @sizeOf(u32));
+            std.mem.writeInt(u32, bytes[0..4], value, .little);
+            return bytes;
+        }
+
+        pub fn decode(alloc: std.mem.Allocator, bytes: []const u8) !u32 {
+            _ = alloc;
+            if (bytes.len != @sizeOf(u32)) return error.BadPayloadLength;
+            return std.mem.readInt(u32, bytes[0..4], .little);
+        }
+    };
+
+    // The same shape for the other message type, so `setCodecRef`'s check has a
+    // codec to be wrong with: a codec is only checked against `Codec(E)` once `E`
+    // is what it takes.
+    const U64Codec = struct {
+        pub const name: []const u8 = "e2e:u64";
+        pub const version: u16 = 1;
+
+        pub fn encode(alloc: std.mem.Allocator, value: u64) ![]u8 {
+            const bytes = try alloc.alloc(u8, @sizeOf(u64));
+            std.mem.writeInt(u64, bytes[0..8], value, .little);
+            return bytes;
+        }
+
+        pub fn decode(alloc: std.mem.Allocator, bytes: []const u8) !u64 {
+            _ = alloc;
+            if (bytes.len != @sizeOf(u64)) return error.BadPayloadLength;
+            return std.mem.readInt(u64, bytes[0..8], .little);
+        }
+    };
+
+    const Probe = struct {
+        pub const Message = u32;
+        log: *HandlerLog,
+        name: []const u8,
+
+        pub fn handle(self: *@This(), msg: u32, ctx: anytype) anyerror!void {
+            self.log.note(self.name, payloadFingerprint(u32, msg), ctx.clock().nowMs());
+        }
+    };
+
+    // ── phase 1: record ─────────────────────────────────────────────────
+    var recorded_log = HandlerLog{};
+    var rec_clock = Clock.Manual{ .now_ms = 0 };
+    var rt_rec = Runtime.init(allocator, io, rec_clock.clock());
+    defer rt_rec.deinit();
+    // "alpha" has room for two deliveries and gets four; "beta" holds all of its
+    // own. The overflow is deliberate: it is what puts a hole in the file, and the
+    // gap has to be *interior* — a missing tail is invisible to a reader, since
+    // nothing in the file says the run went on.
+    const alpha = try rt_rec.spawn(Probe, .{ .log = &recorded_log, .name = "alpha" }, .{
+        .capacity = 8,
+        .record = .{ .id = "alpha", .capacity = 2 },
+    });
+    const beta = try rt_rec.spawn(Probe, .{ .log = &recorded_log, .name = "beta" }, .{
+        .capacity = 8,
+        .record = .{ .id = "beta", .capacity = 8 },
+    });
+
+    for (0..8) |i| {
+        rec_clock.set(@intCast(i * 1_000));
+        // Awaited one at a time, so the recording run's invocation order is its
+        // send order — which is what makes "entry for entry" a comparison rather
+        // than a set match.
+        if (i % 2 == 0) try alpha.send(@intCast(i)) else try beta.send(@intCast(i));
+        try awaitHandled(&recorded_log, i + 1);
+    }
+    const recorded = recorded_log.taken();
+    try std.testing.expectEqual(@as(usize, 8), recorded.len);
+
+    const log = rt_rec.deliveryLog() orelse return error.NoDeliveryLog;
+    try std.testing.expectEqual(@as(usize, 2), log.trackCount());
+    // alpha kept seq 0 and 2 and refused 4 and 6 (the messages themselves were
+    // delivered — the ring is what could not keep them).
+    try std.testing.expect(log.hasOverflowed());
+
+    // A runtime worker's track is only reachable erased (`Handle.track`), so this
+    // is where the drain path gets its codec: `setCodecRef` names the message type
+    // and checks it against the track's own — a codec for another kind of message
+    // is refused, and so is a track belonging to a different log.
+    try std.testing.expectError(error.MessageTypeMismatch, log.setCodecRef(alpha.track.?, U64Codec, u64));
+    var foreign = DeliveryLog.init(allocator, .monotonic);
+    defer foreign.deinit();
+    try std.testing.expectError(error.UnknownTrack, foreign.setCodecRef(alpha.track.?, U32Codec, u32));
+    try log.setCodecRef(alpha.track.?, U32Codec, u32);
+    try log.setCodecRef(beta.track.?, U32Codec, u32);
+    try std.testing.expectEqualStrings(U32Codec.name, alpha.track.?.payload_codec.?);
+
+    // ── the drain, and the file ─────────────────────────────────────────
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    var path_buf: [160]u8 = undefined;
+    const dir_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/replay", .{dir.sub_path[0..]});
+    const config: dlog.Config = .{
+        .dir_path = dir_path,
+        .max_segment_bytes = 1 << 20,
+        .max_record_bytes = 4096,
+        .sync_mode = .none,
+    };
+    var writer = try dlog.Writer.open(allocator, io, config);
+    const report = try log.drainTo(&writer);
+    writer.deinit();
+    try std.testing.expectEqual(@as(usize, 6), report.records);
+    try std.testing.expectEqual(@as(u64, 2), report.holes);
+    try std.testing.expectEqual(@as(?u64, 4), report.first_hole_seq);
+
+    var scanned = try dlog.scan(allocator, io, config);
+    defer scanned.deinit(allocator);
+    try scanned.expectClean(); // the storage layer's own verdict on the file
+    try std.testing.expectEqual(@as(usize, 6), scanned.records.len);
+
+    // ── phase 2: replay, into a *new* graph ─────────────────────────────
+    var replayed_log = HandlerLog{};
+    var replay_clock = Clock.Manual{ .now_ms = 0 };
+    var rt_rep = Runtime.init(allocator, io, replay_clock.clock());
+    defer rt_rep.deinit();
+    const fresh_alpha = try rt_rep.spawn(Probe, .{ .log = &replayed_log, .name = "alpha" }, 8);
+    const fresh_beta = try rt_rep.spawn(Probe, .{ .log = &replayed_log, .name = "beta" }, 8);
+    // The new graph declares no tracks: there is no log here to record into, so
+    // this replay cannot feed the file it is reading.
+    try std.testing.expectEqual(@as(?*DeliveryLog, null), rt_rep.deliveryLog());
+
+    var loader = try ReplayFromLog.init(allocator, &replay_clock, scanned.records);
+    defer loader.deinit();
+    try loader.setCodec("alpha", U32Codec, u32);
+    try loader.setCodec("beta", U32Codec, u32);
+    try loader.bindDecoded("alpha", fresh_alpha);
+    try loader.bindDecoded("beta", fresh_beta);
+    try std.testing.expect(loader.isFullyBound());
+
+    // The first four deliveries, then the gap: refused, named, and nothing
+    // consumed — which is what lets the same delivery go through after the caller
+    // declares that it knows.
+    var seqs: [8]u64 = @splat(0);
+    var seen: usize = 0;
+    for (0..4) |i| {
+        const step = (try loader.step()).?;
+        try std.testing.expectEqual(@as(u64, @intCast(i)), step.seq);
+        seqs[seen] = step.seq;
+        seen += 1;
+        try awaitHandled(&replayed_log, seen);
+    }
+    try std.testing.expectError(error.LogHasHoles, loader.step());
+    try std.testing.expectEqualStrings("beta", loader.refusal().?); // seq 5's track
+    try std.testing.expectEqual(@as(?u64, 4), loader.refusalSeq()); // the missing seq
+    try std.testing.expectEqual(@as(u64, 1), loader.holesSeen());
+
+    loader.allowHoles();
+    while (try loader.step()) |step| {
+        seqs[seen] = step.seq;
+        seen += 1;
+        try awaitHandled(&replayed_log, seen);
+    }
+    try std.testing.expectEqual(@as(usize, 6), seen);
+    // The file's seq order, with the two refused seqs simply absent.
+    try std.testing.expectEqualSlices(u64, &.{ 0, 1, 2, 3, 5, 7 }, seqs[0..seen]);
+    // Crossed exactly two — seq 4 and seq 6, one each — and the lowest one is the
+    // seq the drain's own report named.
+    try std.testing.expectEqual(@as(u64, 2), loader.crossedHoles());
+    try std.testing.expectEqual(@as(u64, 2), loader.holesSeen());
+    try std.testing.expectEqual(report.first_hole_seq, loader.firstHoleSeq());
+    try std.testing.expectEqual(@as(usize, 0), loader.remaining());
+    try std.testing.expectEqual(@as(?recorder_mod.LogStep, null), try loader.step());
+    // The clock rode the recorded stamps to the end, without sleeping: seven
+    // seconds of recorded time went by at CPU speed.
+    try std.testing.expectEqual(@as(i64, 7_000), replay_clock.now_ms);
+
+    // §13.10's acceptance: the replayed sequence and payloads match the recording
+    // run entry for entry — each replayed delivery against the recording that
+    // carried the same seq, worker *and* payload *and* stamp.
+    const replayed = replayed_log.taken();
+    try std.testing.expectEqual(seen, replayed.len);
+    for (replayed, 0..) |got, i| {
+        const want = recorded[seqs[i]];
+        try std.testing.expectEqualStrings(want.worker, got.worker);
+        try std.testing.expectEqual(want.fingerprint, got.fingerprint);
+        try std.testing.expectEqual(want.clock_ms, got.clock_ms);
+    }
+    // And the difference is exactly the loss the drain reported: two deliveries
+    // the recording run's handlers saw and the file could not hold.
+    try std.testing.expectEqual(@as(usize, 2), recorded.len - seen);
+
+    fresh_alpha.stop();
+    fresh_alpha.join();
+    fresh_beta.stop();
+    fresh_beta.join();
+    alpha.stop();
+    alpha.join();
+    beta.stop();
+    beta.join();
 }
 
 // ---------------------------------------------------------------------------
