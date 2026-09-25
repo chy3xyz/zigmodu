@@ -1,11 +1,13 @@
 # API Migration Guide: Simplified API → Application API
 
 ZigModu v0.8+ recommends `Application` as the primary API. The legacy `Simplified.zig`
-(`App`, `Module`, `ModuleImpl`) is deprecated and will be removed in v1.0.
+(`App`, `Module`, `ModuleImpl`) was **removed from the root exports** in commit `557190a`
+(2026-05-12): `zigmodu.App` / `zigmodu.ModuleImpl` no longer compile. The file is still in the
+tree, reachable only by internal path — see [`UPGRADING.md`](UPGRADING.md) 「已移除」.
 
 ## Quick Comparison
 
-| Feature | Simplified (deprecated) | Application (recommended) |
+| Feature | Simplified (deprecated, off the root) | Application (recommended) |
 |---------|------------------------|---------------------------|
 | Entry point | `App.init()` | `Application.init()` / `builder()` |
 | Module type | `Module` (VTable) | `api.Module` (comptime) |
@@ -20,7 +22,14 @@ ZigModu v0.8+ recommends `Application` as the primary API. The legacy `Simplifie
 
 ### Before: Simplified API
 
+> ⚠️ **这段是历史，不是能照抄的代码。** `zigmodu.App` / `zigmodu.ModuleImpl` 已在 commit `557190a`（2026-05-12）
+> 从根导出里**移除**，所以下面那两行 `const` 今天**编译不过**（后面用到的 `App` 也随之未定义）。
+> `src/api/Simplified.zig` 仍在树里，但只能**越路径**触达：
+> `const Simplified = @import("zigmodu/src/api/Simplified.zig");` —— 那不是受支持的消费面，
+> 见 [`UPGRADING.md`](UPGRADING.md) 的「已移除」。保留这段只是为了看懂旧代码在写什么。
+
 ```zig
+// 旧代码长这样（前两行今天编译不过：顶层不再导出这两个名字）
 const zmodu = @import("zigmodu");
 const Simplified = zmodu.App;
 const ModuleImpl = zmodu.ModuleImpl;

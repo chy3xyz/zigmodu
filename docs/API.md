@@ -2,6 +2,9 @@
 
 Complete API reference for the ZigModu modular framework.
 
+> 1.0 冻结的入口类别、0.x 允许破坏的 preview 面（`runtime.*`），以及每一条对应的门禁：
+> [`API_FREEZE.md`](API_FREEZE.md)。弃用别名与删除时点见 [`UPGRADING.md`](UPGRADING.md) 顶部那张表。
+
 ---
 
 ## Table of Contents
@@ -101,6 +104,9 @@ pub fn stop(self: *Self) void
 #### `zigmodu.startAll` / `zigmodu.stopAll`（底层 Lifecycle）
 
 `Application.start/stop` 的内部实现；直接使用需自行管理模块生命周期。
+
+**DEPRECATED**（不早于 1.0 删除）：改用 `Application.start()` / `Application.stop()`，见
+[`UPGRADING.md`](UPGRADING.md) 的弃用别名表。
 
 ```zig
 pub fn startAll(modules: *ApplicationModules) !void

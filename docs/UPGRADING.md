@@ -12,7 +12,24 @@
 | 弃用名 | 现在的名字 | 计划删除 |
 |---|---|---|
 | `ctx.paramPath` | `ctx.nestedParam` | 不早于 1.0 |
-| `Simplified` API（整块入口） | `Application`（见 [`API-MIGRATION.md`](API-MIGRATION.md)） | 不早于 1.0 |
+| `zigmodu.startAll` | `Application.start()` | 不早于 1.0 |
+| `zigmodu.stopAll` | `Application.stop()` | 不早于 1.0 |
+| `zigmodu.http.http_server` | `http.Server` | 不早于 1.0 |
+
+### 已移除（记录，不是承诺）
+
+`Simplified` 整块入口**已经不在了**，所以它不在上面的表里：`不早于 1.0` 是对**还在**的别名做的承诺，
+对一个已经删掉的名字继续承诺删除时点，只会让读者以为 `zigmodu.App` 今天还能用。
+
+- **移除的名字**：`zigmodu.App` / `zigmodu.ModuleImpl`（旧写法长什么样见 [`API-MIGRATION.md`](API-MIGRATION.md)
+  的 Before 段 —— 那段今天**照抄编译不过**，它的价值只剩"看懂旧代码在写什么"）。
+- **何时移除的**：commit `557190a`（2026-05-12，标题 `…+ Simplified removal`）已把它从 `src/root.zig` 移除，
+  此后顶层不再有这些名字。
+- **替代品**：`Application`（`zmodu.builder(...).build(.{...})`）。
+- **今天在哪能找到它**：`src/api/Simplified.zig` 仍在树里（只被 `src/tests.zig` 的编译门禁引用），
+  但**只能越路径**触达：`const Simplified = @import("zigmodu/src/api/Simplified.zig");` —— 越包内路径不受支持，随时会变。
+- **门禁**：`src/test/ApiFreeze.zig` 钉住 `zigmodu.App` / `zigmodu.ModuleImpl` **不得**回到顶层，
+  并钉住 `src/api/Simplified.zig` 仍被 `src/tests.zig` 的编译门禁 import。
 
 新增弃用项要同时做三件事（否则这张表会变成第二个没人维护的清单）：
 1. 在**代码**的文档注释里写明它已弃用并指向新名；

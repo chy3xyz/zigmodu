@@ -138,6 +138,9 @@ test "compile all source files" {
     _ = @import("test/ContractGate.zig");
     _ = @import("test/DocsConsistency.zig");
     _ = @import("test/DocSnippets.zig");
+    // Deprecation / API-freeze gate: the names docs/UPGRADING.md and
+    // docs/API_FREEZE.md promise must still exist and still work.
+    _ = @import("test/ApiFreeze.zig");
     _ = @import("test/ErrorSetSnapshot.zig");
     _ = @import("test/CombinationMatrix.zig");
     _ = @import("test/ErrorShape.zig");

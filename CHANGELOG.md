@@ -2,6 +2,43 @@
 
 ## [Unreleased]
 
+### 第 40 批：弃用别名表变成**可执行门禁**（`ApiFreeze`，9 条测试），并按事实把它与现实对齐 —— `Simplified` 其实早就被移除、"记录成承诺"被改掉，三处代码里的 `DEPRECATED` 补进表（**破坏性：否**，只加门禁与文档）
+
+全量 `-Ddb=all` **2011/2069（58 skipped，0 failed，207 s）**；`ApiFreeze` 9/9；fmt / check / check-deadcode 全绿。
+
+**新门禁 `src/test/ApiFreeze.zig` + `docs/API_FREEZE.md`**（已接进 `src/tests.zig` 的聚合根）。
+
+* **弃用别名是可执行的、不是散文**：`docs/UPGRADING.md` 表里每一项都必须**能编译能调用** ——
+  `ctx.paramPath` 真跑一遍并与 `ctx.nestedParam` 对值、`startAll`/`stopAll` 真做一次模块启停、
+  `http.http_server` 钉住别名等价（`http_server.Server == http.Server`）；另加**规则 1 的标记窗口**
+  （声明前 1500 字节内必须同时出现 `DEPRECATED` 与替代名，防止"表在、标记没了"）。
+* **表 ↔ 门禁双向同步**：表里每一行都要有对应门禁项，门禁里也不能留着表里已删掉的行 —— 谁只动一边都红。
+* **冻结面 vs runtime-preview**：94 个冻结锚点逐条 `@hasDecl`（数据驱动自文档，不是手抄调用清单）；
+  17 个 preview 符号必须仍在 `zigmodu.runtime.*` 且**不得**出现在顶层（把允许破坏的东西搬上冻结面即红）。
+  口径是从 `docs/RUNTIME.md` 读出来的（§2 第 1–4/9 条、第 10 条与 v0.28.0 的先例），**文档里逐行区分"引用"与"本清单自己的决定"**。
+* **覆盖不到的写进文档**：签名准确性、`runtime.*` 的 breaking 有没有真的进 §9 与 UPGRADING、
+  以及一条**不独立**的检查（`stopAll` 的标记窗口与 `startAll` 只隔一行，删掉它自己的注释不会红）。
+
+**按事实对齐两处（门禁自己查出来的，决定是我的）**
+
+* **`Simplified` 那一行是过期的，改成"已移除（记录，不是承诺）"。** 证据：commit `557190a`（2026-05-12，
+  标题就是 `…+ Simplified removal`）**已经把它从 `src/root.zig` 移除**；今天 `zmodu.App` / `zmodu.ModuleImpl`
+  都不在顶层。**对一个已经删掉的名字继续承诺"不早于 1.0 删除"，只会让读者以为它今天还能用。** 现在表下的记录写清
+  名字/何时移除/替代品/今天只能越路径触达，门禁则**钉住这个移除**（不得回顶层 + `src/api/Simplified.zig` 仍被编译门禁 import）。
+  `docs/API-MIGRATION.md` 的 before 片段按事实加注：保留"看懂旧代码在写什么"的价值，同时写明**照抄编译不过**。
+* **代码里三处 `DEPRECATED` 标记不在表里**（`root.zig:63-66` 的 `startAll`/`stopAll`、`http.zig:13` 的
+  `http_server`），违反表自己的规则 2（"新增弃用项要同时在表里加一行"）→ 补三行 + 门禁三项（各自可执行）。
+
+> **红证据（5 类断言各自"改坏 → 红 → 还原"）**：把已移除的名字加回顶层 →
+> `\`zigmodu.Application\` is exported again — docs/UPGRADING.md records it as removed in 557190a` / `FAIL (RemovedNameReexported)`；
+> 删掉 `src/tests.zig` 的 `api/Simplified.zig` 编译门 → `FAIL (RemovedBlockUncompiled)`；
+> 改掉别名声明定位串 → `FAIL (DeclarationMissing)`；改掉标记窗口里的替代名 → `FAIL (DeprecationMarkerMissing)`；
+> 表里换名或门禁留孤行 → `FAIL (DeprecationTableDrift)`（一次跑出两条）。六个文件的 sha256 还原校验全部通过。
+
+**留给下一批的待决**（都记在 `docs/API_FREEZE.md`）：表外还有四处 `DEPRECATED`（`src/validation/Validator.zig`
+整模块、`src/resilience/RateLimiter.zig:70` 的 `acquire`→`tryAcquire`、`src/api/Server.zig` 的四个 `send*`、
+`src/extensions.zig`）没有进表；表自己的规则 3（在各自版本条目里指回本节）也没补。
+
 ### 第 39 批：**根因找到并修掉** —— Linux 上"起第二个 bus 就永久挂住"是 `Io.Group.async` 的 **eager 回落在永不返回的循环上把调用者线程征用了**；顺带查出 `WebSocket` 有两处同形（**破坏性：否**，`start()` 的错误集多一个成员）
 
 全量 `-Ddb=all` **2002/2060（58 skipped，0 failed，178 s）**；`zig build soak-smoke` 本机 15.7 s 绿；`
