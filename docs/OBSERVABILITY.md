@@ -207,3 +207,8 @@ annotations:
 5. 压测一次：`zig build soak`（跨租户泄漏断言）+ 自己的业务压测脚本。
    CI 里已挂 **夜间 soak**（`schedule` 每天 03:17 UTC + 手动触发，
    `-Dsoak-clients=64 -Dsoak-iterations=200`），本地用默认规模即可。
+   **注意这三个目标（`soak` / `soak-cluster` / `runtime-stress`）只在夜间跑**，所以 push 流水线里另外挂了
+   一道 `zig build soak-compile`（Linux 腿）**只编译不运行**，保证它们的编译错误不会等到 03:17 才暴露 ——
+   这道门是补出来的：`src/soak_cluster.zig` 曾经在 Linux 上编译不过好几天（其中一个原因是那次 nightly
+   被 cancelled），而本机 macOS 编译是绿的（坏掉的分支是 `builtin.os.tag == .linux` 门控的、在 macOS 上
+   不被分析）。要验证夜间路径本身，用 `gh workflow run ci.yml`（`workflow_dispatch` 会真的跑 soak job）。

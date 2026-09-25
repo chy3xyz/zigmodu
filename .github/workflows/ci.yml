@@ -114,6 +114,26 @@ jobs:
       - name: Build library
         run: zig build
 
+      - name: Compile the nightly-only targets
+        # `soak` / `soak-cluster` / `runtime-stress` only *run* on the nightly
+        # `schedule` (or a manual dispatch), and `zig build test` compiles its own
+        # root module — so before this step, a push run never compiled them at all
+        # and a compile error in any of them stayed invisible until 03:17 UTC (or
+        # forever, on a day the nightly was cancelled). That is not hypothetical:
+        # `src/soak_cluster.zig` did not build on Linux for days (`no field named
+        # 'd_name' in struct 'os.linux.dirent64'`, fixed in the batch-12 commit)
+        # and the only thing that surfaced it was one nightly going red. This
+        # compiles the three targets and runs none of them.
+        #
+        # Linux only, on purpose: the branch that failed is `builtin.os.tag ==
+        # .linux`-gated, so it is *not analysed* on macOS — the local macOS build
+        # of the same commit was green while the ubuntu nightly was red. Running
+        # it on the Linux leg is what makes the gate mechanical rather than
+        # hopeful, and one OS is enough for a compile gate.
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        run: zig build soak-compile
+
       - name: Run tests
         # The step's status must be the *suite's*, not `tee`'s — see the comment
         # on `scripts/ci-run-logged.sh`, which is what this step now runs.

@@ -2,6 +2,40 @@
 
 ## [Unreleased]
 
+### 第 35 批：夜间才跑的三个目标现在**每次 push 都会编译**（`zig build soak-compile`）—— 因为 `soak_cluster.zig` 曾经在 Linux 上编译不过、好几天没人发现（**破坏性：否**，只加了一道门）
+
+**先记证据**：夜间 soak 在 `2026-09-24T08:31Z` 红过一次，失败步骤是 `Cluster soak`，错误原文：
+
+```
+src/soak_cluster.zig:645:47: error: no field named 'd_name' in struct 'os.linux.dirent64'
+```
+
+而**修掉它的是第 12 批**（`83900c8`，提交时间 `2026-09-24 09:00Z`）—— 比那次 nightly **晚 29 分钟**。
+也就是说 bug 早就不在了，**但让它活了好几天的那个结构性缺口还在**：
+
+* `soak` / `soak-cluster` / `runtime-stress` 三个目标**只有夜间**（`schedule` / `workflow_dispatch`）才编译；
+  push 流水线**从不编译它们** —— `zig build test` 编的是它自己的 root module，而这三个是**三个独立的
+  root module**（`src/soak.zig` / `src/soak_cluster.zig` / `src/runtime_stress.zig`）。
+* 于是同类错误可以在**每次 push 全绿**的情况下活着，直到某天 03:17 UTC 的 nightly —— 而
+  `2026-09-25` 那次 nightly 直接被 **cancelled**，连那一次机会都没有。（`fuzz` 不需要进这道门：
+  它跑的是 `zig build test --fuzz=…`，就是 push 已经在编译的那个 root module。）
+
+**修法**：`build.zig` 新增 `soak-compile` 步骤 —— 依赖那三个**编译**步骤、**不运行任何东西**
+（参照本文件里既有的 `benchmark-build` 先例）；`ci.yml` 的 `build-and-test` 在 **Linux 腿**上加一步
+`zig build soak-compile`（`if: runner.os == 'Linux'`，`timeout-minutes: 10`）。
+
+**为什么只放 Linux 腿**：坏掉的那条分支是 `builtin.os.tag == .linux` 门控的，在 macOS 上
+**根本不会被分析** —— 同一个 commit 本机 macOS 编译是绿的、而 ubuntu 的 nightly 是红的。所以这道门落在
+Linux 上才是机械的，一个 OS 就够；本机 macOS 腿加它只会增加成本而不增加覆盖。
+
+> **红证据（本机实测，两步都有原始输出）**：往 `src/soak_cluster.zig` 里注入一个**必然被分析**的错误后，
+> `zig build soak-compile` 红 —— `src/soak_cluster.zig:91:7: error: duplicate struct member name 'red_probe'`
+> / `Build Summary: 6/8 steps succeeded (1 failed)` / `zig-exit=1`；还原后同一条命令绿（3/3）。
+> **诚实划界**：本机**复现不了**那条 `d_name` 错误（Linux-only 分支不被分析，试过 `-Dtarget=x86_64-linux-gnu`
+> 会先死在交叉链接上：`unable to find dynamic system library 'sqlite3'`）。所以本机能机械证明的是
+> "**这三个文件现在真的被编译了**"；"**Linux 分支也被分析**"这一半由这道门落在 ubuntu 腿上保证，
+> 它的第一次绿在 CI 里、不在本机。
+
 ### 第 34 批：投递种类（`Kind`）从漏斗一路到段文件 —— §13.9 那条"定时器投递在盘上冒充 message"的缺口收掉（**破坏性：否**，`Track.record` 签名未动）
 
 全量 `-Ddb=all` **1998/2056（58 skipped，0 failed）**；CI 示例清单本机 **16/16 构建 + 7 个 `build test` 步骤全绿**；fmt / check / check-api / check-deadcode / check-tenant-scope / check-version 全绿。

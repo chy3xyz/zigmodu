@@ -398,6 +398,24 @@ pub fn build(b: *std.Build) void {
     const stress_step = b.step("runtime-stress", "Run the long-horizon runtime harness (supervision tree, pools, timers, zero-allocation)");
     stress_step.dependOn(&run_stress.step);
 
+    // Compile-only gate for the three targets whose steps only *run* on the
+    // nightly `schedule` (or a manual `workflow_dispatch`): `soak`,
+    // `soak-cluster` and `runtime-stress`. On a push run nothing compiled them —
+    // `zig build test` builds its own root module, and these are three separate
+    // ones — so a compile error in any of them was invisible until 03:17 UTC,
+    // and stayed invisible on every day the nightly was cancelled. That is not
+    // hypothetical: `src/soak_cluster.zig` failed to build for days on Linux
+    // (`no field named 'd_name' in struct 'os.linux.dirent64'`, fixed in the
+    // batch-12 commit) and the only reason anyone saw it was one nightly going
+    // red. This step depends on the three *compile* steps and runs none of them,
+    // so the push gate pays seconds instead of the minutes a real soak costs.
+    // `fuzz` needs no entry here: its step is `zig build test --fuzz=…`, i.e. the
+    // root module push runs already compile.
+    const soak_compile_step = b.step("soak-compile", "Compile the nightly-only targets (soak, soak-cluster, runtime-stress) without running them");
+    soak_compile_step.dependOn(&soak_tests.step);
+    soak_compile_step.dependOn(&soak_cluster_tests.step);
+    soak_compile_step.dependOn(&stress_exe.step);
+
     // The same file, compiled into `zig build test` with a *smoke* budget, so
     // the default suite covers the harness's code path and every check while the
     // long run stays its own step (the split `soak` uses). The numbers are fixed
