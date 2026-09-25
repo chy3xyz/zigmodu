@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+### 第 48 批：查出一条**我自己写进仓库的 flake** —— `PrecisionTimer` 的"窗口不劣于内核 sleep"断言在负载机上是噪声比较，改成"只在窗口真能起作用时才断言"
+
+**触发**：第 45 批那次 push（`7bd9624`，只改了 `ci.yml` 注释与 CHANGELOG，树与刚通过的 `61f82fb` 实质相同）
+在 **macOS 腿**失败，红的是 `PrecisionTimer: the spin window is what buys the accuracy (the bound has teeth)`，
+断言在 `precision_timer.zig:870`：
+
+```
+try std.testing.expect(precise.p50_ns <= coarse.p50_ns + lateness_p50_bound_ns);
+```
+
+**读数（runner 日志原文，1 ms 那一行）**：`sleep-only` p50 **3 271 000 ns** / p99 10 795 000 ·
+`default` p50 **3 533 000 ns** / p99 5 918 000 —— 两次**顺序**采样的"差值"只有 262 µs，而它们各自的散布是
+毫秒级；而且那台机器**早就 miss 了 readiness 探针**（@1 ms 的 p50 = 3 534 000 ns）。也就是说：在窗口根本
+无法起作用的宿主上，这条断言比的是 **runner 的调度噪声**，不是机制。
+
+**改法**：这条跨配置比较只在**窗口真能起作用**的行上断言（纯自旋那一行，以及 `host_ready` 宿主上的每一行）；
+其余行**打印**（并说明"此宿主上窗口不可作用，所以只打印"）。`what the knobs cost` 的 `else` 分支是同一个形状，
+一并改。
+
+**保留的牙**（换个宿主也成立）：纯自旋那一行的绝对界（任何宿主都断言，`sleeps == 0` 还顺带钉住"窗口覆盖整段
+等待时一次都不睡"）· `over_bound > 0`（粗粒度宿主上"把等待交给内核"确实会破界）· capable 宿主上每一行的绝对界。
+
+**诚实记一句**：这是第 30 批那次修复**没做完的一半** —— 当时我只把"绝对界"改成宿主门控，却给"窗口不可作用"
+的宿主留了一条仍然脆弱的**相对**断言。本机 5 次连跑 9/9 绿。
+
 ### 第 46 批：把 `http.FieldRules` 从弃用模块里拆出来（`validation/FieldRules.zig` 成为规范家、`Validator` 变兼容别名）—— 门禁从"钉住耦合"改成"钉住**依赖方向**"；并更正我自己上一批的一处错误（**破坏性：否**，对外拼写与类型一字未变）
 
 全量 `-Ddb=all` **2021/2079（58 skipped，0 failed）**；`ApiFreeze` 14/14、`Validat` 33/33、`FieldRules` 4/4；fmt / check / check-api / check-deadcode 全绿。

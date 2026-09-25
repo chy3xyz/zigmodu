@@ -865,13 +865,36 @@ test "PrecisionTimer: the spin window is what buys the accuracy (the bound has t
             attributed_rows += 1;
         }
 
-        // The teeth. Turning the accuracy knobs off must not improve the median
-        // by more than the bound's own width ...
-        try std.testing.expect(precise.p50_ns <= coarse.p50_ns + lateness_p50_bound_ns);
+        // The teeth, and the boundary of what they can be asked on a host where
+        // the window cannot act at all.
+        //
+        // The cross-configuration comparison — "turning the accuracy knobs off
+        // must not improve the median" — is a claim about *the mechanism*, and it
+        // is only measurable where the mechanism does something: it compares two
+        // **sequential** samples of a noisy quantity, so on a loaded host the
+        // load itself dominates. Measured on the macOS CI runner (2026-09-25,
+        // `7bd9624`): `sleep-only` p50 **3 271 000 ns** vs `default` p50
+        // **3 533 000 ns** at the 1 ms deadline, with p99s of 10.8 ms and 5.9 ms
+        // — a 262 µs "difference" between two runs whose own spreads are
+        // milliseconds, on a runner that had already missed the readiness probe.
+        // Asserting it there would be asserting the runner's scheduling noise, so
+        // it is asserted only on the rows where the window acts (the pure spin
+        // row and, on a capable host, every row); where it cannot act, the row is
+        // printed and the surviving teeth are `over_bound` below.
+        if (deadline_ns <= precise_options.spin_window_ns or host_ready) {
+            try std.testing.expect(precise.p50_ns <= coarse.p50_ns + lateness_p50_bound_ns);
+        } else {
+            std.debug.print(
+                "  [precision-timer] {d} us row: the window cannot act on this host, so the cross-configuration median is printed, not asserted (precise {d} ns vs coarse {d} ns)\n",
+                .{ @divTrunc(deadline_ns, std.time.ns_per_us), precise.p50_ns, coarse.p50_ns },
+            );
+        }
         // ... and it must actually break the bound somewhere. On a host whose
         // `nanosleep` is precise enough that nothing breaks it, that is a real
         // finding (the window is then not needed for *that* deadline) — this
-        // assertion is the one to revisit, with a measurement.
+        // assertion is the one to revisit, with a measurement. It is also the
+        // teeth that survive the attribution above: a coarse host still shows
+        // that handing the wait to the kernel is what breaks the bound.
         if (coarse.p50_ns > lateness_p50_bound_ns) over_bound += 1;
     }
     std.debug.print(
@@ -948,7 +971,15 @@ test "PrecisionTimer: what the knobs cost — lateness and CPU at three periods"
         if (period_ns <= default_options.spin_window_ns or host_ready) {
             try std.testing.expect(measured.p50_ns <= lateness_p50_bound_ns);
         } else {
-            try std.testing.expect(measured.p50_ns <= coarse.p50_ns + lateness_p50_bound_ns);
+            // Same boundary as the teeth test: the cross-configuration median is
+            // not a mechanism claim on a host where the window cannot act — it is
+            // two sequential samples of a quantity whose spread is the runner's
+            // scheduling noise. Printed, not asserted (see that test for the
+            // measurement that forced this).
+            std.debug.print(
+                "  [precision-timer] {d} us period: window cannot act here, so precise-vs-coarse is printed (precise {d} ns vs coarse {d} ns)\n",
+                .{ @divTrunc(period_ns, std.time.ns_per_us), measured.p50_ns, coarse.p50_ns },
+            );
         }
     }
 
