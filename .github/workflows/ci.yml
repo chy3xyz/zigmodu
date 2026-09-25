@@ -737,19 +737,21 @@ jobs:
         run: sudo apt-get install -y libpq-dev libmariadb-dev libmariadb-dev-compat libsqlite3-dev
 
       - name: Drop cached coverage artifacts
-        # `zig build test --fuzz` below is the only step in this workflow that
-        # runs with coverage instrumentation, and a coverage file is
-        # machine-state rather than reusable output: it embeds paths from the run
-        # that produced it, and a run that instrumented nothing still leaves one
-        # behind. This runner's `actions/cache` entry (1.7 GB on Linux, keyed only
-        # on `build.zig.zon`, with a `zig-${runner.os}-` restore fallback)
-        # therefore carries them across commits — and one zero-PC leftover makes
-        # the *next* fuzz run die with `error: step run test: corrupted coverage
-        # file .zig-cache/v/…: pcs_len was zero`. Measured 2026-09-25, on the
-        # first nightly that ever reached the fuzz step (the two steps above it
-        # had hung for days); the same command locally, with a fresh coverage dir,
-        # is green — so it is the artifacts, not the suite, that this removes.
-        # No cache value is lost: nothing else in this workflow consumes coverage.
+        # Hygiene, and **not** a fix — do not read this step as one. It was added
+        # on the hypothesis that a zero-PC coverage file from an earlier build was
+        # riding in this runner's `actions/cache` entry (1.7 GB, keyed only on
+        # `build.zig.zon`, with a `zig-${runner.os}-` restore fallback) and making
+        # `zig build test --fuzz` die with
+        # `error: step run test: corrupted coverage file .zig-cache/v/…: pcs_len
+        # was zero`. The hypothesis was **refuted by experiment**: with this step
+        # in place the very next run failed identically, on the same hash
+        # (`59e4bde28e630904`, 2026-09-25) — so the artifact is written *by* that
+        # run, and the build system rejects it while merging. The cause is still
+        # open; see the CHANGELOG entry for that batch.
+        #
+        # The step stays because deleting coverage output before a build is
+        # harmless and correct on its own terms (a coverage file is machine-state,
+        # never reusable across runs, and nothing in this workflow consumes it).
         run: rm -rf .zig-cache/v
 
       - name: Soak (cross-tenant leak assertions + frozen-registry concurrency)
