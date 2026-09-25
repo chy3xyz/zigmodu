@@ -811,10 +811,12 @@ jobs:
         # `continue-on-error` is a **visibility decision, not a fix**: a step that
         # is red on every run keeps the whole nightly red and hides the three
         # steps above it failing for real — the same masking this workflow was
-        # just fixed for in the push leg. The step's own red stays visible in
-        # every run, and the finding is in the CHANGELOG. Drop this flag when the
-        # cause is known. `--summary all` and the fallback below are evidence
-        # collection for that.
+        # just fixed for in the push leg. Be precise about what is still visible:
+        # the step's *conclusion* reads `success` in the run summary (GitHub
+        # reports the job as the annotation's "continue-on-error" outcome), so the
+        # surviving evidence is the step's log — the `failed command` lines, the
+        # `--summary all` output and the artifact dump below. The finding is in
+        # the CHANGELOG. Drop this flag when the cause is known.
         continue-on-error: true
         run: |
           if ! zig build test --fuzz=2000 -Ddb=all --test-timeout 300s --summary all; then
