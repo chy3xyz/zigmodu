@@ -105,6 +105,12 @@ metrics.setScrapeHook(struct {
 需要按维度拆分时用 `createCounterFamily` / `createHistogramFamily`
 （同样受基数上限保护）。
 
+**注册必须发生在第一次抓取之前**：`GET /metrics` 会在序列化前把注册表
+`freeze()`，之后任何 `create*` 都返回 `error.Frozen` 且不插入任何东西。
+这是有意的——封印之后注册容器不再被写，抓取线程遍历它们才能不加锁
+（需要每抓取刷新的是 gauge，走 `setScrapeHook`，不受此限）。
+所以业务指标在启动接线阶段创建，别在 handler 里注册。
+
 ## 3. PromQL 速查
 
 ```promql

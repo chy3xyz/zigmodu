@@ -350,15 +350,26 @@ pub const SlidingWindowRateLimiter = struct {
     name: []const u8,
     window_size_seconds: u64,
     max_requests: u32,
-    requests: std.array_list.Managed(i64), // Request timestamp list
+    /// Request timestamps inside the window. Capacity for `max_requests` is
+    /// reserved by `init`; the list never grows past that, which is what keeps
+    /// `tryAcquire` allocation-free.
+    requests: std.array_list.Managed(i64),
 
     pub fn init(allocator: std.mem.Allocator, name: []const u8, window_size_seconds: u64, max_requests: u32) !Self {
+        var requests = std.array_list.Managed(i64).init(allocator);
+        errdefer requests.deinit();
+        // Reserve the whole window up front: `tryAcquire` then never allocates,
+        // so a failed allocation can no longer be answered with "rate limited".
+        // `tryAcquire` admits only while `items.len < max_requests`, so the list
+        // never needs room for more than `max_requests` timestamps — this is its
+        // high-water mark, not spare capacity.
+        try requests.ensureTotalCapacity(max_requests);
         return .{
             .allocator = allocator,
             .name = try allocator.dupe(u8, name),
             .window_size_seconds = window_size_seconds,
             .max_requests = max_requests,
-            .requests = std.array_list.Managed(i64).init(allocator),
+            .requests = requests,
         };
     }
 
@@ -369,13 +380,19 @@ pub const SlidingWindowRateLimiter = struct {
     }
 
     /// Record a request if the window has room. Denies rather than waiting.
+    ///
+    /// Never allocates: the window's capacity is reserved by `init`, so there is
+    /// no `error.OutOfMemory` to report and — what this replaced — no way for a
+    /// failed allocation to come back as `false`, i.e. as "you are rate limited".
+    /// A caller that throttles itself because *our* allocator failed is a
+    /// self-inflicted denial of service.
     pub fn tryAcquire(self: *Self) bool {
         self.guard.lock();
         defer self.guard.unlock();
 
         self.cleanupLocked();
         if (self.requests.items.len < self.max_requests) {
-            self.requests.append(Time.monotonicNowSeconds()) catch return false;
+            self.requests.appendAssumeCapacity(Time.monotonicNowSeconds());
             return true;
         }
         return false;
@@ -474,6 +491,26 @@ test "SlidingWindowRateLimiter" {
     try std.testing.expect(limiter.tryAcquire());
     try std.testing.expect(limiter.tryAcquire());
     try std.testing.expect(!limiter.tryAcquire()); // limit reached
+    try std.testing.expectEqual(@as(usize, 2), limiter.currentCount());
+}
+
+test "SlidingWindowRateLimiter: a failed allocation is not a throttle verdict" {
+    // The window has room, and the allocator fails every request from here on:
+    // an admission must not turn into "rate limited" because the *limiter's own*
+    // hot path needed memory. A caller that throttles itself over our OOM is a
+    // self-inflicted denial of service.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = failing.allocator();
+
+    var limiter = try SlidingWindowRateLimiter.init(allocator, "window-oom", 1, 2);
+    defer limiter.deinit();
+
+    // Everything the limiter needs must already be allocated by `init`.
+    failing.fail_index = failing.allocations;
+
+    try std.testing.expect(limiter.tryAcquire()); // admitted…
+    try std.testing.expect(limiter.tryAcquire()); // …up to `max_requests`…
+    try std.testing.expect(!limiter.tryAcquire()); // …and denied for the real reason only
     try std.testing.expectEqual(@as(usize, 2), limiter.currentCount());
 }
 

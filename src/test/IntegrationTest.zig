@@ -26,7 +26,9 @@ pub const IntegrationTest = struct {
     event_captures: std.StringHashMap(*anyopaque),
     http_client: ?HttpTestClient = null,
     db_context: ?DatabaseTestContext = null,
-    instrumentation: ?InstrumentationContext = null,
+    /// Heap-owned: `InstrumentationContext` holds pointers into itself, so it
+    /// must never be copied out of one storage location and back (see its doc).
+    instrumentation: ?*InstrumentationContext = null,
     setup_executed: bool = false,
     teardown_executed: bool = false,
 
@@ -204,21 +206,33 @@ pub const IntegrationTest = struct {
     };
 
     /// Instrumentation context for metrics and tracing
+    ///
+    /// **Not copyable.** `auto_instrumentation` holds the `*PrometheusMetrics`
+    /// / `*DistributedTracer` it was handed, and those are `&self.metrics` /
+    /// `&self.tracer` — the objects *inside this struct*. A by-value copy would
+    /// leave the instrumentation aimed at the original (and the two copies
+    /// would share one registry, whose `deinit` frees the same heap objects
+    /// twice). `init` therefore fills a context **in its final location**
+    /// instead of returning one; the harness creates it on the heap and keeps
+    /// the pointer.
     pub const InstrumentationContext = struct {
         metrics: PrometheusMetrics,
         tracer: DistributedTracer,
         auto_instrumentation: AutoInstrumentation,
 
-        pub fn init(allocator: std.mem.Allocator) !InstrumentationContext {
-            var metrics = PrometheusMetrics.init(allocator);
-            var tracer = try DistributedTracer.init(allocator, "test_tracer", "test_service");
-            const auto_inst = try AutoInstrumentation.init(allocator, &metrics, &tracer);
-
-            return .{
-                .metrics = metrics,
-                .tracer = tracer,
-                .auto_instrumentation = auto_inst,
-            };
+        /// Build the context where it will live: the instrumentation is given
+        /// `&self.metrics` / `&self.tracer`, so the registry, the tracer and the
+        /// instrumentation that points at them all have the one lifetime. The
+        /// old `init(allocator) !InstrumentationContext` built both in stack
+        /// locals and returned the struct by value — a copy — which left
+        /// `AutoInstrumentation.metrics` pointing at a dead frame for as long as
+        /// the harness lived.
+        pub fn init(self: *InstrumentationContext, allocator: std.mem.Allocator) !void {
+            self.metrics = PrometheusMetrics.init(allocator);
+            errdefer self.metrics.deinit();
+            self.tracer = try DistributedTracer.init(allocator, "test_tracer", "test_service");
+            errdefer self.tracer.deinit();
+            self.auto_instrumentation = try AutoInstrumentation.init(allocator, &self.metrics, &self.tracer);
         }
 
         pub fn deinit(self: *InstrumentationContext) void {
@@ -243,9 +257,12 @@ pub const IntegrationTest = struct {
             db_context = try DatabaseTestContext.init(allocator, config.db_mode);
         }
 
-        var instrumentation: ?InstrumentationContext = null;
+        var instrumentation: ?*InstrumentationContext = null;
         if (config.enable_metrics or config.enable_tracing) {
-            instrumentation = try InstrumentationContext.init(allocator);
+            const inst = try allocator.create(InstrumentationContext);
+            errdefer allocator.destroy(inst);
+            try InstrumentationContext.init(inst, allocator);
+            instrumentation = inst;
         }
 
         return .{
@@ -281,8 +298,9 @@ pub const IntegrationTest = struct {
             ctx.deinit(self.allocator);
         }
 
-        if (self.instrumentation) |*inst| {
+        if (self.instrumentation) |inst| {
             inst.deinit();
+            self.allocator.destroy(inst);
         }
 
         if (self.app) |*app| {
@@ -427,7 +445,7 @@ pub const IntegrationTest = struct {
     }
 
     pub fn getMetricsOutput(self: *Self) !?[]const u8 {
-        if (self.instrumentation) |*inst| {
+        if (self.instrumentation) |inst| {
             return try inst.metrics.toPrometheusFormat(self.allocator);
         }
         return null;
@@ -684,4 +702,38 @@ test "IntegrationTest end-to-end service registration" {
     const retrieved = ctx.getService("my_service", i32);
     try testing.expect(retrieved != null);
     try testing.expectEqual(@as(i32, 42), retrieved.?.*);
+}
+
+// The harness hands `AutoInstrumentation` a `*PrometheusMetrics` and a
+// `*DistributedTracer`, and then keeps "the same" two objects in
+// `InstrumentationContext`. They have to be one object each. The old `init`
+// built both in stack locals, passed `&local` on, and then returned them **by
+// value** into the context, so from the moment `init` returned the
+// instrumentation pointed at a dead frame: a registration through
+// `auto_instrumentation.metrics` landed in a stack slot belonging to whoever
+// ran next, while the harness kept a second registry object over the same heap
+// containers (its own `deinit` frees them, the dead copy's fields still name
+// them). Pinned by address, then by value: a metric registered through the
+// instrumentation's registry is the one the harness renders.
+test "the instrumentation's registry is the registry the harness owns" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var ctx = try IntegrationTest.init(allocator, .{
+        .enable_metrics = true,
+        .enable_tracing = true,
+        .db_mode = .in_memory,
+    });
+    defer ctx.deinit();
+
+    const inst = ctx.instrumentation.?;
+    try testing.expect(inst.auto_instrumentation.metrics == &inst.metrics);
+    try testing.expect(inst.auto_instrumentation.tracer == &inst.tracer);
+
+    const probe = try inst.auto_instrumentation.metrics.createCounter("harness_probe_total", "probe");
+    probe.inc();
+
+    const text = (try ctx.getMetricsOutput()).?;
+    defer allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "harness_probe_total 1") != null);
 }

@@ -116,6 +116,25 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 **注意这层封条不是互斥**：它把"启动期注册"从假设变成会报错的契约，但在封条落定前通过检查的 `create*`
 仍可能与第一次抓取交错；真正的互斥需要一把锁，本版没有加。
 
+**行为变化（非破坏）⑩：同名重复的 `create*` 现在是错误，抓取后的注册也是错误。** `PrometheusMetrics` 的六个
+`create*` 现在返回 `CreateError`（`error.Frozen` | `error.DuplicateName` | `std.mem.Allocator.Error`）：
+① 注册（第一次抓取或 `freeze()` 之后）被封 —— 晚期注册返回 `error.Frozen` 且不插入任何东西；
+② **同一个名字（同一种类）注册第二次返回 `error.DuplicateName`**，而不是像以前那样把第一个对象留在堆上没人释放、
+把已发出的旧句柄变成孤儿。若你以前依赖"重复注册就换一个"，请改成在首次抓取之前注册一次，或用
+`getCounter`/`getGauge` 追加 label 值。`Counter.labels`/`Gauge.labels` 与 `Summary` 的
+`quantiles`/`max_age_seconds`/`age_buckets` 三个"声明了没人读"的字段已删除。
+
+**行为变化（非破坏）：集群恢复现在会触发 `on_node_join_cb`。** `ClusterMembership` 以前只在失败/`leave` 时发
+`on_node_leave_cb`，恢复只翻状态、不发回调。现在**一次 `leave` 对应一次 `join`**（`join` 是 "这个 peer 是你应当持有
+状态的成员"，是 **upsert** 而不是"首次见到"）；`.suspect` → `.healthy` 两个方向都**不发**（没有 `leave` 被宣告过）。
+如果你的回调在 `join` 时建了每对端状态，这条修掉的正是"建了却没人拆/拆了却没人建"的不对称。
+
+**行为变化（非破坏，测试工具）：`test.IntegrationTest.InstrumentationContext` 改为原地构造且不可拷贝。**
+`init(allocator) !InstrumentationContext` → `init(self: *InstrumentationContext, allocator) !void`（先
+`allocator.create` 再原地构造），因为旧实现把 `metrics`/`tracer` 在栈上建好、把指针交给 instrumentation、再**按值**
+返回 —— 那个指针指向已失效的栈帧。只影响直接用这个测试工具的类型（`IntegrationTest.instrumentation` 字段也变成
+`?*InstrumentationContext`）。
+
 **行为变化（非破坏）⑨：一批"取消被当成成功/默认值"的路径改成等待或报错。** 涉及 `EventBus`
 （`publish`/`unsubscribe`/`subscriberCount`/`publishedCount` 改不可取消的等待；**`subscribe`/`subscribeAsync`
 现在会返回 `error.Canceled`** —— 以前它们**返回成功却没注册**）、`EventStore`

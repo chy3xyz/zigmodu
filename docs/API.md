@@ -281,40 +281,79 @@ pub fn parseFile(self: *Self, path: []const u8) !std.StringHashMap([]const u8)
 
 #### `zigmodu.core.EventBus(T)`
 
-Type-safe event bus for inter-module communication.
+**无类型事件总线**：`T` 是**事件类型键**（枚举等可哈希类型），payload 以
+`*anyopaque` 传递、由回调自己转回来；一个实例可挂任意多个事件类型。
+**非线程安全**；并发场景用 `ThreadSafeEventBus`（根导出
+`zigmodu.ThreadSafeEventBus`），或模块里 `ModuleContext.eventBus(...)`
+拿到的应用级总线。
 
 ```zig
 pub fn EventBus(comptime T: type) type
 
 // Methods
 pub fn init(alloc: std.mem.Allocator) Self
+pub fn initCapacity(alloc: std.mem.Allocator, capacity: usize) Self   // 容量是提示，失败只 warn
 pub fn deinit(self: *Self) void
-pub fn subscribe(self: *Self, listener: *const fn (T) void) !void
-pub fn unsubscribe(self: *Self, listener: *const fn (T) void) void
-pub fn publish(self: *Self, event: T) void
-pub fn subscriberCount(self: *Self) usize
+pub fn subscribe(self: *Self, event_type: T, callback: *const fn (T, *anyopaque) void) !void
+pub fn unsubscribe(self: *Self, event_type: T, callback: *const fn (T, *anyopaque) void) void
+pub fn publish(self: *Self, event_type: T, payload: *anyopaque) void
+pub fn subscriberCount(self: *Self, event_type: T) usize
+pub fn totalSubscriberCount(self: *Self) usize
 ```
 
 **Example:**
 ```zig
+const Topic = enum { order_created };
 const OrderEvent = struct { order_id: u64, status: []const u8 };
-const Bus = zigmodu.core.EventBus(OrderEvent);
+
+const Bus = zigmodu.core.EventBus(Topic);
 
 var bus = Bus.init(allocator);
 defer bus.deinit();
 
-try bus.subscribe(handleOrder);
-bus.publish(.{ .order_id = 123, .status = "completed" });
+var event = OrderEvent{ .order_id = 123, .status = "completed" };
+try bus.subscribe(.order_created, onOrderCreated);
+bus.publish(.order_created, &event);
+
+fn onOrderCreated(topic: Topic, payload: *anyopaque) void {
+    _ = topic;
+    const e: *OrderEvent = @ptrCast(@alignCast(payload));
+    _ = e.order_id;
+}
 ```
 
 ### TypedEventBus
 
 #### `zigmodu.core.TypedEventBus(T)`
 
-Simplified event bus for single event type.
+单事件类型的简化总线：payload **按值**传递（`fn (T) void`），不用 `*anyopaque`
+转换。同样**非线程安全**。
 
 ```zig
 pub fn TypedEventBus(comptime T: type) type
+
+// Methods
+pub fn init(alloc: std.mem.Allocator) Self
+pub fn deinit(self: *Self) void
+pub fn subscribe(self: *Self, listener: *const fn (T) void) !void
+pub fn subscribeAsync(self: *Self, pool: *WorkerPool, handler: *const fn (T) void) !void
+pub fn unsubscribe(self: *Self, listener: *const fn (T) void) void
+pub fn publish(self: *Self, event: T) void
+pub fn subscriberCount(self: *Self) usize
+pub fn publishedCount(self: *Self) u64              // publish 被调用过多少次
+pub fn droppedAsyncCount(self: *Self) u64           // 异步投递因分配/派发失败而丢弃的次数
+```
+
+**Example:**
+```zig
+const OrderEvent = struct { order_id: u64, status: []const u8 };
+const Bus = zigmodu.core.TypedEventBus(OrderEvent);
+
+var bus = Bus.init(allocator);
+defer bus.deinit();
+
+try bus.subscribe(handleOrder);
+bus.publish(.{ .order_id = 123, .status = "completed" });
 ```
 
 ### DistributedEventBus
@@ -501,12 +540,26 @@ Prometheus-compatible metrics collection.
 ```zig
 pub fn init(allocator: std.mem.Allocator) Self
 pub fn deinit(self: *Self) void
-pub fn createCounter(self: *Self, name: []const u8, help: []const u8) !*Counter
-pub fn createGauge(self: *Self, name: []const u8, help: []const u8) !*Gauge
-pub fn createHistogram(self: *Self, name: []const u8, help: []const u8, buckets: []const f64) !*Histogram
-pub fn createSummary(self: *Self, name: []const u8, help: []const u8) !*Summary
+
+// 六个 create* 返回的都是 (FrozenError || std.mem.Allocator.Error)!*T，
+// 其中 pub const FrozenError = error{Frozen}（见下方生命周期说明）。
+pub fn createCounter(self: *Self, name: []const u8, help: []const u8) (FrozenError || std.mem.Allocator.Error)!*Counter
+pub fn createGauge(self: *Self, name: []const u8, help: []const u8) (FrozenError || std.mem.Allocator.Error)!*Gauge
+pub fn createHistogram(self: *Self, name: []const u8, help: []const u8, buckets: []const f64) (FrozenError || std.mem.Allocator.Error)!*Histogram
+pub fn createSummary(self: *Self, name: []const u8, help: []const u8) (FrozenError || std.mem.Allocator.Error)!*Summary
+
+pub fn freeze(self: *Self) void                             // 显式封注册表；幂等，没有 unfreeze
+pub fn isFrozen(self: *const Self) bool
 pub fn toPrometheusFormat(self: *Self, allocator: std.mem.Allocator) ![]const u8
 ```
+
+**`error.Frozen`（注册表生命周期）**：`toPrometheusFormat` 在读取任何容器**之前**
+自己先 `freeze()`；显式 `freeze()` 只是把这道封印提前。封印之后所有 `create*`
+返回 `error.Frozen` 且**不插入任何东西**——注册是启动期动作，不是 handler 动作。
+之所以能这样封，是因为封印之后容器不再被写入，抓取线程读它们才能不加锁。
+`freeze()` 幂等、无 `unfreeze`；`isFrozen()` 查状态。
+家族入口（`createCounterFamily` / `createHistogramFamily`）同样受此约束，
+见下文「Metrics with bounded labels」。
 
 **Metric Types:**
 ```zig
@@ -647,13 +700,18 @@ Thresholds, PromQL and the Grafana dashboard: [`OBSERVABILITY.md`](OBSERVABILITY
 | `applyHttpDefaults(server, ProfileConfig, *HttpProfileState)` | CORS / request-id / recover / access log / in-memory metrics middleware only |
 | `ResilienceProfileState.init(allocator, deps)` / `applyResilienceDefaults` | per-dependency `CircuitBreaker` + `RateLimiter` holders — nothing is enforced until handlers use `breaker(name)` / `limiter(name)` |
 
-### `zigmodu.http.PrometheusMetrics`
+### `zigmodu.metrics.PrometheusMetrics`（HTTP profile 接线）
+
+与上文是**同一个类型**，这里只列 HTTP profile 侧用到的入口。
 
 ```zig
 pub fn init(allocator: std.mem.Allocator) Self
-pub fn createCounter(self: *Self, name: []const u8, help: []const u8) !*Counter
-pub fn createGauge(self: *Self, name: []const u8, help: []const u8) !*Gauge
-pub fn createHistogram(self: *Self, name: []const u8, help: []const u8, buckets: []const f64) !*Histogram
+// 三个 create* 的冻结语义同上：封印后 error.Frozen，不插入任何东西
+pub fn createCounter(self: *Self, name: []const u8, help: []const u8) (FrozenError || std.mem.Allocator.Error)!*Counter
+pub fn createGauge(self: *Self, name: []const u8, help: []const u8) (FrozenError || std.mem.Allocator.Error)!*Gauge
+pub fn createHistogram(self: *Self, name: []const u8, help: []const u8, buckets: []const f64) (FrozenError || std.mem.Allocator.Error)!*Histogram
+pub fn freeze(self: *Self) void
+pub fn isFrozen(self: *const Self) bool
 pub fn toPrometheusFormat(self: *Self, allocator: std.mem.Allocator) ![]const u8
 pub fn registerMetricsRoute(self: *Self, server: anytype) !void            // GET /metrics
 pub fn registerMetricsRoutePath(self: *Self, server: anytype, path: []const u8) !void
@@ -813,8 +871,9 @@ cannot read chunked framing should use `HEAD` or `Range` for large files.
 ### Metrics with bounded labels
 
 ```zig
-pub fn createCounterFamily(self, name, help, label, max_series: usize, io: std.Io) !*CounterFamily
-pub fn createHistogramFamily(self, name, help, label, max_series: usize, buckets: []const f64, io: std.Io) !*HistogramFamily
+// 冻结后同样 error.Frozen（见上文「Prometheus Metrics」）
+pub fn createCounterFamily(self, name, help, label, max_series: usize, io: std.Io) (FrozenError || std.mem.Allocator.Error)!*CounterFamily
+pub fn createHistogramFamily(self, name, help, label, max_series: usize, buckets: []const f64, io: std.Io) (FrozenError || std.mem.Allocator.Error)!*HistogramFamily
 // family.get(label_value) -> *Counter / *Histogram   (cap → shared "__other__" series)
 pub fn setScrapeHook(self, hook: ?ScrapeHook, userdata: ?*anyopaque) void  // sampled at scrape time
 ```

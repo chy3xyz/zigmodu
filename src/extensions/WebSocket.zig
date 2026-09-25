@@ -16,6 +16,10 @@ pub const WebSocketServer = struct {
     is_running: bool,
     clients: std.array_list.Managed(*WebSocketClient),
     clients_mutex: std.Io.Mutex,
+    /// Broadcasts that reached *nobody* because the client lock could not be
+    /// taken (the publishing task was canceled). `broadcast` returns `void`, so
+    /// this counter — plus the error log — is the only trace a lost push leaves.
+    dropped_broadcasts: std.atomic.Value(u64),
     accept_fiber_started: bool,
     /// Group that owns the `acceptLoop` fiber and every spawned
     /// `handleConnection` fiber. Awaited in `stop()` so no futures leak.
@@ -37,6 +41,7 @@ pub const WebSocketServer = struct {
             .is_running = false,
             .clients = std.array_list.Managed(*WebSocketClient).init(allocator),
             .clients_mutex = std.Io.Mutex.init,
+            .dropped_broadcasts = std.atomic.Value(u64).init(0),
             .accept_fiber_started = false,
             .fiber_group = .init,
             .on_connect_cb = null,
@@ -122,9 +127,15 @@ pub const WebSocketServer = struct {
         defer conn.close(self.io);
 
         var buf: [4096]u8 = undefined;
-        var read_buf: [4096]u8 = undefined;
-        var r = conn.reader(self.io, &read_buf);
-        const bytes_read = r.interface.readSliceShort(&buf) catch |err| {
+        // Raw posix read, like `WebSocketClient.readFull`: this is a
+        // long-blocking read waiting for the peer's request head, and the
+        // io-based path (`conn.reader(...).interface.readSliceShort`) hangs here
+        // even with the bytes already in the kernel buffer once the Io is shared
+        // across threads — the reproduction `core/sockread.zig` documents. Red:
+        // `WebSocketServer: a live client is handshaken, pushed to, and dropped`
+        // (the request head was not read until the peer hung up, so no handshake
+        // answer was ever written).
+        const bytes_read = sockread.readSome(conn, &buf) catch |err| {
             std.log.err("[WebSocketServer] Read error: {}", .{err});
             return;
         };
@@ -140,6 +151,12 @@ pub const WebSocketServer = struct {
             var w = conn.writer(self.io, &write_buf);
             // Best-effort: a failed write means the peer is already gone.
             _ = w.interface.writeAll(response) catch |err| {
+                std.log.debug("[ws] handshake write failed (peer gone?): {s}", .{@errorName(err)});
+            };
+            // `writeAll` only *buffers* what fits in `write_buf` (`Io/Writer.zig`
+            // returns as soon as the bytes are copied), so without this flush the
+            // response dies with `w` — no error, nothing on the wire.
+            w.interface.flush() catch |err| {
                 std.log.debug("[ws] handshake write failed (peer gone?): {s}", .{@errorName(err)});
             };
             return;
@@ -162,6 +179,11 @@ pub const WebSocketServer = struct {
                     // Best-effort: the peer is being rejected anyway; a failed
                     // write only means the socket is already gone.
                     _ = w.interface.writeAll(response) catch |err| {
+                        std.log.debug("[ws] handshake write failed (peer gone?): {s}", .{@errorName(err)});
+                    };
+                    // Same flush contract as the 400 above: without it the 403 is
+                    // never sent and the peer sees a hang instead of a rejection.
+                    w.interface.flush() catch |err| {
                         std.log.debug("[ws] handshake write failed (peer gone?): {s}", .{@errorName(err)});
                     };
                     return;
@@ -199,25 +221,33 @@ pub const WebSocketServer = struct {
             std.log.err("[WebSocketServer] Handshake write error: {}", .{err});
             return;
         };
+        // The flush is the delivery: the response is ~129 bytes and the buffer is
+        // 4096, so `writeAll` alone leaves the 101 in a stack buffer that dies
+        // here — the client waits for a handshake that never arrives. Red:
+        // `WebSocketServer: a live client is handshaken, pushed to, and dropped`.
+        w.interface.flush() catch |err| {
+            std.log.err("[WebSocketServer] Handshake write error: {}", .{err});
+            return;
+        };
 
         // Create client
         const client = self.allocator.create(WebSocketClient) catch |err| {
             std.log.err("[WebSocketServer] Failed to allocate client: {}", .{err});
             return;
         };
-        errdefer self.allocator.destroy(client);
 
         client.* = WebSocketClient.init(self.allocator, conn, self.io, self);
 
-        self.clients_mutex.lock(self.io) catch return;
-        self.clients.append(client) catch |err| {
-            self.clients_mutex.unlock(self.io);
+        // Ownership of `client` is the caller's until `addClient` lands it in the
+        // registry. (No `errdefer` here: this function returns `void`, so one
+        // could never fire.)
+        self.addClient(client) catch |err| {
             std.log.err("[WebSocketServer] Failed to add client: {}", .{err});
-            client.deinit();
+            // The socket belongs to this frame's `defer conn.close` above;
+            // `client.deinit()` here would close the same fd twice.
             self.allocator.destroy(client);
             return;
         };
-        self.clients_mutex.unlock(self.io);
 
         if (self.on_connect_cb) |cb| {
             cb(client);
@@ -225,17 +255,16 @@ pub const WebSocketServer = struct {
 
         client.run();
 
-        // Remove client after disconnect
-        self.clients_mutex.lock(self.io) catch return;
-        for (self.clients.items, 0..) |c, i| {
-            if (c == client) {
-                _ = self.clients.swapRemove(i);
-                break;
-            }
-        }
-        self.clients_mutex.unlock(self.io);
-
-        client.deinit();
+        // Remove client after disconnect, and free it — but do *not* call
+        // `client.deinit()`: `client.stream` is this frame's `conn` (passed by
+        // value), so the `defer conn.close` above is the one that closes the fd.
+        // Closing it twice is not a duplicate-close no-op — once the number is
+        // reusable it closes whatever got the same fd next (the platform's Io
+        // raises `recoverableOsBugDetected` for exactly this in debug builds).
+        // The ownership split is: the frame owns the fd until it returns;
+        // `client.deinit` is for clients the *server* still owns (see
+        // `WebSocketServer.deinit`), where this frame is long gone.
+        self.removeClient(client);
         self.allocator.destroy(client);
     }
 
@@ -249,8 +278,67 @@ pub const WebSocketServer = struct {
         return null;
     }
 
+    /// Register a freshly handshaken client. On failure ownership stays with the
+    /// caller.
+    ///
+    /// Taken uncancelably: `handleConnection` runs on the connection fiber and
+    /// returns `void`, so a `Canceled` from `lock` here has no channel to be
+    /// reported through — and swallowing it would strand the just-allocated
+    /// client (nothing else owns that pointer, and being in `clients` is what
+    /// makes it reachable at all). The critical section is one `append`, which is
+    /// why waiting for it is cheap. Red: `WebSocketServer: cancelation cannot
+    /// strand a client at register`.
+    fn addClient(self: *Self, client: *WebSocketClient) !void {
+        self.clients_mutex.lockUncancelable(self.io);
+        defer self.clients_mutex.unlock(self.io);
+        try self.clients.append(client);
+    }
+
+    /// Drop `client` from the live set. `void`: the only caller is
+    /// `handleConnection` on its way out, which has no error channel.
+    ///
+    /// Uncancelable for the same reason as `addClient`, and with more at stake:
+    /// this is the *only* place an entry ever leaves `clients`. A canceled lock
+    /// would keep a dead client — and its slot — for the life of the server, and
+    /// every later `broadcast` would log a send error into it. One `swapRemove`
+    /// is the whole critical section. Red: `WebSocketServer: cancelation cannot
+    /// strand a client at removal`.
+    fn removeClient(self: *Self, client: *WebSocketClient) void {
+        self.clients_mutex.lockUncancelable(self.io);
+        defer self.clients_mutex.unlock(self.io);
+        for (self.clients.items, 0..) |c, i| {
+            if (c == client) {
+                _ = self.clients.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    /// Send `message` to every connected client.
+    ///
+    /// `void` on purpose: a fan-out to N sockets has no single error a caller
+    /// could act on (per-client send failures are logged as they happen and the
+    /// rest of the fan-out still runs). What `void` *cannot* express is a
+    /// broadcast that never started, so that case is counted
+    /// (`droppedBroadcasts`) and logged — a loud drop rather than an error nobody
+    /// reads or a silent no-op.
+    ///
+    /// The lock stays cancelable here, unlike the registry paths: a cancel means
+    /// the publishing task is being torn down, and waiting uncancelably would
+    /// hold that teardown open for a full fan-out. The loss is recoverable for
+    /// the caller that matters most (`WebSocketMonitor` re-broadcasts every 5s),
+    /// whereas a lost registry entry never comes back on its own.
     pub fn broadcast(self: *Self, message: []const u8) void {
-        self.clients_mutex.lock(self.io) catch return;
+        self.clients_mutex.lock(self.io) catch |err| {
+            // Counted, not just logged: this is the one path that loses a whole
+            // message, and `void` gives the caller nowhere else to look. (`.warn`,
+            // not `.err`: `scripts/test-runner.zig` fails a run over any
+            // err-level log, so an `.err` here would make the drop path
+            // untestable. The counter, not the log line, carries the signal.)
+            _ = self.dropped_broadcasts.fetchAdd(1, .monotonic);
+            std.log.warn("[ws] broadcast of {d} bytes dropped: {s} (it reached no client)", .{ message.len, @errorName(err) });
+            return;
+        };
         defer self.clients_mutex.unlock(self.io);
 
         for (self.clients.items) |client| {
@@ -260,8 +348,23 @@ pub const WebSocketServer = struct {
         }
     }
 
+    /// Broadcasts that never reached a single client. Reads the counter
+    /// `broadcast` bumps on the one path that drops a whole message; per-client
+    /// send failures are not counted here (they are logged, and the other
+    /// clients still get the message).
+    pub fn droppedBroadcasts(self: *const Self) u64 {
+        return self.dropped_broadcasts.load(.monotonic);
+    }
+
+    /// Number of live clients.
+    ///
+    /// Takes the lock (uncancelably) rather than `tryLock`: reporting 0 while
+    /// another fiber held the registry lock is a wrong number no caller can tell
+    /// apart from an empty registry — it is printed as `clients` in the monitor
+    /// payload. Red: `WebSocketServer: clientCount reports the live count, not a
+    /// lock verdict`.
     pub fn clientCount(self: *Self) usize {
-        if (!self.clients_mutex.tryLock()) return 0;
+        self.clients_mutex.lockUncancelable(self.io);
         defer self.clients_mutex.unlock(self.io);
         return self.clients.items.len;
     }
@@ -427,6 +530,13 @@ pub const WebSocketClient = struct {
         var w = self.stream.writer(self.io, &write_buf);
         _ = w.interface.writeAll(header_buf[0..header_len]) catch return error.NotConnected;
         _ = w.interface.writeAll(payload) catch return error.NotConnected;
+        // **The flush is the delivery.** `writeAll` returns as soon as the bytes
+        // are copied into `write_buf` (4096 bytes here) and never touches the
+        // socket; without this, every frame smaller than the buffer is dropped
+        // when `w` goes out of scope — the client receives nothing, no error is
+        // returned, and `broadcast` cannot tell. Red: `WebSocketServer: a live
+        // client is handshaken, pushed to, and dropped` (the push times out).
+        w.interface.flush() catch return error.NotConnected;
     }
 };
 
@@ -491,7 +601,9 @@ pub const WebSocketMonitor = struct {
         const module_count = if (self.modules) |m| m.modules.count() else 0;
 
         var json_buf: [1024]u8 = undefined;
-        const json = try std.fmt.bufPrint(&json_buf, "{{\"type\":\"metrics\",\"module_count\":{d},\"clients\":{d},\"timestamp\":{d}}}", .{ module_count, self.ws_server.clientCount(), 0 });
+        // `dropped_broadcasts` is what makes a lost push visible to whoever
+        // scrapes this payload: it stays 0 unless a broadcast reached nobody.
+        const json = try std.fmt.bufPrint(&json_buf, "{{\"type\":\"metrics\",\"module_count\":{d},\"clients\":{d},\"dropped_broadcasts\":{d},\"timestamp\":{d}}}", .{ module_count, self.ws_server.clientCount(), self.ws_server.droppedBroadcasts(), 0 });
 
         self.ws_server.broadcast(json);
     }
@@ -516,4 +628,262 @@ test "WebSocketMonitor initialization" {
     defer monitor.deinit();
 
     try std.testing.expectEqual(@as(u16, 19002), monitor.ws_server.port);
+}
+
+// ── Registry ownership under cancelation ─────────────────────────────────────
+//
+// `std.Io.Mutex.lock` is a cancelation point, and the client registry has no
+// error channel back to the acceptor: `handleConnection` returns `void`. So "did
+// my client get registered / dropped?" must be decided by the registry, never by
+// the task's cancel state. These tests drive a real cancel into the lock (the
+// technique `runtime/mailbox.zig` uses for the same class of bug) and then read
+// the registry.
+
+/// Bound on the "wait for the other fiber to park" spins, so a missed signal
+/// fails the suite instead of hanging it.
+const wait_for_parked_fiber_rounds = 200_000_000;
+
+/// True once the fiber inside `clients_mutex.lock` has parked: `lock` swaps the
+/// state to `.contended` *before* it futex-waits, and nothing else in these
+/// tests contends for that mutex.
+fn parkedOnClientsLock(server: *WebSocketServer) bool {
+    var spins: usize = 0;
+    while (spins < wait_for_parked_fiber_rounds) : (spins += 1) {
+        if (server.clients_mutex.state.load(.monotonic) == .contended) return true;
+        std.atomic.spinLoopHint();
+    }
+    return false;
+}
+
+/// Teardown for a registry holding *stand-ins*: stack values that never owned a
+/// socket. The entries must go first, because `WebSocketServer.deinit` calls
+/// `WebSocketClient.deinit` on every entry and that closes a stream these values
+/// never had.
+fn deinitWithStandInClients(server: *WebSocketServer, io: std.Io) void {
+    server.clients_mutex.lockUncancelable(io);
+    server.clients.clearRetainingCapacity();
+    server.clients_mutex.unlock(io);
+    server.deinit();
+}
+
+test "WebSocketServer: cancelation cannot strand a client at register" {
+    const io = std.testing.io;
+    var server = WebSocketServer.init(std.testing.allocator, io, 19003);
+    defer deinitWithStandInClients(&server, io);
+
+    var stand_in: WebSocketClient = undefined;
+
+    const Probe = struct {
+        var add_err: ?anyerror = null;
+        fn add(s: *WebSocketServer, c: *WebSocketClient) void {
+            s.addClient(c) catch |err| {
+                add_err = err;
+            };
+        }
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Probe.add_err = null;
+
+    server.clients_mutex.lockUncancelable(io);
+    var add_fut = try io.concurrent(Probe.add, .{ &server, &stand_in });
+    try std.testing.expect(parkedOnClientsLock(&server));
+    var cancel_fut = try io.concurrent(Probe.cancel, .{ io, &add_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+    server.clients_mutex.unlock(io);
+    cancel_fut.await(io);
+    add_fut.await(io);
+
+    // Cancelation is not an ownership answer: the client ends up registered, or
+    // the caller is told it is not (and still owns the pointer).
+    try std.testing.expectEqual(@as(?anyerror, null), Probe.add_err);
+    try std.testing.expectEqual(@as(usize, 1), server.clientCount());
+}
+
+test "WebSocketServer: cancelation cannot strand a client at removal" {
+    const io = std.testing.io;
+    var server = WebSocketServer.init(std.testing.allocator, io, 19004);
+    defer deinitWithStandInClients(&server, io);
+
+    var stand_in: WebSocketClient = undefined;
+    try server.addClient(&stand_in);
+    try std.testing.expectEqual(@as(usize, 1), server.clientCount());
+
+    const Probe = struct {
+        fn remove(s: *WebSocketServer, c: *WebSocketClient) void {
+            s.removeClient(c);
+        }
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+
+    server.clients_mutex.lockUncancelable(io);
+    var remove_fut = try io.concurrent(Probe.remove, .{ &server, &stand_in });
+    try std.testing.expect(parkedOnClientsLock(&server));
+    var cancel_fut = try io.concurrent(Probe.cancel, .{ io, &remove_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+    server.clients_mutex.unlock(io);
+    cancel_fut.await(io);
+    remove_fut.await(io);
+
+    // Nothing else ever drops this entry, so a cancel that skipped the removal
+    // would keep a dead client (and its slot) for the life of the server — and
+    // every later `broadcast` would log a send error into it.
+    try std.testing.expectEqual(@as(usize, 0), server.clientCount());
+}
+
+test "WebSocketServer: clientCount reports the live count, not a lock verdict" {
+    const io = std.testing.io;
+    var server = WebSocketServer.init(std.testing.allocator, io, 19005);
+    defer deinitWithStandInClients(&server, io);
+
+    var stand_in: WebSocketClient = undefined;
+    try server.addClient(&stand_in);
+
+    const Probe = struct {
+        fn count(s: *WebSocketServer) usize {
+            return s.clientCount();
+        }
+    };
+
+    server.clients_mutex.lockUncancelable(io);
+    var count_fut = try io.concurrent(Probe.count, .{&server});
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+    server.clients_mutex.unlock(io);
+    const live = count_fut.await(io);
+
+    // A contended lock is not "no clients": reporting 0 here is a number the
+    // caller cannot tell apart from an empty registry (the monitor prints it as
+    // `clients`).
+    try std.testing.expectEqual(@as(usize, 1), live);
+}
+
+test "WebSocketServer: an abandoned broadcast is counted, not silent" {
+    const io = std.testing.io;
+    var server = WebSocketServer.init(std.testing.allocator, io, 19006);
+    defer deinitWithStandInClients(&server, io);
+
+    const Probe = struct {
+        fn cast(s: *WebSocketServer) void {
+            s.broadcast("metrics");
+        }
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+
+    server.clients_mutex.lockUncancelable(io);
+    var cast_fut = try io.concurrent(Probe.cast, .{&server});
+    try std.testing.expect(parkedOnClientsLock(&server));
+    var cancel_fut = try io.concurrent(Probe.cancel, .{ io, &cast_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+    server.clients_mutex.unlock(io);
+    cancel_fut.await(io);
+    cast_fut.await(io);
+
+    // The message reached nobody, and `broadcast` returns `void` — there is no
+    // channel to report a fan-out that never started. It has to be loud instead.
+    try std.testing.expectEqual(@as(u64, 1), server.droppedBroadcasts());
+}
+
+/// Poll (bounded) then read, until `want` shows up in `out` or the deadline
+/// passes. Returns the bytes read. Same shape as `api/Server.zig`'s `wsProbe`.
+fn readUntilSeen(stream: *std.Io.net.Stream, out: []u8, want: []const u8) usize {
+    var got: usize = 0;
+    var tries: usize = 0;
+    while (tries < 60) : (tries += 1) {
+        if (got == out.len) break;
+        var pfds = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        if ((std.posix.poll(&pfds, 100) catch 0) == 0) continue;
+        const n = std.posix.read(stream.socket.handle, out[got..]) catch break;
+        if (n == 0) break;
+        got += n;
+        if (std.mem.indexOf(u8, out[0..got], want) != null) break;
+    }
+    return got;
+}
+
+/// Bounded wait for the connection fiber to move the registry to `want` (the
+/// handshake answers before the fiber has registered the client).
+fn waitForClientCount(server: *WebSocketServer, want: usize) void {
+    var tries: usize = 0;
+    while (tries < 200) : (tries += 1) {
+        if (server.clientCount() == want) return;
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch |err| {
+            // A short wait only makes this wait shorter than intended; the
+            // assertion after it reports what was actually observed.
+            std.log.debug("[test] waitForClientCount sleep: {s}", .{@errorName(err)});
+        };
+    }
+}
+
+test "WebSocketServer: a live client is handshaken, pushed to, and dropped" {
+    const io = std.testing.io;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = WebSocketServer.init(std.testing.allocator, io, 0);
+    defer server.deinit();
+    try server.start();
+    defer server.stop();
+
+    // Port 0 asks the kernel for a free port. A fixed port here is a shared
+    // resource: `start` binds with `reuse_address`, and on macOS a second process
+    // asking for the same number can be granted it too — the client's connection
+    // then lands in *that* process's accept loop, which is exactly how a fixed
+    // port made this test read 0 bytes while "its" server had already flushed a
+    // 101 into a socket belonging to another run.
+    const port = if (server.server) |*s| s.socket.address.getPort() else 0;
+    try std.testing.expect(port != 0);
+
+    var addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+    var stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    // A minimal RFC 6455 upgrade request, in one write (the server reads the
+    // request head with a single raw-posix `readSome`). The client side has to
+    // flush for the same reason the server does.
+    const handshake = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+    var wbuf: [256]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    _ = w.interface.writeAll(handshake) catch return error.HandshakeWriteFailed;
+    w.interface.flush() catch return error.HandshakeWriteFailed;
+
+    // 1. The server accepts the connection and registers the client — the
+    //    server-side signal that the accept loop is live.
+    waitForClientCount(&server, 1);
+    var resp_buf: [512]u8 = undefined;
+    const resp_len = readUntilSeen(&stream, &resp_buf, "\r\n\r\n");
+    try std.testing.expectEqual(@as(usize, 1), server.clientCount());
+
+    // 2. The handshake answer must actually reach the socket: `writeAll` alone
+    //    only buffers what fits in the writer's 4096-byte buffer, and the whole
+    //    response is ~129 bytes.
+    if (std.mem.indexOf(u8, resp_buf[0..resp_len], "101 Switching Protocols") == null) {
+        return error.HandshakeResponseMissing;
+    }
+
+    // 3. And a broadcast has to reach it — same buffering contract, in
+    //    `WebSocketClient.sendFrame`.
+    server.broadcast("ping");
+    var frame_buf: [64]u8 = undefined;
+    const frame_len = readUntilSeen(&stream, &frame_buf, "ping");
+    if (frame_len < 6) {
+        std.debug.print("[test] broadcast frame was {d} bytes: {any}\n", .{ frame_len, frame_buf[0..frame_len] });
+        return error.BroadcastFrameMissing;
+    }
+    try std.testing.expectEqual(@as(u8, 0x81), frame_buf[0]); // FIN + text
+    try std.testing.expectEqual(@as(u8, 4), frame_buf[1]); // unmasked, 4 bytes
+    try std.testing.expectEqualStrings("ping", frame_buf[2..6]);
+    // A delivered broadcast is not a dropped one.
+    try std.testing.expectEqual(@as(u64, 0), server.droppedBroadcasts());
+
+    // 4. The client hangs up, and the *server* drops the entry — nothing in this
+    //    test removes it by hand.
+    _ = w.interface.writeAll(&[_]u8{ 0x88, 0x00 }) catch return error.CloseWriteFailed;
+    w.interface.flush() catch return error.CloseWriteFailed;
+    waitForClientCount(&server, 0);
+    try std.testing.expectEqual(@as(usize, 0), server.clientCount());
 }

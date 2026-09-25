@@ -2,6 +2,101 @@
 
 ## [Unreleased]
 
+### 第 27 批：WebSocket 的帧死在缓冲里（缺 flush）与 fd 被关两次、`IntegrationTest` 的悬垂（地址级红证据）、同名重复 `create*` 泄漏、`parseEvent` 把 OOM 判成"帧格式错"、集群恢复补上对称回调（**破坏性：否**，但错误集与回调语义有变化）
+
+全量 `-Ddb=all` **1948/2006（58 skipped，0 failed）**；CI 示例清单本机 16/16。
+
+**WebSocket：三处吞错 + 三个顺带查出的真缺陷（其中两个是"线上什么都到不了"级别）。**
+① `addClient`/`removeClient` 的 `lock catch return`：注册时是**刚分配好的客户端对象泄漏**（`handleConnection` 返回 `void`，
+那条 `errdefer destroy` 永远不会触发）、移除时是**注册表条目永久残留**（这是条目唯一的出口）**并且跳过紧随其后的
+`deinit()`/`destroy`**。红证据：`cancelation cannot strand a client at register...expected null, found error.Canceled`、
+`...at removal...expected 0, found 1`。改 `lockUncancelable`（临界区就是一次 `append`/`swapRemove`）。
+② `broadcast` 的静默丢弃**保留可取消**（取消意味着调用方正在被拆掉，而扇出是对 N 个 socket，等下去会把拆除顶住；
+丢的东西 5 秒后会被重播，不像注册表条目）——但**变成响亮**：`dropped_broadcasts` 计数 + warn + `droppedBroadcasts()` +
+进 monitor payload。红证据 `an abandoned broadcast is counted, not silent...expected 1, found 0`。
+③ **缺 flush —— "消息到不了任何客户端"的字面意义**：`sendFrame` 与 400/403/101 响应调 `writeAll` **都没有 flush**，
+而 `writeAll` 只把字节拷进缓冲就返回（`Io/Writer.zig:608`），所以**每一个小于 4096 字节的帧都死在缓冲里**：
+没有错误、线上一片空白。同仓的 writer 都 flush（`im/WsFramer.zig:146`）。**无独立红证据**（当时每一次失败都同时被
+下面的读挂起掩盖了），依据是代码级 + 修好后真实 socket 用例把 101 与帧都收到了。
+④ **同一个 fd 被关两次**：`handleConnection` 的 `defer conn.close(io)` 与 `client.deinit()`（关闭 `client.stream`，
+即同一个 `conn` 的副本）各关一次 —— 平台的 Io 会报 `recoverableOsBugDetected`（debug 下 panic，生产里是**跨连接误杀**）。
+红证据干净且隔离：`panic: reached unreachable code → std/Io/Threaded.zig recoverableOsBugDetected ← closeFd (BADF,
+use after free) ← Io/net.zig close ← WebSocket.zig handleConnection 的 defer`。
+⑤ **握手请求的读取用错了 io 路径**：`conn.reader(...).interface.readSliceShort` 在请求**已经在内核缓冲里**的情况下
+挂了约 8 秒（`core/sockread.zig` 记录的正是这个多线程 Io 的坑），改用同一个 `sockread.readSome`。
+⑥ `clientCount` 的 `tryLock` 在争用时返回 **0** —— 一个和"没有客户端"无法区分的错数（还会被打印进 monitor），
+改不可取消的等待。
+> 这个文件此前**没有任何 socket 测试**（只有两个 `init` 测试），这批补了真 loopback 的握手/推送/断开用例
+> （101 送达、`clients=1`、读回 `0x81 0x04 "ping"`、收到 close 帧后 `clientCount()==0`），本机 6/6 全部真跑、0 skip。
+
+**`IntegrationTest` 的悬垂指针（地址级红证据）。** `InstrumentationContext.init` 在**栈局部**建 `metrics`/`tracer`、
+把 `&metrics`/`&tracer` 交给 `AutoInstrumentation.init`（它**保存**这两个指针），然后把它们**按值**装进返回结构 ——
+于是 `auto_instrumentation.metrics` 指向一个**已经失效的栈帧**，而 harness 手里那份副本与死副本**共享同一批堆容器**。
+红证据是地址级断言（放在任何写操作**之前**，所以不会写穿）：`expect(inst.auto_instrumentation.metrics == &inst.metrics)`
+失败。**tracer 同病，一并修掉。** 修法是"消除副本 + 文档化不可拷贝"（原地构造 `init(self, allocator) !void`、
+harness 改为堆分配并持指针、两个类型都标 **Not copyable**）。**没有**选择"做成可安全拷贝"：那要把 6 个容器挪到
+稳定分配并为 `deinit` 定义共享所有权（引用计数），会改到 `Profiles`/`MetricsBridge`/`OutboxConsumer` 全部调用点的
+生命周期模型，而全仓唯一的按值拷贝点就是这个 harness。
+
+**同名重复 `create*` 现在被拒绝（`error.DuplicateName`），不再泄漏。** `StringHashMap.put` 保留旧 key、覆盖 value ⇒
+第一个对象从 registry 不可达、`deinit` 也不再释放它（泄漏），**已发出的旧句柄成为孤儿**（调用方还在写一个已被替换的
+对象）。红证据：`1 leaked` + 3 条泄漏栈（5B name、9B help、80B Counter）全部溯源到 `createCounter`。语义选择是**拒绝**
+而不是"返回已有对象"（会静默丢掉调用方给的 help，histogram 的桶布局不同更是"拿到错对象"）也不是"替换 + 声明旧句柄
+失效"（那正是上面刚修的悬垂类）。检查在任何分配之前，`error.Frozen` 的先手顺序未动。
+
+**删除三个"声明了就没人读"的字段（外加两处同形）。** `Summary` 的 `quantiles`/`max_age_seconds`/`age_buckets`
+零读点（`observe` 只追加、`getQuantile` 只读，都不看时钟）；顺带 `Counter.labels`、`Gauge.labels` 与
+`CounterFamily.overflow.labels` 也只 init+deinit、从不填读 —— **接受标签对却忽略 = 假承诺**。文档已核对：`API.md`
+只列方法签名、`OBSERVABILITY.md` 无 summary 配置项，**没有契约承诺**，删除不破坏期望（也无法实现：scrape 根本不
+渲染 summary，且钉子测试禁止在并发安全化之前加渲染）。保留 `Summary.name`/`help`（creator 的入参，非行为承诺）。
+> 新记录的近邻：`createCounter("x")` + `createGauge("x")`（或 histogram 生成的 `x_bucket`/`x_sum`/`x_count` 撞名）
+> 仍会渲染出被 Prometheus 拒绝的 exposition。只挡"同名"是**不完整的保证**（挡得住 `x`+`x`、挡不住 `x`+`x_count`），
+> 所以把现状与理由写进 `toPrometheusFormat` 的文档，留决定权（既存用例 `issued metric handles survive registry
+> growth` 正是"按种类分容器"的语义示范）。
+
+**`RateLimiter`：分配失败被报成"被限流"。** `SlidingWindowRateLimiter.tryAcquire` 的
+`requests.append(...) catch return false` —— 热路径上的 OOM 告诉调用方**你被限流了**（自我施加的 DoS）。红证据：
+`a failed allocation is not a throttle verdict...FAIL (TestUnexpectedResult)`。修法是**让这个分配不存在**：
+`init` 里 `ensureTotalCapacity(max_requests)`（那里本来就有错误通道），`tryAcquire` 用 `appendAssumeCapacity` ——
+热路径不再分配，也就没有可误报的失败。调用方零改动（该类型未从 `root.zig` 再导出）。
+
+**`DistributedEventBus.parseEvent`：两个缺陷，两个独立的红证据。** 三个 `dupe catch return null` 同时（a）**漏掉
+已拷好的字段**（struct literal 从左到右求值，第 2/3 个失败时前一个没人释放）与（b）把 **`OutOfMemory` 折成 DLQ 的
+"帧格式错"判决** —— 运维看到的是"对端说的不是这个线格式"，而真相是本机内存不足。红证据（分开的）：
+`expected 3426, found 3417` + `leaked [len: 5]`/`[len: 4]`；`expected .out_of_memory, found .not_an_event`。
+改为 `error{OutOfMemory}!?NetworkEvent`（**`null` 的含义一个字没动**），调用方**跳过该帧并 warn**：帧是**完整读进来**
+的，所以流仍然同步；不记 DLQ（那是解析判决）、不断连接（那是对对端的判决，而这是本机内存压力）。
+> **邻居**：`acceptSeq` 把"记不住这次声明"折成 `false` = **重放判决**，与调用方的 `catch return false` 一起把
+> 本地分配失败说成"对端在重放"。现在 `acceptSeq` 返回错误、`admitInbound` 返回三值
+> `Admission{dispatch, drop, unreadable}` —— OOM 仍然 **fail-closed**（丢掉该帧；放行一个未验证的帧会重开重放窗口）
+> 但报成 `.unreadable`，绝不报成重放。红证据（临时手工回退到旧形状取得）：
+> `a claim that cannot be remembered is reported, not read as a replay...FAIL`。
+
+**集群：恢复时补上对称的 `on_node_join_cb`（行为变化）。** `checkNodeHealth` 在标记 `.failed` 时发
+`on_node_leave_cb`，而恢复路径只翻状态、**不发** `on_node_join_cb`（文件头原写明是故意的）。重新判断后改为**发**：
+"让应用自己轮询"等于让每个消费者各自重新推导健康状态，而这正是本文件已经栽过一次的那类"census 与消费者分歧"
+（`checkNodeHealth` 断开而恢复路径不重拨，同批修的就是它）。现在契约是：**一次 `leave` 对应一次 `join`**，
+`join` 的语义是"这是一个你应当持有状态的成员"（**upsert，不是"首次见到"**）；`.suspect` → `.healthy`
+**两个方向都不发**（没有 `leave` 被宣告过，无端的 `join` 会让消费者建出没人拆的状态）。用例钉住完整序列
+`join, leave, join, leave, join`，并断言恢复的 `join` 带的是 census 里的地址而不是 payload 派生的地址。
+
+**文档同步（不改变行为）。** `docs/API.md` 的六个 creator 签名更新为 `(FrozenError || …)` 形态并把 `error.Frozen`
+只解释一次（"冻结后不再有写者，所以抓取无锁"）、新增 `freeze()`/`isFrozen()`；`docs/OBSERVABILITY.md` 的例子补上
+"注册必须发生在第一次抓取之前"；**`docs/API.md` 里 `EventBus(T)` 那一节其实写的是 `TypedEventBus` 的方法**
+（真实的无类型 `EventBus(T)` 是 `subscribe(event_type, callback)`/`publish(event_type, payload)`/
+`subscriberCount(event_type)`）—— 这一节改成描述无类型总线，紧接着的 `TypedEventBus(T)` 那节拿到类型化方法表与
+例子。另记录：`docs/API.md` 里的 `zigmodu.core.<Symbol>` 路径风格**全仓都不对**（`root.zig` 是扁平导出、
+没有 `src/core.zig` 也没有 `pub const core`），本批只在新增文字里避开它，没有半改两处。
+
+> **顺带发现、未修（已列）**：`WebSocketServer.sendFrame` 把所有写失败报成 `error.NotConnected` 且不置
+> `is_connected = false`；`sendFrame` 之后 `broadcast` 持 `clients_mutex` 跨所有 socket 写，慢对端会卡住整个注册表；
+> `WebSocketServer.deinit` 的 `tryLock` 分支暗示了它给不了的保证（两个分支都 free 同一个 list）；
+> `DistributedEventBus.handleGossipEvent` 里 `nodes.put` 失败是**静默**返回（上一行的 `dupe` 却会 warn）——
+> 本机 2 条目 map 有富余容量，无法确定性触发，所以只有一行修复的价值、没有红证据；
+> `ClusterMembership` 的 `on_leader_change_cb` 在 leader 未变时也会触发（幂等但多余）；
+> `handleConnection` 新的 OOM 分支**没有端到端用例**（只有分类契约层的断言）；
+> `PrometheusMetrics` 跨种类重名、`deinit` 与在飞抓取并发、`scrape_hook`/`scrape_userdata` 撕裂仍是文档级。
+
 ### 第 26 批：`SecurityModule` 的 base64 编码在失败时漏缓冲（**CI 漏掉、本机抓到**）、metrics 注册在首次抓取后被"封条"、`getQuantile` 的既有崩溃、记忆 dump 的字节数组能读回来了（**破坏性：否**，一处行为变更）
 
 全量 `-Ddb=all` **1935/1993（58 skipped，0 failed）**；CI 示例清单本机 16/16。

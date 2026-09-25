@@ -1329,7 +1329,25 @@ pub const DistributedEventBus = struct {
             const data = openEventFrame(sender_key, body.items) orelse break;
 
             // Parse using our arena to avoid multiple tiny heap allocations
-            if (parseEvent(ma, data)) |event| {
+            const maybe_event = parseEvent(ma, data) catch |err| switch (err) {
+                // The frame was never judged: this node could not make the
+                // copies its fields need. That is not a verdict about the
+                // peer's bytes — the DLQ entry below says "these are not an
+                // event" — and not a reason to drop the connection either: the
+                // frame was read in full, so the stream is still in sync and
+                // the next frame is read normally. One event is lost, and the
+                // log is the only place left that can say why.
+                error.OutOfMemory => {
+                    // `warn`, not `err`: this is recoverable and local — one
+                    // event is lost, the connection and the stream stay healthy
+                    // — and the tests that induce it have to be able to watch
+                    // the frame be dropped rather than the log be fatal.
+                    std.log.warn("[DEB] dropping a {d}-byte frame unread: cannot copy its fields", .{data.len});
+                    _ = msg_arena.reset(.retain_capacity);
+                    continue;
+                },
+            };
+            if (maybe_event) |event| {
                 // The claim in the json is checked against what the handshake
                 // proved, and a mismatch is not a dropped event but a dropped
                 // connection: a peer that has proven it is `node-a` and then
@@ -1345,16 +1363,23 @@ pub const DistributedEventBus = struct {
                     }
                 }
 
-                if (!self.admitInbound(event, binding != null)) {
-                    _ = msg_arena.reset(.retain_capacity);
-                    continue;
+                switch (self.admitInbound(event, binding != null)) {
+                    .dispatch => {
+                        // Topic callback lookup is fast with StringHashMap
+                        self.publishToTopic(event);
+
+                        // Local bus dispatch
+                        self.local_bus.publish(event);
+                    },
+                    // A heartbeat (liveness only) or a sequence that is not
+                    // ahead of the last accepted one: a verdict about the
+                    // frame, logged by the gate that decided it.
+                    .drop => {},
+                    // Not a verdict at all — a gate could not be evaluated, so
+                    // nothing about the frame is recorded in either direction,
+                    // and the gate has already logged the real cause.
+                    .unreadable => {},
                 }
-
-                // Topic callback lookup is fast with StringHashMap
-                self.publishToTopic(event);
-
-                // Local bus dispatch
-                self.local_bus.publish(event);
             } else if (self.dlq) |_| {
                 // Deserialization failed — push to DLQ for later inspection
                 self.pushParseFailureToDlq(data);
@@ -1365,25 +1390,57 @@ pub const DistributedEventBus = struct {
         }
     }
 
+    /// What the two receive gates decided about one frame.
+    const Admission = enum {
+        /// Passed both gates: dispatch it.
+        dispatch,
+        /// A verdict about the frame itself — a sequence that is not ahead of
+        /// the last accepted one, or a heartbeat, which is liveness only. The
+        /// gate that decided has logged it.
+        drop,
+        /// The gates could not be evaluated: this node could not write its own
+        /// bookkeeping for the claim. Nothing about the frame or the peer was
+        /// decided, so nothing about them is reported; the frame is still
+        /// dropped (admitting it unverified would reopen the replay window) on
+        /// the real cause, which the gate has logged.
+        unreadable,
+    };
+
     /// The two gates after authentication: the replay sequence, then the
-    /// heartbeat short-circuit. Both `continue` in `handleConnection`, so this
-    /// returns true only for a frame that gets dispatched. `authenticated` is
-    /// whether this connection was bound to a peer; only that path carries a
-    /// sequence, and a bare frame has nothing to compare.
-    fn admitInbound(self: *Self, event: NetworkEvent, authenticated: bool) bool {
+    /// heartbeat short-circuit. Only `.dispatch` goes on to be delivered: the
+    /// other two answers both mean "this frame is not delivered", but they are
+    /// different facts — one is about the frame, the other about this node's
+    /// ability to read its own state. `authenticated` is whether this
+    /// connection was bound to a peer; only that path carries a sequence, and a
+    /// bare frame has nothing to compare.
+    fn admitInbound(self: *Self, event: NetworkEvent, authenticated: bool) Admission {
         // Only the authenticated path carries a sequence (it is part of the MAC'd
         // region); a bare frame has nothing to compare.
-        if (authenticated and !self.acceptSeq(event.source_node, event.seq)) {
-            std.log.debug(
-                "[DEB] dropping frame from '{s}' with seq {d}: not ahead of the last accepted one",
-                .{ event.source_node, event.seq },
-            );
-            return false;
+        if (authenticated) {
+            const fresh = self.acceptSeq(event.source_node, event.seq) catch |err| {
+                // `warn`, not `err`, for the same reason as the frame-copy
+                // failure above: it is a local, recoverable condition (this
+                // frame is dropped, the next one is read normally) and the test
+                // that induces it has to see the gate answer rather than fail.
+                std.log.warn(
+                    "[DEB] dropping a frame from '{s}' unread: cannot track its sequence ({})",
+                    .{ event.source_node, err },
+                );
+                return .unreadable;
+            };
+            if (!fresh) {
+                std.log.debug(
+                    "[DEB] dropping frame from '{s}' with seq {d}: not ahead of the last accepted one",
+                    .{ event.source_node, event.seq },
+                );
+                return .drop;
+            }
         }
         // A frame from a claim we accept still advances that claim's high-water
         // mark above, so a heartbeat counts as being alive; it is just not
         // dispatched.
-        return !std.mem.eql(u8, event.topic, "__heartbeat");
+        if (std.mem.eql(u8, event.topic, "__heartbeat")) return .drop;
+        return .dispatch;
     }
 
     /// Strictly-increasing per-claim sequence check — the replay defence for the
@@ -1399,18 +1456,28 @@ pub const DistributedEventBus = struct {
     /// Anything reaching this function has already had its MAC verified against
     /// the key for `claim`, so the table cannot be grown by an unauthenticated
     /// peer no matter how many connections it opens.
-    fn acceptSeq(self: *Self, claim: []const u8, seq: u64) bool {
-        self.seq_lock.lock(self.io) catch return false;
+    ///
+    /// `false` is a verdict about the frame: its sequence is not ahead of the
+    /// one accepted for this claim. `error.OutOfMemory` / `error.Canceled` are
+    /// not — the table could not be written, so the frame's freshness is
+    /// *unknown*, and the caller must fail closed (drop it) while reporting the
+    /// real cause. Answering `false` for those would blame the peer for this
+    /// node's memory pressure in the log, and would look like a replay in it.
+    fn acceptSeq(self: *Self, claim: []const u8, seq: u64) error{ Canceled, OutOfMemory }!bool {
+        self.seq_lock.lock(self.io) catch return error.Canceled;
         defer self.seq_lock.unlock(self.io);
 
-        const gop = self.peer_seqs.getOrPut(claim) catch return false;
+        const gop = self.peer_seqs.getOrPut(claim) catch return error.OutOfMemory;
         if (gop.found_existing) {
             if (seq <= gop.value_ptr.*) return false;
         } else {
-            // The table owns its keys; `claim` lives in the caller's arena.
+            // The table owns its keys; `claim` lives in the caller's arena. The
+            // slot `getOrPut` just made holds that borrowed pointer, so it has
+            // to go back out if the copy fails — the table must never keep a
+            // key it does not own.
             gop.key_ptr.* = self.allocator.dupe(u8, claim) catch {
                 _ = self.peer_seqs.remove(claim);
-                return false;
+                return error.OutOfMemory;
             };
         }
         gop.value_ptr.* = seq;
@@ -1473,7 +1540,15 @@ pub const DistributedEventBus = struct {
 
     /// Parse one event out of `data`, copying its fields into `allocator` (on the
     /// connection path: the per-message arena). Null means "not an event", which
-    /// the caller records in the DLQ.
+    /// the caller records in the DLQ; `error.OutOfMemory` means the frame was
+    /// **never judged** — this node could not allocate the copies — and the
+    /// caller (which has no event to free) must report that instead of turning
+    /// it into a verdict about the peer's bytes.
+    ///
+    /// The two channels are separate for a reason. This used to answer `null`
+    /// for both, so a failed second or third `dupe` dropped the frame into the
+    /// DLQ as malformed *and* leaked the copies already made, and the DLQ is
+    /// where an operator looks for a peer speaking the wrong wire format.
     ///
     /// This replaced a substring matcher (`extractJsonValue`) that looked for the
     /// literal `"topic"` / `"payload"` / `"source"` anywhere in the bytes, so
@@ -1486,18 +1561,31 @@ pub const DistributedEventBus = struct {
     /// Cost per message: one `std.json` tree, allocated from `allocator` and
     /// released again before this returns (`Parsed.deinit`), so on the connection
     /// path it is the arena that already existed — capacity, not growth.
-    fn parseEvent(allocator: std.mem.Allocator, data: []const u8) ?NetworkEvent {
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch return null;
+    fn parseEvent(allocator: std.mem.Allocator, data: []const u8) error{OutOfMemory}!?NetworkEvent {
+        // The json tree keeps its own `OutOfMemory` apart from its syntax
+        // errors: only the first is "not judged", the rest are the DLQ's.
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
         defer parsed.deinit();
 
         const topic = jsonStringField(parsed.value, "topic") orelse return null;
         const payload = jsonStringField(parsed.value, "payload") orelse return null;
         const source = jsonStringField(parsed.value, "source") orelse return null;
 
+        // One copy at a time, each released again if a later one fails: the
+        // failure path returns no event, so nothing else can release these.
+        const topic_copy = allocator.dupe(u8, topic) catch return error.OutOfMemory;
+        errdefer allocator.free(topic_copy);
+        const payload_copy = allocator.dupe(u8, payload) catch return error.OutOfMemory;
+        errdefer allocator.free(payload_copy);
+        const source_copy = allocator.dupe(u8, source) catch return error.OutOfMemory;
+
         return NetworkEvent{
-            .topic = allocator.dupe(u8, topic) catch return null,
-            .payload = allocator.dupe(u8, payload) catch return null,
-            .source_node = allocator.dupe(u8, source) catch return null,
+            .topic = topic_copy,
+            .payload = payload_copy,
+            .source_node = source_copy,
             .timestamp = jsonTimestamp(parsed.value),
             .seq = jsonSeq(parsed.value),
         };
@@ -2431,7 +2519,7 @@ test "DistributedEventBus parseEvent" {
     const allocator = std.testing.allocator;
     const data = "{\"topic\":\"test\",\"payload\":\"hello\",\"source\":\"node1\",\"time\":456}";
 
-    const event = DistributedEventBus.parseEvent(allocator, data) orelse {
+    const event = (try DistributedEventBus.parseEvent(allocator, data)) orelse {
         return error.ParseFailed;
     };
     defer allocator.free(event.topic);
@@ -2442,6 +2530,76 @@ test "DistributedEventBus parseEvent" {
     try std.testing.expectEqualStrings("hello", event.payload);
     try std.testing.expectEqualStrings("node1", event.source_node);
     try std.testing.expectEqual(@as(i64, 456), event.timestamp);
+}
+
+// `parseEvent` makes three copies into the caller's allocator — one `dupe` per
+// field — after the json tree has been built and released inside the call, and
+// its caller reads `null` as "not an event": the verdict that puts the frame in
+// the DLQ. An allocation failure in the second or third copy used to `return
+// null` as well, so the copies already made belonged to nobody **and** a local
+// memory failure travelled to the DLQ as a judgement about the peer's data.
+// Those are two separate reds, so they are pinned separately.
+const EventVerdict = enum { event, not_an_event, out_of_memory };
+
+/// What `handleConnection` reads out of `parseEvent`, made explicit: dispatch
+/// it, push it to the DLQ as a parse failure, or report that the frame was never
+/// judged at all (the answer a `?NetworkEvent` return cannot carry).
+fn classifyEvent(allocator: std.mem.Allocator, data: []const u8) EventVerdict {
+    const maybe_event = DistributedEventBus.parseEvent(allocator, data) catch |err| switch (err) {
+        error.OutOfMemory => return .out_of_memory,
+    };
+    return if (maybe_event) |_| .event else .not_an_event;
+}
+
+// Red on the old shape: the failed copy returned null while the two copies
+// before it stayed allocated — `expected 3426, found 3417` on the byte
+// accounting, plus two leaked buffers (5 bytes = "hello", 4 = "test") from the
+// harness.
+test "DistributedEventBus parseEvent releases the fields copied before a failed copy" {
+    const allocator = std.testing.allocator;
+    const data = "{\"topic\":\"test\",\"payload\":\"hello\",\"source\":\"node1\",\"time\":456}";
+
+    // The failing index is counted rather than written down, so it stays the
+    // *last* field copy — two copies already made — if the json tree's own
+    // allocation count ever changes.
+    var counting = std.testing.FailingAllocator.init(allocator, .{});
+    const ok = (try DistributedEventBus.parseEvent(counting.allocator(), data)) orelse return error.TestUnexpectedResult;
+    counting.allocator().free(ok.topic);
+    counting.allocator().free(ok.payload);
+    counting.allocator().free(ok.source_node);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = counting.alloc_index - 1 });
+    // The failure is reported, so there is no event for the caller to release:
+    // releasing the partial copies is the failing call's own job.
+    _ = DistributedEventBus.parseEvent(failing.allocator(), data) catch null;
+    try std.testing.expect(failing.has_induced_failure);
+
+    // Every byte the failed call took was given back. The harness would report
+    // this leak too; this is the local, immediate reading.
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+// Red on the old shape: `expected out_of_memory, found not_an_event` — the
+// induced allocation failure came back as the DLQ verdict.
+test "DistributedEventBus parseEvent reports an allocation failure as an error, not as a verdict" {
+    const allocator = std.testing.allocator;
+    const data = "{\"topic\":\"test\",\"payload\":\"hello\",\"source\":\"node1\",\"time\":456}";
+
+    var counting = std.testing.FailingAllocator.init(allocator, .{});
+    const ok = (try DistributedEventBus.parseEvent(counting.allocator(), data)) orelse return error.TestUnexpectedResult;
+    counting.allocator().free(ok.topic);
+    counting.allocator().free(ok.payload);
+    counting.allocator().free(ok.source_node);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = counting.alloc_index - 1 });
+    const verdict = classifyEvent(failing.allocator(), data);
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(EventVerdict.out_of_memory, verdict);
+
+    // And the verdict the DLQ *is* for still comes back: bytes that are not an
+    // event are not an event, whatever the allocator is doing.
+    failing.fail_index = std.math.maxInt(usize);
+    try std.testing.expectEqual(EventVerdict.not_an_event, classifyEvent(failing.allocator(), "not json at all"));
 }
 
 test "DistributedEventBus with WAL persistence" {
@@ -3109,7 +3267,7 @@ test "a signed frame round-trips: publish → wire → subscriber" {
     var peer_keyed: [auth_mac_bytes]u8 = undefined;
     std.crypto.auth.hmac.sha2.HmacSha256.create(&peer_keyed, json, &receiver_key);
     try std.testing.expect(!std.mem.eql(u8, &peer_keyed, body[0..auth_mac_bytes]));
-    const parsed = DistributedEventBus.parseEvent(allocator, json) orelse return error.TestUnexpectedResult;
+    const parsed = (try DistributedEventBus.parseEvent(allocator, json)) orelse return error.TestUnexpectedResult;
     defer allocator.free(parsed.topic);
     defer allocator.free(parsed.payload);
     defer allocator.free(parsed.source_node);
@@ -3241,7 +3399,7 @@ test "without a secret the frame is length-prefixed with no MAC, and accepted" {
     // The whole body is the json: no MAC bytes anywhere in the frame. Length is
     // the check — re-rendering the parsed event has to come back the same size,
     // which only holds when the frame added nothing to the json.
-    const parsed = DistributedEventBus.parseEvent(allocator, body) orelse return error.TestUnexpectedResult;
+    const parsed = (try DistributedEventBus.parseEvent(allocator, body)) orelse return error.TestUnexpectedResult;
     defer allocator.free(parsed.topic);
     defer allocator.free(parsed.payload);
     defer allocator.free(parsed.source_node);
@@ -3282,7 +3440,7 @@ test "a payload containing quoted field names cannot steer the parse" {
     const json =
         "{\"topic\":\"quoted.topic\",\"payload\":\"say \\\"topic\\\" from \\\"source\\\"\",\"source\":\"node-a\",\"time\":9}";
 
-    const event = DistributedEventBus.parseEvent(allocator, json) orelse return error.TestUnexpectedResult;
+    const event = (try DistributedEventBus.parseEvent(allocator, json)) orelse return error.TestUnexpectedResult;
     defer allocator.free(event.topic);
     defer allocator.free(event.payload);
     defer allocator.free(event.source_node);
@@ -3728,6 +3886,45 @@ test "a replayed frame is dropped even on a fresh connection" {
     }, &newer_buf);
     feedAuthed(&bus, "node-r", peer_key, peer_key, &.{newer});
     try std.testing.expectEqual(@as(usize, 2), received);
+}
+
+// `acceptSeq` answers two different questions with one `bool`: "is this frame
+// ahead of the last accepted one" and "could this node write down its own
+// bookkeeping". Only the first is a verdict about the frame. Failing to remember
+// a claim used to come back as `false`, which the gate logs as a *replay*: the
+// frame is dropped either way (not knowing whether it is fresh means failing
+// closed is right), but the reason an operator is shown was the peer's fault
+// rather than this node's memory.
+//
+// Red on the old shape: `expect(accepted)` saw `false` for a claim the table had
+// never seen.
+test "a claim that cannot be remembered is reported, not read as a replay" {
+    const allocator = std.testing.allocator;
+
+    var bus = try DistributedEventBus.init(allocator, std.testing.io, "seq-oom");
+    defer bus.deinit();
+
+    // `peer_seqs` is empty, so the first `getOrPut` has to allocate: failing
+    // index 0 is exactly "this node cannot remember the claim".
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    bus.allocator = failing.allocator();
+
+    const admission = bus.admitInbound(.{
+        .topic = "seq.topic",
+        .payload = "p",
+        .source_node = "node-a",
+        .timestamp = 0,
+        .seq = 1,
+    }, true);
+    const induced = failing.has_induced_failure;
+    // Disarm before the assertions and `deinit`, so a later allocation cannot
+    // add a second, confusing failure to the report.
+    failing.fail_index = std.math.maxInt(usize);
+    try std.testing.expect(induced);
+
+    // Fail closed — an unverified frame is never delivered — but on the truth:
+    // `.unreadable`, not `.drop` (which is the replay verdict).
+    try std.testing.expectEqual(DistributedEventBus.Admission.unreadable, admission);
 }
 
 test "two writers on one socket produce only whole frames" {
@@ -4371,7 +4568,9 @@ fn fuzzWireInput(_: void, smith: *std.testing.Smith) !void {
     }
 
     // The JSON body itself.
-    _ = DistributedEventBus.parseEvent(a, &bytes);
+    // An allocation failure here is the harness's, not a finding about the
+    // bytes, so it is reported rather than folded into the body's answer.
+    _ = try DistributedEventBus.parseEvent(a, &bytes);
 }
 
 test "fuzz: frame open, handshake shapes and event json only error or succeed" {

@@ -27,6 +27,25 @@ const Time = @import("../core/Time.zig");
 /// registry states it: the first scrape (or an explicit `freeze()`) seals the
 /// containers, and a later `create*` returns `error.Frozen` without touching
 /// them. Same contract and error as `zmodu.FrozenStringMap` / `Container.freeze`.
+///
+/// # Ownership: one owner, one address, never copied by value
+///
+/// The registry holds its containers **by value** and hands their addresses
+/// out: `create*` returns `*Counter`/`*Gauge`/`*Histogram`/`*Summary`, the
+/// per-kind maps hold those same pointers, `toBackend` and
+/// `registerMetricsRoutePath` store `self`, and `AutoInstrumentation` /
+/// `ModuleMetricsCollector` / `Runtime.MetricsBridge` keep the
+/// `*PrometheusMetrics` they were handed. So the struct has to live at **one
+/// address for its whole life**: initialize it in its final location
+/// (`var m = PrometheusMetrics.init(...)`, or `ptr.* = …` when a container
+/// owns the storage) and never copy the struct by value into another owner.
+/// A copy is not a second registry: it shares the heap containers with the
+/// original (so the second `deinit` double-frees them) while every pointer
+/// already handed out still refers to the original — which is what the
+/// `InstrumentationContext.init` in `src/test/IntegrationTest.zig` used to do,
+/// leaving `AutoInstrumentation.metrics` aimed at a dead stack frame.
+/// `Profiles.ProductionProfileState` keeps a registry by value and depends on
+/// the same rule: it must not be moved after `productionProfile` has wired it.
 pub const PrometheusMetrics = struct {
     const Self = @This();
 
@@ -35,6 +54,20 @@ pub const PrometheusMetrics = struct {
     /// and the caller either drops it or moves it earlier, before the first
     /// scrape.
     pub const FrozenError = error{Frozen};
+
+    /// Raised by `create*` when `name` is already registered **for that kind** —
+    /// the plain collector or the labeled family that renders that name (a
+    /// `Counter` and a `CounterFamily` both render `name`, so they are one
+    /// kind). The registry is unchanged: the object registered first is still
+    /// the one `get*` and the scrape reach, and it is still the one the caller
+    /// holds — no second object was allocated and no handle was orphaned.
+    /// (The kinds keep separate containers, so `createCounter("x")` followed by
+    /// `createGauge("x")` still succeeds; see the note on `toPrometheusFormat`
+    /// about what that pair does to the exposition.)
+    pub const DuplicateError = error{DuplicateName};
+
+    /// The full failure set of every `create*`.
+    pub const CreateError = FrozenError || DuplicateError || std.mem.Allocator.Error;
 
     allocator: std.mem.Allocator,
     scrape_hook: ?ScrapeHook,
@@ -55,11 +88,18 @@ pub const PrometheusMetrics = struct {
     histograms: std.StringHashMap(*Histogram),
     summaries: std.StringHashMap(*Summary),
 
+    /// A single unlabeled counter: `name`, `help` and one atomic value, nothing
+    /// else — as is `Gauge` below. Per-metric static labels have nowhere to
+    /// appear here (the plain collectors render `name` with no label set), so
+    /// the `labels: StringHashMap` both of them used to carry — allocated in
+    /// `create*`, freed in `deinit`, never filled and never read — was deleted:
+    /// a public field that accepts label pairs a renderer silently ignores. A
+    /// metric that needs labels is a `CounterFamily` / `HistogramFamily` with
+    /// its one bounded label.
     pub const Counter = struct {
         name: []const u8,
         help: []const u8,
         value: std.atomic.Value(u64),
-        labels: std.StringHashMap([]const u8),
 
         pub fn inc(self: *Counter) void {
             _ = self.value.fetchAdd(1, .monotonic);
@@ -79,7 +119,6 @@ pub const PrometheusMetrics = struct {
         help: []const u8,
         /// Thread-safe f64 stored as atomic u64 via bit-cast (same as Java's AtomicDouble).
         raw_value: std.atomic.Value(u64) = std.atomic.Value(u64).init(@bitCast(@as(f64, 0.0))),
-        labels: std.StringHashMap([]const u8),
 
         pub fn set(self: *Gauge, value: f64) void {
             self.raw_value.store(@bitCast(value), .monotonic);
@@ -171,7 +210,6 @@ pub const PrometheusMetrics = struct {
     pub const Summary = struct {
         name: []const u8,
         help: []const u8,
-        quantiles: std.array_list.Managed(f64),
         /// Not thread-safe: see the note on `Summary`. `observe` writes it
         /// unlocked, `getQuantile` reads it unlocked.
         values: std.array_list.Managed(f64),
@@ -179,10 +217,21 @@ pub const PrometheusMetrics = struct {
         sum_bits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
         /// Thread-safe observation count (used for reservoir sampling index).
         count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-        max_age_seconds: u64 = 600,
-        age_buckets: usize = 5,
         /// Hard cap on stored samples to prevent unbounded memory growth.
         /// Once reached, new values replace random existing samples (reservoir sampling).
+        ///
+        /// This is the summary's **only** configuration knob, and it is the only
+        /// one there ever was an implementation for: the quantile you get is an
+        /// argument to `getQuantile`, not a declared property, and the reservoir
+        /// is capped by count rather than by age. The three fields that used to
+        /// sit next to it were deleted rather than left as knobs claiming a
+        /// behaviour nobody implemented: `quantiles` (a list `createSummary`
+        /// allocated and `deinit` freed — nothing ever filled it or read it),
+        /// `max_age_seconds` and `age_buckets` (Prometheus-client-style
+        /// time-window settings no code consulted: `observe` appends,
+        /// `getQuantile` reads, neither looks at a clock). Adding a time window
+        /// means giving the buffer the concurrency treatment the note above
+        /// describes first.
         max_samples: usize = 500,
 
         pub fn observe(self: *Summary, value: f64) !void {
@@ -350,7 +399,6 @@ pub const PrometheusMetrics = struct {
                 .name = self.name,
                 .help = self.help,
                 .value = std.atomic.Value(u64).init(0),
-                .labels = std.StringHashMap([]const u8).init(self.allocator),
             };
             self.series.put(key, counter) catch {
                 self.allocator.free(key);
@@ -382,11 +430,9 @@ pub const PrometheusMetrics = struct {
         }
 
         fn deinit(self: *CounterFamily) void {
-            self.overflow.labels.deinit();
             var it = self.series.iterator();
             while (it.next()) |entry| {
                 self.allocator.free(entry.key_ptr.*);
-                entry.value_ptr.*.labels.deinit();
                 self.allocator.destroy(entry.value_ptr.*);
             }
             self.series.deinit();
@@ -580,7 +626,6 @@ pub const PrometheusMetrics = struct {
             const counter = entry.value_ptr.*;
             self.allocator.free(counter.name);
             self.allocator.free(counter.help);
-            counter.labels.deinit();
             self.allocator.destroy(counter);
         }
         self.counters.deinit();
@@ -590,7 +635,6 @@ pub const PrometheusMetrics = struct {
             const gauge = entry.value_ptr.*;
             self.allocator.free(gauge.name);
             self.allocator.free(gauge.help);
-            gauge.labels.deinit();
             self.allocator.destroy(gauge);
         }
         self.gauges.deinit();
@@ -611,7 +655,6 @@ pub const PrometheusMetrics = struct {
             const summary = entry.value_ptr.*;
             self.allocator.free(summary.name);
             self.allocator.free(summary.help);
-            summary.quantiles.deinit();
             summary.values.deinit();
             self.allocator.destroy(summary);
         }
@@ -620,9 +663,17 @@ pub const PrometheusMetrics = struct {
     }
 
     /// Create Counter. Fails with `error.Frozen` once the registry is sealed
-    /// (a scrape has run) — see the lifecycle note on the type.
-    pub fn createCounter(self: *Self, name: []const u8, help: []const u8) (FrozenError || std.mem.Allocator.Error)!*Counter {
+    /// (a scrape has run) and with `error.DuplicateName` if this name is
+    /// already registered as a counter — see the lifecycle note on the type.
+    pub fn createCounter(self: *Self, name: []const u8, help: []const u8) CreateError!*Counter {
         if (self.isFrozen()) return error.Frozen;
+        // Checked before anything is allocated, so a refused registration
+        // allocates nothing and the object registered first keeps both the map
+        // entry and the handle the caller already holds.
+        if (self.counters.contains(name)) return error.DuplicateName;
+        for (self.counter_families.items) |f| {
+            if (std.mem.eql(u8, f.name, name)) return error.DuplicateName;
+        }
         const counter = try self.allocator.create(Counter);
         errdefer self.allocator.destroy(counter);
         const name_copy = try self.allocator.dupe(u8, name);
@@ -634,16 +685,17 @@ pub const PrometheusMetrics = struct {
             .name = name_copy,
             .help = help_copy,
             .value = std.atomic.Value(u64).init(0),
-            .labels = std.StringHashMap([]const u8).init(self.allocator),
         };
 
         try self.counters.put(name_copy, counter);
         return counter;
     }
 
-    /// Create Gauge. Fails with `error.Frozen` once the registry is sealed.
-    pub fn createGauge(self: *Self, name: []const u8, help: []const u8) (FrozenError || std.mem.Allocator.Error)!*Gauge {
+    /// Create Gauge. Fails with `error.Frozen` once the registry is sealed and
+    /// with `error.DuplicateName` if the name is already a gauge.
+    pub fn createGauge(self: *Self, name: []const u8, help: []const u8) CreateError!*Gauge {
         if (self.isFrozen()) return error.Frozen;
+        if (self.gauges.contains(name)) return error.DuplicateName;
         const gauge = try self.allocator.create(Gauge);
         errdefer self.allocator.destroy(gauge);
         const name_copy = try self.allocator.dupe(u8, name);
@@ -654,16 +706,23 @@ pub const PrometheusMetrics = struct {
         gauge.* = .{
             .name = name_copy,
             .help = help_copy,
-            .labels = std.StringHashMap([]const u8).init(self.allocator),
         };
 
         try self.gauges.put(name_copy, gauge);
         return gauge;
     }
 
-    /// Create Histogram. Fails with `error.Frozen` once the registry is sealed.
-    pub fn createHistogram(self: *Self, name: []const u8, help: []const u8, buckets: []const f64) (FrozenError || std.mem.Allocator.Error)!*Histogram {
+    /// Create Histogram. Fails with `error.Frozen` once the registry is sealed
+    /// and with `error.DuplicateName` if the name is already a histogram.
+    /// The pairs with a `HistogramFamily` of the same name count as one kind:
+    /// both render the same `name_bucket`/`name_sum`/`name_count` series, so
+    /// they are refused together.
+    pub fn createHistogram(self: *Self, name: []const u8, help: []const u8, buckets: []const f64) CreateError!*Histogram {
         if (self.isFrozen()) return error.Frozen;
+        if (self.histograms.contains(name)) return error.DuplicateName;
+        for (self.histogram_families.items) |f| {
+            if (std.mem.eql(u8, f.name, name)) return error.DuplicateName;
+        }
         const histogram = try self.allocator.create(Histogram);
         errdefer self.allocator.destroy(histogram);
 
@@ -693,9 +752,11 @@ pub const PrometheusMetrics = struct {
         return histogram;
     }
 
-    /// Create Summary. Fails with `error.Frozen` once the registry is sealed.
-    pub fn createSummary(self: *Self, name: []const u8, help: []const u8) (FrozenError || std.mem.Allocator.Error)!*Summary {
+    /// Create Summary. Fails with `error.Frozen` once the registry is sealed
+    /// and with `error.DuplicateName` if the name is already a summary.
+    pub fn createSummary(self: *Self, name: []const u8, help: []const u8) CreateError!*Summary {
         if (self.isFrozen()) return error.Frozen;
+        if (self.summaries.contains(name)) return error.DuplicateName;
         const summary = try self.allocator.create(Summary);
         errdefer self.allocator.destroy(summary);
 
@@ -707,7 +768,6 @@ pub const PrometheusMetrics = struct {
         summary.* = .{
             .name = name_copy,
             .help = help_copy,
-            .quantiles = std.array_list.Managed(f64).init(self.allocator),
             .values = std.array_list.Managed(f64).init(self.allocator),
         };
 
@@ -735,6 +795,16 @@ pub const PrometheusMetrics = struct {
     /// refresh handles that already exist — a registration from there would
     /// only work on the first scrape and be refused on every later one, which
     /// is a worse contract than refusing it outright.
+    ///
+    /// Name uniqueness here is **per kind**, which is all `create*` enforces:
+    /// one name can still be registered as a counter *and* a gauge (separate
+    /// containers), and this pass then prints two `# TYPE <name>` blocks — an
+    /// exposition Prometheus rejects. Sealing that needs a decision this type
+    /// has not taken: full name uniqueness also has to cover the series a
+    /// histogram *generates* (`<name>_bucket`/`_sum`/`_count`), or it would
+    /// block `x` twice while letting `x` and `x_count` through — partial
+    /// enforcement that reads like a guarantee. Until then: unique per kind is
+    /// what you get, and cross-kind reuse is on the caller.
     pub fn toPrometheusFormat(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
         self.freeze();
         if (self.scrape_hook) |hook| hook(self.scrape_userdata);
@@ -914,10 +984,16 @@ pub const PrometheusMetrics = struct {
     /// `max_series` caps distinct label values; extra ones share `__other__`.
     ///
     /// Fails with `error.Frozen` once the registry is sealed (a scrape has run)
-    /// — see the lifecycle note on the type. The per-label series a request
-    /// thread wants do not come through here: they come from `CounterFamily.get`.
-    pub fn createCounterFamily(self: *Self, name: []const u8, help: []const u8, label: []const u8, max_series: usize, io: std.Io) (FrozenError || std.mem.Allocator.Error)!*CounterFamily {
+    /// — see the lifecycle note on the type — and with `error.DuplicateName` if
+    /// that name is already a counter (plain or family; both render `name`). The
+    /// per-label series a request thread wants do not come through here: they
+    /// come from `CounterFamily.get`.
+    pub fn createCounterFamily(self: *Self, name: []const u8, help: []const u8, label: []const u8, max_series: usize, io: std.Io) CreateError!*CounterFamily {
         if (self.isFrozen()) return error.Frozen;
+        if (self.counters.contains(name)) return error.DuplicateName;
+        for (self.counter_families.items) |f| {
+            if (std.mem.eql(u8, f.name, name)) return error.DuplicateName;
+        }
         const f = try self.allocator.create(CounterFamily);
         errdefer self.allocator.destroy(f);
         const name_copy = try self.allocator.dupe(u8, name);
@@ -938,7 +1014,6 @@ pub const PrometheusMetrics = struct {
                 .name = name_copy,
                 .help = help_copy,
                 .value = std.atomic.Value(u64).init(0),
-                .labels = std.StringHashMap([]const u8).init(self.allocator),
             },
         };
         try self.counter_families.append(self.allocator, f);
@@ -946,9 +1021,15 @@ pub const PrometheusMetrics = struct {
     }
 
     /// Bounded-cardinality histogram split by a single label. Fails with
-    /// `error.Frozen` once the registry is sealed (a scrape has run).
-    pub fn createHistogramFamily(self: *Self, name: []const u8, help: []const u8, label: []const u8, max_series: usize, buckets: []const f64, io: std.Io) (FrozenError || std.mem.Allocator.Error)!*HistogramFamily {
+    /// `error.Frozen` once the registry is sealed (a scrape has run) and with
+    /// `error.DuplicateName` if that name is already a histogram (plain or
+    /// family; both render `name_bucket`/`name_sum`/`name_count`).
+    pub fn createHistogramFamily(self: *Self, name: []const u8, help: []const u8, label: []const u8, max_series: usize, buckets: []const f64, io: std.Io) CreateError!*HistogramFamily {
         if (self.isFrozen()) return error.Frozen;
+        if (self.histograms.contains(name)) return error.DuplicateName;
+        for (self.histogram_families.items) |f| {
+            if (std.mem.eql(u8, f.name, name)) return error.DuplicateName;
+        }
         const f = try self.allocator.create(HistogramFamily);
         errdefer self.allocator.destroy(f);
         const name_copy = try self.allocator.dupe(u8, name);
@@ -1589,6 +1670,79 @@ test "the scrape has no summary reader, so Summary.values stays unreachable from
 // order, and a descending/unsorted buffer is what lands in that state. The
 // accessor now saturates instead, and this pins it over every ordering of the
 // same three samples at the three quantiles that pin the ends.
+// A second `create*` under a name that was already registered used to *replace*
+// the first object in the map: `put` kept the old key and overwrote the value,
+// so the object registered first (and its name/help) became unreachable from the
+// registry and was never freed by `deinit` — while the handle a caller already
+// held kept pointing at it, i.e. a request thread incremented a counter no
+// scrape would ever render. Refusing the duplicate is the only outcome that
+// keeps "one name, one object, every issued handle is that object" true:
+// returning the existing object would silently drop the caller's help text
+// (and, for a histogram, its bucket layout), and replacing it would dangle the
+// first handle.
+test "a duplicate registration is refused, leaving the first handle as the registry's object" {
+    const allocator = std.testing.allocator;
+    var m = PrometheusMetrics.init(allocator);
+    defer m.deinit();
+
+    const first = try m.createCounter("dup_total", "Total duplicates");
+    first.inc();
+
+    try std.testing.expectError(error.DuplicateName, m.createCounter("dup_total", "another help"));
+    // The refused registration changed nothing: same object, same value — and
+    // it is still the object the registry (and therefore the scrape) reaches.
+    try std.testing.expectEqual(first, m.getCounter("dup_total").?);
+    try std.testing.expectEqual(@as(u64, 1), m.getCounter("dup_total").?.get());
+
+    // The other three kinds follow the same rule, and nothing is allocated for
+    // the refused one (a clean run under `std.testing.allocator` is the proof:
+    // the replacing version leaked the first object's name/help/labels and the
+    // second name copy).
+    _ = try m.createGauge("dup_gauge", "g");
+    try std.testing.expectError(error.DuplicateName, m.createGauge("dup_gauge", "g"));
+    _ = try m.createHistogram("dup_histogram", "h", &.{1});
+    try std.testing.expectError(error.DuplicateName, m.createHistogram("dup_histogram", "h", &.{ 1, 2 }));
+    _ = try m.createSummary("dup_summary", "s");
+    try std.testing.expectError(error.DuplicateName, m.createSummary("dup_summary", "s"));
+
+    // Labeled families are the same kind as the plain collector that renders the
+    // same name (`CounterFamily` prints `name{label=…}`, just like `Counter`
+    // prints `name`), in both directions.
+    _ = try m.createCounterFamily("dup_family_total", "f", "route", 4, std.testing.io);
+    try std.testing.expectError(error.DuplicateName, m.createCounterFamily("dup_family_total", "f", "route", 4, std.testing.io));
+    try std.testing.expectError(error.DuplicateName, m.createCounter("dup_family_total", "plain counter, same rendered name"));
+    _ = try m.createHistogramFamily("dup_family_histogram", "hf", "route", 4, &.{1}, std.testing.io);
+    try std.testing.expectError(error.DuplicateName, m.createHistogramFamily("dup_family_histogram", "hf", "route", 4, &.{2}, std.testing.io));
+    try std.testing.expectError(error.DuplicateName, m.createHistogram("dup_family_histogram", "plain histogram, same rendered name", &.{1}));
+
+    const text = try m.toPrometheusFormat(allocator);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "dup_total 1") != null);
+}
+
+// `max_samples` is the summary's whole configuration surface, and this is the
+// behaviour the three deleted fields (`quantiles`, `max_age_seconds`,
+// `age_buckets`) claimed without having it: the sample buffer is capped by
+// *count*, while the sum and the observation count keep going past the cap
+// (they are atomics, not slices), and the quantile comes from the reservoir.
+test "Summary caps the sample buffer at max_samples and keeps counting past it" {
+    const allocator = std.testing.allocator;
+    var m = PrometheusMetrics.init(allocator);
+    defer m.deinit();
+
+    const summary = try m.createSummary("response_size", "Response size");
+    summary.max_samples = 8;
+    for (0..40) |i| try summary.observe(@floatFromInt(i));
+
+    try std.testing.expectEqual(@as(usize, 8), summary.values.items.len);
+    try std.testing.expectEqual(@as(u64, 40), summary.totalCount());
+    // The sum is not the reservoir's: it saw all 40 observations, capped buffer
+    // or not (0 + 1 + … + 39).
+    try std.testing.expectEqual(@as(f64, 780.0), summary.totalSum());
+    // A quantile still comes out of the (partly overwritten) reservoir.
+    try std.testing.expect(summary.getQuantile(0.5) != 0.0);
+}
+
 test "Summary.getQuantile is correct for every ordering of the sample buffer" {
     const allocator = std.testing.allocator;
     const orders = [_][3]f64{
