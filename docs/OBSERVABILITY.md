@@ -212,3 +212,6 @@ annotations:
    这道门是补出来的：`src/soak_cluster.zig` 曾经在 Linux 上编译不过好几天（其中一个原因是那次 nightly
    被 cancelled），而本机 macOS 编译是绿的（坏掉的分支是 `builtin.os.tag == .linux` 门控的、在 macOS 上
    不被分析）。要验证夜间路径本身，用 `gh workflow run ci.yml`（`workflow_dispatch` 会真的跑 soak job）。
+   现在 push 还多了一道 `zig build soak-smoke`（同样只在 Linux 腿），用 `build.zig` 里**写死**的小预算真跑
+   `soak` 与 `soak-cluster` 的断言（`runtime-stress` 已由 `zig build test` 覆盖，不重复），所以"这三个目标只在
+   夜间跑"对其中两个已不再成立。

@@ -97,15 +97,14 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
   **仍未做**，所以 `Runtime Replay` 现在**依然不能跨进程/跨重启**（§13.5 的边界没变，只是 Q4 第 2 档
   从"未动"变成"存储层已落地"）。不要按"已经能落盘重放了"去设计你的回测。
 - **投递轨的 codec 契约与 `drainTo` 已落地（第 32 批，仍是新增、可选、无破坏）**，而且有一条**会咬人的组合**：
-  `DeliveryLog.setCodec(track, MyCodec)` 之后，**该轨的内存重放就不能用了** —— `Replayer.bind` 对带 codec 的轨
-  返回 `error.CodecRequired`（`src/runtime/recorder.zig:1076`），因为 `bind` 拿不到解码后的值就无法把指针
-  塞进 mailbox。在"读盘重放"落地之前，**`setCodec` 与 `log.replayer()` 是二选一**。若你两条都要，现在别开
-  codec；将来那一刀会把这条路接上。契约本身是 `zigmodu.runtime.Codec(E)`（`name`/`version`/
+  `DeliveryLog.setCodec(track, MyCodec)` 之后 **该轨仍然可以内存重放**（第 36 批起）：codec 只在 `drainTo`
+  里跑，环里始终是**活值**，所以 `Replayer.bind` 不再因为"这条轨声明了 codec"而拒绝 —— 那条
+  `error.CodecRequired` 是第 32 批之前的设计残留（那时以为带 codec 的轨环里存的是字节），第 36 批已拆掉，
+  `BindError` 因此少了那个成员。契约本身是 `zigmodu.runtime.Codec(E)`（`name`/`version`/
   `encode`/`decode`），框架只规定接口，不规定格式；`drainTo` 的返回值带 `holes` / `first_hole_seq`
   （环溢出与游标落后都会变成**看得见的洞**，而不是一份看起来完整的 log）。
-- **"读盘重放"这一刀已经到了（第 33 批）**：`zigmodu.runtime.ReplayFromLog`。所以上面那条"二选一"
-  现在的准确说法是 —— **内存重放**（不开 codec，走 `Replayer`）与 **盘上重放**（开 codec +
-  `drainTo`，走 `ReplayFromLog`）二选一；两条路都通的**同一个进程内**切换还不支持。
+- **"读盘重放"这一刀已经到了（第 33 批）**：`zigmodu.runtime.ReplayFromLog`。**从盘上**重放**要求** codec
+  （它读的是字节，不是活值）—— 这与"内存重放不再要求不开 codec"是两件不同的事，第 36 批之后两条路可以同时开着。
   要点：它是 **load-then-replay**（借 `scan` 读到的记录、按全局 `seq` 排一次索引），**不是**跟随一个
   正在写的 log；**洞默认拒绝**（`error.LogHasHoles`，且不消费那条记录），显式 `allowHoles()` 之后才跨过，
   跨过多少在 `crossedHoles()` 里**精确**计数；绑定走 `setCodec(id, C, E)` + `bindDecoded(id, handle)`

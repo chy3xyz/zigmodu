@@ -451,4 +451,97 @@ pub fn build(b: *std.Build) void {
 
     const stress_smoke_tests = b.addTest(.{ .root_module = stress_smoke_mod });
     addTest(b, test_step, stress_smoke_tests, test_filter, test_force_run);
+
+    // ── `soak-smoke`: the push-gate slice of the nightly soaks ─────────────
+    //
+    // What the push gate already covers, checked rather than assumed:
+    // `zig build test` compiles `src/runtime_stress.zig` against the smoke
+    // option set above and runs its single test, so every check in *that*
+    // harness is walked on a push. It never reaches `src/soak.zig` or
+    // `src/soak_cluster.zig` — neither file is imported by `src/tests.zig`, and
+    // each is its own root module — so the cross-tenant leak assertion
+    // (`soak.zig`) and the cluster's leader / fd / RSS / log-convergence
+    // invariants (`soak_cluster.zig`) had exactly one home: the nightly
+    // `schedule`, which was cancelled outright on 2026-09-25. A cancelled
+    // schedule looks the same as a green one, which is why those assertions
+    // need a second home that a push pays for.
+    //
+    // This step is that home, and only that: it runs the two harnesses
+    // `zig build test` cannot reach. `runtime-stress` is deliberately *not*
+    // re-run here — it is already walked by `zig build test`, and reaching its
+    // real 3-window floor needs a sustained run whose window coverage is a
+    // property of the machine (`stress_smoke_options` above documents the
+    // 2-core CI runner that covered 2 of 6 samples). Adding that floor to a
+    // push would import exactly the runner-speed flakiness this step must not
+    // have; the sustained budget stays nightly-only.
+    //
+    // The options are literals on purpose: a gate whose budget a `-D` flag can
+    // move is a gate that can be quieted by moving it (`-Dsoak-cluster-
+    // iterations=8` would still exit 0), and the nightly's own sizes are far
+    // larger anyway. Sizing is measured, not guessed (Apple M-series, Debug,
+    // 10 cores): `soak` costs ~3 s, and `soak-cluster` at iterations=120 /
+    // sample-ms=50 leaves 28 samples, 26 appends and log_len=26 against the
+    // harness's own floors (samples >= 5 before it will judge fd/RSS/threads,
+    // post_steady >= 3, appends >= 5, log_len >= 5) in 16 s warm / 20 s cold.
+    // ~15 s of that is cluster boot + election + teardown, which a smaller
+    // budget does not remove (iterations=40 measured the same ~16 s), so the
+    // larger budget buys ~5x the sample floor for no wall clock.
+    const soak_smoke_options = b.addOptions();
+    soak_smoke_options.addOption(usize, "soak_clients", 8);
+    soak_smoke_options.addOption(usize, "soak_iterations", 10);
+    const soak_smoke_options_mod = soak_smoke_options.createModule();
+
+    const soak_smoke_mod = b.createModule(.{
+        .root_source_file = b.path("src/soak.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    soak_smoke_mod.addImport("zigmodu", zigmodu_mod);
+    soak_smoke_mod.addImport("build_options", soak_smoke_options_mod);
+    db_link.link(soak_smoke_mod, b, features);
+
+    const soak_smoke_tests = b.addTest(.{ .root_module = soak_smoke_mod });
+    // Same reason as `soak_cluster_tests` above: the default runner speaks the
+    // build runner's stdin protocol and panics on the closed pipe CI hands it.
+    soak_smoke_tests.test_runner = .{
+        .path = b.path("scripts/test-runner.zig"),
+        .mode = .simple,
+    };
+    const run_soak_smoke = b.addRunArtifact(soak_smoke_tests);
+    // A smoke must actually run on every invocation: without this, Zig's cached
+    // "run test" result would print nothing, execute nothing, and exit 0 — a
+    // green that proves as little as the cancelled nightly it replaces.
+    run_soak_smoke.has_side_effects = true;
+
+    const cluster_smoke_options = b.addOptions();
+    cluster_smoke_options.addOption(usize, "soak_iterations", 120);
+    cluster_smoke_options.addOption(usize, "soak_cluster_publish_ms", 10);
+    cluster_smoke_options.addOption(usize, "soak_cluster_append_ms", 50);
+    cluster_smoke_options.addOption(usize, "soak_cluster_sample_ms", 50);
+    cluster_smoke_options.addOption(usize, "soak_cluster_tick_ms", 25);
+    cluster_smoke_options.addOption(usize, "soak_cluster_quiesce_ms", 300);
+    const cluster_smoke_options_mod = cluster_smoke_options.createModule();
+
+    const cluster_smoke_mod = b.createModule(.{
+        .root_source_file = b.path("src/soak_cluster.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    cluster_smoke_mod.addImport("zigmodu", zigmodu_mod);
+    cluster_smoke_mod.addImport("build_options", cluster_smoke_options_mod);
+    db_link.link(cluster_smoke_mod, b, features);
+
+    const cluster_smoke_tests = b.addTest(.{ .root_module = cluster_smoke_mod });
+    cluster_smoke_tests.test_runner = .{
+        .path = b.path("scripts/test-runner.zig"),
+        .mode = .simple,
+    };
+    const run_cluster_smoke = b.addRunArtifact(cluster_smoke_tests);
+    run_cluster_smoke.has_side_effects = true;
+
+    const soak_smoke_step = b.step("soak-smoke", "Run the soak assertions a push never reached (cross-tenant leak + cluster leader/fd/RSS/log invariants) at a fixed small budget");
+    soak_smoke_step.dependOn(&run_soak_smoke.step);
+    soak_smoke_step.dependOn(&run_cluster_smoke.step);
 }

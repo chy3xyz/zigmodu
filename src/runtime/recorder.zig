@@ -343,10 +343,11 @@ pub const TrackRef = struct {
     /// handle whose `Message` is a different type.
     message_type: []const u8,
     /// Reserved for §13.3 Q4's second storage tier: a track persisted across
-    /// processes needs a payload codec, and an entry then has to say which one
+    /// processes needs a payload codec, and the file then has to say which one
     /// wrote it. Attached by `DeliveryLog.setCodec` (§13.9 D2) — the caller's
-    /// `Codec(E).name` — and `null` for a track that only ever held live values,
-    /// which is what makes `drainTo` refuse it *by name* instead of skipping it.
+    /// `Codec(E).name` — and `null` for a track that declared no codec, which is
+    /// what makes `drainTo` refuse it *by name* instead of skipping it. It says
+    /// nothing about what the ring holds: that is a live `E` either way.
     payload_codec: ?[]const u8 = null,
 
     /// Append one delivery of `kind`. `event` points at the sender's value, which
@@ -1059,10 +1060,12 @@ pub const BindError = error{
     /// worker of the same type that is not recorded here (a fresh graph), which
     /// is also the only thing a replay means: the same workers, a new run.
     TargetIsInSourceLog,
-    /// The track was written through a codec (`TrackRef.payload_codec`), so its
-    /// payload is not a live value this process can point at. v1 never sets one.
-    CodecRequired,
 };
+
+// A `CodecRequired` member was removed from `BindError`: a codec runs only in
+// `drainTo` (§13.9 D1), so a track that declared one is still a ring of live
+// values and `bind` has never had a reason to refuse it. `LoadError` — the
+// reader of a *segment file* — keeps its own `CodecRequired`, on purpose.
 
 /// The `seq` range a replay covers: **`[from, to)` — `from` inclusive, `to`
 /// exclusive**. The whole log is `{ .from = 0, .to = null }`, which is what a
@@ -1132,13 +1135,20 @@ pub const Replayer = struct {
     /// its `send`. A target that is recorded *into this log* is refused:
     /// `error.TargetIsInSourceLog` (see `BindError`).
     ///
+    /// A track that declared a codec binds like any other. `post` passes the
+    /// pointer `Track.entry` handed out — into the ring's own live `E` — and a
+    /// codec never changes that: it runs in `drainTo`, not on the record path
+    /// (§13.9 D1, `installCodec`). Draining a track to a file and replaying it
+    /// in memory are therefore two independent use of one log, not a choice.
+    /// What *does* need a codec is reading the payloads back from the file:
+    /// `ReplayFromLog` (`LoadError.CodecRequired`).
+    ///
     /// Last bind wins, deliberately: a second replay binds its own handles.
     pub fn bind(self: *Replayer, id: []const u8, handle: anytype) BindError!void {
         const H = @TypeOf(handle.*);
         if (!@hasField(H, "mailbox") or !@hasField(H, "track") or !@hasDecl(H, "Message"))
             @compileError("Replayer.bind expects a runtime worker handle (*Handle(W, capacity))");
         const track = self.log.find(id) orelse return error.UnknownTrack;
-        if (track.payload_codec != null) return error.CodecRequired;
         if (!std.mem.eql(u8, track.message_type, @typeName(H.Message))) return error.MessageTypeMismatch;
         if (handle.track) |target_track| {
             for (self.log.tracks.items) |t| {
@@ -3017,6 +3027,111 @@ test "drainTo: the codec's buffers all come back, and record never takes one" {
     // leak, and nothing the drain left behind.
     log.deinit();
     try std.testing.expectEqual(probe.allocations, probe.deallocations);
+}
+
+test "Replayer: a track with a codec replays in memory and still drains to a segment file" {
+    // §13.9 D1, pinned: a codec runs *only* in `drainTo`. `Track.recordKind`
+    // copies the value into its ring, and `installCodec` writes exactly three
+    // fields on the erased view (`payload_codec`, `encode`, `decode`) — so a
+    // track that declared a codec is still a ring of live values. `bind` used to
+    // refuse it anyway (`error.CodecRequired`), which made "I want to drain this
+    // track" silently cost the caller its in-memory replay.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var dir = DrainDir.init();
+    defer dir.deinit();
+    const config: dlog.Config = .{
+        .dir_path = try dir.path(),
+        .max_segment_bytes = 1 << 20,
+        .max_record_bytes = 4096,
+        .sync_mode = .none,
+    };
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var log = DeliveryLog.init(allocator, clk.clock());
+    defer log.deinit();
+    const book = try log.addTrack(.{ .id = "book", .capacity = 8 }, u32, 8);
+    try log.setCodec(book, U32Codec);
+    // The premise, asserted rather than assumed: the codec really is attached to
+    // the erased view that `bind` and `drainTo` both look at.
+    try std.testing.expectEqualStrings(U32Codec.name, log.find("book").?.payload_codec.?);
+
+    const payloads = [_]u32{ 7, 11, 13, 42 };
+    for (payloads, 0..) |payload, i| {
+        clk.set(100 + @as(i64, @intCast(i)) * 5);
+        try book.record(payload);
+    }
+
+    // ── (a) the in-memory round trip: `bind` takes the track, and every payload
+    //        comes back by content, entry for entry ───────────────────────────
+    var manual = Clock.Manual{ .now_ms = -1 };
+    var target = FakeTarget(u32){};
+    var rp = log.replayer(&manual);
+    try rp.bind("book", &target);
+    try std.testing.expect(rp.isFullyBound());
+    try std.testing.expectEqual(payloads.len, try rp.replayAll());
+    try std.testing.expectEqualSlices(u32, &payloads, target.taken());
+    // The stamps rode the recorded clock: 100, 105, 110, 115.
+    try std.testing.expectEqual(@as(i64, 115), manual.now_ms);
+
+    // ── (b) the same track still reaches a segment file, and the file agrees
+    //        with the ring that just replayed ─────────────────────────────────
+    var writer = try dlog.Writer.open(allocator, io, config);
+    const report = try log.drainTo(&writer);
+    writer.deinit();
+    try std.testing.expectEqual(payloads.len, report.records);
+    try std.testing.expectEqual(@as(u64, 0), report.holes);
+    try std.testing.expectEqual(@as(?u64, 3), log.drainedUpto("book"));
+
+    var scanned = try dlog.scan(allocator, io, config);
+    defer scanned.deinit(allocator);
+    try scanned.expectClean();
+    try std.testing.expectEqual(payloads.len, scanned.records.len);
+    for (scanned.records, 0..) |record, i| {
+        try std.testing.expectEqualStrings("book", record.track_id);
+        try std.testing.expectEqual(@as(u64, @intCast(i)), record.seq);
+        try std.testing.expectEqual(dlog.Kind.message, record.kind);
+        try std.testing.expectEqual(
+            (100 + @as(i64, @intCast(i)) * 5) * std.time.ns_per_ms,
+            record.recorded_ns,
+        );
+        // Decoded through the track's own erased thunk: the bytes and the ring
+        // value are the same delivery, not two independent accounts of it.
+        var decoded: u32 = 0;
+        try log.find("book").?.decode.?(allocator, record.payload, @ptrCast(&decoded));
+        try std.testing.expectEqual(payloads[i], decoded);
+    }
+
+    // The two paths keep separate state — the drain advanced `drained_slots`,
+    // not the replay cursor — so the memory replay is still all four entries.
+    var manual2 = Clock.Manual{ .now_ms = 0 };
+    var again = FakeTarget(u32){};
+    var rp2 = log.replayer(&manual2);
+    try rp2.bind("book", &again);
+    try std.testing.expectEqual(payloads.len, rp2.remaining());
+    try std.testing.expectEqual(payloads.len, try rp2.replayAll());
+    try std.testing.expectEqualSlices(u32, &payloads, again.taken());
+
+    // ── (c) the disk side was not relaxed along with it ───────────────────────
+    // Reading a file back is bytes → values, so it still needs the codec those
+    // bytes were written with: a bound handle without one is refused by name.
+    var manual3 = Clock.Manual{ .now_ms = 0 };
+    var log_target = FakeTarget(u32){};
+    var loader = try ReplayFromLog.init(allocator, &manual3, scanned.records);
+    defer loader.deinit();
+    try loader.bindDecoded("book", &log_target);
+    try std.testing.expect(!loader.isFullyBound());
+    try std.testing.expectError(error.CodecRequired, loader.step());
+    try std.testing.expectEqualStrings("book", loader.refusal().?);
+    try std.testing.expectEqual(@as(?u64, 0), loader.refusalSeq());
+    try std.testing.expectEqual(@as(usize, 0), log_target.n);
+
+    // … and with the codec declared it hands over the very values the memory
+    // replay delivered above.
+    try loader.setCodec("book", U32Codec, u32);
+    try std.testing.expect(loader.isFullyBound());
+    try std.testing.expectEqual(payloads.len, try loader.replayAll());
+    try std.testing.expectEqualSlices(u32, &payloads, log_target.taken());
 }
 
 // ─────────────────────────────────────────────────

@@ -134,6 +134,43 @@ jobs:
         timeout-minutes: 10
         run: zig build soak-compile
 
+      - name: Soak smoke (the soak assertions a push never reached)
+        # `soak-compile` above proves the two hard-to-reach harnesses still
+        # *build*; it runs neither, and `zig build test` cannot reach them
+        # (`src/soak.zig` and `src/soak_cluster.zig` are separate root modules,
+        # neither imported by `src/tests.zig`). So the cross-tenant leak
+        # assertion and the cluster's leader/fd/RSS/log-convergence invariants
+        # had exactly one home — the nightly `schedule`, cancelled outright on
+        # 2026-09-25, a state that looks the same as a green night.
+        #
+        # This step is that second home. Its budget is fixed in `build.zig` and
+        # deliberately *not* a `-D` flag: a gate whose budget can be moved can be
+        # quieted by moving it. Measured locally in Debug: ~2 s for the HTTP soak
+        # and ~15 s for the cluster (3-node boot + election + teardown dominate —
+        # a 3x smaller budget measured the same wall clock), ~16-20 s per run.
+        # `runtime-stress` is deliberately absent: `zig build test` already walks
+        # it, and reaching its real 3-window floor needs a sustained run whose
+        # window coverage depends on the runner's core count.
+        #
+        # 5 minutes is a hang backstop, not the budget. It is needed because a
+        # *failing* `src/soak.zig` blocks in its deferred server-thread join
+        # (`server.stop()` sits only on the success path), so a red HTTP soak
+        # hangs rather than reporting; `--test-timeout` does not reach a
+        # `.mode = .simple` runner. A timeout is still a red step.
+        #
+        # Linux only, same as `soak-compile` and for the same reason: the
+        # linux-gated branches are not analysed on macOS.
+        #
+        # The RSS envelope is stated here rather than left at the default for the
+        # same reason the nightly `soak` job states it: the spread is dominated
+        # by the runner's allocator page retention and Linux needed the headroom.
+        # The precise leak gate remains the harness's own `soak_gpa.deinit()`.
+        if: runner.os == 'Linux'
+        timeout-minutes: 5
+        env:
+          SOAK_CLUSTER_RSS_BUDGET_MIB: "192"
+        run: zig build soak-smoke
+
       - name: Run tests
         # The step's status must be the *suite's*, not `tee`'s — see the comment
         # on `scripts/ci-run-logged.sh`, which is what this step now runs.

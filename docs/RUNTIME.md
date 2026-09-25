@@ -2059,12 +2059,23 @@ deallocations`，并且**热路径那一侧**（`record`）仍然一条分配都
 （描述文件、不因 drain 归零，`records` 才是本次的），且 `holes` 把"文件已经越过的那条"也算了进去
 （`Writer.append` 的 `error.SeqNotIncreasing` → 记一个洞 + 光标跨过去，而不是让整次 drain 失败：不写
 乱序，也不装作完整）。
-**③ 第三条边界，消费方最容易踩**：`Replayer.bind` 对 `payload_codec != null` 的轨返回 `error.CodecRequired`
-（`recorder.zig:1076`，§13.7 的原决策，本次未动）。也就是说**给一条轨挂了 codec 就等于放弃了它的内存重放**
-—— 在"读盘重放"这一刀落地之前，`setCodec` 与 `log.replayer()` 是**二选一**。这不是笔误，是当前的形状：
-`bind` 拿不到解码后的值，就不能把指针塞进 mailbox。要同时要，得等 D5 的下一刀。
-（`src/runtime/recorder.zig` 的 6 条 `drainTo` 用例都不经过 `bind`，所以这条边界没有测试盖到，
-它是**写在文档与代码注释里的**，不是被断言钉住的 —— 说清楚免得被当成已验证。）
+**③ 第三条边界 —— 已拆**：`Replayer.bind` 曾对 `payload_codec != null` 的轨返回 `error.CodecRequired`
+（§13.7 的原决策），读起来就是"给一条轨挂了 codec 就等于放弃了它的内存重放"，
+`setCodec` 与 `log.replayer()` 像是**二选一**。那是**过时的**，与 D1 的事实相反：codec 只在 `drainTo` 里跑，
+`installCodec` 只写 `payload_codec` / `encode` / `decode` 三个字段，`Track.recordKind` 照旧把**值**拷进环 ——
+带 codec 的轨，环里是活值，`bind` 从来不需要解码。所以那条判断已删：`BindError` 不再有 `CodecRequired`
+（唯一的返回点就是这一行，删掉即死成员；它只有这一个调用点，没有别的路径用它）。
+**`BindError` 现在是 `UnknownTrack` / `MessageTypeMismatch` / `TargetIsInSourceLog` 三个**；
+**读盘那一侧照旧要 codec** —— `ReplayFromLog` 读的是字节，`LoadError.CodecRequired` 原样保留。
+这条边界现在是**被断言钉住的**，不再是"只写在文档与注释里"：
+`Replayer: a track with a codec replays in memory and still drains to a segment file`（同一条挂 codec 的轨：
+`bind` 成功、载荷逐条按内容相等 → `drainTo` 后 `scan` 的 `seq` / `kind` / 解码载荷与内存轨一致，
+且 drain 过之后内存重放仍是全量 → 同一份记录交给 `ReplayFromLog`、不声明 codec 仍报 `error.CodecRequired`）。
+**改动之前那条测试的红**：`507/1942 runtime.recorder.test.Replayer: a track with a codec replays in memory
+and still drains to a segment file...FAIL (CodecRequired)`，栈顶
+`src/runtime/recorder.zig:1141: if (track.payload_codec != null) return error.CodecRequired;`；
+改后聚焦读数 `zm-test-count: aggregate 1/2057 selected passed=1 skipped=0 failed=0 leaked=0 binaries=6
+db=all filter=a track with a codec`。
 **测试名**：`drainTo: two tracks reach a segment file, encoded, in one global seq order` ·
 `drainTo: the second call writes only what the first one left` · `drainTo: a track with no codec is refused
 by name, and the other track is untouched` · `drainTo: an overflow is a hole, with a seq the file really
@@ -2081,8 +2092,10 @@ passed (58 skipped)`（无其它用例被带红）。**变异验红 5 处**（�
 
 ### 13.10 Replay v2（第二刀）：从盘上重放 —— 设计已定，实现按此做
 
-§13.9 让投递轨能进盘（`Codec` + `drainTo`），代价是**挂了 codec 的轨不能再做内存重放**
-（`bind` 返回 `error.CodecRequired`）。这一刀把那条路接回来：**从段文件重放**。七个决定。
+§13.9 让投递轨能进盘（`Codec` + `drainTo`）。当时记的代价是"挂了 codec 的轨不能再做内存重放"
+（`bind` 返回 `error.CodecRequired`）—— 那条边界是**过时的**，已拆（§13.9 状态行 ③：codec 只在 `drainTo`
+里跑，环里一直是活值）。但**读盘重放**依然是独立要做的一刀，与它无关：文件里是字节，要变回值就必须有
+codec。七个决定。
 
 **D1 —— 新类型，不动 `Replayer`。** `Replayer` 的窗口（`open`）、筛选（`onlyTracks`）、计数
 （`log.len() == delivered + skipped + …`）与 `bind` 语义都是为**内存轨**定的，§13.7/§13.8 的 8 条用例

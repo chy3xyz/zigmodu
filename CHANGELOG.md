@@ -2,6 +2,53 @@
 
 ## [Unreleased]
 
+### 第 36 批：soak 的断言终于进了 push（`zig build soak-smoke`）、拆掉"带 codec 的轨不能内存重放"这条**过时**限制；顺带查明两件真事：`soak.zig` 失败时会挂死，以及**夜间 `soak-cluster` 在 Linux runner 上跑不完**（**破坏性：否**，`BindError` 少一个成员，调用方留着它会编译错）
+
+全量 `-Ddb=all` **1999/2057（58 skipped，0 failed）**；CI 示例清单本机 **16/16 构建 + 7 个 `build test` 步骤全绿**；fmt / check / check-api / check-deadcode / check-tenant-scope / check-version 全绿。
+
+**① push 现在真跑 soak 断言（上一批只补了"编译"这一半）。** 新增 `zig build soak-smoke`，接在 push 的
+Linux 腿（`if: runner.os == 'Linux'`）。预算**写死在 `build.zig` 里**（`soak` 侧 8 clients × 10 iterations、
+`soak-cluster` 侧 iterations=120 / publish_ms=10 / append_ms=50 / sample_ms=50 / quiesce_ms=300）—— 写死是
+刻意的：CI 用的最小档不能被命令行参数悄悄改小。本机热 16 s / 冷 20 s，CI 留 3 倍以上余量。
+
+* **覆盖面是探查出来的，不是读注释猜的**：`src/tests.zig` 与 `src/root.zig` 都不 import 这两个文件；
+  运行期反证最硬 —— `bash scripts/test-fast.sh --db all --filter soak` 报
+  `selected 0 of 1942 tests (filter "soak")`（`FAILED — filter 'soak' matched 0`），而对照组
+  `--filter "runtime stress"` 命中 1 条。所以 `soak` / `soak-cluster` 在 push 上**零覆盖**，
+  `runtime-stress` 已经被 `zig build test` 的 smoke 预算走到（`min_windows` 1 对 3，那是有意的）。
+* **红证据三组**（改坏 → 那一行 → 还原后绿，`src/` 用哈希与逐字节比对证明还原）：跨租户泄漏断言
+  `expected 0, found 4`（码 4 = 响应里出现了别的租户的行）· 多发一帧 →
+  `malformed payload '1-121' from sc-b` / `expected 0, found 18` · 丢一帧 → 18 行
+  `recv sc-*: 118/120` + `FAIL (TestUnexpectedResult)`（`drain_timed_out`）。
+  **没覆盖的也说清了**：`runtime-stress` 整档不重复（搬进 push 就是把"慢 runner 假红"引进来）；
+  量级是 8×10 vs 夜间的 64×200，**需要长时间/大流量才显形的竞态仍然只有夜间能抓**。
+
+**② 拆掉一条过时的限制：带 codec 的轨**能**做内存重放。** `Replayer.bind` 以前对 `payload_codec != null`
+返回 `error.CodecRequired`，理由是"那条轨的载荷不是本进程能指着的活值"。**第 32 批之后这句话就不成立了**：
+codec 只在 `drainTo` 里跑（§13.9 D1），记录路径照旧把**值**写进环，`installCodec` 只往 `TrackRef` 上写
+`payload_codec`/`encode`/`decode` 三个字段。已逐条核实 `recordKind`（值语义拷进环）、`entryAt`
+（交出去的是环里那个活 `E` 的指针）、`drainTo`（在 drain 里才编码）之后删掉那行。`BindError` 因此少一个成员
+—— 对下游**不是静默变更**（实测本工具链：调用方若还留着那个 prong 是
+`error: expected type 'error{A,B}', found 'error{C}'` 的编译错）。`ReplayFromLog`（从**盘上**重放）**仍然**
+要求 codec，没被顺手放松。测试双向：带 codec 的轨 `bind` 成功且载荷**逐内容**相等、同一条轨仍然能
+`drainTo` 且 `scan` 回来的 seq/kind/载荷一致、drain 之后再开一个 replayer 仍是全量、从盘重放不声明 codec
+仍被指名拒绝。红证据是**先写红的那条**：`FAIL (CodecRequired)`，栈顶直指那行 `if`。
+
+**③ 两个发现（都不是本批改动引入的，都记在案）**
+
+* **`src/soak.zig` 的失败路径会挂死**：`server.stop()` 在成功路径的末尾，而 `defer th.join()` 比它先注册
+  —— 任一 `try` 失败，defer 就卡在 join 上，进程永不退出（实测注入后打印了红行、随后 `timeout 45` 得
+  `EXIT=124`；`--test-timeout` 对它无效）。所以新 push 步的 `timeout-minutes: 5` 是**卡死兜底**而不是预算，
+  ci.yml 里写明了这一点。**下一批修**（把 stop 挪进 defer，排在 join 之前）。
+* **夜间 `soak-cluster` 在 CI 的 ubuntu runner 上跑不完**：两次 `workflow_dispatch` 都在 30 分钟 job 超时
+  被 cancel —— step 5 `Soak` 绿，step 6 `Cluster soak` 从 10:50:03 起**静默 28 分钟**（日志里最后一行是
+  启动时的 `[soak-cluster] node sc-a raft peers (2): sc-b sc-c`）。**而同样的默认预算在本机 81 秒跑完**
+  （2400/2400 全到，1 passed / 0 leaked）。也就是 **Linux-only 的非完成**，且因为 harness 的 deadline 检查
+  排在采样之后，一个卡在采样里的实现连 deadline 都到不了。
+  **同时纠正一条此前的误读**：`09-21/22/23` 那三次"夜间 soak 成功"**只跑了 step 5**，
+  后来才加进那个 job 的 `Cluster soak` / `Runtime stress` / `Fuzz` 三步**一次都没有成功跑完过**。
+  本批的 `soak-smoke` 就是它的第一个探针（小预算在 Linux 上跑不跑得完，下一次 push 就知道）。
+
 ### 第 35 批：夜间才跑的三个目标现在**每次 push 都会编译**（`zig build soak-compile`）—— 因为 `soak_cluster.zig` 曾经在 Linux 上编译不过、好几天没人发现（**破坏性：否**，只加了一道门）
 
 **先记证据**：夜间 soak 在 `2026-09-24T08:31Z` 红过一次，失败步骤是 `Cluster soak`，错误原文：
