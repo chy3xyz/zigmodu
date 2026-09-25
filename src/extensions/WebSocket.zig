@@ -741,6 +741,24 @@ pub const WebSocketMonitor = struct {
     update_thread: ?std.Thread,
     is_running: bool,
     update_group: std.Io.Group,
+    /// Observation of `updateLoop`'s period sleep — written by the loop itself,
+    /// read (only) by the `stop() wakes the sleep` test. `update_sleeping` is
+    /// true while the member is inside the sleep, so a test can call `stop()`
+    /// knowing the loop is parked rather than between iterations; the counters
+    /// say how a sleep that started ended. `std.Io.sleep`'s error set is exactly
+    /// `error.Canceled` (`std/Io.zig:813`), so a non-zero
+    /// `update_sleeps_canceled` can only mean a cancelation request cut a period
+    /// short — the evidence `stop()` needs, since it is the only canceller.
+    update_sleeping: std.atomic.Value(bool),
+    update_periods_completed: std.atomic.Value(u32),
+    update_sleeps_canceled: std.atomic.Value(u32),
+    /// How many times `updateLoop` has been *entered*. `start()` must put
+    /// exactly one member in `update_group`, so this is the structural half of
+    /// that guard: a second `start()` that slipped past it would show up here as
+    /// 2, and counting entries is host-independent in a way "how many
+    /// cancelations landed" is not (a second member can have its cancelation
+    /// consumed inside `broadcastMetrics` instead of at the sleep).
+    update_loops_started: std.atomic.Value(u32),
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, port: u16) Self {
         return .{
@@ -750,6 +768,10 @@ pub const WebSocketMonitor = struct {
             .update_thread = null,
             .is_running = false,
             .update_group = .init,
+            .update_sleeping = std.atomic.Value(bool).init(false),
+            .update_periods_completed = std.atomic.Value(u32).init(0),
+            .update_sleeps_canceled = std.atomic.Value(u32).init(0),
+            .update_loops_started = std.atomic.Value(u32).init(0),
         };
     }
 
@@ -770,6 +792,12 @@ pub const WebSocketMonitor = struct {
     /// only party that was going to stop it. A dispatch that cannot happen is
     /// reported instead, with the server half rolled back.
     pub fn start(self: *Self, modules: *ApplicationModules) !void {
+        // Same guard the server half has, and it is load-bearing here: without it
+        // a second `start()` would push a *second* `updateLoop` into
+        // `update_group`, and the monitor would broadcast every metric twice per
+        // period. `stop()` would still collect both members, so this is a
+        // semantics bug rather than a leak.
+        if (self.is_running) return;
         self.modules = modules;
         try self.ws_server.start();
         self.is_running = true;
@@ -793,22 +821,82 @@ pub const WebSocketMonitor = struct {
         return err;
     }
 
+    /// Stop both halves, and end the metrics loop *now* rather than after
+    /// whatever is left of its period.
+    ///
+    /// `cancel`, not `await`, and that is the whole reason this call is not the
+    /// tail of a 5 s wait: the member's only long wait is the period sleep, so
+    /// awaiting the group means waiting out the remainder of a period — in
+    /// `deinit()` as much as in a plain `stop()`. `cancel` requests cancelation
+    /// on the member first, and `std.Io.Threaded` delivers it to a thread parked
+    /// in `clock_nanosleep` by interrupting the syscall (`std/Io/Threaded.zig:11855`
+    /// `sleep` → `:11863-11897` `sleepPosix` → `Syscall.checkCancel`, `:1373-1388`
+    /// → `error.Canceled`; the interrupt is `pthread_kill(handle, .IO)`,
+    /// `:1267-1306`), which is the same `error.Canceled` the loop already treated
+    /// as "leave".
+    /// `Group.cancel` still *drains* what it canceled — `Threaded.groupCancel`
+    /// (`:2341-2369`) waits on the group's completion count, and `Io.Group.cancel`
+    /// promises every member has run (`std/Io.zig:1408-1414`) — so this returns
+    /// only once the fiber is really gone, the same guarantee `await` gave.
+    /// Cancel is never the slower choice: same drain, plus a request that can only
+    /// shorten it.
+    ///
+    /// The flag is lowered *before* the cancel on purpose. A cancelation is
+    /// delivered to one cancelation point only (`std/Io.zig:1295-1301`), and the
+    /// sleep is not necessarily the first candidate inside `updateLoop`:
+    /// `broadcast` has cancelable paths of its own (`clients_mutex.lock` while
+    /// contended, the socket write to a peer that stopped reading). Whoever
+    /// consumes the request leaves the loop through `is_running`, which is false
+    /// by then — the other half of the argument is the pre-sleep check in
+    /// `updateLoop`.
+    ///
+    /// Idempotent, because `Group.cancel` is: a second call finds an empty group
+    /// (`std/Io.zig:1421-1425`'s `orelse return`) and a `WebSocketServer` half
+    /// that is already down. Not safe from two threads at once — `Group.cancel`
+    /// is documented "not threadsafe", and `await` was no different.
     pub fn stop(self: *Self) void {
         self.is_running = false;
         self.ws_server.stop();
         self.update_thread = null;
-        self.update_group.await(self.ws_server.io) catch |err| {
-            std.log.debug("[ws] draining update group failed: {s}", .{@errorName(err)});
-        };
+        self.update_group.cancel(self.ws_server.io);
     }
 
+    /// Broadcast the metrics payload, wait one period, repeat — for as long as
+    /// `is_running` says so.
+    ///
+    /// The sleep is the loop's long wait and its cancelation point, which is what
+    /// `stop()` cancels to avoid waiting out a period. `std.Io.sleep`'s error set
+    /// is exactly `error.Canceled`, so "the sleep failed" and "the loop was
+    /// canceled mid-period" are the same event; both leave the loop.
     fn updateLoop(self: *Self) void {
+        _ = self.update_loops_started.fetchAdd(1, .monotonic);
         while (self.is_running) {
             self.broadcastMetrics() catch |err| {
                 std.log.err("[WebSocketMonitor] Broadcast error: {}", .{err});
             };
-            // Broadcast every 5 seconds
-            std.Io.sleep(self.ws_server.io, .{ .nanoseconds = 5_000_000_000 }, .real) catch break;
+            // Checked here as well as at the top of the loop, and this is the
+            // load-bearing one. A cancelation request reaches exactly one
+            // cancelation point (`std/Io.zig:1295-1301`), and `broadcast` can be
+            // the one that consumes it — `clients_mutex.lock` is cancelable while
+            // contended and so is the socket write to a peer that stopped
+            // reading — so the loop can arrive here *after* its cancelation is
+            // spent. A fresh period would then be uncancelable (the request is
+            // never re-signaled) with `stop()` waiting behind it: 5 s of delay on
+            // the shutdown path, which is the defect `stop()`'s `cancel` exists to
+            // remove. The flag is what keeps that state unenterable.
+            if (!self.is_running) return;
+            {
+                self.update_sleeping.store(true, .release);
+                defer self.update_sleeping.store(false, .release);
+                // Broadcast every 5 seconds
+                std.Io.sleep(self.ws_server.io, .{ .nanoseconds = 5_000_000_000 }, .real) catch |err| switch (err) {
+                    error.Canceled => {
+                        _ = self.update_sleeps_canceled.fetchAdd(1, .monotonic);
+                        return;
+                    },
+                };
+                _ = self.update_periods_completed.fetchAdd(1, .monotonic);
+            }
         }
     }
 
@@ -1265,6 +1353,121 @@ test "WebSocketMonitor: a real client is handshaken and receives the update loop
     }
     // It reached a client, so nothing was dropped on the way.
     try std.testing.expectEqual(@as(u64, 0), monitor.ws_server.droppedBroadcasts());
+}
+
+// ── `stop()` must not wait out the update loop's period ──────────────────────
+
+/// Bounded spin until the monitor's update loop is parked in its period sleep.
+/// The loop broadcasts *before* it sleeps (`updateLoop`), so once `start()` has
+/// dispatched it this is true within microseconds — the same bounded spin
+/// `parkedOnClientsLock` uses, so a loop that never parks fails the test instead
+/// of hanging the suite.
+fn waitForUpdateSleep(monitor: *WebSocketMonitor) bool {
+    var spins: usize = 0;
+    while (spins < wait_for_parked_fiber_rounds) : (spins += 1) {
+        if (monitor.update_sleeping.load(.acquire)) return true;
+        std.atomic.spinLoopHint();
+    }
+    return false;
+}
+
+// The assertion is the *sleep's outcome*, not a wall-clock bound: after
+// `stop()`, the loop must have left **without completing a period**, and the
+// period it was in must have ended with `error.Canceled`. Both are properties of
+// the mechanism (`std.Io.sleep`'s error set is exactly `error.Canceled`,
+// `std/Io.zig:813`, and `update_periods_completed` is bumped only by a sleep that
+// returned), so they hold on any host — the lesson `docs/RUNTIME.md` §12.15
+// records. The host-dependent readings (how long `stop()` took, how far into the
+// 5 s period the cancel landed) are printed, not asserted.
+//
+// What this cannot prove: that the cancel is fast on the *host* (a signal that
+// takes milliseconds to be delivered still passes), and that `stop()` is
+// short for a loop parked somewhere other than the sleep (a broadcast writing to
+// a peer that stopped reading is the one remaining wait on this path; see
+// `WebSocketServer.stop`). It also assumes the test thread is not starved for a
+// whole period between seeing `update_sleeping` and calling `stop()` — under
+// that starvation the member completes a period and the test fails *red*, on a
+// correct implementation. That direction is the acceptable one.
+//
+// Red evidence (the shape this replaced — `stop()` draining with
+// `update_group.await(...)` instead of `cancel`): `sleeps_canceled` stays 0,
+// `periods_completed` becomes 1, and `stop()` takes the rest of the period:
+//   [ws stop] period=5000ms stop()=5001ms sleeps_canceled=0 periods_completed=1
+test "WebSocketMonitor: stop() wakes the update loop's sleep instead of waiting it out" {
+    const allocator = std.testing.allocator;
+    // The live-client test's io shape: no async units at all, so both loops can
+    // only be running as `concurrent` members on threads of their own.
+    var threaded = std.Io.Threaded.init(allocator, .{ .async_limit = .limited(0) });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var modules = ApplicationModules.init(allocator);
+    defer modules.deinit();
+
+    var monitor = WebSocketMonitor.init(allocator, io, 0);
+    defer monitor.deinit();
+
+    try monitor.start(&modules);
+    defer monitor.stop();
+
+    // Parked in the period, not between iterations — `stop()` has to land on the
+    // sleep for "waking it" to be the thing under test.
+    try std.testing.expect(waitForUpdateSleep(&monitor));
+
+    const started_ms = Time.monotonicNowMilliseconds();
+    monitor.stop();
+    const stop_ms = Time.monotonicNowMilliseconds() - started_ms;
+
+    const canceled = monitor.update_sleeps_canceled.load(.acquire);
+    const completed = monitor.update_periods_completed.load(.acquire);
+    // Printed, not asserted: host speed (§12.15).
+    std.debug.print("[ws stop] period=5000ms stop()={d}ms sleeps_canceled={d} periods_completed={d}\n", .{ stop_ms, canceled, completed });
+
+    // The period the loop was in ended with `error.Canceled`, which only a
+    // cancelation request produces — and `stop()` is the only canceller here.
+    try std.testing.expectEqual(@as(u32, 1), canceled);
+    // And it never completed a period, so `stop()` cannot have sat through one.
+    try std.testing.expectEqual(@as(u32, 0), completed);
+
+    // Still idempotent: a second `stop()` finds the group empty (`Group.cancel`
+    // drains what it cancels, `std/Io.zig:1421-1425`) and the server half down,
+    // so it neither re-cancels nor waits. `deinit` above makes it a third.
+    monitor.stop();
+    try std.testing.expectEqual(@as(u32, 1), monitor.update_sleeps_canceled.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), monitor.update_periods_completed.load(.acquire));
+}
+
+test "WebSocketMonitor: a second start() does not put a second loop in the group" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{ .async_limit = .limited(0) });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var modules = ApplicationModules.init(allocator);
+    defer modules.deinit();
+
+    var monitor = WebSocketMonitor.init(allocator, io, 0);
+    defer monitor.deinit();
+
+    try monitor.start(&modules);
+    defer monitor.stop();
+    // The server half refuses a second `start()` with `if (self.is_running)
+    // return;`; the monitor half had no such guard, so this call used to put a
+    // *second* `updateLoop` in `update_group` — two broadcasts per period, and
+    // `stop()` had two members to collect. Counted rather than timed, so it is
+    // the same assertion on any host: one loop in, one cancelation out.
+    try monitor.start(&modules);
+
+    // The structural assertion: `updateLoop` counts its own entries, so this is
+    // 1 with the guard and 2 without it — on any host, without timing anything.
+    // (The `sleeps_canceled` counter is *not* usable here: a second member can
+    // have its cancelation consumed inside `broadcastMetrics` instead of at the
+    // sleep, which is exactly how the first version of this test passed with the
+    // guard removed.)
+    try std.testing.expect(waitForUpdateSleep(&monitor));
+    try std.testing.expectEqual(@as(u32, 1), monitor.update_loops_started.load(.acquire));
+    monitor.stop();
+    try std.testing.expectEqual(@as(u32, 1), monitor.update_loops_started.load(.acquire));
 }
 
 // ── The client's socket, and the registry lock across a fan-out ──────────────

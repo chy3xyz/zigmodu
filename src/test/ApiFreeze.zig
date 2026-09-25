@@ -12,25 +12,33 @@
 //! table's own promises, the exact import path a consumer writes, and the split
 //! between the frozen surface and the preview one.
 //!
-//! Five kinds of check, cheapest first:
+//! Six kinds of check, cheapest first:
 //!
 //! 1. **Callability** — every name in the deprecation table is called for real:
 //!    `ctx.paramPath` is compared with `ctx.nestedParam`, `startAll` / `stopAll`
-//!    run over a module set, and `http.http_server` has to name the same types as
-//!    `http.Server`. A removed alias fails to compile at that call site.
+//!    run over a module set, `RateLimiter.acquire` drains the same bucket as
+//!    `tryAcquire`, the four `ctx.send*` envelope helpers write their documented
+//!    body, and `http.http_server` has to name the same types as `http.Server`.
+//!    A removed alias fails to compile at that call site.
 //! 2. **Marker** — the table's own rule 1 ("mark it deprecated in code and name
 //!    the replacement") is checked: the declaration must still carry a
 //!    `DEPRECATED` marker inside its doc comment, and that comment must name the
 //!    replacement.
 //! 3. **Removal** — the opposite direction for names that already left. The
 //!    「已移除」 record in `docs/UPGRADING.md` carries `zigmodu.App` /
-//!    `zigmodu.ModuleImpl`, so re-exporting one from `root.zig` is red. That is
-//!    the failure the old table row invited: "removed no earlier than 1.0" reads
-//!    as "still available", and a `@hasDecl` is enough to stop it.
-//! 4. **Anchor resolution** — every anchor `docs/API_FREEZE.md` names resolves
+//!    `zigmodu.ModuleImpl` and `zigmodu.extensions`, so re-exporting one from
+//!    `root.zig` is red. That is the failure the old table row invited: "removed
+//!    no earlier than 1.0" reads as "still available", and a `@hasDecl` is
+//!    enough to stop it.
+//! 4. **File-level banners** — two files mark the *whole module* deprecated
+//!    without a consumer-writable `zigmodu.<name>` having left, so they are
+//!    neither rows nor removals. The gate pins the banner and — for the one that
+//!    is still load-bearing — the public spelling (`http.FieldRules`) that keeps
+//!    saying "this file cannot be deleted as the banner promises".
+//! 5. **Anchor resolution** — every anchor `docs/API_FREEZE.md` names resolves
 //!    (`@hasDecl`, data-driven from the doc's own rows, so the check follows the
 //!    doc rather than a hand-written list of calls).
-//! 5. **Table ↔ gate sync** — the rows are parsed out of `docs/UPGRADING.md` and
+//! 6. **Table ↔ gate sync** — the rows are parsed out of `docs/UPGRADING.md` and
 //!    `docs/API_FREEZE.md` and compared with the tables here. A row added
 //!    without a check is red, and so is a check for a row that no longer exists
 //!    — the two failure modes the deprecation table would otherwise have.
@@ -95,6 +103,41 @@ const ALIASES = [_]Alias{
         .decl_symbol = "pub const http_server = ",
         .decl_must_contain = &.{ "DEPRECATED", "Server" },
     },
+    .{
+        .doc_deprecated = "ctx.sendSuccess",
+        .doc_target = "ctx.json",
+        .decl_file = "src/api/Server.zig",
+        .decl_symbol = "pub fn sendSuccess(",
+        .decl_must_contain = &.{ "DEPRECATED", "ctx.json" },
+    },
+    .{
+        .doc_deprecated = "ctx.sendFail",
+        .doc_target = "ctx.json",
+        .decl_file = "src/api/Server.zig",
+        .decl_symbol = "pub fn sendFail(",
+        .decl_must_contain = &.{ "DEPRECATED", "ctx.json" },
+    },
+    .{
+        .doc_deprecated = "ctx.sendPageResult",
+        .doc_target = "ctx.json",
+        .decl_file = "src/api/Server.zig",
+        .decl_symbol = "pub fn sendPageResult(",
+        .decl_must_contain = &.{ "DEPRECATED", "ctx.json" },
+    },
+    .{
+        .doc_deprecated = "ctx.sendJsonItems",
+        .doc_target = "ctx.json",
+        .decl_file = "src/api/Server.zig",
+        .decl_symbol = "pub fn sendJsonItems(",
+        .decl_must_contain = &.{ "DEPRECATED", "ctx.json" },
+    },
+    .{
+        .doc_deprecated = "RateLimiter.acquire",
+        .doc_target = "RateLimiter.tryAcquire",
+        .decl_file = "src/resilience/RateLimiter.zig",
+        .decl_symbol = "pub fn acquire(",
+        .decl_must_contain = &.{ "DEPRECATED", "tryAcquire" },
+    },
 };
 
 /// How much text before the declaration counts as "its doc comment". Wide
@@ -119,16 +162,86 @@ const removed_heading = "### 已移除";
 const Removed = struct {
     /// The spelling a consumer used to write: `zigmodu.<root_name>`.
     root_name: []const u8,
-    /// The removal commit, as the doc cites it. Evidence, not a promise.
-    commit: []const u8,
+    /// The removal evidence, as the doc cites it: a commit when one is recorded,
+    /// otherwise the oldest written record the repo still has. Evidence, not a
+    /// promise — and deliberately a string the doc must keep verbatim, so
+    /// "removed at some point" cannot quietly become "removed, details lost".
+    evidence: []const u8,
     /// File that still holds the implementation, reachable by path only.
     file: []const u8,
+    /// The `@import` spelling inside `src/tests.zig`, quotes included: proof the
+    /// file is still compiled (Zig is lazy, so a file nothing imports is a file
+    /// whose signatures can rot unnoticed).
+    compiled_import: []const u8,
 };
 
 const REMOVED = [_]Removed{
-    .{ .root_name = "App", .commit = "557190a", .file = "src/api/Simplified.zig" },
-    .{ .root_name = "ModuleImpl", .commit = "557190a", .file = "src/api/Simplified.zig" },
+    .{
+        .root_name = "App",
+        .evidence = "557190a",
+        .file = "src/api/Simplified.zig",
+        .compiled_import = "\"api/Simplified.zig\"",
+    },
+    .{
+        .root_name = "ModuleImpl",
+        .evidence = "557190a",
+        .file = "src/api/Simplified.zig",
+        .compiled_import = "\"api/Simplified.zig\"",
+    },
+    .{
+        .root_name = "extensions",
+        // No commit and no tag records this one; `CHANGELOG.md`'s `[0.15.0]`
+        // section is the oldest written record — it already describes
+        // `zigmodu.extensions` as a namespace apps were moving off.
+        .evidence = "0.15.0",
+        .file = "src/extensions.zig",
+        .compiled_import = "\"extensions.zig\"",
+    },
 };
+
+// ============================================================
+// 1c. File-level deprecation banners — neither rows nor removals
+// ============================================================
+
+/// A `DEPRECATED` banner on a *whole file*. Both of these used to look like
+/// table material and are not: the table pairs "the old name a consumer wrote"
+/// with "the name to write now", and neither file has such a pair any more.
+///
+/// * `src/extensions.zig` — its `zigmodu.extensions` namespace is gone (see
+///   `REMOVED`); what is left is a type-alias shim, path-reachable only.
+/// * `src/validation/Validator.zig` — its banner says "will be removed in v1.0",
+///   but the file is still the live implementation behind `http.FieldRules`, so
+///   that sentence is a plan with a prerequisite: move the public spelling
+///   first. That half is asserted explicitly (it is the one entry here whose
+///   *reachability* is part of the claim), so deleting the file as the banner
+///   promises cannot happen silently.
+const Banner = struct {
+    file: []const u8,
+    /// Rule-1 text the banner has to keep. Checked inside `banner_window` bytes
+    /// from the top of the file — a banner that drifts down the file has stopped
+    /// being a banner.
+    must_contain: []const []const u8,
+};
+
+const BANNERS = [_]Banner{
+    .{
+        .file = "src/validation/Validator.zig",
+        // The replacement the banner names, and the module it points at. This is
+        // the live entry: the test also asserts `http.FieldRules` still resolves
+        // to this file's `FieldRules`.
+        .must_contain = &.{ "DEPRECATED", "ObjectValidator.zig" },
+    },
+    .{
+        // Path-reachable only; the test also asserts its aliases still name the
+        // domain files' types.
+        .file = "src/extensions.zig",
+        // The replacement the banner names for its first line of exports.
+        .must_contain = &.{ "DEPRECATED", "zigmodu.http.http_server" },
+    },
+};
+
+/// How far into a file its banner has to sit to count as one.
+const banner_window = 1500;
 
 test "deprecation table: ctx.paramPath is still a working alias of ctx.nestedParam" {
     const allocator = std.testing.allocator;
@@ -185,15 +298,134 @@ test "deprecation table: http.http_server still names the same types as http.Ser
     try std.testing.expectEqualStrings("/x", ctx.path);
 }
 
-test "removed: the Simplified entry points are off the root and stay off" {
+test "deprecation table: ctx.sendSuccess / sendFail / sendPageResult / sendJsonItems still work, ctx.json replaces them" {
+    const allocator = std.testing.allocator;
+
+    // The four `{code,msg,data}` envelope helpers moved into the table at once:
+    // they are one response shape, and `check-production.sh` treats them as a
+    // family (the "envelope leak" scan). Calling each one for real is what keeps
+    // the row honest — the markers alone would survive a broken body.
+    inline for (.{ "sendSuccess", "sendFail", "sendPageResult", "sendJsonItems" }) |name| {
+        try std.testing.expect(@hasDecl(http.Context, name));
+    }
+    // The replacement the rows name, on the same type.
+    try std.testing.expect(@hasDecl(http.Context, "json"));
+
+    var ctx = try http.Context.init(allocator, .GET, "/x");
+    defer ctx.deinit();
+
+    try ctx.sendSuccess("{\"a\":1}");
+    try std.testing.expectEqualStrings("{\"code\":0,\"msg\":\"\",\"data\":{\"a\":1}}", ctx.response_body.items);
+
+    ctx.response_body.items.len = 0;
+    try ctx.sendFail(4001, "bad");
+    try std.testing.expectEqualStrings("{\"code\":4001,\"msg\":\"bad\",\"data\":null}", ctx.response_body.items);
+
+    ctx.response_body.items.len = 0;
+    try ctx.sendPageResult("[1,2]", 7);
+    try std.testing.expectEqualStrings("{\"code\":0,\"msg\":\"\",\"data\":{\"list\":[1,2],\"total\":7}}", ctx.response_body.items);
+
+    ctx.response_body.items.len = 0;
+    const items: []const u32 = &[_]u32{ 1, 2 };
+    try ctx.sendJsonItems(items);
+    // The row promises the `{code,msg,data}` envelope with the items in `data`.
+    // Observed on this toolchain: the envelope is there, but `data` holds a
+    // **struct dump** — the helper formats with `{any}`, which prints
+    // `std.json.Stringify`'s fields instead of calling the serializer (the same
+    // `{any}` is in `sendPageItems`). Pinning the envelope only, on purpose: the
+    // defect lives in the deprecated helper, and fixing it must not mean editing
+    // this gate first.
+    const body = ctx.response_body.items;
+    if (!std.mem.startsWith(u8, body, "{\"code\":0,\"msg\":\"\",\"data\":") or !std.mem.endsWith(u8, body, "}")) {
+        std.debug.print("[api-freeze] sendJsonItems wrote `{s}` — its row promises the `{{code,msg,data}}` envelope\n", .{body});
+        return error.SendJsonItemsShapeChanged;
+    }
+
+    // …and the replacement is a different thing on purpose: the same payload
+    // written through `ctx.json` carries **no** envelope (that difference is the
+    // whole point of the row, so it is asserted rather than assumed).
+    var ctx2 = try http.Context.init(allocator, .GET, "/x");
+    defer ctx2.deinit();
+    try ctx2.json(200, "{\"a\":1}");
+    try std.testing.expectEqualStrings("{\"a\":1}", ctx2.response_body.items);
+}
+
+test "deprecation table: RateLimiter.acquire is still callable, tryAcquire replaces it" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expect(@hasDecl(zmodu.RateLimiter, "acquire"));
+    try std.testing.expect(@hasDecl(zmodu.RateLimiter, "tryAcquire"));
+
+    // `refill_rate = 0` so the bucket cannot refill while the test runs: the
+    // point is which call drains a token, not how long the process took.
+    var limiter = try zmodu.RateLimiter.init(allocator, "api-freeze-acquire", 1, 0);
+    defer limiter.deinit();
+
+    // Both drain the same single-token bucket, one row apart.
+    try std.testing.expect(limiter.acquire());
+    try std.testing.expect(!limiter.tryAcquire());
+
+    limiter.reset();
+    try std.testing.expect(limiter.tryAcquire());
+    // The old name denies when the bucket is empty — it does not wait. If it ever
+    // grows a wait, this is the check that notices.
+    try std.testing.expect(!limiter.acquire());
+}
+
+test "deprecation table: every row's replacement name still resolves" {
+    var missing: usize = 0;
+
+    // Data-driven off the gate's own table: the third column is the half of the
+    // promise that rots quietly (a row keeps saying "use X" long after X was
+    // renamed again), and nothing else checks it.
+    inline for (ALIASES) |alias| {
+        if (!replacementResolves(alias.doc_target)) {
+            std.debug.print("[api-freeze] docs/UPGRADING.md row `{s}` tells the reader to use `{s}`, which does not resolve\n", .{ alias.doc_deprecated, alias.doc_target });
+            missing += 1;
+        }
+    }
+
+    if (missing > 0) return error.ReplacementNameMissing;
+}
+
+/// True when the "现在的名字" a row points at still exists. The table's targets
+/// come in four shapes (`ctx.…`, `http.…`, `RateLimiter.…`, `Application.…`, plus
+/// a bare top-level name), and a trailing `()` is allowed because the docs write
+/// `Application.start()`.
+fn replacementResolves(comptime target: []const u8) bool {
+    const name = comptime blk: {
+        const paren = std.mem.indexOfScalar(u8, target, '(') orelse target.len;
+        break :blk target[0..paren];
+    };
+
+    if (comptime std.mem.startsWith(u8, name, "ctx.")) return @hasDecl(http.Context, name["ctx.".len..]);
+    if (comptime std.mem.startsWith(u8, name, "http.")) return @hasDecl(http, name["http.".len..]);
+    if (comptime std.mem.startsWith(u8, name, "RateLimiter.")) return @hasDecl(zmodu.RateLimiter, name["RateLimiter.".len..]);
+    if (comptime std.mem.startsWith(u8, name, "Application.")) return @hasDecl(zmodu.Application, name["Application.".len..]);
+    if (comptime std.mem.startsWith(u8, name, "zigmodu.")) return @hasDecl(zmodu, name["zigmodu.".len..]);
+    return @hasDecl(zmodu, name);
+}
+
+test "removed: the names off the root stay off, and their files are still compiled" {
     const allocator = std.testing.allocator;
 
     // `@hasDecl(zmodu, …)` is what a consumer's `zigmodu.App` resolves against,
     // so `true` here is exactly the regression the 「已移除」 record guards.
     inline for (REMOVED) |removed| {
         if (comptime @hasDecl(zmodu, removed.root_name)) {
-            std.debug.print("[api-freeze] `zigmodu.{s}` is exported again — docs/UPGRADING.md records it as removed in {s}; use `Application`\n", .{ removed.root_name, removed.commit });
+            std.debug.print("[api-freeze] `zigmodu.{s}` is exported again — docs/UPGRADING.md records it as removed ({s}); use the domain files / `Application` instead\n", .{ removed.root_name, removed.evidence });
             return error.RemovedNameReexported;
+        }
+    }
+
+    // …and the compile gate still reaches each file, so a stale signature inside
+    // it cannot hide behind Zig's lazy analysis.
+    const tests = try readDoc(allocator, "src/tests.zig");
+    defer allocator.free(tests);
+    for (REMOVED) |removed| {
+        if (std.mem.indexOf(u8, tests, removed.compiled_import) == null) {
+            std.debug.print("[api-freeze] src/tests.zig no longer imports {s} — {s} still exists, but nothing compiles it any more\n", .{ removed.compiled_import, removed.file });
+            return error.RemovedBlockUncompiled;
         }
     }
 
@@ -203,15 +435,6 @@ test "removed: the Simplified entry points are off the root and stay off" {
     try std.testing.expect(@hasDecl(Simplified, "App"));
     try std.testing.expect(@hasDecl(Simplified, "ModuleImpl"));
     try std.testing.expect(@hasDecl(Simplified, "Module"));
-
-    // …and the compile gate still reaches it, so a stale signature inside it
-    // cannot hide behind Zig's lazy analysis.
-    const tests = try readDoc(allocator, "src/tests.zig");
-    defer allocator.free(tests);
-    if (std.mem.indexOf(u8, tests, "\"api/Simplified.zig\"") == null) {
-        std.debug.print("[api-freeze] src/tests.zig no longer imports `api/Simplified.zig` — the file still exists, but nothing compiles it any more\n", .{});
-        return error.RemovedBlockUncompiled;
-    }
 
     // The record claims the internal path is the only way in today, so exercise
     // exactly that: `App.init` → `register(ModuleImpl(T)…)` → `start` / `stop`.
@@ -246,6 +469,28 @@ test "removed: the Simplified entry points are off the root and stay off" {
     defer app.deinit();
 }
 
+test "removed: the extensions shim is a rename, not a fork" {
+    // The record has two halves: the `zigmodu.extensions` namespace is gone (the
+    // loop in the test above), and the file that carried it is still in the tree
+    // with the same *types* the domain files export. Pinning the second half is
+    // what makes "migrate off the namespace" a rename rather than a fork: an old
+    // `zigmodu.extensions.HttpServer` value is a `http.Server` value.
+    const Ext = @import("../extensions.zig");
+
+    inline for (.{ "HttpServer", "HttpContext", "SqlxClient", "Orm", "RedisClient", "RetryPolicy", "ConnectionPool", "CronScheduler" }) |name| {
+        try std.testing.expect(@hasDecl(Ext, name));
+    }
+
+    // Identity, not shape: these four are plain types, so the shim's name has to
+    // resolve to the very same declaration the domain file exports (`Orm`,
+    // `Pool`, `Policy`, `Scheduler` are generic/returned types — only existence
+    // is checked for those).
+    try std.testing.expect(Ext.HttpServer == http.Server);
+    try std.testing.expect(Ext.HttpContext == http.Context);
+    try std.testing.expect(Ext.SqlxClient == zmodu.data.sqlx.Client);
+    try std.testing.expect(Ext.RedisClient == zmodu.data.redis.Redis);
+}
+
 test "removed: docs/UPGRADING.md records the same removals this gate pins" {
     const allocator = std.testing.allocator;
 
@@ -268,8 +513,8 @@ test "removed: docs/UPGRADING.md records the same removals this gate pins" {
             std.debug.print("[api-freeze] docs/UPGRADING.md '{s}' does not name {s}, which this gate asserts stays off the root\n", .{ removed_heading, name });
             problems += 1;
         }
-        if (std.mem.indexOf(u8, section, removed.commit) == null) {
-            std.debug.print("[api-freeze] docs/UPGRADING.md '{s}' does not cite commit {s} for `zigmodu.{s}` — the record needs evidence, not just a name\n", .{ removed_heading, removed.commit, removed.root_name });
+        if (std.mem.indexOf(u8, section, removed.evidence) == null) {
+            std.debug.print("[api-freeze] docs/UPGRADING.md '{s}' does not cite {s} for `zigmodu.{s}` — the record needs evidence (a commit, or the oldest written record there is), not just a name\n", .{ removed_heading, removed.evidence, removed.root_name });
             problems += 1;
         }
         if (std.mem.indexOf(u8, section, removed.file) == null) {
@@ -285,6 +530,78 @@ test "removed: docs/UPGRADING.md records the same removals this gate pins" {
     }
 
     if (problems > 0) return error.RemovedRecordDrift;
+}
+
+// ============================================================
+// 1c. File-level banners
+// ============================================================
+
+test "banners: the whole-file DEPRECATED notices are still at the top, and the live one is still live" {
+    const allocator = std.testing.allocator;
+
+    var problems: usize = 0;
+
+    for (BANNERS) |banner| {
+        const content = readDoc(allocator, banner.file) catch |err| {
+            std.debug.print("[api-freeze] cannot read {s} ({s}) — the banner is the file's only deprecation notice\n", .{ banner.file, @errorName(err) });
+            return error.BannerFileUnreadable;
+        };
+        defer allocator.free(content);
+
+        // Banner, not a tombstone somewhere in the middle: the markers have to
+        // sit in the file's opening stretch. (Same 1500-byte budget the
+        // declaration markers use; here it is measured from the top.)
+        const head = content[0..@min(content.len, banner_window)];
+        for (banner.must_contain) |needle| {
+            if (std.mem.indexOf(u8, head, needle) != null) continue;
+            std.debug.print("[api-freeze] {s}: the file-level deprecation banner lost '{s}' from its opening {d} bytes (docs/UPGRADING.md rule 1: mark it deprecated and name the replacement)\n", .{ banner.file, needle, banner_window });
+            problems += 1;
+        }
+    }
+
+    // The still-live one: `src/validation/Validator.zig` says "removed in v1.0",
+    // but `http.FieldRules` *is* its `FieldRules` today, so the sentence is a plan
+    // with a prerequisite. Both halves are pinned — the public spelling consumers
+    // use, and the file it resolves to — so the file cannot be deleted as the
+    // banner promises without this gate going red first.
+    const DeprecatedValidator = @import("../validation/Validator.zig");
+    const ObjectValidator = @import("../validation/ObjectValidator.zig");
+
+    try std.testing.expect(@hasDecl(http, "FieldRules"));
+    try std.testing.expect(@hasDecl(http, "validateRequest"));
+    try std.testing.expect(http.FieldRules == DeprecatedValidator.FieldRules);
+
+    // …and the replacement the banner names is a *different* type, so "use
+    // `zigmodu.Validator` instead" is a real migration and not a self-reference.
+    try std.testing.expect(@hasDecl(zmodu, "Validator"));
+    try std.testing.expect(zmodu.Validator == ObjectValidator.Validator);
+    try std.testing.expect(zmodu.Validator != DeprecatedValidator.Validator);
+
+    // Called for real: Zig's lazy analysis would let the file's signatures rot
+    // as long as nothing ever calls them.
+    const empty = DeprecatedValidator.notEmpty("");
+    try std.testing.expect(!empty.valid);
+
+    // The other half of the banner the gate checks: the replacements it lists for
+    // the extensions shim's first line of exports still resolve.
+    try std.testing.expect(@hasDecl(http, "http_server"));
+    try std.testing.expect(@hasDecl(zmodu.data, "sqlx"));
+    try std.testing.expect(@hasDecl(zmodu.data, "orm"));
+    try std.testing.expect(@hasDecl(zmodu.data, "redis"));
+    try std.testing.expect(@hasDecl(zmodu.security, "auth"));
+
+    if (problems > 0) return error.BannerDrift;
+
+    // The classification itself is written down (docs/API_FREEZE.md), so a reader
+    // meets "these two are neither rows nor removals" before the failure does.
+    const freeze_doc = try readDoc(allocator, "docs/API_FREEZE.md");
+    defer allocator.free(freeze_doc);
+    for (BANNERS) |banner| {
+        if (std.mem.indexOf(u8, freeze_doc, banner.file) == null) {
+            std.debug.print("[api-freeze] docs/API_FREEZE.md does not mention {s}, which this gate treats as a file-level deprecation banner — the classification has to live somewhere a reader can find it\n", .{banner.file});
+            return error.BannerUndocumented;
+        }
+    }
 }
 
 /// Text after `heading` up to the next line that starts with `#`, so a sibling

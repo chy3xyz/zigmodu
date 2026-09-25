@@ -8,7 +8,7 @@
 
 | 口径 | 出处 |
 |---|---|
-| 弃用别名**不早于 1.0** 删除 | `docs/UPGRADING.md:8-10`（统一口径），表在 `:12-17`、已移除记录在 `:19-32`（本文件不抄第二份） |
+| 弃用别名**不早于 1.0** 删除 | `docs/UPGRADING.md:8-10`（统一口径），表在 `:12-22`、已移除记录在 `:43-71`（本文件不抄第二份） |
 | `Application` / `Module` / `DI` / `EventBus` / HTTP 公开契约**只增不改** | `docs/RUNTIME.md:58`（§2 第 1–4 条见 `:37-40`，第 9 条见 `:46`） |
 | `runtime.*` 在 0.x **允许 breaking** | `docs/RUNTIME.md:47-49`（§2 第 10 条）+ `:54-61`（"0.x 不破坏"不成立）；先例 `:537`（v0.28.0 删掉 `Runtime.cancelTimer(id) bool`） |
 | 每次 runtime breaking 要**同时**进 §9 路线图与 `UPGRADING.md` 对应版本段 | `docs/RUNTIME.md:59-61` |
@@ -52,13 +52,14 @@
 
 ## 弃用别名与删除时点
 
-**不在这里抄第二份。** 表在 `docs/UPGRADING.md:12-17`，本文件只声明门禁怎么管它：
+**不在这里抄第二份。** 表在 `docs/UPGRADING.md:12-22`，本文件只声明门禁怎么管它：
 
-- 每一行由 `src/test/ApiFreeze.zig` 逐行断言：弃用名仍可调用、指向的"现在的名字"仍存在；
-- 该行代码里的 `DEPRECATED` 标注与"指向新名"也要在（`docs/UPGRADING.md:34-37` 的规则 1）；
+- 每一行由 `src/test/ApiFreeze.zig` 逐行断言：弃用名仍可调用、指向的"现在的名字"仍存在
+  （`replacementResolves` 按 `ALIASES` 的第三列逐条 `@hasDecl`，第三列自己也会烂）；
+- 该行代码里的 `DEPRECATED` 标注与"指向新名"也要在（`docs/UPGRADING.md` 的规则 1）；
 - **表 ↔ 门禁双向同步**：表里加一行而门禁没跟上是红，门禁里留着一行而表删了也是红。
 
-### 已移除的记录（`docs/UPGRADING.md:19-32`）
+### 已移除的记录（`docs/UPGRADING.md:43-71`）
 
 表只承诺**还活着**的别名。已经删掉的名字进不了表 —— 给它写"不早于 1.0 删除"等于告诉读者它今天还能用；
 它们记在表下方的「已移除」小节里，门禁对它们的断言方向**相反**：**不得**重新出现在顶层。
@@ -66,12 +67,29 @@
 - `zigmodu.App` / `zigmodu.ModuleImpl`：随 `Simplified` 整块在 commit `557190a`（2026-05-12）从 `src/root.zig` 移除，
   替代品 `Application`。门禁断言 `@hasDecl(zmodu, …)` 为**假**（回到顶层即红），
   并断言 `src/api/Simplified.zig` 仍在树里、仍被 `src/tests.zig` 的编译门禁 import —— **只到文件级**，
-  不是"整块 API 仍受支持"的承诺。记录里的名字 / commit / 文件路径三者都由门禁对照文档检查（措辞改了也要一起改）。
+  不是"整块 API 仍受支持"的承诺。记录里的名字 / 证据 / 文件路径三者都由门禁对照文档检查（措辞改了也要一起改）。
+- `zigmodu.extensions`：整个命名空间（旧写法 `zigmodu.extensions.HttpServer` 等）已从顶层移除，
+  **没有可引用的 commit** —— 记录里给的是本仓最老的书面证据 `CHANGELOG.md` 的 `[0.15.0]` 段，门禁要求文档
+  原样保留这个引用。替代品是域文件（`zigmodu.http.*` / `zigmodu.data.*`），今天 `src/extensions.zig` 仍在树里、
+  仍被 `src/tests.zig` 的编译门禁 import，且 shim 里的名字仍指向域文件的**同一批类型**（门禁逐条 `==`）。
+
+### 整模块级弃用横幅（第三类：既不进表，也不进「已移除」）
+
+`docs/UPGRADING.md:24-41` 写着这两处为什么两边都不进。门禁（`src/test/ApiFreeze.zig` 的 `BANNERS`）钉的是：
+
+- 横幅仍在**文件头 1500 字节**内，且仍点名替代路径；
+- `src/extensions.zig` 仍被 `src/tests.zig` 的编译门禁 import；`src/validation/Validator.zig` 不在那份直接
+  import 名单里（那里 import 的是 `validation/ObjectValidator.zig`），由门禁自己 `@import` 并**真调一次**
+  （`notEmpty`），所以它的签名同样不会静默烂掉；
+- `src/validation/Validator.zig` 的"还活着"证据：`http.FieldRules` 与 `http.validateRequest` 仍在，
+  且 `http.FieldRules == Validator.zig 的 FieldRules`；替代品 `zigmodu.Validator` 解析到
+  `validation/ObjectValidator.zig` 的**另一个**类型（`!=` 是断言的一部分：那是真迁移，不是自指）。
+  这半条是刻意钉住的 —— 横幅写着"v1.0 删除"，但删之前必须先把 `http.FieldRules` 这个公开拼写迁走。
 
 ## 覆盖不到的部分（只能人工看）
 
 1. **已移除的块只钉"回不到顶层"，不钉"用不了"。** `Simplified` 整块（`App` / `ModuleImpl` / `Module`）已从顶层移除
-   （`docs/UPGRADING.md:19-32`）。门禁钉的是 `zigmodu.App` / `zigmodu.ModuleImpl` **不**在顶层、且 `src/api/Simplified.zig`
+   （`docs/UPGRADING.md:43-71`）。门禁钉的是 `zigmodu.App` / `zigmodu.ModuleImpl` **不**在顶层、且 `src/api/Simplified.zig`
    仍在树上并被 `src/tests.zig` 的编译门禁 import —— 这不是"整块 API 仍受支持"的承诺：门禁**不断言**里面的签名，
    也不断言越路径 `@import("zigmodu/src/api/Simplified.zig")` 在下一个版本还能用（越包内路径不受支持）。
    门禁确实跑 `App.init` → `register(ModuleImpl(T).interface(…))` → `start` / `stop` 的 before 流程，但那是**走越路径 import**
@@ -81,23 +99,35 @@
 4. **`docs/API.md` 里的逐符号存在性**由 `src/test/DocsConsistency.zig` 覆盖（跨文件 import，与消费者可见性一致），本文件不重复。
 5. **每个类别的完整导出名单**不在本文件：同步测试比的是"本文件点到的锚点集合"与门禁的集合，不是 `root.zig` 的全部导出。
 6. **`runtime.*` 的 breaking 是否真的进了 §9 与 `UPGRADING.md`**（`RUNTIME.md:59-61` 的流程要求）没有机械检查 —— 人工看。
-7. **表外的弃用标记没有反查。** 门禁只检查"表里已有的行"；反过来"代码里标了 `DEPRECATED` 但表里没补行"
-   仍然**没有**机械检查，只能人工看 —— 要自动化就得扫全树标记，而标记既出现在声明前、也出现在模块级横幅里，
-   误报面太大。**已收口（2026-09-25）**：`src/root.zig:63-66` 的 `startAll` / `stopAll` 与 `src/http.zig:13` 的
-   `http_server` 已按该节规则 2 补进表（`docs/UPGRADING.md:15-17`），并各有一条可执行检查。
-   **仍在表外（观察，未决定）**：`src/validation/Validator.zig:3`（整个模块弃用）、
-   `src/resilience/RateLimiter.zig:70`（`acquire` → `tryAcquire`）、`src/api/Server.zig` 的 `sendSuccess` /
-   `sendFail` / `sendPageResult` / `sendJsonItems`（都指向 `ctx.json`）、`src/extensions.zig:1`（域文件级弃用）。
+7. **表外的弃用标记仍然不能全量反查；但已知的四处已经逐个收口。** 门禁只检查"表里已有的行"；反过来
+   "代码里标了 `DEPRECATED` 但表里没补行"**没有**通用的机械检查 —— 要自动化就得扫全树标记，而标记既出现在
+   声明前、也出现在模块级横幅里，误报面太大。所以采取的是**点名收口**：每发现一处就归类、入表或入档，并由门禁钉住。
+   - **已按规则 2 补进表（2026-09-25，第 40 批）**：`src/root.zig:63-66` 的 `startAll` / `stopAll` 与
+     `src/http.zig:13` 的 `http_server`。
+   - **已按规则 2 补进表（第二批）**：`src/resilience/RateLimiter.zig:70` 的 `acquire` → `tryAcquire`、
+     `src/api/Server.zig` 的 `sendSuccess` / `sendFail` / `sendPageResult` / `sendJsonItems` → `ctx.json`
+     （表在 `docs/UPGRADING.md:18-22`）。四条 `send*` 是**一族**：`scripts/check-production.sh` 的"信封泄漏"
+     扫描把它们当同一形状处理。
+   - **整模块横幅已归类，不在这张表里**：`src/validation/Validator.zig` 与 `src/extensions.zig`
+     （见上面「整模块级弃用横幅」一节）。前者**还活着**（`http.FieldRules` 就是它的），所以按"可达"处理而不是
+     "已移除"；后者是**命名空间级**的移除，已记进「已移除」的记录并由门禁钉住 `@hasDecl(zmodu, "extensions")` 为假。
+   - **仍未收口**：没有。四处都已在文档与门禁里各就各位；下次再发现表外标记，照同样的三步走（归类 → 入表/入档 → 加断言）。
 8. **`zigmodu.stopAll` 的标记检查不独立。** 门禁的标记看的是声明前 1500 字节（`marker_window`），
    `src/root.zig:63-66` 两条标记只隔一行，所以只删 `stopAll` 那条注释**不会**让它红（`startAll` 的注释里也有
    `Application.stop()`）。要让两条各自独立，得把窗口收窄成"紧邻的 doc comment"—— 那是门禁自己的比较口径，暂不动，人工看。
+   同样的窗口口径也适用于 `Server.zig` 里连续四个 `send*`（四个标记相邻），以及两条 `root.zig` 之外的
+   文件级横幅（`banner_window` 从文件头量起）—— 这些**验收标准是"标记还在"，不是"标记恰好只属于这一条"**。
 
 ## 新增一行要做什么
 
-1. 在 `docs/UPGRADING.md:12-17` 加弃用行（删除列不要留空），**并**在 `src/test/ApiFreeze.zig` 的 `ALIASES` 加对应项 + 一个可调用的检查；
-   两张表不一致时同步测试会红。
+1. 在 `docs/UPGRADING.md:12-22` 加弃用行（删除列不要留空），**并**在 `src/test/ApiFreeze.zig` 的 `ALIASES` 加对应项 + 一个可调用的检查
+   （第三列的"现在的名字"由 `replacementResolves` 统一断言存在）；两张表不一致时同步测试会红。
 2. 冻结/preview 面同理：改本文件的表 → 门禁的表必须同改（`FREEZE_CATEGORIES` / `PREVIEW`）。
    只改一边 = 红。**preview 往上加符号时先问一句**：它是不是该留在 `runtime.*` 里（第 10 条只保护 `runtime.*`）。
 3. **删一行要在三处一起动**：从表里移出去 → `ALIASES` 同步删（"门禁留着一行而表删了"是红）→ 在
-   `docs/UPGRADING.md:19-32` 的「已移除」记录里写清名字 / commit / 替代品 / 今天怎么找到它，并在
-   `src/test/ApiFreeze.zig` 的 `REMOVED` 加一项（门禁钉它**不得**回到顶层，也钉记录里的名字与 commit）。
+   `docs/UPGRADING.md` 的「已移除」记录里写清名字 / 证据 / 替代品 / 今天怎么找到它，并在
+   `src/test/ApiFreeze.zig` 的 `REMOVED` 加一项（门禁钉它**不得**回到顶层，也钉记录里的名字、证据与文件路径，
+   外加"该文件仍被 `src/tests.zig` 的编译门禁 import"）。
+4. **整文件级的 `DEPRECATED` 横幅（第三种情况）**：既没有"消费者写过的旧名"可进表，又不是移除记录时，
+   标进 `docs/UPGRADING.md:24-41` 与本文件的「整模块级弃用横幅」，并在 `src/test/ApiFreeze.zig` 的 `BANNERS`
+   加一项（横幅位置 + 替代路径 + 是否还承载公开拼写）。`BANNERS` 里的文件必须在本文件里被点到，否则红。

@@ -2,6 +2,42 @@
 
 ## [Unreleased]
 
+### 第 44 批：弃用表收口（补 5 行 + 把两个"整模块横幅"另立一类，并查出其中一个是**活的**）、`WebSocketMonitor.stop()` 不再等满一个 sleep 周期、并给 `start()` 补上缺失的幂等守卫（**破坏性：否**）
+
+全量 `-Ddb=all` **2021/2079（58 skipped，0 failed）**；`WebSocket` 19/19（含 2 条新增）、`ApiFreeze` 14/14（9 → 14）、`im.` 47/47；抽查的示例（含改动过的两个）全绿；fmt / check / check-api / check-deadcode 全绿。
+
+**① 弃用表收口：把"表外还挂着的标记"逐个归类，而不是加一条通用反查。** 表里补 5 行 —— 四个
+`ctx.sendSuccess/sendFail/sendPageResult/sendJsonItems`（→ `ctx.json`，不再包 `{code,msg,data}` 信封）与
+`RateLimiter.acquire`（→ `tryAcquire`，它从来没等过）—— 各带可执行门禁（能编译能调用 + 标记窗口 + 替身名可解析）。
+另立第三类「**整模块级弃用横幅**」（既不进表也不进"已移除"，因为它们的旧名要么命名空间没了、要么只能越路径触达）：
+`src/extensions.zig` 与 `src/validation/Validator.zig`。
+
+> **这一批查出来最值得记的一条**：`src/validation/Validator.zig` **今天仍然是活的** —— `http.FieldRules`
+> **就是**它的 `FieldRules`（`src/http.zig:291` → `src/api/Extract.zig:16`），`http.validateRequest` 中间件也
+> import 它。所以那条横幅写的"v1.0 删除"**不能直接执行**：删之前必须先把 `http.FieldRules` 这个公开拼写迁走。
+> 门禁把这条耦合钉住了（`http.FieldRules` 仍指向该文件，且 `zigmodu.Validator` 解析到的是**另一个**类型 ——
+> 那是真迁移，不是自指）。
+> `zigmodu.extensions` 记进"已移除"，并**如实标注没有可引用的 commit**（无 git 可用）：改引本仓最老的书面证据
+> `CHANGELOG.md` 的 `[0.15.0]` 段，再由门禁实测 `@hasDecl(zigmodu, "extensions") == false`。
+> **仍缺**：规则 3（在各自版本条目里回指本节）没补。
+
+**② `WebSocketMonitor.stop()` 不再等满一个 sleep 周期。** 上一批改成 `concurrent` 时留的代价是
+`update_group.await` 要等当前 `std.Io.sleep`（默认 5 s）到期。改成 **`Group.cancel`**：std 自己给的这条路
+（`Io.zig:1421-1425`，"Equivalent to `await` but immediately requests cancelation on all members"，且**带 drain**），
+对 `std.Io.sleep` 的效果是 `error.Canceled`（它的错误集恰好只有这一个值）。同时给 `updateLoop` 加了
+"**睡前再查一次 flag**" —— 取消只送达**一个**取消点（`Io.zig:1295-1301`），而 `broadcastMetrics` 自己也能吃掉它
+（争用的 `clients_mutex.lock`、socket 写），那时新周期将**不可取消**、`stop()` 只好等满 5 s：那正是要修的缺陷
+换了个触发条件。新测试用**结构性断言**（`sleeps_canceled == 1` 且 `periods_completed == 0`），
+红证据：把 `cancel` 退回 `await` → `[ws stop] period=5000ms stop()=5001ms sleeps_canceled=0 periods_completed=1`
++ `expected 1, found 0` / `FAIL`。
+
+**③ `WebSocketMonitor.start()` 缺 `is_running` 守卫**（`WebSocketServer.start()` 有）。重复 `start()` 会往同一个
+`update_group` 里塞**第二个** `updateLoop` —— 每周期广播两次（`stop()` 仍能收掉两个成员，所以是语义 bug、不是泄漏）。
+已补守卫。**并且这条测试的第一版没有牙齿**：用 `sleeps_canceled` 断言时，**去掉守卫它照样通过** —— 第二个成员在
+`broadcastMetrics` 里就把取消吃掉了，压根没走到 sleep。改成计 `updateLoop` 的**进入次数**（新增
+`update_loops_started`）后才是结构性的：去掉守卫 → `expected 1, found 2` / `FAIL`；有守卫 → 绿。
+（这条"我的断言本来没牙齿、被一次注入实验证伪"的过程也留在测试注释里。）
+
 ### 第 43 批（诊断，答案已出）：夜间 `Fuzz` 的 `corrupted coverage file` —— 一次 dispatch 排除了"runner 文件系统"这个候选；留下的是一个 **24 字节的头部空产物**（**破坏性：否**；临时改动已按承诺收掉，只留失败时的证据转储）
 
 第 41 批已否掉"缓存里的陈旧产物"。本批把 `ZIG_LOCAL_CACHE_DIR` 指到 `${{ runner.temp }}`（把本地缓存连同

@@ -15,6 +15,30 @@
 | `zigmodu.startAll` | `Application.start()` | 不早于 1.0 |
 | `zigmodu.stopAll` | `Application.stop()` | 不早于 1.0 |
 | `zigmodu.http.http_server` | `http.Server` | 不早于 1.0 |
+| `ctx.sendSuccess` | `ctx.json`(200, data) —— 不再包 `{code,msg,data}` 信封 | 不早于 1.0 |
+| `ctx.sendFail` | `ctx.json`(status, body) | 不早于 1.0 |
+| `ctx.sendPageResult` | `ctx.json`(200, body)，分页结构自己拼 | 不早于 1.0 |
+| `ctx.sendJsonItems` | `ctx.json`(200, body) | 不早于 1.0 |
+| `RateLimiter.acquire` | `RateLimiter.tryAcquire`（同义；它从来没等过） | 不早于 1.0 |
+
+### 整模块级弃用横幅（既不进表，也不进「已移除」）
+
+代码里还有两个**整文件级**的 `DEPRECATED` 横幅。它们与 `Simplified` 不是一类，所以两边都不进：上面那张表只写
+"消费者写过的旧名 → 现在的名字"，而这两处的旧名要么命名空间已经没了，要么本来就只能越路径触达。
+
+- **`src/extensions.zig`** —— 旧的 `zigmodu.extensions` 命名空间**已从顶层移除**（记录见下面的「已移除」），
+  剩下一个只导出类型别名的 shim，仍被 `src/tests.zig` 的编译门禁 import。
+- **`src/validation/Validator.zig`** —— 横幅写的是"用 `zigmodu.Validator`（`validation/ObjectValidator.zig`）替代，
+  v1.0 删除"，但**今天它仍然是活的**：`http.FieldRules` 就是它的 `FieldRules`（`src/http.zig:291` →
+  `src/api/Extract.zig:16`），`http.validateRequest` 中间件也 import 它。所以这条横幅的后半句**不能直接执行**：
+  先把 `http.FieldRules` 这个公开拼写迁走，否则删文件就是编译错。`src/test/ApiFreeze.zig` 把这条耦合钉住了。
+
+门禁对这两处的断言：横幅仍在**文件头 1500 字节**内、横幅点名的替代路径仍可解析（`zigmodu.Validator` /
+`zigmodu.http.http_server` / `zigmodu.data.sqlx` / `zigmodu.data.orm` / `zigmodu.data.redis` / `zigmodu.security.auth`）、
+`http.FieldRules` 仍指向 `validation/Validator.zig`（"它还没死"的证据）、`src/extensions.zig` 仍被 `src/tests.zig`
+的编译门禁 import（`validation/Validator.zig` 不在那份直接 import 名单里 —— `src/tests.zig` 直接 import 的是
+`validation/ObjectValidator.zig`；前者由门禁自己 `@import` 并可执行地调一次，加上 `src/api/Extract.zig` /
+`src/api/middleware/Validation.zig` 这两条链一起编译）。
 
 ### 已移除（记录，不是承诺）
 
@@ -31,10 +55,32 @@
 - **门禁**：`src/test/ApiFreeze.zig` 钉住 `zigmodu.App` / `zigmodu.ModuleImpl` **不得**回到顶层，
   并钉住 `src/api/Simplified.zig` 仍被 `src/tests.zig` 的编译门禁 import。
 
+第二块是 `zigmodu.extensions`：
+
+- **移除的名字**：`zigmodu.extensions` 整个命名空间 —— 旧写法长这样：`zigmodu.extensions.HttpServer`、
+  `zigmodu.extensions.ModuleTestContext`（迁移方向见 `docs/dev/upgrade-roadmap.md:77`）。
+- **何时移除的**：**没有可引用的 commit 或 tag**（本批不查 `git`）。可引用的书面证据是 `CHANGELOG.md` 的
+  `[0.15.0]`（2026-08-01）那一段：它把 `zigmodu.ModuleTestContext` 列为 `root.zig` 的导出，并把
+  `examples/testing` 记作"已移出弃用的 `zigmodu.extensions` 命名空间"—— 也就是说那时这个命名空间已经不在推荐面上。
+  今天的事实**由门禁自己钉住**：`@hasDecl(zigmodu, "extensions")` 必须为**假**。
+- **替代品**：域文件 —— `HttpServer` → `zigmodu.http.Server`、`HttpContext` → `zigmodu.http.Context`、
+  `SqlxClient` → `zigmodu.data.sqlx.Client`、`Orm` → `zigmodu.data.orm.Orm`、`RedisClient` → `zigmodu.data.redis.Redis`。
+- **今天在哪能找到它**：`src/extensions.zig` 仍在树里（只导出上述几种类型别名），且**只能越路径**触达：
+  `const extensions = @import("zigmodu/src/extensions.zig");` —— 越包内路径不受支持，随时会变。
+  文件头横幅自己写着 "This file will be removed in v1.0"。
+- **门禁**：`src/test/ApiFreeze.zig` 钉住 `zigmodu.extensions` **不得**回到顶层、`src/extensions.zig` 仍在树里、
+  仍被 `src/tests.zig` 的编译门禁 import，且 shim 里的名字仍指向域文件里的**同一批类型**（`HttpServer == http.Server` 等）。
+
 新增弃用项要同时做三件事（否则这张表会变成第二个没人维护的清单）：
 1. 在**代码**的文档注释里写明它已弃用并指向新名；
 2. 在**本表**加一行，删除列不要留空；
 3. 在**它自己那版**的条目里指回本节。
+
+规则 3 的现状（逐条写清楚，**不为凑数编版本号**）：`ctx.paramPath` 在 `v0.15.46` 那节已回指、
+`RateLimiter.acquire` 在 `v0.15.45` 那节已回指。其余各项**在本仓找不到可回指的版本段** ——
+`ctx.sendSuccess` / `ctx.sendFail` / `ctx.sendPageResult` / `ctx.sendJsonItems`、`zigmodu.startAll` / `zigmodu.stopAll` /
+`zigmodu.http.http_server`、以及上面两个整模块横幅，在 `CHANGELOG.md` 与本文里都没有"某版本引入/弃用"的条目
+（`docs/API-MIGRATION.md`「HTTP responses」那段是散文，没有版本号），所以不演一个出来。
 
 
 > 每条变更标注 **Breaking?** / **影响面** / **一行改法**。
@@ -1020,6 +1066,10 @@ const lim = registry.limiters.getPtr("key").?;
 // after
 const lim = registry.get("key").?;            // 或 getOrCreate("key")
 ```
+
+**顺带（同一版）**：`RateLimiter.acquire` 从这一版起被标注为 `DEPRECATED` —— 它与 `tryAcquire` 同义
+（同步上下文里那个"等待"从来没有实现过）。`CHANGELOG.md` 的 `[0.15.45]` 段记着这条；
+删除时点与替代名见 **§ 弃用别名与删除计划**。
 
 ### `ProblemDetails.statusTitle` 补全状态码
 
