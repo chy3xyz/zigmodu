@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+### 第 43 批（诊断，答案已出）：夜间 `Fuzz` 的 `corrupted coverage file` —— 一次 dispatch 排除了"runner 文件系统"这个候选；留下的是一个 **24 字节的头部空产物**（**破坏性：否**；临时改动已按承诺收掉，只留失败时的证据转储）
+
+第 41 批已否掉"缓存里的陈旧产物"。本批把 `ZIG_LOCAL_CACHE_DIR` 指到 `${{ runner.temp }}`（把本地缓存连同
+覆盖目录一起换到另一个文件系统）跑了一次 dispatch，结果是：
+
+```
+error: step run test: corrupted coverage file /home/runner/work/_temp/zig-fuzz-cache/v/59e4bde28e630904: pcs_len was zero
+--- /home/runner/work/_temp/zig-fuzz-cache/v/59e4bde28e630904 (24 bytes)
+```
+
+**失败跟着目录走、哈希一模一样、产物 24 字节** ⇒ **不是文件系统截断**（候选 1 排除）。24 字节 = 一个只有头部、
+**零个 PC** 的覆盖文件，而且它是这次运行自己写出来的。
+
+**下一步的关键线索（本批读日志时发现，尚未定论）**：这个 runner 上**好几个步骤的 build summary 里都印着
+`compile test debug native failure`，而那些步骤 GitHub 报成 success** —— 所以那行本身证明不了什么；
+但"24 字节空覆盖产物"与"某个 test 二进制其实没构建/没跑成"是能对上的（真错误可能被覆盖文件的报错盖住）。
+判它的实验是：同一台 runner 上跑一次**不带 `--fuzz`** 的 `zig build test`，看编译结果是否干净。
+
+**按承诺收掉的临时改动**：`ZIG_LOCAL_CACHE_DIR` 覆盖已删除。**保留**失败时的证据转储（列出 `v/` 下每个
+产物的字节数与头 32 字节）——它不掩盖失败、也不改变任何断言，只是让下一次红自带现场。
+
 ### 第 43 批（诊断）：一次 dispatch 把夜间 `Fuzz` 的 `corrupted coverage file` 在剩下两个候选之间切开（**临时**，拿到答案就撤）
 
 第 41 批记过：这个失败**不是**缓存里的陈旧产物（那一步在位时它照样红、同一个哈希），本机同一条命令绿。
