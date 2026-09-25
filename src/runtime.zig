@@ -40,6 +40,11 @@ pub const scheduler = @import("runtime/scheduler.zig");
 /// Supervisor module: supervision groups — policies, restart budget, the tree
 /// (docs/RUNTIME.md §14).
 pub const supervisor = @import("runtime/supervisor.zig");
+/// CPU affinity module: pin the calling thread to a CPU where the platform
+/// allows it. The module doc is the platform truth table (macOS: no API at all;
+/// Linux: `sched_setaffinity`; Windows: no binding in std) — read it before
+/// reaching for this.
+pub const affinity = @import("runtime/affinity.zig");
 /// Runtime implementation: `Runtime`, the worker contract, stats, supervision.
 pub const runtime_impl = @import("runtime/runtime.zig");
 

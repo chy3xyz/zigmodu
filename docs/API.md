@@ -201,12 +201,20 @@ Service container for dependency injection.
 ```zig
 pub fn init(allocator: std.mem.Allocator) Self
 pub fn deinit(self: *Self) void
+pub fn freeze(self: *Self) void
 pub fn register(self: *Self, comptime T: type, name: []const u8, instance: *T) !void
+pub fn registerBorrowed(self: *Self, comptime T: type, name: []const u8, instance: *T) !void
 pub fn get(self: *Self, comptime T: type, name: []const u8) ?*T
+pub fn getComptime(self: *Self, comptime T: type, comptime name: []const u8) ?*T
 pub fn contains(self: *Self, name: []const u8) bool
 pub fn remove(self: *Self, name: []const u8) void
 pub fn serviceCount(self: *Self) usize
 ```
+
+`register` takes ownership (the container destroys the instance on
+`remove`/`deinit`); `registerBorrowed` does not. After `freeze()`, `register` and
+`registerBorrowed` return `error.ContainerFrozen`, `remove` warns and is a no-op,
+and `get`/`contains` are lock-free reads.
 
 **Example:**
 ```zig
@@ -229,9 +237,27 @@ Scoped dependency container with parent resolution. Hoisted like `zigmodu.Contai
 pub fn init(allocator: std.mem.Allocator, scope_name: []const u8, parent: ?*Container) Self
 pub fn deinit(self: *Self) void
 pub fn register(self: *Self, comptime T: type, name: []const u8, instance: *T) !void
+pub fn registerBorrowed(self: *Self, comptime T: type, name: []const u8, instance: *T) !void
 pub fn get(self: *Self, comptime T: type, name: []const u8) ?*T
 pub fn contains(self: *Self, name: []const u8) bool
+pub fn remove(self: *Self, name: []const u8) void
+pub fn serviceCount(self: *Self) usize
 ```
+
+**Semantics — the two halves do not fall through the same way:**
+
+| Falls through to `parent` | Local only |
+|---|---|
+| `get`, `contains` | `register`, `registerBorrowed`, `remove`, `serviceCount` |
+
+`remove` drops this scope's own registration and never reaches the parent: a
+scope unregistering a shared service would leave every other reader of the parent
+container holding a destroyed instance. `serviceCount` counts this scope's
+registrations only — the same name may be registered at both levels and would
+otherwise count twice. There is no `freeze` and no `getComptime` here: a scope is
+short-lived, the framework's freeze point is the application `Container` after
+`start()`, and the local→parent lookups are runtime branches that a comptime
+specialization cannot hoist away.
 
 ---
 
@@ -256,6 +282,35 @@ pub fn set(self: *Self, key: []const u8, value: ConfigValue) !void
 pub fn has(self: *Self, key: []const u8) bool
 ```
 
+The store loads JSON itself; TOML arrives through `zigmodu.TomlLoader` below.
+
+### TomlLoader
+
+#### `zigmodu.TomlLoader`
+
+Fills an existing `ConfigManager` from a `.toml` file — sections become
+dotted keys (`[server]` + `port` → `server.port`) and values keep their TOML
+type, so `getInt` / `getBool` / `getFloat` work on them. Owned by the caller:
+construct it per load, and `deinit` the store as usual.
+
+```zig
+pub fn init(allocator: std.mem.Allocator) Self
+pub fn loadFile(self: *Self, path: []const u8, config: *ConfigManager) !void
+```
+
+```zig
+var config = zigmodu.ConfigManager.init(allocator);
+defer config.deinit();
+
+var loader = zigmodu.TomlLoader.init(allocator);
+try loader.loadFile("app.toml", &config);
+
+const port = config.getInt("server.port") orelse 8080;
+```
+
+For a flat string→string map instead (no typed reads), `zigmodu.TomlParser` in
+the parser section below does the same job without a store.
+
 ### ExternalizedConfig
 
 #### `zigmodu.ExternalizedConfig`
@@ -273,13 +328,21 @@ pub fn refresh(self: *Self) !void
 
 ### YAML/TOML Parser
 
-```zig
-// YAML
-pub fn parseFile(self: *Self, path: []const u8) !std.StringHashMap([]const u8)
+#### `zigmodu.YamlParser` / `zigmodu.TomlParser`
 
-// TOML
+Both flatten a file into a `StringHashMap([]const u8)` — values stay strings, so
+numbers and booleans need parsing by hand. Reach for `zigmodu.TomlLoader` above
+instead when you want typed reads out of the same key space.
+
+```zig
+pub fn init(allocator: std.mem.Allocator) Self
 pub fn parseFile(self: *Self, path: []const u8) !std.StringHashMap([]const u8)
+pub fn parse(self: *Self, content: []const u8) !std.StringHashMap([]const u8)
+pub fn deinitMap(self: *Self, map: *std.StringHashMap([]const u8)) void
 ```
+
+Ownership: the returned map and the strings in it are the parser's allocations —
+hand the map back to `deinitMap` rather than freeing it field by field.
 
 ---
 
@@ -385,14 +448,15 @@ pub fn getConnectedNodes(self: *Self) []const *Node
 pub fn getNodeCount(self: *Self) usize
 ```
 
-### TransactionalEvent — internal, not importable
+### TransactionalEvent — removed
 
-`src/core/TransactionalEvent.zig` has **no** `root.zig` export and should not get
-one: it is a stub. `TransactionManager.stageEvent` and `Transaction.addEvent`
-discard their argument (`_ = event;`), `commit` only flips a local state field, and
-`EventOutbox.store` allocates a zero-length payload. The working implementations
-are the outbox (`zigmodu.outbox.OutboxPublisher` / `OutboxPoller`, plus
-`docs/API.md` § Outbox) and, for compensating long-running flows,
+`src/core/TransactionalEvent.zig` was deleted: it was a stub, not an implementation.
+`TransactionManager.stageEvent` and `Transaction.addEvent` discarded their argument
+(`_ = event;`), `commit` only flipped a local state field, and `EventOutbox.store`
+allocated a zero-length payload. It had no `root.zig` export and no caller anywhere in
+`src/`, `examples/` or `tools/`, so there was nothing to keep for. The working
+implementations are the outbox (`zigmodu.outbox.OutboxPublisher` / `OutboxPoller`, see
+§ `zigmodu.outbox.OutboxConsumer` below) and, for compensating long-running flows,
 `zigmodu.SagaOrchestrator`.
 
 ---

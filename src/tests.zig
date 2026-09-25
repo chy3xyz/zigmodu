@@ -58,7 +58,6 @@ test "compile all source files" {
     _ = @import("core/ModuleRuntime.zig");
     _ = @import("core/ModuleRegistry.zig");
     _ = @import("core/Transactional.zig");
-    _ = @import("core/TransactionalEvent.zig");
     _ = @import("extensions/PluginManager.zig");
     _ = @import("extensions/WebMonitor.zig");
     _ = @import("extensions/WebSocket.zig");
@@ -156,6 +155,12 @@ test "compile all source files" {
     // and spin-cost tables are printed, and the bound is asserted — so reaching
     // this file from here is what makes the numbers below run at all.
     _ = @import("runtime/precision_timer.zig");
+    // CPU affinity: the primitive alone (`pinCurrentThread`). The test here is
+    // the platform contract — a real pin on Linux, `error.Unsupported`
+    // everywhere the OS has no API — so reaching this file from here is what
+    // keeps the Linux half of it exercised in CI (see the module doc for the
+    // evidence behind the truth table).
+    _ = @import("runtime/affinity.zig");
 
     // IM domain. `im/ConnectionRegistry.zig`'s own tests were never wired here:
     // the file is reached only through `im/im.zig`, which `root.zig` exports and

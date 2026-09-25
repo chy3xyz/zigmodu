@@ -123,6 +123,16 @@ build() 注入 withService  ──▶  start() 模块 initWith 注册/读取  �
 `ApplicationBuilder.withService` 一律走借用注册——main 里的 `config`、`db_client` 等由 main 管理
 生命周期，容器只是目录。把栈指针交给 `register`（拥有语义）会得到悬垂指针，这是旧 API 的已修陷阱。
 
+**scoped 容器同理，且改/查两半的穿透规则不同**（`zigmodu.ScopedContainer`）：
+
+| 穿透到 `parent` | 只作用于本 scope |
+|----------------|-----------------|
+| `get`、`contains` | `register`、`registerBorrowed`、`remove`、`serviceCount` |
+
+`remove` 只删本 scope 自己的注册，**永远不下沉到 parent**——scope 注销一个共享服务，会让 parent 容器的
+其它读者拿到已销毁的实例；`serviceCount` 同理只数本 scope（同名可在两层都注册，跨层计数会重复）。
+`ScopedContainer` 没有 `freeze`：scope 是短生命周期对象，冻结点是 `start()` 之后的应用级容器。
+
 ### 3.3 命名
 
 - name 用稳定字符串字面量（`"config"`、`"db"`、`"redis"`），模块间通过文档约定；

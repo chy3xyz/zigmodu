@@ -98,6 +98,12 @@ pub const ModuleContext = @import("core/ModuleContext.zig").ModuleContext;
 /// Dependency-injection container: register and resolve services by type.
 pub const Container = @import("di/Container.zig").Container;
 /// Child container: its own registrations, falling back to the parent.
+///
+/// Mutations and bookkeeping (`register`, `registerBorrowed`, `remove`,
+/// `serviceCount`) act on **this scope only**; resolution (`get`, `contains`)
+/// checks this scope first and then the parent. There is deliberately no
+/// `freeze` — a scope is short-lived, and the framework's freeze point is the
+/// application `Container` after `start()`.
 pub const ScopedContainer = @import("di/Container.zig").ScopedContainer;
 /// Build-then-freeze map: fill at startup, read concurrently afterwards.
 pub const FrozenMap = @import("core/FrozenMap.zig").FrozenMap;
@@ -383,10 +389,19 @@ pub const Validator = @import("validation/ObjectValidator.zig").Validator;
 pub const ExternalizedConfig = @import("config/ExternalizedConfig.zig").ExternalizedConfig;
 /// Typed key/value config store: JSON loading, `ModuleConfig` key prefixes.
 ///
-/// Positioning: user-facing; its only in-tree consumer is
-/// `config/TomlLoader.zig` (also not re-exported), which fills a store passed in
-/// by the application. The alias below is what makes the store nameable.
+/// Positioning: user-facing; the store loads JSON itself, and TOML arrives
+/// through `TomlLoader` (re-exported below) — it fills a store passed in by the
+/// application. The alias here is what makes the store nameable.
 pub const ConfigManager = @import("config/ConfigManager.zig").ConfigManager;
+/// Fills a `ConfigManager` from a TOML file: `loadFile(path, *ConfigManager)`.
+///
+/// Positioning: user-facing; its only in-tree caller is its own test — the
+/// framework's own config is JSON, so nothing inside the tree loads TOML. It is
+/// re-exported as a separate adapter rather than as a `ConfigManager.loadToml`
+/// method because `config/TomlLoader.zig` already imports `ConfigManager.zig`:
+/// a method there would invert that dependency (store → loader) and make the two
+/// files import each other for a two-line delegation.
+pub const TomlLoader = @import("config/TomlLoader.zig").TomlLoader;
 /// Feature flags: percentage rollout, allowlists, per-tenant targeting.
 pub const FeatureFlagManager = @import("core/FeatureFlags.zig").FeatureFlagManager;
 /// One flag's definition (key, default, rollout).

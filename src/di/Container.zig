@@ -185,6 +185,14 @@ pub const ScopedContainer = struct {
         try self.local.register(T, name, instance);
     }
 
+    /// Register a borrowed service in this scope — the scope never destroys it.
+    /// Use it for stack-allocated or externally owned per-request objects:
+    /// handing such a pointer to `register` would make `deinit` free memory the
+    /// scope does not own.
+    pub fn registerBorrowed(self: *Self, comptime T: type, name: []const u8, instance: *T) !void {
+        try self.local.registerBorrowed(T, name, instance);
+    }
+
     pub fn get(self: *Self, comptime T: type, name: []const u8) ?*T {
         if (self.local.get(T, name)) |svc| {
             return svc;
@@ -197,6 +205,22 @@ pub const ScopedContainer = struct {
 
     pub fn contains(self: *Self, name: []const u8) bool {
         return self.local.contains(name) or (self.parent != null and self.parent.?.contains(name));
+    }
+
+    /// Drop **this scope's own** registration; the parent is never reached.
+    /// A scope that unregistered a shared service would leave every other reader
+    /// of the parent container holding a destroyed service, so the fall-through
+    /// that `get`/`contains` have is intentionally absent here.
+    pub fn remove(self: *Self, name: []const u8) void {
+        self.local.remove(name);
+    }
+
+    /// Number of services registered **in this scope**, excluding the parent's.
+    /// Counting across the parent (or a chain of scopes) is ill-defined: the same
+    /// name can be registered at both levels and would then count twice, while
+    /// the parent's count can change under a scope that does not own it.
+    pub fn serviceCount(self: *Self) usize {
+        return self.local.serviceCount();
     }
 };
 
@@ -290,4 +314,63 @@ test "Container registerBorrowed does not destroy the instance" {
     try std.testing.expectEqual(@as(i64, 7), container.get(i64, "n").?.*);
     container.deinit(); // must only free the wrapper
     try std.testing.expectEqual(@as(i64, 7), borrowed_instance);
+}
+
+test "ScopedContainer remove and serviceCount stay local" {
+    const allocator = std.testing.allocator;
+
+    var parent = Container.init(allocator);
+    defer parent.deinit();
+
+    var scoped = ScopedContainer.init(allocator, "request", &parent);
+    defer scoped.deinit();
+
+    const SvcType = struct { value: i32 = 0 };
+
+    const parent_svc = try allocator.create(SvcType);
+    parent_svc.* = .{ .value = 100 };
+    try parent.register(SvcType, "shared", parent_svc);
+
+    const local_svc = try allocator.create(SvcType);
+    local_svc.* = .{ .value = 7 };
+    try scoped.register(SvcType, "local", local_svc);
+
+    // Same name at both levels: the scope's registration wins for resolution
+    // and is counted once, by the scope.
+    const shadow_svc = try allocator.create(SvcType);
+    shadow_svc.* = .{ .value = 8 };
+    try scoped.register(SvcType, "shared", shadow_svc);
+    try std.testing.expectEqual(@as(i32, 8), scoped.get(SvcType, "shared").?.value);
+
+    try std.testing.expectEqual(@as(usize, 2), scoped.serviceCount());
+    try std.testing.expectEqual(@as(usize, 1), parent.serviceCount());
+
+    scoped.remove("shared");
+    try std.testing.expectEqual(@as(usize, 1), scoped.serviceCount());
+    // Removing is local-only: the parent's service survived, and the name now
+    // resolves back through the fall-through.
+    try std.testing.expect(parent.contains("shared"));
+    try std.testing.expectEqual(@as(i32, 100), scoped.get(SvcType, "shared").?.value);
+    try std.testing.expectEqual(@as(i32, 100), parent.get(SvcType, "shared").?.value);
+
+    // A name the scope never registered is a no-op, not a parent removal.
+    scoped.remove("shared");
+    try std.testing.expectEqual(@as(i32, 100), scoped.get(SvcType, "shared").?.value);
+}
+
+test "ScopedContainer registerBorrowed does not destroy the instance" {
+    const allocator = std.testing.allocator;
+
+    var borrowed: i64 = 42; // stack-allocated: destroying it would be UB
+    var scoped = ScopedContainer.init(allocator, "request", null);
+    defer scoped.deinit();
+
+    try scoped.registerBorrowed(i64, "n", &borrowed);
+    try std.testing.expectEqual(@as(i64, 42), scoped.get(i64, "n").?.*);
+    try std.testing.expect(scoped.contains("n"));
+    try std.testing.expectEqual(@as(usize, 1), scoped.serviceCount());
+
+    scoped.remove("n");
+    try std.testing.expectEqual(@as(usize, 0), scoped.serviceCount());
+    try std.testing.expectEqual(@as(i64, 42), borrowed);
 }

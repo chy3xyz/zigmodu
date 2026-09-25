@@ -2,6 +2,75 @@
 
 ## [Unreleased]
 
+### 第 30 批：空壳 `TransactionalEvent` 删除、`TomlLoader` 补导出、`ScopedContainer` 补齐三个方法、CPU pin 原语落地（`.affinity` 声明判缓做并指名阻塞点），以及**上一次 CI 为什么红**（`PrecisionTimer` 的界是宿主的）（**破坏性：否**）
+
+全量 `-Ddb=all` **1967/2025（58 skipped，0 failed，191 s）**；CI 示例清单本机 **16/16 构建 + 7 个 `build test` 步骤全绿**。
+
+**先记一次 CI 红：`PrecisionTimer` 的两个用例在 GitHub `macos-latest` 上失败，红的原因不是机制而是宿主。**
+失败断言是那两条绝对中位数界（`precise.p50_ns <= lateness_p50_bound_ns`，10 µs）。实测（runner 日志原文）：
+
+| 宿主 | `nanosleep(100 µs)` 的实际迟到 | `nanosleep(500 µs)` | 出厂配置 @1 ms 的 p50 | 纯自旋（窗口盖住等待）@100 µs |
+|------|------|------|------|------|
+| 本仓开发机（Apple Silicon macOS） | ~55 µs | ~257 µs | **0 ns** | 0 ns |
+| GitHub `macos-latest` runner | **+818 µs** | **+4 031 µs** | **+3 531 000 ns** | **0 ns** |
+
+等待循环睡的是 `remaining - spin_window_ns`，只有这次唤醒**落在窗口内**，自旋才有 deadline 可收口；内核一旦把
+唤醒推过 deadline，剩下的延迟就全是宿主的帐。runner 上出厂窗口（200 µs）**比这台机器的 sleep 粒度还粗**，
+所以 500 µs 及以上那几行必然落在毫秒级 —— 机制没错，界不成立。
+
+**修法：把"界"从常量改成"先探针、再断言"**（`src/runtime/precision_timer.zig`）：
+* 新增 `hostCanHoldTheBound`：用**出厂 knobs** 打一个 1 ms deadline 并读 p50，读数打印在归因行旁边；
+* 探针通过 → 每一行都断言绝对界（本机：**4/4 行**，与修前强度一致）；
+* 探针不通过 → 改断言**可移植的那条**："出厂 knobs 不比把整段等待交给内核更差"（`precise.p50 <= coarse.p50 + 界宽`），
+  并把这行**归因**到宿主粒度，而不是静默跳过；
+* `100 µs` 那行是**纯自旋**（deadline 落在窗口内 ⇒ 一次都不睡，连断言 `sleeps == 0`），在 runner 上实测 p50 = **0 ns**，
+  所以它在任何宿主上都断言绝对界 —— 机制永远有证明，归因分支无法把整个用例变成打印
+  （`expect(absolute_rows > 0)`；runner 那次读数：1 行绝对界 + 3 行归因，`teeth: 4 of 4`）。
+* 归因分支用一次性开关在本机跑过（1 行绝对 / 3 行归因，9/9 绿），不是只靠推理。
+* `docs/RUNTIME.md` 新增 **§12.15**：宿主真值表、"界是宿主的"这件事对消费方的含义（搬进容器/共享 runner 前
+  先读一遍 harness 表格再决定窗口，或把 `spin_window_ns` 设 0），以及"正解是调窗口、不是放松界"。
+
+**`src/core/TransactionalEvent.zig` 删除（249 行）。** 上一批已判定它不是公开 API（`root.zig` 从未导出、
+`docs/API.md` 那节已改 internal）—— 但"不导出"留着它，等于留一份看起来能用的**假实现**
+（`stageEvent`/`addEvent` 都是 `_ = event;`，`commit` 只改状态，载荷 `alloc(u8, 0)`）。本次连文件删掉，
+并清掉 `src/tests.zig` 的编译门、`docs/API.md` 那节改写成 "**removed**" + 指回真身、`README.zh.md` 去掉它。
+**顺带**：`scripts/deadcode-baseline.json` 里那条指向**已删文件**的陈旧条目一并清掉（手工，不动别人的漂移）。
+
+**`zigmodu.TomlLoader` 补导出（上一批"顺带发现、未做"的那条）。** 上一批让 `ConfigManager` 可命名了，但
+store 只读得了 JSON —— TOML 那条路仍锁在内部。现在 `zigmodu.TomlLoader.init(allocator)` +
+`loadFile(path, &config)`。**没有做成 `ConfigManager.loadToml` 方法**的理由写在导出注释里：那样会让
+store → loader 反向依赖，两个文件为两行转发互相 import。`src/test/DocsConsistency.zig` 的
+"文档里出现的符号必须可导入"用例加了一条**端到端**（写临时 `.toml` → `loadFile` → `getInt`/`getBool`），
+所以以后再漏导出是测试红，而不是用户在调用处踩坑。
+
+**`ScopedContainer` 补齐 `Container` 的差集**（`src/di/Container.zig`）：`registerBorrowed` / `remove` /
+`serviceCount`。**要点是"改/查两半穿透规则不同"**：
+
+| 下沉到 `parent` | 只作用于本作用域 |
+|---|---|
+| `get`、`contains` | `register`、`registerBorrowed`、`remove`、`serviceCount` |
+
+`remove` **永不下沉** —— 作用域注销一个共享服务，会让 parent 容器的其它读者拿到已销毁的实例；
+`serviceCount` 只数本层（同名可在两层都注册，跨层计数会重复）。两个新测试钉住这条（含"同名遮蔽后再 `remove`，
+解析回落到 parent"与"删一个本层没注册的名字是 no-op、不是越权删 parent"）。`docs/EVENTS_DI.md` 同步。
+
+**CPU affinity：落地的是原语，不是 `spawn` 上的声明（`src/runtime/affinity.zig`）。**
+`supported`（comptime）+ `pinCurrentThread(cpu_index) PinError!void`：Linux 走
+`std.os.linux.sched_setaffinity(0, …)`（`std.posix` 只暴露读侧），**macOS / Windows 返回 `error.Unsupported`**，
+平台有 API 而内核拒绝时返回 `error.PinFailed` —— 绝不假报成功（`runtime.zig:145-146` 的家规：
+"静默忽略的声明是比没声明更坏的失败模式"）。平台真值表逐格带证据行号，含两条**实测**：本机 SDK 的 `sched.h`
+只声明三个函数、没有 `cpu_set_t`；Mach 的 `THREAD_AFFINITY_POLICY` 是 L2 分组标签而非 CPU 索引，且本机
+`thread_policy_set` 返回 **46 = `KERN_NOT_SUPPORTED`**（连"内核可能忽略的 hint"都不成立）。
+**`.affinity` 声明判定为缓做，阻塞点指名**：它只能属于 `.dedicated`（`.pooled` 的线程是"谁 claim 谁跑"，
+"pin 这个 worker"在那里不是难实现而是**未定义**），而 dedicated 路径**还没有父子启动握手** ——
+`spawn` 在 worker 线程跑起来之前就返回（`runtime.zig:1719-1723`），线程体不读 init 结果（`:2305-2308`），
+现在加字段只能买到"静默失败"或"假报成功"。等那个握手存在了再加。
+
+**其余**：`scripts/deadcode-baseline.json` 用 `--update` 收掉 3 条陈旧项（31 → 28；这脚本是 ratchet，
+`--update` 只减不增，`--force` 才允许增，所以不会把新死代码记进基线）。`docs/UPGRADING.md` 里
+`v0.33.4（未发布）` 这层标签早就过期（tag 推了、`release.sh` 不碰 UPGRADING）—— 已改成
+`v0.33.4 + v0.33.5（均已发布）` 并把"发布后要手工改这层标签"写在节首。
+
 ### 第 29 批：四个"真实存在但没导出"的符号补齐、新的亚毫秒 `PrecisionTimer`（实测 p50 = 0 vs wheel 4.67 ms）、`IpAddress.ConnectOptions.timeout` 是**陷阱**（实测 SIGABRT）并补上有界 dial（**破坏性：否**，均为新增公开 API）
 
 全量 `-Ddb=all` **1966/2025（59 skipped，0 failed）**；CI 示例清单本机 16/16。

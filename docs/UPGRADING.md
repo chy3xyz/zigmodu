@@ -35,7 +35,59 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 
 ---
 
-## v0.33.4（未发布）
+## v0.33.6（未发布）
+
+> **本版无破坏性变更**：新增 `zigmodu.TomlLoader`、`ScopedContainer` 的三个方法、`zigmodu.runtime.affinity`
+> （CPU pin 原语），删除一个从没实现过的空壳 `TransactionalEvent`。
+> 另有两条**消费者应当知道的口径**：① `PrecisionTimer` 的 10 µs 中位数界是**宿主的**、不是机制的 ——
+> 共享 runner/容器上要按下面的表调 knob；② 弃用别名表里的删除时点仍是"不早于 1.0"。
+
+**新增公开 API（additive，无破坏性）**
+
+- **`zigmodu.TomlLoader`** —— 上一版补了 `ConfigManager` 的导出，但 TOML 还是读不了（loader 本身没导出）。
+  现在 `var loader = zigmodu.TomlLoader.init(allocator); try loader.loadFile("app.toml", &config);`，
+  `[server]` + `port` 落成 `server.port`，类型保留（`getInt`/`getBool`/`getFloat` 可用）。
+  **一行改法**：以前只能自己 `@import` 框架内部文件路径的，改从 `zigmodu` 导入。`root.zig` 的
+  "文档里出现的符号必须可导入"测试里加了一条 TOML 端到端（文件 → `loadFile` → 读值），漏加导出让测试红。
+- **`ScopedContainer.registerBorrowed` / `remove` / `serviceCount`** —— 补齐与 `Container` 的差集。
+  **语义要点：改/查两半的穿透规则不同** ——`get`/`contains` 查本作用域再下沉 `parent`；
+  `register`/`registerBorrowed`/`remove`/`serviceCount` **只作用于本作用域**。`remove` 永不下沉：
+  作用域注销一个共享服务，会让 parent 容器的其它读者拿到已销毁的实例。`serviceCount` 只数本层
+  （同名可在两层都注册，跨层计数会重复）。**一行改法**：以前为了"改本层"而绕开 `ScopedContainer`、
+  直接对 `Container` 动手的代码可以收回来。
+- **`zigmodu.runtime.affinity`** —— `supported`（comptime 常量）与 `pinCurrentThread(cpu_index)`：
+  Linux 走 `sched_setaffinity(0, …)`（pin 的是**调用线程**），**macOS 与 Windows 返回 `error.Unsupported`**，
+  平台有 API 但内核拒绝时返回 `error.PinFailed`。**它绝不假报成功** —— 这是刻意的：
+  "静默忽略的声明是比没声明更坏的失败模式"。**注意这不等于 `spawn` 上有了 `.affinity` 字段**：
+  那个声明判定为**缓做**，阻塞点是 dedicated 路径还没有父子启动握手（见 CHANGELOG 第 30 批）。
+
+**删除：`src/core/TransactionalEvent.zig`（249 行的空壳）** —— 上一版已判定它不是公开 API（`root.zig`
+从未导出、`docs/API.md` 那节已改为 internal）。这次连文件一起删掉，因为留着它就是留一份"看起来能用"的假实现
+（`stageEvent`/`addEvent` 都是 `_ = event;`）。**影响面**：只有**越路径**导入框架内部文件的代码
+（`@import("zigmodu/src/core/TransactionalEvent.zig")`）会**编译错**；公开面没有任何变化。
+**一行改法**：`zigmodu.outbox.*`（真实 outbox）或 `zigmodu.SagaOrchestrator`。
+
+**测量口径（非破坏，但会改变你在别的机器上看到的数字）：`PrecisionTimer` 的 10 µs 界是宿主相关的。**
+它的用例曾在 GitHub 的 macOS runner 上红两条，原因是那台机器的 `nanosleep` **比自旋窗口还粗**：
+
+| 宿主 | `nanosleep(100 µs)` 实际迟到 | `nanosleep(500 µs)` | 出厂配置 @1 ms 的 p50 |
+|------|------|------|------|
+| 本仓开发机（Apple Silicon macOS） | ~55 µs | ~257 µs | **0 ns** |
+| GitHub `macos-latest` | **+818 µs** | **+4 031 µs** | **+3 531 000 ns** |
+
+等待循环睡的是 `remaining - spin_window_ns`，只有这次唤醒落在窗口内，自旋才有 deadline 可收口；一旦内核把
+唤醒推过 deadline，剩下的延迟就全是宿主的。所以**出厂的两个 knob（窗口 200 µs / 分块上限 500 µs）是按本仓
+开发机的过冲梯子定的**。**一行改法**：把 `PrecisionTimer` 搬到容器/共享 CI/云主机上之前，先跑一次它自己的
+测量用例（每个用例都会打印 min/p50/p99/max 与 spun 占比），粗粒度宿主上把 `spin_window_ns` 调大
+（或设 `0` 明确表示不要这个精度）。`Runtime` 的 5 ms 时间轮不受影响。详见 `docs/RUNTIME.md` §12.15。
+
+---
+
+## v0.33.4 + v0.33.5（均已发布）
+
+> 本节标题此前一直写着「（未发布）」，而 `v0.33.4`/`v0.33.5` 的 tag 早就推了 —— 下面这些内容**是已发布**的。
+> 原因记在这里免得复发：`scripts/release.sh` 只 bump 版本引用，**不碰 `docs/UPGRADING.md`**，
+> 所以"（未发布）"这层标签是纯手工维护的；发布后请把它改成版本号（下一个版本另起一节）。
 
 > **本版有 2 处破坏性变更（都是编译错）**：口令校验不再返回裸 `bool`、
 > `Middleware.attachIdentityBestEffort` 改成 `!void`。另有 8 处**行为变化**值得确认：Redis 不可达时不再

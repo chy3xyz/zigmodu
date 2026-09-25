@@ -701,7 +701,8 @@ rec.replay(&manual, &harness, Harness.sink);         // 按 seq 推进 clock，�
 > 12.1–12.9 是设计原文，原样保留作为决策记录；**12.10 记 Phase 1 的落地结果**，
 > **12.11 记 Phase 1 发出去之后修掉的四处缺陷**，**12.12 记 Phase 2**（多消费者环、线程集合、
 > 宽度声明、以及实测数字）。
-> **仍未做**：drain 批量调优、公平性加权、affinity（正是 12.7 明确不做的那些）。
+> **仍未做**：drain 批量调优、公平性加权、affinity 的**声明**（`spawn` 上的字段；§12.7 的复核记了
+> 为什么它卡在"dedicated 路径没有启动握手"，以及原语 `runtime.pinCurrentThread` 已落地）。
 
 ### 12.1 问题：一 worker = 一线程
 
@@ -941,6 +942,23 @@ B 仍然被服务，只是要等 A 那一批跑干。所以小 batch 换吞吐�
   `enqueue_pos`/`dequeue_pos` + 槽位序号，只是**出队那一半也要 CAS 下标**（§12.12）。
 - **不做 CPU affinity / NUMA / 优先级**（评估 §14 也建议往后放）：它们属于**执行策略层**，
   应在 Dedicated/Pooled 稳定之后再谈，否则会同时改两个变量。
+  **调度器稳定后的复核（本条的前提"应在 Dedicated/Pooled 稳定之后再谈"已满足，拆成两层结论）**：
+  * **原语已落地**：`src/runtime/affinity.zig` 的 `runtime.pinCurrentThread(cpu)` —— 把**调用线程**
+    钉到一个 CPU；平台没有这个能力时返回 `error.Unsupported`，**不静默**（本仓库明写"静默忽略的
+    声明比不声明更糟"，`runtime.zig:145-146`）。平台事实是**实测**出来的，不是推测：
+    Linux 有 `sched_setaffinity`（`lib/std/os/linux.zig:3082`）；**macOS 根本没有** —— SDK 的
+    `sched.h` 46 行里只声明 `sched_yield` / `sched_get_priority_{min,max}`（没有 `cpu_set_t`、
+    没有 `sched_setaffinity`），唯一 affinity 形状的 API 是 Mach 的 `THREAD_AFFINITY_POLICY`，
+    参数是 **L2 分组 tag 而不是 CPU 序号**（`mach/thread_policy.h:208-212`，其头文件自称
+    "experimental"、"a hint to the scheduler for thread placement"），且本机（Darwin 25.6.0 /
+    macOS 26.6.2 arm64）内核连这个 hint 都不收：`thread_policy_set` 返回
+    **46 = `KERN_NOT_SUPPORTED`**（`mach/kern_return.h:298`）；Windows 侧本 std **没有**
+    `SetThreadAffinityMask` 之类的绑定。**三个目标里两个不能兑现，能兑现的那个正是 CI 跑的。**
+  * **`.affinity` 声明仍不做**：它只对 `.dedicated` 有意义 —— `.pooled` 的 worker 线程是"谁抢到
+    token 谁跑"，"把这个 worker 钉住"在那儿是**未定义**而非"难实现"（没有可归属的线程）；
+    而它若要"失败必须响亮"，就需要 dedicated 路径目前**没有**的父子启动握手：`spawn` 在线程跑起来
+    之前就返回（`runtime.zig:1719-1723`），线程体的 init 结果"刻意不读"（`runtime.zig:2305-2308`）。
+    先加字段只能买到"静默失败的 pin"或"上报成功却没拿到核的 worker"。详见 `affinity.zig` 的模块 doc。
 - **不做 μs 级 timer**：那是独立的 `LowLatencyClock/Timer`（评估 §7 的建议），与调度器正交。
 - **不做 remote worker**（评估 §15）：本地 Runtime 稳定之前不谈。
 
@@ -1339,6 +1357,33 @@ dedicated 加"抽干后再停"，两者都是会动到 D5 那条回执出口的�
 **Phase 2 仍未做**：`batch` 的实测调优（仍是 D3 的起点 16，per-worker 覆盖没有）、
 公平性加权、优先级、affinity/NUMA（§12.7 本来就排除）、以及"池线程数随负载自适应"。
 另外一条已知的**取舍**（不是缺陷）：上面第 4 点的 1 ms 偷取延迟。
+
+### 12.15 `PrecisionTimer` 的界是**宿主的**，不是机制的（v0.33.6；CI 红过一次）
+
+`zigmodu.runtime.PrecisionTimer` 的 `lateness_p50_bound_ns = 10 µs` 此前被直接当作断言，
+在 GitHub 的 macOS runner 上红了两条用例。实测原因不是循环写错，而是**那台宿主机的
+`nanosleep` 粒度比自旋窗口还粗**：
+
+| 宿主 | `nanosleep(100 µs)` 的实际迟到 | `nanosleep(500 µs)` | 交付的 `default` 配置 p50 @1 ms |
+|------|------|------|------|
+| 本仓开发机（Apple Silicon macOS） | ~55 µs | ~257 µs | **0 ns** |
+| GitHub `macos-latest` runner | **+818 µs** | **+4 031 µs** | **+3 531 000 ns** |
+
+机制本身没变：等待循环睡的是 `remaining - spin_window_ns`，只有这次唤醒**落在窗口内**，
+自旋才有 deadline 可收口；一旦内核把唤醒推过 deadline，剩下的就全是宿主的账。所以：
+
+* 绝对界只在**宿主测得可交付**时断言 —— 判据是运行期探针
+  （`hostCanHoldTheBound`：用出厂 knobs 打一个 1 ms deadline，读 p50），不是常量、不是平台判断；
+* 过粗的宿主上改断言**可移植的那条**："出厂 knobs 不比把整段等待交给内核更差"，
+  并把探针读数与 sleep-only 行**打印出来**（红与归因都带证据）；
+* 100 µs 那一行是**纯自旋**（deadline 落在窗口内 → 一次都不睡），所以它在任何宿主上都断言绝对界 ——
+  机制不会因为宿主粗就完全没有证明；
+* 粗宿主上的正解是**调大 `spin_window_ns`**（或 `= 0` 表示不要这个精度），而不是把界放松。
+
+**这条对消费方的含义**：`PrecisionTimer` 出厂的两个 knob 是按本仓开发机的过冲梯子定的。
+把它搬进容器/共享 runner/云主机时，先读一次 `src/runtime/precision_timer.zig` 里那份
+harness 表格（每个用例都会打印 min/p50/p99/max 与 spun 占比），再决定窗口；
+`Runtime` 的 5 ms 时间轮（§3）不受这条影响。
 
 ## 13. Runtime Replay —— v1 已实现（见 §13.7）
 

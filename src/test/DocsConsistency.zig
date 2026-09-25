@@ -134,6 +134,22 @@ test "documented root aliases are importable" {
     try config.set("app.name", .{ .string = "demo" });
     try std.testing.expectEqualStrings("demo", config.getString("app.name").?);
     try std.testing.expect(config.has("app.name"));
+
+    // The store loads JSON itself; TOML reaches it through the loader alias.
+    // Exercised end to end: file → `TomlLoader.loadFile` → typed reads.
+    const TomlLoader = zigmodu.TomlLoader;
+    const toml_path = "zigmodu_root_alias_test.toml";
+    {
+        const file = try std.Io.Dir.cwd().createFile(std.testing.io, toml_path, .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "[server]\nport = 8080\ndebug = true\n");
+    }
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, toml_path) catch {};
+
+    var toml_loader = TomlLoader.init(allocator);
+    try toml_loader.loadFile(toml_path, &config);
+    try std.testing.expectEqual(@as(i64, 8080), config.getInt("server.port").?);
+    try std.testing.expectEqual(true, config.getBool("server.debug").?);
 }
 
 fn scanDir(

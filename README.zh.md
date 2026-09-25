@@ -32,7 +32,7 @@
 - **依赖验证** - 编译期依赖检查
 - **生命周期管理** - 自动初始化/清理；模块可声明 `initWith(ctx)` 接收框架设施
 - **依赖注入** - Application 内置类型安全容器：启动期注册（`withService` / 借用注册），`start()` 后 freeze，运行期无锁只读
-- **事件驱动** - Application 级 `EventRegistry` 只发放线程安全的按类型总线（`app.eventBus(T)`）；另含 TransactionalEvent + Outbox
+- **事件驱动** - Application 级 `EventRegistry` 只发放线程安全的按类型总线（`app.eventBus(T)`）；另含 Outbox（`zigmodu.outbox.*`）
 
 ### 分布式能力
 - **DistributedEventBus** ⚠️ - 跨节点事件通信（experimental）
