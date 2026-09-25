@@ -754,6 +754,23 @@ jobs:
         # never reusable across runs, and nothing in this workflow consumes it).
         run: rm -rf .zig-cache/v
 
+      - name: Fuzz smoke (before the soak steps — TEMPORARY DIAGNOSTIC)
+        # The `Fuzz (bounded)` step at the end of this job fails on every run, and
+        # five hypotheses have been refuted (see its comment). This is the *same*
+        # command at a smaller bound, run **before** the soak steps of the same
+        # job: if it passes here while the one at the end fails, the trigger is an
+        # interaction with what the soak steps leave behind (the build cache they
+        # populate, ports, leftover processes in the same sandbox) rather than
+        # `--fuzz` on this runner as such. If it fails too, the position is
+        # irrelevant. Delete this step once that is known.
+        continue-on-error: true
+        run: |
+          if ! zig build test --fuzz=200 -Ddb=all --test-timeout 300s; then
+            echo "=== fuzz-smoke (early) failed: artifacts ==="
+            ls -la .zig-cache/v 2>/dev/null | tail -10 || echo "(no v/ there)"
+            exit 1
+          fi
+
       - name: Soak (cross-tenant leak assertions + frozen-registry concurrency)
         # Larger than the local defaults: the point of running this nightly is
         # to widen the window, not to re-run the fast suite.
