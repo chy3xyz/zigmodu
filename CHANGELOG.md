@@ -2,6 +2,47 @@
 
 ## [Unreleased]
 
+### 第 39 批：**根因找到并修掉** —— Linux 上"起第二个 bus 就永久挂住"是 `Io.Group.async` 的 **eager 回落在永不返回的循环上把调用者线程征用了**；顺带查出 `WebSocket` 有两处同形（**破坏性：否**，`start()` 的错误集多一个成员）
+
+全量 `-Ddb=all` **2002/2060（58 skipped，0 failed，178 s）**；`zig build soak-smoke` 本机 15.7 s 绿；`
+DistributedEventBus` 50/50、`ClusterBootstrap` 12/12；六道门禁全绿。
+
+**根因（顺带纠正我自己在第 38 批的措辞：`async` 不是"排队等单元"，而是"直接在调用者线程上把任务体跑完"）**：
+`Group.async` 在 `busy_count >= async_limit` 时走 `groupAsyncEager`，**同步执行任务体**（`std/Io/Threaded.zig`
+`:2188-2191` → `:2222-2226`），而 `busy_count` 只在任务体**返回之后**才递减（`worker()` `:1800-1802`）；
+`async_limit` 的默认值是 `.limited(cpu_count - 1)`（`:1641`）。`DistributedEventBus.start()` 用 `async` 起了两个
+**永不返回**的循环（`acceptLoop`、`heartbeatLoop`，各自 `while (is_running)`），于是：**第 N 个 bus 的
+`heartbeatLoop` 落在 `start()` 的调用者线程上 → `start()` 永不返回 → harness 的 "bus listener up" 永不打印**。
+本机 10 核（上限 9）永远看不到；runner 上三个 bus 的永循环把上限吃光。这是**容量缺陷，不是时序抖动**。
+
+**证据链（三级，都不是猜的）**：心跳日志把范围收窄到 `start()` → `[DEB-TRACE]` 夹到
+`sc-b start: heartbeat-fiber async begin` 之后**再无返回**（sc-a 同一序列完整）→ 读 std 源码定机制 + 一份
+**只用 std** 的独立复现（`.limited(1)` 下第二个 `Group.async` 3 秒不返回、任务体线程 id 与调用者相同）。
+
+**修法**：三个永循环（accept / heartbeat / dlq）改用 `Group.concurrent` —— 它的超限路径是
+**返回 `error.ConcurrencyUnavailable`**（`groupConcurrent` `:2252-2253`），于是 `start()` 能**响亮失败**而不是
+把调用者征用；新增私有 `abortStart` 做回滚（复位 `is_running`、关 listener、排空已派发的成员、错误原样返回）。
+这条路与仓库既有路线一致：`Server.zig:2969`、`WebSocket.zig:121`、`NetworkTransport.zig:139` 的连接级派发
+早就是 `concurrent`，注释写的就是同一个理由。`stop()` 无需改动（`Group.await` 同时覆盖 `async` 与
+`concurrent` 成员）。**`[DEB-TRACE]` 13 条临时行已全部删除**（承诺兑现）；`acceptLoop` 的 accept 错误**计数**
+保留（去掉前缀、节流为前 5 次 + 每 1000 次），因为 `catch → continue` 在 `accept` 持续失败时是忙循环，
+这个计数是"忙循环"与"真空闲"的唯一区分 —— 本次运行立刻给出读数：三个节点各一次
+`accept error #1: ConnectionAborted`（正是 `stop()` 关 listener 唤醒 accept 的那次）。
+
+**新测试（3 条）**：`.limited(0)` 下 `Group.async` 在**调用者线程**跑完而 `Group.concurrent` 不会（机制断言，
+任何核数都确定性通过）· `async_limit = 1` 上**连起 3 个 bus**、每个 `start()` 都必须返回、随后 B 拨号 A 并
+publish、A 的订阅者**恰好**收到 1 次（这是 runner 形状的本机复现：`start(0)` 由内核分配端口以消除
+"找空闲端口→绑定"的竞态）· `concurrent_limit = .nothing` 时 `start()` 返回 `error.ConcurrencyUnavailable`
+且回滚干净（`!is_running`、`listener == null`、端口可重新 bind）。**它们不能证明**：真实 2 核上的调度、
+"CI 一定过"、以及下一条。
+
+**同族审计（查出两处必修，留待下一批）**：`WebSocket.zig:92` 的 `acceptLoop` 与 `:722` 的 `updateLoop` 都是
+"**永不返回的循环 + `fiber_group.async`**" —— **与本缺陷同形**（池满时 `start`/`update` 的调用者被征用）。
+其余长循环安全：`Server.zig:2930`（`runInBackground` 起裸 `std.Thread`）、`Cron` / `HotReloader` /
+`OutboxConsumer` / `WebMonitor` / `WorkerPool` / `im/ws_uring` / `NetworkTransport.ClusterServer` 全是裸线程，
+不占 io 单元；连接级 fiber 早已是 `concurrent`。`ai/workflow.zig` 与 `ai/hierarchy.zig` 的 `async` 是**有界波次**
+（`max_parallel` 后 `await`），eager 回落只是退化成串行、不会挂。
+
 > **第 38 批是一次**诊断**推送（临时，见下一条）**：`[DEB-TRACE]` 那些 `warn` 行是为了把 Linux-only 的
 > `DistributedEventBus.start` 卡点夹出来，**修掉它的批次会一并删除**。
 

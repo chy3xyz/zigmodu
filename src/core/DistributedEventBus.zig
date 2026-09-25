@@ -450,21 +450,40 @@ pub const DistributedEventBus = struct {
     }
 
     /// Start listening for incoming connections
+    ///
+    /// The loops dispatched below use `Group.concurrent`, **not** `Group.async`,
+    /// and that is load-bearing rather than stylistic. `std.Io.Threaded`'s
+    /// `groupAsync` answers an exhausted `async_limit` by running the task body
+    /// on the **calling** thread (`std/Io/Threaded.zig:2188-2191` →
+    /// `groupAsyncEager`, `:2222-2226`; the limit itself defaults to
+    /// `cpu_count - 1`, `:1641`). Every loop here is a `while (self.is_running)`
+    /// that never returns by design, so that fallback *is* a `start()` that never
+    /// returns: in the 3-node `soak-smoke` the first node consumed the Linux
+    /// runner's units and the second node's heartbeat fiber never came back from
+    /// `start()`. `groupConcurrent` (`:2245-2270`) has no eager path — past
+    /// `concurrent_limit` (`.unlimited` by default, `:40`) it returns
+    /// `error.ConcurrencyUnavailable` — which is propagated here, so a bus whose
+    /// loops cannot be dispatched says so and stays down instead of hanging.
+    ///
+    /// The other half of why these are not `async`: `Threaded` decrements
+    /// `busy_count` only once a task body *returns* (`:1802`), so a
+    /// never-returning loop occupies its unit for the life of the process. At
+    /// one unit that is not just "the second bus cannot start" — the entire
+    /// process's `async` pool is gone, and every unrelated caller of `async`
+    /// silently switches to running its work on its own thread.
+    ///
+    /// A raw `std.Thread` per loop — what `Cron`, `OutboxConsumer`, `WebMonitor`
+    /// and `WorkerPool` do, and what `ClusterServer` (`NetworkTransport.zig`) is
+    /// handed by its callers — would also dodge the pool, but `stop()` already
+    /// owns these loops via `fiber_group.await`, and the loops themselves are io
+    /// calls (`accept`, `std.Io.sleep`): `concurrent` keeps one teardown
+    /// mechanism instead of two.
     pub fn start(self: *Self, port: u16) !void {
         if (self.is_running) return;
 
-        // TEMPORARY DIAGNOSTIC (`[DEB-TRACE]`, removed in the batch that fixes
-        // it): the 3-node soak hangs inside `start()` on the Linux runner —
-        // node sc-a gets through, node sc-b stops between the harness's
-        // "bus start begin" and "bus listener up" landmarks, and the process
-        // sits there until the step times out. Every blocking candidate in this
-        // function is one of four lines, so each one is bracketed at `warn`
-        // (the soak's log level; `std.log.info` below never reaches the log).
-        std.log.warn("[DEB-TRACE] {s} start: bind+listen begin (port {d})", .{ self.node_id, port });
         const address = try std.Io.net.IpAddress.parseIp4("0.0.0.0", port);
         self.listener = try address.listen(self.io, .{});
         self.is_running = true;
-        std.log.warn("[DEB-TRACE] {s} start: listening, auth check next", .{self.node_id});
 
         std.log.info("[DistributedEventBus] Node '{s}' listening on port {d}", .{ self.node_id, port });
 
@@ -495,24 +514,43 @@ pub const DistributedEventBus = struct {
             );
         }
 
-        // Start accept loop and heartbeat asynchronously as members of
-        // `fiber_group` so their futures do not leak.
-        std.log.warn("[DEB-TRACE] {s} start: accept-fiber async begin", .{self.node_id});
-        self.fiber_group.async(self.io, acceptLoop, .{self});
-        std.log.warn("[DEB-TRACE] {s} start: accept-fiber async returned", .{self.node_id});
+        // Members of `fiber_group`, so their lifetimes are bounded by `stop()`.
+        // `concurrent` for the reason in this function's header: none of these
+        // loops ever returns on its own.
+        self.fiber_group.concurrent(self.io, acceptLoop, .{self}) catch |err| return self.abortStart(err);
         self.heartbeat_thread = null;
-        std.log.warn("[DEB-TRACE] {s} start: heartbeat-fiber async begin", .{self.node_id});
-        self.fiber_group.async(self.io, heartbeatLoop, .{self});
-        std.log.warn("[DEB-TRACE] {s} start: heartbeat-fiber async returned", .{self.node_id});
+        self.fiber_group.concurrent(self.io, heartbeatLoop, .{self}) catch |err| return self.abortStart(err);
 
         // Start DLQ retry fiber if a DLQ has been configured.
         if (self.dlq != null and !self.dlq_retry_running) {
             self.dlq_retry_running = true;
-            std.log.warn("[DEB-TRACE] {s} start: dlq-fiber async begin", .{self.node_id});
-            self.fiber_group.async(self.io, dlqRetryLoop, .{self});
-            std.log.warn("[DEB-TRACE] {s} start: dlq-fiber async returned", .{self.node_id});
+            self.fiber_group.concurrent(self.io, dlqRetryLoop, .{self}) catch |err| {
+                // The loop never ran, so its own `defer` will not clear this.
+                self.dlq_retry_running = false;
+                return self.abortStart(err);
+            };
         }
-        std.log.warn("[DEB-TRACE] {s} start: done", .{self.node_id});
+    }
+
+    /// Unwind a `start()` that could not dispatch one of its loops, so a failed
+    /// `start()` leaves the bus exactly as it was found: not running, listener
+    /// closed, and nothing of its own still executing behind the caller's back.
+    fn abortStart(self: *Self, err: std.Io.ConcurrentError) std.Io.ConcurrentError {
+        self.is_running = false;
+        if (self.listener) |*l| {
+            sockread.closeListener(self.io, l);
+            self.listener = null;
+        }
+        self.fiber_group.await(self.io) catch |await_err| {
+            std.log.err("[DistributedEventBus] fiber drain after a failed start: {}", .{await_err});
+        };
+        // `warn`, not `err`, for the same reason `acceptLoop`'s rejected
+        // connection is a `warn`: the caller has the error in hand and is the
+        // party that can act on it, and Zig's test runner fails the whole run
+        // when a test logs at `err` — so an `err` here would make this path
+        // untestable.
+        std.log.warn("[DistributedEventBus] node '{s}': loops not dispatched: {}", .{ self.node_id, err });
+        return err;
     }
 
     pub fn stop(self: *Self) void {
@@ -525,7 +563,12 @@ pub const DistributedEventBus = struct {
             sockread.closeListener(self.io, l);
             self.listener = null;
         }
-        // Drain accept/handle/heartbeat fibers; idempotent.
+        // Drain every member of `fiber_group` — the accept / heartbeat / DLQ
+        // loops and the per-connection handlers. `Group.await` covers both
+        // dispatch forms: `groupConcurrent` increments the same `num_running`
+        // the `async` path does (`std/Io/Threaded.zig:2269-2275`), which is why
+        // switching the loops from `async` to `concurrent` left this unchanged.
+        // Idempotent.
         self.fiber_group.await(self.io) catch |err| std.log.err("[DEB] Fiber await failed: {}", .{err});
     }
 
@@ -608,26 +651,26 @@ pub const DistributedEventBus = struct {
     }
 
     fn acceptLoop(self: *Self) void {
-        std.log.warn("[DEB-TRACE] {s} acceptLoop: entered (is_running={})", .{ self.node_id, self.is_running });
         var accept_errors: u64 = 0;
         while (self.is_running) {
             if (self.listener) |*l| {
-                std.log.warn("[DEB-TRACE] {s} acceptLoop: accept() begin", .{self.node_id});
                 const conn = l.accept(self.io) catch |err| {
                     accept_errors += 1;
-                    // The `continue` below is a busy loop when `accept` keeps
-                    // failing: `[DEB-TRACE]` counts them so a Linux-only spin
-                    // (which would starve every other node) is visible as a
-                    // number instead of as silence.
+                    // The `continue` below is a busy loop whenever `accept` keeps
+                    // failing, and a spinning accept thread starves every other
+                    // node in the process. The count is what tells that apart
+                    // from a merely idle loop: a failing loop then shows up as a
+                    // number instead of as silence. First few and every 1000th,
+                    // so the counter cannot itself become the flood; the
+                    // `std.log.err` below is the unthrottled signal.
                     if (accept_errors <= 5 or accept_errors % 1000 == 0) {
-                        std.log.warn("[DEB-TRACE] {s} acceptLoop: accept error #{d}: {s}", .{ self.node_id, accept_errors, @errorName(err) });
+                        std.log.warn("[DistributedEventBus] node '{s}': accept error #{d}: {s}", .{ self.node_id, accept_errors, @errorName(err) });
                     }
                     if (self.is_running) {
                         std.log.err("[DistributedEventBus] Accept error: {}", .{err});
                     }
                     continue;
                 };
-                std.log.warn("[DEB-TRACE] {s} acceptLoop: accepted a connection", .{self.node_id});
 
                 // Handle connection in the shared group. Use `concurrent` (not
                 // `async`): handleConnection blocks on peer reads, and `async`'s
@@ -2403,7 +2446,19 @@ pub const DistributedEventBus = struct {
         self.dlq = d;
         if (self.is_running and !self.dlq_retry_running) {
             self.dlq_retry_running = true;
-            self.fiber_group.async(self.io, dlqRetryLoop, .{self});
+            // `concurrent`, for the same reason `start()` uses it: this loop
+            // never returns on its own, so `async`'s eager fallback would run it
+            // *here*, on the caller's thread, and this function would never
+            // return either.
+            self.fiber_group.concurrent(self.io, dlqRetryLoop, .{self}) catch |err| {
+                // `setDlq` has no error channel to put this on, so the signal is
+                // a log line plus leaving the flag clear: the DLQ is installed and
+                // the loop is not running, which is a state a later `start()` or
+                // `setDlq` can retry rather than a claim that it is running.
+                // (`warn`, not `err`: see `abortStart`.)
+                self.dlq_retry_running = false;
+                std.log.warn("[DistributedEventBus] node '{s}': DLQ retry loop not started: {}", .{ self.node_id, err });
+            };
         }
     }
 
@@ -3828,6 +3883,162 @@ test "two credentialed nodes bind over the network and exchange an event" {
         std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch break;
     }
     try std.testing.expectEqual(@as(usize, 1), received);
+}
+
+// ── Dispatching N buses must not depend on the io's async pool ──────────────
+//
+// The red run behind the 2026-09-25 `soak-smoke` hang: `Group.async` has a
+// backpressure fallback that *runs the task body on the calling thread* once
+// `async_limit` is reached (`std/Io/Threaded.zig:2188-2191` → `groupAsyncEager`,
+// `:2222-2226`), and `async_limit` defaults to `cpu_count - 1` (`:1641`). Every
+// loop `DistributedEventBus.start()` dispatches is a `while (self.is_running)`
+// that never returns, so the fallback *is* a `start()` that never returns: on
+// the runner the first node's loops used up the units and the second node's
+// `start()` sat inside the accept loop instead of coming back.
+//
+// The three tests below split that in two. The first pins the fallback itself —
+// what `async` does at the limit and what `concurrent` does instead — on an io
+// where the limit is 0, so it is visible on any machine. The second is the
+// bus-level shape: three buses, sequentially, on an io whose `async_limit` is 1
+// (a 2-core runner's default), all of them listening and serving. The third is
+// the other half of the contract: when a loop cannot be dispatched at all,
+// `start()` reports it instead of hanging or quietly pretending to run.
+
+/// Subscriber sink for the `async_limit` test below. File scope because
+/// `subscribe` takes a non-capturing function, so there is nowhere else to put
+/// the counter; `hits` is atomic because the callbacks arrive on bus fibers.
+const PoolSink = struct {
+    const topic = "bus.async-pool";
+    var hits = std.atomic.Value(usize).init(0);
+
+    fn onEvent(evt: DistributedEventBus.NetworkEvent) void {
+        if (std.mem.eql(u8, evt.topic, topic)) _ = hits.fetchAdd(1, .release);
+    }
+};
+
+/// A loopback port nothing is listening on: bind, read the number, close.
+fn deadLoopbackPort(io: std.Io) !u16 {
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    return listener.socket.address.getPort();
+}
+
+test "at async_limit 0 Group.async runs the body on the caller, Group.concurrent does not" {
+    const allocator = std.testing.allocator;
+    // `.limited(0)`: nothing can be dispatched, so the fallback is unconditional
+    // — the mechanism the runner reached by exhausting `cpu_count - 1` units.
+    var threaded = std.Io.Threaded.init(allocator, .{ .async_limit = .limited(0) });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var group: std.Io.Group = .init;
+    var async_thread = std.atomic.Value(usize).init(0);
+    var concurrent_thread = std.atomic.Value(usize).init(0);
+    const Caller = struct {
+        fn mark(slot: *std.atomic.Value(usize)) void {
+            slot.store(std.Thread.getCurrentId(), .release);
+        }
+    };
+
+    group.async(io, Caller.mark, .{&async_thread});
+    // Nothing was dispatched: the body had already run, right here, by the time
+    // `async` returned. A never-returning body would never have returned.
+    try std.testing.expectEqual(std.Thread.getCurrentId(), async_thread.load(.acquire));
+
+    // `concurrent` consults `concurrent_limit` — `.unlimited` by default
+    // (`std/Io/Threaded.zig:40`) — and has no eager path, which is what a loop
+    // that never returns has to have.
+    try group.concurrent(io, Caller.mark, .{&concurrent_thread});
+    try group.await(io);
+    try std.testing.expect(concurrent_thread.load(.acquire) != std.Thread.getCurrentId());
+}
+
+test "three buses start on an io whose async pool has one unit" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    // A 2-core runner's default (`async_limit = cpu_count - 1`,
+    // `std/Io/Threaded.zig:1641`) pinned explicitly: the ceiling is a property
+    // of the io, so a bigger machine can reproduce the runner's shape — and a
+    // 10-core laptop is precisely where this used to pass by accident.
+    var threaded = std.Io.Threaded.init(allocator, .{ .async_limit = .limited(1) });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const ids = [_][]const u8{ "pool-bus-a", "pool-bus-b", "pool-bus-c" };
+    PoolSink.hits.store(0, .release);
+
+    var buses: [ids.len]DistributedEventBus = undefined;
+    var ports: [ids.len]u16 = undefined;
+    var opened: usize = 0;
+    var started: usize = 0;
+    // Teardown covers only the buses that exist: the loop below is where the
+    // hang used to happen, so cleaning up cannot assume it ran to the end.
+    defer for (buses[0..opened], 0..) |*bus, i| {
+        if (i < started) bus.stop();
+        bus.deinit();
+    };
+
+    for (0..ids.len) |i| {
+        buses[i] = try DistributedEventBus.init(allocator, io, ids[i]);
+        opened = i + 1;
+        // Port 0: the kernel picks one and it is read back below, so there is no
+        // window between "find a free port" and "bind it" for something else to
+        // take it.
+        //
+        // One bus at a time, on this one thread. With `Group.async` this call
+        // would not return once the pool's single unit was spent — which is the
+        // assertion: it is the *return* of `start()` that the runner never saw.
+        try buses[i].start(0);
+        started = i + 1;
+        ports[i] = buses[i].listener.?.socket.address.getPort();
+        try std.testing.expect(ports[i] != 0);
+    }
+
+    // Started is not enough — the loops have to be running. Bus B dials bus A
+    // and publishes; bus A's accept and connection fibers parse the frame and
+    // hand it to this subscriber, so a count of one is proof both are alive.
+    // Only bus A subscribes: `publish` serves the publisher's own subscribers
+    // too (see `publish`), so a subscriber on bus B would count this event
+    // twice — once locally, once when the remote copy lands — and which of the
+    // two is seen first is a race, not a liveness signal.
+    try buses[0].subscribe(PoolSink.topic, PoolSink.onEvent);
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", ports[0]);
+    try buses[1].connectToNode(ids[0], addr);
+    try buses[1].publish(PoolSink.topic, "hello");
+    var waited: usize = 0;
+    while (PoolSink.hits.load(.acquire) == 0 and waited < 500) : (waited += 1) {
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch break;
+    }
+    try std.testing.expectEqual(@as(usize, 1), PoolSink.hits.load(.acquire));
+}
+
+test "a bus whose loops cannot be dispatched fails start() instead of hanging" {
+    const allocator = std.testing.allocator;
+    // Not one concurrent unit available, so every dispatch answers
+    // `error.ConcurrencyUnavailable` — the failure the eager fallback used to
+    // hide by running the loop on the caller instead.
+    var threaded = std.Io.Threaded.init(allocator, .{ .concurrent_limit = .nothing });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const port = try deadLoopbackPort(io);
+    var bus = try DistributedEventBus.init(allocator, io, "no-dispatch");
+    defer bus.deinit();
+
+    try std.testing.expectError(error.ConcurrencyUnavailable, bus.start(port));
+    // Rolled back rather than half-started, and not a silent downgrade: the bus
+    // is down and says so.
+    try std.testing.expect(!bus.is_running);
+    try std.testing.expect(bus.listener == null);
+
+    // The listener really is closed: the port the failed `start()` had bound
+    // (on 0.0.0.0) is bindable again.
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
 }
 
 test "a bare frame on an authenticated port is not delivered" {
