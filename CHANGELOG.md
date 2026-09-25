@@ -33,6 +33,12 @@
 "Drop cached coverage artifacts" 保留但注释缩成一句卫生说明（它的原始假设已被实验否掉，真实原因在别处）。
 **仍未验证的一步**：本机没有 x86_64-linux 主机，所以"ubuntu 上真跑完并绿"要靠下一次 dispatch 确认。
 
+> **已确认（同一次 dispatch，`39c9376`）**：整个 workflow `success`，`Nightly soak` job `success`，
+> **`Fuzz (bounded) | success` 并且没有 `continue-on-error`**（`18:38:40 → 18:44:08`，5 分 28 秒，真跑完了整套）。
+> runner 日志里那一步的读数是 **`Coverage: 0/155829 -> 1157/155829 (0.74%)`** —— 对比修前的 0 个 PC ——
+> 以及 **`Build Summary: 15/15 steps succeeded; 2021/2079 tests passed (58 skipped)`**；
+> 那些装饰性的 `failed command:` 行也随 `ZIG_BUILD_ERROR_STYLE=minimal` 一起消失了。
+
 ### 第 48 批：查出一条**我自己写进仓库的 flake** —— `PrecisionTimer` 的"窗口不劣于内核 sleep"断言在负载机上是噪声比较，改成"只在窗口真能起作用时才断言"
 
 **触发**：第 45 批那次 push（`7bd9624`，只改了 `ci.yml` 注释与 CHANGELOG，树与刚通过的 `61f82fb` 实质相同）
