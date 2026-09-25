@@ -1,5 +1,76 @@
 # Changelog
 
+## [Unreleased]
+
+### 第 26 批：`SecurityModule` 的 base64 编码在失败时漏缓冲（**CI 漏掉、本机抓到**）、metrics 注册在首次抓取后被"封条"、`getQuantile` 的既有崩溃、记忆 dump 的字节数组能读回来了（**破坏性：否**，一处行为变更）
+
+全量 `-Ddb=all` **1935/1993（58 skipped，0 failed）**；CI 示例清单本机 16/16。
+
+**`base64UrlEncode` 在收缩 `realloc` 失败时漏掉整块缓冲（144 字节）—— 而 CI 不会发现它。**
+`encoded = try alloc.alloc(...)` 之后是 `realloc(encoded, len)` 去掉 base64 padding；**后者失败时前者悬空**。
+红证据（本机）：
+```
+941 ... generateTokenWithTenantAndVersion survives every allocation point failing (OOM scan)...
+[SafeAllocator] (err): leaked [addr: …, len: 144] allocated at: … SecurityModule.zig:479 …
+zm-test-runner: selected 1 of 1878 — 0 passed; 1 failed; 1 leaked
+```
+修法一行：`errdefer allocator.free(encoded);`（与同文件 `base64UrlDecode` 早先由下游项目逼出来的修法同形）。
+> **为什么 CI 一直是绿的（查清了，值得记）**：`std.testing.checkAllAllocationFailures` 用的是
+> `FailingAllocator`，而它**只在 `alloc` 上注入失败**（`resize`/`remap` 只走计数转发，见
+> `std/testing/FailingAllocator.zig:58/81/102`）。所以"收缩 `realloc` 失败"这条路径**只能在下层分配器的
+> `remap` 拒绝原地收缩时**才可达 —— 那时 `realloc` 退化成 `alloc+copy+free`，被注入的失败落在那次 `alloc` 上，
+> 原缓冲就悬空了。本机（SafeAllocator/DebugAllocator 的 `remap` 拒绝收缩）**走这条路径**，GitHub 的
+> macos runner **不走**（同一份源码、同一个 Zig 版本、`run test` 未被缓存、237 行测试输出都在）。
+> 也就是说：**"CI 绿"没能覆盖这个泄漏，本机的 OOM 扫描覆盖到了**。这不是"CI 有 bug"，而是这条扫描的
+> 可达性依赖分配器的 `remap` 行为 —— 记在这里，因为它决定了"发版前必须在本机跑一遍 OOM 扫描"。
+
+**metrics 的注册现在有"封条"：首次抓取之后 `create*` 返回 `error.Frozen`。** 上一批修掉了 per-family
+`render` 的 use-after-free，但**注册级**的容器（`counters`/`gauges`/`histograms`/`summaries` 四个 map 与
+两个 family ArrayList）仍是"无锁遍历 + `create*` 插入"——同一个 UAF 形状。查过全部 `create*` 调用点后确认
+树内的注册都是启动期接线（`productionProfile`、`Runtime.MetricsBridge.init`、`OutboxConsumer.setMetrics`、
+`AutoInstrumentation.init`、`ModuleMetricsCollector.init`；请求线程创建的 per-label series 走
+**mutex 保护**的 `CounterFamily.get`/`HistogramFamily.get`，不走 `create*`）。**没有把"启动期注册"留成
+假设，而是把它变成机制**：`toPrometheusFormat` 在读任何容器**之前**置 `frozen`（也可显式 `freeze()`，
+幂等、不可解除），之后 `create*` 立刻 `return error.Frozen` 且**什么都不插入**（检查在所有分配之前），
+新增 `isFrozen()`。红证据：
+```
+a scrape seals the registry...FAIL   (expectError(error.Frozen, m.createCounter("late_total", …)))
+```
+> **坦白这层封条不是什么**：它是 **release store + acquire load，不是互斥** —— 一个在封条落定**之前**
+> 通过检查的 `create*` 仍可能在第一次迭代期间完成 `put`，那一次交错下原来的窗口还在。类型文档里明说了
+> （"enforce/loud，不是已互斥"）。真关掉需要锁，而 `init` 没有 `io`（加 `std.Io.Mutex` 会改到范围外的所有
+> 调用点），`core.SpinLock` 又要求临界区不放可能分配的 `put`。所以这一版把契约变响而不是变严。
+> 行为变化（对外）：**第一次抓取之后，原本成功的 `create*` 现在返回 `error.Frozen`**；仓内所有调用点都在
+> 启动期，实测 16 个示例全部照旧构建通过。
+
+**`Summary.getQuantile` 有一个既有的崩溃（写测试时撞出来）。** QuickSelect 的 `j -= 1` 在 `lo == 0` 时
+**usize 回绕** → `panic: integer overflow`。红证据：`thread … panic: integer overflow @ PrometheusMetrics.zig:234
+in getQuantile`。改为饱和减 `j -|= 1`，并加了"3 个样本的全部 6 种到达顺序 × q=0/0.5/1"的回归用例。
+> 同文件的 `Summary` 仍是**唯一**既非原子也非加锁的容器（`observe` 无锁 append、`getQuantile` 无锁读且**就地
+> swap**）。这次**只文档化 + 加了钉子测试**：`toPrometheusFormat` 目前完全不渲染 summary，`createSummary`/
+> `getQuantile` 树内也没有生产调用者；钉子测试会在将来给 summary 加渲染时变红，逼作者先处理并发。
+> `setScrapeHook` 同理**只文档化**（hook 与 userdata 成对写入、必须启动期接线；强制要改返回类型，而
+> `examples/zmsaas/backend/src/main.zig:133` 是不带 `try` 的唯一生产调用点）。
+
+**记忆 dump 的字节数组现在能读回来了（往返无损），并且恢复行自己的时间戳。**
+① `dumpJson` 会把**不是合法 UTF-8** 的 `[]const u8` 序列化成**字节值数组**，而 `loadJson` 只认字符串 —— 这类
+值**写得出、读不回**（上一批至少让它 warn，这一批让它真的回来）。`std.json` 的行为是**实测**的（写：
+`{"value":[255,254,0,111,107]}`；读回：`.array` of `.integer`）。现在 `.array` 成员必须是 `0..255` 的整数
+（否则**跳过该条目并 warn**，与"畸形条目跳过"的既有规则一致；只有 *scope* 缺失才整份拒绝 —— 那是安全理由）。
+顺带发现 `key` 也是 `[]const u8`、同样会被写成数组、同样被跳过，**两个字段共用同一个 reader** 后，二进制 key
+也能恢复并按前缀命中 `recall`。② `created_at`/`access_count`/`last_accessed_at` 以前**写了从不读**（恢复走
+`remember` 重新打戳），后果是恢复后 `evictOldestLocked` 看到所有行时间戳相同、按哈希序淘汰。现在有个私有的
+`putLocked(history)` 让 apply 趟把 dump 声明的 history 带进去；**公开签名未变**（`EntryHistory` 是私有类型）。
+> merge 语义变化需注意：load 覆盖已存在的复合键时，**整行（含 history）以 dump 为准**（旧行为是"换值 +
+> `access_count += 1` + 留下本地 `created_at`"）。history 三字段任一损坏 → warn + 该行按新戳恢复（绝不因
+> 时间戳丢内容，与 scope 的严格拒绝刻意相反）。
+
+> **顺带发现、未修（已列）**：`PrometheusMetrics` 的死字段（`Summary.quantiles`/`max_age_seconds`/
+> `age_buckets` 声明后从未读）、同名重复 `create*` 会替换旧对象（泄漏 + 旧句柄孤立）、`deinit` 与在飞抓取/
+> 句柄并发、`scrape_hook`/`scrape_userdata` 成对读写的撕裂（仅文档）；**`src/test/IntegrationTest.zig:213-220`
+> 把 `PrometheusMetrics` 按值拷进 harness，而 `auto_inst.metrics` 指向 `init` 的栈局部** —— 既有悬垂。
+> `docs/API.md`/`docs/OBSERVABILITY.md` 里 creator 的签名形态与新错误集尚未同步（不是错，但不完整）。
+
 ## [0.33.4] - 2026-09-25
 
 ### 第 25 批：损坏的记忆 dump 会把作用域**放宽**成 "any"（真红，值级证据）、畸形条目静默消失（**破坏性：否**，但一个损坏文件现在会失败）
