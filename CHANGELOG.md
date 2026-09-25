@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+> **第 38 批是一次**诊断**推送（临时，见下一条）**：`[DEB-TRACE]` 那些 `warn` 行是为了把 Linux-only 的
+> `DistributedEventBus.start` 卡点夹出来，**修掉它的批次会一并删除**。
+
+### 第 38 批（诊断）：把 Linux 上 `DistributedEventBus.start` 的卡点夹到具体那一行（临时 `[DEB-TRACE]`，随修复删除）
+
+**第 37 批的判读表把范围收窄到一处**：带心跳的 CI 日志最后一行是
+`[soak-cluster] boot: node sc-b bus start begin (port 24347)`，**再没有下文** —— 也就是卡在
+`DistributedEventBus.start()` 里，与 raft、发布、teardown 都无关（本批因此推翻了上一批记的
+"SO_SNDTIMEO/teardown"假设：**那条是错的**，先前的猜测没有成为结论）。
+
+`start()` 里能阻塞的只有四处：`address.listen(...)` 与三个 `fiber_group.async(...)`。本批给每一处前后都
+加了 `[DEB-TRACE]` 的 `warn` 行（`start` 内部的 `std.log.info` 到不了 soak 的日志级别，所以必须是 warn），
+并给 `acceptLoop` 加了入口行、`accept()` 前后行**以及 accept 错误计数**（它 `catch → continue` 是个忙循环，
+Linux 上若 `accept` 持续失败会把整机 CPU 吃掉、表现得和"卡死"一样，这个计数就是用来区分这两种情况的）。
+本机 macOS 一次 smoke 打印 42 行 trace，序列完整（`listening → accept-fiber → heartbeat-fiber → done`），
+`zig build soak-smoke` 仍绿（16 s）。
+
 ### 第 37 批：cluster soak 在 Linux 上卡住 —— 先让它**卡住也能从日志判读**（心跳 + 相位地标 + 采样器上界），并修掉 `soak.zig` 失败时挂死（**破坏性：否**，只加可观测性；断言与阈值一字未改）
 
 全量 `-Ddb=all` 见下；`zig build soak-smoke` 本机 16 s 绿；fmt / check / check-deadcode 全绿。

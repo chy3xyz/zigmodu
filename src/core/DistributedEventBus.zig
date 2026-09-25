@@ -453,9 +453,18 @@ pub const DistributedEventBus = struct {
     pub fn start(self: *Self, port: u16) !void {
         if (self.is_running) return;
 
+        // TEMPORARY DIAGNOSTIC (`[DEB-TRACE]`, removed in the batch that fixes
+        // it): the 3-node soak hangs inside `start()` on the Linux runner —
+        // node sc-a gets through, node sc-b stops between the harness's
+        // "bus start begin" and "bus listener up" landmarks, and the process
+        // sits there until the step times out. Every blocking candidate in this
+        // function is one of four lines, so each one is bracketed at `warn`
+        // (the soak's log level; `std.log.info` below never reaches the log).
+        std.log.warn("[DEB-TRACE] {s} start: bind+listen begin (port {d})", .{ self.node_id, port });
         const address = try std.Io.net.IpAddress.parseIp4("0.0.0.0", port);
         self.listener = try address.listen(self.io, .{});
         self.is_running = true;
+        std.log.warn("[DEB-TRACE] {s} start: listening, auth check next", .{self.node_id});
 
         std.log.info("[DistributedEventBus] Node '{s}' listening on port {d}", .{ self.node_id, port });
 
@@ -488,15 +497,22 @@ pub const DistributedEventBus = struct {
 
         // Start accept loop and heartbeat asynchronously as members of
         // `fiber_group` so their futures do not leak.
+        std.log.warn("[DEB-TRACE] {s} start: accept-fiber async begin", .{self.node_id});
         self.fiber_group.async(self.io, acceptLoop, .{self});
+        std.log.warn("[DEB-TRACE] {s} start: accept-fiber async returned", .{self.node_id});
         self.heartbeat_thread = null;
+        std.log.warn("[DEB-TRACE] {s} start: heartbeat-fiber async begin", .{self.node_id});
         self.fiber_group.async(self.io, heartbeatLoop, .{self});
+        std.log.warn("[DEB-TRACE] {s} start: heartbeat-fiber async returned", .{self.node_id});
 
         // Start DLQ retry fiber if a DLQ has been configured.
         if (self.dlq != null and !self.dlq_retry_running) {
             self.dlq_retry_running = true;
+            std.log.warn("[DEB-TRACE] {s} start: dlq-fiber async begin", .{self.node_id});
             self.fiber_group.async(self.io, dlqRetryLoop, .{self});
+            std.log.warn("[DEB-TRACE] {s} start: dlq-fiber async returned", .{self.node_id});
         }
+        std.log.warn("[DEB-TRACE] {s} start: done", .{self.node_id});
     }
 
     pub fn stop(self: *Self) void {
@@ -592,14 +608,26 @@ pub const DistributedEventBus = struct {
     }
 
     fn acceptLoop(self: *Self) void {
+        std.log.warn("[DEB-TRACE] {s} acceptLoop: entered (is_running={})", .{ self.node_id, self.is_running });
+        var accept_errors: u64 = 0;
         while (self.is_running) {
             if (self.listener) |*l| {
+                std.log.warn("[DEB-TRACE] {s} acceptLoop: accept() begin", .{self.node_id});
                 const conn = l.accept(self.io) catch |err| {
+                    accept_errors += 1;
+                    // The `continue` below is a busy loop when `accept` keeps
+                    // failing: `[DEB-TRACE]` counts them so a Linux-only spin
+                    // (which would starve every other node) is visible as a
+                    // number instead of as silence.
+                    if (accept_errors <= 5 or accept_errors % 1000 == 0) {
+                        std.log.warn("[DEB-TRACE] {s} acceptLoop: accept error #{d}: {s}", .{ self.node_id, accept_errors, @errorName(err) });
+                    }
                     if (self.is_running) {
                         std.log.err("[DistributedEventBus] Accept error: {}", .{err});
                     }
                     continue;
                 };
+                std.log.warn("[DEB-TRACE] {s} acceptLoop: accepted a connection", .{self.node_id});
 
                 // Handle connection in the shared group. Use `concurrent` (not
                 // `async`): handleConnection blocks on peer reads, and `async`'s
