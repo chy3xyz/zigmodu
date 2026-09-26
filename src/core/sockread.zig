@@ -51,18 +51,40 @@ fn applyTimeout(fd: std.posix.socket_t, optname: u32, tv: *const std.posix.timev
     std.log.warn("[sockread] {s} not applied ({s}): {s}", .{ what, @tagName(e), consequence });
 }
 
+/// Make a syscall already parked on `fd` return **now**.
+///
+/// `shutdown()` is what does it, and the same call covers both directions of the
+/// same problem: a listener parked in `accept` (see `closeListener`, EINVAL) and
+/// a connection parked in `read` — a peer that completes a handshake and then
+/// sends nothing, and never hangs up, leaves the reading fiber there for as long
+/// as it likes, and whoever drains that fiber (`Io.Group.await`) waits with it.
+/// The parked read comes back as EOF, which every read loop in the tree already
+/// treats as "the peer went away". `close()` alone wakes neither on Linux: the
+/// kernel keeps the socket alive for the in-flight syscall.
+///
+/// Errors are expected and ignored — ENOTCONN on a socket that is not connected,
+/// EINVAL for a listener on macOS — because a caller that gets no error had
+/// nothing blocked to begin with.
+///
+/// Deliberately not an idle / `SO_RCVTIMEO` bound: a long quiet period is a
+/// *normal* WebSocket state, so a timeout would cut healthy connections, whereas
+/// this only ever fires because someone is shutting the socket down.
+pub fn wakeBlockedSyscall(fd: std.posix.socket_t) void {
+    _ = std.c.shutdown(fd, std.c.SHUT.RDWR);
+}
+
 /// Close a listening socket so a thread already blocked in `accept()` returns.
 ///
-/// `close()` alone does not do that on Linux: the kernel keeps the socket alive
-/// for the in-flight `accept`, so the accept loop stays blocked and whoever is
-/// waiting for it — a `Thread.join`, an `Io.Group.await` — waits with it. The
-/// symptom is a `stop()` that never returns, which is a hang, not a shutdown.
-/// `shutdown()` on a listening socket makes that `accept` fail immediately
-/// (EINVAL). Errors are expected (macOS answers ENOTCONN for a listener) and
-/// ignored: the fd is closed either way, and a caller that gets no error had
-/// nothing blocked to begin with.
+/// `wakeBlockedSyscall` is the shutdown half, and the reason it is not optional:
+/// `close()` alone does not wake an in-flight `accept` on Linux, so the accept
+/// loop stays blocked and whoever is waiting for it — a `Thread.join`, an
+/// `Io.Group.await` — waits with it. The symptom is a `stop()` that never
+/// returns, which is a hang, not a shutdown. `shutdown()` on a listening socket
+/// makes that `accept` fail immediately (EINVAL). Errors are expected (macOS
+/// answers ENOTCONN for a listener) and ignored: the fd is closed either way, and
+/// a caller that gets no error had nothing blocked to begin with.
 pub fn closeListener(io: std.Io, listener: *std.Io.net.Server) void {
-    _ = std.c.shutdown(listener.socket.handle, std.c.SHUT.RDWR);
+    wakeBlockedSyscall(listener.socket.handle);
     listener.deinit(io);
 }
 

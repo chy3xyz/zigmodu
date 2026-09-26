@@ -105,8 +105,18 @@ pub fn build(b: *std.Build) void {
     // `-Dtest-llvm=` overrides either way. A *new* test root that contains
     // `std.testing.fuzz` must be attached through `addTest` below, or `--fuzz`
     // loses coverage for it again.
-    const test_llvm = b.option(bool, "test-llvm", "Force the LLVM backend for the `test` step's artifacts (default: true on x86_64-linux, where the default backend emits no `--fuzz` coverage sections)") orelse
-        (target.result.cpu.arch == .x86_64 and target.result.os.tag == .linux);
+    // `null` means "not asked": then only the artifacts that actually contain
+    // `std.testing.fuzz` blocks take the LLVM backend (see `llvm_for_fuzz`),
+    // because forcing all six is not free — measured for the same root module,
+    // the default backend compiles it in 5.2 s / 635 MB and LLVM in 26.3 s /
+    // 2.04 GB, and the ubuntu `Run tests` step went 3m51s → 4m47s while every
+    // artifact was forced through. `-Dtest-llvm=true` forces all of them (the
+    // escape hatch if a future fuzz root is not declared below), `=false` forces
+    // none.
+    const test_llvm_forced = b.option(bool, "test-llvm", "Force the LLVM backend for the `test` step's artifacts (default: only the artifacts that contain `std.testing.fuzz` blocks, on x86_64-linux, where the default backend emits no `--fuzz` coverage sections)");
+    // x86_64-linux is where the default backend drops the `--fuzz` coverage
+    // sections entirely; every other target emits them already.
+    const llvm_for_fuzz = target.result.cpu.arch == .x86_64 and target.result.os.tag == .linux;
 
     // Attach a test artifact to the `test` step. Kept as one helper so the
     // filter, the runner, the backend choice and the side-effect flag cannot
@@ -146,7 +156,7 @@ pub fn build(b: *std.Build) void {
     const lib_tests = b.addTest(.{
         .root_module = lib_test_mod,
     });
-    addTest(b, test_step, lib_tests, test_filter, test_force_run, test_llvm);
+    addTest(b, test_step, lib_tests, test_filter, test_force_run, test_llvm_forced orelse llvm_for_fuzz);
 
     // Test log_level.zig separately (needs build_options module)
     const log_level_test_mod = b.createModule(.{
@@ -158,7 +168,7 @@ pub fn build(b: *std.Build) void {
     const log_level_tests = b.addTest(.{
         .root_module = log_level_test_mod,
     });
-    addTest(b, test_step, log_level_tests, test_filter, test_force_run, test_llvm);
+    addTest(b, test_step, log_level_tests, test_filter, test_force_run, test_llvm_forced orelse false);
 
     // Benchmark step
     const benchmark_mod = b.createModule(.{
@@ -301,7 +311,7 @@ pub fn build(b: *std.Build) void {
     const zmodu_tests = b.addTest(.{
         .root_module = zmodu_cli_mod,
     });
-    addTest(b, test_step, zmodu_tests, test_filter, test_force_run, test_llvm);
+    addTest(b, test_step, zmodu_tests, test_filter, test_force_run, test_llvm_forced orelse false);
 
     // Dead-code analyzer unit tests live in the deadcode/ submodule; include
     // them explicitly so `zig build test` covers the analyzer itself.
@@ -311,14 +321,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const dc_analyze_tests = b.addTest(.{ .root_module = dc_analyze_mod });
-    addTest(b, test_step, dc_analyze_tests, test_filter, test_force_run, test_llvm);
+    addTest(b, test_step, dc_analyze_tests, test_filter, test_force_run, test_llvm_forced orelse false);
     const dc_scanner_mod = b.createModule(.{
         .root_source_file = b.path("tools/zmodu/src/deadcode/scanner.zig"),
         .target = target,
         .optimize = optimize,
     });
     const dc_scanner_tests = b.addTest(.{ .root_module = dc_scanner_mod });
-    addTest(b, test_step, dc_scanner_tests, test_filter, test_force_run, test_llvm);
+    addTest(b, test_step, dc_scanner_tests, test_filter, test_force_run, test_llvm_forced orelse false);
 
     // Concurrency soak (`zig build soak`) — real sockets, N clients x M
     // tenants, cross-tenant leak assertions. Kept out of `zig build test` so
@@ -473,7 +483,7 @@ pub fn build(b: *std.Build) void {
     db_link.link(stress_smoke_mod, b, features);
 
     const stress_smoke_tests = b.addTest(.{ .root_module = stress_smoke_mod });
-    addTest(b, test_step, stress_smoke_tests, test_filter, test_force_run, test_llvm);
+    addTest(b, test_step, stress_smoke_tests, test_filter, test_force_run, test_llvm_forced orelse false);
 
     // ── `soak-smoke`: the push-gate slice of the nightly soaks ─────────────
     //

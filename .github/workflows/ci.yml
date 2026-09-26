@@ -66,6 +66,14 @@ jobs:
     name: Build & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    env:
+      # The build summary prints a `failed command:` line for any run step whose
+      # child wrote to stderr — *including steps that pass* (measured: two
+      # artifact families here do, the stress smoke's `[stress] …` output and the
+      # main suite's sqlx warnings). In a log read for status that noise looks
+      # like failure; this only changes the summary's verbosity, and a genuine
+      # failure still prints its own output and still fails the step.
+      ZIG_BUILD_ERROR_STYLE: minimal
     strategy:
       fail-fast: false
       matrix:
@@ -371,6 +379,46 @@ jobs:
 
       - name: Install deps
         run: sudo apt-get install -y libpq-dev libmariadb-dev libmariadb-dev-compat libsqlite3-dev
+
+      - name: The example lists in this workflow agree with each other
+        # Four `for ex in …; do` loops name example directories: the two *build*
+        # lists (which must be identical — their comments say so, and they
+        # drifted once, leaving `zent-modulith` compiled by only one job) and two
+        # deliberate subsets (the `zmodu doctor` apps, and the examples that ship
+        # a `test` step). Every name in a subset must be reachable as a build
+        # somewhere in this file — either in the loop or in an explicit
+        # `(cd "examples/<name>" && zig build)` line, which is how
+        # `zmsaas/backend` is built. (The first version of this check demanded
+        # plain membership in the loop list and failed on exactly that, which is
+        # the kind of thing an invariant should be made to say out loud.)
+        run: |
+          python3 - <<'PY'
+          import re, sys
+          src = open(".github/workflows/ci.yml").read()
+          lists = re.findall(r"for ex in ([a-z0-9 _./-]+); do", src)
+          if len(lists) != 4:
+              sys.exit(f"expected 4 `for ex in` lists, found {len(lists)}")
+          full_a, doctor, full_b, test_steps = (l.split() for l in lists)
+          # `cd` lines appear both quoted (`(cd "examples/$ex" …)`) and bare
+          # (`(cd examples/zmsaas/backend …)`), so neither form may be assumed:
+          # the first version of this check assumed quotes and reported
+          # `zmsaas/backend` as never built.
+          explicit = set(re.findall(r'\(cd "?examples/([^" ]+)', src)) - {"$ex"}
+          known = set(full_a) | explicit
+          ok = True
+          if full_a != full_b:
+              print("the two build lists differ:")
+              print("  build-and-test:", " ".join(full_a))
+              print("  examples      :", " ".join(full_b))
+              ok = False
+          for name, sub in (("doctor", doctor), ("test-step", test_steps)):
+              extra = sorted(set(sub) - known)
+              if extra:
+                  print(f"the {name} list names examples this workflow never builds: {extra}")
+                  ok = False
+          print(f"OK: {len(full_a)} looped examples, {len(explicit)} explicit, doctor {len(doctor)}, test-step {len(test_steps)}")
+          sys.exit(0 if ok else 1)
+          PY
 
       - name: Zig fmt check
         # Single home for the formatting gate: the build graph owns the path

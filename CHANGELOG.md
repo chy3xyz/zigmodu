@@ -2,6 +2,43 @@
 
 ## [Unreleased]
 
+### 第 50 批：把 `-Dtest-llvm` 收窄到**真正含 fuzz 用例的那个 artifact**（省回每次 push 的 ~56 s）、`WebSocketServer.stop()` 不再被沉默的对端拖住、CI 加两道小门禁（**破坏性：否**）
+
+**① `-Dtest-llvm` 收窄（清理我自己在第 49 批引入的成本）。** 第 49 批为了让 fuzz 在 x86_64-linux 上拿到覆盖，
+把**六个** test artifact 全推去 LLVM。实测代价：ubuntu 腿的 `Run tests` 从 **3m51s → 4m47s（+56 s / +24%）**。
+而真正含 `std.testing.fuzz` 的只有主套件（`src/api/Server.zig`、`src/core/cluster/RaftTransport.zig`、
+`src/core/DistributedEventBus.zig` 都在它里面）—— 另外五个一个都没有。改成**按 artifact 声明**：
+
+* 默认（未给 `-Dtest-llvm`）：**只有**含 fuzz 的那个 artifact 在 x86_64-linux 上走 LLVM；
+* `-Dtest-llvm=true` 强制全部（逃生口，将来别的 root 加了 fuzz 用例而没声明时用它）；
+* `-Dtest-llvm=false` 一个都不走。
+
+实测（`--verbose | grep -c fllvm`）：x86_64-linux 默认 **1** 处、强制 true **6** 处、本机 aarch64-macos **0** 处。
+`build.zig` 的注释写明"**新加 fuzz 用例的 root 必须走 `addTest` 并声明**，否则 `--fuzz` 又会丢覆盖"——
+而丢覆盖是**响亮失败**（就是第 49 批修的那个 `pcs_len was zero`），不是静默通过。
+
+**② `WebSocketServer.stop()` 不再被"沉默的对端"拖住。** 核实：`src/extensions/WebSocket.zig` 里**没有任何**读/写/空闲
+超时，对端握手后不发也不关，`handleConnection` 就永远卡在裸 `read`，而 `stop()` 要 `fiber_group.await` 它 ——
+**关停时长由远端决定、没有上界**。修法**不是**加超时（WS 的正常态就是长空闲，加超时砍掉健康连接，方向是错的），
+而是**关停时主动唤醒**：新增 `sockread.wakeBlockedSyscall`（`shutdown(fd, RDWR)`，与 `closeListener` 同一手法，
+后者改为调用它），`WebSocketServer.stop()` 在 `await` 前**在注册表锁下**对每个 pending/已注册连接的 fd 唤醒。
+"`closeListener` 之后 accept 还可能返回一个 conn" 这个窗口由 `registerPendingConnection` 在同一把锁内读
+`is_running` 兜住。新增两个测试（静默已注册客户端 / 连上但一字节不发的半开连接）。
+**红证据**：去掉唤醒那一行 → `[ws stop] silent peer: stop()=10000ms woken=0 clients=1` /
+`FAIL (StopDidNotWakeSilentPeer)` 与半开形状同款；还原后逐字节一致；修后同一测试读数是 `stop()=20ms woken=1`。
+**仍未覆盖**（如实记）：`on_connect_cb` / `on_message_cb` 里用户代码自己永久阻塞时，drain 仍要等 —— 框架唤不醒它。
+
+**③ 两道小门禁**（都是"把注释里的承诺变成机械检查"）：
+
+* **CI 里那四份示例清单互相对账**（lint job）：两份**构建清单必须逐字相同**（注释说它们漂过一次 ——
+  `zent-modulith` 只被其中一个 job 编译过），两份**子集清单**（`zmodu doctor` / 带 `test` 步的示例）里的每个名字
+  必须在本 workflow 里**真的被构建**（循环里，或像 `zmsaas/backend` 那样有显式的 `cd examples/… && zig build`）。
+  **这道门禁第一次跑就抓出两个真事**：`zmsaas/backend` 不在循环里（是另一条命令建的），以及 `cd` 的两种写法
+  （带引号与不带引号）—— 两条都已按事实写进脚本与注释。反向验证：塞一个不存在的名字 → 红；让两份构建清单漂移 → 红。
+* **`ZIG_BUILD_ERROR_STYLE: minimal`**（`build-and-test` job）：构建摘要会给**任何**往 stderr 写过字的 run step 打一行
+  `failed command:`（**包括成功的**，本仓就有两族：stress smoke 的 `[stress] …` 与主套件的 sqlx 警告），
+  在被当作状态读的日志里那噪声看着像失败。只影响摘要详略，真实失败照样打印自己的输出并让步骤红。
+
 ### 第 49 批：夜间 `Fuzz` 的真正根因找到了 —— **x86_64 上 Zig 的默认后端不发射 `--fuzz` 的覆盖 section**（`-fllvm` 才发）；同时**更正我在第 45 批写错的两处**
 
 `Fuzz (bounded)` 自第一次执行起一直红，前六条候选（陈旧缓存、runner 文件系统、内存、bound、CI 的关闭 stdin、位置/前序步骤）
