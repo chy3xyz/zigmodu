@@ -37,11 +37,15 @@ INT/TERM 的 handler —— 默认动作是**终止进程**。实测（独立小
 > 红证据是**进程外**的实测（上面两个退出码），测试只钉住"报 `ConnectionError`，而不是死"这条契约——
 > 这一条已经足以防止实现退回 `write`（退回会让**真实应用**重新可被一个 RST 杀掉，而不是让测试变红）。
 
-**③ 本批不声称**：`ctx.streaming` 那条（`Context.flushHeadersToSocket` / `writeChunk`，以及
-`src/http/Sse.zig` 的 `SseWriter` 五个方法）**仍走 `std.Io` 的 writer，仍然无界** —— 一个不读的
-SSE 订阅者照样能把 fiber park 住，`stop()` 照样等它。修它要把同一个预算接线进 `Context`/`SseWriter`
-（且不能靠"给 fd 挂一次 `SO_SNDTIMEO`"绕过：那会让这些 io 写者在超时时 panic）。这是本批留下的
-最大缺口，下一批的主题。
+**③ 本批不声称**：**凡是走 `std.Io` 的 writer 的写，仍然无界** —— 服务端连接上还有三处：
+(a) `Context.flushHeadersToSocket` / `writeChunk`（chunked / streaming 的 HTTP/1.1），
+(b) `src/http/Sse.zig` 的 `SseWriter`（五个方法），(c) `src/http/Http2Server.zig` 的
+`ConnWriter.writeDirect` —— **HTTP/2 的每个响应都走它**；扩展层的 `extensions/WebSocket.zig` /
+`WebMonitor.zig` 同理。一个不读的 SSE 订阅者、或一个不读的 H2 客户端，照样能把 fiber park 住，
+`stop()` 照样等它。修法是把同一个预算接线进这些写者（各需要一个 `write_timeout_ms`，并把
+`ResponseWriter` 抽成共享的裸写实现）；**不能**靠"给 fd 挂一次 `SO_SNDTIMEO`"绕过 —— 那会让
+这些 io 写者在超时时 panic（`netWritePosix` 的 `errnoBug`），这正是本批把预算围在单次写上的原因。
+这是本批留下的最大缺口，下一批的主题。
 
 ### 第 54 批：上一批报出的 `ws_uring` 两个真缺陷 —— 升级后 fd 归属自相矛盾导致的**重复关闭**、`adopt` 与事件循环之间**共享元数据的跨线程撕裂**（**破坏性：否**）
 
