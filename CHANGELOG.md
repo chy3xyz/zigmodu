@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.34.0] - 2026-09-26
 
 ### 第 50 批：把 `-Dtest-llvm` 收窄到**真正含 fuzz 用例的那个 artifact**（省回每次 push 的 ~56 s）、`WebSocketServer.stop()` 不再被沉默的对端拖住、CI 加两道小门禁（**破坏性：否**）
 
