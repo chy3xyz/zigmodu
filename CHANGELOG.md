@@ -2,6 +2,51 @@
 
 ## [Unreleased]
 
+### 第 63 批：写失败必须**粘住**（`ConnWriter`/`BoundedWriter`）—— 失败的空 flush 曾返回成功，H2 会话因此带着废 socket 继续读（**破坏性：否**）
+
+第 61 批推上去后 CI 的 **ubuntu 腿**红在一条**既有**测试
+（`api.Server.test.an HTTP/2 client that stops reading cannot hold the session: the write budget ends it`），
+用 SIGABRT 收场。本批查清并修掉，它其实是三个叠在一起的问题：
+
+**① 根因：`ConnWriter.flush` 把 `self.len = 0` 放在写之前。** 写失败后缓冲已经清空，下一次
+`flush()` 无话可写、**返回成功** —— 于是一次写超时可以在 `finishStreamScheduled` 的 `catch` 里被
+转成 `RST_STREAM(INTERNAL_ERROR)`，而那个 13 字节的 RST 恰好能塞进刚腾出的 socket 缓冲 →
+`resetStream` 成功返回 → 会话没有待发响应、回去读 socket，直到读空闲预算（10 s）才结束；测试的
+3 s 预算等不到，判定"写预算没结束会话"，随后测试自己的诊断把它升级成崩溃。
+修法：两个带缓冲的写者各加 `failed: ?WriteError`（**第一次写失败粘住**，之后任何 `write`/`flush`
+都返回它，空 flush 也不例外）。这是"失败的 socket 不许再写得像成功"的不变量，不是补丁。
+
+**② 顺带把 `sockread.writeFull`/`writeFullBounded` 的 error set 显式写成新的具名
+`WriteError`**：`?anyerror` 字段回传会把上层**所有** `switch (err)` 变成"缺 else"的编译错误
+（实测：`Server.zig:3730`、`:3841`），具名集合既不丢可读性也不放宽调用方的推断集合。
+
+**③ H2 的 dispatch `catch`：传输类错误（`WriteTimeout`/`ConnectionError`/`ConnectionClosed`）直接
+结束会话**，不再假装用 `RST_STREAM` 回答一个已经写不出去的 socket（`isTransportError`）。语义上
+这是**连接**级失败，不是流级失败。
+
+那条测试自己的诊断还有一处越界（`drain[off..drained]` 把**累计**字节数当**单次读**的缓冲下标）——
+在失败路径上正好把"断言失败"变成 SIGABRT，把真正的证据埋掉；改成按每次读的切片解析并顺手把帧
+打出来。
+
+**平台证据（这是本批的关键，也是为什么它只在 Linux 上现形）**：临时启动本机 OrbStack，把
+`-Dtarget=x86_64-linux` 交叉编译出的测试二进制放进 `ubuntu:24.04` 容器跑（
+`tcp_wmem 4096/16384/4194304`、`tcp_rmem 4096/131072/33554432`、`wmem/rmem_default 229376`，即
+无读者时内核只能吸 ~160 KiB）。
+
+* 修前：**8 次里 0 次通过**（每次都是 `still held the session fiber 3000ms past the 200ms write
+  budget (159793 bytes on the wire)` + 越界 panic）；临时打点看到
+  `writeDirect 65536 -> WriteTimeout` → `dispatch err WriteTimeout -> resetStream`，
+  而 13 字节的 RST 有时写成功（会话活下来）有时失败（会话结束）——**这就是那条竞态**。
+* 基线对照：同一测试在上一版 tag（`5ea017c`）的 Linux 二进制上 **3/3 通过**，所以这是第 61 批
+  改动暴露出来的既有缺陷（切片让队列/写节奏变了，撞上了这条路径）。
+* 修后：**8 次 8 通过**；容器里 `--filter=h2` 37 条全绿。
+* 新增两条确定性回归（不依赖平台缓冲大小）：`ConnWriter keeps failing after a failed write:
+  an empty flush is not a no-op`、`BoundedWriter keeps failing after a failed write` —— 都对着
+  已关闭 peer 的 `socketpair`，修前第二条 `flush()` 会返回成功。
+
+读数：macOS 全量 `zig build test -Ddb=all` → **2048/2107 passed · 59 skipped · 0 failed**；
+`check` / `check-api` / `fmt-check` / deadcode(baseline 28,0) 全 OK；x86_64-linux 交叉编译通过。
+
 ### 第 62 批：`docs/dev/` 那 8 份零引用陈旧评估移进归档区（**破坏性：否**）
 
 `docs/dev/README.md` §4 一直写着"§2 那 8 份是唯一可动的，建议移动而非删除（**未执行**，需要你点

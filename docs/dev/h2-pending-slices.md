@@ -77,6 +77,21 @@
 
 ## 相关
 
+* **同一批修完后又暴露的一条（Linux 专属）**：`Server.zig` 那条"H2 客户端不读 → 写预算结束会话"
+  的既有测试在 Linux 上红了。根因是 `ConnWriter.flush` 把 `self.len = 0` 放在 `writeDirect`
+  **之前** —— 写失败后缓冲已经空，下一次 flush 无话可写、直接**返回成功**。于是在
+  `finishStreamScheduled` 的 `catch` 里，写超时被转成 `RST_STREAM(INTERNAL_ERROR)`，而那个 13 字节的
+  RST 恰好能塞进刚腾出的 socket 缓冲 → `resetStream` 成功返回 → 会话没有待发响应、回去读 socket，
+  直到读空闲预算（10 s）才结束；测试的 3 s 预算等不到。实测（OrbStack 的 Linux，`-fllvm`
+  交叉编译后在容器里跑）8/8 复现，修后 8/8 绿。
+  修法三条：① `ConnWriter`/`BoundedWriter` 各加 `failed: ?WriteError`（第一次写失败**粘住**，
+  之后任何 write/flush 都返回它，空 flush 也不例外）；② `sockread.writeFull`/`writeFullBounded`
+  的 error set 显式写成新的具名 `WriteError`（否则 `?anyerror` 字段回传会把上层所有
+  `switch (err)` 变成缺 `else` 的编译错误）；③ H2 的 dispatch `catch` 里，传输类错误
+  （`WriteTimeout`/`ConnectionError`/`ConnectionClosed`）**直接结束会话**，不再假装能用
+  `RST_STREAM` 回答一个写不出去的 socket。
+  那条测试自己的诊断还有个越界 bug（`drain[off..drained]` 把累计字节数当单次读的缓冲下标），
+  在失败路径上把"断言失败"升级成 SIGABRT —— 一并修好。
 * 上游修复（本批之前）：新流的发送窗口按对端 `SETTINGS_INITIAL_WINDOW_SIZE` 起
   （`Http2.FlowControlState.initStream`，RFC 9113 §6.5.2），见 CHANGELOG 第 57 批；本批的切片在它
   之上做。

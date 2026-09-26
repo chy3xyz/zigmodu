@@ -1681,6 +1681,12 @@ shard 锁）被无限期占住。设了超时后写返回 `error.WriteTimeout` �
 连接被截断并关闭。预算是**每次 `send`** 的（`SO_SNDTIMEO`，围绕每一次写 arm/clear，
 避免它外溢到同一 fd 上别的写者），所以只是慢（一直在流动）的对端不会被切断。
 
+**两条带缓冲的写者（`sockread.BoundedWriter`、H2 的 `ConnWriter`）还把第一次写失败
+记成"这个 socket 到此为止"**（`failed` 字段）：失败的 `flush` 会先把缓冲清空再写，
+于是只看 `len` 的下一次 flush 会在已经废掉的 socket 上**返回成功** —— 这个代价实测过
+（Linux 上 H2 的写超时被转成 `RST_STREAM`，13 字节的 RST 恰好写得进去，会话就带着一个
+不再可写的 socket 继续读，直到读空闲预算；见 `docs/dev/h2-pending-slices.md`）。
+
 上界覆盖**所有**服务端写路径，而不只是缓冲响应那一条（否则"流式响应"就是绕开它的
 后门）：
 

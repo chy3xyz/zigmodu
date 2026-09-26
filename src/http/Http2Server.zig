@@ -28,6 +28,7 @@ const Http2 = @import("Http2.zig");
 const Hpack = @import("Hpack.zig");
 const Grpc = @import("../extensions/GrpcTransport.zig");
 const Time = @import("../core/Time.zig");
+const WriteError = @import("../core/sockread.zig").WriteError;
 
 // ==== §1  Wire types ====
 
@@ -288,12 +289,28 @@ const ConnWriter = struct {
     len: usize = 0,
     /// See `ServeOptions.write_timeout_ms`.
     timeout_ms: u32 = 0,
+    /// The first write failure, kept for the life of the writer (`null` until
+    /// then): a `send` that gave up may have put part of a frame on the wire, so
+    /// nothing may follow it — and, just as important, every later write has to
+    /// **fail** rather than look like a no-op.
+    ///
+    /// Without this, a timed-out `flush` left `len == 0` behind (it clears the
+    /// buffer before writing), so the `RST_STREAM` that reports the write error
+    /// went through a flush that had nothing to do, returned success, and left
+    /// the session alive on a socket nobody was reading — measured on Linux,
+    /// where the 13-byte RST happened to fit in the freed socket buffer: the
+    /// session then sat in the read-idle budget while the peer still saw a live
+    /// connection (`Server.zig`'s H2 stall test caught exactly that).
+    failed: ?WriteError = null,
 
     fn init(io: std.Io, stream: std.Io.net.Stream, timeout_ms: u32) ConnWriter {
         return .{ .io = io, .stream = stream, .timeout_ms = timeout_ms };
     }
 
     fn write(self: *ConnWriter, data: []const u8) !void {
+        // Buffering after a failure would hide it: the bytes would sit in `buf`
+        // and the caller would read "written".
+        if (self.failed) |err| return err;
         var rest = data;
         while (rest.len > 0) {
             const space = self.buf.len - self.len;
@@ -336,10 +353,16 @@ const ConnWriter = struct {
     /// once per connection (which would leave the socket armed for anything else
     /// that ever writes to it).
     fn writeDirect(self: *ConnWriter, data: []const u8) !void {
-        return @import("../core/sockread.zig").writeFullBounded(self.stream, data, self.timeout_ms);
+        return @import("../core/sockread.zig").writeFullBounded(self.stream, data, self.timeout_ms) catch |err| {
+            self.failed = err;
+            return err;
+        };
     }
 
     fn flush(self: *ConnWriter) !void {
+        // Even with nothing buffered: the socket is the writer's state, and a
+        // failed socket stays failed.
+        if (self.failed) |err| return err;
         if (self.len == 0) return;
         const to_write = self.buf[0..self.len];
         self.len = 0;
@@ -834,6 +857,12 @@ fn serveSession(
                 } else if (gop.value_ptr.ready()) {
                     const more_inbound = (prefetch_off < prefetch_buf.len) or (reader.bufferedLen() > 0);
                     finishStreamScheduled(&writer, allocator, sid, gop.value_ptr, &conn_flow, conn_max_frame_size, peer_max_header_list, opts, &priority_tree, &outbound, more_inbound) catch |err| {
+                        // A transport failure is the connection's, not this
+                        // stream's: there is no point spending another write
+                        // budget on an RST_STREAM nobody can receive, and the
+                        // session has to end here rather than fall back to
+                        // reading a socket it can no longer write.
+                        if (isTransportError(err)) return err;
                         try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, streamErrorFromAny(err));
                         continue;
                     };
@@ -1756,6 +1785,16 @@ fn streamErrorFromAny(err: anyerror) u32 {
         error.PendingStreamsExceeded => Http2.ErrorCode.REFUSED_STREAM,
         error.PendingBytesExceeded => Http2.ErrorCode.ENHANCE_YOUR_CALM,
         else => Http2.ErrorCode.INTERNAL_ERROR,
+    };
+}
+
+/// The errors `sockread.writeFull` raises when the *transport* is the problem,
+/// not the stream: the socket timed out, is broken, or is closed. They end the
+/// session (a stream-level answer could not be delivered anyway).
+fn isTransportError(err: anyerror) bool {
+    return switch (err) {
+        error.WriteTimeout, error.ConnectionError, error.ConnectionClosed => true,
+        else => false,
     };
 }
 
@@ -4175,6 +4214,29 @@ test "h2 server answers a HEAD on a gRPC route with no DATA frame" {
         try std.testing.expectEqual(@as(usize, 0), countFramesInReply(reply, .data, 1));
         try std.testing.expect(findFrameInReply(reply, .rst_stream, 1) == null);
     }
+}
+
+test "ConnWriter keeps failing after a failed write: an empty flush is not a no-op" {
+    var fds: [2]std.posix.socket_t = undefined;
+    const rc = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    // Peer gone: every send on this end fails.
+    _ = std.posix.system.close(fds[1]);
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = fds[0], .address = undefined } };
+    defer stream.close(std.testing.io);
+
+    var w = ConnWriter.init(std.testing.io, stream, 200);
+    try w.write("hello");
+    try std.testing.expectError(error.ConnectionError, w.flush());
+    // The failed flush cleared the buffer, so without the sticky error this
+    // second one had nothing to write and returned success — that is how a
+    // timed-out response write turned into a session that stayed alive with
+    // nothing left to send (measured on Linux; see `ConnWriter.failed`).
+    try std.testing.expectError(error.ConnectionError, w.flush());
+    try std.testing.expectError(error.ConnectionError, w.write("more"));
 }
 
 // --- §9  A response larger than `max_pending_bytes` ---

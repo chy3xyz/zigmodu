@@ -132,6 +132,13 @@ pub fn setRecvTimeout(stream: std.Io.net.Stream, timeout_ms: u32) void {
     applyTimeout(stream.socket.handle, std.posix.SO.RCVTIMEO, &tv, "SO_RCVTIMEO", "a peer that accepts and never replies can block the reader indefinitely");
 }
 
+/// What a bounded write on this file can fail with, named so the writers that
+/// remember their first failure (`BoundedWriter.failed`, `ConnWriter.failed`)
+/// can do so **without widening their callers' inferred error sets** — an
+/// `anyerror` field read back and returned turns every exhaustive `switch (err)`
+/// up the stack into a compile error about a missing `else`.
+pub const WriteError = error{ WriteTimeout, ConnectionError, ConnectionClosed };
+
 /// Write all of `bytes` (loops on partial writes so frames are never split).
 ///
 /// `send(MSG_NOSIGNAL)`, not `write`, and that matters: a peer whose socket is
@@ -147,7 +154,7 @@ pub fn setRecvTimeout(stream: std.Io.net.Stream, timeout_ms: u32) void {
 /// `unreachable` — so a *bounded* write cannot be expressed through it at all.
 /// A bound has to be the socket's own (`setSendTimeout`) plus this helper, which
 /// is what `writeResponse` does around the response it writes.
-pub fn writeFull(stream: std.Io.net.Stream, bytes: []const u8) !void {
+pub fn writeFull(stream: std.Io.net.Stream, bytes: []const u8) WriteError!void {
     var sent: usize = 0;
     while (sent < bytes.len) {
         const rc = std.c.send(stream.socket.handle, bytes[sent..].ptr, bytes.len - sent, std.posix.MSG.NOSIGNAL);
@@ -187,7 +194,7 @@ pub fn clearSendTimeout(stream: std.Io.net.Stream) void {
 /// silence into a panic for anything else that writes to it. Two `setsockopt`s
 /// per bounded write is what makes the bound *provable* rather than a convention
 /// about who else may write to this fd.
-pub fn writeFullBounded(stream: std.Io.net.Stream, bytes: []const u8, timeout_ms: u32) !void {
+pub fn writeFullBounded(stream: std.Io.net.Stream, bytes: []const u8, timeout_ms: u32) WriteError!void {
     if (timeout_ms == 0) return writeFull(stream, bytes);
     setSendTimeout(stream, timeout_ms);
     defer clearSendTimeout(stream);
@@ -211,6 +218,11 @@ pub const BoundedWriter = struct {
     buf: []u8,
     len: usize = 0,
     timeout_ms: u32 = 0,
+    /// The first write failure, kept for the life of the writer — see
+    /// `ConnWriter.failed` in `http/Http2Server.zig` for what going without it
+    /// costs (a timed-out flush clears the buffer, so the next flush is a
+    /// no-op that reports success on a socket that is already done).
+    failed: ?WriteError = null,
 
     pub fn init(stream: std.Io.net.Stream, buf: []u8, timeout_ms: u32) BoundedWriter {
         return .{ .stream = stream, .buf = buf, .timeout_ms = timeout_ms };
@@ -231,6 +243,7 @@ pub const BoundedWriter = struct {
     }
 
     pub fn write(self: *BoundedWriter, bytes: []const u8) !void {
+        if (self.failed) |err| return err;
         if (bytes.len <= self.buf.len - self.len) {
             @memcpy(self.buf[self.len..][0..bytes.len], bytes);
             self.len += bytes.len;
@@ -242,14 +255,22 @@ pub const BoundedWriter = struct {
             self.len = bytes.len;
             return;
         }
-        return writeFullBounded(self.stream, bytes, self.timeout_ms);
+        return self.writeDirect(bytes);
+    }
+
+    fn writeDirect(self: *BoundedWriter, bytes: []const u8) !void {
+        return writeFullBounded(self.stream, bytes, self.timeout_ms) catch |err| {
+            self.failed = err;
+            return err;
+        };
     }
 
     pub fn flush(self: *BoundedWriter) !void {
+        if (self.failed) |err| return err;
         if (self.len == 0) return;
         const pending = self.buf[0..self.len];
         self.len = 0;
-        try writeFullBounded(self.stream, pending, self.timeout_ms);
+        try self.writeDirect(pending);
     }
 };
 
@@ -382,6 +403,28 @@ test "readSome returns EOF on closed socketpair" {
     var buf: [16]u8 = undefined;
     const n = try readSome(stream, &buf);
     try std.testing.expectEqual(@as(usize, 0), n);
+}
+
+test "BoundedWriter keeps failing after a failed write" {
+    var fds: [2]std.posix.socket_t = undefined;
+    const rc = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    _ = std.posix.system.close(fds[1]);
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = fds[0], .address = undefined } };
+    defer stream.close(std.testing.io);
+
+    var buf: [16]u8 = undefined;
+    var w = BoundedWriter.init(stream, &buf, 200);
+    try w.write("hello");
+    try std.testing.expectError(error.ConnectionError, w.flush());
+    // Same invariant as `ConnWriter` (see `failed`): the buffer is empty now, so
+    // a flush that only looked at `len` would answer with success on a socket
+    // that is already done.
+    try std.testing.expectError(error.ConnectionError, w.flush());
+    try std.testing.expectError(error.ConnectionError, w.write("more"));
 }
 
 test "Reader serves many small reads from one refill" {

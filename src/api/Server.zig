@@ -5570,18 +5570,29 @@ test "an HTTP/2 client that stops reading cannot hold the session: the write bud
     }
     const still_running = server.active_connections.load(.monotonic);
     if (still_running != 0) {
-        var drain: [64 * 1024]u8 = undefined;
+        // One read's worth of frames, parsed as its own buffer: `drained` is a
+        // running total over the read loop, and using it as an index into a
+        // single read's buffer is an out-of-bounds panic in exactly the case
+        // this diagnostic exists to report (it aborted the test runner instead
+        // of printing frames, on Linux).
+        var read: [64 * 1024]u8 = undefined;
         var drained: usize = 0;
         var polls = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
         while (std.posix.poll(&polls, 200) catch 0 > 0) {
-            const n = std.posix.read(stream.socket.handle, &drain) catch break;
+            const n = std.posix.read(stream.socket.handle, &read) catch break;
             if (n == 0) break;
             drained += n;
+            var off: usize = 0;
+            while (off + 9 <= n) {
+                const f = Http2.decodeFrame(read[off..n]) catch break;
+                std.log.err("[test]   frame {s} len={d} flags=0x{x} stream={d} payload={any}", .{ @tagName(f.header.typ), f.header.length, f.header.flags, f.header.stream_id, f.payload[0..@min(f.payload.len, 4)] });
+                off += 9 + @as(usize, f.header.length);
+            }
         }
         std.log.err("[test] a non-reading HTTP/2 client held the session fiber {d}ms past the 200ms write budget ({d} bytes on the wire)", .{ waited_ms, drained });
         var off: usize = 0;
-        while (off + 9 <= drained) {
-            const f = Http2.decodeFrame(drain[off..drained]) catch break;
+        while (off + 9 <= read.len) {
+            const f = Http2.decodeFrame(read[off..]) catch break;
             std.log.err("[test]   frame {s} len={d} flags=0x{x} stream={d} payload={any}", .{ @tagName(f.header.typ), f.header.length, f.header.flags, f.header.stream_id, f.payload[0..@min(f.payload.len, 4)] });
             off += 9 + @as(usize, f.header.length);
         }
