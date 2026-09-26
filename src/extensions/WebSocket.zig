@@ -2236,11 +2236,22 @@ test "a frame push to a peer that stopped reading fails on the write budget inst
     // only sets the refcount, it does not take ownership of the stream).
     var client = WebSocketClient.init(allocator, stream, std.testing.io, &server);
 
-    // Bigger than any socket buffer, and the peer end never reads.
+    // The peer never reads, and the loop is what makes this portable: an AF_UNIX
+    // socket buffer is ~8 KiB on macOS but ~200 KiB on Linux, so **one** 64 KiB
+    // frame fits there and a single write just succeeds (measured: it did, on the
+    // Linux leg of CI, run 36237806206). Keep writing until the kernel says no —
+    // the failing write is the one the budget is about.
     var frame: [64 * 1024]u8 = @splat('w');
-    const started = std.Io.Timestamp.now(std.testing.io, .real);
-    try std.testing.expectError(error.WriteFailed, client.sendText(&frame));
-    const elapsed_ms: u64 = @intCast(@divTrunc(std.Io.Timestamp.now(std.testing.io, .real).nanoseconds - started.nanoseconds, std.time.ns_per_ms));
+    var attempts: usize = 0;
+    var elapsed_ms: u64 = 0;
+    while (attempts < 64) : (attempts += 1) {
+        const started = std.Io.Timestamp.now(std.testing.io, .real);
+        client.sendText(&frame) catch |err| {
+            try std.testing.expectEqual(error.WriteFailed, err);
+            elapsed_ms = @intCast(@divTrunc(std.Io.Timestamp.now(std.testing.io, .real).nanoseconds - started.nanoseconds, std.time.ns_per_ms));
+            break;
+        };
+    } else return error.TestUnexpectedResultWithMessage;
 
     // It failed, it failed because of the budget (not before it), and the client
     // is marked disconnected so `broadcast` skips it next time.

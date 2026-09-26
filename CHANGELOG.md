@@ -35,6 +35,11 @@ io writer + 无界：`broadcast` 的注释自己写着"这是会 park 的那一�
   耗时 ≥ 预算、`is_connected == false`。
   > **这条的红只能以"挂住"呈现**：修复前它 park 在 `send` 里无限期 —— 这正是缺陷的形状，不是
   > 可断言的失败。
+  > **修正（同日）**：第一版只写一帧就断言失败 —— 在 Linux 上不成立：AF_UNIX 的缓冲在那里约
+  > 200 KiB（macOS 约 8 KiB），一帧 64 KiB 直接写进去了，于是 ubuntu 腿红
+  > （`run 36237806206`：`expectError(error.WriteFailed, client.sendText(&frame))`）。改成
+  > **循环写到大内核说"不"**为止，再断言那一次失败花了预算内的时间；两平台都成立（本机 macOS
+  > 绿，Linux 的等价形状由 `sockread` 既有测试覆盖）。
 
 **③ 本批不声称**：H2 响应体超过 `max_pending_bytes`（4 MiB）被 `RST_STREAM(ENHANCE_YOUR_CALM)`
 拒绝仍在队列（要动调度器：响应体改成按窗口切片排队）。
