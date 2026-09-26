@@ -2,6 +2,44 @@
 
 ## [Unreleased]
 
+### 第 65 批：按"两条平面"的新定位重写 README 与最佳实践文档（**破坏性：否**）
+
+定位已经从"Zig 版 Spring Modulith"长成 **"编译期模块化应用框架 + worker 导向的执行运行时"**
+（v0.31–v0.35 落地了 WorkerPool / Scheduler / Supervision / StopPolicy / Replay→WAL / µs 定时器 /
+阻塞池），README 与最佳实践却还停在旧定位上。本批只改文档与注释，不动行为。
+
+**README（en + zh）**
+- **首屏换定位**：一张"两条平面"的表（应用平面默认在用 / 执行平面 `app.runtime()` opt-in）+ 那句契约
+  "不调 `app.runtime()` 就不多起线程"；"受 Spring Modulith 启发"降为模块系统的血统说明。
+- **去掉自评分徽章**：`Quality-98%25-A` → **CI 徽章**（自更新、可复核）；文档表里
+  `Evaluation Report (~98/100)` 降级为"旧的自评"，新增 **Status & readiness** 指到
+  `docs/dev/v1.0-readiness-v0.35.md`。
+- **新增 `🚧 What it is not`**：集群硬切升级（混合版本从未对跑）、线上不加密（要边车 TLS）、
+  Raft 侧仍是共享 PSK、`ws_uring` 仅 Linux、⚠️ experimental 清单、AI 是可选领域、
+  **自评且无独立审计** —— 每条带指针。
+- **新增 `🔬 How it is verified`**：11 条门禁一张表（全量套件 / **分配契约** / `check` / `check-api` /
+  deadcode / bench / soak / soak-cluster / runtime-stress / 走私 e2e / 交叉编译），每行给命令与口径。
+- **执行平面特性表重写**：worker pool（dedicated/pooled + claim token）、阻塞池
+  （`.execution_class = .blocking` + `withBlockingThreads`）、StopPolicy/监督、HotBus 的定位边界、
+  `TimerWheel` vs `PrecisionTimer`、`Recorder` → `DeliveryLog`(ZDL1) → `ReplayFromLog`、
+  25 条 runtime 指标、affinity 原语、**分配契约是测试**；并列出这一平面"刻意还没有的"
+  （优先级/加权公平、deterministic、remote worker）。
+- **对账**：Project Structure 与实际树对齐（`src/runtime/` 15 个文件、`src/http` 真实清单、
+  examples 真实清单）；Progressive Evolution 从 DAU 表改成两条轴的阶段表；Commands 补上三套长跑
+  harness、三个校验脚本、`zmodu audit/ci`、`scripts/release.sh`；Examples 换成"先读哪几个"；
+  Contributing 的克隆 URL 修正为真实仓库。
+
+**最佳实践（BEST_PRACTICES.md / MODULITH.md）**
+- 头部加**两条平面**的组织口径；片段基线 `v0.26.0` → `v0.35.0`；指到现行就绪度评估。
+- **新增《执行平面（Runtime）最佳实践》**：该不该上（一句话判据 + 表）、别把 HotBus 当第二个
+  EventBus、容量是契约、**热路径零分配的分工表（0 次 / 1 次）**、四个执行位置怎么选 + 三个常见错误、
+  失败与停机策略、上线前检查清单。
+- 原《现状复核》**标注为 v0.26.0 快照**（它记的是当时抽到了什么，不是现在是什么）并指向现行评估。
+- **《质量指标》从愿望值改成可复核的门禁表**（原来"覆盖率 ≥ 95%"这类既没有工具也不是门禁，
+  现在换成真跑的门禁，并明确写"覆盖率没有强制阈值"）；**生产就绪清单**补上跨平台复跑、
+  三套长跑 harness、五个校验脚本；**渐进式演进路线图**加一条"第二条轴正交"的说明。
+- `MODULITH.md`：适用版本 v0.14 → v0.35，并写明本文只讲应用平面、执行平面看哪两份。
+
 ### 第 64 批：`v0.35 → v1.0 差距评估` 落成文档（取代 v0.32 那份）+ 清掉 5 处文档与代码不符（**破坏性：否**）
 
 **① 新的现行差距评估：[`docs/dev/v1.0-readiness-v0.35.md`](docs/dev/v1.0-readiness-v0.35.md)。**

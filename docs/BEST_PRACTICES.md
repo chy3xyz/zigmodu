@@ -1,19 +1,26 @@
 # ZigModu 最佳实践指南 (Best Practices Guide)
 
-> **Modulith 从第一天怎么写高并发应用**：见专文 [MODULITH.md](MODULITH.md)（边界、fiber、池化、规模阶梯、反模式）。  
+> **两条平面**：ZigModu 是"**编译期模块化应用框架 + worker 导向执行运行时**"。本文按这两条平面组织 ——
+> **应用平面**（模块 / DI / HTTP / 数据 / 事件 / 安全 / 运维，默认就在用）与**执行平面**
+> （worker / mailbox / 调度 / 定时器 / 监督 / 回放，`app.runtime()` opt-in）。
+> 执行平面的**规格**在 [RUNTIME.md](RUNTIME.md)；**该不该用、怎么用、哪里会踩**在本文
+> 「执行平面（Runtime）最佳实践」一节。没碰执行平面的应用，行为与本文的其他章节一致。
+>
+> **Modulith 从第一天怎么写高并发应用**：见专文 [MODULITH.md](MODULITH.md)（边界、fiber、池化、规模阶梯、反模式）。
+> 
 > **model / persistence / service / Tx 分层**：见专文 [MODULE_LAYERS.md](MODULE_LAYERS.md)（参考实现 `examples/tenant-shop`）。  
 > **ZigModu × zent（schema / Client / privacy / 模块级选型）**：见专文 [ZENT.md](ZENT.md)（参考实现 `examples/zent-modulith`）。  
 > **SQLx 选择性驱动链接（`-Ddb=` / `.db=`）**：见专文 [SQLX_DRIVERS.md](SQLX_DRIVERS.md)。  
 > **HTTP 路由 + catalog JWT / RBAC**：见专文 [ROUTE_TABLE.md](ROUTE_TABLE.md) §7；可执行清单见下文「JWT / 多端身份」。  
 > **AI / Agent 写代码**：先读仓库根目录 [AGENTS.md](../AGENTS.md)（文档地图 + DO/DON'T）；方法论见 [AI_METHODOLOGY.md](AI_METHODOLOGY.md)。  
-> **代码片段基线**：**ZigModu v0.26.0 · Zig 0.17.0**（CI 钉 `0.17.0-dev.2151+2ec5523d5`，见 `.github/workflows/ci.yml` 的 `ZIG_VERSION`）。跨版本升级看 [UPGRADING.md](UPGRADING.md)。  
+> **代码片段基线**：**ZigModu v0.35.0 · Zig 0.17.0**（CI 钉 `0.17.0-dev.2151+2ec5523d5`，见 `.github/workflows/ci.yml` 的 `ZIG_VERSION`）。跨版本升级看 [UPGRADING.md](UPGRADING.md)；"哪些是证明过的、哪些不是"看 [v1.0 差距评估](dev/v1.0-readiness-v0.35.md)。  
 > **片段口径**：本文的代码围栏分两类 —— **可照抄的完整示例**，和**示意用的片段/伪码**（含 `...`、`// ...`、
 > 或引用了上下文里没给的标识符）。伪码**不保证可直接编译**，只表达结构与契约；可编译的完整示例看
 > `examples/**`。逐段标注见各围栏前的说明。
 
 ## 📋 目录 (Table of Contents)
 
-- [现状复核（2026-09-18 复核，v0.26.0）—— 近期演进对示例/文档的影响](#-现状复核2026-09-18-复核v0260-近期演进对示例文档的影响)
+- [现状复核（**v0.26.0 快照**，2026-09-18）—— 近期演进对示例/文档的影响](#-现状复核v0260-快照2026-09-18-近期演进对示例文档的影响)
   - [当前最佳实践速查](#当前最佳实践速查)
   - [待修清单（审计产出，按严重度）](#-待修清单审计产出按严重度-命中的条目是-2026-09-17--2026-09-18-两批复核后已修的其余仍未修)
   - [源码文档质量（2026-09-17 抽样）](#源码文档质量2026-09-17-抽样)
@@ -24,6 +31,7 @@
   - [BEST_PRACTICES 自审（2026-09-18）](#best_practices-自审2026-09-18)
   - [实践 ↔ 门禁一致性（2026-09-18）](#实践--门禁一致性2026-09-18)
 - [渐进式架构演进路线图](#-渐进式架构演进路线图)
+- [执行平面（Runtime）最佳实践](#-执行平面runtime最佳实践)
 - [模块设计原则](#-模块设计原则)
 - [代码质量规范](#-代码质量规范)
 - [错误处理](#-错误处理)
@@ -53,7 +61,14 @@
 - [版本升级指南](#-版本升级指南)
 - [团队协作](#-团队协作)
 
-## 🔄 现状复核（2026-09-18 复核，v0.26.0）—— 近期演进对示例/文档的影响
+## 🔄 现状复核（**v0.26.0 快照**，2026-09-18）—— 近期演进对示例/文档的影响
+
+> **这一节是 v0.26.0 当时的审计快照，不是当前状态**（写于 09-18；此后到 v0.35.0 之间又过了九个
+> 小版本，其中"每条服务端写路径都有上界"、"Runtime Replay 落盘"、"fuzz/soak/bench 三套门禁"、
+> "执行平面"等都已落地）。**当前的逐条状态看
+> [dev/v1.0-readiness-v0.35.md](dev/v1.0-readiness-v0.35.md)**（同一形状：逐条 + 证据 + 谁验证的），
+> 那一节里标 `已修` 的条目不要照着做第二遍。留在这里是因为它记的是"当时抽样抽到了什么"，
+> 而不是"现在是什么"。
 
 **结论：对 `examples/` 的代码影响很小，问题集中在文档与 CLI 模板。** 三份只读审计（Runtime/builder、
 AI 侧、集群侧）的实测结果：builder 绑定、worker 归 app、不手动 `rt.start()` 这三条在 examples 里**零违规**
@@ -501,6 +516,11 @@ std.Io.Dir.cwd().rename(self.io, old_name, new_name)   // 0.17 之前的签名
 ## 🚀 渐进式架构演进路线图
 
 ZigModu 核心设计理念：**从单体部署到分布式集群，随着用户规模增长平滑演进**。
+
+> **本节讲的是第一条轴（应用平面的规模）。** 另有一条**正交**的轴 —— **执行平面**
+> （worker / mailbox / 调度 / 定时器 / 监督 / 回放）：它不由用户量驱动，而由**负载形状**驱动
+> （要不要跨请求的状态、会不会长时间占住一条执行流）。两条轴可以各自推进，都不需要拆服务：
+> 见上文 [执行平面（Runtime）最佳实践](#-执行平面runtime最佳实践) 与 [RUNTIME.md](RUNTIME.md)。
 
 **起步请先读** [MODULITH.md](MODULITH.md) 与 [MODULE_LAYERS.md](MODULE_LAYERS.md)：五文件模块边界、Tx 工作单元、Day-1 连接池/Outbox、以及何时才拆独立进程。本节描述用户量增长驱动的架构演进，框架能力随阶段自动解锁。
 
@@ -1292,6 +1312,91 @@ autoCrud 之上加业务逻辑，按复杂度选档，全部向后兼容：
 `events.zig` 订阅）。注意：`zmodu saas` 重新生成会覆盖
 model/persistence/service/api/module/root 五个文件，自定义逻辑可放在
 `events.zig` 等独立文件（生成器不写）或重新生成后重放差异。
+
+## 🚀 执行平面（Runtime）最佳实践
+
+> **适用**：`app.runtime()` 已经或将要出现在你的应用里。**没用它的应用不必读这一节** ——
+> 不调 `runtime()` 就不多起线程，行为与上文完全一致。规格与 API 看 [RUNTIME.md](RUNTIME.md)；
+> 领域背景见 [alpha-engine](https://github.com/chy3xyz/zigmodu/tree/master/examples/alpha-engine)。
+
+### 0. 先判断该不该上执行平面
+
+**判据一句话：需要"跨请求的可变状态"或"长时间占住一条执行流"就上；只是"handler 里做点事"就别上。**
+
+| 你的负载形状 | 用什么 | 为什么 |
+|---|---|---|
+| 请求进来 → 查库/计算 → 回响应 | **不用 runtime** | fiber + 连接池已经够；多一层队列只是多一次拷贝 |
+| 需要跨请求的状态（行情、会话、聚合器、房间、每 shard） | `.mode = .dedicated` | 状态归 worker **独占**，不用锁 —— 这是执行平面最大的价值 |
+| 同一种 worker 有很多个（每 symbol / 每房间一个） | `.mode = .pooled` | N 个 worker 跑在 N 条池线程上；worker 状态仍然独占（claim token 保证同一时刻只有一个线程跑它） |
+| 会阻塞在进程外（DB、HTTP、文件、锁） | **`.execution_class = .blocking`** | 否则它会把 CPU 池的线程耗干，调度器没线程可派 |
+
+### 1. 别把执行平面当成第二个 EventBus
+
+`HotBus` 的定位是 **L0 扇出**：一个发布者 → 多个消费者 mailbox；`freeze()` 之后 `publish` 无锁、
+无分配，满了**丢**并计数。它**不**保证投递、不重试、不落盘、不跨节点。
+"我要一个全局事件总线" → 那是应用平面的 `app.eventBus(T)` / `TypedEventBus` / outbox。
+把它改成通用总线的代价，正是这条路径不再无锁无分配 —— 那是它唯一的存在理由。
+
+### 2. 容量是契约，不是建议值
+
+* mailbox 的 `.capacity` 决定"满了会怎样"：生产者拿到 `error.Full`（**不是**无限增长）。
+  容量要按"消费者最慢时能容忍多少积压"算，不是"看起来够大"。
+* 满与丢都必须**看得见**：`messages_dropped` / `record_dropped` / `pool_ready_push_failures` /
+  HotBus 的丢计数。生产上至少给这些挂一条告警（[OBSERVABILITY.md](OBSERVABILITY.md)）。
+* 定时器不是队列：`Wheel.schedule` 有容量，迟到以 `timer_lag_max_ms` 暴露。
+
+### 3. 热路径**零分配**是有测试的契约，不是口号
+
+`src/runtime/alloc_contract_test.zig` 用"会失败的分配器"断言**精确 0**：
+
+| 路径 | 分配次数 |
+|---|---|
+| `Mailbox.send` / `sendBlocking` / `tryRecv` | 0 |
+| `RingBuffer` / `MpscRing` / `Sequencer` | 0 |
+| `HotBus.subscribeSink` + `freeze` + `publish` | 0 |
+| `Handle.send` / `sendBlocking` / `sendTraced`（含 pooled 的 ready token） | 0 |
+| `Runtime.scheduleAction` / `requestCancelTimer` | 0 |
+| `Handle.after` / `Wheel.schedule`（按契约） | 1 |
+
+**推论**：你写进 `handle`/`run` 的代码也在热路径上 —— 在那里 `allocator.create`、`dupe`、拼字符串，
+就把"零分配"变成"每条消息一次分配"。要分配就在 `init`/`deinit`（每个 worker 一次）里做，
+或者把 payload 的所有权随消息一起交出去（发送方拥有 → 接收方释放）。
+
+### 4. 四个"执行位置"怎么选
+
+| 位置 | 隔离 | 代价 | 什么时候用 |
+|---|---|---|---|
+| HTTP handler（fiber） | 无 | 最低（无交接） | 一请求一结果、无跨请求状态 |
+| `.dedicated` worker | 一条 OS 线程**独占** | 一次 mailbox 交接 | 关键路径：行情、订单簿、风控、执行 |
+| `.pooled` worker | worker 状态独占、线程共享 | 一次队列交接 + 可能排队 | 同类多实例：每 symbol、每房间、每 shard |
+| `.blocking` worker | 独立阻塞池 | 同上 + 池宽上限 | 会等进程外的东西；**必须显式声明** |
+
+**三个常见错误**：
+
+* **在 `.dedicated` worker 里查数据库** —— 一条线程被一个 DB 往返占住，而它的价值恰恰是"绝不被占住"。
+  挪去 `.blocking`（或让它跑在阻塞池上）。
+* **用 `.pooled` 装"必须准时"的实时 worker** —— 池线程可能正在跑别人。实时路径用 `.dedicated`。
+* **忘了声明 `.blocking`** —— 调度器不会替你检测；阻塞调用会直接吃掉 CPU 池的线程。这正是
+  "非阻塞 IO"仍是 v1.0 缺口之一的实际形状（[dev/v1.0-readiness-v0.35.md](dev/v1.0-readiness-v0.35.md) A-5）。
+
+### 5. 失败与停机：策略要显式
+
+* 每个 worker 的失败策略（fail-fast，或"窗口内错误预算"）+ `onError` 钩子 —— 别让默认值替你决定。
+* 停机由 runtime 负责（`stop()` 会 join 每个 worker）；**你的 `handle`/`run` 必须能返回**。
+  一个不返回的 `run` 会把停机拖住 —— 这是执行平面上唯一"你写错就无解"的地方。
+* 重放（`Recorder` / `DeliveryLog` / `ReplayFromLog`）是**诊断与回测**工具：它记录的是"某条轨上的投递"，
+  不是"进程的全部确定性"（`spawn` 副作用、socket、墙钟都不重放）。
+  落盘那一侧目前**没有** CLI / 保留 / 压实 / 加密（`recorder.zig` 自己写着边界）。
+
+### 6. 上这套东西前的检查清单
+
+- [ ] `app.runtime()` 是**需要它的那一刻**才加的：加之前先问"这能不能就是一个 handler"
+- [ ] 每个会阻塞的 worker 都显式 `.execution_class = .blocking`，且阻塞池宽度按"最坏并发阻塞数"声明（`Application.withBlockingThreads`）
+- [ ] 每个 mailbox 的 `.capacity` 是按"最慢消费者"算出来的，且满了会告警
+- [ ] `handle`/`run` 里没有分配、没有阻塞、没有 panic
+- [ ] `/metrics` 上 `zigmodu_runtime_*` 在跑（至少 dropped / timer lag / pool depth 三类）
+- [ ] 跑过 `zig build runtime-stress`（它专抓"每个短测试都对、长交织才错"的缺陷）
+- [ ] 要回放/回测的场景：`Recorder` 挂在 `freeze()` **之前**，并声明 `Codec(E)`
 
 ## 🧪 代码质量规范
 
@@ -2682,6 +2787,9 @@ jobs:
 **验证与发布**
 - [ ] `zig build test` 全绿；`bash scripts/ci-integration.sh` 通过
 - [ ] 发布前跑 `zig build soak`（跨租户泄漏断言）；CI 夜间已挂 64×200
+- [ ] 用 runtime 的应用额外跑 `zig build runtime-stress`（长交织下的监督/池/就绪环/定时器/零分配）与 `zig build soak-cluster`（3 节点 raft + 总线）
+- [ ] **跨平台复跑一遍**：本机（macOS）绿 ≠ Linux 绿。上次 CI 红就是 Linux 独有的一条（写路径竞态）；复现办法是把 `-Dtarget=x86_64-linux` 交叉编译出的测试二进制放进 Linux 容器跑
+- [ ] 门禁都在：`bash scripts/check-production.sh`、`bash scripts/check-deadcode.sh`、`bash scripts/check-bench.sh`、`zig build check-api`（CI 各有一条，别只在本地跑）
 - [ ] TLS 在边车终结（`examples/production-deploy/`），证书轮换有流程
 - [ ] 迁移幂等（`IF NOT EXISTS`），且有失败恢复步骤（本文「迁移失败后怎么恢复」）
 
@@ -2962,24 +3070,24 @@ zig build docs
 - **契约**：框架层不强制禁止（工具链兼容），但**应用层默认禁止**在 handler /
   中间件 / Agent 工具回调里做同步阻塞 I/O。
 
-## 📊 质量指标
+## 📊 质量指标（**可复核的**，不是愿望值）
 
-### 代码质量
-- [ ] 零 `@panic` 调用（生产代码）
-- [ ] 错误覆盖率 ≥ 95%
-- [ ] 代码重复率 < 5%
-- [ ] 圈复杂度平均值 < 5
+这一节原来是一串"覆盖率 ≥ x%"的愿望值 —— 既没有工具在测、也不是门禁，读起来却像承诺。
+换成仓库里**真的在跑、而且会红**的东西：每一行都能用右边那条命令复现。
 
-### 测试质量
-- [ ] 单元测试覆盖率 ≥ 80%
-- [ ] 集成测试覆盖率 ≥ 60%
-- [ ] 关键路径覆盖率 ≥ 95%
-- [ ] 性能测试定期运行
+| 维度 | 现状 | 怎么复核 |
+|---|---|---|
+| 测试 | `-Ddb=all` 全量 2000+ 条 / 6 个 artifact，0 失败 | `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test` |
+| 热路径分配 | 有**契约测试**（断言精确 0）；bench 侧另有 32 条 `max_alloc_per_op` 预算 | `src/runtime/alloc_contract_test.zig` · `bash scripts/check-bench.sh` |
+| 性能 | 32 条指标对 CI 基线（阈值 2.0×），双峰指标降级为"候选回归 + 诊断" | `bash scripts/check-bench.sh` |
+| 死代码 | ratchet：`src`+`tools` 基线 28、`examples` 基线 0 | `bash scripts/check-deadcode.sh` |
+| 热路径纪律 | 禁裸 `catch {}`、CSPRNG 来源、fuzz 声明与树一致 | `zig build check` |
+| API 纪律 | examples 必须走 `zigmodu.http` 规范入口 | `zig build check-api` |
+| 长跑 | 三套 harness：HTTP+租户 / 3 节点集群 / runtime 交织 | `zig build soak` · `soak-cluster` · `runtime-stress` |
+| 覆盖率 | **没有强制阈值**（`zig build test` 不产出覆盖率门禁）。想加就得先有工具与基线；在那之前不写进清单当承诺 | —— |
 
-### 文档质量
-- [ ] 所有公共 API 有文档
-- [ ] 示例代码可运行
-- [ ] 更新及时同步功能变更
+文档与示例的口径：公共 API 要有 doc comment（`zig build docs` 生成）、示例要能编译（CI 的
+Build Examples 腿），"哪些证明过、哪些没有"逐条记在 [dev/v1.0-readiness-v0.35.md](dev/v1.0-readiness-v0.35.md)。
 
 ## 🛠️ 版本升级指南
 
