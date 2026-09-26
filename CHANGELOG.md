@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### 第 60 批附：H2 `max_pending_bytes` 那条落成设计笔记（`docs/dev/h2-pending-slices.md`）
+
+队列里"H2 响应体 > 4 MiB 被 `RST_STREAM(ENHANCE_YOUR_CALM)` 拒绝"那一条，本批先把**实测、定位、
+修法形状、验收**写进 `docs/dev/h2-pending-slices.md`（不改代码）：6 MiB 实测给
+`ENHANCE_YOUR_CALM(10)`、16 MiB 给 `INTERNAL_ERROR(2)`、3 MiB 正常；上限来自
+`ServeOptions.max_pending_bytes`（默认 4 MiB），拒绝点在一次响应被**整体**入队处 —— 于是这个
+"backpressure 上限"实际成了响应体大小上限。修法是把响应体改成按窗口切片、边发边补，
+验收含一条正面（会读的客户端拿满 6 MiB）与一条反面（不读的客户端仍由写预算结束，且失败形状不同）。
+
 ### 第 60 批：fuzz 声明变成门禁（`scripts/check-production.sh`）—— 忘了声明的 fuzz 块过去会**静默零覆盖**（**破坏性：否**）
 
 `build.zig` 靠 `llvm_for_fuzz` 决定哪些 artifact 在 x86_64-linux 上开 LLVM（默认后端不产出 `--fuzz`
