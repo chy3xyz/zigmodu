@@ -2,6 +2,49 @@
 
 ## [Unreleased]
 
+### 第 53 批：HTTP 服务器的 WebSocket 路由有**同一形状的关停洞**（远端静默即可把关停拖到无限期）—— 已修；并报出 `ws_uring` 两个**本机无法验证**的真缺陷（**破坏性：否**）
+
+**① `src/api/Server.zig` 的 WS 路由：fiber 路径上"握手后静默"的对端能把关停拖住。** 事实链（逐条可核）：
+连接由 `conn_group.concurrent(io, connFiber, …)` 派发，而 `start()` 的 defer 是
+`conn_group.await`（注释写着"Await (not cancel) so in-flight requests complete"）；`connFiber` 里的 WS 读循环
+（`while (server.running…)` → `WsFramer.readFull` → `sockread.readSome` = **裸 `read`，没有 deadline**）
+在升级成功后就停在那里；而 `stop()` 原来**只关监听**（`wakeAccept`），对已 accept 的连接零动作。
+对比：**keep-alive 的 HTTP 连接不会拖住**（同一个 await，但它们各自被 `header_timeout_ms` 到点打断）——
+这正是"只有 WS 有这形状"的原因。
+
+**修法**：`Server` 没有连接登记表，而且**不该给所有连接加**（每连接一次 append/remove = 热路径新开销；
+更要紧的是语义 —— drain 是"等 in-flight 请求跑完"，对 HTTP 连接 `shutdown` 会**打断正在写的响应**）。
+所以只给**升级后的 WS 连接**加一张冷路径登记表（`ws_conns` + `ws_conns_mutex` + `ws_woken_connections` 计数），
+`stop()` 在 `running=false` → `wakeAccept()` 之后、`conn_group.await` 之前调 **`wakeWsConnections()`**
+（对每个登记 fd 做 `sockread.wakeBlockedSyscall`）。**锁序无环**：那张锁是唯一的锁，`stop()` 持它只做
+`shutdown`（永不阻塞），fiber 侧只在登记/注销时各持一次且不持别的锁；`stop()` **不提前返回**（提前返回会在
+随后 `deinit` 时变成 use-after-free，不是"快一点的关停"）。契约写进 `docs/API.md` 与
+`docs/BEST_PRACTICES.md`（含"各阶段等待 ↔ 解除方式"表）。
+
+> **红证据**（先落地测试、未加修复时）：`stop() left the WebSocket fiber parked 3000ms after it returned:
+> the silent peer decides the shutdown length` / `expected 0, found 1`（`stop()` 返回 3 s 后
+> `active_connections` 仍是 1）/ `FAIL`。修后三条新测试全绿：静默客户端（真 socket，断言"唤醒 pass 真关掉了
+> 这个 fd"且 `on_close` 已回调）· 两个登记 fd 都被 shutdown（socketpair，**无网络无时序**）· **`stop()` 之后
+> 的登记被拒**（覆盖"读到 true 之后才登记"那第三种交错）。**不能证明**：快慢（3 s 是防挂死预算，不是延迟断言）。
+
+**② `ws_uring` 侧：两个真缺陷，本机跑不了所以只报不改**（该文件 `builtin.os.tag != .linux` 直接 `@compileError`，
+唯一引用是脚手架模板，**没有任何测试覆盖** → 拿不到红证据）：
+
+* **升级后 fd 的归属自相矛盾**：`ws_uring.zig:112-114` 写着 "Takes ownership of the fd — caller must NOT close it"，
+  而 `Server.zig` 那侧 `return` 会跑 `connFiber` 的 `defer stream.close(...)`（真 `close(2)`）；加上 `adopt`
+  返回前已投了初始读 → ring 的 in-flight 读拿 `EBADF`、`teardownConn` 再 `close` 一次（**重复关闭**，
+  该 fd 号可能已被别的连接复用），`on_close` 会在握手后立刻触发。
+* **并发元数据撕裂**：`adopt`（connFiber 线程）与 `runLoop`/`teardownConn`（uring 线程）共享同一个**无锁**
+  `AutoHashMap`（`put` 与 `get`/`remove` 并发）。
+* 判断：`Server.stop()` **不会**被 `ws_uring` 拖住（它的连接不在 `conn_group` 里）；反过来 `stop()` 也**不会**
+  结束那些会话 —— 调用方必须自己 `uring.stop()`/`deinit()`（已写进契约）。
+  要修上面两条得**在 Linux 上**修 + 加一个真跑 `setWsUring` 的用例。
+
+**③ 报告一处残余（未动）**：非 WS 的**响应写**（`writeResponse` 走阻塞 send，没有 `SO_SNDTIMEO`；
+只有 WS 有 `ws_write_timeout_ms`）对"对端不读 + 响应大于内核发送缓冲"仍**无上界**。修它要么登记每条连接
+（热路径），要么给所有 HTTP 连接设写超时（会切断合法的慢客户端）——两者都与"等 in-flight 请求跑完"的语义
+冲突，属同一"慢对端"家族的下一处。
+
 ### 第 52 批：关停路径最后一处"无上界"变成**明面契约 + 可诊断**（用户回调）、把 §12.16 那批等待预算从"5 秒"改成"观测预算"（修掉 MySQL 腿的 `WaitTimeout` flake）、`PrecisionTimer` 的 capable-host 断言加一次重测（**破坏性：否**）
 
 **① 用户回调把关停拖住这件事：写明白 + 能看见。** 关停路径上此前只剩一处不是框架能解开的等待 ——

@@ -2390,6 +2390,23 @@ pub const Server = struct {
     /// starts, released when it returns).
     active_connections: std.atomic.Value(u64) = .init(0),
     in_flight: ?*std.atomic.Value(u64) = null,
+    /// Upgraded WebSocket connections a `connFiber` is still serving — the ones
+    /// `stop()` shuts down so a silent peer cannot decide how long shutdown
+    /// takes (see `wakeWsConnections`). Connections handed to `ws_uring` are
+    /// owned by the ring instead and are deliberately not listed: the fiber
+    /// returns at `adopt`.
+    ///
+    /// Registration happens once per upgrade, not per request, so this stays off
+    /// the HTTP hot path — and non-WebSocket connections are *absent* on purpose:
+    /// the drain awaits in-flight requests rather than cancelling them, so it
+    /// must not shut their sockets down.
+    ws_conns_mutex: std.Io.Mutex,
+    /// Guarded by `ws_conns_mutex`; a list of *borrowed* fds — see
+    /// `wakeWsConnections` for why that lock is what makes them safe to shut down.
+    ws_conns: std.ArrayList(std.posix.socket_t),
+    /// Connections a `stop()` wake pass actually shut down. Structural evidence
+    /// that the drain was woken rather than merely asked to stop (read by tests).
+    ws_woken_connections: std.atomic.Value(u64) = .init(0),
     /// Allocated route-group / scoped middleware slices (RouteGroup.use, ComptimeRouter Scoped.use).
     owned_route_mw: std.ArrayList([]const Middleware),
     /// Prior-knowledge HTTP/2 (h2c). When true, connFiber detects `PRI * HTTP/2.0` preface.
@@ -2486,6 +2503,8 @@ pub const Server = struct {
             .max_requests_per_conn = config.max_requests_per_conn,
             .header_limits = config.header_limits,
             .max_connections = config.max_connections,
+            .ws_conns_mutex = std.Io.Mutex.init,
+            .ws_conns = std.ArrayList(std.posix.socket_t).empty,
             .connection_stack_size = config.connection_stack_size,
             .over_limit_response = config.over_limit_response,
             .header_timeout_ms = config.header_timeout_ms,
@@ -2820,6 +2839,7 @@ pub const Server = struct {
             }
         }
         self.ws_handlers.deinit();
+        self.ws_conns.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -2930,6 +2950,13 @@ pub const Server = struct {
         }
         // Reap any still-running connection fibers on exit so their futures
         // are released. Await (not cancel) so in-flight requests complete.
+        //
+        // The waits behind this drain and what ends them: header/body deadlines
+        // bound the read phases, the HTTP/2 session's idle read uses the same
+        // header deadline, and an upgraded WebSocket fiber parked in its read is
+        // woken by `stop()` (`wakeWsConnections`) — a peer that goes silent after
+        // the handshake cannot hold this. What no wake reaches is user code
+        // (`on_connect` / `on_message` / `on_close`, handlers): see `stop()`.
         defer self.conn_group.await(self.io) catch |err| std.log.warn("[Server] conn_group await: {}", .{err});
 
         self.running.store(true, .monotonic);
@@ -3022,9 +3049,32 @@ pub const Server = struct {
     /// accept loop exit on its own thread — `start()`'s defer then closes
     /// the listener there and the port is released. Even without a join the
     /// loop unwinds itself promptly.
+    ///
+    /// **Bounded against peers, not against your code.** Every wait the accept
+    /// loop's drain can sit in is ended by a `shutdown` on a socket, not by the
+    /// remote end: `accept` (above), the header/body deadlines
+    /// (`header_timeout_ms` / `body_timeout_ms`), HTTP/2 sessions (the same
+    /// header deadline as an idle read timeout), and — the one that used to have
+    /// no bound at all — the WebSocket read loop, woken by `wakeWsConnections`
+    /// (see there for the fd-safety argument). What is left is *your code*:
+    /// a handler or `on_connect` / `on_message` / `on_close` that does not return
+    /// holds the drain for as long as it blocks, and no budget cuts it short on
+    /// purpose — returning with a fiber alive would hand it a server its caller is
+    /// about to `deinit`, which is memory unsafety rather than a fast shutdown.
+    ///
+    /// Idempotent: a second call finds no listener, an empty wake set, and (if
+    /// `start()` has unwound) a drained group.
     pub fn stop(self: *Server) void {
         self.running.store(false, .monotonic);
         self.wakeAccept();
+        // ... and the same maneuver for the upgraded WebSocket connections that
+        // accept loop produced. Ordered after the listener wake so the accept
+        // loop is already on its way out; it cannot miss a connection either way,
+        // because `running` is already false and a fiber records itself under the
+        // same lock this pass takes, checking that flag there — so a fiber that
+        // arrives after the pass refuses the connection instead of parking in a
+        // read nobody will wake.
+        self.wakeWsConnections();
     }
 
     /// Start the server in a background thread. Returns immediately.
@@ -3118,6 +3168,86 @@ pub const Server = struct {
             .zero = std.mem.zeroes([8]u8),
         };
         _ = std.c.connect(fd, @ptrCast(&sa), @sizeOf(std.posix.sockaddr.in));
+    }
+
+    /// Reserve `fd` for the WebSocket read loop. `false` (no error) once the
+    /// server is stopping, and then the caller drops the connection instead of
+    /// reading from it.
+    ///
+    /// The `running` check lives *inside* the critical section on purpose.
+    /// `stop()` clears the flag before its wake pass, and the pass takes this
+    /// same lock, so a fiber that arrives late either (a) recorded itself before
+    /// the pass and gets woken, or (b) finds `running == false` through the mutex
+    /// and never parks. A check outside the lock would leave a third
+    /// interleaving — "read true, be recorded after the pass" — in which the
+    /// fiber parks in a read that nothing will ever wake, which is the hang this
+    /// all exists to remove.
+    ///
+    /// Uncancelable: this runs on a fiber that returns `void`, so a `Canceled`
+    /// has no channel to be reported through, and the critical section is one
+    /// `append`.
+    fn registerWsConnection(self: *Server, fd: std.posix.socket_t) !bool {
+        self.ws_conns_mutex.lockUncancelable(self.io);
+        defer self.ws_conns_mutex.unlock(self.io);
+        if (!self.running.load(.monotonic)) return false;
+        try self.ws_conns.append(self.allocator, fd);
+        return true;
+    }
+
+    /// Drop `fd`'s reservation. Called by the fiber that made it, under this same
+    /// lock and *before* the socket is closed — the invariant `wakeWsConnections`
+    /// depends on. A no-op when the entry is already gone.
+    fn unregisterWsConnection(self: *Server, fd: std.posix.socket_t) void {
+        self.ws_conns_mutex.lockUncancelable(self.io);
+        defer self.ws_conns_mutex.unlock(self.io);
+        for (self.ws_conns.items, 0..) |p, i| {
+            if (p == fd) {
+                _ = self.ws_conns.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    /// Make every WebSocket connection fiber parked in a read return, so the
+    /// drain (`conn_group.await` in `start()`'s defer) has an upper bound.
+    ///
+    /// The fiber path reads WebSocket frames with a bare `read`
+    /// (`im/WsFramer.zig` `readFull` → `core/sockread.zig` `readSome`), which a
+    /// peer that goes silent after the handshake never disturbs — no frame, no
+    /// close, no FIN — so the fiber waits for as long as the peer wants and the
+    /// length of `stop()` becomes the *remote* end's decision.
+    /// `shutdown(SHUT_RDWR)` is the wake — the same helper `sockread.closeListener`
+    /// applies to `accept` — and the parked read returns 0, which the WS read
+    /// loop below already treats as "the peer went away".
+    ///
+    /// Deliberately not a socket timeout: a long quiet period is a WebSocket's
+    /// normal state, so an idle bound would cut healthy connections, whereas this
+    /// fires only because the server is being torn down.
+    ///
+    /// **Taken under `ws_conns_mutex`, and that is what makes the fds safe to
+    /// touch**: the owner removes its entry under this same lock before the fd can
+    /// be closed, so a recorded fd cannot have been closed and recycled under a
+    /// fresh connection by the time the pass sees it. Holding the lock across the
+    /// pass adds no wait to anyone — `shutdown` never blocks — and it is taken
+    /// uncancelably because `stop()` returns `void` and has to complete.
+    fn wakeWsConnections(self: *Server) void {
+        self.ws_conns_mutex.lockUncancelable(self.io);
+        defer self.ws_conns_mutex.unlock(self.io);
+
+        var woken: u64 = 0;
+        for (self.ws_conns.items) |fd| {
+            sockread.wakeBlockedSyscall(fd);
+            woken += 1;
+        }
+        if (woken != 0) _ = self.ws_woken_connections.fetchAdd(woken, .monotonic);
+    }
+
+    /// Registered WebSocket connections. Test-facing: it lets a shutdown test
+    /// wait for the *parked* state instead of guessing at it with a sleep.
+    fn registeredWsCount(self: *Server) usize {
+        self.ws_conns_mutex.lockUncancelable(self.io);
+        defer self.ws_conns_mutex.unlock(self.io);
+        return self.ws_conns.items.len;
     }
 };
 
@@ -3414,6 +3544,35 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                     }
 
                     // WebSocket read loop (fiber path)
+                    //
+                    // This connection is now the one shape where the *peer* could
+                    // otherwise choose how long `stop()` takes: the loop below
+                    // reads with a bare `read` and the loop condition alone never
+                    // ends it. So it is registered for the shutdown wake pass
+                    // first — `stop()` shuts registered sockets down, which makes
+                    // the parked read return 0.
+                    //
+                    // The `defer` runs *before* `connFiber`'s `defer stream.close`
+                    // (LIFO), which is the invariant `wakeWsConnections` depends
+                    // on: an entry never outlives the fd it names.
+                    const ws_fd = stream.socket.handle;
+                    const reserved = server.registerWsConnection(ws_fd) catch |err| blk: {
+                        // An unreservable connection must not be served half-tracked:
+                        // it is refused exactly like the stopping case, and named so
+                        // an allocation failure is not read as a shutdown.
+                        std.log.warn("[Server] WS connection refused, cannot reserve it for shutdown: {}", .{err});
+                        break :blk false;
+                    };
+                    if (!reserved) {
+                        // `stop()` is under way: don't park in a read nobody will
+                        // wake. The client gets a close frame, the application its
+                        // `on_close`.
+                        framer.writeClose() catch |err| std.log.debug("[Server] WS writeClose on stopping: {}", .{err});
+                        if (@intFromPtr(ws_route.on_close) != 0) ws_route.on_close(session);
+                        return;
+                    }
+                    defer server.unregisterWsConnection(ws_fd);
+
                     var messages = WsFramer.MessageReader.init(&framer, server.allocator);
                     defer messages.deinit();
                     while (server.running.load(.monotonic)) {
@@ -4873,6 +5032,231 @@ test "WebSocket fiber path receives client frames and fires on_close" {
     try std.testing.expect(ws_e2e_state.closed);
 
     server.stop();
+}
+
+/// Server-side state for the silent-peer shutdown test. Atomics because the
+/// callbacks run on the connection fiber and the assertions on the test thread.
+const WsSilentState = struct {
+    closed: std.atomic.Value(bool) = .init(false),
+};
+var ws_silent_state = WsSilentState{};
+
+// A client that completes the handshake and then says nothing — no frame, no
+// close frame, no FIN.
+//
+// The connection fiber parks in a bare `read` (`im/WsFramer.zig` `readFull` →
+// `core/sockread.zig` `readSome`), which nothing on the shutdown path disturbs,
+// while `start()`'s `conn_group.await` waits for that fiber — so the length of
+// `stop()` is decided by the *peer*. `stop()` must shut those sockets down.
+//
+// The wait below is a **hang budget, not a latency bound**: the wake pass is
+// immediate, so a green run finishes in microseconds and only a drain that
+// never ends reaches the 3 s ceiling. It therefore cannot prove *how fast*
+// shutdown is — only that it does not depend on the peer.
+test "stop() ends a silent WebSocket client's fiber instead of waiting for the peer" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    ws_silent_state = .{};
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0 });
+    defer server.deinit();
+    var group = server.group("");
+    try group.ws("ws", (struct {
+        fn connect(_: *Context, _: ?*anyopaque) ?*anyopaque {
+            return @ptrCast(&ws_silent_state);
+        }
+    }).connect, (struct {
+        fn message(_: ?*anyopaque, _: []const u8, _: WsFrameKind) void {}
+    }).message, (struct {
+        fn close(session: ?*anyopaque) void {
+            _ = session;
+            ws_silent_state.closed.store(true, .monotonic);
+        }
+    }).close, null);
+
+    const th = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, struct {
+        fn run(s: *Server) void {
+            s.start() catch {};
+        }
+    }.run, .{&server});
+    var joined = false;
+    // LIFO note: the client socket below is closed *before* this runs, so the
+    // failure path can never leave the accept thread parked in a drain.
+    defer if (!joined) {
+        server.stop();
+        th.join();
+    };
+
+    var port: u16 = 0;
+    var tries: usize = 0;
+    while (tries < 200) : (tries += 1) {
+        if (server.listener) |*l| {
+            port = l.socket.address.getPort();
+            break;
+        }
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    try std.testing.expect(port != 0);
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+    var stream = try addr.connect(std.testing.io, .{ .mode = .stream });
+    var closed_early = false;
+    defer if (!closed_early) stream.close(std.testing.io);
+
+    var wbuf: [512]u8 = undefined;
+    var w = stream.writer(std.testing.io, &wbuf);
+    const handshake = "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+    try w.interface.writeAll(handshake);
+    try w.interface.flush();
+
+    // Read the 101, then go silent for the rest of the test.
+    var pfds = [_]std.posix.pollfd{.{
+        .fd = stream.socket.handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    try std.testing.expect((try std.posix.poll(&pfds, 3000)) > 0);
+    var resp: [512]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, resp[0..try std.posix.read(stream.socket.handle, &resp)], "101") != null);
+
+    // The upgrade answer is written before `on_connect` runs, so the counter can
+    // be observed a moment before the fiber reaches its read loop. Wait for the
+    // connection to be *registered* (the step immediately before that read)
+    // rather than guessing with a sleep, so the assertions below are about the
+    // parked state, not about a race.
+    tries = 0;
+    while (server.registeredWsCount() != 1 and tries < 200) : (tries += 1) {
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), server.registeredWsCount());
+
+    server.stop();
+
+    // Structural, and immediate: the wake pass shut this connection's socket
+    // down. That is what ends the read — no timeout, no peer cooperation.
+    try std.testing.expectEqual(@as(u64, 1), server.ws_woken_connections.load(.monotonic));
+
+    // Bounded wait for the connection fiber to be gone. 3 s is a hang budget:
+    // the wake pass runs inside `stop()`, so nothing here is a latency bound.
+    var waited_ms: usize = 0;
+    while (server.active_connections.load(.monotonic) != 0 and waited_ms < 3000) : (waited_ms += 10) {
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    const still_running = server.active_connections.load(.monotonic);
+    if (still_running != 0) {
+        // The peer's silence is exactly what holds it: end the silence, let the
+        // threads unwind, then report the observation made *before* the cleanup.
+        std.log.err("[test] stop() left the WebSocket fiber parked {d}ms after it returned: the silent peer decides the shutdown length", .{waited_ms});
+        stream.close(std.testing.io);
+        closed_early = true;
+        th.join();
+        joined = true;
+    }
+    try std.testing.expectEqual(@as(u64, 0), still_running);
+
+    th.join();
+    joined = true;
+    // `on_close` runs before the fiber returns, so a drained connection count
+    // means the application was told, not just abandoned.
+    try std.testing.expect(ws_silent_state.closed.load(.monotonic));
+    try std.testing.expect(server.listener == null);
+    // The reservation is gone too — made before the fiber could close the fd, so
+    // no later wake pass can land on a recycled descriptor.
+    try std.testing.expectEqual(@as(usize, 0), server.registeredWsCount());
+
+    stream.close(std.testing.io);
+    closed_early = true;
+}
+
+// The registry half of the shutdown fix, without a server or a network: a
+// socketpair stands in for an upgraded connection, and the assertion is the
+// syscall-level consequence the fiber read depends on (`shutdown` → the read
+// returns EOF). Deterministic — no timing, no peer.
+test "stop() shuts down every registered WebSocket connection" {
+    const allocator = std.testing.allocator;
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0 });
+    defer server.deinit();
+
+    var fds: [2]std.posix.socket_t = undefined;
+    const rc = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    var peer_fds: [2]std.posix.socket_t = undefined;
+    const rc2 = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &peer_fds);
+    switch (std.posix.errno(rc2)) {
+        .SUCCESS => {},
+        else => {
+            _ = std.posix.system.close(fds[0]);
+            _ = std.posix.system.close(fds[1]);
+            return error.SkipZigTest;
+        },
+    }
+    defer {
+        for (fds) |fd| _ = std.posix.system.close(fd);
+        for (peer_fds) |fd| _ = std.posix.system.close(fd);
+    }
+
+    // The registry only accepts a connection while the server is up: `start()`
+    // sets this flag, `stop()` is what clears it. Set it here the way a running
+    // accept loop would.
+    server.running.store(true, .monotonic);
+    try std.testing.expect(try server.registerWsConnection(fds[0]));
+    try std.testing.expect(try server.registerWsConnection(peer_fds[0]));
+    try std.testing.expectEqual(@as(usize, 2), server.registeredWsCount());
+    try std.testing.expectEqual(@as(u64, 0), server.ws_woken_connections.load(.monotonic));
+
+    server.stop();
+
+    try std.testing.expectEqual(@as(u64, 2), server.ws_woken_connections.load(.monotonic));
+    // The registered end of each pair is now at EOF — exactly what the fiber's
+    // bare read gets, which is what makes it leave.
+    var buf: [8]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try std.posix.read(fds[0], &buf));
+    try std.testing.expectEqual(@as(usize, 0), try std.posix.read(peer_fds[0], &buf));
+    // The pass shuts sockets down; it never drops entries. Removal is the owning
+    // fiber's job (under the same lock, before it closes the fd), which is what
+    // keeps a recorded fd from being recycled while the pass is using it.
+    try std.testing.expectEqual(@as(usize, 2), server.registeredWsCount());
+
+    // Deregistration is therefore what shrinks the set: the next pass wakes only
+    // what is still registered.
+    server.unregisterWsConnection(fds[0]);
+    try std.testing.expectEqual(@as(usize, 1), server.registeredWsCount());
+    server.stop();
+    try std.testing.expectEqual(@as(u64, 3), server.ws_woken_connections.load(.monotonic));
+}
+
+// The interleaving the `running` check inside the lock exists for: a connection
+// that upgrades *after* the wake pass has already run must not be served, or it
+// would park in a read that nothing will ever wake.
+test "a WebSocket registration after stop() is refused instead of parking" {
+    const allocator = std.testing.allocator;
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0 });
+    defer server.deinit();
+
+    var fds: [2]std.posix.socket_t = undefined;
+    const rc = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    defer for (fds) |fd| {
+        _ = std.posix.system.close(fd);
+    };
+
+    // Up, then stopping: this is the interleaving a late upgrade can land in.
+    server.running.store(true, .monotonic);
+    server.stop();
+    try std.testing.expect(!try server.registerWsConnection(fds[0]));
+    // Refused means refused: nothing was recorded, so the caller's teardown is
+    // the only place that fd is closed (the invariant that keeps the wake pass
+    // off recycled descriptors).
+    try std.testing.expectEqual(@as(usize, 0), server.registeredWsCount());
+    // Nothing to wake, so the counter stays put — the `false` above is really the
+    // stopping flag, not an empty list happening to answer the same way.
+    try std.testing.expectEqual(@as(u64, 0), server.ws_woken_connections.load(.monotonic));
 }
 
 /// A masked client frame (RFC 6455 §5.1 — a server MUST reject unmasked ones).

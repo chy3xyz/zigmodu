@@ -1621,6 +1621,32 @@ shard 锁）被无限期占住。设了超时后写返回 `error.WriteTimeout` �
 连接；广播/Fan-out 还可先用 `framer.isWritable()` 做 O(1) 水位探测，主动丢帧
 而不是排队堆积。
 
+**WebSocket 关停**（读方向，同一形状的另一半）：握手后不发帧、也不挂断的客户端，
+让连接 fiber 停在一个裸 `read` 上（`im/WsFramer.zig` → `core/sockread.zig` 的
+`readSome`）；而 `start()` 退出时要 `conn_group.await` 这些 fiber，`stop()` 只负责
+把 `running` 置 false —— 于是**关停时长由对端决定**。现在 `stop()` 会对登记过的 WS
+连接调 `sockread.wakeBlockedSyscall`（= `shutdown(SHUT_RDWR)`），被 park 的读立刻
+返回 0，而 WS 读循环本来就把 0 当作"对端走了"（写方向同理，见上一条）。
+
+登记**只在每次升级做一次**，不在每请求路径上；HTTP/1.1、HTTP/2 连接**故意不登记**
+——关停是等 in-flight 请求跑完，不是取消它们，shutdown 它们的 socket 会打断正在写的
+响应。各连接的等待与解开方式：
+
+| 阶段 | 上界 |
+|------|------|
+| `accept` | `wakeAccept()`（Linux `shutdown` / macOS loopback 连接） |
+| keep-alive 等下一个请求 | `header_timeout_ms` |
+| 请求行 + 头 | `header_timeout_ms`（slowloris 闸门） |
+| body | `body_timeout_ms` |
+| HTTP/2 会话空闲 | `header_timeout_ms`（GOAWAY `ENHANCE_YOUR_CALM`） |
+| **WS 读循环** | **`stop()` 的唤醒**（过去：无上界，对端说了算） |
+| 你的回调（`on_connect` / `on_message` / `on_close`）、handler | **无上界** —— 必须自己返回 |
+
+最后一行是有意的：`shutdown` 够不到 park 在回调里的 fiber，**没有预算会打断它**。
+回调里等的东西都要自带超时（出站请求、锁），否则 `stop()` 会一直等——提前返回会在
+随后 `deinit` 时把它指向的 server 交给你正要释放的内存（use-after-free，而不是
+"快一点的关停"）。
+
 **并发验收**：`zig build soak`（`-Dsoak-clients=N -Dsoak-iterations=M`）跑真实
 socket 的 N 并发 × M 租户压测，断言跨租户读取为 **0**、冻结注册表在并发读 +
 拒写下不撕裂、连接计数回落为 0。它刻意不挂在 `zig build test` 里，以便日常

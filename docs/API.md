@@ -1173,6 +1173,27 @@ pub fn stop(self: *Server) void    // Gracefully stops accepting new connections
 
 
 
+**WebSocket route shutdown contract.** `stop()` is bounded against *peers*: every
+upgraded WebSocket connection the fiber path is still serving has its socket shut
+down, so a client that completes the handshake and then sends neither frames nor a
+FIN does not keep `stop()` — and the drain in `start()`'s defer — waiting.
+Reservation happens once per upgrade, not per request, and HTTP/1.1 / HTTP/2
+connections are deliberately **not** touched: the drain awaits in-flight requests
+rather than cancelling them.
+
+What no wake can reach is your own callback: `on_connect` / `on_message` /
+`on_close` run on the connection fiber, and a callback that does not return (an
+outbound request with no timeout, a lock nobody releases) keeps the drain waiting
+for exactly as long as it blocks — there is no budget that cuts it short, by
+design. A `stop()` that returned with a fiber still alive would hand it a server
+its caller is about to `deinit`. Put your own timeout on anything the callback
+waits for.
+
+Connections adopted through `setWsUring` are owned by the ring instead: they are
+ended by `WsUring.stop()` / `deinit()`, not by `Server.stop()`.
+
+
+
 **Server Options:**
 
 
