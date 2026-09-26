@@ -1690,6 +1690,9 @@ shard 锁）被无限期占住。设了超时后写返回 `error.WriteTimeout` �
 | chunked / streaming（`startChunked` / `writeChunk` / `endStream`） | `Context` → 同一个 writer | `Context.write_timeout_ms`（`Server` 从同一个配置填） |
 | SSE 事件（`http.sse`） | `SseWriter` → 同一个 writer | 同上 |
 | HTTP/2 帧（`ConnWriter`） | `writeDirect` → `sockread.writeFullBounded` | `ServeOptions.write_timeout_ms` ← 同一配置 |
+| WS 帧推送（`Server` 的 `RouteGroup.ws`） | `WsFramer.writeFrame` → `sockread.writevAll` | `ws_write_timeout_ms`（`0` = 继承 `response_write_timeout_ms`） |
+| 扩展层 WS（`extensions/WebSocket.zig` 的 `WebSocketServer`/`Client`） | `writeFrame` → `sockread.BoundedWriter` | `WebSocketServer.setWriteTimeout`（默认 30 s） |
+| 扩展层监控（`extensions/WebMonitor.zig`） | `writeResponse` → `sockread.writeFullBounded` | `WebMonitor.setWriteTimeout`（默认 30 s） |
 
 公共实现只有一处：`src/core/sockread.zig` 的 `writeFullBounded`（arm/clear + 裸
 `send`）与它上面的 `BoundedWriter`（缓冲 + `print`/`write`/`flush`）。**不要**改成

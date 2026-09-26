@@ -2,6 +2,43 @@
 
 ## [Unreleased]
 
+### 第 59 批：H2 loopback 测试族加"期望帧 + 一次重试"（拆掉上一批那条 CI 红的成因）；扩展层 WS 的写也接上界（`WebSocketServer`/`Client`）（**破坏性：否**）
+
+**① H2 测试族的 flake：不是框架缺陷，是 3 s 预算在负载机器上被错过**
+
+第 58 批推送后 `Build & Test (macos-latest)` 红在既有测试
+`h2 session answers GOAWAY FRAME_SIZE_ERROR for an oversized inbound DATA frame`（`no GOAWAY → loop
+did not answer`），重跑转绿。机制：`runLoopbackH2Session` 是一次 spawn + accept + 交换，空闲时微秒级，
+但读预算只有 **3 s**（hang budget），负载机器上可以错过。
+
+* 修法：helper 增加 `expect: ?Http2.FrameType`（= 调用方**接下来要找的那一帧**），第一次交换里
+  没有它就**再交换一次**并打一条 warn。真缺陷两次都答不出来，所以重试**掩盖不了**任何东西——
+  与 batch 52 给 `PrecisionTimer` capable-host 断言加重试同一形状。12 个调用点各传自己的期望帧
+  （`.goaway` / `.rst_stream` / `.data` / `.headers` / `.settings`，只看 hook 的那两个传 `null`）。
+* 重试**可被断言**：新增 `h2_exchange_retries` 计数 + 一条测试——期望一个永不出现的帧
+  （`.push_promise`）时计数恰好 1、返回的是**第二次**的应答；期望真会出现的那帧时计数为 0。
+
+**② 扩展层 WS 的写也接上界**
+
+第 58 批统一了 `Server` 侧 WS 的时间来源，但 `extensions/WebSocket.zig` 这条独立实现还是
+io writer + 无界：`broadcast` 的注释自己写着"这是会 park 的那一段"。
+
+* `WebSocketServer.write_timeout_ms`（默认 30 s）+ `setWriteTimeout`；`WebSocketClient.writeFrame`
+  经 `server` 指针读它（一个字段同时覆盖推送与出站帧）→ 改走 `sockread.BoundedWriter`。
+* 三处握手应答（400/403/101）也改走 `writeFullBounded`：写与 flush 是同一次调用（io writer 那条
+  只缓冲、漏 flush 就丢掉整条应答，文件里已有三处红记录）。
+* `broadcast` 里单客户端发送失败由 `err` 降为 `warn`：对端不读不是服务端错误，而且
+  `scripts/test-runner.zig` 把任何 `err` 级日志当成整轮失败——降到 warn 之后这条路径才可测。
+* `writeFailed` 改成收**具体错误**（原来读 io writer 的 `w.err` 字段），名字更准，仍返回
+  `error.WriteFailed` 并把 `is_connected` 置 false（batch 已有的命名测试保持绿）。
+* 新测试：socketpair + 对端不读 + `setWriteTimeout(50)` → `sendText` 拿到 `error.WriteFailed`、
+  耗时 ≥ 预算、`is_connected == false`。
+  > **这条的红只能以"挂住"呈现**：修复前它 park 在 `send` 里无限期 —— 这正是缺陷的形状，不是
+  > 可断言的失败。
+
+**③ 本批不声称**：H2 响应体超过 `max_pending_bytes`（4 MiB）被 `RST_STREAM(ENHANCE_YOUR_CALM)`
+拒绝仍在队列（要动调度器：响应体改成按窗口切片排队）。
+
 ### 第 58 批：WS 帧推送默认继承响应写预算（`ws_write_timeout_ms = 0` 由"无界"改成"继承"）；`extensions/WebMonitor.zig` 的响应**根本没被发出去**（顺手修掉）并加上界（**破坏性：窄** —— 见下）
 
 **① WS 帧推送的上界默认打开**

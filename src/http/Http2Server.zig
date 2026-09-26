@@ -2613,7 +2613,33 @@ test "streamErrorFromAny maps outbound backpressure codes" {
 /// Feed `frames` to one real h2c session (preface already consumed) and return
 /// the server's reply bytes in `out`. Client I/O is raw `posix` so the test never
 /// shares the io scheduler across threads (same reason as the WS e2e test).
-fn runLoopbackH2Session(opts: ServeOptions, frames: []const u8, out: []u8) !usize {
+/// One loopback h2 exchange, retried **once** when the frame the caller is about
+/// to look for is missing from the reply.
+///
+/// The retry is for a loaded CI runner, not for a defect: this is a spawn + accept
+/// + exchange that takes microseconds when the machine is idle, and the read
+/// budget below is a hang budget (3 s). Observed once on a loaded macOS runner
+/// (`no GOAWAY → loop did not answer`, green on the rerun and in two local full
+/// runs). A real defect answers nothing on *both* attempts, so the retry cannot
+/// hide one — the same shape as `PrecisionTimer`'s capable-host retry.
+///
+/// `expect == null` means "the caller looks at the bytes, not at a frame" (the
+/// deadline-hook tests): no retry.
+/// Counts the retries below, so a test can assert the retry *happened* rather
+/// than believe it did (a counter, not a log line: `scripts/test-runner.zig`
+/// counts `err`-level logs as failures, and there is no log-capturing API here).
+var h2_exchange_retries: usize = 0;
+
+fn runLoopbackH2Session(opts: ServeOptions, frames: []const u8, out: []u8, expect: ?Http2.FrameType) !usize {
+    const first = try runLoopbackH2Exchange(opts, frames, out);
+    if (expect == null) return first;
+    if (findFrameInReply(out[0..first], expect.?, 0) != null) return first;
+    h2_exchange_retries += 1;
+    std.log.warn("[h2 test] no {s} in the first exchange ({d} bytes back); retrying once — a loaded runner, not a verdict", .{ @tagName(expect.?), first });
+    return runLoopbackH2Exchange(opts, frames, out);
+}
+
+fn runLoopbackH2Exchange(opts: ServeOptions, frames: []const u8, out: []u8) !usize {
     const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
     var listener = try addr.listen(std.testing.io, .{ .reuse_address = true });
     defer listener.deinit(std.testing.io);
@@ -2666,6 +2692,31 @@ fn findFrameInReply(wire: []const u8, typ: Http2.FrameType, stream_id: u31) ?Htt
     return null;
 }
 
+test "the h2 loopback helper retries once when the expected frame is missing, and returns the retry's reply" {
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var payload: [65536]u8 = @splat(0x41);
+    const oversized = try Http2.encodeData(allocator, 1, &payload, false);
+    defer allocator.free(oversized);
+
+    // `.push_promise` is never in this reply, so the retry runs: the counter is
+    // what proves it (the two attempts both answer, so nothing else would show
+    // it), and what comes back is the *second* attempt's bytes — a caller's own
+    // `orelse` is still what reports a missing frame, on both attempts.
+    var out: [4096]u8 = undefined;
+    h2_exchange_retries = 0;
+    const n = try runLoopbackH2Session(.{}, oversized, &out, .push_promise);
+    try std.testing.expectEqual(@as(usize, 1), h2_exchange_retries);
+    try std.testing.expect(findFrameInReply(out[0..n], .goaway, 0) != null);
+
+    // And with the frame it does answer, there is no retry at all.
+    h2_exchange_retries = 0;
+    const m = try runLoopbackH2Session(.{}, oversized, &out, .goaway);
+    try std.testing.expectEqual(@as(usize, 0), h2_exchange_retries);
+    try std.testing.expect(findFrameInReply(out[0..m], .goaway, 0) != null);
+}
+
 test "h2 session answers GOAWAY FRAME_SIZE_ERROR for an oversized inbound DATA frame" {
     if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -2677,7 +2728,7 @@ test "h2 session answers GOAWAY FRAME_SIZE_ERROR for an oversized inbound DATA f
     defer allocator.free(oversized);
 
     var out: [4096]u8 = undefined;
-    const n = try runLoopbackH2Session(.{}, oversized, &out);
+    const n = try runLoopbackH2Session(.{}, oversized, &out, .goaway);
     const goaway = findFrameInReply(out[0..n], .goaway, 0) orelse
         return error.TestUnexpectedResultWithMessage; // no GOAWAY → loop did not answer
     const info = try Http2.decodeGoAway(goaway.payload);
@@ -2702,7 +2753,7 @@ test "h2 session answers GOAWAY PROTOCOL_ERROR for an even client stream id" {
     defer allocator.free(headers);
 
     var out: [4096]u8 = undefined;
-    const n = try runLoopbackH2Session(.{}, headers, &out);
+    const n = try runLoopbackH2Session(.{}, headers, &out, .goaway);
     const goaway = findFrameInReply(out[0..n], .goaway, 0) orelse return error.TestUnexpectedResultWithMessage;
     const info = try Http2.decodeGoAway(goaway.payload);
     try std.testing.expectEqual(Http2.ErrorCode.PROTOCOL_ERROR, info.error_code);
@@ -2721,7 +2772,7 @@ test "h2 session answers GOAWAY COMPRESSION_ERROR for a header block the decoder
     defer allocator.free(headers);
 
     var out: [4096]u8 = undefined;
-    const n = try runLoopbackH2Session(.{}, headers, &out);
+    const n = try runLoopbackH2Session(.{}, headers, &out, .goaway);
     const goaway = findFrameInReply(out[0..n], .goaway, 0) orelse return error.TestUnexpectedResultWithMessage;
     const info = try Http2.decodeGoAway(goaway.payload);
     try std.testing.expectEqual(Http2.ErrorCode.COMPRESSION_ERROR, info.error_code);
@@ -2745,7 +2796,7 @@ test "h2 session still serves a normal request on stream 1" {
     defer allocator.free(headers);
 
     var out: [4096]u8 = undefined;
-    const n = try runLoopbackH2Session(.{}, headers, &out);
+    const n = try runLoopbackH2Session(.{}, headers, &out, .headers);
     const reply = out[0..n];
     try std.testing.expect(findFrameInReply(reply, .goaway, 0) == null);
     try std.testing.expect(findFrameInReply(reply, .rst_stream, 0) == null);
@@ -2783,7 +2834,7 @@ test "h2 session refuses the stream past the advertised MAX_CONCURRENT_STREAMS" 
     const refused_sid: u31 = 1 + 2 * max;
 
     var out: [4096]u8 = undefined;
-    const n = try runLoopbackH2Session(.{}, script.items, &out);
+    const n = try runLoopbackH2Session(.{}, script.items, &out, .rst_stream);
     const rst = findFrameInReply(out[0..n], .rst_stream, refused_sid) orelse return error.TestUnexpectedResultWithMessage;
     try std.testing.expectEqual(Http2.ErrorCode.REFUSED_STREAM, try Http2.decodeRstStream(rst.payload));
     try std.testing.expect(findFrameInReply(out[0..n], .rst_stream, 1) == null);
@@ -3097,7 +3148,7 @@ test "h2 session advertises SETTINGS_MAX_HEADER_LIST_SIZE from the options" {
 
     const advertised: u32 = 4096;
     var out: [4096]u8 = undefined;
-    const n = try runLoopbackH2Session(.{ .inbound = .{ .max_header_list_bytes = advertised } }, &.{}, &out);
+    const n = try runLoopbackH2Session(.{ .inbound = .{ .max_header_list_bytes = advertised } }, &.{}, &out, .settings);
     const reply = out[0..n];
 
     var seen = false;
@@ -3159,7 +3210,7 @@ test "h2 session answers a header list past the advertised size with one RST" {
     const n = try runLoopbackH2Session(.{
         .inbound = .{ .max_header_list_bytes = 250 },
         .site_handler = echoBigHeader,
-    }, script.items, &out);
+    }, script.items, &out, .rst_stream);
     const reply = out[0..n];
 
     // The over-size list is refused for *that stream*: RST + ENHANCE_YOUR_CALM,
@@ -3205,7 +3256,7 @@ test "h2 session answers too many header fields with one RST" {
     // Byte budget off: this test is about the count.
     const n = try runLoopbackH2Session(.{
         .inbound = .{ .max_header_list_bytes = 0, .max_header_count = 4 },
-    }, script.items, &out);
+    }, script.items, &out, .rst_stream);
     const reply = out[0..n];
 
     const rst = findFrameInReply(reply, .rst_stream, 1) orelse return error.TestUnexpectedResultWithMessage;
@@ -3235,7 +3286,7 @@ test "the h2 loop's own 404 answers HEAD with a field section and no body" {
         defer allocator.free(head);
 
         var out: [4096]u8 = undefined;
-        const n = try runLoopbackH2Session(.{}, head, &out);
+        const n = try runLoopbackH2Session(.{}, head, &out, .data);
         const reply = out[0..n];
         const data = findFrameInReply(reply, .data, 1) orelse return error.TestUnexpectedResultWithMessage;
         try std.testing.expectEqualStrings("not found", data.payload);
@@ -3247,7 +3298,7 @@ test "the h2 loop's own 404 answers HEAD with a field section and no body" {
         defer allocator.free(head);
 
         var out: [4096]u8 = undefined;
-        const n = try runLoopbackH2Session(.{}, head, &out);
+        const n = try runLoopbackH2Session(.{}, head, &out, .headers);
         const reply = out[0..n];
 
         // No DATA frame at all, and the HEADERS frame closes the stream
@@ -3273,7 +3324,7 @@ test "h2 session arms the read idle deadline and clears it on exit" {
     const n = try runLoopbackH2Session(.{
         .read_idle_timeout_ms = 30_000,
         .read_deadline = fake.handle(),
-    }, &.{}, &out);
+    }, &.{}, &out, null);
     _ = n;
 
     // Armed before the read (that is what lets a silent peer be cut off) and

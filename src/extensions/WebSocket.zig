@@ -139,6 +139,13 @@ pub const WebSocketServer = struct {
     /// rejected with `PayloadTooLarge`. Explicit contract (was previously
     /// implied by a hard-coded 4096-byte stack buffer in `WebSocketClient.run`).
     max_frame_size: usize = 4096,
+    /// Send bound for every frame this server (or its clients' `sendText`) writes
+    /// — `SO_SNDTIMEO`, armed around each write. `broadcast`'s own comment says it
+    /// best: "this is the part that can park (a slow peer's socket buffer)", and
+    /// with `0` it parks forever. `WebSocketClient.writeFrame` reads this through
+    /// its `server` pointer, so one field covers pushes and outgoing frames
+    /// alike. 0 = unbounded.
+    write_timeout_ms: u32 = 30_000,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, port: u16) Self {
         return .{
@@ -482,16 +489,10 @@ pub const WebSocketServer = struct {
         const ws_key = extractHeaderValue(request, "Sec-WebSocket-Key: ") orelse {
             // Not a WebSocket upgrade request - send HTTP response
             const response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
-            var write_buf: [256]u8 = undefined;
-            var w = conn.writer(self.io, &write_buf);
-            // Best-effort: a failed write means the peer is already gone.
-            _ = w.interface.writeAll(response) catch |err| {
-                std.log.debug("[ws] handshake write failed (peer gone?): {s}", .{@errorName(err)});
-            };
-            // `writeAll` only *buffers* what fits in `write_buf` (`Io/Writer.zig`
-            // returns as soon as the bytes are copied), so without this flush the
-            // response dies with `w` — no error, nothing on the wire.
-            w.interface.flush() catch |err| {
+            // Raw and bounded, and write+flush in one step: the io writer this
+            // used buffered the response and needed a `flush` that is easy to
+            // lose, and it cannot express `write_timeout_ms` at all.
+            sockread.writeFullBounded(conn, response, self.write_timeout_ms) catch |err| {
                 std.log.debug("[ws] handshake write failed (peer gone?): {s}", .{@errorName(err)});
             };
             return;
@@ -509,16 +510,8 @@ pub const WebSocketServer = struct {
                 }
                 if (!origin_allowed) {
                     const response = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
-                    var write_buf: [256]u8 = undefined;
-                    var w = conn.writer(self.io, &write_buf);
-                    // Best-effort: the peer is being rejected anyway; a failed
-                    // write only means the socket is already gone.
-                    _ = w.interface.writeAll(response) catch |err| {
-                        std.log.debug("[ws] handshake write failed (peer gone?): {s}", .{@errorName(err)});
-                    };
-                    // Same flush contract as the 400 above: without it the 403 is
-                    // never sent and the peer sees a hang instead of a rejection.
-                    w.interface.flush() catch |err| {
+                    // Same raw, bounded, write-and-flush shape as the 400 above.
+                    sockread.writeFullBounded(conn, response, self.write_timeout_ms) catch |err| {
                         std.log.debug("[ws] handshake write failed (peer gone?): {s}", .{@errorName(err)});
                     };
                     return;
@@ -550,18 +543,15 @@ pub const WebSocketServer = struct {
             "Sec-WebSocket-Accept: {s}\r\n" ++
             "\r\n", .{accept_key}) catch return;
 
-        var write_buf: [4096]u8 = undefined;
-        var w = conn.writer(self.io, &write_buf);
-        _ = w.interface.writeAll(response) catch |err| {
-            std.log.err("[WebSocketServer] Handshake write error: {}", .{err});
-            return;
-        };
-        // The flush is the delivery: the response is ~129 bytes and the buffer is
-        // 4096, so `writeAll` alone leaves the 101 in a stack buffer that dies
-        // here — the client waits for a handshake that never arrives. Red:
-        // `WebSocketServer: a live client is handshaken, pushed to, and dropped`.
-        w.interface.flush() catch |err| {
-            std.log.err("[WebSocketServer] Handshake write error: {}", .{err});
+        // Raw, bounded, write-and-flush in one step. The io writer this used only
+        // *buffered* the ~129-byte 101 into a 4096-byte stack buffer, so a missing
+        // `flush` left the client waiting for a handshake that never arrived
+        // (red: `WebSocketServer: a live client is handshaken, pushed to, and
+        // dropped`), and it could not carry `write_timeout_ms` either.
+        sockread.writeFullBounded(conn, response, self.write_timeout_ms) catch |err| {
+            // `warn`: a peer that hung up mid-handshake is its own business, not
+            // a server error — and an `err`-level line makes the whole suite fail.
+            std.log.warn("[WebSocketServer] handshake write failed: {}", .{err});
             return;
         };
 
@@ -769,7 +759,12 @@ pub const WebSocketServer = struct {
             defer client.write_mutex.unlock(self.io);
 
             client.sendText(message) catch |err| {
-                std.log.err("[WebSocketServer] Broadcast error to client: {}", .{err});
+                // A peer that stopped reading (or went away) is not a server
+                // fault, and this is now a *bounded* failure rather than a park
+                // (`write_timeout_ms`) — `warn`, not `err`: `scripts/test-runner.zig`
+                // fails a run over any err-level log, which would make this path
+                // untestable.
+                std.log.warn("[WebSocketServer] broadcast to a client failed: {}", .{err});
             };
         }
     }
@@ -798,6 +793,11 @@ pub const WebSocketServer = struct {
     /// Register the handshake callback. It runs on the connection fiber that
     /// `stop()` drains — see the `on_connect_cb` field for the "must return on
     /// its own" contract, and put a timeout on anything the callback waits for.
+    /// Override the frame send bound (`write_timeout_ms`; 0 = unbounded).
+    pub fn setWriteTimeout(self: *Self, timeout_ms: u32) void {
+        self.write_timeout_ms = timeout_ms;
+    }
+
     pub fn onConnect(self: *Self, callback: *const fn (*WebSocketClient) void) void {
         self.on_connect_cb = callback;
     }
@@ -1030,27 +1030,35 @@ pub const WebSocketClient = struct {
             header_len = 10;
         }
 
+        // Raw, buffered, bounded — `sockread.BoundedWriter` writes through on
+        // `flush` (the delivery, see below) and arms the send bound around each
+        // write. `std.Io`'s writer cannot express that bound at all: it answers a
+        // timed-out send with `errnoBug`, which is `unreachable`.
         var write_buf: [4096]u8 = undefined;
-        var w = self.stream.writer(self.io, &write_buf);
-        _ = w.interface.writeAll(header_buf[0..header_len]) catch return self.writeFailed(&w);
-        _ = w.interface.writeAll(payload) catch return self.writeFailed(&w);
-        // **The flush is the delivery.** `writeAll` returns as soon as the bytes
-        // are copied into `write_buf` (4096 bytes here) and never touches the
-        // socket; without this, every frame smaller than the buffer is dropped
-        // when `w` goes out of scope — the client receives nothing, no error is
-        // returned, and `broadcast` cannot tell. Red: `WebSocketServer: a live
-        // client is handshaken, pushed to, and dropped` (the push times out).
-        w.interface.flush() catch return self.writeFailed(&w);
+        var w = sockread.BoundedWriter.init(self.stream, &write_buf, self.server.write_timeout_ms);
+        w.write(header_buf[0..header_len]) catch |err| return self.writeFailed(err);
+        w.write(payload) catch |err| return self.writeFailed(err);
+        // **The flush is the delivery.** `write` returns as soon as the bytes are
+        // copied into `write_buf` (4096 bytes here) and never touches the socket;
+        // without this, every frame smaller than the buffer is dropped when `w`
+        // goes out of scope — the client receives nothing, no error is returned,
+        // and `broadcast` cannot tell. Red: `WebSocketServer: a live client is
+        // handshaken, pushed to, and dropped` (the push times out).
+        w.flush() catch |err| return self.writeFailed(err);
     }
 
     /// The one exit for a failed frame write: keep the writer's own cause (the
     /// `WriteFailed` the `Io.Writer` interface returns hides it — `w.err` is
     /// where the `Io` puts the real one), stop claiming to be connected, and name
     /// the failure for what it is.
-    fn writeFailed(self: *Self, w: *std.Io.net.Stream.Writer) error{WriteFailed} {
+    /// Named for the *write*, and the flag stops lying: the old shape reported
+    /// every failure as `error.NotConnected` and left `is_connected` true, so a
+    /// caller could not tell "the peer is gone" from "try again". Red:
+    /// `WebSocketClient: a write failure is named for the write, and the flag
+    /// stops lying`.
+    fn writeFailed(self: *Self, err: anyerror) error{WriteFailed} {
         self.is_connected = false;
-        const cause = if (w.err) |c| @errorName(c) else "unreported";
-        std.log.debug("[ws] frame write failed ({s}); the client is now marked disconnected", .{cause});
+        std.log.debug("[ws] frame write failed ({s}); the client is now marked disconnected", .{@errorName(err)});
         return error.WriteFailed;
     }
 };
@@ -2201,6 +2209,44 @@ const TestSocketPair = struct {
 /// `undefined` stand-in leaves as garbage.
 fn standInClient(server: *WebSocketServer, io: std.Io) WebSocketClient {
     return WebSocketClient.init(std.testing.allocator, .{ .socket = .{ .handle = -1, .address = undefined } }, io, server);
+}
+
+test "a frame push to a peer that stopped reading fails on the write budget instead of parking" {
+    // The shape `broadcast`'s own comment warns about — "this is the part that can
+    // park (a slow peer's socket buffer)". Red, measured on the previous
+    // implementation (io writer, no bound): `sendText` parked inside `send`
+    // forever, so the only outcome this test *could* have had was a hang.
+    const allocator = std.testing.allocator;
+    var fds: [2]std.posix.socket_t = undefined;
+    const rc = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = fds[0], .address = undefined } };
+    defer stream.close(std.testing.io);
+    defer _ = std.posix.system.close(fds[1]);
+
+    var server = WebSocketServer.init(allocator, std.testing.io, 0);
+    defer server.deinit();
+    server.setWriteTimeout(50);
+
+    // A client built by hand over one end of the socketpair. Nothing owns it, so
+    // it never gets released and its fd stays the test's (`WebSocketClient.init`
+    // only sets the refcount, it does not take ownership of the stream).
+    var client = WebSocketClient.init(allocator, stream, std.testing.io, &server);
+
+    // Bigger than any socket buffer, and the peer end never reads.
+    var frame: [64 * 1024]u8 = @splat('w');
+    const started = std.Io.Timestamp.now(std.testing.io, .real);
+    try std.testing.expectError(error.WriteFailed, client.sendText(&frame));
+    const elapsed_ms: u64 = @intCast(@divTrunc(std.Io.Timestamp.now(std.testing.io, .real).nanoseconds - started.nanoseconds, std.time.ns_per_ms));
+
+    // It failed, it failed because of the budget (not before it), and the client
+    // is marked disconnected so `broadcast` skips it next time.
+    try std.testing.expect(elapsed_ms >= 50);
+    try std.testing.expect(elapsed_ms < 5000);
+    try std.testing.expect(!client.is_connected);
 }
 
 test "WebSocketClient: a write failure is named for the write, and the flag stops lying" {
