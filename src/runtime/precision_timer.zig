@@ -859,7 +859,19 @@ test "PrecisionTimer: the spin window is what buys the accuracy (the bound has t
             pure_spin_rows += 1;
             absolute_rows += 1;
         } else if (host_ready) {
-            try std.testing.expect(precise.p50_ns <= lateness_p50_bound_ns);
+            // Capable host: the shipped knobs must hold the bound. One **retry**
+            // on a miss, because a transient spike and a broken mechanism are
+            // different findings and a single sample cannot tell them apart: this
+            // exact assertion failed once on a loaded dev machine (the whole
+            // suite red, `what the knobs cost` passing in isolation seconds
+            // later) while the readiness probe — measured once, at the start —
+            // had passed. Sustained load still fails: the probe would have
+            // missed, and a spike that repeats across the retry is not a spike.
+            if (precise.p50_ns > lateness_p50_bound_ns) {
+                const retry = try runLateness(std.testing.io, &queue, precise_options, deadline_ns, samples[0..round_count]);
+                printRun("default (retry)", deadline_ns, precise_options, retry);
+                try std.testing.expect(retry.p50_ns <= lateness_p50_bound_ns);
+            }
             absolute_rows += 1;
         } else {
             attributed_rows += 1;
@@ -969,7 +981,15 @@ test "PrecisionTimer: what the knobs cost — lateness and CPU at three periods"
         printRun("default", period_ns, default_options, measured);
         try std.testing.expect(measured.min_ns >= 0);
         if (period_ns <= default_options.spin_window_ns or host_ready) {
-            try std.testing.expect(measured.p50_ns <= lateness_p50_bound_ns);
+            // Capable host: bound asserted, with the same single retry the teeth
+            // test documents (a transient spike is not a broken mechanism).
+            if (period_ns > default_options.spin_window_ns and measured.p50_ns > lateness_p50_bound_ns) {
+                const retry = try runLateness(std.testing.io, &queue, default_options, period_ns, samples[0..round_count]);
+                printRun("default (retry)", period_ns, default_options, retry);
+                try std.testing.expect(retry.p50_ns <= lateness_p50_bound_ns);
+            } else {
+                try std.testing.expect(measured.p50_ns <= lateness_p50_bound_ns);
+            }
         } else {
             // Same boundary as the teeth test: the cross-configuration median is
             // not a mechanism claim on a host where the window cannot act — it is

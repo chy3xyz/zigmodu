@@ -4608,13 +4608,13 @@ test "Runtime.MetricsBridge publishes the pool's counters, and they move with th
     // declared. The scrape is compared against `poolStats()` taken *after*
     // `join()`, when nothing else can be running, so the two cannot disagree.
     for (0..5) |i| try pooled.send(@intCast(i));
-    try waitUntil(Published(@TypeOf(shared.handled), u32){ .value = &shared.handled, .want = 5 }, 5_000);
+    try waitUntil(Published(@TypeOf(shared.handled), u32){ .value = &shared.handled, .want = 5 }, observation_budget_ms);
     pooled.stop();
     pooled.join(); // pooled join: waits for the claim to come back and the mailbox to drain
     // ...for the *worker's* claim. The pool's counter is decremented one step
     // later (and a token re-push lands between the two), so wait for the reading
     // this test compares against the scrape rather than for the join.
-    try waitUntil(PoolUnclaimed(@TypeOf(rt)){ .rt = &rt }, 5_000);
+    try waitUntil(PoolUnclaimed(@TypeOf(rt)){ .rt = &rt }, observation_budget_ms);
 
     const warm = rt.poolStats().?;
     try std.testing.expect(warm.dispatches >= 1);
@@ -4684,6 +4684,18 @@ test "Runtime.MetricsBridge reports no pool as zeros" {
 /// rather than "sleep long enough": a scheduler that never delivers has to
 /// *fail* these tests, and a test that sleeps for a fixed while instead of
 /// observing the condition can only pass or hang.
+///
+/// The budgets the §12.16 tests hand this are deliberately large
+/// (`observation_budget_ms`), because they are **scheduling** budgets, not
+/// properties of the mechanism: the reading those tests assert is a *message
+/// count*, and the waits only exist to observe it. A fixed 5 s passed locally
+/// and on the push legs for days, then failed the `Test (DB=mysql)` leg with
+/// `error.WaitTimeout` — on a shared runner the wait is what gives way first,
+/// and a flake there says nothing about fairness (the same lesson §12.15
+/// records for absolute latency bounds). A genuinely stuck wait still fails:
+/// after the budget, and the CI step's `--test-timeout` bounds it further.
+const observation_budget_ms: i64 = 60_000;
+
 fn waitUntil(probe: anytype, timeout_ms: i64) !void {
     const Time = @import("../core/Time.zig");
     const deadline = Time.monotonicNowMilliseconds() + timeout_ms;
@@ -4799,7 +4811,7 @@ test "Runtime: a pooled worker receives every message, in order" {
     // Wait (bounded) for the drain, then stop and join: `join` is what makes
     // reading `state` from this thread sound — it waits for "nothing left to run",
     // which includes the mailbox being empty, not just the claim being free.
-    try waitUntil(Drained(@TypeOf(handle.*)){ .handle = handle }, 5_000);
+    try waitUntil(Drained(@TypeOf(handle.*)){ .handle = handle }, observation_budget_ms);
     handle.stop();
     handle.join();
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5 }, handle.state.seen[0..5]);
@@ -4860,7 +4872,7 @@ test "Runtime: a timer's delivery to a pooled worker arms its ready token" {
     clk.now_ms = 5;
     try std.testing.expectEqual(@as(usize, 1), rt.tick());
 
-    try waitUntil(Published(@TypeOf(shared.total), u32){ .value = &shared.total, .want = 41 }, 2_000);
+    try waitUntil(Published(@TypeOf(shared.total), u32){ .value = &shared.total, .want = 41 }, observation_budget_ms);
     try std.testing.expectEqual(@as(u32, 1), shared.seen.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), rt.stats().timer_deliveries_dropped);
 }
@@ -4906,7 +4918,7 @@ test "Runtime: a pooled worker loses nothing under concurrent producers" {
     }
     for (threads) |t| t.join();
 
-    try waitUntil(Drained(@TypeOf(handle.*)){ .handle = handle }, 10_000);
+    try waitUntil(Drained(@TypeOf(handle.*)){ .handle = handle }, observation_budget_ms);
     handle.stop();
     handle.join();
 
@@ -5027,7 +5039,7 @@ test "Runtime: N pool threads conserve messages and never overlap on one worker"
     try waitUntil(Published(std.atomic.Value(u64), u64){
         .value = &shared.received,
         .want = calls_made - dropped,
-    }, 20_000);
+    }, observation_budget_ms);
     for (handles) |h| {
         h.stop();
         h.join();
@@ -5153,7 +5165,7 @@ test "Runtime: a blocked `.blocking` worker does not hold the cpu pool" {
     const cpu = try rt.spawn(Cpu, .{}, .{ .capacity = 4, .mode = .pooled });
 
     try waiter.send(1);
-    try waitUntil(Flag(std.atomic.Value(bool)){ .value = &entered }, 5_000);
+    try waitUntil(Flag(std.atomic.Value(bool)){ .value = &entered }, observation_budget_ms);
 
     // The blocking pool's only thread is inside `handle` right now, and stays
     // there until this test says otherwise. The CPU pool's only thread is a
@@ -5162,7 +5174,7 @@ test "Runtime: a blocked `.blocking` worker does not hold the cpu pool" {
     try waitUntil(Published(std.atomic.Value(u32), u32){
         .value = &cpu.state.handled,
         .want = 4,
-    }, 5_000);
+    }, observation_budget_ms);
     try std.testing.expectEqual(@as(u32, 4), cpu.state.handled.load(.acquire));
     // ...and the blocked worker is *still* inside that one message: the line above
     // is a statement about isolation, not about a pause that happened to end.
@@ -5344,7 +5356,7 @@ test "Runtime: a pooled worker's init and deinit run around its life" {
     // with its first batch — the earliest moment it can own one.
     try std.testing.expectEqual(@as(u32, 0), busy.inits.load(.acquire));
     try used.send(41);
-    try waitUntil(Published(@TypeOf(busy.seen), u32){ .value = &busy.seen, .want = 41 }, 5_000);
+    try waitUntil(Published(@TypeOf(busy.seen), u32){ .value = &busy.seen, .want = 41 }, observation_budget_ms);
 
     // `shutdown` (idempotent) rather than `deinit`, so the assertions below can
     // still read the test's own `Shared` values.
@@ -5391,7 +5403,7 @@ test "Runtime: shutdown with the pool mid-batch hands the claim back first" {
     var shared = Blocker.Shared{};
     const handle = try rt.spawn(Blocker, .{ .shared = &shared }, .{ .capacity = 8, .mode = .pooled });
     try handle.send(41);
-    try waitUntil(Flag(@TypeOf(shared.started)){ .value = &shared.started }, 5_000);
+    try waitUntil(Flag(@TypeOf(shared.started)){ .value = &shared.started }, observation_budget_ms);
 
     // Tear the runtime down *while the pool thread is inside `handle`: the pool
     // join has to wait for the batch, the claim has to be handed back before the
@@ -5525,7 +5537,7 @@ test "Runtime: a pooled join waits for a claim without burning a core" {
     // Measure from the moment the handler really owns the claim, so the window
     // is "waiting for a running handler" and not the microseconds before the
     // pool picked the message up.
-    try waitUntil(Flag(@TypeOf(started)){ .value = &started }, 5_000);
+    try waitUntil(Flag(@TypeOf(started)){ .value = &started }, observation_budget_ms);
 
     const before = processCpuNanos();
     h.join();
@@ -5586,7 +5598,7 @@ test "Runtime: stats() reads soundly while another thread joins the worker" {
     const reader = try std.Thread.spawn(.{}, Reader.run, .{ h, &stop, &calls, &torn });
     // Let the reader reach `stats()` *before* the join writes anything: that is
     // what puts the two accesses in the sanitizer's conflicting pair.
-    try waitUntil(Published(@TypeOf(calls), u32){ .value = &calls, .want = 1 }, 5_000);
+    try waitUntil(Published(@TypeOf(calls), u32){ .value = &calls, .want = 1 }, observation_budget_ms);
 
     h.stop(); // a dedicated `join` waits for the *thread*, which stops on this
     h.join(); // ...while the reader is calling `stats()`
@@ -5825,7 +5837,7 @@ test "Runtime Replay: a track that ran out of room marks the log incomplete, and
     // mailbox decides that, not the track — and is not recorded. The log has a
     // hole, and it says so (the send cannot: it succeeded).
     for (1..4) |i| try handle.send(@intCast(i));
-    try waitUntil(Published(@TypeOf(handle.mailbox.received), u64){ .value = &handle.mailbox.received, .want = 3 }, 5_000);
+    try waitUntil(Published(@TypeOf(handle.mailbox.received), u64){ .value = &handle.mailbox.received, .want = 3 }, observation_budget_ms);
 
     try std.testing.expectEqual(@as(u64, 3), handle.stats().received);
     try std.testing.expectEqual(@as(usize, 2), log.len());
@@ -5941,7 +5953,7 @@ test "Runtime Replay: replayAll hands a whole log to a fresh graph, in order" {
         rec_clock.set(100 * @as(i64, @intCast(i)));
         try recorded.send(@intCast(i * 10));
     }
-    try waitUntil(Published(@TypeOf(recorded.mailbox.received), u64){ .value = &recorded.mailbox.received, .want = 5 }, 5_000);
+    try waitUntil(Published(@TypeOf(recorded.mailbox.received), u64){ .value = &recorded.mailbox.received, .want = 5 }, observation_budget_ms);
 
     // Phase 2: a fresh graph and `replayAll` — the convenience driver, which is
     // `step` in a loop and therefore has the same "hands over, never waits"
@@ -5960,7 +5972,7 @@ test "Runtime Replay: replayAll hands a whole log to a fresh graph, in order" {
     // The driver moved its clock to the last recorded stamp and stopped there.
     try std.testing.expectEqual(@as(i64, 500), replay_clock.now_ms);
 
-    try waitUntil(Published(@TypeOf(fresh.mailbox.received), u64){ .value = &fresh.mailbox.received, .want = 5 }, 5_000);
+    try waitUntil(Published(@TypeOf(fresh.mailbox.received), u64){ .value = &fresh.mailbox.received, .want = 5 }, observation_budget_ms);
     fresh.stop();
     fresh.join();
     try std.testing.expectEqualSlices(u32, &.{ 10, 20, 30, 40, 50 }, fresh.state.seen[0..fresh.state.len]);
@@ -6194,7 +6206,7 @@ test "Delivery kind (§13.9) e2e: a mixed track keeps every kind, entry for entr
     // The replay really delivered: four ordinary sends into the fresh worker,
     // i.e. `.message` there whatever the file said — the file's kind is the
     // recorded run's, and `LogStep.kind` is where a reader reads it.
-    try waitUntil(Published(@TypeOf(fresh.mailbox.received), u64){ .value = &fresh.mailbox.received, .want = 4 }, 5_000);
+    try waitUntil(Published(@TypeOf(fresh.mailbox.received), u64){ .value = &fresh.mailbox.received, .want = 4 }, observation_budget_ms);
     try std.testing.expectEqual(@as(u64, 4), fresh.stats().received);
     try std.testing.expectEqual(@as(?*DeliveryLog, null), rt_rep.deliveryLog());
 
@@ -6495,13 +6507,13 @@ test "Supervision (§14): one_for_one rebuilds a dying actor in place and it kee
     // Two messages per rebuild: the first error is inside budget, the second
     // takes the window over. So four messages are two rebuilds.
     for (0..4) |i| try h.send(@intCast(i));
-    try waitUntil(Published(@TypeOf(handled), u32){ .value = &handled, .want = 4 }, 5_000);
-    try waitUntil(Published(@TypeOf(h.group_restarts), u64){ .value = &h.group_restarts, .want = 2 }, 5_000);
+    try waitUntil(Published(@TypeOf(handled), u32){ .value = &handled, .want = 4 }, observation_budget_ms);
+    try waitUntil(Published(@TypeOf(h.group_restarts), u64){ .value = &h.group_restarts, .want = 2 }, observation_budget_ms);
     // Wait on the counter this test *asserts*, not on `group_restarts`: a
     // rebuild bumps the latter *before* it runs `init` (`rebuildWorker`),
     // so waiting on it and then reading `inits` is a check-then-assert race.
     // It flaked once in a full-suite run before this.
-    try waitUntil(Published(@TypeOf(inits), u32){ .value = &inits, .want = 3 }, 5_000);
+    try waitUntil(Published(@TypeOf(inits), u32){ .value = &inits, .want = 3 }, observation_budget_ms);
 
     // The actor really came back: three generations ran (the original plus two
     // rebuilds) and every message was handled by one of them.
@@ -6515,7 +6527,7 @@ test "Supervision (§14): one_for_one rebuilds a dying actor in place and it kee
 
     // ...and it is still taking work, on the same handle a producer already has.
     try h.send(99);
-    try waitUntil(Published(@TypeOf(handled), u32){ .value = &handled, .want = 5 }, 5_000);
+    try waitUntil(Published(@TypeOf(handled), u32){ .value = &handled, .want = 5 }, observation_budget_ms);
 }
 
 test "Supervision (§14): without a group an actor stops where it stands, unchanged" {
@@ -6531,8 +6543,8 @@ test "Supervision (§14): without a group an actor stops where it stands, unchan
     });
 
     for (0..2) |i| try h.send(@intCast(i));
-    try waitUntil(Published(@TypeOf(handled), u32){ .value = &handled, .want = 2 }, 5_000);
-    try waitUntil(Published(@TypeOf(rt.supervised_stops), u64){ .value = &rt.supervised_stops, .want = 1 }, 5_000);
+    try waitUntil(Published(@TypeOf(handled), u32){ .value = &handled, .want = 2 }, observation_budget_ms);
+    try waitUntil(Published(@TypeOf(rt.supervised_stops), u64){ .value = &rt.supervised_stops, .want = 1 }, observation_budget_ms);
 
     // The v0.16/v0.17 contract, untouched: one generation, a stop, and a closed
     // mailbox rather than a rebuild.
@@ -6564,20 +6576,20 @@ test "Supervision (§14): one_for_all reaches a healthy group-mate through its h
     });
 
     for (0..2) |i| try a.send(@intCast(i));
-    try waitUntil(Published(@TypeOf(a.group_restarts), u64){ .value = &a.group_restarts, .want = 1 }, 5_000);
+    try waitUntil(Published(@TypeOf(a.group_restarts), u64){ .value = &a.group_restarts, .want = 1 }, observation_budget_ms);
     // Wait on the counter this test *asserts*, not on `group_restarts`: a
     // rebuild bumps the latter *before* it runs `init` (`rebuildWorker`),
     // so waiting on it and then reading `a_inits` is a check-then-assert race.
     // It flaked once in a full-suite run before this.
-    try waitUntil(Published(@TypeOf(a_inits), u32){ .value = &a_inits, .want = 2 }, 5_000);
+    try waitUntil(Published(@TypeOf(a_inits), u32){ .value = &a_inits, .want = 2 }, observation_budget_ms);
     // `b` never errored, and was still rebuilt — that is `one_for_all`, and it
     // is the half that cannot be tested without a real handle behind the member.
-    try waitUntil(Published(@TypeOf(b.group_restarts), u64){ .value = &b.group_restarts, .want = 1 }, 5_000);
+    try waitUntil(Published(@TypeOf(b.group_restarts), u64){ .value = &b.group_restarts, .want = 1 }, observation_budget_ms);
     // Wait on the counter this test *asserts*, not on `group_restarts`: a
     // rebuild bumps the latter *before* it runs `init` (`rebuildWorker`),
     // so waiting on it and then reading `b_inits` is a check-then-assert race.
     // It flaked once in a full-suite run before this.
-    try waitUntil(Published(@TypeOf(b_inits), u32){ .value = &b_inits, .want = 2 }, 5_000);
+    try waitUntil(Published(@TypeOf(b_inits), u32){ .value = &b_inits, .want = 2 }, observation_budget_ms);
 
     try std.testing.expectEqual(@as(u32, 2), a_inits.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 2), b_inits.load(.monotonic));
@@ -6587,7 +6599,7 @@ test "Supervision (§14): one_for_all reaches a healthy group-mate through its h
 
     // `b` is still live and still serving, on the handle its producers hold.
     try b.send(1);
-    try waitUntil(Published(@TypeOf(b_handled), u32){ .value = &b_handled, .want = 1 }, 5_000);
+    try waitUntil(Published(@TypeOf(b_handled), u32){ .value = &b_handled, .want = 1 }, observation_budget_ms);
 }
 
 test "Supervision (§14): spending the restart budget takes the group down, and it is counted" {
@@ -6618,15 +6630,15 @@ test "Supervision (§14): spending the restart budget takes the group down, and 
     // member that is stopped first never gets to read the rebuild it was asked
     // for ("stop wins"), which would make the count below a race rather than a
     // reading.
-    try waitUntil(Published(@TypeOf(a.group_restarts), u64){ .value = &a.group_restarts, .want = 1 }, 5_000);
-    try waitUntil(Published(@TypeOf(b.group_restarts), u64){ .value = &b.group_restarts, .want = 1 }, 5_000);
+    try waitUntil(Published(@TypeOf(a.group_restarts), u64){ .value = &a.group_restarts, .want = 1 }, observation_budget_ms);
+    try waitUntil(Published(@TypeOf(b.group_restarts), u64){ .value = &b.group_restarts, .want = 1 }, observation_budget_ms);
     // The counter is per **member rebuilt**, not per action taken: one
     // `one_for_all` decision lands here as two.
     try std.testing.expectEqual(@as(u64, 2), rt.stats().group_restarts);
 
     // Two more: the group is out of budget now, so there is no second action.
     for (0..2) |i| try a.send(@intCast(i));
-    try waitUntil(Published(@TypeOf(rt.supervised_stops), u64){ .value = &rt.supervised_stops, .want = 2 }, 5_000);
+    try waitUntil(Published(@TypeOf(rt.supervised_stops), u64){ .value = &rt.supervised_stops, .want = 2 }, observation_budget_ms);
 
     // Both members stopped — the failing one and the healthy one — and both are
     // on the counter. Before §14 this number had nowhere to live: a member's
@@ -6685,13 +6697,13 @@ test "Supervision (§14): a pooled member is rebuilt by its next claim" {
     }, .{ .max_errors = 1, .window_ms = 60_000, .group = group });
 
     for (0..4) |i| try h.send(@intCast(i));
-    try waitUntil(Published(@TypeOf(handled), u32){ .value = &handled, .want = 4 }, 5_000);
-    try waitUntil(Published(@TypeOf(h.group_restarts), u64){ .value = &h.group_restarts, .want = 2 }, 5_000);
+    try waitUntil(Published(@TypeOf(handled), u32){ .value = &handled, .want = 4 }, observation_budget_ms);
+    try waitUntil(Published(@TypeOf(h.group_restarts), u64){ .value = &h.group_restarts, .want = 2 }, observation_budget_ms);
     // Wait on the counter this test *asserts*, not on `group_restarts`: a
     // rebuild bumps the latter *before* it runs `init` (`rebuildWorker`),
     // so waiting on it and then reading `inits` is a check-then-assert race.
     // It flaked once in a full-suite run before this.
-    try waitUntil(Published(@TypeOf(inits), u32){ .value = &inits, .want = 3 }, 5_000);
+    try waitUntil(Published(@TypeOf(inits), u32){ .value = &inits, .want = 3 }, observation_budget_ms);
 
     // Same accounting as the dedicated case: a pooled rebuild is the same
     // `deinit` + `init` on whichever thread holds the claim.
@@ -6746,11 +6758,11 @@ test "Supervision (§14.5): a nested group escalates to its parent, and the pare
 
     // `inner` is rebuilt by the child — with a budget the *parent* reset on the
     // way down, so the next escalation is not immediate.
-    try waitUntil(Published(@TypeOf(inner.group_restarts), u64){ .value = &inner.group_restarts, .want = 1 }, 5_000);
+    try waitUntil(Published(@TypeOf(inner.group_restarts), u64){ .value = &inner.group_restarts, .want = 1 }, observation_budget_ms);
     // ...and `outer`, which never failed and is not even in the same group, is
     // rebuilt too: the parent's `one_for_all` applies to its whole member list,
     // which contains the child subtree as one entry.
-    try waitUntil(Published(@TypeOf(outer.group_restarts), u64){ .value = &outer.group_restarts, .want = 1 }, 5_000);
+    try waitUntil(Published(@TypeOf(outer.group_restarts), u64){ .value = &outer.group_restarts, .want = 1 }, observation_budget_ms);
 
     // Wait on the counter this test *asserts*, not on `group_restarts`: a
     // rebuild bumps the latter *before* it runs `init` (`rebuildWorker`),
@@ -6758,14 +6770,14 @@ test "Supervision (§14.5): a nested group escalates to its parent, and the pare
     // race. Both init counters below are asserted this way; the `inner` one used
     // to be read straight after the wait above, and that is what flaked on a
     // loaded macOS CI runner (`expected 2, found 1`).
-    try waitUntil(Published(@TypeOf(inner_inits), u32){ .value = &inner_inits, .want = 2 }, 5_000);
+    try waitUntil(Published(@TypeOf(inner_inits), u32){ .value = &inner_inits, .want = 2 }, observation_budget_ms);
     try std.testing.expectEqual(@as(u32, 2), inner_inits.load(.monotonic));
 
     // Wait on the counter this test *asserts*, not on `group_restarts`: a
     // rebuild bumps the latter *before* it runs `init` (`rebuildWorker`),
     // so waiting on it and then reading `outer_inits` is a check-then-assert race.
     // It flaked once in a full-suite run before this.
-    try waitUntil(Published(@TypeOf(outer_inits), u32){ .value = &outer_inits, .want = 2 }, 5_000);
+    try waitUntil(Published(@TypeOf(outer_inits), u32){ .value = &outer_inits, .want = 2 }, observation_budget_ms);
     try std.testing.expectEqual(@as(u32, 2), outer_inits.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), outer.stats().handler_errors);
     try std.testing.expect(!inner.stats().stopped_by_supervisor);
@@ -6782,7 +6794,7 @@ test "Supervision (§14.5): a nested group escalates to its parent, and the pare
     // Still serving on the handles their producers hold, and the child is still
     // reachable through the parent.
     try inner.send(9);
-    try waitUntil(Published(@TypeOf(inner_handled), u32){ .value = &inner_handled, .want = 3 }, 5_000);
+    try waitUntil(Published(@TypeOf(inner_handled), u32){ .value = &inner_handled, .want = 3 }, observation_budget_ms);
 }
 
 /// A pooled worker that **tops its own mailbox back up**, so its backlog can be
@@ -6876,7 +6888,7 @@ test "Pooled (§12.3): an endlessly busy worker cannot starve a ready one" {
     // ask for B — so B arrives behind a worker that is already busy and never
     // about to stop.
     for (0..64) |i| a.send(@intCast(i)) catch break;
-    try waitUntil(Published(@TypeOf(a_seen), u64){ .value = &a_seen, .want = 64 }, 5_000);
+    try waitUntil(Published(@TypeOf(a_seen), u64){ .value = &a_seen, .want = 64 }, observation_budget_ms);
     try b.send(1);
     // The reference point, published **after** the hand-off (see
     // `SelfFeedingWorker`): from here on, the number A records is the part of
@@ -6888,12 +6900,12 @@ test "Pooled (§12.3): an endlessly busy worker cannot starve a ready one" {
     // B was still served. `no starvation` is stated in §12.3 and, until now, was
     // assumed rather than asserted — every other counter in the runtime looks the
     // same whether or not it holds.
-    try waitUntil(Published(@TypeOf(b_seen), u64){ .value = &b_seen, .want = 1 }, 5_000);
+    try waitUntil(Published(@TypeOf(b_seen), u64){ .value = &b_seen, .want = 1 }, observation_budget_ms);
 
     // The premise, and it is the part a finite backlog could not give: B was not
     // served because A ran dry. A keeps running after B's arrival.
     const a_at_b = a_when_b.load(.acquire);
-    try waitUntil(Published(@TypeOf(a_seen), u64){ .value = &a_seen, .want = a_at_b + 64 }, 5_000);
+    try waitUntil(Published(@TypeOf(a_seen), u64){ .value = &a_seen, .want = a_at_b + 64 }, observation_budget_ms);
 
     // The tight half: how much work A did **between the hand-off and B being
     // served**. The ring is FIFO and a worker holds at most one token, so the
@@ -7296,7 +7308,7 @@ test "Pooled (§12.16): a continuously busy worker starves nobody — the wait i
     const feeder = try std.Thread.spawn(.{}, FeedBusy.run, .{ a, &feeding, &refused, &a_seq });
 
     // The premise, before the first probe: A is demonstrably mining a backlog.
-    try waitUntil(Published(@TypeOf(a_log.handled), usize){ .value = &a_log.handled, .want = 64 }, 5_000);
+    try waitUntil(Published(@TypeOf(a_log.handled), usize){ .value = &a_log.handled, .want = 64 }, observation_budget_ms);
     const a_at_probe_start = a_log.observed();
 
     const Probes = struct {
@@ -7338,8 +7350,8 @@ test "Pooled (§12.16): a continuously busy worker starves nobody — the wait i
             // records, and the reason the reading is taken from inside the two
             // handlers rather than from out here.
             round_.store(@intCast(slot + 1), .release);
-            try waitUntil(Published(@TypeOf(log.handled), usize){ .value = &log.handled, .want = index + 1 }, 5_000);
-            try waitUntil(RoundOpened{ .slot = &opened_[slot] }, 5_000);
+            try waitUntil(Published(@TypeOf(log.handled), usize){ .value = &log.handled, .want = index + 1 }, observation_budget_ms);
+            try waitUntil(RoundOpened{ .slot = &opened_[slot] }, observation_budget_ms);
             return peer_at[index].load(.acquire) -| opened_[slot].load(.acquire);
         }
     };
@@ -7357,7 +7369,7 @@ test "Pooled (§12.16): a continuously busy worker starves nobody — the wait i
     // logs are a settled fact only after a join (§12.12's reading discipline).
     feeding.store(false, .release);
     feeder.join();
-    try waitUntil(Drained(BusyHandle){ .handle = a }, 5_000);
+    try waitUntil(Drained(BusyHandle){ .handle = a }, observation_budget_ms);
     b.stop();
     b.join();
     c.stop();

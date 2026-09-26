@@ -1694,6 +1694,40 @@ pub fn generateReport(self: *Self) ![]const u8
 
 ## Additional Components
 
+### `zigmodu.WebSocketServer` / `zigmodu.WebSocketMonitor` (`src/extensions/WebSocket.zig`)
+
+RFC 6455 server for pushing live updates to browsers; `WebSocketMonitor` wraps it
+and adds a 5 s metrics `updateLoop` on top.
+
+```zig
+pub fn init(allocator: std.mem.Allocator, io: std.Io, port: u16) WebSocketServer
+pub fn start(self: *WebSocketServer) !void
+pub fn stop(self: *WebSocketServer) void
+pub fn deinit(self: *WebSocketServer) void
+pub fn onConnect(self: *WebSocketServer, callback: *const fn (*WebSocketClient) void) void
+pub fn onMessage(self: *WebSocketServer, callback: *const fn (*WebSocketClient, []const u8) void) void
+pub fn broadcast(self: *WebSocketServer, message: []const u8) void
+pub fn clientCount(self: *WebSocketServer) usize
+```
+
+**Callback contract: `onConnect` and `onMessage` run on the connection fiber, and
+must return on their own.** `stop()` — and therefore `deinit()` — drains that
+fiber, and the only wait the framework can end is one on a *socket*: tearing the
+connection down frees a fiber parked in a read or a write, never one parked
+inside a callback. So a callback that blocks (an outbound request with no
+timeout, a lock nobody releases) keeps `stop()` waiting for exactly as long as it
+blocks — there is no budget that cuts it short, by design. Put your own timeout
+on anything the callback waits for.
+
+`stop()` is bounded against *peers*, not against your code: a client that
+completes the handshake and then sends neither frames nor a FIN has its socket
+shut down, so its fiber leaves. A drain that is still holding connections 5 s
+later is reported at `err` level with the live connection count
+(`… connection fiber(s) still running after …ms — a user callback that does not
+return holds shutdown …`): the log is the diagnosis, and the wait continues — a
+`stop()` that returned with a fiber still alive would hand it a server its caller
+is about to `deinit`.
+
 ### Cache
 
 ```zig

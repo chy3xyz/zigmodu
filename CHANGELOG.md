@@ -2,6 +2,42 @@
 
 ## [Unreleased]
 
+### 第 52 批：关停路径最后一处"无上界"变成**明面契约 + 可诊断**（用户回调）、把 §12.16 那批等待预算从"5 秒"改成"观测预算"（修掉 MySQL 腿的 `WaitTimeout` flake）、`PrecisionTimer` 的 capable-host 断言加一次重测（**破坏性：否**）
+
+**① 用户回调把关停拖住这件事：写明白 + 能看见。** 关停路径上此前只剩一处不是框架能解开的等待 ——
+`on_connect_cb` / `on_message_cb` **跑在连接 fiber 上**，回调自己永久阻塞时 `stop()` / `deinit()` 就无限期等它
+（框架唤不醒用户代码）。
+
+* **契约写进两个地方**：两个回调字段与它们的 setter 的文档注释（"回调在连接 fiber 上执行，**必须自行保证有界
+  返回**；不返回会让 `stop()`/`deinit()` 无限期等待，框架无法打断它"），以及 **`docs/API.md` 新增的
+  `WebSocketServer` / `WebSocketMonitor` 节**（该文件此前**没有** WebSocket 节，而这两个符号在
+  `docs/API_FREEZE.md` 的冻结清单里）。
+* **可诊断**：`stop()` 在 `wakeConnections` 之后、`await` 之前取一次活连接数，并用 `io.concurrent` 派发一个
+  **只 sleep 预算**的看门狗（不轮询）；超过 `stuck_callback_report_ms`（5 s）仍未收完就打一条 `err`，点名
+  "N connection fiber(s) still running … a user callback that does not return holds shutdown"。
+  **语义一字未改**：`stop()` 仍必须等完所有成员（提前返回会在随后 `deinit` 时变成 use-after-free），签名与幂等性
+  不变；drain 正常结束时先置位再 `future.cancel`，不留 future。代价：每次"有连接要等"的 `stop()` 多要一个并发
+  单元（`live == 0` 时完全不派发）；拿不到单元时回落到"前后计时"，那条只能事后报告，注释里写明了。
+  **两处机械红证据**：把回调改成用 `io.concurrent` 派发（用户代码离开连接 fiber）→ 新测试 FAIL 并打出
+  `stop() was inside for 20ms of the 300ms window; it returned 0ms after the callback was released`；
+  把预算临时降到 50 ms → 那条 `err` 出现且 `test-fast` 红（仓库的 runner 把任何 `err` 级日志判为失败），
+  改回 5 s 即绿。**并且说清另一半**：5 s 那条路径**不能**被自动覆盖（同为 runner 的 err 判红规则），
+  它由上面的实验 + 代码审阅保证。
+
+**② §12.16 那批等待预算是调度预算，不是机制属性 —— MySQL 腿被它 flake 掉了。** `Test (DB=mysql)` 腿红在
+`Pooled (§12.16): a continuously busy worker starves nobody`，栈是 `waitUntil` → `error.WaitTimeout`：
+**不是公平性断言失败**，而是那个 helper 的固定 5 秒预算在共享 runner 上先耗尽。这批测试断言的是**消息条数**，
+等待只是用来观测它 —— 与 §12.15 记的"绝对时间界不属于机制"是同一课。把 `src/runtime/runtime.zig` 里 **41 处**
+`try waitUntil(…, 5_000/2_000/10_000/20_000)` 统一改成 `observation_budget_ms = 60_000`（并把理由写进该常量的
+注释、附上这次失败的读数）。**故意保留**那一处**有意的竞态预算**（`waitUntil(Cleared…) catch`，它的注释解释了
+为什么该预算会耗尽），因为它不是"等一个该发生的条件"。真卡住仍然会失败（预算后返回 `error.WaitTimeout`），
+CI 步还有 `--test-timeout` 兜底。
+
+**③ `PrecisionTimer` 的 capable-host 断言加一次重测。** 第 48 批修掉了"窗口不可作用"那半的噪声比较，但
+**capable** 分支的绝对界断言仍可能在负载尖峰上红（实测：一次全量套件红在 `what the knobs cost`，隔离重跑即过；
+而 readiness 探针是**开头一次性**测的，它通过不代表后面每一行都被测在安静时刻）。改成：miss 时**重测该行一次**
+并断言重测 —— 瞬时尖峰与"机制坏了"是两种不同的发现，一次采样分不开；**持续**负载仍会红（那时探针本身就不会通过）。
+
 ### 第 51 批：把 `validateStruct*` 那条链也搬出不弃用的家（新家 `validation/FieldValidation.zig`，弃用文件只剩别名）—— **`src/validation/Validator.zig` 现在没有消费方阻塞项了**（**破坏性：否**，对外拼写与行为一字未变）
 
 上一批搬走了 `FieldRules`（`http.FieldRules` 不再挡路）。本批把**最后一条链**搬走：

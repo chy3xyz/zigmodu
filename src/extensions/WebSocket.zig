@@ -3,6 +3,69 @@ const sockread = @import("../core/sockread.zig");
 const Time = @import("../core/Time.zig");
 const ApplicationModules = @import("../core/Module.zig").ApplicationModules;
 
+/// How long a `stop()` drain may run before it says out loud that user code is
+/// holding it (`DrainWatchdog`, and the timing fallback in
+/// `WebSocketServer.stop`).
+///
+/// A **reporting** budget, not a bound on the wait: `stop()` still waits for
+/// every connection fiber (returning early would leave a live fiber pointing at
+/// a server its caller is about to free, and `deinit` does exactly that).
+/// Deliberately wide — every connection fiber that is *going* to leave does so
+/// on the first `shutdown`, so five seconds of drain means user code, and the
+/// cost of the log is one line during a shutdown that was already pathological.
+const stuck_callback_report_ms: i64 = 5_000;
+
+/// The one line that makes "user code is holding shutdown" visible, at the level
+/// such a thing deserves: an application that cannot shut down needs the cause
+/// named, not a thread dump.
+///
+/// `waited_ms` is what the reporter observed — the diagnostic budget for
+/// `DrainWatchdog`, the whole drain for `stop`'s timing fallback. Named for the
+/// contract it points at, so the operator can go and look at the callback.
+fn reportStuckDrain(live: usize, waited_ms: i64) void {
+    std.log.err("[ws] {d} connection fiber(s) still running after {d}ms — a user callback that does not return holds shutdown; stop() keeps waiting (the framework cannot interrupt user code). See WebSocketServer.onConnect / onMessage.", .{ live, waited_ms });
+}
+
+/// Reports a `stop()` drain that outlives `stuck_callback_report_ms`.
+///
+/// A timer task of its own, because the wait it reports on can be
+/// **unbounded**: `fiber_group.await` has nothing that ends it when a user
+/// callback never returns, so a reporter that only ran *after* the drain
+/// returned would stay silent in exactly the case this exists for. It reads the
+/// live-connection count `stop()` snapshotted after its wake pass, plus an
+/// atomic "the drain finished" flag — plain "record the time, then compare once
+/// the await returns" can see a slow drain but never a stuck one.
+///
+/// Held by value on `stop()`'s stack, and that is what makes the probe valid:
+/// `stop()` cancels and reaps this task before it returns (`Future.cancel` is
+/// `await` plus a cancelation request, and the sleep below is the cancelation
+/// point), so no task outlives the frame that owns the count it reports. The
+/// cost is one unit of concurrency per `stop()` with connections to wait for,
+/// and it is only requested when there is something to report on (see the
+/// fallback in `stop`) — the task never polls, it sleeps.
+const DrainWatchdog = struct {
+    /// Set by `stop()` once the drain returned. A watchdog whose sleep already
+    /// elapsed reads it to tell "the drain is still running" from "the drain
+    /// finished while I was waking up"; the race between the two is a benign
+    /// false report (a shutdown that took > the budget, which is worth a log
+    /// either way).
+    drain_finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Connections the drain was waiting for, as `stop()` saw them after the
+    /// wake pass.
+    live: usize,
+
+    fn report(self: *DrainWatchdog, io: std.Io) void {
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(stuck_callback_report_ms), .real) catch |err| switch (err) {
+            // Canceled is `stop()` reaching the end of the drain before the
+            // budget elapsed: nothing to report, and returning here is what lets
+            // the canceling side join this task.
+            error.Canceled => return,
+        };
+        if (self.drain_finished.load(.acquire)) return;
+        reportStuckDrain(self.live, stuck_callback_report_ms);
+    }
+};
+
 /// WebSocket support for real-time monitoring
 /// Provides RFC 6455 WebSocket server functionality for live module updates
 /// WebSocket support for real-time monitoring
@@ -44,7 +107,32 @@ pub const WebSocketServer = struct {
     /// Group that owns the `acceptLoop` fiber and every spawned
     /// `handleConnection` fiber. Awaited in `stop()` so no futures leak.
     fiber_group: std.Io.Group,
+    /// User callback for a completed handshake, run **on the connection fiber**
+    /// (`handleConnection`, right after the 101 is answered).
+    ///
+    /// **Contract: it must return on its own, within a bound the application can
+    /// afford.** `stop()` — and so `deinit()` — drains that fiber
+    /// (`fiber_group.await`), and the only wait the framework can end is one on
+    /// a *socket*: `wakeConnections` shuts the connection down, which frees a
+    /// fiber parked in a read or a write, not one parked inside a callback.
+    /// Nothing can interrupt user code, so a callback that blocks forever (an
+    /// outbound request with no timeout, a lock nobody releases) keeps `stop()`
+    /// waiting for exactly as long as it blocks.
+    ///
+    /// A drain that outlives `stuck_callback_report_ms` is reported at `err`
+    /// level with the live connection count: that is the **diagnosis**, not an
+    /// upper bound. The wait stays unbounded on purpose — a `stop()` that
+    /// returned early would leave a live fiber pointing at a server the caller
+    /// is about to free. Red: `WebSocketServer: stop() waits for a blocking user
+    /// callback, and returns when it comes back`.
     on_connect_cb: ?*const fn (*WebSocketClient) void,
+    /// User callback for each text frame, run **on the connection fiber** from
+    /// `WebSocketClient.run`.
+    ///
+    /// Same contract as `on_connect_cb`, and for the same reason: while this
+    /// runs, the fiber is not parked in a read, so `wakeConnections` cannot
+    /// reach it and `stop()` / `deinit()` wait for it to return. Put a timeout
+    /// on anything this callback waits for.
     on_message_cb: ?*const fn (*WebSocketClient, []const u8) void,
     allowed_origins: []const []const u8 = &.{},
     /// Max WebSocket frame payload, in bytes. Frames larger than this are
@@ -176,6 +264,16 @@ pub const WebSocketServer = struct {
     /// bound: a quiet connection stays valid, only a socket being torn down is
     /// disturbed (`wakeConnections`).
     ///
+    /// **The one wait left that is not bounded is user code**, and it is
+    /// reported rather than cut short. `onConnect` / `onMessage` run on the very
+    /// fiber this function drains, and a `shutdown` cannot reach a fiber parked
+    /// inside a callback: a callback that never returns keeps `stop()` (and
+    /// `deinit()`) waiting for as long as it blocks. So the drain is *timed*, and
+    /// a drain past `stuck_callback_report_ms` is logged at `err` with the live
+    /// connection count — a diagnosis, never an early return. Returning with a
+    /// fiber still alive would hand that fiber a server its caller is about to
+    /// free (`deinit`), which is memory unsafety, not a fast shutdown.
+    ///
     /// Idempotent, like the `Group.await` it ends with: a second call finds no
     /// listener, an empty wake set, and a drained group.
     pub fn stop(self: *Self) void {
@@ -195,11 +293,68 @@ pub const WebSocketServer = struct {
         // that flag there — so a fiber that arrives after the pass refuses the
         // connection instead of parking in a read nobody will wake.
         self.wakeConnections();
+
+        // What the drain below is about to wait for. Taken *after* the wake pass
+        // and *before* the await, so the number describes this wait: everything
+        // the wake pass can end is already leaving, and whatever is left is a
+        // fiber that has not returned — user code being the only thing here that
+        // cannot be woken.
+        var watchdog = DrainWatchdog{ .live = self.liveConnectionCount() };
+        const drain_started_ms = Time.monotonicNowMilliseconds();
+        // Only worth a timer when a connection exists to hold the drain: with no
+        // clients and no handshake in flight, the group's other member is the
+        // accept loop, which runs no user code and is already being woken above.
+        var watchdog_future: ?std.Io.Future(void) = null;
+        if (watchdog.live != 0) {
+            // `concurrent`, never `async` (see `start`): the eager fallback would
+            // run the timer on *this* thread, and `stop()` would sit out its own
+            // diagnostic budget before it could even drain the group.
+            watchdog_future = self.io.concurrent(DrainWatchdog.report, .{ &watchdog, self.io }) catch |err| blk: {
+                // No unit of concurrency for the timer. Named at debug level, not
+                // swallowed: it is why the `else if` below is the only reporter
+                // left, and it cannot speak for a drain that never ends.
+                std.log.debug("[ws] shutdown-drain watchdog not dispatched: {s}", .{@errorName(err)});
+                break :blk null;
+            };
+        }
         // Drain any in-flight accept/connection fibers so their futures do
         // not leak. Safe to call repeatedly because `Group.await` is idempotent.
         self.fiber_group.await(self.io) catch |err| {
             std.log.debug("[ws] draining fiber group failed: {s}", .{@errorName(err)});
         };
+        const drain_ms = Time.monotonicNowMilliseconds() - drain_started_ms;
+        // Before the cancel below, so a watchdog that is already past its sleep
+        // re-reads the flag and stays quiet.
+        watchdog.drain_finished.store(true, .release);
+        if (watchdog_future) |*future| {
+            // Ends the timer — the sleep is its cancelation point — and reaps it,
+            // so nothing from this `stop()` outlives the frame: `Future.cancel`
+            // blocks until the task has run (`std/Io.zig`), which is also what
+            // keeps `&watchdog` above a valid pointer. When the budget *did*
+            // elapse, this finds the task already done and the `err` line it
+            // wrote is the whole point.
+            future.cancel(self.io);
+        } else if (watchdog.live != 0 and drain_ms >= stuck_callback_report_ms) {
+            // No unit of concurrency for the timer. Report what the drain did
+            // instead of what it was doing: later than the watchdog, and it
+            // cannot speak for a drain that never ends — the trade for needing no
+            // task at all.
+            reportStuckDrain(watchdog.live, drain_ms);
+        }
+    }
+
+    /// Connections the drain in `stop()` is about to wait for: handshaken
+    /// clients plus connections still in the handshake read.
+    ///
+    /// One snapshot, taken under the lock both lists live behind — the same lock
+    /// `wakeConnections` has just released, so nothing contends here and the two
+    /// lengths cannot come from different moments (which two bare
+    /// `items.len` reads could). Feeds the diagnostic only; no decision depends
+    /// on it.
+    fn liveConnectionCount(self: *Self) usize {
+        self.clients_mutex.lockUncancelable(self.io);
+        defer self.clients_mutex.unlock(self.io);
+        return self.clients.items.len + self.pending_connections.items.len;
     }
 
     /// Make every connection fiber that is parked in a read return, so the drain
@@ -640,10 +795,16 @@ pub const WebSocketServer = struct {
         return self.clients.items.len;
     }
 
+    /// Register the handshake callback. It runs on the connection fiber that
+    /// `stop()` drains — see the `on_connect_cb` field for the "must return on
+    /// its own" contract, and put a timeout on anything the callback waits for.
     pub fn onConnect(self: *Self, callback: *const fn (*WebSocketClient) void) void {
         self.on_connect_cb = callback;
     }
 
+    /// Register the text-frame callback. Same contract as `onConnect`: it runs on
+    /// the connection fiber (`WebSocketClient.run`), which `stop()` waits for —
+    /// see the `on_message_cb` field.
     pub fn onMessage(self: *Self, callback: *const fn (*WebSocketClient, []const u8) void) void {
         self.on_message_cb = callback;
     }
@@ -1541,6 +1702,156 @@ test "WebSocketServer: stop() also wakes a connection that never completes the h
     // that frame unregistered before closing, i.e. `stop()` woke it rather than
     // the peer happening to leave.
     try std.testing.expectEqual(@as(usize, 0), pending);
+    try std.testing.expectEqual(@as(usize, 0), server.clientCount());
+}
+
+// ── A user callback that does not return holds `stop()` — the contract ───────
+//
+// `onConnect` / `onMessage` run on the connection fiber, and `stop()` drains
+// that fiber (`fiber_group.await`). `wakeConnections` can only end a fiber
+// parked in a socket read or write — never one parked inside user code, which
+// the framework cannot interrupt. The shutdown length is therefore user code's
+// decision, and the declaration-site docs say so. This is what makes that a
+// *pinned behavior* rather than a sentence: the drain must not finish while the
+// callback is still inside, and must finish once the callback returns.
+
+/// The blocking `on_message_cb` and the flags the test drives it with.
+const HeldCallbackProbe = struct {
+    /// Set from the connection fiber: a frame reached the callback, so the
+    /// `stop()` below has something to wait for. Without it the test could pass
+    /// vacuously — a `stop()` that returned *before* the frame was delivered
+    /// would satisfy "it returned".
+    var entered: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+    var release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+    /// Runs on the connection fiber. The spin is bounded
+    /// (`wait_for_parked_fiber_rounds`) so that a test which never releases it
+    /// ends in a failed assertion instead of a hung suite: the fiber returns on
+    /// its own and the drain completes.
+    fn cb(_: *WebSocketClient, _: []const u8) void {
+        entered.store(true, .release);
+        var spins: usize = 0;
+        while (spins < wait_for_parked_fiber_rounds and !release.load(.acquire)) : (spins += 1) {
+            std.atomic.spinLoopHint();
+        }
+    }
+};
+
+/// How long the test gives `stop()` to prove it is still waiting, before it lets
+/// the callback go. Short, and not a latency claim: the assertion is the
+/// *ordering* ("it had every chance to return and did not"), while the readings
+/// §12.15 would call host-dependent are printed. Every millisecond here is also
+/// a millisecond `stop()`'s watchdog has already been running, so the window
+/// stays far below its budget.
+const held_callback_stop_window_ms: i64 = 300;
+
+test "WebSocketServer: stop() waits for a blocking user callback, and returns when it comes back" {
+    const io = std.testing.io;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = WebSocketServer.init(std.testing.allocator, io, 0);
+    defer server.deinit();
+    try server.start();
+    defer server.stop();
+
+    HeldCallbackProbe.entered.store(false, .release);
+    HeldCallbackProbe.release.store(false, .release);
+    server.onMessage(HeldCallbackProbe.cb);
+
+    const port = if (server.server) |*s| s.socket.address.getPort() else 0;
+    try std.testing.expect(port != 0);
+
+    var addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+    var stream = try addr.connect(io, .{ .mode = .stream });
+    // Closed by hand only on the failure path, where it is what unblocks a fiber
+    // the assertions below could not account for — the same maneuver the two
+    // wake tests use, and what turns a broken contract into a failure instead of
+    // a hung suite.
+    var stream_open = true;
+    defer if (stream_open) stream.close(io);
+
+    const handshake = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+    var wbuf: [256]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    _ = w.interface.writeAll(handshake) catch return error.HandshakeWriteFailed;
+    w.interface.flush() catch return error.HandshakeWriteFailed;
+
+    waitForClientCount(&server, 1);
+    var resp_buf: [512]u8 = undefined;
+    const resp_len = readUntilSeen(&stream, &resp_buf, "\r\n\r\n");
+    if (std.mem.indexOf(u8, resp_buf[0..resp_len], "101 Switching Protocols") == null) {
+        return error.HandshakeResponseMissing;
+    }
+
+    // One text frame ("hi"), unmasked: the server's frame reader takes unmasked
+    // frames as-is — the client-side tests in this file rely on the same.
+    _ = w.interface.writeAll(&[_]u8{ 0x81, 0x02, 'h', 'i' }) catch return error.FrameWriteFailed;
+    w.interface.flush() catch return error.FrameWriteFailed;
+
+    // Bounded spin for the server-side signal that the frame arrived and user
+    // code took over the fiber.
+    var spins: usize = 0;
+    while (spins < wait_for_parked_fiber_rounds and !HeldCallbackProbe.entered.load(.acquire)) : (spins += 1) {
+        std.atomic.spinLoopHint();
+    }
+    if (!HeldCallbackProbe.entered.load(.acquire)) {
+        HeldCallbackProbe.release.store(true, .release);
+        return error.CallbackNeverEntered;
+    }
+
+    // `stop()` on a fiber of its own: the connection fiber it would drain is
+    // inside the callback, which is the one thing the wake pass cannot end.
+    StopProbe.returned.store(false, .release);
+    var stop_fut = try io.concurrent(StopProbe.drop, .{&server});
+
+    var waited_ms: i64 = 0;
+    while (waited_ms < held_callback_stop_window_ms and !StopProbe.returned.load(.acquire)) : (waited_ms += 20) {
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(20), .real) catch |err| {
+            // A short sleep only makes this window shorter than intended; the
+            // assertions below report what was actually observed.
+            std.log.debug("[test] held-callback window sleep: {s}", .{@errorName(err)});
+        };
+    }
+    const returned_while_held = StopProbe.returned.load(.acquire);
+
+    // Let user code return. The fiber comes back to a read whose socket the wake
+    // pass already shut down, so it leaves on its own and the drain completes.
+    HeldCallbackProbe.release.store(true, .release);
+
+    // Bounded wait for the return, so a contract broken in the *other*
+    // direction fails here instead of hanging the suite.
+    var released_ms: i64 = 0;
+    while (released_ms < silent_peer_stop_budget_ms and !StopProbe.returned.load(.acquire)) : (released_ms += 20) {
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(20), .real) catch |err| {
+            std.log.debug("[test] post-release stop sleep: {s}", .{@errorName(err)});
+        };
+    }
+    const returned_after_release = StopProbe.returned.load(.acquire);
+    // Printed, not asserted: host speed (§12.15). `waited_ms` reaching the
+    // window is "it was still inside"; a smaller number means it returned early,
+    // which the assertion right below reports as the failure it is.
+    std.debug.print("[ws stop] blocked callback: stop() was inside for {d}ms of the {d}ms window; it returned {d}ms after the callback was released\n", .{ waited_ms, held_callback_stop_window_ms, released_ms });
+
+    if (!returned_after_release) {
+        // Unblock the drain so the failure is reported instead of hanging the
+        // run: the peer end closing is the EOF its read needs, and the
+        // cancelation request is the backstop for a fiber that is not in a read
+        // at all.
+        stream.close(io);
+        stream_open = false;
+        stop_fut.cancel(io);
+        return error.StopDidNotReturnAfterCallbackReleased;
+    }
+    stop_fut.await(io);
+
+    // The contract, as behavior: `stop()` was still draining while the callback
+    // was inside, and it finished because the callback returned — not because
+    // something gave up on it.
+    try std.testing.expect(!returned_while_held);
+    try std.testing.expect(returned_after_release);
+    // ... and the fiber is really gone rather than detached: an empty registry is
+    // the `removeClient` on its way out.
     try std.testing.expectEqual(@as(usize, 0), server.clientCount());
 }
 
