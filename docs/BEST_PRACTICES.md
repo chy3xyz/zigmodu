@@ -1639,9 +1639,13 @@ var server = zigmodu.http.Server.initWithConfig(io, allocator, .{
 ```zig
 var server = zigmodu.http.Server.initWithConfig(io, allocator, .{
     .port = 8080,
-    .ws_write_timeout_ms = 10_000,   // 0 = 旧行为（可无限阻塞）
+    .ws_write_timeout_ms = 10_000,   // 0 = 继承 response_write_timeout_ms（默认）
 });
 ```
+
+**`0` 现在是"继承"而不是"无界"**（第 58 批起）：帧推送停住与响应写停住是同一件事，
+默认共用 `response_write_timeout_ms` 那个数。要回到旧的无界行为，设
+`response_write_timeout_ms = 0`（两边一起关）。
 
 不读数据的客户端会让发送缓冲填满，写线程（以及 `im.ConnectionRegistry` 的
 shard 锁）被无限期占住。设了超时后写返回 `error.WriteTimeout` 并 shutdown
@@ -2651,7 +2655,7 @@ jobs:
 **HTTP 层**
 - [ ] `http.productionProfile(&server, cfg, &state)` 在**所有 `addRoute` / `mountAll` 之前**调用
 - [ ] `max_connections` 已设（≈ 预期并发 × 2）；`header_timeout_ms` 打开；`.unavailable` 或 `.close` 按需
-- [ ] WS 服务设了 `ws_write_timeout_ms`；广播前用 `framer.isWritable()` 丢帧
+- [ ] 响应写/WS 写都有上界（默认已是 `response_write_timeout_ms` = 30 s；WS 侧的 `ws_write_timeout_ms = 0` 表示继承它）；广播前用 `framer.isWritable()` 丢帧
 - [ ] CORS 不再是 `"*"`（profile 会告警）
 
 **数据与并发**

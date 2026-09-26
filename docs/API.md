@@ -721,7 +721,7 @@ request (details: `docs/ROUTE_TABLE.md` §4.6).
 | `header_timeout_ms` | `10_000` | request line + headers deadline (slowloris); `0` disables; cleared once headers are read |
 | `body_timeout_ms` | `30_000` | request body deadline, armed at the blank line; exceeding it answers `408`; `0` disables |
 | `response_write_timeout_ms` | `30_000` | per-`send` budget for **every response write**: the buffered response (`writeResponse`), the streaming ones (`startChunked` / `writeChunk`), SSE events (`http.sse`) and HTTP/2 frames. A peer that stops reading gets a truncated response and a closed connection instead of a fiber parked forever — which is also what `stop()`'s drain waits for. A slow-but-live peer (one that keeps draining) is never cut off; `0` restores the unbounded write |
-| `ws_write_timeout_ms` | `0` (unbounded) | `SO_SNDTIMEO` for WebSocket writes; on timeout the frame fails with `error.WriteTimeout` and the socket is shut down |
+| `ws_write_timeout_ms` | `0` = inherit `response_write_timeout_ms` | `SO_SNDTIMEO` for WebSocket writes (a frame push parks its thread exactly like a response write parks its fiber, so they share one number by default). On timeout the frame fails with `error.WriteTimeout` and the socket is shut down. Set `response_write_timeout_ms = 0` for the old unbounded behavior |
 
 Environment equivalents (`fromEnv`): `HTTP_PORT`, `HTTP_MAX_BODY`,
 `HTTP_MAX_CONNECTIONS`, `HTTP_HEADER_TIMEOUT_MS`, `HTTP_BODY_TIMEOUT_MS`,

@@ -2,6 +2,42 @@
 
 ## [Unreleased]
 
+### 第 58 批：WS 帧推送默认继承响应写预算（`ws_write_timeout_ms = 0` 由"无界"改成"继承"）；`extensions/WebMonitor.zig` 的响应**根本没被发出去**（顺手修掉）并加上界（**破坏性：窄** —— 见下）
+
+**① WS 帧推送的上界默认打开**
+
+第 55/56 批把 `response_write_timeout_ms`（默认 30 s）接到了 HTTP/1.1、streaming、SSE、HTTP/2 四条写路径；WS 帧推送走的是另一套（`ws_write_timeout_ms`，**默认 0 = 无界**）——一个不读的客户端照样能把推送线程 park 住（`extensions/WebSocket.zig` 的 `broadcast` 注释里就写着"这是会 park 的那一段"）。两者其实是同一件事（写方向被对端停住），所以本批让 `0` 表示**继承**：
+
+* `Server` 的 WS 升级处：`framer.setSendTimeout(if (ws_write_timeout_ms != 0) ws_write_timeout_ms else response_write_timeout_ms)`。
+* 想要旧的无界行为：`response_write_timeout_ms = 0`（两边一起关）。
+* **破坏性：窄** —— 只影响"WS 写在一个预算内零进展"的对端（先被截断/断开而不是永久 park）；HTTP 侧不受影响。
+* 新测试：WS 路由的 `on_connect` 起一个推送线程，客户端握手后**不再读** → 断言推送拿到
+  `error.WriteTimeout` **且**连接 fiber 随之结束（`WsFramer` 在发送超时时 shutdown socket）。
+  > **红证据**（把继承退回 `ws_write_timeout_ms`）：
+  > `[test] a WebSocket push to a non-reading peer parked 3000ms past the 200ms write budget` /
+  > `expected error.WriteTimeout, found null`。
+
+**② `WebMonitor` 的响应从来没到过客户端 —— 顺带修掉**
+
+给这五个 handler 加写预算时发现：它们用 `stream.writer(io, &buf)` + `Writer.writeAll`，
+**没有 flush**。`writeAll` 只把放得下的字节**缓冲**在局部 writer 里（`Io/Writer.zig` 的契约），
+于是每个小于缓冲的响应都随 `w` 一起消失：客户端拿到**空 socket**，而那段 `catch` 只见过
+*套接字*错误（一个也没发生），所以连日志都没有。`extensions/WebSocket.zig` 里有三处专门
+警告过"flush 才是投递"（red 记录也在），这五个点漏了。
+
+* 修法：`writeResponse` 走 `sockread.writeFullBounded` —— 写与 flush 是同一次调用，
+  投递与上界一起成立；同时新增 `setWriteTimeout`（默认 30 s）。这里是**每个连接一个
+  detached 线程**，没有任何 `stop()` 会 join 它们，所以上界只能挂在这里。
+* 新测试（socketpair，直接调三个 handler）：断言三条响应**都在**线缆上
+  （`HTTP/1.1 200 OK` / `ZigModu Module Monitor` / `HTTP/1.1 404 Not Found`）。
+  > **红证据**（换回修复前那 6 行）：`a monitor response reaches the socket instead of dying in the writer's buffer...FAIL (TestUnexpectedResult)`
+  > —— 线上一个字节都没有。
+
+**③ 本批不声称**：`extensions/WebSocket.zig` 的**服务端**推送仍走 `WebSocketClient.writeFrame`
+的 io writer（本批只把它的上界来源统一到 `WebSocketMonitor`/`Server` 那一层之外尚未接），
+以及 H2 响应体超过 `max_pending_bytes`（4 MiB）被 `RST_STREAM(ENHANCE_YOUR_CALM)` 拒绝 ——
+两条都在队列里。
+
 ### 第 57 批：HTTP/2 新流采用对端的 `SETTINGS_INITIAL_WINDOW_SIZE`（第 56 批实测到的 64 KiB 卡顿）；并把上一批那条 CI 红（WS 静默测试）的**竞态**查清、拆掉（**破坏性：否**）
 
 **① H2：新流的发送窗口从"协议默认 65535"改成"对端当前的 `SETTINGS_INITIAL_WINDOW_SIZE`"**

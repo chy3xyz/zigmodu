@@ -15,6 +15,12 @@ pub const WebMonitor = struct {
     is_running: bool,
     modules: ?*ApplicationModules,
     buf: [8192]u8,
+    /// Send bound for every response this monitor writes (`SO_SNDTIMEO` armed
+    /// around the write). Each connection is handled by a **detached thread**, so
+    /// a browser tab that stops reading would otherwise hold that thread for as
+    /// long as it likes — and nobody joins these threads, so there is no other
+    /// place to bound it. 0 = unbounded.
+    write_timeout_ms: u32 = 30_000,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, port: u16) Self {
         return .{
@@ -25,6 +31,28 @@ pub const WebMonitor = struct {
             .is_running = false,
             .modules = null,
             .buf = undefined,
+        };
+    }
+
+    /// Override the response send bound (`write_timeout_ms`; 0 = unbounded).
+    pub fn setWriteTimeout(self: *Self, timeout_ms: u32) void {
+        self.write_timeout_ms = timeout_ms;
+    }
+
+    /// Write one response with the send bound armed.
+    ///
+    /// Raw syscalls, not `stream.writer(io, …)`, for two reasons: the io writer
+    /// cannot express the bound at all (it answers a timed-out send with
+    /// `errnoBug`, which is `unreachable`), and — as these five handlers found out
+    /// the hard way — `Writer.writeAll` only *buffers* what fits, so a response
+    /// smaller than the buffer needs a `flush` this file never had: the bytes died
+    /// with the local writer, the client got an empty socket, and nothing was
+    /// logged (the old code's `catch` only ever saw a *socket* error, and there
+    /// was none). `sockread.writeFullBounded` writes and flushes in one step, so
+    /// delivery and the bound are the same call.
+    fn writeResponse(self: *Self, stream: std.Io.net.Stream, response: []const u8) void {
+        sockread.writeFullBounded(stream, response, self.write_timeout_ms) catch |err| {
+            std.log.debug("[web-monitor] response write failed (peer gone or not reading?): {s}", .{@errorName(err)});
         };
     }
 
@@ -153,11 +181,7 @@ pub const WebMonitor = struct {
         var response_buf: [2048]u8 = undefined;
         const response = std.fmt.bufPrint(&response_buf, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {d}\r\n\r\n{s}", .{ html.len, html }) catch return;
 
-        var write_buf: [2048]u8 = undefined;
-        var w = stream.writer(self.io, &write_buf);
-        _ = w.interface.writeAll(response) catch |err| {
-            std.log.debug("[web-monitor] response write failed (peer gone?): {s}", .{@errorName(err)});
-        };
+        self.writeResponse(stream, response);
     }
 
     fn handleModules(self: *Self, stream: std.Io.net.Stream) void {
@@ -186,11 +210,7 @@ pub const WebMonitor = struct {
         var response_buf: [8192]u8 = undefined;
         const response = std.fmt.bufPrint(&response_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ json.items.len, json.items }) catch return;
 
-        var write_buf: [8192]u8 = undefined;
-        var w = stream.writer(self.io, &write_buf);
-        _ = w.interface.writeAll(response) catch |err| {
-            std.log.debug("[web-monitor] response write failed (peer gone?): {s}", .{@errorName(err)});
-        };
+        self.writeResponse(stream, response);
     }
 
     fn handleHealth(self: *Self, stream: std.Io.net.Stream) void {
@@ -199,11 +219,7 @@ pub const WebMonitor = struct {
         var response_buf: [256]u8 = undefined;
         const response = std.fmt.bufPrint(&response_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ json.len, json }) catch return;
 
-        var write_buf: [256]u8 = undefined;
-        var w = stream.writer(self.io, &write_buf);
-        _ = w.interface.writeAll(response) catch |err| {
-            std.log.debug("[web-monitor] response write failed (peer gone?): {s}", .{@errorName(err)});
-        };
+        self.writeResponse(stream, response);
     }
 
     fn handleMetrics(self: *Self, stream: std.Io.net.Stream) void {
@@ -215,11 +231,7 @@ pub const WebMonitor = struct {
 
         const response = std.fmt.bufPrint(&response_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ json.len, json }) catch return;
 
-        var write_buf: [1024]u8 = undefined;
-        var w = stream.writer(self.io, &write_buf);
-        _ = w.interface.writeAll(response) catch |err| {
-            std.log.debug("[web-monitor] response write failed (peer gone?): {s}", .{@errorName(err)});
-        };
+        self.writeResponse(stream, response);
     }
 
     fn handle404(self: *Self, stream: std.Io.net.Stream) void {
@@ -228,11 +240,7 @@ pub const WebMonitor = struct {
         var response_buf: [256]u8 = undefined;
         const response = std.fmt.bufPrint(&response_buf, "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch return;
 
-        var write_buf: [256]u8 = undefined;
-        var w = stream.writer(self.io, &write_buf);
-        _ = w.interface.writeAll(response) catch |err| {
-            std.log.debug("[web-monitor] response write failed (peer gone?): {s}", .{@errorName(err)});
-        };
+        self.writeResponse(stream, response);
     }
 };
 
@@ -243,4 +251,47 @@ test "WebMonitor init stop" {
 
     try std.testing.expectEqual(@as(u16, 19999), monitor.port);
     try std.testing.expect(!monitor.is_running);
+}
+
+test "a monitor response reaches the socket instead of dying in the writer's buffer" {
+    // Red, measured on the previous implementation: every handler wrote through
+    // `stream.writer(io, &buf)` + `Writer.writeAll` and **never flushed**, so a
+    // response smaller than the buffer was dropped — the client got an empty
+    // socket and nothing was logged, because the `catch` there only ever saw
+    // socket errors and there was none. (`extensions/WebSocket.zig` carries the
+    // same warning about the flush being the delivery; these five sites had
+    // missed it.)
+    const allocator = std.testing.allocator;
+    var fds: [2]std.posix.socket_t = undefined;
+    const rc = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    const server_side = std.Io.net.Stream{ .socket = .{ .handle = fds[0], .address = undefined } };
+    defer _ = std.posix.system.close(fds[0]);
+    defer _ = std.posix.system.close(fds[1]);
+
+    var monitor = WebMonitor.init(allocator, std.testing.io, 0);
+
+    // Three handlers on one socket, in order: the field section of each has to be
+    // on the wire.
+    monitor.handleIndex(server_side);
+    monitor.handleMetrics(server_side);
+    monitor.handle404(server_side);
+
+    var buf: [8192]u8 = undefined;
+    var got: usize = 0;
+    var polls = [_]std.posix.pollfd{.{ .fd = fds[1], .events = std.posix.POLL.IN, .revents = 0 }};
+    while (got < buf.len) {
+        const ready = std.posix.poll(&polls, 200) catch break;
+        if (ready == 0) break;
+        const n = std.posix.read(fds[1], buf[got..]) catch break;
+        if (n == 0) break;
+        got += n;
+    }
+    const wire = buf[0..got];
+    try std.testing.expect(std.mem.indexOf(u8, wire, "HTTP/1.1 200 OK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "ZigModu Module Monitor") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "HTTP/1.1 404 Not Found") != null);
 }

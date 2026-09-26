@@ -2498,7 +2498,12 @@ pub const Server = struct {
         /// stops reading would otherwise stall the writing thread forever
         /// (and, for `im.ConnectionRegistry`, while holding a shard lock).
         /// On timeout the frame write fails with `error.WriteTimeout` and the
-        /// socket is shut down. 0 keeps the unbounded behavior.
+        /// socket is shut down.
+        ///
+        /// **0 means inherit `response_write_timeout_ms`** (the default: a WS
+        /// frame push and a response write are the same hazard, so they share one
+        /// number unless this overrides it). `response_write_timeout_ms = 0` is
+        /// how you get the old unbounded behavior on both.
         ws_write_timeout_ms: u32 = 0,
     };
 
@@ -3573,7 +3578,14 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                         return;
                     };
                     ctx.upgraded = true;
-                    framer.setSendTimeout(server.ws_write_timeout_ms);
+                    // `ws_write_timeout_ms` overrides; `0` means **inherit** the
+                    // connection's response budget rather than "unbounded". A
+                    // frame push to a peer that stopped reading parks the pushing
+                    // thread exactly like a response write parks its fiber, and
+                    // "unbounded by default" is what the HTTP side stopped doing
+                    // (`Config.response_write_timeout_ms`). Set
+                    // `response_write_timeout_ms = 0` to disable both.
+                    framer.setSendTimeout(if (server.ws_write_timeout_ms != 0) server.ws_write_timeout_ms else server.response_write_timeout_ms);
 
                     // Call on_connect — gateway returns session pointer (null = reject)
                     const session = ws_route.on_connect(&ctx, @ptrCast(&framer));
@@ -5587,6 +5599,115 @@ test "an HTTP/2 client that stops reading cannot hold the session: the write bud
     }
     try std.testing.expect(total > 0);
     try std.testing.expect(total < body_bytes);
+
+    stream.close(std.testing.io);
+    closed_client = true;
+    server.stop();
+    running.thread.join();
+    joined = true;
+}
+
+/// The framer of the WebSocket route below, so the pusher thread can write to it
+/// — an application pushes to its own sessions, and *that* write is what a peer
+/// which stopped reading parks.
+var ws_push_framer: ?*WsFramer = null;
+var ws_push_failure: ?anyerror = null;
+
+/// Push binary frames until a write fails. Nothing else can stop it: a peer that
+/// is reading never makes a write fail.
+fn wsPusher() void {
+    const framer = ws_push_framer orelse return;
+    var frame: [8 * 1024]u8 = @splat('w');
+    while (true) {
+        framer.writeFrame(0x2, &frame) catch |err| {
+            ws_push_failure = err;
+            return;
+        };
+    }
+}
+
+test "a WebSocket push to a peer that stopped reading gets the write budget (ws 0 = inherit)" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    ws_push_framer = null;
+    ws_push_failure = null;
+    ws_silent_state = .{};
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{
+        .port = 0,
+        // `ws_write_timeout_ms` is deliberately left at its default 0: this is
+        // the *inheritance* test — one number for response writes and frame
+        // pushes, which is what `0` means since 第 58 批.
+        .response_write_timeout_ms = 200,
+    });
+    defer server.deinit();
+    var group = server.group("");
+    try group.ws("ws", (struct {
+        fn connect(_: *Context, framer: ?*anyopaque) ?*anyopaque {
+            ws_push_framer = @ptrCast(@alignCast(framer.?));
+            const th = std.Thread.spawn(.{}, wsPusher, .{}) catch return null;
+            th.detach();
+            return @ptrCast(&ws_silent_state);
+        }
+    }).connect, (struct {
+        fn message(_: ?*anyopaque, _: []const u8, _: WsFrameKind) void {}
+    }).message, (struct {
+        fn close(session: ?*anyopaque) void {
+            _ = session;
+            ws_silent_state.closed.store(true, .monotonic);
+        }
+    }).close, null);
+
+    var running = try TestServer.start(&server);
+    var joined = false;
+    defer if (!joined) {
+        server.stop();
+        running.thread.join();
+    };
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", running.port);
+    var stream = try addr.connect(std.testing.io, .{ .mode = .stream });
+    var closed_client = false;
+    defer if (!closed_client) stream.close(std.testing.io);
+
+    var wbuf: [512]u8 = undefined;
+    var w = stream.writer(std.testing.io, &wbuf);
+    try w.interface.writeAll("GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
+    try w.interface.flush();
+
+    // Read the 101 and then never read again: from here the pusher is talking to
+    // a full socket buffer.
+    var pfds = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    try std.testing.expect((try std.posix.poll(&pfds, 3000)) > 0);
+    var resp: [512]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, resp[0..try std.posix.read(stream.socket.handle, &resp)], "101") != null);
+
+    // The pusher returns as soon as one write fails, and with nobody reading the
+    // only thing that can fail one is the budget. 3 s is a hang budget: the bound
+    // under test is 200 ms.
+    var waited_ms: usize = 0;
+    while (ws_push_failure == null and waited_ms < 3000) : (waited_ms += 10) {
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch |err|
+            std.log.debug("[test] push poll sleep failed: {s}", .{@errorName(err)});
+    }
+    const failure = ws_push_failure;
+    if (failure == null) {
+        std.log.err("[test] a WebSocket push to a non-reading peer parked {d}ms past the 200ms write budget", .{waited_ms});
+        // Nothing shut the socket down, so unblock the pusher for the teardown.
+        stream.close(std.testing.io);
+        closed_client = true;
+    }
+    try std.testing.expectEqual(@as(?anyerror, error.WriteTimeout), failure);
+
+    // And the server side ends with it: `WsFramer.writeFrame` shuts the socket
+    // down on a send timeout, so the connection fiber's read returns and the fiber
+    // leaves — the connection is not left half-open.
+    waited_ms = 0;
+    while (server.active_connections.load(.monotonic) != 0 and waited_ms < 3000) : (waited_ms += 10) {
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch |err|
+            std.log.debug("[test] fiber poll sleep failed: {s}", .{@errorName(err)});
+    }
+    try std.testing.expectEqual(@as(u64, 0), server.active_connections.load(.monotonic));
 
     stream.close(std.testing.io);
     closed_client = true;
