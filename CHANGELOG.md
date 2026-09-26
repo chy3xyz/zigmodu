@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+### 第 68 批：第 67 批记下的那条并发协议洞（`cancelTimerSync` 的 use-after-return）按设计修掉（**破坏性：否**）
+
+第 67 批把这条明确记为"有意不在那一轮临时改"，因为它是**所有权问题**而不是漏解锁。这一批按设计做掉：
+
+**缺陷**（`src/runtime/runtime.zig` `cancelTimerSync`）：非 owner 调用者把自己的 `&done`/`&result`
+放进队列项，owner（ticker 的 `drainTimerCommands` 或停服的 `abandonTimerCommands`）**写穿它们**。
+而原来的等待循环有两条提前返回：`!alive` 与"取锁被取消"。两者都发生在**命令已入队之后** ——
+于是 `alive=false` 之后、`abandonTimerCommands` 仍在跑的那段窗口里返回，帧已释放而 owner 还要写它
+= **use-after-return**。这是第 58 批那条"等待方可以取消"规则没覆盖到的边界（等待方可以放弃，
+但**已经交付给别人的命令不能**）。
+
+**修法**（保留"调用者可以放弃"的语义，同时让放弃点落在安全的一侧）：
+
+| 改动 | 为什么 |
+|---|---|
+| 入队**之前**先查 `alive` | 停服后进来的命令永远不会被应答；直接在队列外拒绝，连一个无人应答的条目都不留 |
+| 等待循环只在**已被应答**或**停服排空已经跑完**时退出 | `alive=false` 不是那个点（排空还在后面）；`timer_commands_abandoned`（新增字段，`abandonTimerCommands` 末尾以 release 次序发布）才是"从此不存在会写答案的人" |
+| 取锁改 `lockUncancelable` | 命令已经在队列里，取消不能把它丢在地上；每次等待本来就是一个 tick 为界 |
+
+ticker 在排空之前已被 join，所以 `abandoned` 一旦为真就不存在后续写者 —— 这是那句"可以放弃"的
+前提。测试 `Runtime: a cancel after shutdown is refused instead of queueing an unanswerable
+command`：断言停服后调用返回 `error.RuntimeStopped`、**队列里一条都没留**（旧写法会留下一条永远
+无人应答的条目）、且 `timer_commands_abandoned` 为真。
+
 ### 第 67 批：第二轮复核（换三个维度：错误路径所有权 / 不可信输入算术 / 取消语义）—— 修掉 **1 个 P0（远程打崩进程）** 与 **7 处 P1**（**破坏性：否**）
 
 第 66 批是"持锁纪律"。这一遍换三个维度重来（同样四个**只读**子代理 + 主代理逐处复核代码，未跑构建），

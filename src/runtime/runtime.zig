@@ -1079,6 +1079,13 @@ pub const Runtime = struct {
     /// Threads blocked in `cancelTimerSync`. Kept as a counter so the ticker only
     /// pays for the signal when somebody is actually waiting.
     timer_waiters: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// Set once the shutdown path has released everything still in
+    /// `timer_commands` (`abandonTimerCommands`). After that no owner exists to
+    /// answer a queued cancel, which is the one case where a producer must stop
+    /// waiting for its own command instead of waiting forever — see
+    /// `cancelTimerSync`'s wait loop for why "waiting" is the safe answer and
+    /// returning early is not.
+    timer_commands_abandoned: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Dedicated to `cancelTimerSync`'s wait, so the control-plane waiters cannot
     /// interfere with the ticker's own `mu`/`idle` sleep.
     cmd_mu: std.Io.Mutex = .init,
@@ -1792,6 +1799,11 @@ pub const Runtime = struct {
             return self.wheel.cancelWith(id, self, onTimerCancel);
         }
 
+        // Checked *before* queueing: a command that goes in after the shutdown
+        // drain would never be answered, and a queued command carries pointers
+        // into this frame (see the wait loop).
+        if (!self.alive.load(.acquire)) return error.RuntimeStopped;
+
         var done = std.atomic.Value(bool).init(false);
         var result = std.atomic.Value(bool).init(false);
         const accepted = self.timer_commands.tryPush(.{ .cancel = .{
@@ -1803,19 +1815,26 @@ pub const Runtime = struct {
 
         _ = self.timer_waiters.fetchAdd(1, .monotonic);
         defer _ = self.timer_waiters.fetchSub(1, .monotonic);
+        var stopped = false;
         while (!done.load(.acquire)) {
-            // KNOWN (queued, not fixed — see CHANGELOG 第 67 批 and
-            // docs/dev/v1.0-readiness-v0.35.md): both early returns below happen with
-            // the command *already queued*, and that command holds `&done`/`&result`
-            // from this frame. The owner (ticker drain, or `abandonTimerCommands` on
-            // shutdown) writes through them, so returning here is a use-after-return.
-            // The fix is an ownership change (heap-owned answer slot, or wait for
-            // `done` plus an `abandoned` epoch) — deliberately not improvised here.
-            if (!self.alive.load(.acquire)) return error.RuntimeStopped;
+            // The command above carries `&done`/`&result` from *this* frame and the
+            // owner writes through them: the ticker's drain, or the shutdown path
+            // (`abandonTimerCommands`). So this loop may leave only when somebody has
+            // answered it, or when the shutdown drain has *already run* — because
+            // then no owner is left to touch them. `alive` going false is not that
+            // point: the drain still runs after it. Returning on `!alive` (which this
+            // used to do) was a use-after-return, and so was bailing out of the lock
+            // wait on cancellation — the command was already in the queue.
+            if (!self.alive.load(.acquire)) {
+                stopped = true;
+                if (self.timer_commands_abandoned.load(.acquire)) return error.RuntimeStopped;
+            }
+            // Uncancelable: a canceled waiter cannot drop a command that is already
+            // queued — somebody has to answer it before this frame may go away.
+            self.cmd_mu.lockUncancelable(self.io);
             // Waiting on the condition (rather than spinning) keeps the caller
             // off the CPU during the up-to-one-tick wait; the timeout is the
             // safety net, the owner's signal after a drain is the fast path.
-            self.cmd_mu.lock(self.io) catch return error.RuntimeStopped;
             self.cmd_idle.waitTimeout(self.io, &self.cmd_mu, .{
                 .duration = clock_mod.duration(tick_interval_ms),
             }) catch |err| switch (err) {
@@ -1825,6 +1844,7 @@ pub const Runtime = struct {
             };
             self.cmd_mu.unlock(self.io);
         }
+        if (stopped) return error.RuntimeStopped;
         return result.load(.acquire);
     }
 
@@ -2112,6 +2132,11 @@ pub const Runtime = struct {
                 },
             }
         }
+        // Published *after* the drain: a producer that found the queue empty-and-
+        // unowned can now stop waiting for an answer nobody will ever write (see
+        // `cancelTimerSync`). The ticker has been joined by the time this runs, so
+        // there is no later writer of a queued command's answer.
+        self.timer_commands_abandoned.store(true, .release);
     }
 
     /// Release every timer still pending in the wheel, and count them.
@@ -3932,6 +3957,34 @@ test "Runtime: the ticker fires timers without help from the caller" {
 
     rt.shutdown();
     try std.testing.expectEqual(@as(usize, 0), rt.stats().workers);
+}
+
+test "Runtime: a cancel after shutdown is refused instead of queueing an unanswerable command" {
+    // Non-owner callers receive the answer through pointers into their own frame,
+    // so the two ways out of `cancelTimerSync`'s wait are "the owner answered" or
+    // "the shutdown drain has already run, so no owner exists". Returning as soon
+    // as `alive` went false (the old shape) could return *while the drain was
+    // still pending* — a use-after-return once `abandonTimerCommands` wrote the
+    // answer into a frame that had gone.
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .monotonic);
+    defer rt.deinit();
+
+    const handle = try rt.spawn(CounterWorker, .{}, 4);
+    try rt.start();
+    const id = try handle.after(60_000, 1); // far out: only cancel or shutdown releases it
+
+    handle.stop();
+    rt.shutdown();
+
+    // Past that point the command would never be answered: it is refused before
+    // it can reach the queue, so nothing waits and nothing is written later.
+    try std.testing.expectError(error.RuntimeStopped, rt.cancelTimerSync(id));
+    try std.testing.expectEqual(@as(u32, 0), rt.timer_waiters.load(.monotonic));
+    try std.testing.expect(rt.timer_commands_abandoned.load(.acquire));
+    // And nothing was queued on the way to that refusal: the old shape pushed the
+    // command first and returned on `!alive` afterwards, leaving an entry nobody
+    // would ever answer (and, before the drain ran, one that *would* be written).
+    try std.testing.expectEqual(@as(usize, 0), rt.timer_commands.len());
 }
 
 const FlakyActor = struct {
