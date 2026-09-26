@@ -2,6 +2,51 @@
 
 ## [Unreleased]
 
+### 第 66 批：持锁纪律逐处复核（4 个只读子代理 244 个持锁点）—— 修掉 **6 处真缺陷**（4 类死锁/无效超时）（**破坏性：否**）
+
+起因是"审计一遍 `std.Io.Mutex` / `std.Io.Condition` 的用法"。本批把 `src/` 里 **244 个持锁点**
+（生产路径）按"临界区里允许出现什么"逐处过了一遍（四个**只读**子代理分工 + 主代理逐处复核代码）。
+结论：**大部分是安全的（A 类）或已带论证（B 类，注释里写了为什么、常带红测试名），但翻出 6 处真缺陷，
+全部属于"锁没放"与"超时没生效"两类** —— 也就是"只在错误路径/首次交接时才现形"的那种。
+
+**修掉的（每处都补了确定性回归测试）**
+
+| # | 位置 | 缺陷 | 修法 |
+|---|------|------|------|
+| 1 | `sqlx/sqlx.zig:4625` `ConnPool.acquire` | **正常交接路径**：`waiter.ready` 分支 `return waiter.conn` 时**仍持池锁** → 池第一次把连接交给等待者就永久死锁 | 返回前 `unlock` |
+| 2 | `sqlx/sqlx.zig:4615` 同函数 | 取消路径 `cancelWaiter` 交付连接后 `return conn` 未 `unlock` —— 同样永久锁死 | 同上 |
+| 3 | `ai/skill.zig:423` `dispatchWith` | `try validateArgs`（**用户输入**）失败直接 return，跳过 `unlock` → 注册表永久锁死（它是唯一入口） | 改成 `locked` 标志 + `defer`，所有早退都放锁；handler 仍在锁外跑 |
+| 4 | `ai/cooldown_store.zig:271` `coolFn` | `dupe(...) catch return`（OOM）跳过 `unlock` | `catch { unlock; return; }` |
+| 5 | `ai/cooldown_store.zig:298` `bumpFailuresFn` | 同上 | 同上 |
+| 6 | `pool/Pool.zig:116` `acquire` | 用**无超时**的 `cond.wait` + "每次唤醒算 10 ms"的假计时 → `max_wait_ms` 完全不生效，池耗尽即无限阻塞 | 照 `sqlx.ConnPool` 的 50 ms 切片 + 真实经过时间（`core/Time`） |
+
+回归测试（3 条，都断言"之后还能用"，而不是只断言返回值）：
+`acquire stays usable after a release hands a connection to a waiter`（sqlx，缺 `warmPool()` 会 panic、
+`max_open_conns <= 1` 根本没有池 —— 两条都踩过）、`a rejected dispatch does not leave the registry locked`（skill）、
+`an exhausted pool honours max_wait_ms instead of blocking forever`（Pool，**它的红只能以"挂住"呈现**，
+与第 58 批那条 WS 写预算同形）。前两处之所以长期没被发现，是因为既有测试只检查交接的**状态位**
+（`waiters[0].ready`），从没有第二次进 `acquire`。
+
+**红证据（实测，不是推论）**：把第 1 处那条 `unlock` 去掉，sqlx 那条回归测试在 **3 s** 内失败 ——
+`[test] the waiter never returned: the hand-off left the pool's mutex held (3000ms)` + `FAIL (PoolLeftLocked)`，
+并伴随分配器泄漏报告（失败路径上**刻意**跳过 `db.deinit()`：`deinit` 会去拿同一把锁，否则红会变成挂死，
+没有任何结论）。这条测试最初就是挂死的形状（实测 90 s 无结论），改成有界看门狗后才成为可判定的红。
+
+**没修的（C 类，已记进 `docs/BEST_PRACTICES.md` 的《持锁纪律》一节，作为队列而非沉默）**：
+持锁做 I/O 或调用户代码的若干处 —— `DistributedEventBus` 的 fan-out/心跳（有界且注释里论证过锁序）、
+`RaftElection.tick`（锁内出站 I/O + transport 回调）、`scheduler/Cron.tick`（锁内 `allocPrint` +
+`DistributedLock` 的 DB 往返 + `job.task`）、`EventBus.publish`（锁内跑全部监听器）、
+`EventStore.replay`（锁内调应用 handler）、`DLQ.push`（自旋锁内 `append` 可能大块重分配）、
+`supervisor.restartMembers`/`stopSubtree`（自旋锁内回调）、`RateLimiter/CircuitBreaker` 的两个 registry
+（自旋锁内分配 + JSON 序列化）、`DistributedEventBus.settleConnect`（持 `nodes_lock` 关 socket，
+与它自己 `:181-184` 的"teardown 不在锁内关 socket"相矛盾）。**这些不是崩溃而是退化**（锁的粒度变粗、
+延迟被对端决定），修法形状都是"锁内只做快照，锁外做 I/O / 回调"，但每一处都要动控制流，属于独立批次。
+
+**顺手记下的契约（原先只活在注释里，现在进了文档）**：`lockUncancelable` 用于**信号方/收尾**
+（mailbox 的 send/close、runtime 的 broadcast、metrics 的 family 取用、registry 写路径），
+普通 `lock` 用于**等待方**（取消是合法答案：`recvWakeable`、`challenge.verifyAndConsume`、
+`WebSocket.broadcast`、`runtime.cancelTimerSync`、`scheduler.wakeIdle`）—— 64 处逐点核对，方向都对。
+
 ### 第 65 批：按"两条平面"的新定位重写 README 与最佳实践文档（**破坏性：否**）
 
 定位已经从"Zig 版 Spring Modulith"长成 **"编译期模块化应用框架 + worker 导向的执行运行时"**

@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const errors = @import("../sqlx/errors.zig");
+const Time = @import("../core/Time.zig");
 
 /// Connection factory interface
 pub const Factory = struct {
@@ -139,14 +140,26 @@ pub fn Pool(comptime T: type) type {
                 return conn;
             }
 
-            // Wait for a connection to be released
-            var waited: u32 = 0;
-            const step_ms: u32 = 10;
-            while (self.idle_conns.items.len == 0 and waited < self.max_wait_ms) {
-                self.cond.wait(self.io, &self.mutex) catch break;
-                waited += step_ms;
+            // Wait for a connection to be released, bounded by `max_wait_ms` and
+            // sliced (50 ms) so cancellation and `close()` are seen between
+            // slices. The previous shape waited on `cond.wait` — an unbounded futex
+            // wait — and then *assumed* 10 ms per wake-up, so an exhausted pool
+            // blocked forever with `max_wait_ms` set while the metric reported a
+            // budget that had never elapsed. (Same slice shape as
+            // `sqlx.ConnPool.acquire`.)
+            const start_ms = Time.monotonicNowMilliseconds();
+            while (self.idle_conns.items.len == 0) {
+                if (self.closed.load(.monotonic)) break;
+                if (Time.monotonicNowMilliseconds() - start_ms >= @as(i64, self.max_wait_ms)) break;
+                if (self.cond.waitTimeout(self.io, &self.mutex, .{
+                    .duration = .{ .raw = .{ .nanoseconds = 50_000_000 }, .clock = .awake },
+                })) |_| {} else |err| switch (err) {
+                    // A slice is not the budget: keep waiting until it is out.
+                    error.Timeout => {},
+                    error.Canceled => break,
+                }
             }
-
+            const waited: u32 = @intCast(@max(Time.monotonicNowMilliseconds() - start_ms, 0));
             _ = self.total_wait_time_ms.fetchAdd(waited, .monotonic);
 
             if (self.idle_conns.items.len > 0) {
@@ -231,6 +244,57 @@ pub const Config = struct {
     max_wait_ms: u32 = 5000,
     max_idle_time_ms: u32 = 300000, // 5 minutes
 };
+
+test "an exhausted pool honours max_wait_ms instead of blocking forever" {
+    const CreateCtx = struct {
+        var count: *u32 = undefined;
+    };
+    var create_count: u32 = 0;
+    CreateCtx.count = &create_count;
+
+    const createFn = struct {
+        fn create() errors.ResultT(*u32) {
+            CreateCtx.count.* += 1;
+            const ptr = std.heap.page_allocator.create(u32) catch return error.ServerError;
+            ptr.* = 7;
+            return ptr;
+        }
+    }.create;
+    const destroyFn = struct {
+        fn destroy(ptr: *u32) void {
+            std.heap.page_allocator.destroy(ptr);
+        }
+    }.destroy;
+    const validateFn = struct {
+        fn validate(ptr: *u32) bool {
+            _ = ptr;
+            return true;
+        }
+    }.validate;
+
+    var pool = try Pool(u32).init(
+        std.testing.allocator,
+        std.testing.io,
+        createFn,
+        destroyFn,
+        validateFn,
+        .{ .min_idle = 0, .max_active = 1, .max_wait_ms = 120 },
+    );
+    defer pool.deinit();
+
+    const only = try pool.acquire();
+    const started_ms = Time.monotonicNowMilliseconds();
+    try std.testing.expectError(error.Timeout, pool.acquire());
+    const elapsed_ms = Time.monotonicNowMilliseconds() - started_ms;
+
+    // The wait used to be an unbounded `cond.wait` with the elapsed time merely
+    // *assumed* at 10 ms per wake-up, so `max_wait_ms` did nothing: this test
+    // hung (the red can only present as a hang, like the WS write-budget one).
+    try std.testing.expect(elapsed_ms >= 100);
+    try std.testing.expect(elapsed_ms < 2000);
+
+    pool.release(only);
+}
 
 test "connection pool" {
     const CreateCtx = struct {

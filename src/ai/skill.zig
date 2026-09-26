@@ -403,10 +403,16 @@ pub const SkillRegistry = struct {
         }
 
         try self.mutex.lock(self.io);
-        const tool = self.tools.get(name) orelse {
-            self.mutex.unlock(self.io);
-            return error.ToolNotFound;
-        };
+        // Every early return in the lookup section below has to release it: this
+        // is the only way into the registry, so a mutex left locked here is a
+        // permanent deadlock — `try validateArgs` (user input) used to return
+        // straight out of the lock. `locked` keeps the section exception-safe
+        // while still releasing *before* the handler runs: holding it across a
+        // caller-supplied handler would serialize every tool call behind it.
+        var locked = true;
+        defer if (locked) self.mutex.unlock(self.io);
+
+        const tool = self.tools.get(name) orelse return error.ToolNotFound;
         if (tool.required_permission) |perm| {
             var granted = false;
             for (ctx.permissions) |p| {
@@ -415,15 +421,13 @@ pub const SkillRegistry = struct {
                     break;
                 }
             }
-            if (!granted) {
-                self.mutex.unlock(self.io);
-                return error.PermissionDenied;
-            }
+            if (!granted) return error.PermissionDenied;
         }
         try validateArgs(tool, args);
         const handler = tool.handler;
         const budget = opts.timeout_ms orelse tool.timeout_ms;
         self.mutex.unlock(self.io);
+        locked = false;
 
         const prev_deadline = ctx.deadline_ms;
         defer ctx.deadline_ms = prev_deadline;
@@ -515,6 +519,34 @@ test "SkillRegistry allowlist and required args" {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"text\":\"hi\"}", .{});
     defer parsed.deinit();
     const ok = try reg.dispatchAllowed("echo", &ctx, parsed.value, &.{"echo"});
+    try std.testing.expectEqualStrings("hi", ok.string);
+}
+
+test "a rejected dispatch does not leave the registry locked" {
+    const allocator = std.testing.allocator;
+    var reg = SkillRegistry.init(allocator, std.testing.io);
+    defer reg.deinit();
+
+    try reg.register(.{
+        .name = "echo",
+        .description = "echo",
+        .parameters = &.{.{ .name = "text", .type = .string, .description = "t", .required = true }},
+        .handler = echoHandler,
+    });
+
+    var ctx = SkillContext{ .allocator = allocator };
+    // The lookup path takes the registry's mutex and used to `try validateArgs`
+    // straight out of it: one call whose arguments fail validation then deadlocked
+    // every later dispatch, because this is the only way into the registry.
+    try std.testing.expectError(error.MissingToolArg, reg.dispatch("echo", &ctx, .null));
+
+    try std.testing.expect(reg.mutex.tryLock());
+    reg.mutex.unlock(reg.io);
+
+    // ...and the registry still works, which is what a caller notices.
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"text\":\"hi\"}", .{});
+    defer parsed.deinit();
+    const ok = try reg.dispatch("echo", &ctx, parsed.value);
     try std.testing.expectEqualStrings("hi", ok.string);
 }
 

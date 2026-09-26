@@ -4612,7 +4612,13 @@ const ConnPool = struct {
                         // connection outright — neither closed nor re-pooled,
                         // with `active` never decremented — so every canceled
                         // wait would cost the pool one permanent slot.
-                        if (self.cancelWaiter(&waiter)) |conn| return conn;
+                        if (self.cancelWaiter(&waiter)) |conn| {
+                            // `waitTimeout` re-acquired the mutex before returning,
+                            // and every other exit from this function unlocks: a
+                            // bare `return conn` left it locked for good.
+                            self.mutex.unlock(self.io);
+                            return conn;
+                        }
                         self.mutex.unlock(self.io);
                         return error.Timeout;
                     },
@@ -4622,6 +4628,10 @@ const ConnPool = struct {
                 if (waiter.ready) {
                     self.removeWaiter(&waiter);
                     _ = self.acquire_count.fetchAdd(1, .monotonic);
+                    // Same contract as above — this is the *normal* hand-off path,
+                    // so leaving the mutex held here deadlocked the pool on the
+                    // first release-to-waiter hand-off it ever did.
+                    self.mutex.unlock(self.io);
                     return waiter.conn;
                 }
                 if (self.closed.load(.monotonic)) {
@@ -8977,6 +8987,75 @@ test "conn pool release hands off to waiters in FIFO order" {
     // pool's active count and the test allocator stay consistent.
     waiters[0].conn.close();
     waiters[1].conn.close();
+}
+
+test "acquire stays usable after a release hands a connection to a waiter" {
+    const allocator = std.testing.allocator;
+
+    // Torn down only if the hand-off settled: `deinit` takes the pool's mutex,
+    // so on the failure path (a stuck waiter) cleanup would hang where the test
+    // had already failed — a hang reports no verdict at all.
+    var settled = false;
+    var db = try Client.open(allocator, std.testing.io, .{
+        .driver = .sqlite,
+        .sqlite_path = ":memory:",
+        // The pool only exists above one connection (`ensurePool`), so
+        // exhausting it takes two.
+        .max_open_conns = 2,
+        .max_idle_conns = 0,
+        .max_wait_ms = 2000,
+    });
+    defer if (settled) db.deinit();
+    db.warmPool();
+
+    const pool = &db.pool.?;
+    const held = try pool.acquire();
+    const handed_over = try pool.acquire();
+
+    const Waiter = struct {
+        var done = std.atomic.Value(bool).init(false);
+        fn run(p: *ConnPool) void {
+            const conn = p.acquire() catch {
+                done.store(true, .release);
+                return;
+            };
+            p.release(conn);
+            done.store(true, .release);
+        }
+    };
+    const waiter = try std.Thread.spawn(.{}, Waiter.run, .{pool});
+    // Wait until it is registered, so the `release` below takes the FIFO
+    // hand-off path rather than the idle path (only a hand-off wakes a waiter).
+    var waited_ms: usize = 0;
+    while (pool.waiters.items.len == 0 and waited_ms < 1000) : (waited_ms += 5) {
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(5), .real) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), pool.waiters.items.len);
+
+    pool.release(handed_over);
+    // Bounded rather than `join()`: with the mutex held, the waiter's own
+    // `release` blocks on it forever, and a hang is a much worse red than a
+    // failure (measured on the pre-fix code: the test never returned — the suite
+    // hit its outer timeout with no verdict).
+    var settled_ms: usize = 0;
+    while (!Waiter.done.load(.acquire) and settled_ms < 3000) : (settled_ms += 10) {
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    if (!Waiter.done.load(.acquire)) {
+        std.log.err("[test] the waiter never returned: the hand-off left the pool's mutex held ({d}ms)", .{settled_ms});
+        return error.PoolLeftLocked;
+    }
+    waiter.join();
+
+    // The waiter's `acquire` used to return *while holding* the pool's mutex —
+    // the normal hand-off path, so the pool went permanently dead the first time
+    // it handed a connection over. No test re-entered `acquire` after a hand-off,
+    // which is why it survived CI.
+    try std.testing.expect(pool.mutex.tryLock());
+    pool.mutex.unlock(pool.io);
+
+    pool.release(held);
+    settled = true;
 }
 
 test "canceled pool waiter keeps a connection already handed to it" {

@@ -37,6 +37,7 @@
 - [错误处理](#-错误处理)
   - [错误响应形状：一条开关统一全框架（v0.15.45+）](#错误响应形状一条开关统一全框架v01545)
   - [韧性：一个 bug 不拖垮整个后端（v0.15.36+）](#韧性一个-bug-不拖垮整个后端v01536)
+  - [持锁纪律：临界区里允许出现什么（v0.35.0 逐处复核）](#持锁纪律临界区里允许出现什么v0350-逐处复核)
   - [共享限流器 / 统计结构的线程安全（v0.15.45+）](#共享限流器--统计结构的线程安全v01545)
   - [连接级背压与慢连接防护（v0.15.36+）](#连接级背压与慢连接防护v01536)
   - [上线前预检（v0.15.36+）](#上线前预检v01536)
@@ -1607,6 +1608,45 @@ panic 钩子管诊断，不管存活。进程存活靠 supervisor：`systemd`
 `Restart=always`、k8s `restartPolicy: Always` 或容器编排的重启策略。
 多进程隔离（prefork）的边界与前置条件见
 [`PRODUCTION_ROADMAP.md`](PRODUCTION_ROADMAP.md)「单进程单点与原位隔离」。
+
+### 持锁纪律：临界区里允许出现什么（v0.35.0 逐处复核）
+
+`src/` 里 **244 个持锁点**（`std.Io.Mutex` / `core/SpinLock.zig` 的 `SpinLock` / `std.Io.Condition`，
+生产路径）被逐处过了一遍。**大部分是安全的**，但那一遍翻出 6 处真缺陷 —— 全是"锁没放"与
+"超时没生效"，且**只在错误路径或首次交接时才现形**（见 CHANGELOG 第 66 批；每处都补了回归测试）。
+
+**四条硬规则**（前三条来自这次复核，第四条是仓库既有的）：
+
+| # | 规则 | 为什么 |
+|---|------|--------|
+| 1 | **每一个 `return`、`catch`、`errdefer` 路径都要放锁** —— 用 `defer`/`errdefer`，或"锁标志 + `defer`" | 4 处真缺陷里有 3 处是"某条早退忘了 unlock"。这类锁的持有者通常只有一个入口，**锁住就是永久死锁**，而错误路径（非法参数、OOM）恰恰是热路径上最少被跑到的那条 |
+| 2 | **`max_wait_ms` 之类的超时只能靠"真实经过时间 + 有界切片"实现**，不能靠"唤醒次数 × 常量" | `src/pool/Pool.zig` 的旧写法把每次唤醒当 10 ms，于是"超时"参数完全不生效；`sqlx.ConnPool` 的 50 ms 切片是对的样板（它也顺带让取消与 `close()` 能被观察到） |
+| 3 | **锁内只做快照，I/O、用户回调、可能换页的分配都放到锁外** | 仍在队列里的若干处（见下）都是这个形状：`EventBus.publish` 在锁里跑监听器、`Cron.tick` 在锁里走 DB 往返与 `job.task`、`supervisor.restartMembers` 在自旋锁里回调。它们**不崩**，但把锁的粒度交给对端和业务代码决定 |
+| 4 | **`lockUncancelable` 给"信号方/收尾"，普通 `lock` 给"等待方"** | 仓库把它当契约用：mailbox 的 `send`/`close`、runtime 的 `broadcast`、metrics 的 family 取用、registry 写路径都不可取消（否则丢的是唤醒）；等待方（`recvWakeable`、`challenge.verifyAndConsume`、`WebSocket.broadcast`、`cancelTimerSync`、`wakeIdle`）用普通 `lock`，取消是合法答案 |
+
+**判据（拿来问自己写的临界区）**：① 里面有 socket / DB / 文件 / HTTP 吗？② 会调用别人给的
+handler / subscriber / 钩子吗？③ 会分配（尤其可能增长/换页的容器）吗？④ 会取第二把锁吗
+（那就得写下锁序，且全仓库只有一个方向）？⑤ 这条路径上的每个出口都放锁了吗？⑥ 等待有没有界？
+命中 ①②③ 就把它改成"锁内快照，锁外做事"；命中 ⑤ 就是缺陷。
+
+**已知仍在队列里的 C 类**（不是崩溃，是粒度/延迟问题；修法形状一致，留作独立批次）：
+
+| 位置 | 形状 |
+|------|------|
+| `EventBus.zig:358` `ThreadSafeEventBus.publish` | 锁内跑**全部**监听器 + 分配 + 嵌 `WorkerPool.mu` |
+| `EventStore.zig:159` `replay` | 锁内调用应用 handler |
+| `scheduler/Cron.zig:294` `tick` | 锁内 `allocPrint` + `DistributedLock` 的 DB 往返 + `job.task` |
+| `core/cluster/RaftElection.zig` `tick` / `handleVoteResponse` | `RaftLock` 内做出站 I/O 并回调 transport |
+| `core/eventbus/DLQ.zig:206/445` | 自旋锁内 `append`（可能大块重分配）/ `getOrPut` |
+| `runtime/supervisor.zig:261/284` | 自旋锁内回调 `request_restart`/`request_stop` 并递归子组锁 |
+| `resilience/RateLimiter.zig:321`、`CircuitBreaker.zig:319` | 自旋锁内 append + JSON 序列化（报告路径） |
+| `core/DistributedEventBus.zig:969` `settleConnect` | 持 `nodes_lock` 关 socket，与它自己 `:181-184` 的"teardown 不在锁内关 socket"相反 |
+| `extensions/WebSocket.zig`、`api/Server.zig` 的 registry 写路径 | 持锁写 → 唤醒之间夹了 `client.release()`（可能 close socket），属同族边缘 |
+
+**已论证过的 B 类**（读的时候别急着"修"它们）：`DistributedEventBus` 的 `nodes_lock` → `Node.write_lock`
+固定锁序（`:176-184` 写明"publish 的扇出就是持锁做有界写"）、`snapshotNodes` 的"锁内分配但无调用无 I/O"
+（`:2215-2232` 写明为什么不用 visitor 回调）、mailbox 的"先自旋再 park"与 `lockUncancelable` 的取舍
+（带红测试 `Mailbox: send signals even when the sender's lock is canceled`）。
 
 ### 共享限流器 / 统计结构的线程安全（v0.15.45+）
 

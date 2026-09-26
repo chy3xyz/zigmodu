@@ -269,7 +269,12 @@ pub const RedisCooldownStore = struct {
             // shape the in-process store uses (this used to call the old
             // three-argument `put`, which no longer exists; see the note on the
             // vtable below).
-            const owned = self.allocator.dupe(u8, key) catch return;
+            const owned = self.allocator.dupe(u8, key) catch {
+                // OOM must not leave the mirror's mutex held: the next `coolFn`
+                // for any key would then block forever.
+                self.mutex.unlock(self.io);
+                return;
+            };
             self.mirror_cooling.put(owned, self.now_fn() + ttl_ms) catch |err| {
                 self.allocator.free(owned);
                 std.log.debug("[RedisCooldownStore] mirror cool insert failed ({s})", .{@errorName(err)});
@@ -295,7 +300,11 @@ pub const RedisCooldownStore = struct {
         if (self.mirror_failures.getPtr(key)) |c| {
             c.* = count;
         } else {
-            const owned = self.allocator.dupe(u8, key) catch return count;
+            const owned = self.allocator.dupe(u8, key) catch {
+                // Same as `coolFn`: the lock is not the failure's to keep.
+                self.mutex.unlock(self.io);
+                return count;
+            };
             self.mirror_failures.put(owned, count) catch |err| {
                 self.allocator.free(owned);
                 std.log.debug("[RedisCooldownStore] mirror failure insert failed ({s})", .{@errorName(err)});
