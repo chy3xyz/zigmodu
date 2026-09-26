@@ -153,6 +153,12 @@ pub const ServeOptions = struct {
     read_idle_timeout_ms: u32 = 10_000,
     /// Transport hook that cuts a blocked read short — see `ReadDeadline`.
     read_deadline: ?ReadDeadline = null,
+    /// Send bound for every frame this session writes (`SO_SNDTIMEO`, armed and
+    /// cleared around each write). Without it a client that stops reading parks
+    /// this connection's fiber inside `send`, and whoever drains the fiber
+    /// (`Server.stop()`) waits with it. `Server` fills this from
+    /// `Config.response_write_timeout_ms`; `0` = unbounded.
+    write_timeout_ms: u32 = 0,
 };
 
 /// Inbound resource limits for one HTTP/2 connection.
@@ -274,9 +280,11 @@ const ConnWriter = struct {
     stream: std.Io.net.Stream,
     buf: [64 * 1024]u8 = undefined,
     len: usize = 0,
+    /// See `ServeOptions.write_timeout_ms`.
+    timeout_ms: u32 = 0,
 
-    fn init(io: std.Io, stream: std.Io.net.Stream) ConnWriter {
-        return .{ .io = io, .stream = stream };
+    fn init(io: std.Io, stream: std.Io.net.Stream, timeout_ms: u32) ConnWriter {
+        return .{ .io = io, .stream = stream, .timeout_ms = timeout_ms };
     }
 
     fn write(self: *ConnWriter, data: []const u8) !void {
@@ -313,11 +321,16 @@ const ConnWriter = struct {
         try self.writeFrame(.data, flags, stream_id, data);
     }
 
+    /// The session's only writer: raw syscalls, with the send bound armed and
+    /// cleared around each write.
+    ///
+    /// `std.Io`'s writer cannot express that bound — it answers a timed-out send
+    /// with `errnoBug`, which is `unreachable` — and this is the one place on an
+    /// H2 connection where bytes leave, so the bound is applied here rather than
+    /// once per connection (which would leave the socket armed for anything else
+    /// that ever writes to it).
     fn writeDirect(self: *ConnWriter, data: []const u8) !void {
-        var dummy_buf: [4096]u8 = undefined;
-        var w = self.stream.writer(self.io, &dummy_buf);
-        try w.interface.writeAll(data);
-        try w.interface.flush();
+        return @import("../core/sockread.zig").writeFullBounded(self.stream, data, self.timeout_ms);
     }
 
     fn flush(self: *ConnWriter) !void {
@@ -426,7 +439,7 @@ fn serveSession(
     inbound: ?*std.Io.Reader,
     upgrade: ?UpgradeRequest,
 ) !void {
-    var writer = ConnWriter.init(io, stream);
+    var writer = ConnWriter.init(io, stream, opts.write_timeout_ms);
 
     // Advertised limits: the peer must see the same numbers we enforce, or it
     // cannot know which of its requests will be refused (RFC 9113 §6.5.2).

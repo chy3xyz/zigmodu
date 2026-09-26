@@ -720,7 +720,7 @@ request (details: `docs/ROUTE_TABLE.md` §4.6).
 | `over_limit_response` | `.close` | `.close` = cheapest, `.unavailable` = raw-socket `503` first |
 | `header_timeout_ms` | `10_000` | request line + headers deadline (slowloris); `0` disables; cleared once headers are read |
 | `body_timeout_ms` | `30_000` | request body deadline, armed at the blank line; exceeding it answers `408`; `0` disables |
-| `response_write_timeout_ms` | `30_000` | per-`send` budget for **response writes** (`SO_SNDTIMEO`, armed around the write). A peer that stops reading gets a truncated response and a closed connection instead of a fiber parked forever — which is also what `stop()`'s drain waits for. A slow-but-live peer (one that keeps draining) is never cut off; `0` restores the unbounded write |
+| `response_write_timeout_ms` | `30_000` | per-`send` budget for **every response write**: the buffered response (`writeResponse`), the streaming ones (`startChunked` / `writeChunk`), SSE events (`http.sse`) and HTTP/2 frames. A peer that stops reading gets a truncated response and a closed connection instead of a fiber parked forever — which is also what `stop()`'s drain waits for. A slow-but-live peer (one that keeps draining) is never cut off; `0` restores the unbounded write |
 | `ws_write_timeout_ms` | `0` (unbounded) | `SO_SNDTIMEO` for WebSocket writes; on timeout the frame fails with `error.WriteTimeout` and the socket is shut down |
 
 Environment equivalents (`fromEnv`): `HTTP_PORT`, `HTTP_MAX_BODY`,
@@ -1054,6 +1054,20 @@ ZigModu ships HTTP/1.1 and h2c in `http.Server` (`enable_http2`), and gRPC over
 HTTP/2 via `extensions/GrpcTransport.zig` + `GrpcServiceRegistry`. There is no
 `TransportProtocol` enum and no built-in MQTT transport — bring your own client
 for those (an MQTT client is not part of the framework).
+
+**HTTP/2 response limits, so an app is not surprised by them.** Both are
+`ServeOptions` fields (`Server.http2ServeOptions` fills them from its `Config`):
+
+| Limit | Default | Effect |
+|-------|---------|--------|
+| `max_pending_bytes` | 4 MiB | Outbound bytes buffered before the peer's window drains. A response body past it is **refused** with `RST_STREAM(ENHANCE_YOUR_CALM)` — measured: a 3 MiB body is served, a 6 MiB one is refused. Raise it for large responses, or serve large payloads over HTTP/1.1 (which has no equivalent cap). |
+| `max_pending_streams` | 64 | Concurrent outbound response streams; over it the stream is refused with `REFUSED_STREAM`. |
+
+A new stream's send window starts at the protocol default (65535) regardless of
+the peer's `SETTINGS_INITIAL_WINDOW_SIZE`; the peer's per-stream `WINDOW_UPDATE`
+is what raises it. Clients that advertise a large window and wait for the server
+to use it (instead of sending `WINDOW_UPDATE`s) therefore see a 64 KiB response
+and a stall — measured: 65636 bytes on the wire, then waiting.
 
 ### gRPC Transport (unary)
 

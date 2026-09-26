@@ -168,8 +168,8 @@ pub fn writeFull(stream: std.Io.net.Stream, bytes: []const u8) !void {
 /// to leave on: `std.Io`'s writers answer a timed-out send with `errnoBug`
 /// (`Threaded.netWritePosix` — `unreachable`), so an armed socket that a
 /// `stream.writer(io, …)` writes to turns the timeout into a panic. A caller that
-/// arms the bound for one bounded write (`writeResponse` does) has to clear it on
-/// the way out, including the error paths — that is what makes "the bound is
+/// arms the bound for one bounded write (`writeFullBounded` does) has to clear it
+/// on the way out, including the error paths — that is what makes "the bound is
 /// armed only while this fiber owns the fd for writes" true rather than hopeful.
 ///
 /// A kernel that will not clear it is warned about, like every other option here.
@@ -177,6 +177,81 @@ pub fn clearSendTimeout(stream: std.Io.net.Stream) void {
     const tv = std.posix.timeval{ .sec = 0, .usec = 0 };
     applyTimeout(stream.socket.handle, std.posix.SO.SNDTIMEO, &tv, "SO_SNDTIMEO (clear)", "an armed timeout would outlive the write it was meant to bound");
 }
+
+/// Write all of `bytes` with the send bound armed for exactly this call
+/// (`timeout_ms` 0 = `writeFull`'s unbounded behavior).
+///
+/// Armed and cleared **per call**, not once per connection, and that is the
+/// point: `SO_SNDTIMEO` is fd-global and `std.Io`'s writers answer a timed-out
+/// send with `errnoBug` (`unreachable`), so a socket left armed turns a peer's
+/// silence into a panic for anything else that writes to it. Two `setsockopt`s
+/// per bounded write is what makes the bound *provable* rather than a convention
+/// about who else may write to this fd.
+pub fn writeFullBounded(stream: std.Io.net.Stream, bytes: []const u8, timeout_ms: u32) !void {
+    if (timeout_ms == 0) return writeFull(stream, bytes);
+    setSendTimeout(stream, timeout_ms);
+    defer clearSendTimeout(stream);
+    return writeFull(stream, bytes);
+}
+
+/// A socket writer with a caller-owned buffer, raw syscalls and a bounded send.
+///
+/// Why not `stream.writer(io, …)`: that one cannot express the bound at all (see
+/// `writeFullBounded`). Why buffered at all: it is what keeps a small response —
+/// a field section plus a small body — **one** syscall.
+///
+/// `write` takes bytes of any size (a body bigger than the buffer goes straight
+/// out without a copy); `print` formats one piece into the buffer. A single
+/// `print` that cannot fit an **empty** buffer is `error.LineTooLong` rather than
+/// a split line: the callers where that can only be a protocol violation (an HTTP
+/// field section) answer it with a 500, and the ones where a long piece is legal
+/// (streaming bodies, SSE events) use `write`.
+pub const BoundedWriter = struct {
+    stream: std.Io.net.Stream,
+    buf: []u8,
+    len: usize = 0,
+    timeout_ms: u32 = 0,
+
+    pub fn init(stream: std.Io.net.Stream, buf: []u8, timeout_ms: u32) BoundedWriter {
+        return .{ .stream = stream, .buf = buf, .timeout_ms = timeout_ms };
+    }
+
+    pub fn print(self: *BoundedWriter, comptime fmt: []const u8, args: anytype) !void {
+        while (true) {
+            if (std.fmt.bufPrint(self.buf[self.len..], fmt, args)) |written| {
+                self.len += written.len;
+                return;
+            } else |err| switch (err) {
+                error.NoSpaceLeft => {
+                    if (self.len == 0) return error.LineTooLong;
+                    try self.flush();
+                },
+            }
+        }
+    }
+
+    pub fn write(self: *BoundedWriter, bytes: []const u8) !void {
+        if (bytes.len <= self.buf.len - self.len) {
+            @memcpy(self.buf[self.len..][0..bytes.len], bytes);
+            self.len += bytes.len;
+            return;
+        }
+        try self.flush();
+        if (bytes.len <= self.buf.len) {
+            @memcpy(self.buf[0..bytes.len], bytes);
+            self.len = bytes.len;
+            return;
+        }
+        return writeFullBounded(self.stream, bytes, self.timeout_ms);
+    }
+
+    pub fn flush(self: *BoundedWriter) !void {
+        if (self.len == 0) return;
+        const pending = self.buf[0..self.len];
+        self.len = 0;
+        try writeFullBounded(self.stream, pending, self.timeout_ms);
+    }
+};
 
 /// Write all segments with a single `sendmsg` syscall (header + body in one
 /// call). Falls back to per-segment writes only on a rare partial write.

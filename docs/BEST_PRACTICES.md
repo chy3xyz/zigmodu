@@ -1665,7 +1665,7 @@ shard 锁）被无限期占住。设了超时后写返回 `error.WriteTimeout` �
 | keep-alive 等下一个请求 | `header_timeout_ms` |
 | 请求行 + 头 | `header_timeout_ms`（slowloris 闸门） |
 | body | `body_timeout_ms` |
-| **响应写**（`writeResponse`） | **`response_write_timeout_ms`**（过去：无上界，对端说了算） |
+| **响应写**（`writeResponse`、`startChunked`/`writeChunk`、SSE 事件、H2 帧） | **`response_write_timeout_ms`**（过去：无上界，对端说了算） |
 | HTTP/2 会话空闲 | `header_timeout_ms`（GOAWAY `ENHANCE_YOUR_CALM`） |
 | **WS 读循环** | **`stop()` 的唤醒**（过去：无上界，对端说了算） |
 | 你的回调（`on_connect` / `on_message` / `on_close`）、handler | **无上界** —— 必须自己返回 |
@@ -1673,11 +1673,24 @@ shard 锁）被无限期占住。设了超时后写返回 `error.WriteTimeout` �
 **响应写**那一行的形状和 WS 读循环一样，只是方向相反：客户端发一个 `GET` 要一个
 16 MiB 的响应、然后**不再读**，服务端的 `send` 就在塞满的内核缓冲上停住；而
 `start()` 退出时要 `conn_group.await` 这条 fiber —— 于是**关停时长同样由对端决定**。
-`response_write_timeout_ms` 就是这条 fiber 的上界（`SO_SNDTIMEO`，围绕写本身
-arm/clear，避免它外溢到同一 fd 上别的写者）：超时后 `writeResponse` 返回
-`error.WriteTimeout`、连接被截断并关闭。预算是**每次 `send`** 的，所以只是慢
-（一直在流动）的对端不会被切断。过大/过慢的内核缓冲是这条路径唯一的"缓冲"，见
-`src/api/Server.zig` 的 `ResponseWriter`。
+`response_write_timeout_ms` 就是这条 fiber 的上界：超时后写返回 `error.WriteTimeout`、
+连接被截断并关闭。预算是**每次 `send`** 的（`SO_SNDTIMEO`，围绕每一次写 arm/clear，
+避免它外溢到同一 fd 上别的写者），所以只是慢（一直在流动）的对端不会被切断。
+
+上界覆盖**所有**服务端写路径，而不只是缓冲响应那一条（否则"流式响应"就是绕开它的
+后门）：
+
+| 写路径 | 走哪 | 上界怎么来 |
+|--------|------|-----------|
+| 缓冲响应（handler 返回后一次写） | `writeResponse` → `sockread.BoundedWriter` | `response_write_timeout_ms` |
+| chunked / streaming（`startChunked` / `writeChunk` / `endStream`） | `Context` → 同一个 writer | `Context.write_timeout_ms`（`Server` 从同一个配置填） |
+| SSE 事件（`http.sse`） | `SseWriter` → 同一个 writer | 同上 |
+| HTTP/2 帧（`ConnWriter`） | `writeDirect` → `sockread.writeFullBounded` | `ServeOptions.write_timeout_ms` ← 同一配置 |
+
+公共实现只有一处：`src/core/sockread.zig` 的 `writeFullBounded`（arm/clear + 裸
+`send`）与它上面的 `BoundedWriter`（缓冲 + `print`/`write`/`flush`）。**不要**改成
+"给 fd 挂一次 `SO_SNDTIMEO` 然后一直留着"：那是 fd 全局状态，任何走 `std.Io` writer
+的写者在超时时会 panic（`errnoBug`）。
 
 最后一行是有意的：`shutdown` 够不到 park 在回调里的 fiber，**没有预算会打断它**。
 回调里等的东西都要自带超时（出站请求、锁），否则 `stop()` 会一直等——提前返回会在

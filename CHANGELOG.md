@@ -2,6 +2,47 @@
 
 ## [Unreleased]
 
+### 第 56 批：把响应写预算接到**所有**服务端写路径（streaming / SSE / HTTP/2）—— 第 55 批只盖住了"缓冲响应"那一条（**破坏性：否**）
+
+第 55 批把 `response_write_timeout_ms` 接到了 `writeResponse`（handler 返回后一次写的那条），并在 CHANGELOG 里点名"凡是走 `std.Io` writer 的写仍然无界，服务端还有三处"。本批把这三处接上，并把实现收敛成一处。
+
+* **共享实现**：`sockread.writeFullBounded`（arm/clear + 裸 `send`）+ `sockread.BoundedWriter`（缓冲 + `print`/`write`/`flush`）。`Server` 私有那份 `ResponseWriter` 删掉，改用它；`writeResponse` 的 arm/clear 也从"围住整条响应"改成"围住每一次写"——少一处需要论证的不变量（不需要再假设"这段时间里没别人写这个 fd"）。
+* **§1 streaming（HTTP/1.1）**：`Context.write_timeout_ms`（`Server` 从同一个配置填）→ `flushHeadersToSocket` / `writeChunk` / `endStream` 全部走 `BoundedWriter`。顺带修掉一个真缺陷：流式响应头过去用 **256 字节的 scratch line** 做 `bufPrint`，一个长 header 值（CORS 回显 `Origin` 就够）会让**整条 SSE 流**以 `error.NoSpaceLeft` 失败；现在走同一个 8 KiB+ 的缓冲，长值正常写出。
+* **§2 SSE**：`SseWriter.write_timeout_ms`（`init` 从 context 取）→ 五个事件方法 + `flushHeaders` 走同一个 writer。
+* **§3 HTTP/2**：`ServeOptions.write_timeout_ms` → `ConnWriter.writeDirect`（H2 连接上**唯一**的写点）走 `writeFullBounded`；`Server.http2ServeOptions` 从 `Config.response_write_timeout_ms` 填，与 H1 同一号码。
+* 文档：`docs/API.md` 的 Server Options 行改写（点明覆盖范围），`docs/BEST_PRACTICES.md` 的"各阶段等待 ↔ 上界"表与说明段补全（四条写路径 ↔ 各自的上界从哪来），并把 HTTP/2 的两个上限写进 `docs/API.md`（见下）。
+
+**新测试 3 条**（都是"对端不读"形状）：
+
+| 测试 | 形状 | 钉住什么 |
+|------|------|---------|
+| SSE 订阅者不读 | 8 KiB 事件循环 | fiber 在预算内结束，且 `sendData` 拿到 `error.WriteTimeout`（**直接断言错误**，不是从字节数推断） |
+| chunked 客户端不读 | 16 KiB `writeChunk` 循环 | 同上 |
+| HTTP/2 客户端不读 | 放大窗口 + 请求 + 不再读 | 会话在预算内结束、收到的字节远小于响应体 |
+
+> **红证据**：这三条与第 55 批的 `unbounded write` 孪生测试同一机制 —— 把预算设 0（即修复前的无界行为）后，fiber 会停在那里，测试的 `expectEqual(0, active_connections)` 与诊断行
+> （`[test] a non-reading subscriber held a streaming fiber {d}ms past the 200ms write budget`）随之失败。
+
+> **本批最值得记住的一条（H2 那条测试的第一次"通过"是假的）**：第一版 H2 测试用
+> `header_timeout_ms = 200`，它**通过了** —— 但那是 **H2 读空闲预算**（`read_idle_timeout_ms`
+> 由 `header_timeout_ms` 填）结束的会话，不是写预算。把 `header_timeout_ms` 提到 10 s（> 测试的
+> 3 s 预算）后立刻失败，才把因果钉在写预算上。同一条 H2 会话上至少有两个预算能结束它，**测试必须
+> 显式排除另一个**；这类"两个时钟都能停同一件事"的坑，H1 那两条（handler 在写循环里，读阶段早已
+> 结束）没有。
+
+**顺带发现两条（本批不改，已写进 `docs/API.md` 的 Transport 节）**：
+
+1. **新流的发送窗口固定从 65535 起，不采用对端 `SETTINGS_INITIAL_WINDOW_SIZE`**：实测客户端宣告
+   16 MiB 也只放行 **65636** 字节就停；要靠**每流** `WINDOW_UPDATE` 才继续。对"宣告大窗口然后等
+   服务端发满"的客户端，这表现为 64 KiB 之后就卡住（它自己也该发 `WINDOW_UPDATE`，所以是
+   "比协议允许的保守"，不是死锁，但确实是一个可观测的错配）。
+2. **响应体超过 `max_pending_bytes`（默认 4 MiB）会被拒绝**：实测 3 MiB 正常服务、6 MiB 得到
+   `RST_STREAM(ENHANCE_YOUR_CALM)`（16 MiB 时是 `INTERNAL_ERROR`）。HTTP/1.1 没有这个上限，
+   所以"同一路由换个协议就 500"是应用能看到的差异；`max_pending_bytes` 可调，但文档此前没写。
+
+**未接线（下一批）**：扩展层的 `extensions/WebSocket.zig` / `extensions/WebMonitor.zig` 仍走
+`std.Io` writer —— 它们的连接不属于 `Server` 的连接，需要各自把预算接进自己的配置。
+
 ### 第 55 批：非 WS 的**响应写无上界**（对端不读即可把关停拖住）—— 已修，顺带修掉**裸写会发 SIGPIPE 杀进程**（**破坏性：否**）
 
 第 53 批 ③ 报的那条（"`writeResponse` 走阻塞 send、没有 `SO_SNDTIMEO`，对'对端不读 + 响应大于内核发送缓冲'无上界"）本批落地，并且修它的过程中发现同一段代码里还有一个更狠的：**裸 `write`/`writev` 写已被 reset 的对端会发 SIGPIPE，默认动作是杀进程**。

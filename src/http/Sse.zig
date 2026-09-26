@@ -5,6 +5,7 @@
 //! (same contract as `Context.startChunked`).
 
 const std = @import("std");
+const sockread = @import("../core/sockread.zig");
 
 /// Read `Last-Event-ID` from the request (EventSource reconnect). Header keys are lowercase.
 pub fn lastEventId(ctx: anytype) ?[]const u8 {
@@ -17,7 +18,7 @@ pub fn lastEventId(ctx: anytype) ?[]const u8 {
 /// Write SSE `data:` lines, splitting on `\n` (and stripping trailing `\r`).
 fn writeDataField(w: anytype, data: []const u8) !void {
     if (data.len == 0) {
-        try w.interface.writeAll("data: \n");
+        try w.write("data: \n");
         return;
     }
     var start: usize = 0;
@@ -30,14 +31,14 @@ fn writeDataField(w: anytype, data: []const u8) !void {
             line_raw[0 .. line_raw.len - 1]
         else
             line_raw;
-        try w.interface.writeAll("data: ");
-        try w.interface.writeAll(line);
-        try w.interface.writeAll("\n");
+        try w.write("data: ");
+        try w.write(line);
+        try w.write("\n");
         if (nl) |n| {
             start += n + 1;
             if (start == data.len) {
                 // Trailing newline → empty data line per common SSE usage
-                try w.interface.writeAll("data: \n");
+                try w.write("data: \n");
                 break;
             }
         } else break;
@@ -114,20 +115,33 @@ pub const SseWriter = struct {
     head_request: bool = false,
     last_id: ?[]const u8 = null,
     event_count: usize = 0,
+    /// Send bound for every event this writer puts on the wire
+    /// (`Context.write_timeout_ms`, i.e. `Config.response_write_timeout_ms`).
+    /// An SSE loop runs *inside* the handler, so `writeResponse` — and the bound
+    /// it applies — never gets a turn here; a subscriber that stops reading is
+    /// otherwise able to park this fiber for as long as it likes, which is also
+    /// as long as `stop()` waits.
+    write_timeout_ms: u32 = 0,
 
     pub fn init(ctx: anytype) !SseWriter {
         const stream = ctx.stream orelse return error.NoStream;
         const io = ctx.io orelse return error.NoIo;
 
         try markSseResponse(ctx);
-        try flushHeaders(ctx, stream, io);
+        try flushHeaders(ctx, stream, writeTimeoutOf(ctx));
 
         return SseWriter{
             .allocator = ctx.allocator,
             .stream = stream,
             .io = io,
             .head_request = isHeadRequest(ctx),
+            .write_timeout_ms = writeTimeoutOf(ctx),
         };
+    }
+
+    /// The buffered, bounded writer one event goes through.
+    fn writer(self: *SseWriter, buf: []u8) sockread.BoundedWriter {
+        return sockread.BoundedWriter.init(self.stream, buf, self.write_timeout_ms);
     }
 
     /// Send a named event with data. Alias for sendEvent (backward compat).
@@ -139,19 +153,19 @@ pub const SseWriter = struct {
     pub fn sendEvent(self: *SseWriter, event: []const u8, data: []const u8) !void {
         if (self.head_request) return;
         var buf: [4096]u8 = undefined;
-        var w = self.stream.writer(self.io, &buf);
+        var w = self.writer(&buf);
 
         if (self.last_id) |id| {
-            try w.interface.writeAll("id: ");
-            try w.interface.writeAll(id);
-            try w.interface.writeAll("\n");
+            try w.write("id: ");
+            try w.write(id);
+            try w.write("\n");
         }
-        try w.interface.writeAll("event: ");
-        try w.interface.writeAll(event);
-        try w.interface.writeAll("\n");
+        try w.write("event: ");
+        try w.write(event);
+        try w.write("\n");
         try writeDataField(&w, data);
-        try w.interface.writeAll("\n");
-        try w.interface.flush();
+        try w.write("\n");
+        try w.flush();
 
         self.event_count += 1;
     }
@@ -160,16 +174,16 @@ pub const SseWriter = struct {
     pub fn sendData(self: *SseWriter, data: []const u8) !void {
         if (self.head_request) return;
         var buf: [4096]u8 = undefined;
-        var w = self.stream.writer(self.io, &buf);
+        var w = self.writer(&buf);
 
         if (self.last_id) |id| {
-            try w.interface.writeAll("id: ");
-            try w.interface.writeAll(id);
-            try w.interface.writeAll("\n");
+            try w.write("id: ");
+            try w.write(id);
+            try w.write("\n");
         }
         try writeDataField(&w, data);
-        try w.interface.writeAll("\n");
-        try w.interface.flush();
+        try w.write("\n");
+        try w.flush();
 
         self.event_count += 1;
     }
@@ -178,23 +192,23 @@ pub const SseWriter = struct {
     pub fn sendMultiLine(self: *SseWriter, event: []const u8, data_lines: []const []const u8) !void {
         if (self.head_request) return;
         var buf: [4096]u8 = undefined;
-        var w = self.stream.writer(self.io, &buf);
+        var w = self.writer(&buf);
 
         if (self.last_id) |id| {
-            try w.interface.writeAll("id: ");
-            try w.interface.writeAll(id);
-            try w.interface.writeAll("\n");
+            try w.write("id: ");
+            try w.write(id);
+            try w.write("\n");
         }
-        try w.interface.writeAll("event: ");
-        try w.interface.writeAll(event);
-        try w.interface.writeAll("\n");
+        try w.write("event: ");
+        try w.write(event);
+        try w.write("\n");
         for (data_lines) |line| {
-            try w.interface.writeAll("data: ");
-            try w.interface.writeAll(line);
-            try w.interface.writeAll("\n");
+            try w.write("data: ");
+            try w.write(line);
+            try w.write("\n");
         }
-        try w.interface.writeAll("\n");
-        try w.interface.flush();
+        try w.write("\n");
+        try w.flush();
 
         self.event_count += 1;
     }
@@ -210,30 +224,30 @@ pub const SseWriter = struct {
         if (self.head_request) return;
         var write_buf: [64]u8 = undefined;
         var line_buf: [64]u8 = undefined;
-        var w = self.stream.writer(self.io, &write_buf);
+        var w = self.writer(&write_buf);
         const retry_line = try std.fmt.bufPrint(&line_buf, "retry: {d}\n\n", .{ms});
-        try w.interface.writeAll(retry_line);
-        try w.interface.flush();
+        try w.write(retry_line);
+        try w.flush();
     }
 
     /// Send an SSE comment (ignored by clients, useful for keep-alive).
     pub fn sendComment(self: *SseWriter, comment: []const u8) !void {
         if (self.head_request) return;
         var buf: [4096]u8 = undefined;
-        var w = self.stream.writer(self.io, &buf);
-        try w.interface.writeAll(": ");
-        try w.interface.writeAll(comment);
-        try w.interface.writeAll("\n");
-        try w.interface.flush();
+        var w = self.writer(&buf);
+        try w.write(": ");
+        try w.write(comment);
+        try w.write("\n");
+        try w.flush();
     }
 
     /// Send keep-alive comment (prevents proxy timeouts).
     pub fn heartbeat(self: *SseWriter) !void {
         if (self.head_request) return;
         var buf: [64]u8 = undefined;
-        var w = self.stream.writer(self.io, &buf);
-        try w.interface.writeAll(": ping\n");
-        try w.interface.flush();
+        var w = self.writer(&buf);
+        try w.write(": ping\n");
+        try w.flush();
     }
 
     /// Send [DONE] event to signal stream completion.
@@ -246,21 +260,32 @@ pub const SseWriter = struct {
         try self.sendEvent("error", message);
     }
 
-    fn flushHeaders(ctx: anytype, stream: std.Io.net.Stream, io: std.Io) !void {
-        var write_buf: [4096]u8 = undefined;
-        var w = stream.writer(io, &write_buf);
-        var line_buf: [256]u8 = undefined;
+    /// One response head line at a time, through the same bounded writer the
+    /// events use.
+    ///
+    /// The 256-byte `line_buf` this used to `bufPrint` into is gone: it silently
+    /// capped a field line at 256 bytes, so an SSE response with a long
+    /// `Set-Cookie`/`Access-Control-Allow-Origin` failed the whole stream with
+    /// `error.NoSpaceLeft`. The buffer below is sized past every value
+    /// `Context.setHeader` accepts (`max_response_header_value_bytes` = 8 KiB).
+    fn flushHeaders(ctx: anytype, stream: std.Io.net.Stream, write_timeout_ms: u32) !void {
+        var head_buf: [16 * 1024]u8 = undefined;
+        var w = sockread.BoundedWriter.init(stream, &head_buf, write_timeout_ms);
 
-        const status_line = try std.fmt.bufPrint(&line_buf, "HTTP/1.1 {d} OK\r\n", .{ctx.status_code});
-        try w.interface.writeAll(status_line);
-
+        try w.print("HTTP/1.1 {d} OK\r\n", .{ctx.status_code});
         var hiter = ctx.response_headers.iterator();
         while (hiter.next()) |entry| {
-            const header_line = try std.fmt.bufPrint(&line_buf, "{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
-            try w.interface.writeAll(header_line);
+            try w.print("{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
         }
-        try w.interface.writeAll("\r\n");
-        try w.interface.flush();
+        try w.write("\r\n");
+        try w.flush();
+    }
+
+    /// The context's send bound where it has one: `Context.write_timeout_ms`.
+    /// Context-shaped callers without it (tests, adapters) stay unbounded.
+    fn writeTimeoutOf(ctx: anytype) u32 {
+        if (!@hasField(@TypeOf(ctx.*), "write_timeout_ms")) return 0;
+        return ctx.write_timeout_ms;
     }
 };
 
