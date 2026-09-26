@@ -719,10 +719,13 @@ request (details: `docs/ROUTE_TABLE.md` §4.6).
 | `max_connections` | `0` (unlimited) | concurrent accepted connections; over the limit the socket is closed |
 | `over_limit_response` | `.close` | `.close` = cheapest, `.unavailable` = raw-socket `503` first |
 | `header_timeout_ms` | `10_000` | request line + headers deadline (slowloris); `0` disables; cleared once headers are read |
+| `body_timeout_ms` | `30_000` | request body deadline, armed at the blank line; exceeding it answers `408`; `0` disables |
+| `response_write_timeout_ms` | `30_000` | per-`send` budget for **response writes** (`SO_SNDTIMEO`, armed around the write). A peer that stops reading gets a truncated response and a closed connection instead of a fiber parked forever — which is also what `stop()`'s drain waits for. A slow-but-live peer (one that keeps draining) is never cut off; `0` restores the unbounded write |
 | `ws_write_timeout_ms` | `0` (unbounded) | `SO_SNDTIMEO` for WebSocket writes; on timeout the frame fails with `error.WriteTimeout` and the socket is shut down |
 
 Environment equivalents (`fromEnv`): `HTTP_PORT`, `HTTP_MAX_BODY`,
-`HTTP_MAX_CONNECTIONS`, `HTTP_HEADER_TIMEOUT_MS`, `WS_WRITE_TIMEOUT_MS`.
+`HTTP_MAX_CONNECTIONS`, `HTTP_HEADER_TIMEOUT_MS`, `HTTP_BODY_TIMEOUT_MS`,
+`HTTP_RESPONSE_WRITE_TIMEOUT_MS`, `WS_WRITE_TIMEOUT_MS`.
 
 ### `zigmodu.http.productionProfile`
 

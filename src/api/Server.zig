@@ -2224,30 +2224,100 @@ fn getStatusText(status: u16) []const u8 {
 /// explicit and named instead.
 const max_response_header_value_bytes = 8 * 1024;
 
-/// Write HTTP response directly to a `std.Io.net.Stream`.
-/// Avoids intermediate ArrayList allocation — header lines are formatted
-/// straight into the stream's write buffer and the body is written from the
-/// caller's buffer.
+/// Room for one response field line: the largest field *value* the server accepts
+/// (`max_response_header_value_bytes`) plus a field name, its colon, CRLF and
+/// slack.
 ///
-/// Every line goes through `Writer.print`, so its length is the peer's choice,
-/// not a stack buffer's: a fixed scratch line meant a long header value (a
-/// 300-byte `Origin` echoed by CORS is enough) failed with `error.NoSpaceLeft`,
-/// which connFiber logged and dropped — the client saw an empty socket. The
-/// only remaining bound is the explicit `max_response_header_value_bytes`.
+/// The writer flushes as it fills, so this bounds a **single line**, not the
+/// section — the same shape the `std.Io` writer had (a 4 KiB buffer it flushed
+/// through), with one difference worth naming: a line that could not fit was a
+/// silent drop there (`error.NoSpaceLeft` on a scratch line, logged and never
+/// sent — the client saw an empty socket), and is `error.HeaderTooLarge` here,
+/// which the caller already answers with a warning and a 500.
+const response_head_buffer_bytes = max_response_header_value_bytes + 1024;
+
+/// Writes one response: the field section, then as much of the body as fits
+/// behind it — so a small response is still a single syscall, exactly as it was
+/// through the `std.Io` writer's buffer.
+///
+/// Raw syscalls through `sockread`, not `stream.writer(io, …)`, because this
+/// write has to be **bounded**: a peer that stops reading must not own this
+/// connection's fiber (and with it `stop()`'s drain of `conn_group`), and the io
+/// writer cannot express a bound at all — it answers a timed-out send with
+/// `errnoBug`, which is `unreachable`.
+const ResponseWriter = struct {
+    stream: std.Io.net.Stream,
+    buf: []u8,
+    len: usize = 0,
+
+    fn init(stream: std.Io.net.Stream, buf: []u8) ResponseWriter {
+        return .{ .stream = stream, .buf = buf };
+    }
+
+    fn print(self: *ResponseWriter, comptime fmt: []const u8, args: anytype) !void {
+        while (true) {
+            if (std.fmt.bufPrint(self.buf[self.len..], fmt, args)) |written| {
+                self.len += written.len;
+                return;
+            } else |err| switch (err) {
+                error.NoSpaceLeft => {
+                    // A line that cannot fit even an empty buffer is refused
+                    // rather than split: the caller's answer is a 500, and a
+                    // recipient that cannot frame the response is worse off than
+                    // one that got a clean error.
+                    if (self.len == 0) return error.HeaderTooLarge;
+                    try self.flush();
+                },
+            }
+        }
+    }
+
+    fn append(self: *ResponseWriter, bytes: []const u8) !void {
+        while (true) {
+            if (bytes.len <= self.buf.len - self.len) {
+                @memcpy(self.buf[self.len..][0..bytes.len], bytes);
+                self.len += bytes.len;
+                return;
+            }
+            if (self.len == 0) return error.HeaderTooLarge;
+            try self.flush();
+        }
+    }
+
+    /// The body: buffered behind the field section when it fits (one syscall for
+    /// the whole response), written on its own when it does not.
+    fn writeBody(self: *ResponseWriter, body: []const u8) !void {
+        if (body.len <= self.buf.len - self.len) return self.append(body);
+        try self.flush();
+        return sockread.writeFull(self.stream, body);
+    }
+
+    fn flush(self: *ResponseWriter) !void {
+        if (self.len == 0) return;
+        const pending = self.buf[0..self.len];
+        self.len = 0;
+        try sockread.writeFull(self.stream, pending);
+    }
+};
+
 /// Write one HTTP/1.1 response. `write_body` is `false` for a `HEAD` request:
 /// the field section is the `GET` one — `Content-Length` included — and the
 /// octets are not sent (RFC 9110 §9.3.2).
+///
+/// `write_timeout_ms` bounds how long a single send may stall on a full send
+/// buffer (0 = unbounded, i.e. no bound is armed). It is the same policy the
+/// request side has always had (`header_timeout_ms`, `body_timeout_ms`) and the
+/// WS side has for its frames (`ws_write_timeout_ms`): without it, "the peer
+/// stopped reading" is a fiber parked forever, which is a shutdown that never
+/// finishes, not a slow client.
 fn writeResponse(
-    io: std.Io,
     stream: std.Io.net.Stream,
     status: u16,
     headers: std.StringHashMap([]const u8),
     body: []const u8,
     write_body: bool,
+    write_timeout_ms: u32,
 ) !void {
-    var write_buf: [4096]u8 = undefined;
-    var w = stream.writer(io, &write_buf);
-
     // Refuse first, write afterwards: a header the server will not put on the
     // wire must not leave a half-written response behind (and the caller can
     // still answer 500, because nothing has been sent yet). The map can be
@@ -2258,10 +2328,22 @@ fn writeResponse(
         try validateResponseField(entry.key_ptr.*, entry.value_ptr.*);
     }
 
+    // `SO_SNDTIMEO` is fd-global state, so it is armed for exactly this write and
+    // cleared on the way out — the error paths included. That is what keeps the
+    // bound from outliving the write it was meant for: an armed socket that
+    // anything else on this connection writes to through `std.Io`'s writer turns
+    // a timed-out send into a panic. Nothing else writes to this fd here, and no
+    // application callback runs inside this function.
+    sockread.setSendTimeout(stream, write_timeout_ms);
+    defer if (write_timeout_ms != 0) sockread.clearSendTimeout(stream);
+
+    var head_buf: [response_head_buffer_bytes]u8 = undefined;
+    var w = ResponseWriter.init(stream, &head_buf);
+
     const status_text = getStatusText(status);
 
     // Status line
-    try w.interface.print("HTTP/1.1 {d} {s}\r\n", .{ status, status_text });
+    try w.print("HTTP/1.1 {d} {s}\r\n", .{ status, status_text });
 
     // The framing field, decided before the map is written.
     //
@@ -2294,18 +2376,18 @@ fn writeResponse(
     var hiter = headers.iterator();
     while (hiter.next()) |entry| {
         if (!keep_declared_length and std.ascii.eqlIgnoreCase(entry.key_ptr.*, "content-length")) continue;
-        try w.interface.print("{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+        try w.print("{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
     }
 
     if (!chunked and !keep_declared_length) {
-        try w.interface.print("Content-Length: {d}\r\n", .{body.len});
+        try w.print("Content-Length: {d}\r\n", .{body.len});
     }
-    try w.interface.writeAll("\r\n");
+    try w.append("\r\n");
 
     // Body (already chunk-encoded if Transfer-Encoding: chunked). Under `HEAD`
     // there is none to write: the entity length above is the `GET` answer's.
-    if (write_body) try w.interface.writeAll(body);
-    try w.interface.flush();
+    if (write_body) try w.writeBody(body);
+    try w.flush();
 }
 
 /// The handler's `Content-Length`, when the value really is one: `1*DIGIT` per
@@ -2382,6 +2464,8 @@ pub const Server = struct {
     header_timeout_ms: u32 = 10_000,
     /// See `Config.body_timeout_ms`.
     body_timeout_ms: u32 = 30_000,
+    /// See `Config.response_write_timeout_ms`.
+    response_write_timeout_ms: u32 = 30_000,
     /// See `Config.ws_write_timeout_ms`.
     ws_write_timeout_ms: u32 = 0,
     /// See `Config.max_params`.
@@ -2453,6 +2537,16 @@ pub const Server = struct {
         /// connection (and its slot) forever. Exceeding it answers 408.
         /// 0 disables the deadline.
         body_timeout_ms: u32 = 30_000,
+        /// Bound on blocking **response** writes (`SO_SNDTIMEO`, armed around the
+        /// write and cleared again). Without it a peer that stops reading owns
+        /// the connection's fiber for as long as it likes — and that fiber is
+        /// what `stop()`'s drain waits for, so it owns shutdown too. It is the
+        /// write-side counterpart of `body_timeout_ms`: the budget is per
+        /// blocking `send`, so a slow-but-live peer (one that keeps draining the
+        /// socket) is never cut off, while a peer that has stopped reading gets
+        /// `error.WriteTimeout`, a truncated response and a closed connection.
+        /// 0 keeps the unbounded behavior.
+        response_write_timeout_ms: u32 = 30_000,
         /// Upper bound on parameters parsed from one request's query string or
         /// form body (occurrences, not distinct names). Mirrors PHP's
         /// `max_input_vars`: a parser that accepts unbounded input is a DoS
@@ -2509,6 +2603,7 @@ pub const Server = struct {
             .over_limit_response = config.over_limit_response,
             .header_timeout_ms = config.header_timeout_ms,
             .body_timeout_ms = config.body_timeout_ms,
+            .response_write_timeout_ms = config.response_write_timeout_ms,
             .ws_write_timeout_ms = config.ws_write_timeout_ms,
             .max_params = config.max_params,
             .owned_route_mw = std.ArrayList([]const Middleware).empty,
@@ -2988,7 +3083,7 @@ pub const Server = struct {
                     // Raw socket write, deliberately: this runs on the accept
                     // thread, and the io write path can block it (which would
                     // stop all accepts — worse than the flood we're shedding).
-                    writeOverLimit503(stream);
+                    writeOverLimit503(stream, self.response_write_timeout_ms);
                 }
                 stream.close(self.io);
                 continue;
@@ -3124,6 +3219,7 @@ pub const Server = struct {
             .max_connections = envInt(usize, env, "HTTP_MAX_CONNECTIONS", 0),
             .header_timeout_ms = envInt(u32, env, "HTTP_HEADER_TIMEOUT_MS", 10_000),
             .body_timeout_ms = envInt(u32, env, "HTTP_BODY_TIMEOUT_MS", 30_000),
+            .response_write_timeout_ms = envInt(u32, env, "HTTP_RESPONSE_WRITE_TIMEOUT_MS", 30_000),
             .ws_write_timeout_ms = envInt(u32, env, "WS_WRITE_TIMEOUT_MS", 0),
         });
     }
@@ -3324,11 +3420,11 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
             // so these two answers are the `GET` shape (see `writeErrorResponse`).
             switch (err) {
                 error.ReadFailed => {
-                    if (reader.timed_out) writeErrorResponse(server.io, stream, arena_alloc, 408, "Request Timeout", false);
+                    if (reader.timed_out) writeErrorResponse(stream, arena_alloc, 408, "Request Timeout", false, server.response_write_timeout_ms);
                     return;
                 },
                 else => {
-                    writeErrorResponse(server.io, stream, arena_alloc, 400, "Bad Request", false);
+                    writeErrorResponse(stream, arena_alloc, 400, "Bad Request", false, server.response_write_timeout_ms);
                     return;
                 },
             }
@@ -3367,7 +3463,7 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                 error.ReadFailed => {
                     // A spent read deadline is the client that stalled (headers
                     // or body): 408, observable, instead of a vanished socket.
-                    if (reader.timed_out) writeErrorResponse(server.io, stream, arena_alloc, 408, "Request Timeout", requestLineIsHead(first_line_raw));
+                    if (reader.timed_out) writeErrorResponse(stream, arena_alloc, 408, "Request Timeout", requestLineIsHead(first_line_raw), server.response_write_timeout_ms);
                     return;
                 },
                 else => {},
@@ -3376,7 +3472,7 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
             // so scanners/probes cannot inflate the error signal.
             std.log.warn("Parse error: {any}", .{err});
             const refusal = requestParseRefusal(err);
-            writeErrorResponse(server.io, stream, arena_alloc, refusal.status, refusal.message, requestLineIsHead(first_line_raw));
+            writeErrorResponse(stream, arena_alloc, refusal.status, refusal.message, requestLineIsHead(first_line_raw), server.response_write_timeout_ms);
             return;
         };
         defer request.deinit(arena_alloc);
@@ -3433,7 +3529,7 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
             .absent => {},
             .parsed => |form| ctx.form = form,
             .refused => |refusal| {
-                writeErrorResponse(server.io, stream, arena_alloc, refusal.status, refusal.message, request.method == .HEAD);
+                writeErrorResponse(stream, arena_alloc, refusal.status, refusal.message, request.method == .HEAD, server.response_write_timeout_ms);
                 return;
             },
         }
@@ -3461,7 +3557,7 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                 var hdr_it = ctx.headers.iterator();
                 while (hdr_it.next()) |e| {
                     upgrade_headers.append(arena_alloc, .{ .name = e.key_ptr.*, .value = e.value_ptr.* }) catch {
-                        writeErrorResponse(server.io, stream, arena_alloc, 500, "Internal Server Error", request.method == .HEAD);
+                        writeErrorResponse(stream, arena_alloc, 500, "Internal Server Error", request.method == .HEAD, server.response_write_timeout_ms);
                         return;
                     };
                 }
@@ -3515,7 +3611,7 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                         // would never reach the socket. The method is the real
                         // one — `GET` is the only method that gets this far, and
                         // passing it keeps the answer honest if that ever widens.
-                        writeErrorResponse(server.io, stream, allocator, 400, "WebSocket handshake failed", request.method == .HEAD);
+                        writeErrorResponse(stream, allocator, 400, "WebSocket handshake failed", request.method == .HEAD, server.response_write_timeout_ms);
                         return;
                     }
 
@@ -3525,7 +3621,7 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                     // Perform handshake
                     var framer = WsFramer.init(stream, server.io);
                     framer.handshake(ws_key) catch {
-                        writeErrorResponse(server.io, stream, allocator, 400, "WebSocket handshake failed", request.method == .HEAD);
+                        writeErrorResponse(stream, allocator, 400, "WebSocket handshake failed", request.method == .HEAD, server.response_write_timeout_ms);
                         return;
                     };
                     ctx.upgraded = true;
@@ -3660,7 +3756,6 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
 
         if (ctx.responded and !ctx.streaming) {
             writeResponse(
-                server.io,
                 stream,
                 ctx.status_code,
                 ctx.response_headers,
@@ -3670,21 +3765,36 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                 // — gets the same treatment, and the declared `Content-Length`
                 // still describes the entity the `GET` would have sent.
                 ctx.method != .HEAD,
+                server.response_write_timeout_ms,
             ) catch |err| {
-                // A header the server refuses (non-token name, CR/LF value, past
-                // the value ceiling) is a server-side bug — a handler built it
-                // from input it should have validated. `writeResponse` rejects
-                // before writing a byte, so the connection is still clean and
-                // the client gets a status instead of nothing. `warn`, not
-                // `err`: the request is answered, and an error-level line makes
-                // `scripts/test-runner.zig` fail the whole suite (it counts
-                // err-level logs as failures).
-                if (err == error.InvalidHeader or err == error.HeaderTooLarge) {
-                    std.log.warn("[HC] response header refused: {any}", .{err});
-                    writeErrorResponse(server.io, stream, arena_alloc, 500, "Internal Server Error", ctx.method == .HEAD);
-                } else {
-                    std.log.err("[HC] write error: {any}", .{err});
+                switch (err) {
+                    // A header the server refuses (non-token name, CR/LF value,
+                    // past the value ceiling) is a server-side bug — a handler
+                    // built it from input it should have validated.
+                    // `writeResponse` rejects before writing a byte, so the
+                    // connection is still clean and the client gets a status
+                    // instead of nothing. `warn`, not `err`: the request is
+                    // answered, and an error-level line makes
+                    // `scripts/test-runner.zig` fail the whole suite (it counts
+                    // err-level logs as failures).
+                    error.InvalidHeader, error.HeaderTooLarge => {
+                        std.log.warn("[HC] response header refused: {any}", .{err});
+                        writeErrorResponse(stream, arena_alloc, 500, "Internal Server Error", ctx.method == .HEAD, server.response_write_timeout_ms);
+                    },
+                    // The peer stopped reading and the response is truncated:
+                    // the connection ends here. That is the bound doing its job
+                    // (`response_write_timeout_ms`), not a server fault — and a
+                    // `debug` line, because an err-level one fails the suite.
+                    error.WriteTimeout => std.log.debug("[HC] response abandoned: peer stopped reading", .{}),
+                    error.ConnectionError, error.ConnectionClosed => std.log.debug("[HC] client went away mid-response", .{}),
+                    // Exhaustive on purpose: `writeResponse`'s error set is
+                    // inferred from its body, so a new one is a compile error
+                    // here rather than an error nobody logs.
                 }
+                // Whatever went wrong, this connection is not a clean one to
+                // keep serving: the response is either refused before its first
+                // byte, truncated, or the peer is gone. (A write timeout used to
+                // mean a parked fiber; now it means the connection ends.)
                 return;
             };
         }
@@ -3700,27 +3810,29 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
 /// Minimal 503 for over-limit connections. Raw `write` syscalls only — it runs
 /// on the accept thread, where an io-path write could stall the accept loop.
 /// The body follows `transport_error_renderer` when one is installed.
-fn writeOverLimit503(stream: std.Io.net.Stream) void {
+///
+/// Bounded like every other response write (`write_timeout_ms`, 0 = unbounded):
+/// a peer that stops reading must not own the **accept loop**, which is worse
+/// than owning one connection's fiber — no new connection can be taken while it
+/// is parked here. The over-limit socket may never speak HTTP at all, so this is
+/// the answer it is least likely to read.
+fn writeOverLimit503(stream: std.Io.net.Stream, write_timeout_ms: u32) void {
     var body_buf: [1024]u8 = undefined;
     const rendered = renderTransportError(503, "Service Unavailable", &body_buf);
     var head_buf: [256]u8 = undefined;
     const head = std.fmt.bufPrint(&head_buf, "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Type: {s}\r\nContent-Length: {d}\r\n\r\n", .{ rendered.content_type, rendered.body.len }) catch return;
+    sockread.setSendTimeout(stream, write_timeout_ms);
+    defer if (write_timeout_ms != 0) sockread.clearSendTimeout(stream);
     writeRaw(stream, head);
     writeRaw(stream, rendered.body);
 }
 
+/// Best-effort write that gives up on its own errors (`WriteTimeout` included —
+/// the caller has nothing to say to a peer that is not reading).
 fn writeRaw(stream: std.Io.net.Stream, bytes: []const u8) void {
-    var sent: usize = 0;
-    while (sent < bytes.len) {
-        const rc = std.posix.system.write(stream.socket.handle, bytes[sent..].ptr, bytes[sent..].len);
-        switch (std.posix.errno(rc)) {
-            .SUCCESS => {},
-            else => return,
-        }
-        const n: usize = @intCast(rc);
-        if (n == 0) return;
-        sent += n;
-    }
+    sockread.writeFull(stream, bytes) catch |err| {
+        std.log.debug("[Server] raw write gave up: {s}", .{@errorName(err)});
+    };
 }
 
 /// Error response for requests that failed *before* routing (bad request line,
@@ -3735,12 +3847,12 @@ fn writeRaw(stream: std.Io.net.Stream, bytes: []const u8) void {
 /// genuinely unknown there, and the body is the only answer that is right for
 /// every request that is not `HEAD`.
 fn writeErrorResponse(
-    io: std.Io,
     stream: std.Io.net.Stream,
     allocator: std.mem.Allocator,
     status: u16,
     message: []const u8,
     head_request: bool,
+    write_timeout_ms: u32,
 ) void {
     var body_buf: [1024]u8 = undefined;
     const rendered = renderTransportError(status, message, &body_buf);
@@ -3766,7 +3878,19 @@ fn writeErrorResponse(
         return;
     };
 
-    writeResponse(io, stream, status, headers, rendered.body, !head_request) catch |err| std.log.err("[Server] writeErrorResponse failed: {}", .{err});
+    writeResponse(stream, status, headers, rendered.body, !head_request, write_timeout_ms) catch |err| switch (err) {
+        // The framework's own field section was refused — a bug here, not in a
+        // handler: the 500 it was going to answer with is not on the wire.
+        error.InvalidHeader, error.HeaderTooLarge => std.log.err("[Server] writeErrorResponse's own header refused: {}", .{err}),
+        // The peer stopped reading: the answer is truncated and the connection
+        // ends with it. That is the bound doing its job, not a server fault, so
+        // it is not an error-level line (which `scripts/test-runner.zig` counts
+        // as a test failure).
+        error.WriteTimeout => std.log.debug("[Server] writeErrorResponse abandoned: peer stopped reading", .{}),
+        error.ConnectionError, error.ConnectionClosed => std.log.debug("[Server] writeErrorResponse: peer gone", .{}),
+        // Exhaustive for the same reason the caller's switch is: a new error out
+        // of `writeResponse` must be looked at, not swallowed.
+    };
 }
 
 /// Whether a request line read from the wire begins with the `HEAD` method
@@ -5046,6 +5170,219 @@ test "WebSocket fiber path receives client frames and fires on_close" {
     try std.testing.expect(ws_e2e_state.closed);
 
     server.stop();
+}
+
+/// A body no combination of kernel send/receive buffers can absorb, so a client
+/// that stops reading forces the server's write to block (measured on macOS
+/// loopback: ~1.6 MiB gets buffered before `send` blocks).
+const stalled_response_bytes = 16 * 1024 * 1024;
+
+/// The body the `/big` route serves. A global because a `HandlerFn` carries no
+/// context of its own.
+var stalled_body: []u8 = &.{};
+
+fn bigResponse(ctx: *Context) anyerror!void {
+    try ctx.text(200, stalled_body);
+}
+
+// The write-side twin of the WS shutdown tests below, and the same shape of
+// finding: the *peer* decides how long a connection fiber lives. A client that
+// asks for a large response and then never reads parks the fiber inside
+// `writeResponse`'s blocking send, and `start()`'s `conn_group.await` waits for
+// that fiber — so `stop()` would be unbounded too.
+//
+// `response_write_timeout_ms` is what ends it. The wait below is a hang budget
+// (3 s), not a latency claim: the budget under test is 200 ms.
+test "a response write is bounded: a non-reading peer cannot hold the connection fiber" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    stalled_body = try allocator.alloc(u8, stalled_response_bytes);
+    defer {
+        allocator.free(stalled_body);
+        stalled_body = &.{};
+    }
+    @memset(stalled_body, 'x');
+
+    // `header_timeout_ms` is small too, so the *keep-alive* read a finished
+    // response returns to cannot outlive the test either.
+    var server = Server.initWithConfig(std.testing.io, allocator, .{
+        .port = 0,
+        .response_write_timeout_ms = 200,
+        .header_timeout_ms = 200,
+    });
+    defer server.deinit();
+    var group = server.group("");
+    try group.get("big", bigResponse, null);
+
+    const th = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, struct {
+        fn run(s: *Server) void {
+            s.start() catch {};
+        }
+    }.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        server.stop();
+        th.join();
+    };
+
+    var port: u16 = 0;
+    var tries: usize = 0;
+    while (tries < 200) : (tries += 1) {
+        if (server.listener) |*l| {
+            port = l.socket.address.getPort();
+            break;
+        }
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    try std.testing.expect(port != 0);
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+    var stream = try addr.connect(std.testing.io, .{ .mode = .stream });
+    var closed_client = false;
+    defer if (!closed_client) stream.close(std.testing.io);
+
+    var wbuf: [256]u8 = undefined;
+    var w = stream.writer(std.testing.io, &wbuf);
+    // Ask for the big body and then *never read*: no more client work happens
+    // until the assertions below are done.
+    try w.interface.writeAll("GET /big HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try w.interface.flush();
+
+    // The fiber took the connection...
+    var waited_ms: usize = 0;
+    while (server.active_connections.load(.monotonic) == 0 and waited_ms < 3000) : (waited_ms += 10) {
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    try std.testing.expectEqual(@as(u64, 1), server.active_connections.load(.monotonic));
+
+    // ...and the write budget ended it, with nobody reading the socket.
+    waited_ms = 0;
+    while (server.active_connections.load(.monotonic) != 0 and waited_ms < 3000) : (waited_ms += 10) {
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    const still_running = server.active_connections.load(.monotonic);
+    if (still_running != 0) {
+        // Report before the cleanup unblocks it: a read here would let the write
+        // finish and hide exactly what is being asserted.
+        std.log.err("[test] a non-reading peer held the connection fiber {d}ms past the 200ms write budget", .{waited_ms});
+        var drain: [64 * 1024]u8 = undefined;
+        _ = std.posix.read(stream.socket.handle, &drain) catch {};
+    }
+    try std.testing.expectEqual(@as(u64, 0), still_running);
+
+    // And the client's answer is a *truncated* response, not a delivered one:
+    // the field section names the whole body, the octets stop early, and the
+    // connection ends there.
+    var saw_declared_length = false;
+    var total: usize = 0;
+    var buf: [64 * 1024]u8 = undefined;
+    while (total < stalled_response_bytes) {
+        const n = std.posix.read(stream.socket.handle, &buf) catch break;
+        if (n == 0) break;
+        if (!saw_declared_length and std.mem.indexOf(u8, buf[0..n], "Content-Length: 16777216\r\n") != null) saw_declared_length = true;
+        total += n;
+    }
+    try std.testing.expect(saw_declared_length);
+    try std.testing.expect(total > 0);
+    try std.testing.expect(total < stalled_response_bytes);
+
+    stream.close(std.testing.io);
+    closed_client = true;
+    // `stop()` first: `start()`'s thread only returns once the server is told
+    // to stop, so joining before that is a hang, not a shutdown.
+    server.stop();
+    th.join();
+    joined = true;
+}
+
+// The other half of that contract: `response_write_timeout_ms = 0` is the
+// behavior the default replaces — no budget, so the peer owns the fiber. This is
+// the red shape the bound above is measured against, and it is a test rather
+// than a note because "0 means unbounded" is a documented promise.
+test "response_write_timeout_ms = 0 keeps the unbounded write: only the client can end it" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    stalled_body = try allocator.alloc(u8, stalled_response_bytes);
+    defer {
+        allocator.free(stalled_body);
+        stalled_body = &.{};
+    }
+    @memset(stalled_body, 'x');
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{
+        .port = 0,
+        .response_write_timeout_ms = 0,
+        .header_timeout_ms = 200,
+    });
+    defer server.deinit();
+    var group = server.group("");
+    try group.get("big", bigResponse, null);
+
+    const th = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, struct {
+        fn run(s: *Server) void {
+            s.start() catch {};
+        }
+    }.run, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        server.stop();
+        th.join();
+    };
+
+    var port: u16 = 0;
+    var tries: usize = 0;
+    while (tries < 200) : (tries += 1) {
+        if (server.listener) |*l| {
+            port = l.socket.address.getPort();
+            break;
+        }
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    try std.testing.expect(port != 0);
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+    var stream = try addr.connect(std.testing.io, .{ .mode = .stream });
+    var closed_client = false;
+    defer if (!closed_client) stream.close(std.testing.io);
+
+    var wbuf: [256]u8 = undefined;
+    var w = stream.writer(std.testing.io, &wbuf);
+    try w.interface.writeAll("GET /big HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try w.interface.flush();
+
+    // A second of silence with the client not reading: the fiber cannot have
+    // finished, because finishing needs the whole body to be accepted.
+    std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(1000), .real) catch {};
+    try std.testing.expectEqual(@as(u64, 1), server.active_connections.load(.monotonic));
+
+    // Reading is what ends it, and the whole body arrives (nothing was cut):
+    // `total` counts the field section too, so the body is what follows the
+    // blank line the response starts with.
+    var total: usize = 0;
+    var head_bytes: usize = 0;
+    var buf: [64 * 1024]u8 = undefined;
+    while (total < stalled_response_bytes) {
+        const n = std.posix.read(stream.socket.handle, &buf) catch break;
+        if (n == 0) break;
+        if (head_bytes == 0) {
+            if (std.mem.indexOf(u8, buf[0..n], "\r\n\r\n")) |i| head_bytes = i + 4;
+        }
+        total += n;
+    }
+    try std.testing.expect(head_bytes > 0);
+    try std.testing.expectEqual(@as(usize, stalled_response_bytes), total - head_bytes);
+
+    stream.close(std.testing.io);
+    closed_client = true;
+    var waited_ms: usize = 0;
+    while (server.active_connections.load(.monotonic) != 0 and waited_ms < 3000) : (waited_ms += 10) {
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    server.stop();
+    th.join();
+    joined = true;
 }
 
 /// Server-side state for the silent-peer shutdown test. Atomics because the
@@ -6599,6 +6936,7 @@ test "fromEnv reads the documented variables off init.environ_map" {
     try env.put("HTTP_MAX_CONNECTIONS", "4096");
     try env.put("HTTP_HEADER_TIMEOUT_MS", "2500");
     try env.put("HTTP_MAX_BODY", "1024");
+    try env.put("HTTP_RESPONSE_WRITE_TIMEOUT_MS", "1500");
 
     var server = try Server.fromEnv(std.testing.io, allocator, &env);
     defer server.deinit();
@@ -6607,6 +6945,7 @@ test "fromEnv reads the documented variables off init.environ_map" {
     try std.testing.expectEqual(@as(usize, 4096), server.max_connections);
     try std.testing.expectEqual(@as(u32, 2500), server.header_timeout_ms);
     try std.testing.expectEqual(@as(usize, 1024), server.max_body_size);
+    try std.testing.expectEqual(@as(u32, 1500), server.response_write_timeout_ms);
     // Unset or malformed variables fall back to the documented defaults.
     try std.testing.expectEqual(@as(u32, 0), server.ws_write_timeout_ms);
 }
@@ -6667,7 +7006,7 @@ test "long response header values are written, not dropped" {
     defer headers.deinit();
     try headers.put("Access-Control-Allow-Origin", origin);
 
-    try writeResponse(std.testing.io, stream, 200, headers, "{}", true);
+    try writeResponse(stream, 200, headers, "{}", true, 0);
 
     var buf: [1024]u8 = undefined;
     const response = try readPeer(fds[1], &buf, 2000);
@@ -6694,7 +7033,7 @@ test "response header values have an explicit ceiling, reported as an error" {
 
     // No fixed write buffer exists anymore, so the ceiling has to be explicit
     // and named — not "NoSpaceLeft from a scratch buffer nobody can see".
-    try std.testing.expectError(error.HeaderTooLarge, writeResponse(std.testing.io, stream, 200, headers, "{}", true));
+    try std.testing.expectError(error.HeaderTooLarge, writeResponse(stream, 200, headers, "{}", true, 0));
 }
 
 test "setHeader refuses a CR/LF/NUL value and a non-token name" {

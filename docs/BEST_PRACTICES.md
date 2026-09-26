@@ -1607,6 +1607,33 @@ var server = zigmodu.http.Server.initWithConfig(io, allocator, .{
 （`Server.fromEnv`）。上线前按"预期并发 × 2"设 `max_connections`，
 `header_timeout_ms` 取 p99 建连时间的两倍左右（默认 10s 已相当宽松）。
 
+**HTTP 响应出站**（"慢客户端"的写方向；上面几行是请求方向的期限）：
+
+```zig
+var server = zigmodu.http.Server.initWithConfig(io, allocator, .{
+    .port = 8080,
+    .response_write_timeout_ms = 30_000,   // 0 = 旧行为（可无限阻塞）
+});
+```
+
+客户端要一个大响应、然后不再读：内核发送缓冲填满后 `send` 就停住，连接 fiber
+一直 park 在里面 —— 而 `start()` 退出要 `conn_group.await` 它，于是**关停时长
+由对端决定**。超时后 `writeResponse` 返回 `error.WriteTimeout`，连接被截断并
+关闭。默认 30 s，与请求方向的 `body_timeout_ms` 对称；预算是**每次 `send`** 的，
+所以只是慢（一直在流动）的对端不会被切断。
+
+实现上有两处必须照做，自己写裸 socket 代码时同样适用：
+
+* `ResponseWriter`（`src/api/Server.zig`）走**裸 `send`**，不走 `std.Io` 的
+  writer：后者（`Threaded.netWritePosix`）把超时的 `EAGAIN` 当 errno bug
+  （`unreachable`），上界根本表达不出来。`SO_SNDTIMEO` 也只围绕这一次写
+  arm/clear —— 它对 fd 是**全局**的，留着会让同一 fd 上任何 `std.Io` 写者把
+  超时变成 panic（见 `core/sockread.zig` 的 `clearSendTimeout`）。
+* `write`/`writev` 写**已被对端 reset** 的 socket 会**发 SIGPIPE**，默认动作是
+  杀进程（`Application.zig` 只装了 INT/TERM 的 handler）。所以 `core/sockread.zig`
+  的三个写助手现在都用 `send`/`sendmsg` + `MSG_NOSIGNAL`：实测 `write` → 进程
+  exit 141（被信号杀死），`send(MSG_NOSIGNAL)` → `EPIPE` → `error.ConnectionError`。
+
 **WebSocket 出站**（同属"慢客户端"问题，但发生在写方向）：
 
 ```zig
@@ -1638,9 +1665,19 @@ shard 锁）被无限期占住。设了超时后写返回 `error.WriteTimeout` �
 | keep-alive 等下一个请求 | `header_timeout_ms` |
 | 请求行 + 头 | `header_timeout_ms`（slowloris 闸门） |
 | body | `body_timeout_ms` |
+| **响应写**（`writeResponse`） | **`response_write_timeout_ms`**（过去：无上界，对端说了算） |
 | HTTP/2 会话空闲 | `header_timeout_ms`（GOAWAY `ENHANCE_YOUR_CALM`） |
 | **WS 读循环** | **`stop()` 的唤醒**（过去：无上界，对端说了算） |
 | 你的回调（`on_connect` / `on_message` / `on_close`）、handler | **无上界** —— 必须自己返回 |
+
+**响应写**那一行的形状和 WS 读循环一样，只是方向相反：客户端发一个 `GET` 要一个
+16 MiB 的响应、然后**不再读**，服务端的 `send` 就在塞满的内核缓冲上停住；而
+`start()` 退出时要 `conn_group.await` 这条 fiber —— 于是**关停时长同样由对端决定**。
+`response_write_timeout_ms` 就是这条 fiber 的上界（`SO_SNDTIMEO`，围绕写本身
+arm/clear，避免它外溢到同一 fd 上别的写者）：超时后 `writeResponse` 返回
+`error.WriteTimeout`、连接被截断并关闭。预算是**每次 `send`** 的，所以只是慢
+（一直在流动）的对端不会被切断。过大/过慢的内核缓冲是这条路径唯一的"缓冲"，见
+`src/api/Server.zig` 的 `ResponseWriter`。
 
 最后一行是有意的：`shutdown` 够不到 park 在回调里的 fiber，**没有预算会打断它**。
 回调里等的东西都要自带超时（出站请求、锁），否则 `stop()` 会一直等——提前返回会在

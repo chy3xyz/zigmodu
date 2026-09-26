@@ -95,6 +95,12 @@ pub fn closeListener(io: std.Io, listener: *std.Io.net.Server) void {
 /// holds a shard lock. After the timeout the syscall returns `EAGAIN`, which
 /// the write helpers surface as `error.WriteTimeout` so callers can disconnect
 /// the peer. 0 disables the bound (previous behavior).
+///
+/// The option is **fd-global and not harmless to leave armed**: `std.Io`'s
+/// writers answer a timed-out send with `errnoBug` (`unreachable`). So it is for
+/// a *section of code that owns the fd's writes*, not for a connection's whole
+/// life: arm it, do the bounded writes, and `clearSendTimeout` on the way out
+/// (see the note there).
 pub fn setSendTimeout(stream: std.Io.net.Stream, timeout_ms: u32) void {
     if (timeout_ms == 0) return;
     const tv = std.posix.timeval{
@@ -127,10 +133,24 @@ pub fn setRecvTimeout(stream: std.Io.net.Stream, timeout_ms: u32) void {
 }
 
 /// Write all of `bytes` (loops on partial writes so frames are never split).
+///
+/// `send(MSG_NOSIGNAL)`, not `write`, and that matters: a peer whose socket is
+/// already closed — or **reset**, which is what a crashed client leaves behind —
+/// makes a plain `write` raise `SIGPIPE`, and its default action terminates the
+/// process. Measured on macOS against a `socketpair` whose peer end is closed:
+/// `write` → the process is killed (exit 141), `send(MSG_NOSIGNAL)` → `-1`/`EPIPE`,
+/// which is the `error.ConnectionError` below. `RaftTransport.sendAll` made this
+/// switch for the same reason; every raw write in this file has to.
+///
+/// `std.Io`'s own writer is not the alternative: it sets `MSG_NOSIGNAL` too
+/// (`Threaded.netWritePosix`), but it answers a timed-out send with `errnoBug` —
+/// `unreachable` — so a *bounded* write cannot be expressed through it at all.
+/// A bound has to be the socket's own (`setSendTimeout`) plus this helper, which
+/// is what `writeResponse` does around the response it writes.
 pub fn writeFull(stream: std.Io.net.Stream, bytes: []const u8) !void {
     var sent: usize = 0;
     while (sent < bytes.len) {
-        const rc = std.posix.system.write(stream.socket.handle, bytes[sent..].ptr, bytes[sent..].len);
+        const rc = std.c.send(stream.socket.handle, bytes[sent..].ptr, bytes.len - sent, std.posix.MSG.NOSIGNAL);
         switch (std.posix.errno(rc)) {
             .SUCCESS => {},
             .AGAIN => return error.WriteTimeout,
@@ -142,8 +162,29 @@ pub fn writeFull(stream: std.Io.net.Stream, bytes: []const u8) !void {
     }
 }
 
-/// Write all segments with a single `writev` syscall (header + body in one
+/// Undo `setSendTimeout`: back to the blocking default.
+///
+/// Needed because `SO_SNDTIMEO` is **fd-global**, and the option is not harmless
+/// to leave on: `std.Io`'s writers answer a timed-out send with `errnoBug`
+/// (`Threaded.netWritePosix` — `unreachable`), so an armed socket that a
+/// `stream.writer(io, …)` writes to turns the timeout into a panic. A caller that
+/// arms the bound for one bounded write (`writeResponse` does) has to clear it on
+/// the way out, including the error paths — that is what makes "the bound is
+/// armed only while this fiber owns the fd for writes" true rather than hopeful.
+///
+/// A kernel that will not clear it is warned about, like every other option here.
+pub fn clearSendTimeout(stream: std.Io.net.Stream) void {
+    const tv = std.posix.timeval{ .sec = 0, .usec = 0 };
+    applyTimeout(stream.socket.handle, std.posix.SO.SNDTIMEO, &tv, "SO_SNDTIMEO (clear)", "an armed timeout would outlive the write it was meant to bound");
+}
+
+/// Write all segments with a single `sendmsg` syscall (header + body in one
 /// call). Falls back to per-segment writes only on a rare partial write.
+///
+/// `sendmsg(MSG_NOSIGNAL)`, not `writev`: same reason `writeFull` gives — a peer
+/// that already reset its socket turns a plain `writev` into `SIGPIPE` and the
+/// process dies. This is the WebSocket frame path, where a client that crashes
+/// mid-fan-out is exactly the peer that does it.
 pub fn writevAll(stream: std.Io.net.Stream, parts: []const []const u8) !void {
     var iovecs: [16]std.posix.iovec_const = undefined;
     var total: usize = 0;
@@ -154,9 +195,19 @@ pub fn writevAll(stream: std.Io.net.Stream, parts: []const []const u8) !void {
     }
     if (count == 0) return;
 
+    const msg: std.posix.msghdr_const = .{
+        .name = null,
+        .namelen = 0,
+        .iov = &iovecs,
+        .iovlen = @intCast(count),
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+
     var sent: usize = 0;
     while (sent < total) {
-        const rc = std.posix.system.writev(stream.socket.handle, &iovecs, @intCast(count));
+        const rc = std.c.sendmsg(stream.socket.handle, &msg, std.posix.MSG.NOSIGNAL);
         const got = switch (std.posix.errno(rc)) {
             .SUCCESS => @as(usize, @intCast(rc)),
             .AGAIN => return error.WriteTimeout,
@@ -343,4 +394,77 @@ test "setSendTimeout(0) keeps the blocking default" {
     var buf: [5]u8 = undefined;
     const n = try std.posix.read(fds[1], &buf);
     try std.testing.expectEqualStrings("hello", buf[0..n]);
+}
+
+test "writeFull and writevAll report a peer that is gone instead of dying of SIGPIPE" {
+    // What this pins: both helpers turn "the peer is gone" into
+    // `error.ConnectionError` rather than a process dead from SIGPIPE.
+    //
+    // **It cannot go red here.** Zig's test runner ignores SIGPIPE for the test
+    // process (measured: inside `zig test`, the same raw `write` below returns
+    // `EPIPE`), so a `write`-based implementation also passes this. The red was
+    // measured *outside* a test process, with a two-line standalone binary doing
+    // exactly this `socketpair` + close + `write`: **exit 141** (killed by
+    // SIGPIPE) with `write`, and `-1`/`EPIPE` — the error below — with
+    // `send(MSG_NOSIGNAL)`. That is the defect: in a real application the default
+    // SIGPIPE action terminates the process (`Application.zig` installs handlers
+    // for INT/TERM, not PIPE).
+    //
+    // The peer is closed *before* the write on purpose: over TCP a graceful FIN
+    // lets the next write succeed (the bytes sit in the send buffer), so TCP
+    // cannot make this deterministic. The peer that matters in production is the
+    // one that has **reset** — a crashed WebSocket client — and a closed AF_UNIX
+    // peer gives the same `EPIPE` on the spot.
+    var fds: [2]std.posix.socket_t = undefined;
+    const rc = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = fds[0], .address = undefined } };
+    defer stream.close(std.testing.io);
+    _ = std.posix.system.close(fds[1]);
+
+    try std.testing.expectError(error.ConnectionError, writeFull(stream, "x"));
+    try std.testing.expectError(error.ConnectionError, writevAll(stream, &.{ "x", "y" }));
+}
+
+test "the send bound clears: the socket reports the option it was given, and 0 after" {
+    // What makes arm-then-write-then-clear a *section* rather than a permanent
+    // change to the fd: the kernel is asked, not trusted. A socket left armed
+    // would take any `std.Io` writer on it down with `errnoBug` the first time a
+    // send timed out.
+    var fds: [2]std.posix.socket_t = undefined;
+    const rc = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = fds[0], .address = undefined } };
+    defer stream.close(std.testing.io);
+    defer _ = std.posix.system.close(fds[1]);
+
+    // Unset to begin with.
+    try expectSendTimeoutMs(stream, 0);
+
+    setSendTimeout(stream, 250);
+    try expectSendTimeoutMs(stream, 250);
+
+    clearSendTimeout(stream);
+    try expectSendTimeoutMs(stream, 0);
+
+    // And `setSendTimeout(0)` is the no-op the other test relies on.
+    setSendTimeout(stream, 0);
+    try expectSendTimeoutMs(stream, 0);
+}
+
+fn expectSendTimeoutMs(stream: std.Io.net.Stream, ms: u64) !void {
+    var tv: std.posix.timeval = undefined;
+    var len: std.posix.socklen_t = @sizeOf(std.posix.timeval);
+    const rc = std.posix.system.getsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, @ptrCast(&tv), &len);
+    // macOS rejects the option on an AF_UNIX socket whose peer is gone; here the
+    // peer is alive, so a rejection is a real failure.
+    try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(rc));
+    try std.testing.expectEqual(@as(i64, @intCast(ms / 1000)), @as(i64, tv.sec));
+    try std.testing.expectEqual(@as(i64, @intCast((ms % 1000) * 1000)), @as(i64, tv.usec));
 }

@@ -2,6 +2,47 @@
 
 ## [Unreleased]
 
+### 第 55 批：非 WS 的**响应写无上界**（对端不读即可把关停拖住）—— 已修，顺带修掉**裸写会发 SIGPIPE 杀进程**（**破坏性：否**）
+
+第 53 批 ③ 报的那条（"`writeResponse` 走阻塞 send、没有 `SO_SNDTIMEO`，对'对端不读 + 响应大于内核发送缓冲'无上界"）本批落地，并且修它的过程中发现同一段代码里还有一个更狠的：**裸 `write`/`writev` 写已被 reset 的对端会发 SIGPIPE，默认动作是杀进程**。
+
+**① 响应写有了预算，默认 30 s（`response_write_timeout_ms`）**
+
+事实链（第 53 批已核，本批用测试锁住）：客户端发一个 `GET` 要 16 MiB 的响应、然后**不再读** —— 内核发送缓冲（macOS 回环实测约 1.6 MiB）填满后 `send` 停住，连接 fiber 就 park 在里面；而 `start()` 的 defer 是 `conn_group.await`，于是 **`stop()` 的时长由对端决定**。请求方向早就有 `header_timeout_ms` / `body_timeout_ms`，写方向一个都没有。
+
+* **`ResponseWriter`（`src/api/Server.zig`）**：字段段 + 尽量多的 body 先进同一个栈缓冲（小响应仍是一次系统调用），溢出即冲刷；它走**裸 `send`**，不走 `std.Io` 的 writer —— 后者（`Threaded.netWritePosix`）把超时的 `EAGAIN` 当 errno bug（`unreachable`），上界根本表达不出来。单行放不进空缓冲 → `error.HeaderTooLarge`（和"值超 `max_response_header_value_bytes`"同一个错误，调用方已有的 warn + 500 分支接住它）。
+* **预算是每次 `send` 的**（`SO_SNDTIMEO` 语义）：一直在流动的慢对端永远不会被切断，只有"整整一个预算内一个字节都推不动"的对端才会拿到 `error.WriteTimeout` → 响应被截断、连接关闭（调用方在这一分支上是 `debug` 而不是 `err`：这是预算在干活，不是服务端出错）。
+* **arm/clear 只围住这一次写**：`SO_SNDTIMEO` 对 fd 是全局的，留着会让同一 fd 上任何 `std.Io` 写者把超时变成 panic（`errnoBug`），所以 `writeResponse` 用 `defer` 在出口清掉（`sockread.clearSendTimeout`，新加），失败路径也一样。
+* **连接数超限的 503 也上了同一个预算**：`writeOverLimit503` 跑在 **accept 线程**上，它停住 = 没有新连接能被 accept ——比停住一条连接 fiber 更糟。`writeRaw` 顺手换成 `sockread.writeFull`（见 ②）。
+* **配置面**：`Server.Config.response_write_timeout_ms`（默认 `30_000`，`0` = 旧行为）、`HTTP_RESPONSE_WRITE_TIMEOUT_MS`、`docs/API.md` 的 Server Options 表 + 环境变量清单、`docs/BEST_PRACTICES.md` 的"各阶段等待 ↔ 上界"表新增一行（响应写）+ 一段说明。
+
+> **红证据**（保留新测试、把 `sockread.setSendTimeout(stream, 0)` 放回 `writeResponse`——即修复前的无界行为）：
+> `[test] a non-reading peer held the connection fiber 3000ms past the 200ms write budget` /
+> `expected 0, found 1`。修后两条测试全绿：**有预算**（fiber 在预算内结束、客户端拿到的是
+> **被截断**的响应：`Content-Length: 16777216` 却是几十 MB 里的一小段 + 连接结束）与
+> **`0` = 旧行为**（客户端不读 → 1 s 后 fiber 仍在；客户端开始读 → 全量 16 MiB 到达，一个字节不缺）。
+
+**② 同一条路径上的 SIGPIPE：裸写已 reset 的对端会杀进程**
+
+`core/sockread.zig` 的 `writeFull`/`writevAll` 用的是裸 `write`/`writev`。写一个已经 **reset** 的
+socket（= 崩掉的 WebSocket 客户端，或 RST 过的连接）会 **发 SIGPIPE**，而 `Application.zig` 只装了
+INT/TERM 的 handler —— 默认动作是**终止进程**。实测（独立小程序，`socketpair` + 关掉对端）：
+`write` → **exit 141**（被信号杀死）；`send(MSG_NOSIGNAL)` → `-1`/`EPIPE`，也就是本文件里的
+`error.ConnectionError`。`cluster/RaftTransport.zig` 的 `sendAll` 早就为同一个理由换成了
+`MSG_NOSIGNAL`（注释里写着"否则会把进程带走"），这两个公共助手当时没跟上；本批换成
+`send`/`sendmsg` + `MSG_NOSIGNAL`。
+
+> **这条的红证据拿不到在测试里**：Zig 的 test runner 给测试进程忽略了 SIGPIPE（实测：同一个
+> `socketpair` + `write` 在 `zig test` 里返回 `EPIPE`），所以新测试在同形状下**旧实现也会通过**。
+> 红证据是**进程外**的实测（上面两个退出码），测试只钉住"报 `ConnectionError`，而不是死"这条契约——
+> 这一条已经足以防止实现退回 `write`（退回会让**真实应用**重新可被一个 RST 杀掉，而不是让测试变红）。
+
+**③ 本批不声称**：`ctx.streaming` 那条（`Context.flushHeadersToSocket` / `writeChunk`，以及
+`src/http/Sse.zig` 的 `SseWriter` 五个方法）**仍走 `std.Io` 的 writer，仍然无界** —— 一个不读的
+SSE 订阅者照样能把 fiber park 住，`stop()` 照样等它。修它要把同一个预算接线进 `Context`/`SseWriter`
+（且不能靠"给 fd 挂一次 `SO_SNDTIMEO`"绕过：那会让这些 io 写者在超时时 panic）。这是本批留下的
+最大缺口，下一批的主题。
+
 ### 第 54 批：上一批报出的 `ws_uring` 两个真缺陷 —— 升级后 fd 归属自相矛盾导致的**重复关闭**、`adopt` 与事件循环之间**共享元数据的跨线程撕裂**（**破坏性：否**）
 
 第 53 批 ② 报的这两条，本批落地。文件仍是 Linux-only（`init` 体的第一个语句就是 `@compileError`），
