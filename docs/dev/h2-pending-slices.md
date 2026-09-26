@@ -13,7 +13,7 @@
 |-------|------|------|
 | 3 MiB | 正常服务 | 正常服务 |
 | 6 MiB | `RST_STREAM`，error_code = **10 = ENHANCE_YOUR_CALM** | 完整到达，无 RST / GOAWAY |
-| 16 MiB | `RST_STREAM`，error_code = **2 = INTERNAL_ERROR** | 完整到达（本批只测 6 MiB；16 MiB 由"按帧切"结构保证，见下） |
+| 16 MiB | `RST_STREAM`，error_code = **2 = INTERNAL_ERROR** | 能编号也能开写（第 61 批的反面测试服务的就是 16 MiB，只是客户端故意不读，被写预算截断）；端到端"读满 16 MiB"的用例本批没加 |
 
 修复前客户端在线缆上依次看到 `SETTINGS`（服务器自己的）→ `SETTINGS ACK` → **`RST_STREAM(stream 1)`**，
 **一个 HEADERS/DATA 帧都没有** —— 响应根本没开始写就被拒了。

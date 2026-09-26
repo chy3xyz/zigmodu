@@ -47,10 +47,13 @@ DATA 帧。** 切片要以帧为单位，于是暴露出来：帧长只有 24 �
 * **正面** `h2 server sends a response larger than max_pending_bytes to a reading client`：回环 + 会读、
   并把发送窗口开大的客户端要 6 MiB → 逐字节比对全部到达、`END_STREAM` 收到、无 RST/GOAWAY、
   DATA 帧多于一个。先断言 `(ServeOptions{}).max_pending_bytes < 6 MiB`，否则它对着旧行为也会绿。
-* **反面** `h2: a non-reading client is ended by the write budget, not by the pending cap`：同一个 6 MiB
-  + **不读**的客户端 → 由 `response_write_timeout_ms`(200 ms) 结束（`active_connections` 归零），
+* **反面** `h2: a non-reading client is ended by the write budget, not by the pending cap`：**16 MiB** +
+  **不读**的客户端 → 由 `response_write_timeout_ms`(200 ms) 结束（`active_connections` 归零），
   拿到的是**截断的 body** 且**没有** RST/GOAWAY —— 与"被上限拒绝"形状不同。`header_timeout_ms`
-  保持默认 10 s，免得读空闲预算抢先。
+  保持默认 10 s，免得读空闲预算抢先。这条用的是 16 MiB（与 `Server.zig` 那条 H1 stall 测试同数
+  同理由 —— macOS 回环实测内核能吸 ~1.6 MiB，Linux 的 `tcp_wmem`/`tcp_rmem` autotune 可到 ~10 MiB，
+  6 MiB 在 Linux 上可能被整个吸掉，那样"写阻塞"就不会发生）；发送窗口开到 4×body，免得是**窗口**
+  而不是**写预算**把会话停住（那会走 10 s 读空闲）。正面那条保持 6 MiB + 2×窗口就够。
 * **单元** `encodeSiteResponseWire splits the body into SETTINGS_MAX_FRAME_SIZE chunks`（40 KiB → 3 帧、
   每帧 ≤ 16384、只末帧带 `END_STREAM`）、`OutboundScheduler stages a response larger than
   max_pending_bytes instead of refusing it`、`OutboundScheduler lets a budget-starved stream start,

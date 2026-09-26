@@ -4194,6 +4194,12 @@ test "h2 server answers a HEAD on a gRPC route with no DATA frame" {
 /// `ServeOptions.max_pending_bytes`. A global because a `HandlerFn` carries no
 /// context of its own.
 const h2_big_body_bytes = 6 * 1024 * 1024;
+/// The body the **non-reading** client's session serves: large enough that no
+/// combination of kernel send/receive buffers absorbs it, so the write is
+/// forced to block — measured on macOS loopback at ~1.6 MiB absorbed, and Linux
+/// autotunes `tcp_wmem`/`tcp_rmem` up to ~10 MiB, so this is the same 16 MiB the
+/// HTTP/1.1 stall test in `Server.zig` uses for the same reason.
+const h2_stall_body_bytes = 16 * 1024 * 1024;
 var h2_big_body: []u8 = &.{};
 
 fn h2BigResponse(ctx: *api_server.Context) anyerror!void {
@@ -4330,7 +4336,9 @@ test "h2 server sends a response larger than max_pending_bytes to a reading clie
     var running = try RunningServer.start(&server);
     defer running.stop(&server);
 
-    const script = try h2BigRequestScript(allocator, "/h2big", 8 * 1024 * 1024);
+    // The window is opened past the body up front, so the transfer cannot stop
+    // on flow control: this test is about the queue cap, not about the window.
+    const script = try h2BigRequestScript(allocator, "/h2big", 2 * h2_big_body_bytes);
     defer allocator.free(script);
     const body = try allocator.alloc(u8, h2_big_body_bytes);
     defer allocator.free(body);
@@ -4355,7 +4363,7 @@ test "h2: a non-reading client is ended by the write budget, not by the pending 
     if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
-    h2_big_body = try allocator.alloc(u8, h2_big_body_bytes);
+    h2_big_body = try allocator.alloc(u8, h2_stall_body_bytes);
     defer {
         allocator.free(h2_big_body);
         h2_big_body = &.{};
@@ -4377,7 +4385,10 @@ test "h2: a non-reading client is ended by the write budget, not by the pending 
     var running = try RunningServer.start(&server);
     defer running.stop(&server);
 
-    const script = try h2BigRequestScript(allocator, "/h2big", 8 * 1024 * 1024);
+    // The window is opened far past both the body and anything the kernel can
+    // absorb, so the only thing that can stop this session is the write budget —
+    // were it the window, the session would sit until the 10 s read idle budget.
+    const script = try h2BigRequestScript(allocator, "/h2big", 4 * h2_stall_body_bytes);
     defer allocator.free(script);
 
     const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", running.port);
