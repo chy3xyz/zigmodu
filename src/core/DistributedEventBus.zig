@@ -1847,17 +1847,22 @@ pub const DistributedEventBus = struct {
     }
 
     fn subscribeHandler(self: *Self, topic: []const u8, handler: TopicHandler) !void {
+        // Existing topic: append in place. Nothing is allocated for the key, so a
+        // failed append leaves the list exactly as it was.
+        if (self.topic_callbacks.getPtr(topic)) |callbacks| {
+            return callbacks.append(self.allocator, handler);
+        }
+
+        // New topic: build the entry to completion, then insert it as the *last*
+        // fallible step. The old shape (`getOrPut` + a fallible key dupe + the
+        // caller's `errdefer`) could both double-free the key (the found-existing
+        // branch) and leave the map holding a dangling key (a failed append).
         const topic_copy = try self.allocator.dupe(u8, topic);
         errdefer self.allocator.free(topic_copy);
-
-        const gop = try self.topic_callbacks.getOrPut(topic_copy);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = topic_copy;
-            gop.value_ptr.* = std.ArrayList(TopicHandler).empty;
-        } else {
-            self.allocator.free(topic_copy);
-        }
-        try gop.value_ptr.append(self.allocator, handler);
+        var callbacks = std.ArrayList(TopicHandler).empty;
+        errdefer callbacks.deinit(self.allocator);
+        try callbacks.append(self.allocator, handler);
+        try self.topic_callbacks.put(topic_copy, callbacks);
     }
 
     /// Unsubscribe a plain callback from a topic

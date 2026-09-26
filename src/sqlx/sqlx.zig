@@ -2988,6 +2988,20 @@ pub const PostgresConn = struct {
         defer if (begin) |b| libpq_c.PQclear(b);
         if (begin == null or libpq_c.PQresultStatus(begin.?) != libpq_c.ExecStatusType.PGRES_COMMAND_OK) return error.DatabaseError;
 
+        // Every failure from here on must leave the connection *usable*: it goes
+        // back to the pool (`release`), and the driver's `ping` only checks
+        // `PQstatus` — which stays CONNECTION_OK inside an aborted transaction. A
+        // slot left in that state answers 25P02 ("current transaction is aborted")
+        // to every later statement until lifetime/idle eviction, and the server
+        // keeps whatever locks the transaction took.
+        errdefer {
+            const rb = libpq_c.PQexec(self.conn, "ROLLBACK");
+            defer if (rb) |r| libpq_c.PQclear(r);
+            if (rb == null or libpq_c.PQresultStatus(rb.?) != libpq_c.ExecStatusType.PGRES_COMMAND_OK) {
+                std.log.err("[sqlx] COPY-in failed and ROLLBACK did not succeed; this pooled connection may be unusable", .{});
+            }
+        }
+
         const res = libpq_c.PQexec(self.conn, @ptrCast(sql_z.ptr));
         defer if (res) |r| libpq_c.PQclear(r);
         if (res == null or libpq_c.PQresultStatus(res.?) != libpq_c.ExecStatusType.PGRES_COPY_IN) return error.DatabaseError;
@@ -6371,12 +6385,18 @@ pub const CachedConn = struct {
                 var parsed = hit;
                 defer parsed.deinit();
                 const items = try self.allocator.alloc(T, parsed.value.len);
+                // Only the slots actually written are freed: `alloc` leaves the
+                // rest `undefined`, and freeing an uninitialised field pointer is
+                // heap corruption (an OOM part-way through this loop used to do
+                // exactly that).
+                var written: usize = 0;
                 errdefer {
-                    for (items) |item| freeScanned(self.allocator, T, item);
+                    for (items[0..written]) |item| freeScanned(self.allocator, T, item);
                     self.allocator.free(items);
                 }
                 for (parsed.value, 0..) |item, i| {
                     items[i] = try deepCopyStruct(self.allocator, T, item);
+                    written = i + 1;
                 }
                 return .{ .items = items, .arena = null };
             }
@@ -6406,12 +6426,18 @@ pub const CachedConn = struct {
                 var parsed = hit;
                 defer parsed.deinit();
                 const items = try self.allocator.alloc(T, parsed.value.len);
+                // Only the slots actually written are freed: `alloc` leaves the
+                // rest `undefined`, and freeing an uninitialised field pointer is
+                // heap corruption (an OOM part-way through this loop used to do
+                // exactly that).
+                var written: usize = 0;
                 errdefer {
-                    for (items) |item| freeScanned(self.allocator, T, item);
+                    for (items[0..written]) |item| freeScanned(self.allocator, T, item);
                     self.allocator.free(items);
                 }
                 for (parsed.value, 0..) |item, i| {
                     items[i] = try deepCopyStruct(self.allocator, T, item);
+                    written = i + 1;
                 }
                 return .{ .items = items, .arena = null };
             }

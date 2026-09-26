@@ -2,6 +2,68 @@
 
 ## [Unreleased]
 
+### 第 67 批：第二轮复核（换三个维度：错误路径所有权 / 不可信输入算术 / 取消语义）—— 修掉 **1 个 P0（远程打崩进程）** 与 **7 处 P1**（**破坏性：否**）
+
+第 66 批是"持锁纪律"。这一遍换三个维度重来（同样四个**只读**子代理 + 主代理逐处复核代码，未跑构建），
+每一组都要求"能用 `file:line` 说清触发条件与后果"，并允许写"未能判定"。
+
+**P0 · gRPC 帧长 `5 + len` 在 `u32` 上溢出 —— 5 字节请求打崩进程**（`extensions/GrpcTransport.zig`，
+**3 处**：`GrpcFrame.decode:188`、`GrpcStreamReader.next:231`、`GrpcStreamBuffer.tryNext:280`）
+
+```zig
+const len: u32 = (rem[1] << 24) | ... | rem[4];   // 对端给的 4 字节长度
+if (5 + len > rem.len) return error.IncompleteGrpcFrame;   // ← u32 加法
+```
+一个 `content-type: application/grpc` 的请求，体只用 5 字节 `00 FF FF FF FF`：`len = 0xFFFFFFFF`，
+`5 + len` 溢出 → safe 构建直接 `panic: integer overflow`（进程 ABRT），**调用点的
+`catch { return 400 }` 拦不住 panic**；ReleaseFast 回绕成 4 → `rem[5..4]`（start > end）→ UB。
+修法：**先加宽再相加**（`const frame_len: usize = @as(usize, len) + 5;`），三处同改。
+回归测试 `GrpcFrame.decode refuses a peer-supplied length that would overflow` ——
+写完后它**先是红的（ABRT）**，因为同一个溢出的流式副本还在；三处都修完才转绿。
+
+**P1 · 错误路径上的双重释放 / 释放未初始化内存 / UB**（都是 OOM 或 DB 错误路径，且原先无测试覆盖）
+
+| 位置 | 缺陷 | 修法 |
+|---|---|---|
+| `ai/memory.zig:115` | 更新已存在的键时先 `free(sk)` 再 `dupe(value)`；dupe 失败 → 上面 arm 着的 `errdefer` 再 free 一次 → **double free** | 先分配再释放 |
+| `core/DistributedEventBus.zig:1852` `subscribeHandler` | `getOrPut` + 可失败的 key dupe：found-existing 分支已 free，`errdefer` 再 free（**double free**）；新主题分支 `append` 失败则 map 里留下**悬垂 key** | 已有的追加到底；新的「先建齐 list 再 `put`」 |
+| `core/cluster/PeerDiscovery.zig:196` `registerService` | 同上形状，且失败时 map 里留下**借用 key + `undefined` 的 ArrayList** → 之后 `deinit`/`deregisterPeer` 迭代 `.items` 即 UB | 同上 |
+| `sqlx/sqlx.zig` `CachedConn.queryRows`/`queryRowsPartial`（2 处） | `errdefer` 遍历整条 `alloc` 出来的切片调 `freeScanned`，而 `deepCopyStruct` 只写了前 `i` 个 → 对**未初始化**槽调 free = 堆损坏 | 只释放已写入的前缀（`written` 游标） |
+| `pool/Pool.zig:83` `init` | 预建 `min_idle` 途中 `append` 失败 → 已建连接与 list 缓冲全泄漏（调用方拿不到 pool） | `errdefer` 覆盖 list 与每条已建连接 |
+
+**P1 · 资源/状态没收尾**
+
+* `sqlx/sqlx.zig` `PostgresConn.copyFrom`：`BEGIN` 之后任何失败路径都**不 ROLLBACK**，连接照样回池；
+  `pingFn` 只看 `PQstatus`（在 aborted 事务里仍是 `CONNECTION_OK`）→ 该池槽之后每条语句都返回
+  25P02，且服务端事务锁不释放。修法：`BEGIN` 之后挂 `errdefer` 做 best-effort `ROLLBACK`，
+  失败则打 err 日志（明确点名连接可能不可用）。
+* `redis/redis.zig`（**16 处**写路径）：只有**读**失败会 `evictStream`，**写**失败直接 `try` 返回，
+  desync 的连接回池 → 下一个借用者可能读到**上一个客户端的回复**（`$` 开头会被当 bulk 解析），
+  即 `get`/`rPop`/`hGet` **静默返回别人的数据**。修法：新增 `writeCmdEvicting`，16 处统一走它。
+
+**没修、但已明确记录的（不是遗漏）**
+
+* **`runtime/runtime.zig` `cancelTimerSync` 的 use-after-return（P1）**：命令已入队后，等待期间
+  `!alive` 或取锁被取消就 `return` —— 而队列里那条命令持有**本栈帧**的 `&done`/`&result`，
+  owner（ticker drain 或停服的 `abandonTimerCommands`）会写穿它们。这就是第 58 批那条
+  "等待方可以取消"规则没考虑到的边界。**修法是所有权变更**（堆上的应答槽，或"等 `done` + 一个
+  `abandoned` epoch"），涉及 `TimerCommand` 与两条 drain 路径的握手 —— 不在一轮里临时改并发协议。
+  已在源码处留 `// KNOWN` 注释指明。
+* `sqlx/sqlx.zig` `mysqlReadRowsAfterQuery` **按值收 arena**：函数内用 `arena_mut.allocator()` 分配，
+  出错时那些节点链在副本上，调用方的 `errdefer arena.deinit()` 清的是空的原件 → 错误路径整段泄漏
+  （成功路径无碍，因为 `Rows.arena` 把副本带了出去）。修法：签名改 `*ArenaAllocator`（同文件
+  `mysqlStmtReadRows` 已经这么做了，此处是漏网）。
+* P2 清单（都带位置，留作队列）：`migration/Migration.zig` 的 checksum 无 errdefer、
+  `parseMigrationFile` 的 description/rollback_sql 泄漏；`sqlx` 的 `StringCache.set` 失败泄 k/v、
+  `deepCopyStruct`/`scanRowsToSlice` 半成品字段泄、`closeFn` 的 `DEALLOCATE` 结果未 `PQclear`；
+  `http/Multipart.zig` 结构体字面量里的 `try dupe`；`extensions/GrpcTransport.zig:627` 的 `owned`
+  未兜底；`api/Server.zig` `setHeader` 先摘旧后写失败静默丢头；`redis` RESP 数组分帧**自递归无深度上限**
+  （被控 Redis 可致栈溢出）；`http/Hpack.zig:940` 在 32 位目标下 `<< 28` 可能溢出（本项目按 64 位）。
+
+**两条子代理报告被我否掉（记下来，免得后人重复"修"）**：① `PQputCopyEnd` 的返回值不是
+`PGresult*`（它是 `int`，1/0/-1），"丢掉 PGresult 会泄漏"不成立；② `redis.zig:380` 的
+`response[value_start..@min(...)]` 推不出可达输入（`readLine`/`readCount` 保证 CRLF），归"未能判定"。
+
 ### 第 66 批：持锁纪律逐处复核（4 个只读子代理 244 个持锁点）—— 修掉 **6 处真缺陷**（4 类死锁/无效超时）（**破坏性：否**）
 
 起因是"审计一遍 `std.Io.Mutex` / `std.Io.Condition` 的用法"。本批把 `src/` 里 **244 个持锁点**

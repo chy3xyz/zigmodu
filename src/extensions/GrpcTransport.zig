@@ -186,8 +186,12 @@ pub const GrpcFrame = struct {
         if (frame.len < 5) return error.InvalidGrpcFrame;
         if (frame[0] != 0) return error.CompressedNotSupported;
         const len: u32 = (@as(u32, frame[1]) << 24) | (@as(u32, frame[2]) << 16) | (@as(u32, frame[3]) << 8) | frame[4];
-        if (5 + len > frame.len) return error.IncompleteGrpcFrame;
-        return frame[5 .. 5 + len];
+        // Widen *before* adding: `5 + len` in `u32` overflowed for a peer-supplied
+        // `len` near 2^32 (a 5-byte body of `00 ff ff ff ff` is enough), which in a
+        // safe build is a panic that takes the process down — the `catch` at the
+        // call sites cannot see a panic.
+        if (@as(usize, len) + 5 > frame.len) return error.IncompleteGrpcFrame;
+        return frame[5 .. 5 + @as(usize, len)];
     }
 };
 
@@ -225,9 +229,12 @@ pub const GrpcStreamReader = struct {
         if (rem.len < 5) return error.IncompleteGrpcFrame;
         if (rem[0] != 0) return error.CompressedNotSupported;
         const len: u32 = (@as(u32, rem[1]) << 24) | (@as(u32, rem[2]) << 16) | (@as(u32, rem[3]) << 8) | rem[4];
-        if (5 + len > rem.len) return error.IncompleteGrpcFrame;
-        const payload = rem[5 .. 5 + len];
-        self.offset += 5 + @as(usize, len);
+        // Widened before the addition, for the reason `GrpcFrame.decode` gives: a
+        // peer-supplied `FF FF FF FF` makes `5 + len` a `u32` overflow (ABRT).
+        const frame_len: usize = @as(usize, len) + 5;
+        if (frame_len > rem.len) return error.IncompleteGrpcFrame;
+        const payload = rem[5..frame_len];
+        self.offset += frame_len;
         self.count += 1;
         return payload;
     }
@@ -274,11 +281,15 @@ pub const GrpcStreamBuffer = struct {
         }
         if (rem[0] != 0) return error.CompressedNotSupported;
         const len: u32 = (@as(u32, rem[1]) << 24) | (@as(u32, rem[2]) << 16) | (@as(u32, rem[3]) << 8) | rem[4];
-        if (5 + len > rem.len) {
+        // Widened before the addition — `5 + len` in `u32` is a panic (ABRT) for a
+        // peer-supplied `FF FF FF FF`, and `rem[5 .. 5 + len]` computes the same
+        // sum. See `GrpcFrame.decode`'s note.
+        const frame_len: usize = @as(usize, len) + 5;
+        if (frame_len > rem.len) {
             if (self.ended) return error.IncompleteGrpcFrame;
             return null;
         }
-        const payload = rem[5 .. 5 + len];
+        const payload = rem[5..frame_len];
         self.offset += 5 + @as(usize, len);
         self.count += 1;
         return payload;
@@ -1097,6 +1108,30 @@ test "GrpcFrame encode decode roundtrip" {
     try std.testing.expectEqual(@as(usize, 16), framed.len);
     const payload = try GrpcFrame.decode(framed);
     try std.testing.expectEqualStrings("hello-proto", payload);
+}
+
+test "GrpcFrame.decode refuses a peer-supplied length that would overflow" {
+    const allocator = std.testing.allocator;
+    // Five bytes are a complete frame header, and `FF FF FF FF` is a length the
+    // peer chooses. `5 + len` used to be computed in `u32`, so this input was a
+    // `panic: integer overflow` — a process kill from a five-byte request, which
+    // the callers' `catch |err| return 400` could not intercept (a panic is not an
+    // error). It must come back as a refusal.
+    const hostile = [_]u8{ 0x00, 0xff, 0xff, 0xff, 0xff };
+    try std.testing.expectError(error.IncompleteGrpcFrame, GrpcFrame.decode(&hostile));
+
+    // The same through the streaming buffer, which has its own copy of the check
+    // (and returns `null` rather than an error while the stream is still open).
+    var buf = GrpcStreamBuffer.init(allocator);
+    defer buf.deinit();
+    try buf.append(&hostile);
+    try std.testing.expectEqual(@as(?[]const u8, null), buf.tryNext());
+    buf.markEnded();
+    try std.testing.expectError(error.IncompleteGrpcFrame, buf.tryNext());
+
+    // Sanity: the boundary right below the overflow still round-trips.
+    const ok = [_]u8{ 0x00, 0x00, 0x00, 0x00, 0x01, 'x' };
+    try std.testing.expectEqualStrings("x", try GrpcFrame.decode(&ok));
 }
 
 test "GrpcServiceRegistry register and find" {

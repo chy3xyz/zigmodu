@@ -193,12 +193,21 @@ pub const PeerDiscovery = struct {
         const host_dup = try self.allocator.dupe(u8, peer.host);
         errdefer self.allocator.free(host_dup);
 
-        const gop = try self.service_map.getOrPut(service_name);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = try self.allocator.dupe(u8, service_name);
-            gop.value_ptr.* = std.ArrayList(Peer).empty;
+        // An existing service appends in place; a new one is built to completion
+        // and inserted last, so no failure can leave the map holding a borrowed key
+        // or an `undefined` list — `getOrPut` + a fallible key dupe did both (the
+        // `undefined` value then crashed `deinit`/`deregisterPeer`, which iterate
+        // `entry.value_ptr.items`).
+        if (self.service_map.getPtr(service_name)) |list| {
+            return list.append(self.allocator, .{ .id = id_dup, .host = host_dup, .port = peer.port });
         }
-        try gop.value_ptr.append(self.allocator, .{ .id = id_dup, .host = host_dup, .port = peer.port });
+
+        const name_copy = try self.allocator.dupe(u8, service_name);
+        errdefer self.allocator.free(name_copy);
+        var list = std.ArrayList(Peer).empty;
+        errdefer list.deinit(self.allocator);
+        try list.append(self.allocator, .{ .id = id_dup, .host = host_dup, .port = peer.port });
+        try self.service_map.put(name_copy, list);
     }
 
     /// Discover peers for a service. Returns null if the service is unknown.

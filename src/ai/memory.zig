@@ -115,8 +115,11 @@ pub const MemoryStore = struct {
         errdefer self.allocator.free(sk);
 
         if (self.entries.getPtr(sk)) |existing| {
-            self.allocator.free(sk);
+            // Allocate *before* releasing `sk`: the `errdefer` above is still
+            // armed, so freeing first and then failing here freed the same key
+            // twice (double free on OOM in the update path).
             const owned_value = try self.allocator.dupe(u8, value);
+            self.allocator.free(sk);
             self.allocator.free(existing.value);
             existing.value = owned_value;
             if (history) |h| {

@@ -285,6 +285,21 @@ pub const Redis = struct {
         return .{ .stream = s, .pool_idx = null };
     }
 
+    /// Write a command, and treat a *write* failure like a read failure: the
+    /// stream's framing can no longer be trusted (the command may have gone out
+    /// whole, in part, or not at all), so it must never be handed to the next
+    /// borrower. Before this, only the read path called `evictStream`, so a write
+    /// failure put a desynchronised connection back in the pool — the next
+    /// borrower could then read the *previous* client's reply (a `$` line parses
+    /// as a bulk string), i.e. silently return someone else's data for `get` /
+    /// `rPop` / `hGet`.
+    fn writeCmdEvicting(self: *Redis, borrowed: Borrowed, cmd: []const u8) errors.Result {
+        writeCmd(&borrowed.stream, self.io, cmd) catch {
+            self.evictStream(borrowed);
+            return error.RedisError;
+        };
+    }
+
     /// Hand a borrowed connection back to the pool.
     ///
     /// Uncancelable: `std.Io.Mutex.lock` fails only with `error.Canceled`, and
@@ -354,7 +369,7 @@ pub const Redis = struct {
             const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$3\r\nGET\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
             defer self.allocator.free(cmd);
 
-            try writeCmd(&stream, self.io, cmd);
+            try self.writeCmdEvicting(borrowed, cmd);
 
             var response_list = std.ArrayList(u8).empty;
             defer response_list.deinit(self.allocator);
@@ -396,7 +411,7 @@ pub const Redis = struct {
             std.fmt.allocPrint(self.allocator, "*3\r\n$3\r\nSET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{ key.len, key, value.len, value }) catch return error.RedisError;
         defer self.allocator.free(cmd);
 
-        try writeCmd(&stream, self.io, cmd);
+        try self.writeCmdEvicting(borrowed, cmd);
 
         var response_list = std.ArrayList(u8).empty;
         defer response_list.deinit(self.allocator);
@@ -415,7 +430,7 @@ pub const Redis = struct {
         const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$5\r\nSETNX\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{ key.len, key, value.len, value }) catch return error.RedisError;
         defer self.allocator.free(cmd);
 
-        try writeCmd(&stream, self.io, cmd);
+        try self.writeCmdEvicting(borrowed, cmd);
 
         var response_list = std.ArrayList(u8).empty;
         defer response_list.deinit(self.allocator);
@@ -450,7 +465,7 @@ pub const Redis = struct {
             try cmd_builder.print(self.allocator, "${d}\r\n{s}\r\n", .{ key.len, key });
         }
 
-        try writeCmd(&stream, self.io, cmd_builder.items);
+        try self.writeCmdEvicting(borrowed, cmd_builder.items);
 
         var response_list = std.ArrayList(u8).empty;
         defer response_list.deinit(self.allocator);
@@ -478,7 +493,7 @@ pub const Redis = struct {
         const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$6\r\nEXISTS\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
         defer self.allocator.free(cmd);
 
-        try writeCmd(&stream, self.io, cmd);
+        try self.writeCmdEvicting(borrowed, cmd);
 
         var response_list = std.ArrayList(u8).empty;
         defer response_list.deinit(self.allocator);
@@ -506,7 +521,7 @@ pub const Redis = struct {
         const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$4\r\nINCR\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
         defer self.allocator.free(cmd);
 
-        try writeCmd(&stream, self.io, cmd);
+        try self.writeCmdEvicting(borrowed, cmd);
 
         var response_list = std.ArrayList(u8).empty;
         defer response_list.deinit(self.allocator);
@@ -534,7 +549,7 @@ pub const Redis = struct {
         const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$4\r\nDECR\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
         defer self.allocator.free(cmd);
 
-        try writeCmd(&stream, self.io, cmd);
+        try self.writeCmdEvicting(borrowed, cmd);
 
         var response_list = std.ArrayList(u8).empty;
         defer response_list.deinit(self.allocator);
@@ -562,7 +577,7 @@ pub const Redis = struct {
         const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$6\r\nEXPIRE\r\n${d}\r\n{s}\r\n${d}\r\n{d}\r\n", .{ key.len, key, std.fmt.count("{d}", .{seconds}), seconds }) catch return error.RedisError;
         defer self.allocator.free(cmd);
 
-        try writeCmd(&stream, self.io, cmd);
+        try self.writeCmdEvicting(borrowed, cmd);
 
         var response_list = std.ArrayList(u8).empty;
         defer response_list.deinit(self.allocator);
@@ -582,7 +597,7 @@ pub const Redis = struct {
         const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$3\r\nTTL\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
         defer self.allocator.free(cmd);
 
-        try writeCmd(&stream, self.io, cmd);
+        try self.writeCmdEvicting(borrowed, cmd);
 
         var response_list = std.ArrayList(u8).empty;
         defer response_list.deinit(self.allocator);
@@ -618,7 +633,7 @@ pub const Redis = struct {
         try cmd_builder.print(self.allocator, "$2\r\nNX\r\n$2\r\nPX\r\n", .{});
         try cmd_builder.print(self.allocator, "${d}\r\n{d}\r\n", .{ px_len, px });
 
-        try writeCmd(&stream, self.io, cmd_builder.items);
+        try self.writeCmdEvicting(borrowed, cmd_builder.items);
 
         var response_list = std.ArrayList(u8).empty;
         defer response_list.deinit(self.allocator);
@@ -651,7 +666,7 @@ pub const Redis = struct {
         const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$3\r\nDEL\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
         defer self.allocator.free(cmd);
 
-        try writeCmd(&stream, self.io, cmd);
+        try self.writeCmdEvicting(borrowed, cmd);
 
         var response_list = std.ArrayList(u8).empty;
         defer response_list.deinit(self.allocator);
@@ -679,7 +694,7 @@ pub const Redis = struct {
         const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$5\r\nLPUSH\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{ key.len, key, value.len, value }) catch return error.RedisError;
         defer self.allocator.free(cmd);
 
-        try writeCmd(&stream, self.io, cmd);
+        try self.writeCmdEvicting(borrowed, cmd);
 
         var response_list = std.ArrayList(u8).empty;
         defer response_list.deinit(self.allocator);
@@ -706,7 +721,7 @@ pub const Redis = struct {
         const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$4\r\nRPOP\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
         defer self.allocator.free(cmd);
 
-        try writeCmd(&stream, self.io, cmd);
+        try self.writeCmdEvicting(borrowed, cmd);
 
         var response_list = std.ArrayList(u8).empty;
         defer response_list.deinit(self.allocator);
@@ -747,7 +762,7 @@ pub const Redis = struct {
         }) catch return error.RedisError;
         defer self.allocator.free(cmd);
 
-        try writeCmd(&stream, self.io, cmd);
+        try self.writeCmdEvicting(borrowed, cmd);
 
         var response_list = std.ArrayList(u8).empty;
         defer response_list.deinit(self.allocator);
@@ -776,7 +791,7 @@ pub const Redis = struct {
         }) catch return error.RedisError;
         defer self.allocator.free(cmd);
 
-        try writeCmd(&stream, self.io, cmd);
+        try self.writeCmdEvicting(borrowed, cmd);
 
         var response_list = std.ArrayList(u8).empty;
         defer response_list.deinit(self.allocator);
@@ -817,7 +832,7 @@ pub const Redis = struct {
         }) catch return error.RedisError;
         defer self.allocator.free(cmd);
 
-        try writeCmd(&stream, self.io, cmd);
+        try self.writeCmdEvicting(borrowed, cmd);
 
         var response_list = std.ArrayList(u8).empty;
         defer response_list.deinit(self.allocator);

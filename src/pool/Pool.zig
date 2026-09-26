@@ -80,8 +80,14 @@ pub fn Pool(comptime T: type) type {
 
             // Pre-create min idle connections
             var i: u32 = 0;
+            // Every connection this loop builds is owned by `pool` only once it is
+            // in `idle_conns`; a failure part-way (the `append` above running out
+            // of memory) returned an error to a caller that never got a `pool`, so
+            // each created connection and the list's buffer leaked.
+            errdefer pool.idle_conns.deinit(allocator);
             while (i < config.min_idle) : (i += 1) {
                 const conn = createFn() catch continue;
+                errdefer destroyFn(conn);
                 try pool.idle_conns.append(allocator, .{
                     .conn = conn,
                     .last_used = 0,

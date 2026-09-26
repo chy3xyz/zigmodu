@@ -1804,6 +1804,13 @@ pub const Runtime = struct {
         _ = self.timer_waiters.fetchAdd(1, .monotonic);
         defer _ = self.timer_waiters.fetchSub(1, .monotonic);
         while (!done.load(.acquire)) {
+            // KNOWN (queued, not fixed — see CHANGELOG 第 67 批 and
+            // docs/dev/v1.0-readiness-v0.35.md): both early returns below happen with
+            // the command *already queued*, and that command holds `&done`/`&result`
+            // from this frame. The owner (ticker drain, or `abandonTimerCommands` on
+            // shutdown) writes through them, so returning here is a use-after-return.
+            // The fix is an ownership change (heap-owned answer slot, or wait for
+            // `done` plus an `abandoned` epoch) — deliberately not improvised here.
             if (!self.alive.load(.acquire)) return error.RuntimeStopped;
             // Waiting on the condition (rather than spinning) keeps the caller
             // off the CPU during the up-to-one-tick wait; the timeout is the
