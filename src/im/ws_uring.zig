@@ -61,7 +61,24 @@ pub const WsUring = struct {
     /// is the 0.17 replacement for the removed `std.time.sleep`, and it takes
     /// the same `io` the rest of the framework threads through.
     io: std.Io,
+    /// Registered connections, keyed by fd. **The ring thread is its only
+    /// reader and writer** (registration, dispatch, teardown); a connection
+    /// fiber never touches it — see `pending`.
     connections: std.AutoHashMap(i32, *Conn),
+    /// Connections `adopt`ed but not yet registered, plus the lock guarding this
+    /// list. They exist as a pair because `adopt` runs on the **connection's own
+    /// fiber thread** while the loop runs on the ring thread: an io_uring
+    /// submission queue has one writer (`get_sqe` reads *and* stores the SQ tail
+    /// non-atomically) and so does the map. So the fiber only ever appends here;
+    /// the ring thread moves entries into `connections` and submits their first
+    /// read. `adopt` used to `put` into the map and `get_sqe` from the fiber
+    /// thread — a torn SQ tail and a torn hash map, both silent.
+    pending: std.ArrayList(*Conn),
+    mutex: std.Io.Mutex = .init,
+    /// Connections admitted and not yet torn down — the same number as
+    /// `connections.count() + pending.items.len`, but readable from the fiber
+    /// thread without touching a container that thread does not own.
+    active: std.atomic.Value(u32) = .init(0),
     running: std.atomic.Value(bool),
     max_conn: u32,
     thread: ?std.Thread = null,
@@ -80,16 +97,21 @@ pub const WsUring = struct {
             .allocator = allocator,
             .io = io,
             .connections = std.AutoHashMap(i32, *Conn).init(allocator),
+            .pending = std.ArrayList(*Conn).empty,
             .running = std.atomic.Value(bool).init(false),
             .max_conn = cfg.max_connections,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.running.store(false, .monotonic);
-        if (self.thread) |t| t.join();
+        self.stop();
+        // Post-join, on this thread: `stop` has already drained both containers,
+        // so these two are no-ops after a normal run and the only cleanup there
+        // is when `start()` was never called.
         self.drainConnections(true);
+        self.drainPending(true);
         self.ring.deinit();
+        self.pending.deinit(self.allocator);
         self.connections.deinit();
         self.* = undefined;
     }
@@ -100,21 +122,43 @@ pub const WsUring = struct {
         self.thread = try std.Thread.spawn(.{}, runLoop, .{self});
     }
 
-    /// Signal shutdown and wait for the event loop to exit.
+    /// Signal shutdown, wait for the event loop to exit, then release whatever
+    /// it was still holding.
+    ///
+    /// The loop drains `connections` on its way out; a connection adopted after
+    /// its last pass was never registered and is still in `pending`, so it is
+    /// drained here — on a thread the loop has already joined, which is why this
+    /// is safe to do without the loop's cooperation. `adopt` decides whether to
+    /// accept under this same lock (see below), so there is no window in which a
+    /// connection is accepted by nobody: it is either registered by the loop or
+    /// torn down here.
     pub fn stop(self: *Self) void {
         self.running.store(false, .monotonic);
         if (self.thread) |t| {
             t.join();
             self.thread = null;
         }
+        self.drainPending(true);
     }
 
-    /// Transfer a WS connection (after handshake) from fiber to io_uring.
-    /// Takes ownership of the fd — caller must NOT close it.
+    /// Transfer a WS connection (after handshake) from its fiber to io_uring.
+    ///
+    /// **On success the ring owns `fd`** and closes it exactly once, in
+    /// `teardownConn`; the caller must NOT close it — that is the caller's half
+    /// of this contract, and it is the fiber's `defer stream.close` that has to
+    /// be skipped (`Server.connFiber`). **On error nothing was taken**: the fd is
+    /// untouched and still the caller's to close.
+    ///
+    /// Registration itself is deferred to the ring thread (`registerPending`);
+    /// this only enqueues, so `self.allocator` is the one thing that crosses
+    /// threads here and must be safe to use from any (it is: every connection
+    /// fiber already allocates from it through its own arena).
     pub fn adopt(self: *Self, fd: i32, session: *anyopaque, on_message: OnMessageFn, on_close: OnCloseFn) !void {
-        if (self.connections.count() >= self.max_conn) return error.MaxConnections;
-
         const conn = try self.allocator.create(Conn);
+        errdefer {
+            conn.assembler.deinit();
+            self.allocator.destroy(conn);
+        }
         conn.* = .{
             .fd = fd,
             .session = session,
@@ -124,16 +168,27 @@ pub const WsUring = struct {
             .data_len = 0,
             .assembler = WsFramer.Assembler.init(self.allocator),
         };
-        try self.connections.put(fd, conn);
 
-        // Submit initial read
-        try self.submitRead(conn);
+        // `lock` fails only with `error.Canceled`; report that itself rather than
+        // a lock-machinery story, and let it mean "take the connection back".
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+
+        // Decided under the lock `stop()` drains under, so a connection accepted
+        // here cannot outlive the drain that would have cleaned it.
+        if (!self.running.load(.monotonic)) return error.ShuttingDown;
+        if (self.active.load(.monotonic) >= self.max_conn) return error.MaxConnections;
+
+        try self.pending.append(self.allocator, conn);
+        _ = self.active.fetchAdd(1, .monotonic);
     }
 
     fn runLoop(self: *Self) void {
         var cqes: [64]linux.io_uring_cqe = undefined;
 
         while (self.running.load(.monotonic)) {
+            self.registerPending();
+
             _ = self.ring.submit() catch |err| {
                 std.log.debug("[ws_uring] submit failed: {s}", .{@errorName(err)});
             };
@@ -166,6 +221,62 @@ pub const WsUring = struct {
         self.drainConnections(true);
     }
 
+    /// The ring thread's half of `adopt`: move newly adopted connections into
+    /// `connections` and submit each one's first read.
+    ///
+    /// The lock covers the *handover only* — one uncontended lock per pass, and
+    /// never a syscall per message. Registration happens outside it on purpose:
+    /// `put` can fail, and a failure ends in `teardownConn`, which runs the
+    /// application's `on_close`. No application callback runs while a fiber is
+    /// waiting on this lock, so nothing the application does can invert the lock
+    /// order from under the ring.
+    ///
+    /// Latency note for the move: `submitRead` only *fills* an SQE — the kernel
+    /// picks it up at the loop's next `ring.submit()`, and that is exactly where
+    /// the pre-fix code's fiber-written SQE also landed. Filling it here instead
+    /// adds nothing the kernel could see.
+    fn registerPending(self: *Self) void {
+        // `lock` fails only with `error.Canceled`; there is nothing to unwind
+        // here, so a canceled wait simply leaves the batch for the next pass.
+        var batch: std.ArrayList(*Conn) = .empty;
+        {
+            self.mutex.lock(self.io) catch return;
+            defer self.mutex.unlock(self.io);
+            std.mem.swap(std.ArrayList(*Conn), &batch, &self.pending);
+        }
+        defer batch.deinit(self.allocator);
+        if (batch.items.len == 0) return;
+
+        for (batch.items) |conn| {
+            self.connections.put(conn.fd, conn) catch |err| {
+                // Untrackable (out of memory): close it rather than serve it with
+                // no entry the ring can find. Post-handshake, so the peer sees a
+                // plain close — the same outcome as a rejected peer.
+                std.log.warn("[ws_uring] cannot track fd {d}: {s}", .{ conn.fd, @errorName(err) });
+                self.teardownConn(conn, conn.fd, true);
+                continue;
+            };
+            self.submitRead(conn) catch |err| {
+                std.log.debug("[ws_uring] initial read submit failed: {s}", .{@errorName(err)});
+                self.closeConn(conn, conn.fd);
+            };
+        }
+    }
+
+    /// Tear down connections that were adopted but never registered.
+    ///
+    /// Called from `stop`/`deinit` once the loop thread is joined, and on the way
+    /// out of `registerPending`'s failures, so the list is quiescent whenever it
+    /// runs. It is also what keeps `start()`-never-called clean: a connection
+    /// adopted with no loop running has nobody else to close it.
+    fn drainPending(self: *Self, notify_close: bool) void {
+        self.mutex.lock(self.io) catch return;
+        defer self.mutex.unlock(self.io);
+
+        for (self.pending.items) |conn| self.teardownConn(conn, conn.fd, notify_close);
+        self.pending.clearRetainingCapacity();
+    }
+
     /// 1 ms back-off when the ring has nothing to report.
     ///
     /// This used to be `std.time.sleep`, which Zig 0.17 removed — so `start()`
@@ -186,10 +297,18 @@ pub const WsUring = struct {
         self.connections.clearRetainingCapacity();
     }
 
+    /// The one place a connection is actually released: `on_close` once, the fd
+    /// closed once, the slot given back to `max_conn`.
+    ///
+    /// Every path that ends a connection comes through here — dispatch failure,
+    /// protocol failure, loop exit, `stop` — which is what makes "closed exactly
+    /// once" a property of the ring rather than of its callers. It used to be
+    /// otherwise: the handshake fiber closed the fd too, after handing it over.
     fn teardownConn(self: *Self, conn: *Conn, fd: i32, notify_close: bool) void {
         if (notify_close and @intFromPtr(conn.on_close) != 0) conn.on_close(conn.session);
         _ = self.connections.remove(fd);
         _ = linux.close(fd);
+        _ = self.active.fetchSub(1, .monotonic);
         conn.assembler.deinit();
         self.allocator.destroy(conn);
     }
@@ -545,3 +664,160 @@ const Conn = struct {
     /// both apply the 1 MiB cap and the UTF-8 rule in one place.
     assembler: WsFramer.Assembler,
 };
+
+// ---------------------------------------------------------------------------
+// The handoff contract (`adopt`) and the teardown that closes what it took.
+//
+// `init` is Linux-only — that is where `std.os.linux.IoUring` comes from — so
+// these tests build the bookkeeping by hand instead. That is possible precisely
+// because `adopt`, `registerPending` and `teardownConn` no longer touch the ring:
+// the fiber used to `put` into the map and submit its own SQE, and this is the
+// test-shaped half of undoing that. `ring` stays `undefined` and no loop runs.
+// ---------------------------------------------------------------------------
+
+/// A `WsUring` whose `ring` is never reached. Not usable with `deinit` (it calls
+/// `ring.deinit`); every field the admission and teardown paths read is real.
+fn testInstance(allocator: std.mem.Allocator) WsUring {
+    return .{
+        .ring = undefined,
+        .allocator = allocator,
+        .io = std.testing.io,
+        .connections = std.AutoHashMap(i32, *Conn).init(allocator),
+        .pending = std.ArrayList(*Conn).empty,
+        .running = std.atomic.Value(bool).init(false),
+        .max_conn = 8,
+    };
+}
+
+/// Callback state for `testInstance`'s connections — file-level because the
+/// callbacks are plain function pointers, with no context argument to carry it.
+var handoff_state: struct {
+    closes: usize = 0,
+    messages: usize = 0,
+} = .{};
+
+fn handoffOnMessage(_: ?*anyopaque, _: []const u8, _: WsFrameKind) void {
+    handoff_state.messages += 1;
+}
+
+fn handoffOnClose(_: ?*anyopaque) void {
+    handoff_state.closes += 1;
+}
+
+/// Whether the kernel still has `fd` open. Asked with `F_GETFD`, so the answer is
+/// the real one: a second `close` on a number the kernel has since reissued is
+/// invisible to the process that does it, but not to this question.
+fn fdIsOpen(fd: std.posix.socket_t) bool {
+    return std.posix.errno(std.posix.system.fcntl(fd, std.posix.F.GETFD, @as(usize, 0))) == .SUCCESS;
+}
+
+fn testSocketPair() ![2]std.posix.socket_t {
+    var fds: [2]std.posix.socket_t = undefined;
+    const rc = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+    if (std.posix.errno(rc) != .SUCCESS) return error.SkipZigTest;
+    return fds;
+}
+
+test "WsUring.adopt: a refusal takes nothing, and the fd stays the caller's" {
+    const allocator = std.testing.allocator;
+    var uring = testInstance(allocator);
+    defer {
+        // Not `deinit`: it would call `ring.deinit` on the `undefined` above.
+        uring.connections.deinit();
+        uring.pending.deinit(allocator);
+    }
+    handoff_state = .{};
+
+    const fds = try testSocketPair();
+    // `fds[0]` is handed over below, so on Linux the teardown closes it; off Linux
+    // `linux.close` is a stub, so the test has to.
+    defer {
+        if (builtin.os.tag != .linux) _ = std.posix.system.close(fds[0]);
+    }
+    defer _ = std.posix.system.close(fds[1]);
+    var session: u32 = 0;
+
+    // Not started: an upgrade that gets here has no loop to serve it, so it is
+    // refused — and a refused handoff must hand nothing over. The caller's half
+    // of that is `connFiber`'s `fd_owned_by_fiber` staying true, so the fd is
+    // closed exactly once, by the fiber.
+    try std.testing.expectError(error.ShuttingDown, uring.adopt(@intCast(fds[0]), &session, handoffOnMessage, handoffOnClose));
+    try std.testing.expectEqual(@as(usize, 0), uring.pending.items.len);
+    try std.testing.expectEqual(@as(u32, 0), uring.active.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), handoff_state.closes);
+    try std.testing.expect(fdIsOpen(fds[0]));
+
+    // Started, but full: refused the same way, and the refusal does not consume a
+    // slot — `active` is what `max_conn` is measured against, and it counts what
+    // was taken, not what was offered.
+    uring.running.store(true, .monotonic);
+    uring.max_conn = 1;
+    try uring.adopt(@intCast(fds[0]), &session, handoffOnMessage, handoffOnClose);
+    try std.testing.expectEqual(@as(u32, 1), uring.active.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), uring.pending.items.len);
+
+    const more = try testSocketPair();
+    defer {
+        _ = std.posix.system.close(more[0]);
+        _ = std.posix.system.close(more[1]);
+    }
+    try std.testing.expectError(error.MaxConnections, uring.adopt(@intCast(more[0]), &session, handoffOnMessage, handoffOnClose));
+    try std.testing.expectEqual(@as(u32, 1), uring.active.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), uring.pending.items.len);
+    try std.testing.expectEqual(@as(usize, 0), handoff_state.closes);
+    try std.testing.expect(fdIsOpen(more[0]));
+
+    // And the one connection that was taken goes through the drain `stop()` ends
+    // with: `on_close` once, the slot back, the `Conn` freed (the testing
+    // allocator would report it otherwise).
+    uring.drainPending(true);
+    try std.testing.expectEqual(@as(u32, 0), uring.active.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), handoff_state.closes);
+}
+
+test "WsUring.teardown: on_close runs once per connection, and the slot comes back" {
+    const allocator = std.testing.allocator;
+    var uring = testInstance(allocator);
+    defer {
+        uring.connections.deinit();
+        uring.pending.deinit(allocator);
+    }
+    handoff_state = .{};
+
+    const fds = try testSocketPair();
+    defer _ = std.posix.system.close(fds[1]);
+    var session: u32 = 0;
+
+    uring.running.store(true, .monotonic);
+    try uring.adopt(@intCast(fds[0]), &session, handoffOnMessage, handoffOnClose);
+
+    // Success *is* the ownership transfer, so from here the fd belongs to the
+    // ring and must still be open: the regression under guard is the handshake
+    // fiber closing it anyway, which is what left the ring reading a descriptor
+    // that the kernel was free to reissue.
+    try std.testing.expect(fdIsOpen(fds[0]));
+    try std.testing.expectEqual(@as(usize, 0), handoff_state.closes);
+    try std.testing.expectEqual(@as(usize, 1), uring.pending.items.len);
+
+    uring.drainPending(true);
+    try std.testing.expectEqual(@as(usize, 1), handoff_state.closes);
+    try std.testing.expectEqual(@as(usize, 0), uring.pending.items.len);
+    try std.testing.expectEqual(@as(u32, 0), uring.active.load(.monotonic));
+
+    // A second drain is a no-op: `on_close` does not run twice, and the `Conn` is
+    // not freed twice (the testing allocator turns that into a failure on its
+    // own).
+    uring.drainPending(true);
+    try std.testing.expectEqual(@as(usize, 1), handoff_state.closes);
+    try std.testing.expectEqual(@as(u32, 0), uring.active.load(.monotonic));
+
+    if (builtin.os.tag == .linux) {
+        // The teardown closed the fd it took — exactly once. This is the only
+        // host where that can be asserted: off Linux `linux.close` is this
+        // module's stub and does nothing, so an "open" answer below would say
+        // nothing about the code under test.
+        try std.testing.expect(!fdIsOpen(fds[0]));
+    } else {
+        _ = std.posix.system.close(fds[0]);
+    }
+}

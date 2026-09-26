@@ -3290,7 +3290,14 @@ fn wsHandshakeValid(ctx: *const Context) bool {
 /// Connection fiber — handles one HTTP connection
 fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allocator) void {
     defer _ = server.active_connections.fetchSub(1, .monotonic);
-    defer stream.close(server.io);
+    // The fd is closed here *unless* it was handed to `ws_uring`, which owns it
+    // from that point (see `WsUring.adopt`). Closing it here as well would close
+    // a descriptor the ring has a read in flight on: the read comes back EBADF,
+    // the ring tears the connection down, and it closes that same number a
+    // second time — by then the kernel may have reissued it to another
+    // connection, which is the descriptor this fiber would be closing.
+    var fd_owned_by_fiber = true;
+    defer if (fd_owned_by_fiber) stream.close(server.io);
     Server.tuneSocket(stream);
 
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -3535,11 +3542,18 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                     // If io_uring is available, transfer fd ownership (fiber stack released here)
                     if (server.ws_uring) |uring| {
                         const sock_fd = stream.socket.handle;
-                        uring.adopt(sock_fd, session.?, ws_route.on_message, ws_route.on_close) catch {
-                            framer.writeClose() catch |err| std.log.err("[Server] WS writeClose on reject: {}", .{err});
+                        uring.adopt(sock_fd, session.?, ws_route.on_message, ws_route.on_close) catch |err| {
+                            // Nothing was taken: the fd is still ours, so it is
+                            // closed by the `defer` above as soon as this returns.
+                            std.log.warn("[Server] WS handoff to io_uring refused: {}", .{err});
+                            framer.writeClose() catch |err2| std.log.err("[Server] WS writeClose on reject: {}", .{err2});
                             if (@intFromPtr(ws_route.on_close) != 0) ws_route.on_close(session.?);
                             return;
                         };
+                        // The ring owns the fd now and closes it in its own
+                        // teardown — this is the "on success" half of `adopt`'s
+                        // contract, and it has to be set before the `return`.
+                        fd_owned_by_fiber = false;
                         return; // Fiber exits — io_uring takes over
                     }
 

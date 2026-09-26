@@ -1190,7 +1190,12 @@ its caller is about to `deinit`. Put your own timeout on anything the callback
 waits for.
 
 Connections adopted through `setWsUring` are owned by the ring instead: they are
-ended by `WsUring.stop()` / `deinit()`, not by `Server.stop()`.
+ended by `WsUring.stop()` / `deinit()`, not by `Server.stop()`. That ownership
+includes the descriptor: the handshake fiber stops owning the fd the moment
+`WsUring.adopt` returns success — it is closed once, by the ring's teardown — and
+a handoff that is *refused* leaves the fd to the fiber, which closes it as it
+always did. You do not have to do anything for either half; a rejected connection
+gets a close frame and its `on_close` call, the same as any other refusal.
 
 
 

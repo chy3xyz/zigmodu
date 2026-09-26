@@ -2,6 +2,57 @@
 
 ## [Unreleased]
 
+### 第 54 批：上一批报出的 `ws_uring` 两个真缺陷 —— 升级后 fd 归属自相矛盾导致的**重复关闭**、`adopt` 与事件循环之间**共享元数据的跨线程撕裂**（**破坏性：否**）
+
+第 53 批 ② 报的这两条，本批落地。文件仍是 Linux-only（`init` 体的第一个语句就是 `@compileError`），
+本机（macOS）**跑不了这段代码**，所以本批的证据按"能证明什么"分开写，不混：
+
+| 部分 | 覆盖到哪一步 |
+|------|--------------|
+| 准入 / 归属契约（`adopt`、`teardownConn`、排空） | **两个平台都真跑**（两条新测试；Linux 上多一条"fd 真被 `close(2)` 了"的断言） |
+| `Server.connFiber` 的归属翻转、`registerPending` 接线 | **交叉编译**：`zig build test -Dtarget=x86_64-linux -Ddb=none`，6 个 compile 步骤全 success（run 步骤失败 = host 不能执行目标平台二进制，属预期） |
+| ring 线程 ↔ fiber 线程的锁序与所有权 | **只能评审**（无 io_uring 主机，仓库里也没有任何用例构造 `WsUring`） |
+
+**① 升级后 fd 的归属：`adopt` 说"我接管了"，而调用方仍然关了一次。** 事实链：
+`Server.connFiber` 的 `defer stream.close(server.io)` 在升级成功后照样跑（`return` 会执行 defer），
+而 `adopt` 返回前已经用**调用方线程**投了初始读 → ring 的 in-flight 读拿 `EBADF` → `teardownConn`
+再 `close` 同一个 fd 号（此刻该号可能已被内核发给别的连接，于是关掉的是**别人的**连接）→ `on_close`
+在握手后立刻触发。
+
+* **修法（两侧各一半）**：`connFiber` 用显式标志 `fd_owned_by_fiber` 把那个 `defer` 变成条件式，
+  只在 `adopt` **成功**之后翻成 `false`；`adopt` 的文档把两半都写死 —— **成功**则 ring 拥有 fd 并
+  在 `teardownConn` 里关**恰好一次**，**失败**则什么都没拿走、fd 仍归调用方。`adopt` 失败分支现在
+  把原因记进日志（`ShuttingDown` / `MaxConnections` / `Canceled` 不再被静默吞掉）。
+* **`teardownConn` 成为唯一的释放点**：`on_close` 一次、`close` 一次、`max_conn` 名额归还一次 ——
+  调度失败、协议失败、循环退出、`stop()` 全走它。
+
+**② 共享元数据的跨线程撕裂：fiber 过去直接 `put` 哈希表、直接投 SQE。** `adopt` 跑在**连接的 fiber 线程**，
+`runLoop`/`teardownConn` 跑在 ring 线程，两者共享同一个**无锁** `AutoHashMap`；更早一步 `adopt` 还自己
+`ring.get_sqe()` —— io_uring 的 SQ tail 是**非原子**读改写，两个写者就是撕裂（用 `-Dtarget=x86_64-linux`
+编译不出来的正是这类问题，它只在运行时咬人）。
+
+* **修法**：`pending`（`ArrayList(*Conn)` + 一把 `std.Io.Mutex`）作为唯一跨线程交接面 —— fiber 只
+  **append 一条**，ring 线程在 `registerPending` 里**成批取走**（锁只覆盖交接，注册与 `on_close` 都在锁外：
+  失败路径会走到 `teardownConn`，而它会跑**应用回调**，不该让任何应用回调在锁里跑）。于是
+  `connections` 和 SQ 各自回到**单写者**（ring 线程）。
+* **准入判定的位置也一起修了**：`max_conn` 不再读 `connections.count()`（那是别人的容器），改用
+  `active` 原子计数；`adopt` 在**同一把锁**下判定并 append，`stop()` 在同一把锁下排空 —— 因此不存在
+  "循环已退出、连接却没人管"的窗口，也不再出现"循环已退出还被接受"。新增 `error.ShuttingDown`
+  把这件事说清楚（而不是让它看起来像连接数满）。
+* `stop()` 现在会在 join 之后排空 `pending`（循环的最后一遍没来得及注册的那些）；`deinit` 复用它，
+  并把 `pending` 一并 `deinit`。
+
+> **红证据**（保留新测试、把 `adopt` 的**修复前函数体**临时放回去）：两条新测试都被打红 ——
+> `expected error.ShuttingDown, found error.SubmissionQueueFull`（停止状态下仍被"接管"）、
+> `FAIL (SubmissionQueueFull)`（成功路径）。**这个红证明的是"修复前的 `adopt` 在调用方线程里投 SQE
+> 且不查停机"，不是重复关闭** —— 本机 `linux.close` 是该文件的 stub（空操作），重复关闭这一条
+> **在本机拿不到红证据**，要么 Linux + io_uring，要么靠评审。修后：两条测试在两个平台全绿，
+> Linux 上多一条 `!fdIsOpen(fd)`（排水后 fd 真被关闭，且只关一次）。
+
+**③ 本批**不**声称**：`Server.connFiber` 的归属翻转没有任何运行时用例覆盖（仓库里没有构造
+`WsUring` 的测试，也不该为它造一个假的 ring）；`registerPending` 的"锁只覆盖交接"这一条是评审结论。
+CI 的 ubuntu 腿对本批的贡献 = **编译** + 两条新测试真跑（其中 Linux-only 的 `close` 断言随之执行）。
+
 ### 第 53 批：HTTP 服务器的 WebSocket 路由有**同一形状的关停洞**（远端静默即可把关停拖到无限期）—— 已修；并报出 `ws_uring` 两个**本机无法验证**的真缺陷（**破坏性：否**）
 
 **① `src/api/Server.zig` 的 WS 路由：fiber 路径上"握手后静默"的对端能把关停拖住。** 事实链（逐条可核）：
