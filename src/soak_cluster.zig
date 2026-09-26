@@ -12,7 +12,7 @@
 //! reconnects, a leader that flaps every other second, a connection counter
 //! that walks up one heartbeat at a time, logs that silently diverge after a
 //! re-election. A unit test cannot reach those by construction (see
-//! `docs/dev/v1.0-readiness-v0.32.md` B-10).
+//! `docs/dev/v1.0-readiness-v0.35.md` B-10).
 //!
 //! **Scope: this is a concurrency/correctness soak, not a 24h longevity run;
 //! mixed-version (rolling-upgrade) pairs are out of scope here** — the bus

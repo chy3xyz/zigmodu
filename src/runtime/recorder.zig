@@ -78,8 +78,10 @@
 //!   two single-typed tracks merged by their sequence numbers, and `record` still
 //!   stores the value itself: turning a value into bytes is a caller-supplied
 //!   `Codec(E)` that runs in `drainTo`, where allocating is allowed (§13.9
-//!   D1/D2). What is still missing is the other direction — replaying *from*
-//!   those bytes is the next slice (§13.9 D5).
+//!   D1/D2). The other direction — replaying *from* those bytes — landed as
+//!   `ReplayFromLog` over `delivery_log.zig`'s segment files (§13.10); what is
+//!   still missing on that side is its CLI / retention / compaction
+//!   (§13.10's own list, not this one).
 //! - **Not a `HotBus` subscriber.** A sink consumes a comptime subscriber slot,
 //!   and a log too small for the traffic would come back as `deliver ==
 //!   false` → counted as a *drop* while the event kept flowing. Both record

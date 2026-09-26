@@ -1,5 +1,42 @@
 # Changelog
 
+## [Unreleased]
+
+### 第 64 批：`v0.35 → v1.0 差距评估` 落成文档（取代 v0.32 那份）+ 清掉 5 处文档与代码不符（**破坏性：否**）
+
+**① 新的现行差距评估：[`docs/dev/v1.0-readiness-v0.35.md`](docs/dev/v1.0-readiness-v0.35.md)。**
+把 v0.32 那份（`docs/dev/v1.0-readiness-v0.32.md`，源码注释按路径引用它，原地保留）的 **17 条逐条**
+对着 v0.35.0 的代码复核。方法：四个**只读**子代理分工 + 主代理 grep 交叉验证，**未跑任何构建**；
+判定只认代码证据（`文件:行` / 测试名 / 一条可复现命令），文档旧结论一律复核不采信。
+
+| 组 | 结果 |
+|---|---|
+| A（写代码能关的，9 条） | **0 已关 · 4 部分 · 5 未关** |
+| B（要证据的，6 条）—— v0.32 说这才是门槛 | **4 已关**（soak 覆盖 cluster、fuzz、bench 证据、CL/TE 端到端）**· 2 未关**（混合版本对跑、独立验证） |
+| C（治理/可持续性） | 2 条仍在（879 提交：AI 629 / neox33 220 / ZigModu Developer 29 / **所有者 1**；stars 3 · forks 0） |
+
+判断：**功能+安全 ≈ 1.0 的 88%；"能称为 1.0" ≈ 70%**。差的三件不是功能 —— **Raft 侧身份绑定
+（A-1）、混合版本对跑（B-11）、独立验证（B-14）**；"如果只能做一件"从 v0.32 的"soak + 混合版本
+对跑"收窄成**混合版本对跑**（soak 已由 `src/soak_cluster.zig` 补上）。文件里另有一节
+**写明这份复核自己的局限**（同一批 AI 自证 = B-14 本身）。
+
+**② 5 处文档与代码不符，清掉 4 处 + 1 处加注**（都带实测，不是照抄上一份报告）：
+
+* `src/runtime/recorder.zig` 说"从字节重放是**下一刀**" → 已实现（`ReplayFromLog`，`docs/RUNTIME.md` §13.10）；
+* `docs/RUNTIME.md` §12.7「**不做 µs 级 timer**」 → µs 级定时器已落地（`PrecisionTimer`，§12.15，
+  p50 0 ns / p99 1 µs）；仍**没有**独立 `LowLatencyClock` **类型**，"不做"的对象是那个类型；
+  同时 §13.9 D5 的"下一刀"加了一行指回 §13.10；
+* `docs/RUNTIME.md` §12「注册 **19** 条 `zigmodu_runtime_*`」 → 实测 **25** 条
+  （13 通用 + 6 CPU 池 + 6 阻塞池；计数口径写进文档）；
+* `CHANGELOG.md` 阻塞池那批写「`zigmodu_runtime_*` 从 **25** 条变 **31** 条」 → 按唯一 gauge 名字
+  数，该提交前后实测 **17 → 25**，今天仍 25（已在该条内加"修正（清账时实测）"注）；
+* `docs/dev/cluster-auth-design.md` 标题「集群入站零认证 —— **未实现**」 → L1/L2 已实现，
+  未实现的是 **Raft 侧身份绑定**（标题 + `docs/dev/README.md` 那行 + §0 的问题陈述都改了）；
+* `docs/dev/v1.0-gap.md`「出站 dial **无界**」 → 已由 v0.34.0 第 29 批关掉
+  （`RaftTransport.connectTimeout`），已加注（Windows 仍回落无界）。
+
+顺带：`src/soak_cluster.zig` 的注释从 v0.32 那份指到现行的 v0.35 那份。
+
 ## [0.35.0] - 2026-09-26
 
 ### 发版前补记：`docs/UPGRADING.md` 补上本版口径、修掉 `v0.33.6（未发布）` 这个旧标题（**破坏性：否**）
@@ -5243,6 +5280,10 @@ D4 每 worker 一 token、`push` 不可失败、§12.11 修的四处都不需要
 - **`MetricsBridge` 覆盖阻塞池**：同样六条，`zigmodu_runtime_blocking_pool_*`（declared / threads /
   ready_len / claimed / dispatches / ready_push_failures），与 CPU 池并列。没声明阻塞池时读 0 ——
   "这个 app 没有阻塞池"是仪表盘能画出来的答案，不是一条缺失的线。`zigmodu_runtime_*` 从 25 条变 31 条。
+  > **修正（清账时实测）**：这一行的两个数都对不上代码。按唯一 gauge 名字数
+  > （`grep -o '"zigmodu_runtime_[a-z_0-9]*"' src/runtime/runtime.zig | sort -u | wc -l`），
+  > 在那个提交之前是 **17** 条、之后是 **25** 条，今天仍是 **25** 条
+  > （13 通用 + 6 CPU 池 + 6 阻塞池；口径见 `docs/RUNTIME.md` §12 那一段）。
 - **`Application.withBlockingThreads(blocking_threads, max_blocking_workers)`**：与
   `Config.blocking_threads` / `Config.max_blocking_workers` 同名同义，走
   `ApplicationBuilder → Config → Runtime.initWithOptions` 这条既有的镜像路（六处：两个 `Config` 字段、

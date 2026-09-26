@@ -415,13 +415,14 @@ var bridge = try zigmodu.runtime.Runtime.MetricsBridge(PrometheusMetrics).init(&
 metrics.setScrapeHook(@TypeOf(bridge).sample, &bridge);
 ```
 
-它注册 19 条 `zigmodu_runtime_*` 指标（`workers` / `running` / `messages_sent` /
+它注册 **25** 条 `zigmodu_runtime_*` 指标：通用的 13 条（`workers` / `running` / `messages_sent` /
 `messages_received` / **`messages_dropped`** / **`messages_discarded_on_stop`** / `handler_errors` /
 `timer_fires` / **`timers_discarded`** / **`timer_deliveries_dropped`** / **`timer_lag_ms`** /
-**`supervised_stops`** / **`group_restarts`**（后两条是 §14 的监督读数），
+**`supervised_stops`** / **`group_restarts`**（后两条是 §14 的监督读数）），
 加上池化执行（§12）的 6 条：
 `pool_declared` / `pool_threads` / `pool_ready_len` / `pool_claimed` / `pool_dispatches` /
-`pool_ready_push_failures`）。名字里没有 `_total` 后缀是刻意的：这些是**抓取时采样**的快照，
+`pool_ready_push_failures`，再加上**阻塞池**那 6 条（同名加 `blocking_` 前缀；
+没声明阻塞池时读 0，见 §12）。计数口径 = 唯一 gauge 名字（`grep -o '"zigmodu_runtime_[a-z_0-9]*"' src/runtime/*.zig | sort -u | wc -l`）。名字里没有 `_total` 后缀是刻意的：这些是**抓取时采样**的快照，
 所以走 gauge 而不是 counter（`PrometheusMetrics.Counter` 没有 `set`）。
 
 `supervised_stops` 与 `messages_discarded_on_stop` 是**两条曲线**：前者是"一个成员被框架停掉了"
@@ -961,6 +962,9 @@ B 仍然被服务，只是要等 A 那一批跑干。所以小 batch 换吞吐�
     之前就返回（`runtime.zig:1719-1723`），线程体的 init 结果"刻意不读"（`runtime.zig:2305-2308`）。
     先加字段只能买到"静默失败的 pin"或"上报成功却没拿到核的 worker"。详见 `affinity.zig` 的模块 doc。
 - **不做 μs 级 timer**：那是独立的 `LowLatencyClock/Timer`（评估 §7 的建议），与调度器正交。
+  **后续（§12.15）**：µs 级**定时器**已由 `PrecisionTimer` 落地（min-heap + spin window，实测
+  p50 0 ns / p99 1 µs）；仍**没有**独立的 `LowLatencyClock` 类型 —— 它直接读
+  `Time.monotonicNow()`。这条决策记录的是"不为它开一个新时钟类型"，不是"不做 µs 定时器"。
 - **不做 remote worker**（评估 §15）：本地 Runtime 稳定之前不谈。
 
 ### 12.8 已定的四个决策
@@ -2034,7 +2038,8 @@ pub fn Codec(comptime E: type) type {
 第一次 drain 从头开始。`DeliveryLog` 因此多一个每轨 `drained_upto: u64`（最后写出去的全局 seq）。
 
 **D5 —— 这一刀不做**：从盘上重放（`Replayer` 侧读 `delivery_log` 段 + `decode` 投回 handle：
-**下一刀**）、CLI、保留策略/压实、压缩与加密、跨进程传输。段文件本身的格式也不动。
+**下一刀** —— **已在 §13.10 落地为 `ReplayFromLog`**，见那一节的状态行）、CLI、保留策略/压实、
+压缩与加密、跨进程传输。段文件本身的格式也不动。
 
 **D6 —— 分配契约。** `drainTo` 允许分配，但必须**全部还回去**：测试用数分配的分配器（本文件
 `Replayer: narrowing and stepping take no allocator` 用的同款手法），drain 前后 `allocations ==

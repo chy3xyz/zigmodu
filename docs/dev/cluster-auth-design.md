@@ -1,4 +1,4 @@
-# 集群入站零认证 —— 设计（未实现）
+# 集群入站认证 —— 设计（**L1 逐帧 HMAC + L2 成员校验已实现**；Raft 侧**身份绑定**仍未实现）
 
 > 状态：**§3（L1 逐帧 HMAC 认证）与 §3.5（fail-closed 门禁）已实现并验证；
 > §4（L2 成员校验）已实现 —— 它当初被 §10 的缺陷阻断，§10 修完后随之解锁。**
@@ -6,9 +6,13 @@
 > 以及本次评估中对 `handleVoteRequest` / `handleAppendEntries` 的复核。
 > 所有事实都带 `文件:行`；推测的地方显式标注"未验证"。
 
-## 0. 结论（一句话）
+## 0. 结论（一句话，记的是**写这份设计时**的现状）
 
-今天**TCP 可达即集群成员**：`TlsTransport.ClusterAuth`（HMAC-PSK）定义在案、有单测，
+> **今天的状态在标题下面那段"状态"里**；本节保留的是当时的问题陈述 ——
+> L1/L2 已实现，剩下的缺口是 `docs/dev/v1.0-readiness-v0.35.md` 的 A-1（Raft 侧仍是**一把共享
+> PSK**，`ClusterAuth` 只做帧认证、不绑定节点身份；总线的每节点凭证握手未推广过来）。
+
+当时：**TCP 可达即集群成员**：`TlsTransport.ClusterAuth`（HMAC-PSK）定义在案、有单测，
 但**全仓库零调用点**，连"打开它"的入口都不存在。要用 HS256 把每个入站帧按
 `[len][tag][payload][mac32]` 验一遍，并在 `ClusterBootstrap.start()` 上按既有
 `allow_stub_raft_transport` 的同一种"拒绝 + 显式承认"惯用法做 fail-closed。
