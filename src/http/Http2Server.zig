@@ -542,7 +542,7 @@ fn serveSession(
         // The map owns stream 1 from here — a failure below releases it.
         const gop = try streams.getOrPut(1);
         if (gop.found_existing) return error.UpgradeStreamAlreadyOpen;
-        gop.value_ptr.* = StreamState.init();
+        gop.value_ptr.* = StreamState.initWithPeerWindow(conn_flow.peer_initial);
         errdefer {
             if (streams.fetchRemove(1)) |kv| {
                 var removed = kv;
@@ -773,7 +773,7 @@ fn serveSession(
                     last_opened_stream = sid;
                 }
                 const gop = try streams.getOrPut(sid);
-                if (!gop.found_existing) gop.value_ptr.* = StreamState.init();
+                if (!gop.found_existing) gop.value_ptr.* = StreamState.initWithPeerWindow(conn_flow.peer_initial);
                 try priority_tree.ensureStream(sid);
                 const header_chunk = blk: {
                     const stripped = Http2.stripHeadersPriority(frame.payload, frame.header.flags) catch break :blk frame.payload;
@@ -1412,7 +1412,12 @@ const StreamState = struct {
     path: []u8 = &.{},
     content_type: []u8 = &.{},
     decoded: ?[]Hpack.Header = null,
-    flow: Http2.FlowControlState = Http2.FlowControlState.init(Http2.default_initial_window_size),
+    /// Our window for *receiving* on this stream is the framework's advertised
+    /// value; the window for *sending* is the peer's `SETTINGS_INITIAL_WINDOW_SIZE`
+    /// as of the stream's creation — see `Http2.FlowControlState.initStream`. The
+    /// field default is only for the tests that build a `StreamState` directly;
+    /// the session passes the peer's number through `init`.
+    flow: Http2.FlowControlState = Http2.FlowControlState.initStream(Http2.default_initial_window_size, Http2.default_initial_window_size),
     priority: Http2.PriorityInfo = .{ .exclusive = false, .depends_on = 0, .weight = 15 },
     /// Inbound request-body bytes counted against `InboundLimits.max_body_bytes`
     /// — covers both `data` and the live bidi `grpc_buf`.
@@ -1423,7 +1428,14 @@ const StreamState = struct {
     grpc_buf_active: bool = false,
 
     fn init() StreamState {
-        return .{};
+        return .{ .flow = Http2.FlowControlState.initStream(Http2.default_initial_window_size, Http2.default_initial_window_size) };
+    }
+
+    /// A stream opened while the peer's `SETTINGS_INITIAL_WINDOW_SIZE` is
+    /// `peer_initial_window`: that is the window its **send** side starts at
+    /// (RFC 9113 §6.5.2 — the setting applies to streams opened later too).
+    fn initWithPeerWindow(peer_initial_window: u31) StreamState {
+        return .{ .flow = Http2.FlowControlState.initStream(Http2.default_initial_window_size, peer_initial_window) };
     }
 
     pub fn getPriority(self: *const StreamState) Http2.PriorityInfo {

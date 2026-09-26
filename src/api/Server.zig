@@ -5531,18 +5531,19 @@ test "an HTTP/2 client that stops reading cannot hold the session: the write bud
     defer allocator.free(block);
     const head = try Http2.encodeHeaders(allocator, 1, block, true, true);
     defer allocator.free(head);
-    // The stream's own window, *after* the HEADERS that opened it: a
-    // WINDOW_UPDATE for an idle stream is a protocol error, and this is the
-    // adversarial shape anyway — a client that says "send me everything" and then
-    // stops reading.
-    const stream_window = try Http2.encodeWindowUpdate(allocator, 1, window);
-    defer allocator.free(stream_window);
-
+    // **No per-stream `WINDOW_UPDATE`**: the stream's send window has to come
+    // from the SETTINGS above (`INITIAL_WINDOW_SIZE` applies to streams opened
+    // after it — RFC 9113 §6.5.2). That is deliberate, and it is what makes this
+    // test the regression test for `Http2.FlowControlState.initStream`: while new
+    // streams started at the protocol default instead, the response stopped at
+    // 64 KiB (measured: 65636 bytes on the wire, then a stall) and this test's
+    // 3 s budget could never be met — the session was waiting for a per-stream
+    // window nobody was going to send, so no `send` ever blocked and no write
+    // budget could fire.
     try sockread.writeFull(stream, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
     try sockread.writeFull(stream, settings);
     try sockread.writeFull(stream, conn_window);
     try sockread.writeFull(stream, head);
-    try sockread.writeFull(stream, stream_window);
     // And then nothing: no read, no further WINDOW_UPDATE, no GOAWAY.
 
     var waited_ms: usize = 0;
@@ -5692,9 +5693,27 @@ test "stop() ends a silent WebSocket client's fiber instead of waiting for the p
 
     server.stop();
 
-    // Structural, and immediate: the wake pass shut this connection's socket
-    // down. That is what ends the read — no timeout, no peer cooperation.
-    try std.testing.expectEqual(@as(u64, 1), server.ws_woken_connections.load(.monotonic));
+    // **Either** the wake pass shut this connection's socket down, **or** the
+    // fiber saw `running == false` on its way into the read and left before
+    // parking. Both end it without any cooperation from the peer — which is the
+    // claim this test exists for — but only the first exercises the wake pass,
+    // and the wake pass has its own deterministic test
+    // (`stop() shuts down every registered WebSocket connection`: socketpair, no
+    // fiber, no timing).
+    //
+    // This used to assert `ws_woken_connections == 1` outright, and that is a
+    // race: between `registerWsConnection` returning and the fiber's first
+    // `running` check there is a window, and a stop() landing inside it leaves the
+    // fiber to leave on its own (observed as one red CI job, green on rerun and in
+    // 40 idle local runs). Asserting the disjunction keeps the teeth that matter:
+    // a *parked* fiber that the wake pass fails to wake is still registered here
+    // and still fails the budget check below.
+    const registered_after_stop = server.registeredWsCount();
+    const woken = server.ws_woken_connections.load(.monotonic);
+    if (woken == 0) {
+        std.log.warn("[test] the silent connection was not woken (registered after stop: {d}): it saw `running == false` and left before parking, so this run does not exercise the wake pass", .{registered_after_stop});
+    }
+    try std.testing.expect(woken == 1 or registered_after_stop == 0);
 
     // Bounded wait for the connection fiber to be gone. 3 s is a hang budget:
     // the wake pass runs inside `stop()`, so nothing here is a latency bound.

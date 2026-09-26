@@ -2,6 +2,51 @@
 
 ## [Unreleased]
 
+### 第 57 批：HTTP/2 新流采用对端的 `SETTINGS_INITIAL_WINDOW_SIZE`（第 56 批实测到的 64 KiB 卡顿）；并把上一批那条 CI 红（WS 静默测试）的**竞态**查清、拆掉（**破坏性：否**）
+
+**① H2：新流的发送窗口从"协议默认 65535"改成"对端当前的 `SETTINGS_INITIAL_WINDOW_SIZE`"**
+
+第 56 批在写 H2 那条 stall 测试时实测到：客户端在 SETTINGS 里宣告 16 MiB，服务端仍只放行
+**65636** 字节就停（要靠**每流** `WINDOW_UPDATE` 才继续）。根因在 `StreamState` 的字段默认值：
+`flow: FlowControlState = .init(Http2.default_initial_window_size)` —— 无论对端宣告多少，
+新流的发送窗口都从 65535 起，而 RFC 9113 §6.5.2 说这个设置"适用于所有流，包括闲置的流"。
+
+* 新增 `Http2.FlowControlState.initStream(our_initial, peer_initial)`：**接收**侧仍是我们自己
+  广播的值，**发送**侧取对端的数。`StreamState.initWithPeerWindow(conn_flow.peer_initial)`
+  在两个建流点（h2c 升级的流 1、普通 HEADERS 建流）使用；测试直接构造 `StreamState` 时仍走
+  `init()`（协议默认），行为不变。
+* **回归测试就是那条 stall 测试**：它现在**不再**发每流 `WINDOW_UPDATE`（这正是它能测出这个
+  缺陷的原因 —— 说明仍留在代码注释里）。
+  > **红证据**（把 `initWithPeerWindow` 退回协议默认）：
+  > `[test] a non-reading HTTP/2 client held the session fiber 3000ms past the 200ms write budget (65636 bytes on the wire)`
+  > 即"64 KiB 之后卡住、根本到不了 send、写预算无从谈起"。修后同一条测试绿（会话在预算内结束）。
+
+**② 上一批那条 CI 红的真正原因：测试自身的竞态，不是框架缺陷**
+
+第 56 批推送后 `Test (Redis + NATS + Kafka live)` 红了，位置是第 53 批的
+`stop() ends a silent WebSocket client's fiber…`：`ws_woken_connections` 期望 1 得 0。重跑同 commit
+全绿。本批把它查清了 —— **不是"唤醒 pass 漏了"，而是这条连接有两种都合法的结束方式**：
+
+| 结束方式 | 计数 | 说明 |
+|----------|------|------|
+| `stop()` 的唤醒 pass 关掉它的 socket | `ws_woken == 1` | 测试想测的那条 |
+| fiber 进读循环前看到 `running == false`，自己返回 | `ws_woken == 0` | `registerWsConnection` 返回到第一次 `running` 检查之间有窗口，`stop()` 落在窗口里就走这条 |
+
+第二条不是缺陷：那条 fiber 根本没 park，`stop()` 也没有被它拖住（这正是测试要保的不变量）。
+压测下的调度延迟把这个窗口放大了，于是偶发。
+
+* 修法：断言改成二者之一（`woken == 1 or registered_after_stop == 0`），并且在走第二条时打一条
+  **warn**，点名"这一次没有测到唤醒 pass"，而不是让它冒充通过。牙齿还在：**parked** 的 fiber
+  如果没被唤醒，计数在这里仍是 1，后面的预算断言照样失败；而且唤醒 pass 本身另有确定性测试
+  （`stop() shuts down every registered WebSocket connection`，socketpair、无 fiber、无时序）。
+* 在**同一条测试**里复现并验证：修前 12 次里 1 次硬失败；修后 20 次 **0 次硬失败**，
+  其中 1 次打印了"这次没测到唤醒 pass"的 warn。
+
+**③ 本批不声称**：`extensions/WebSocket.zig` / `extensions/WebMonitor.zig` 的写预算仍未接线
+（它们的连接不属于 `Server` 的连接）；H2 响应体超过 `max_pending_bytes`（4 MiB）被
+`RST_STREAM(ENHANCE_YOUR_CALM)` 拒绝这条仍按现状保留并在 `docs/API.md` 写明（改它要动调度器：
+把一次性排队的响应体改成按窗口切片排队）。
+
 ### 第 56 批：把响应写预算接到**所有**服务端写路径（streaming / SSE / HTTP/2）—— 第 55 批只盖住了"缓冲响应"那一条（**破坏性：否**）
 
 第 55 批把 `response_write_timeout_ms` 接到了 `writeResponse`（handler 返回后一次写的那条），并在 CHANGELOG 里点名"凡是走 `std.Io` writer 的写仍然无界，服务端还有三处"。本批把这三处接上，并把实现收敛成一处。

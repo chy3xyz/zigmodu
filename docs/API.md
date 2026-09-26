@@ -1063,11 +1063,14 @@ for those (an MQTT client is not part of the framework).
 | `max_pending_bytes` | 4 MiB | Outbound bytes buffered before the peer's window drains. A response body past it is **refused** with `RST_STREAM(ENHANCE_YOUR_CALM)` — measured: a 3 MiB body is served, a 6 MiB one is refused. Raise it for large responses, or serve large payloads over HTTP/1.1 (which has no equivalent cap). |
 | `max_pending_streams` | 64 | Concurrent outbound response streams; over it the stream is refused with `REFUSED_STREAM`. |
 
-A new stream's send window starts at the protocol default (65535) regardless of
-the peer's `SETTINGS_INITIAL_WINDOW_SIZE`; the peer's per-stream `WINDOW_UPDATE`
-is what raises it. Clients that advertise a large window and wait for the server
-to use it (instead of sending `WINDOW_UPDATE`s) therefore see a 64 KiB response
-and a stall — measured: 65636 bytes on the wire, then waiting.
+A stream's send window starts at the peer's `SETTINGS_INITIAL_WINDOW_SIZE` as of
+the stream's creation (`Http2.FlowControlState.initStream`, RFC 9113 §6.5.2 — the
+setting applies to streams opened after it), and the peer's per-stream
+`WINDOW_UPDATE` raises it further. Before that, new streams started at the
+protocol default regardless of what the peer advertised, which showed up as a
+response stopping after 64 KiB (measured: 65636 bytes on the wire) for a client
+that advertised a large window; the h2 stall test in `api/Server.zig` is the
+regression test (it no longer sends a per-stream `WINDOW_UPDATE`).
 
 ### gRPC Transport (unary)
 

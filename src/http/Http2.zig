@@ -86,6 +86,29 @@ pub const FlowControlState = struct {
         };
     }
 
+    /// A state whose **receive** side is our own advertised window and whose
+    /// **send** side starts at the peer's `SETTINGS_INITIAL_WINDOW_SIZE`.
+    ///
+    /// That split is the RFC's (9113 §6.5.2): a connection's INITIAL_WINDOW_SIZE
+    /// is the peer saying how much *we* may send, and it "applies to all streams,
+    /// including those in the idle state" — so a stream opened after the SETTINGS
+    /// arrives starts with the peer's value, not with the protocol default.
+    /// Starting those streams at 65535 instead is what caps a response at 64 KiB
+    /// for a client that advertised a larger window and then waits (measured:
+    /// 65636 bytes on the wire, then a stall — see the h2 stall test in
+    /// `api/Server.zig`).
+    ///
+    /// The receive side is deliberately *not* the peer's number: what we accept
+    /// inbound is governed by our own advertised window.
+    pub fn initStream(our_initial: u31, peer_initial: u31) FlowControlState {
+        return .{
+            .our_initial = our_initial,
+            .peer_initial = peer_initial,
+            .recv_window = our_initial,
+            .send_window = peer_initial,
+        };
+    }
+
     /// Decrement recv window after inbound DATA. Returns WINDOW_UPDATE increment when below half initial.
     ///
     /// Fails with `error.RecvWindowExceeded` when `size` is larger than the
