@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.35.1] - 2026-09-27
 
 ### 第 68 批：第 67 批记下的那条并发协议洞（`cancelTimerSync` 的 use-after-return）按设计修掉（**破坏性：否**）
 
