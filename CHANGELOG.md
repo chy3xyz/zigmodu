@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### 发版前补记：`docs/UPGRADING.md` 补上本版口径、修掉 `v0.33.6（未发布）` 这个旧标题（**破坏性：否**）
+
+发版前的过一遍发现 `docs/UPGRADING.md` 的最新一节写着 `## v0.33.6（未发布）` —— 而那份内容
+（`TomlLoader`、`ScopedContainer` 的三个方法、`runtime.affinity`、删掉空壳 `TransactionalEvent`）
+**已随 v0.34.0 发布**（0.34.0 的 CHANGELOG 段里能查到，含第 30/31 批），标题却停在从未发过的
+0.33.6；同时**本次要发的版本一节也没有**。
+
+* 新增 `## v0.35.0`：三条消费者看得见的口径 —— ① `ws_write_timeout_ms = 0` 由"无界"改成"继承
+  `response_write_timeout_ms`"（唯一的行为变化，含一行改法：想保持无界就 `response_write_timeout_ms = 0`）；
+  ② 服务端每条写路径默认都有写预算（含"写失败粘住"这条契约）；③ HTTP/2 两条行为变化
+  （> `max_pending_bytes` 的响应体现在能发；新流窗口按对端 `SETTINGS_INITIAL_WINDOW_SIZE`）。
+  并写明**没有公开 API 被删**。
+* `## v0.33.6（未发布）` 改名 `## v0.33.6 → v0.34.0（内容已随 v0.34.0 发布，本节标题是旧名）`。
+
 ### 第 63 批：写失败必须**粘住**（`ConnWriter`/`BoundedWriter`）—— 失败的空 flush 曾返回成功，H2 会话因此带着废 socket 继续读（**破坏性：否**）
 
 第 61 批推上去后 CI 的 **ubuntu 腿**红在一条**既有**测试

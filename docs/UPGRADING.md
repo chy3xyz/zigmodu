@@ -134,7 +134,44 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 
 ---
 
-## v0.33.6（未发布）
+## v0.35.0
+
+> **没有公开 API 被删**（`docs/API.md` 里的名字一个没动）。**一条口径变化**：WS 帧推送的
+> `ws_write_timeout_ms = 0` 从"无界"改成"继承 `response_write_timeout_ms`"。另有两条 HTTP/2
+> 行为变化和一条全局口径（服务端**每条**写路径都有上界）—— 都是修缺陷，但你在生产上看得见。
+
+### 1. `ws_write_timeout_ms = 0` 现在是"继承"，不是"无界"（**行为变化，窄**）
+
+**谁受影响**：把 `ws_write_timeout_ms` 显式设成 `0`、并指望"推送永远不因对端不读而失败"的部署。
+以前一个不读的客户端能把推送线程永久 park 住；现在它在 `response_write_timeout_ms`（默认 30 s）
+的预算内零进展就会被截断/断开。
+
+**一行改法**：想要旧的无界行为，把 `response_write_timeout_ms` 设成 `0`（两处一起关）。
+不设 `0` 的部署不需要动。
+
+### 2. 服务端每条写路径都默认有写预算（**口径**，`response_write_timeout_ms` 是开关）
+
+HTTP/1.1 缓冲响应、chunked/streaming、SSE、HTTP/2 帧、`Server` 的 WS 帧推送，现在都由
+`response_write_timeout_ms`（默认 30 s）界定；扩展层 `WebSocketServer` / `WebMonitor` 各有自己的
+`setWriteTimeout`（默认 30 s）。预算是**每次 `send`** 的，所以只是慢（一直在流动）的对端不会被切断；
+停住不读的会拿到**被截断的响应** + 连接关闭，而不是把连接 fiber 一直占着（`stop()` 也就不会被对端拖住）。
+
+顺带一条契约：**写失败是粘住的** —— 一个 socket 写失败之后，之后任何写/flush 都会返回那次错误
+（不会出现"空 flush 返回成功"）。这条过去会让一个已经写不出去的 H2 会话继续读下去。
+
+### 3. HTTP/2 两条行为变化（都在修缺陷）
+
+* **响应体大于 `max_pending_bytes`（默认 4 MiB）现在能发出去。** 以前 6 MiB 得到
+  `RST_STREAM(ENHANCE_YOUR_CALM)`、16 MiB 得到 `INTERNAL_ERROR`，而同一路由在 HTTP/1.1 上正常 ——
+  为此做过的"H2 大响应改走 H1"变通可以撤掉。`max_pending_bytes` 恢复成它注释里的语义：**管队列，
+  不管响应体**。
+* **新流的发送窗口按对端 `SETTINGS_INITIAL_WINDOW_SIZE` 起**（RFC 9113 §6.5.2）。过去新流一律从
+  65535 起、忽略对端声明 —— 对端声明小于 65535 时，现在它拿到的是**它声明的值**（WINDOW_UPDATE
+  轮次相应变多）。
+
+---
+
+## v0.33.6 → v0.34.0（内容已随 **v0.34.0** 发布，本节标题是旧名）
 
 > **本版无破坏性变更**：新增 `zigmodu.TomlLoader`、`ScopedContainer` 的三个方法、`zigmodu.runtime.affinity`
 > （CPU pin 原语），删除一个从没实现过的空壳 `TransactionalEvent`。**第 31 批也是无公开 API 变化的一批**
