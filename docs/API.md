@@ -1060,7 +1060,7 @@ for those (an MQTT client is not part of the framework).
 
 | Limit | Default | Effect |
 |-------|---------|--------|
-| `max_pending_bytes` | 4 MiB | Outbound bytes buffered before the peer's window drains. A response body past it is **refused** with `RST_STREAM(ENHANCE_YOUR_CALM)` — measured: a 3 MiB body is served, a 6 MiB one is refused. Raise it for large responses, or serve large payloads over HTTP/1.1 (which has no equivalent cap). |
+| `max_pending_bytes` | 4 MiB | Outbound bytes **queued** before the peer's window drains — a bound on the queue, not on a response body. A body larger than it is staged frame by frame as earlier frames leave for the wire (`OutboundScheduler.refill`), so a 6 MiB (or 16 MiB) body is served over H2 exactly as it is over HTTP/1.1. Measured before the fix: 3 MiB served, 6 MiB refused with `RST_STREAM(ENHANCE_YOUR_CALM)`, 16 MiB with `INTERNAL_ERROR` (a single DATA frame's 24-bit length). It only refuses a stream when it is `0`, where no slice can be staged at all. |
 | `max_pending_streams` | 64 | Concurrent outbound response streams; over it the stream is refused with `REFUSED_STREAM`. |
 
 A stream's send window starts at the peer's `SETTINGS_INITIAL_WINDOW_SIZE` as of

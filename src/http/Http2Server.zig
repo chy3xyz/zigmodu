@@ -140,6 +140,12 @@ pub const ServeOptions = struct {
     /// Cap concurrent pending outbound response streams (REFUSED_STREAM when exceeded).
     max_pending_streams: usize = 64,
     /// Cap total pending outbound wire bytes (ENHANCE_YOUR_CALM when exceeded).
+    ///
+    /// This is a bound on the *queue*, not on a response body: a response larger
+    /// than this is staged frame by frame as earlier frames leave for the wire
+    /// (see `OutboundScheduler.refill`). It only refuses a stream when it is
+    /// zero, where no slice can be staged at all. HTTP/1.1 has no counterpart of
+    /// this knob — a body it can build, it sends.
     max_pending_bytes: usize = 4 * 1024 * 1024,
     /// Inbound resource limits (RFC 7540 §10.5 denial-of-service defenses).
     inbound: InboundLimits = .{},
@@ -1169,10 +1175,23 @@ fn sendGoAway(
 // ==== §5  Outbound scheduler ====
 
 /// Per-stream pending HTTP/2 wire (HEADERS/DATA/trailers) drained by PriorityTree WRR.
+///
+/// The buffer holds the whole response, but only the frame-aligned prefix
+/// `[offset, committed)` is *queued* against `max_pending_bytes`; `refill` walks
+/// `committed` forward as the byte budget (and, at send time, the flow-control
+/// window) frees up. Before this, `enqueue` staged the whole response in one
+/// shot, so the cap — which names a *queue*, see `ServeOptions.max_pending_bytes`
+/// — silently became a response-size cap: a 6 MiB body was answered with
+/// `RST_STREAM(ENHANCE_YOUR_CALM)` and not one DATA frame, while HTTP/1.1 served
+/// the same route.
 const PendingOutbound = struct {
     wire: []u8,
     /// Logical end of wire (may shrink after in-place DATA partial send).
     end: usize,
+    /// Frame-aligned end of the *queued* prefix: `offset <= committed <= end`,
+    /// and `committed < end` means the tail is still waiting for budget. Always
+    /// lands on a frame boundary so `remaining()` can never end mid-frame.
+    committed: usize = 0,
     offset: usize = 0,
     flow: Http2.FlowControlState,
 
@@ -1181,18 +1200,29 @@ const PendingOutbound = struct {
         self.* = undefined;
     }
 
+    /// Queued bytes that have not left for the wire yet.
     fn remaining(self: *const PendingOutbound) []const u8 {
-        return self.wire[self.offset..self.end];
+        return self.wire[self.offset..self.committed];
     }
 
+    fn hasQueued(self: *const PendingOutbound) bool {
+        return self.offset < self.committed;
+    }
+
+    /// Whole response flushed to the wire (not merely dequeued).
     fn done(self: *const PendingOutbound) bool {
         return self.offset >= self.end;
     }
 
-    fn byteLen(self: *const PendingOutbound) usize {
-        return self.end -| self.offset;
+    fn queued(self: *const PendingOutbound) usize {
+        return self.committed - self.offset;
     }
 };
+
+/// Frames `refill` may stage per stream per call. Bounds how much of the queue
+/// one stream can own, so a single large response cannot starve a small one
+/// multiplexed behind it; `max_pending_bytes` is the hard cap.
+const outbound_slice_frames: usize = 16;
 
 /// Weighted outbound DATA scheduler: interleaves pending streams via `PriorityTree.pickNext`.
 const OutboundScheduler = struct {
@@ -1221,32 +1251,73 @@ const OutboundScheduler = struct {
     fn cancel(self: *OutboundScheduler, stream_id: u31) void {
         if (self.pending.fetchRemove(stream_id)) |kv| {
             var p = kv.value;
-            self.pending_bytes -|= p.byteLen();
+            self.pending_bytes -|= p.queued();
             p.deinit(self.allocator);
         }
     }
 
-    fn enqueue(self: *OutboundScheduler, stream_id: u31, wire: []u8, flow: Http2.FlowControlState) !void {
+    /// Take ownership of a whole response, queueing only its first slice.
+    ///
+    /// `error.PendingBytesExceeded` is reserved for `max_pending_bytes == 0`,
+    /// where no slice can ever be staged and parking the response would hang it.
+    /// Otherwise the queue is bounded by the budget in `refill` — `pending_bytes`
+    /// stays at or below `max_bytes`, plus one frame per stream that is starting
+    /// with nothing queued (see there).
+    fn enqueue(
+        self: *OutboundScheduler,
+        stream_id: u31,
+        wire: []u8,
+        flow: Http2.FlowControlState,
+        conn_max_frame_size: u31,
+    ) !void {
         self.cancel(stream_id);
         if (self.pending.count() >= self.max_streams) {
             self.allocator.free(wire);
             return error.PendingStreamsExceeded;
         }
-        if (self.pending_bytes + wire.len > self.max_bytes) {
+        if (self.max_bytes == 0 and wire.len > 0) {
             self.allocator.free(wire);
             return error.PendingBytesExceeded;
         }
-        self.pending_bytes += wire.len;
-        errdefer {
-            self.pending_bytes -|= wire.len;
-            self.allocator.free(wire);
-        }
+        errdefer self.allocator.free(wire);
         try self.pending.put(stream_id, .{
             .wire = wire,
             .end = wire.len,
-            .offset = 0,
             .flow = flow,
         });
+        self.refill(self.pending.getPtr(stream_id).?, conn_max_frame_size);
+    }
+
+    /// Stage the next frames of a response, whole frames only, within the byte
+    /// budget. Called on enqueue and after every frame leaves the wire, so the
+    /// queue stays full while never holding more than `max_bytes`.
+    ///
+    /// A stream with *nothing* queued is given one frame even when the budget is
+    /// spent: the budget bounds how much this queue pushes at once, not whether
+    /// an admitted response may start (its wire is held either way — the buffer
+    /// is already allocated). Without that, a large response that fills the
+    /// budget while its window is shut would starve a multiplexed small one.
+    fn refill(self: *OutboundScheduler, p: *PendingOutbound, conn_max_frame_size: u31) void {
+        const slice_target = @min(
+            self.max_bytes,
+            @as(usize, conn_max_frame_size) * outbound_slice_frames,
+        );
+        while (p.committed < p.end) {
+            if (p.queued() >= slice_target) return;
+            const flen = wireFrameLen(p.wire, p.committed) orelse {
+                // A tail that is not a whole frame is queued as-is (at most one
+                // frame past the budget): `writeNextWireFrame` drops it by
+                // advancing to `end`, so a truncated wire cannot park a stream.
+                const rest = p.end - p.committed;
+                p.committed = p.end;
+                self.pending_bytes += rest;
+                return;
+            };
+            const free = self.max_bytes -| self.pending_bytes;
+            if (flen > free and p.queued() > 0) return;
+            p.committed += flen;
+            self.pending_bytes += flen;
+        }
     }
 
     fn drain(
@@ -1268,11 +1339,13 @@ const OutboundScheduler = struct {
                 if (single_it.next()) |e| {
                     const stream_id = e.key_ptr.*;
                     const p = e.value_ptr;
-                    if (!p.done() and canSendNextFrame(p, conn_flow.send_window, conn_max_frame_size)) {
-                        const before = p.byteLen();
+                    self.refill(p, conn_max_frame_size);
+                    if (p.hasQueued() and canSendNextFrame(p, conn_flow.send_window, conn_max_frame_size)) {
+                        const before = p.queued();
                         const progress = try writeNextWireFrame(writer, conn_flow, &p.flow, stream_id, p, conn_max_frame_size);
-                        const after: usize = if (progress == .done) 0 else p.byteLen();
+                        const after: usize = if (progress == .done) 0 else p.queued();
                         self.pending_bytes = self.pending_bytes - before + after;
+                        if (progress != .done) self.refill(p, conn_max_frame_size);
                         switch (progress) {
                             .blocked => return,
                             .wrote => wrote_n += 1,
@@ -1292,9 +1365,11 @@ const OutboundScheduler = struct {
             var ready_n: usize = 0;
             var it = self.pending.iterator();
             while (it.next()) |e| {
-                if (e.value_ptr.done()) continue;
+                const p = e.value_ptr;
+                self.refill(p, conn_max_frame_size);
+                if (!p.hasQueued()) continue;
                 if (ready_n >= ready_buf.len) break;
-                if (canSendNextFrame(e.value_ptr, conn_flow.send_window, conn_max_frame_size)) {
+                if (canSendNextFrame(p, conn_flow.send_window, conn_max_frame_size)) {
                     ready_buf[ready_n] = e.key_ptr.*;
                     ready_n += 1;
                 }
@@ -1303,11 +1378,12 @@ const OutboundScheduler = struct {
 
             const pick = (try tree.pickNext(ready_buf[0..ready_n])) orelse return;
             const p = self.pending.getPtr(pick) orelse continue;
-            const before = p.byteLen();
+            const before = p.queued();
             const progress = try writeNextWireFrame(writer, conn_flow, &p.flow, pick, p, conn_max_frame_size);
             // After write, remaining bytes for this stream (0 if finished).
-            const after: usize = if (progress == .done) 0 else p.byteLen();
+            const after: usize = if (progress == .done) 0 else p.queued();
             self.pending_bytes = self.pending_bytes - before + after;
+            if (progress != .done) self.refill(p, conn_max_frame_size);
             switch (progress) {
                 .blocked => return,
                 .wrote => wrote_n += 1,
@@ -1329,6 +1405,14 @@ fn canSendNextFrame(p: *PendingOutbound, conn_send_window: u31, conn_max_frame_s
     if (frame.header.typ != .data) return true;
     const max_chunk = maxOutboundChunk(&p.flow, conn_send_window, conn_max_frame_size);
     return max_chunk > 0 or frame.payload.len == 0;
+}
+
+/// Whole-frame length at `off` (9-byte header + payload), or `null` when the
+/// bytes there are not one complete frame. `refill` uses it to keep `committed`
+/// on a frame boundary.
+fn wireFrameLen(wire: []const u8, off: usize) ?usize {
+    const frame = Http2.decodeFrame(wire[off..]) catch return null;
+    return 9 + @as(usize, frame.header.length);
 }
 
 fn writeNextWireFrame(
@@ -1398,6 +1482,14 @@ fn shrinkDataFrameInPlace(pending: *PendingOutbound, sent: usize) void {
         .flags = rem[4],
         .stream_id = frame.header.stream_id,
     }).encode(pending.wire[base..][0..9]);
+    // The queued prefix moved down with the payload it covers. This frame is
+    // always queued (it is the one being written), so `committed` sits at or
+    // past its end; the `else` is a clamp, not a case the sender produces.
+    if (pending.committed >= after_old) {
+        pending.committed -= (old_frame_len - new_frame_len);
+    } else if (pending.committed > base + new_frame_len) {
+        pending.committed = base + new_frame_len;
+    }
     pending.end = base + new_frame_len + after_len;
 }
 
@@ -1654,7 +1746,7 @@ fn finishStreamScheduled(
     try tree.setPriority(stream_id, st.getPriority());
     const wire = try buildStreamResponseWire(allocator, stream_id, st, conn_max_frame_size, peer_max_header_list, opts);
     // enqueue takes ownership of wire (frees on refuse).
-    try outbound.enqueue(stream_id, wire, st.flow);
+    try outbound.enqueue(stream_id, wire, st.flow, conn_max_frame_size);
     const budget: usize = if (more_inbound or outbound.pending.count() > 1) 8 else 0;
     try outbound.drain(writer, tree, conn_flow, conn_max_frame_size, budget);
 }
@@ -1760,6 +1852,7 @@ fn buildStreamResponseWire(
             // the handler produced, so a declared `content-length` is judged
             // against what a `GET` would have sent.
             no_body,
+            conn_max_frame_size,
         );
     }
 
@@ -1767,7 +1860,7 @@ fn buildStreamResponseWire(
     // `HEAD` 404 is a field section and nothing else, like every other `HEAD`
     // response on this connection.
     const budget = responseHeaderBudget(opts, peer_max_header_list, conn_max_frame_size);
-    return try encodeSiteResponseWire(allocator, stream_id, 404, "text/plain", &.{}, "not found", budget, no_body);
+    return try encodeSiteResponseWire(allocator, stream_id, 404, "text/plain", &.{}, "not found", budget, no_body, conn_max_frame_size);
 }
 
 /// The gRPC response wire, minus its DATA frames when the request was a `HEAD`.
@@ -1900,6 +1993,7 @@ fn encodeSiteResponseWire(
     body: []const u8,
     budget: ResponseHeaderBudget,
     no_body: bool,
+    conn_max_frame_size: u31,
 ) ![]u8 {
     const status_str = try std.fmt.allocPrint(allocator, "{d}", .{status});
     defer allocator.free(status_str);
@@ -1910,9 +2004,33 @@ fn encodeSiteResponseWire(
     const h = try Http2.encodeHeaders(allocator, stream_id, block, no_body, true);
     if (no_body) return h;
     defer allocator.free(h);
-    const d = try Http2.encodeData(allocator, stream_id, body, true);
-    defer allocator.free(d);
-    return try std.mem.concat(allocator, u8, &.{ h, d });
+
+    // The body goes out as one DATA frame per `SETTINGS_MAX_FRAME_SIZE` chunk —
+    // the same shape `Http2.encodeGrpcServerStream` builds, and for the same
+    // reasons. One frame holding the whole body is not a valid frame stream: its
+    // 24-bit length field overflows at 16 MiB, it exceeds the size this very
+    // request advertised in SETTINGS, and the scheduler's partial sends memmove
+    // the unsent remainder of *that frame* on every write — quadratic work on a
+    // body it is meant to trickle.
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, h);
+    const chunk_max = @max(@as(usize, conn_max_frame_size), 1);
+    if (body.len == 0) {
+        const d = try Http2.encodeData(allocator, stream_id, "", true);
+        defer allocator.free(d);
+        try out.appendSlice(allocator, d);
+        return out.toOwnedSlice(allocator);
+    }
+    var off: usize = 0;
+    while (off < body.len) {
+        const end = @min(body.len, off + chunk_max);
+        const d = try Http2.encodeData(allocator, stream_id, body[off..end], end == body.len);
+        defer allocator.free(d);
+        try out.appendSlice(allocator, d);
+        off = end;
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 /// The response header block: the two fields this module owns, then every extra
@@ -2299,9 +2417,41 @@ test "PriorityTree pickNext favors high-weight among ready streams" {
     try std.testing.expect(hi >= 24);
 }
 
+test "encodeSiteResponseWire splits the body into SETTINGS_MAX_FRAME_SIZE chunks" {
+    const allocator = std.testing.allocator;
+    // 40 KiB against a 16 KiB frame size: three DATA frames, the last one ending
+    // the stream. One frame for the whole body would declare 40 KiB, which is
+    // both past what this client advertised and (at 16 MiB) unencodable — the
+    // 24-bit length field overflows.
+    const body = try allocator.alloc(u8, 40 * 1024);
+    defer allocator.free(body);
+    @memset(body, 'b');
+
+    const wire = try encodeSiteResponseWire(allocator, 7, 200, "text/plain", &.{}, body, .{}, false, 16384);
+    defer allocator.free(wire);
+
+    var off: usize = 0;
+    var data_frames: usize = 0;
+    var body_bytes: usize = 0;
+    while (off + 9 <= wire.len) {
+        const frame = try Http2.decodeFrame(wire[off..]);
+        const len = 9 + @as(usize, frame.header.length);
+        off += len;
+        if (frame.header.typ != .data) continue;
+        data_frames += 1;
+        try std.testing.expect(frame.payload.len <= 16384);
+        body_bytes += frame.payload.len;
+        const end_stream = (frame.header.flags & Http2.FrameFlags.end_stream) != 0;
+        try std.testing.expectEqual(off == wire.len, end_stream);
+    }
+    try std.testing.expectEqual(@as(usize, 3), data_frames);
+    try std.testing.expectEqual(body.len, body_bytes);
+    try std.testing.expectEqual(wire.len, off);
+}
+
 test "encodeSiteResponseWire is headers then data" {
     const allocator = std.testing.allocator;
-    const wire = try encodeSiteResponseWire(allocator, 7, 200, "text/plain", &.{}, "ok", .{}, false);
+    const wire = try encodeSiteResponseWire(allocator, 7, 200, "text/plain", &.{}, "ok", .{}, false, 16384);
     defer allocator.free(wire);
     const f0 = try Http2.decodeFrame(wire);
     try std.testing.expectEqual(Http2.FrameType.headers, f0.header.typ);
@@ -2314,7 +2464,7 @@ test "encodeSiteResponseWire is headers then data" {
 test "encodeSiteResponseWire answers HEAD with END_STREAM and no DATA frame" {
     const allocator = std.testing.allocator;
     const extra = [_]Hpack.Header{.{ .name = "Content-Length", .value = "2" }};
-    const wire = try encodeSiteResponseWire(allocator, 1, 200, "text/plain", &extra, "ok", .{}, true);
+    const wire = try encodeSiteResponseWire(allocator, 1, 200, "text/plain", &extra, "ok", .{}, true, 16384);
     defer allocator.free(wire);
 
     // The whole message is the HEADERS frame: END_STREAM takes the place of the
@@ -2370,7 +2520,7 @@ test "encodeSiteResponseWire carries handler fields, lowercased, and only one co
         .{ .name = "X-Split", .value = "a\r\nX-Injected: 1" },
         .{ .name = "X-Padded", .value = "v1 " },
     };
-    const wire = try encodeSiteResponseWire(allocator, 1, 429, "text/plain", &extra, "ok", .{}, false);
+    const wire = try encodeSiteResponseWire(allocator, 1, 429, "text/plain", &extra, "ok", .{}, false, 16384);
     defer allocator.free(wire);
     const hdrs = try decodeSiteResponseFields(allocator, wire);
     defer Hpack.freeHeaders(allocator, hdrs);
@@ -2395,7 +2545,7 @@ test "encodeSiteResponseWire carries handler fields, lowercased, and only one co
 test "encodeSiteResponseWire drops a content-length that disagrees with the body" {
     const allocator = std.testing.allocator;
     const extra = [_]Hpack.Header{.{ .name = "Content-Length", .value = "9999" }};
-    const wire = try encodeSiteResponseWire(allocator, 1, 200, "text/plain", &extra, "ok", .{}, false);
+    const wire = try encodeSiteResponseWire(allocator, 1, 200, "text/plain", &extra, "ok", .{}, false, 16384);
     defer allocator.free(wire);
     const hdrs = try decodeSiteResponseFields(allocator, wire);
     defer Hpack.freeHeaders(allocator, hdrs);
@@ -2423,7 +2573,7 @@ test "encodeSiteResponseWire never builds a HEADERS block past the peer's frame 
     // ~8 KiB of extras against a 600-byte frame cap: the block has to be
     // truncated, and the result still a single, sendable HEADERS frame.
     const cap: usize = 600;
-    const wire = try encodeSiteResponseWire(allocator, 1, 200, "text/plain", &extra, "ok", .{ .max_block_bytes = cap }, false);
+    const wire = try encodeSiteResponseWire(allocator, 1, 200, "text/plain", &extra, "ok", .{ .max_block_bytes = cap }, false, 16384);
     defer allocator.free(wire);
     const f = try Http2.decodeFrame(wire);
     try std.testing.expectEqual(Http2.FrameType.headers, f.header.typ);
@@ -2452,7 +2602,7 @@ test "encodeSiteResponseWire enforces the response header count and list budgets
 
     // `:status` + `content-type` + one extra = 3 fields.
     {
-        const wire = try encodeSiteResponseWire(allocator, 1, 200, "text/plain", &extra, "ok", .{ .max_count = 3 }, false);
+        const wire = try encodeSiteResponseWire(allocator, 1, 200, "text/plain", &extra, "ok", .{ .max_count = 3 }, false, 16384);
         defer allocator.free(wire);
         const hdrs = try decodeSiteResponseFields(allocator, wire);
         defer Hpack.freeHeaders(allocator, hdrs);
@@ -2462,7 +2612,7 @@ test "encodeSiteResponseWire enforces the response header count and list budgets
 
     // 42 + 54 bytes for the mandatory pair, so a 40-byte extra no longer fits.
     {
-        const wire = try encodeSiteResponseWire(allocator, 1, 200, "text/plain", &extra, "ok", .{ .max_list_bytes = 100 }, false);
+        const wire = try encodeSiteResponseWire(allocator, 1, 200, "text/plain", &extra, "ok", .{ .max_list_bytes = 100 }, false, 16384);
         defer allocator.free(wire);
         const hdrs = try decodeSiteResponseFields(allocator, wire);
         defer Hpack.freeHeaders(allocator, hdrs);
@@ -2564,18 +2714,109 @@ test "SETTINGS payload not a multiple of 6 keeps the FRAME_SIZE_ERROR mapping" {
     try std.testing.expectEqual(Http2.ErrorCode.FRAME_SIZE_ERROR, settingsErrorCode(error.InvalidSettingsPayload));
 }
 
-test "OutboundScheduler refuses over pending stream/byte caps" {
+test "OutboundScheduler refuses a stream past the pending stream cap" {
     const allocator = std.testing.allocator;
     const flow = Http2.FlowControlState.init(Http2.default_initial_window_size);
 
     var by_streams = OutboundScheduler.init(allocator, 1, 1024 * 1024);
     defer by_streams.deinit();
-    try by_streams.enqueue(1, try allocator.dupe(u8, "aaaa"), flow);
-    try std.testing.expectError(error.PendingStreamsExceeded, by_streams.enqueue(3, try allocator.dupe(u8, "bbbb"), flow));
+    try by_streams.enqueue(1, try allocator.dupe(u8, "aaaa"), flow, 16384);
+    try std.testing.expectError(error.PendingStreamsExceeded, by_streams.enqueue(3, try allocator.dupe(u8, "bbbb"), flow, 16384));
+}
 
-    var by_bytes = OutboundScheduler.init(allocator, 64, 8);
-    defer by_bytes.deinit();
-    try std.testing.expectError(error.PendingBytesExceeded, by_bytes.enqueue(1, try allocator.alloc(u8, 32), flow));
+test "OutboundScheduler stages a response larger than max_pending_bytes instead of refusing it" {
+    const allocator = std.testing.allocator;
+    const flow = Http2.FlowControlState.init(Http2.default_initial_window_size);
+    const frame_size: usize = 16384;
+    const frames = 6;
+    const budget: usize = frame_size * 2;
+
+    var wire = std.ArrayList(u8).empty;
+    defer wire.deinit(allocator);
+    // Two DATA frames' worth of the header block is not the point here; the
+    // body is what has to be sliced. Six 16 KiB frames = 96 KiB against a
+    // 32 KiB budget.
+    var payload: [frame_size]u8 = @splat('x');
+    for (0..frames) |i| {
+        const f = try Http2.encodeData(allocator, 1, &payload, i + 1 == frames);
+        defer allocator.free(f);
+        try wire.appendSlice(allocator, f);
+    }
+
+    var sched = OutboundScheduler.init(allocator, 64, budget);
+    defer sched.deinit();
+    // The whole response is handed over once; only a slice is queued.
+    try sched.enqueue(1, try allocator.dupe(u8, wire.items), flow, @intCast(frame_size));
+    const p = sched.pending.getPtr(1).?;
+    try std.testing.expectEqual(@as(usize, wire.items.len), p.end);
+    try std.testing.expect(p.queued() <= budget);
+    try std.testing.expect(p.committed < p.end);
+    try std.testing.expectEqual(p.queued(), sched.pending_bytes);
+    // The queue boundary is a frame boundary, never mid-frame: the sender
+    // decodes the frame at `committed` next.
+    try std.testing.expect(wireFrameLen(p.wire, p.committed) != null);
+
+    // Simulate the sender draining the queue: advancing `offset` past what was
+    // staged frees the budget, and the next refill must stage more of the body.
+    var rounds: usize = 0;
+    while (p.committed < p.end) : (rounds += 1) {
+        try std.testing.expect(rounds < 32);
+        sched.pending_bytes -= p.queued();
+        p.offset = p.committed;
+        sched.refill(p, @intCast(frame_size));
+        try std.testing.expect(p.queued() <= budget);
+        try std.testing.expectEqual(p.queued(), sched.pending_bytes);
+    }
+    try std.testing.expectEqual(@as(usize, wire.items.len), p.committed);
+    // Staged in more than one round: a single-shot enqueue is what made a large
+    // body a refusal.
+    try std.testing.expect(rounds > 1);
+    try std.testing.expect(rounds <= frames);
+    // Every byte of the body was staged, in frame-sized steps.
+    try std.testing.expectEqual(@as(usize, wire.items.len), p.end);
+}
+
+test "OutboundScheduler refuses the degenerate zero-byte budget" {
+    const allocator = std.testing.allocator;
+    const flow = Http2.FlowControlState.init(Http2.default_initial_window_size);
+
+    var sched = OutboundScheduler.init(allocator, 64, 0);
+    defer sched.deinit();
+    // No slice can ever be staged, so parking the response would hang it.
+    try std.testing.expectError(error.PendingBytesExceeded, sched.enqueue(1, try allocator.alloc(u8, 32), flow, 16384));
+}
+
+test "OutboundScheduler lets a budget-starved stream start, then holds it to the budget" {
+    const allocator = std.testing.allocator;
+    const flow = Http2.FlowControlState.init(Http2.default_initial_window_size);
+    const frame_size: usize = 16384;
+    const one_frame = 9 + frame_size;
+    const budget: usize = 3 * one_frame;
+
+    var wire = std.ArrayList(u8).empty;
+    defer wire.deinit(allocator);
+    var payload: [frame_size]u8 = @splat('x');
+    for (0..6) |i| {
+        const f = try Http2.encodeData(allocator, 1, &payload, i == 5);
+        defer allocator.free(f);
+        try wire.appendSlice(allocator, f);
+    }
+
+    var sched = OutboundScheduler.init(allocator, 64, budget);
+    defer sched.deinit();
+    // First stream fills the budget exactly and stops there.
+    try sched.enqueue(1, try allocator.dupe(u8, wire.items), flow, @intCast(frame_size));
+    const first = sched.pending.getPtr(1).?;
+    try std.testing.expectEqual(budget, first.queued());
+    try std.testing.expectEqual(budget, sched.pending_bytes);
+
+    // Second stream arrives with nothing free. It must still get one frame out —
+    // the budget bounds the queue, not whether an admitted response may start —
+    // and must not stage more than that until the first stream drains.
+    try sched.enqueue(3, try allocator.dupe(u8, wire.items), flow, @intCast(frame_size));
+    const second = sched.pending.getPtr(3).?;
+    try std.testing.expectEqual(one_frame, second.queued());
+    try std.testing.expectEqual(budget + one_frame, sched.pending_bytes);
 }
 
 test "shrinkDataFrameInPlace keeps remaining DATA without realloc" {
@@ -2584,6 +2825,7 @@ test "shrinkDataFrameInPlace keeps remaining DATA without realloc" {
     var pending = PendingOutbound{
         .wire = wire,
         .end = wire.len,
+        .committed = wire.len,
         .offset = 0,
         .flow = Http2.FlowControlState.init(Http2.default_initial_window_size),
     };
@@ -3933,4 +4175,262 @@ test "h2 server answers a HEAD on a gRPC route with no DATA frame" {
         try std.testing.expectEqual(@as(usize, 0), countFramesInReply(reply, .data, 1));
         try std.testing.expect(findFrameInReply(reply, .rst_stream, 1) == null);
     }
+}
+
+// --- §9  A response larger than `max_pending_bytes` ---
+//
+// `max_pending_bytes` bounds the outbound *queue*, not a response body: the
+// scheduler stages a body frame by frame as earlier frames leave for the wire
+// (`OutboundScheduler.refill`). Before that, `enqueue` staged the whole response
+// in one shot, so the cap silently became a body-size cap — a 6 MiB body was
+// answered with `RST_STREAM(ENHANCE_YOUR_CALM)` and not one DATA frame, while the
+// same route over HTTP/1.1 served it (see the `/big` stall test in `Server.zig`,
+// which serves 16 MiB).
+//
+// The two tests below are the two clients that tell "the queue is bounded" from
+// "the body is refused": one that reads, and one that does not.
+
+/// The body the `/h2big` route serves: past the default
+/// `ServeOptions.max_pending_bytes`. A global because a `HandlerFn` carries no
+/// context of its own.
+const h2_big_body_bytes = 6 * 1024 * 1024;
+var h2_big_body: []u8 = &.{};
+
+fn h2BigResponse(ctx: *api_server.Context) anyerror!void {
+    try ctx.text(200, h2_big_body);
+}
+
+/// What a reading client saw on one stream.
+const H2BigRead = struct {
+    body_bytes: usize = 0,
+    data_frames: usize = 0,
+    end_stream: bool = false,
+    rst_code: ?u32 = null,
+    saw_goaway: bool = false,
+};
+
+/// HEADERS for `path` on stream 1, then the send window opened wide enough for
+/// the body. Without the WINDOW_UPDATEs the default 64 KiB window stops any
+/// large body at 64 KiB — a different bound than the one under test.
+fn h2BigRequestScript(allocator: std.mem.Allocator, path: []const u8, window: u31) ![]u8 {
+    const block = try hpackRequestBlock(allocator, "GET", path, &.{});
+    defer allocator.free(block);
+    const head = try Http2.encodeHeaders(allocator, 1, block, true, true);
+    defer allocator.free(head);
+    const wu_stream = try Http2.encodeWindowUpdate(allocator, 1, window);
+    defer allocator.free(wu_stream);
+    const wu_conn = try Http2.encodeWindowUpdate(allocator, 0, window);
+    defer allocator.free(wu_conn);
+    return std.mem.concat(allocator, u8, &.{ head, wu_stream, wu_conn });
+}
+
+/// Drive one real H2 session as a *reading* client: send the preface and
+/// `frames`, then read until the stream closes, copying DATA payloads into
+/// `body_out`. The write side stays open (no half-close), so the session keeps
+/// draining while the body arrives.
+///
+/// Not `h2SpeakToServer`: that helper stops at a byte budget, and the frame it
+/// looks for after a truncated read may be a frame that never fit on the wire.
+fn h2ReadBigResponse(port: u16, frames: []const u8, stream_id: u31, body_out: []u8) !H2BigRead {
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+    var stream = try addr.connect(std.testing.io, .{ .mode = .stream });
+    defer stream.close(std.testing.io);
+
+    try @import("../core/sockread.zig").writeFull(stream, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try @import("../core/sockread.zig").writeFull(stream, frames);
+
+    var res = H2BigRead{};
+    var buf: [64 * 1024]u8 = undefined;
+    var held: usize = 0;
+    while (!res.end_stream and res.rst_code == null) {
+        var fds = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&fds, 3000) catch break;
+        if (ready == 0) break;
+        const n = std.posix.read(stream.socket.handle, buf[held..]) catch break;
+        if (n == 0) break;
+        held += n;
+
+        var off: usize = 0;
+        while (off + 9 <= held) {
+            const frame = Http2.decodeFrame(buf[off..held]) catch break;
+            const len = 9 + @as(usize, frame.header.length);
+            if (frame.header.typ == .goaway) res.saw_goaway = true;
+            if (frame.header.stream_id == stream_id) switch (frame.header.typ) {
+                .data => {
+                    const take = @min(frame.payload.len, body_out.len - res.body_bytes);
+                    @memcpy(body_out[res.body_bytes..][0..take], frame.payload[0..take]);
+                    res.body_bytes += take;
+                    res.data_frames += 1;
+                    if ((frame.header.flags & Http2.FrameFlags.end_stream) != 0) res.end_stream = true;
+                },
+                .rst_stream => res.rst_code = try Http2.decodeRstStream(frame.payload),
+                else => {},
+            };
+            off += len;
+        }
+        std.mem.copyForwards(u8, buf[0 .. held - off], buf[off..held]);
+        held -= off;
+    }
+    return res;
+}
+
+/// The frames a (possibly truncated) reply carries, parsed up to the first
+/// partial frame — a write cut short always leaves its last frame partial.
+const ReplyFrameScan = struct {
+    frames: usize = 0,
+    data: usize = 0,
+    rst_stream: usize = 0,
+    goaway: usize = 0,
+    end_stream_seen: bool = false,
+};
+
+fn scanReplyFrames(reply: []const u8, stream_id: u31) ReplyFrameScan {
+    var scan = ReplyFrameScan{};
+    var off: usize = 0;
+    while (off + 9 <= reply.len) {
+        const frame = Http2.decodeFrame(reply[off..]) catch break;
+        scan.frames += 1;
+        if (frame.header.typ == .goaway) scan.goaway += 1;
+        if (frame.header.stream_id == stream_id) switch (frame.header.typ) {
+            .data => {
+                scan.data += 1;
+                if ((frame.header.flags & Http2.FrameFlags.end_stream) != 0) scan.end_stream_seen = true;
+            },
+            .rst_stream => scan.rst_stream += 1,
+            else => {},
+        };
+        off += 9 + @as(usize, frame.header.length);
+    }
+    return scan;
+}
+
+test "h2 server sends a response larger than max_pending_bytes to a reading client" {
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    // The body has to be past the cap for this test to mean anything: below it,
+    // the old single-shot enqueue passed too.
+    try std.testing.expect((ServeOptions{}).max_pending_bytes < h2_big_body_bytes);
+
+    h2_big_body = try allocator.alloc(u8, h2_big_body_bytes);
+    defer {
+        allocator.free(h2_big_body);
+        h2_big_body = &.{};
+    }
+    @memset(h2_big_body, 'y');
+    h2_big_body[0] = 'a';
+    h2_big_body[h2_big_body_bytes - 1] = 'z';
+
+    var server = api_server.Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h2-big" });
+    defer server.deinit();
+    server.setHttp2Enabled(true);
+    var group = server.group("");
+    try group.get("h2big", h2BigResponse, null);
+
+    var running = try RunningServer.start(&server);
+    defer running.stop(&server);
+
+    const script = try h2BigRequestScript(allocator, "/h2big", 8 * 1024 * 1024);
+    defer allocator.free(script);
+    const body = try allocator.alloc(u8, h2_big_body_bytes);
+    defer allocator.free(body);
+
+    const res = try h2ReadBigResponse(running.port, script, 1, body);
+    if (res.rst_code) |code| {
+        std.log.err("[test] the {d} MiB body was refused: RST_STREAM({d}) after {d} DATA frames", .{ h2_big_body_bytes / (1024 * 1024), code, res.data_frames });
+    }
+    try std.testing.expectEqual(@as(?u32, null), res.rst_code);
+    try std.testing.expect(!res.saw_goaway);
+    try std.testing.expect(res.end_stream);
+    try std.testing.expectEqual(@as(usize, h2_big_body_bytes), res.body_bytes);
+    // `expect` on the comparison, not `expectEqualStrings`: a mismatch would
+    // print six megabytes of body.
+    try std.testing.expect(std.mem.eql(u8, h2_big_body, body));
+    try std.testing.expectEqual(@as(u8, 'a'), body[0]);
+    try std.testing.expectEqual(@as(u8, 'z'), body[h2_big_body_bytes - 1]);
+    try std.testing.expect(res.data_frames > 1);
+}
+
+test "h2: a non-reading client is ended by the write budget, not by the pending cap" {
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    h2_big_body = try allocator.alloc(u8, h2_big_body_bytes);
+    defer {
+        allocator.free(h2_big_body);
+        h2_big_body = &.{};
+    }
+    @memset(h2_big_body, 'y');
+
+    // The write budget ends the session; `header_timeout_ms` keeps its 10 s
+    // default so the *read* idle budget cannot be the ender inside the 3 s wait.
+    var server = api_server.Server.initWithConfig(std.testing.io, allocator, .{
+        .port = 0,
+        .name = "h2-big-stall",
+        .response_write_timeout_ms = 200,
+    });
+    defer server.deinit();
+    server.setHttp2Enabled(true);
+    var group = server.group("");
+    try group.get("h2big", h2BigResponse, null);
+
+    var running = try RunningServer.start(&server);
+    defer running.stop(&server);
+
+    const script = try h2BigRequestScript(allocator, "/h2big", 8 * 1024 * 1024);
+    defer allocator.free(script);
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", running.port);
+    var stream = try addr.connect(std.testing.io, .{ .mode = .stream });
+    var closed_client = false;
+    defer if (!closed_client) stream.close(std.testing.io);
+
+    try @import("../core/sockread.zig").writeFull(stream, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try @import("../core/sockread.zig").writeFull(stream, script);
+    // From here the client does not read: with the window open, the body will
+    // not fit in any combination of kernel buffers, so the 200 ms write budget
+    // is the only thing that can end the session.
+
+    // The fiber took the connection...
+    var waited_ms: usize = 0;
+    while (server.active_connections.load(.monotonic) == 0 and waited_ms < 3000) : (waited_ms += 10) {
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    try std.testing.expectEqual(@as(u64, 1), server.active_connections.load(.monotonic));
+
+    // ...and the write budget ended it, with nobody reading the socket.
+    waited_ms = 0;
+    while (server.active_connections.load(.monotonic) != 0 and waited_ms < 3000) : (waited_ms += 10) {
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    const still_running = server.active_connections.load(.monotonic);
+    if (still_running != 0) {
+        // Report before the cleanup read unblocks it: that read would let the
+        // write finish and hide what is being asserted.
+        std.log.err("[test] a non-reading H2 peer held the session {d}ms past the 200ms write budget", .{waited_ms});
+        var drain: [64 * 1024]u8 = undefined;
+        _ = std.posix.read(stream.socket.handle, &drain) catch {};
+    }
+    try std.testing.expectEqual(@as(u64, 0), still_running);
+
+    // The client's answer is a truncated body — and, the point of this half, not
+    // the *refusal* the defect produced: no RST_STREAM on the stream, no GOAWAY.
+    var got: [64 * 1024]u8 = undefined;
+    var held: usize = 0;
+    while (held < got.len) {
+        var fds = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&fds, 2000) catch break;
+        if (ready == 0) break;
+        const n = std.posix.read(stream.socket.handle, got[held..]) catch break;
+        if (n == 0) break;
+        held += n;
+    }
+    stream.close(std.testing.io);
+    closed_client = true;
+
+    const scan = scanReplyFrames(got[0..held], 1);
+    try std.testing.expect(scan.data > 0);
+    try std.testing.expectEqual(@as(usize, 0), scan.rst_stream);
+    try std.testing.expectEqual(@as(usize, 0), scan.goaway);
+    try std.testing.expect(!scan.end_stream_seen);
 }

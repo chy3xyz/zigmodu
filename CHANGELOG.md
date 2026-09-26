@@ -2,6 +2,64 @@
 
 ## [Unreleased]
 
+### 第 62 批：`docs/dev/` 那 8 份零引用陈旧评估移进归档区（**破坏性：否**）
+
+`docs/dev/README.md` §4 一直写着"§2 那 8 份是唯一可动的，建议移动而非删除（**未执行**，需要你点
+头）"。本批执行：`git mv` 到 `docs/dev/archive/2026-05-review/` —— `architecture-review.md`、
+`performance-review.md`、`comprehensive-assessment.md`、`final-quality-assessment.md`、
+`gap-to-92.md`、`shopdemo-review.md`、`performance-v094.md`、`todo2.md`。
+
+* **移动前重跑了引用检查**（索引自己要求的那条）：这 8 份在 `src/**`、`scripts/**`、`docs/*.md`、
+  `CHANGELOG.md` 里按字面路径与 `§N` 都**零引用** —— 命中的只有 `docs/dev/README.md` 自己。
+  §1 那 15 份则**一律不动**（`cluster-*.md`、`alpha-engine-spec.md`、`READING_NUMBERS.md`、
+  `todo3*.md`、三份安全审计、两份 v1.0 差距评估 + `final-assessment.md` / `upgrade-roadmap.md`）。
+* 新增 `docs/dev/archive/README.md`：归档区入口，带"哪份被谁取代、今天该看哪份"对照表，并写死
+  约定 —— 归档只读、不要在那边补进展、不要按它的 TODO 开工。与第 53 批给
+  `docs/COMPLETENESS_REPORT.md` 加的"历史快照，勿照做"免责表同一口径。
+* `docs/dev/README.md` 更新：文件计数（22 → 16 份 + 归档 8 份）、§2 改成"已归档（2026-09-26 执行）"、
+  §3 的 todo 四代注明 `todo2.md` 已归档、§4 划掉已执行的项并留下"以后再归档"的口径；顺带把第 60 批
+  新增的 `h2-pending-slices.md` 补进 §1（§0 的"不能移动"计数 14 → 15）。
+
+### 第 61 批：H2 响应体大于 `max_pending_bytes` 不再被拒 —— 真因是 site 响应线把整段 body 编成**一个** DATA 帧（**破坏性：否**）
+
+`docs/dev/h2-pending-slices.md` 里那条"H2 响应体 > 4 MiB 被 `RST_STREAM(ENHANCE_YOUR_CALM)` 拒绝"
+（第 60 批附落成设计笔记、未改代码）本批修完。修的过程发现它是**两个叠在一起的缺陷**，第二个才是真因：
+
+**① 直接原因：入队把整份响应一次性铺进队列，`max_pending_bytes`（默认 4 MiB）于是变成了体上限。**
+`OutboundScheduler` 改成"帧对齐的续发游标"（`PendingOutbound.committed` + `refill`）：`enqueue` 只铺
+第一片，每帧发出后在同一个锁内逐帧补，`pending_bytes` 记的是**队列**占用。单流一次最多占
+`min(max_pending_bytes, conn_max_frame_size × 16)`。
+
+**② 真因：`encodeSiteResponseWire` 用 `Http2.encodeData(..., body, true)` 把整段 body 编成一个
+DATA 帧。** 切片要以帧为单位，于是暴露出来：帧长只有 24 位 → **16 MiB 的 body 根本编不出来**
+（`PayloadTooLarge` → `INTERNAL_ERROR`，正是实测表第三行）；该帧声明长度远超服务器自己广告的
+`SETTINGS_MAX_FRAME_SIZE`（对端看不到——上线前被切碎——但**按帧遍历这段 wire 的代码会相信它**，
+切片器就是这样卡死的）；`shrinkDataFrameInPlace` 每次部分发送 memmove 该帧未发余量，对 6 MiB 单帧
+是 O(n²) 搬运。修法是**按 `conn_max_frame_size` 切 DATA 帧**，与 gRPC 路径
+（`Http2.encodeGrpcServerStream`，一直按 16 KiB 切）同心。
+
+另外两条：**被预算饿死的流至少能发一帧**（预算约束"一次推多少"，不是"已接收的响应能不能开始"——
+否则大响应占满预算且窗口关闭时，复用在它后面的小响应被饿住）；`max_pending_bytes` 现在只在
+`== 0` 时拒绝（退化配置：切不出片，停着就是挂死），仍是 `ENHANCE_YOUR_CALM`。
+
+测试（新增 5 条，`zm-test-count: aggregate` 由 2099 → 2104）：
+
+* **正面** `h2 server sends a response larger than max_pending_bytes to a reading client`：回环 + 会读、
+  并把发送窗口开大的客户端要 6 MiB → 逐字节比对全部到达、`END_STREAM` 收到、无 RST/GOAWAY、
+  DATA 帧多于一个。先断言 `(ServeOptions{}).max_pending_bytes < 6 MiB`，否则它对着旧行为也会绿。
+* **反面** `h2: a non-reading client is ended by the write budget, not by the pending cap`：同一个 6 MiB
+  + **不读**的客户端 → 由 `response_write_timeout_ms`(200 ms) 结束（`active_connections` 归零），
+  拿到的是**截断的 body** 且**没有** RST/GOAWAY —— 与"被上限拒绝"形状不同。`header_timeout_ms`
+  保持默认 10 s，免得读空闲预算抢先。
+* **单元** `encodeSiteResponseWire splits the body into SETTINGS_MAX_FRAME_SIZE chunks`（40 KiB → 3 帧、
+  每帧 ≤ 16384、只末帧带 `END_STREAM`）、`OutboundScheduler stages a response larger than
+  max_pending_bytes instead of refusing it`、`OutboundScheduler lets a budget-starved stream start,
+  then holds it to the budget`；`shrinkDataFrameInPlace` 那条补上 `committed`。
+
+红证据（修前实测，macOS 回环）：3 MiB 正常 / 6 MiB `ENHANCE_YOUR_CALM(10)` / 16 MiB
+`INTERNAL_ERROR(2)`，线缆上只有 `SETTINGS + SETTINGS ACK + RST_STREAM(stream 1)`，一个 HEADERS/DATA
+都没有。`docs/API.md` 的 HTTP/2 limits 表同步改成"上限管队列、不管响应体"。
+
 ### 第 60 批附：H2 `max_pending_bytes` 那条落成设计笔记（`docs/dev/h2-pending-slices.md`）
 
 队列里"H2 响应体 > 4 MiB 被 `RST_STREAM(ENHANCE_YOUR_CALM)` 拒绝"那一条，本批先把**实测、定位、
