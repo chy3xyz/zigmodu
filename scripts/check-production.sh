@@ -158,6 +158,27 @@ if [[ "$fail" -ne 0 ]]; then
   exit 1
 fi
 
+# Fuzz declarations are manual and silent when forgotten: `build.zig` decides which
+# artifacts get the LLVM backend from `llvm_for_fuzz` (the default backend emits no
+# `--fuzz` coverage sections on x86_64-linux), and a `std.testing.fuzz` block in an
+# undeclared root simply gets no coverage — the nightly fuzz step stays green while
+# testing nothing. So the set of files that *contain* fuzz blocks is a ratchet here:
+# a new one means adding it below (and checking the artifact that compiles it is the
+# one `-Dtest-llvm` reaches).
+FUZZ_ROOTS=(
+  src/api/Server.zig
+  src/core/cluster/RaftTransport.zig
+  src/core/DistributedEventBus.zig
+)
+want="$(printf '%s\n' "${FUZZ_ROOTS[@]}" | sort)"
+found="$(grep -rl 'std\.testing\.fuzz' --include='*.zig' "${SCAN_ROOTS[@]}" 2>/dev/null | sort || true)"
+if [[ "$found" != "$want" ]]; then
+  echo "check-production: the fuzz-block files moved; declared vs found:" >&2
+  diff <(printf '%s\n' "$want") <(printf '%s\n' "$found") >&2 || true
+  echo "check-production: a \`std.testing.fuzz\` block in an undeclared root gets no coverage (see build.zig llvm_for_fuzz) — update FUZZ_ROOTS and the artifact that compiles it" >&2
+  exit 1
+fi
+
 if [[ "$warned" -gt 0 ]]; then
   echo "check-production: OK (${warned} warning(s) in not-yet-enforced paths)"
 else

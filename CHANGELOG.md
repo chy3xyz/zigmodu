@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### 第 60 批：fuzz 声明变成门禁（`scripts/check-production.sh`）—— 忘了声明的 fuzz 块过去会**静默零覆盖**（**破坏性：否**）
+
+`build.zig` 靠 `llvm_for_fuzz` 决定哪些 artifact 在 x86_64-linux 上开 LLVM（默认后端不产出 `--fuzz`
+需要的 `__sancov*` section），而一个**没被声明的 root 里的 `std.testing.fuzz` 块**不会报错、不会警告
+——夜间的 fuzz 步骤照样绿，只是什么都没测。声明是人工的，所以把"哪些文件含 fuzz 块"变成门禁里的
+ratchet：`check-production.sh` 末尾比对 `FUZZ_ROOTS` 与实际 `grep -rl 'std\.testing\.fuzz'` 的结果，
+不一致就 diff 出两边并提示"更新 FUZZ_ROOTS，并确认编译它的 artifact 在 `-Dtest-llvm` 可达范围内"。
+
+* 现状三个（已核对）：`src/api/Server.zig`、`src/core/cluster/RaftTransport.zig`、
+  `src/core/distributed…`（准确名见脚本）。
+* 门禁**有牙齿**（实测）：临时在 `src/core/Time.zig` 里写一句提到 `std.testing.fuzz` 的注释
+  → `zig build check` 失败；去掉后恢复 OK。
+
 ### 第 59 批：H2 loopback 测试族加"期望帧 + 一次重试"（拆掉上一批那条 CI 红的成因）；扩展层 WS 的写也接上界（`WebSocketServer`/`Client`）（**破坏性：否**）
 
 **① H2 测试族的 flake：不是框架缺陷，是 3 s 预算在负载机器上被错过**
