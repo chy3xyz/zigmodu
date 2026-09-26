@@ -1,5 +1,39 @@
 # Changelog
 
+## [Unreleased]
+
+### 第 51 批：把 `validateStruct*` 那条链也搬出不弃用的家（新家 `validation/FieldValidation.zig`，弃用文件只剩别名）—— **`src/validation/Validator.zig` 现在没有消费方阻塞项了**（**破坏性：否**，对外拼写与行为一字未变）
+
+上一批搬走了 `FieldRules`（`http.FieldRules` 不再挡路）。本批把**最后一条链**搬走：
+
+* `http.validateRequest`（`api/middleware/Validation.zig`）与 `http.extractJsonValidated`（`api/Extract.zig`）用的
+  `validateStruct` / `validateStructCollect` / `Violations` / `MessageHook`，以及那批标量检查器
+  （`notEmpty`/`minLength`/`email`/`uuid`/…）；
+* 新家 **`src/validation/FieldValidation.zig`**（实现**逐字搬来**，9 个既有测试一个没删地跟着搬）；
+* 弃用文件 `src/validation/Validator.zig` 从 ~690 行重写成 **78 行、17 个 `pub const … = ` 别名、0 个 `pub fn`**。
+
+**为什么另建而不是塞进 `FieldRules.zig`**（写进了两个文件的头注释）：`FieldRules.zig` 的硬性质是**零 import**
+（http 域要能只读规则形状，不带进求值引擎），而引擎需要 `std` 与 `sqlx/errors.zig`。一对文件的名字也诚实：
+`FieldRules`（声明）/ `FieldValidation`（求值）。**也没有**改叫 `ObjectValidator.Validator` —— 那是**另一套 API**
+（有状态累加器、固定英文消息 + 机器码、启发式反射），弃用模块的"comptime 规则表 + 逐字段 `Violation{field,rule,message}`
++ `MessageHook` + `FieldRules.message` 逐字覆写"这五项它一个都没有，换过去等于改对外行为。
+
+**门禁："方向三条"照 `FieldRules` 那套的形状扩写**（`src/test/ApiFreeze.zig`）：① 规范实现必须在新家、
+不得回到弃用文件（16 条声明逐条断言，外加更强的"弃用文件里**不得出现任何 `pub fn`**"——整层只能是对，
+连转发 wrapper 也拦得住）；② 新家不得 import 弃用文件、弃用文件必须指向新家；③ `http.*` 那条链的两个文件
+必须直连新家且不得含弃用文件的 import。再叠上"17 个拼写仍是 `pub const <名字> = `"、类型 `==`、以及两个入口与
+一个弃用拼写的**真调用**。
+
+> **红证据五组**（改坏 → 红 → 逐字节还原，5 个文件 `sha256` 复核）：A 新家反向 import（`the direction is
+> backwards …`）· B 删掉一个旧别名拼写（`consumers who wrote \`Validator.phone\` lose the spelling at their next
+> build`）· C `http.*` 两处改回走弃用文件（四条同时红）· D 把一条规范实现放回弃用文件（三条：`declares \`pub fn
+> uuid(\` again …` / `contains \`pub fn \` — … aliases only …` / `no longer contains \`pub const uuid = \``）·
+> E 规范声明离开新家。**没有把任何断言放宽成"永远绿"**，既有 9 个测试全部保留。
+
+**结论（已写进 `docs/UPGRADING.md` 与 `docs/API_FREEZE.md`）**：删 `src/validation/Validator.zig` **不再有任何
+消费方阻塞项** —— 全树只剩门禁自己两处 `@import`，它们存在的唯一目的就是证明"删掉不会打断 `http.*`"，
+删文件时要同步销掉这几笔账。
+
 ## [0.34.0] - 2026-09-26
 
 ### 第 50 批：把 `-Dtest-llvm` 收窄到**真正含 fuzz 用例的那个 artifact**（省回每次 push 的 ~56 s）、`WebSocketServer.stop()` 不再被沉默的对端拖住、CI 加两道小门禁（**破坏性：否**）

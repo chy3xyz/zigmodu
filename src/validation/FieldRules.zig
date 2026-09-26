@@ -1,20 +1,22 @@
 //! Canonical home of `FieldRules` — the comptime struct-validation rule shape.
 //!
 //! Consumers write it as `http.FieldRules` (`src/http.zig` → `src/api/Extract.zig`),
-//! and the `validateStruct*` entry points in `validation/Validator.zig` read its
-//! fields. It sits in its own file because neither of those two can declare it:
+//! and the `validateStruct*` entry points in `validation/FieldValidation.zig` read
+//! its fields. It sits in its own file because it is the *declaration* half of a
+//! pair and has to stay import-free:
 //!
-//! * `src/api/Extract.zig` re-exports it for the http domain but imports
-//!   `validation/Validator.zig` for `validateStruct`, so declaring the type there
-//!   would make the deprecated file import the http domain — an import cycle, and
-//!   the type would once again sit behind the deprecation banner.
+//! * `src/api/Extract.zig` re-exports it for the http domain while importing
+//!   `validation/FieldValidation.zig` for `validateStruct`; if the type were
+//!   declared there instead, the rule shape would travel with the engine — `std`
+//!   and `sqlx/errors.zig` — and the two halves would be one file.
 //! * `src/validation/Validator.zig` is the file the banner deprecates; the
 //!   banner's "removed in v1.0" is only executable once `http.FieldRules` no
 //!   longer resolves through it.
 //!
-//! This file imports nothing, so both of them point here and it points at
-//! neither: deleting the deprecated file leaves `http.FieldRules` intact. The
-//! direction is pinned by `src/test/ApiFreeze.zig`.
+//! This file imports nothing, so it points at nobody and the deprecated file's
+//! alias points here: deleting that file leaves `http.FieldRules` intact, and the
+//! engine can be read without pulling the rule shape's consumers in. Both
+//! directions are pinned by `src/test/ApiFreeze.zig`.
 
 /// Field validation rules for comptime struct validation.
 /// Only fields relevant to the value type are enforced.

@@ -9,7 +9,7 @@
 const std = @import("std");
 const Server = @import("Server.zig");
 const ProblemDetails = @import("../http/ProblemDetails.zig").ProblemDetails;
-const Validator = @import("../validation/Validator.zig");
+const FieldValidation = @import("../validation/FieldValidation.zig");
 const FieldRulesFile = @import("../validation/FieldRules.zig");
 const OpenApi = @import("../http/OpenApi.zig");
 const Multipart = @import("../http/Multipart.zig");
@@ -21,6 +21,11 @@ pub const Context = Server.Context;
 /// `validation/Validator.zig` — so the `http.FieldRules` spelling survives that
 /// file's deletion.
 pub const FieldRules = FieldRulesFile.FieldRules;
+
+// The other half of that chain: `extractJsonValidated` runs the rules through
+// `validation/FieldValidation.zig`, the canonical engine, rather than the
+// deprecated `validation/Validator.zig`. Both imports sit here side by side so
+// neither `http.*` entry point resolves through the deprecated file.
 
 /// Parse a `multipart/form-data` body, rendering failures as ProblemDetails.
 ///
@@ -175,7 +180,7 @@ pub fn extractJson(ctx: *Context, comptime T: type) !T {
     return try deepCopyValue(parsed.value, ctx.allocator);
 }
 
-/// `extractJson` then `Validator.validateStruct` with `rules`. Failures → 422 ProblemDetails.
+/// `extractJson` then `FieldValidation.validateStruct` with `rules`. Failures → 422 ProblemDetails.
 pub fn extractJsonValidated(ctx: *Context, comptime T: type, comptime rules: anytype) !T {
     if (ctx.body == null) {
         try respondProblem(ctx, 400, "Request body required");
@@ -187,7 +192,7 @@ pub fn extractJsonValidated(ctx: *Context, comptime T: type, comptime rules: any
     };
     defer parsed.deinit();
 
-    const err_msg = Validator.validateStruct(ctx.allocator, parsed.value, rules) catch |e| {
+    const err_msg = FieldValidation.validateStruct(ctx.allocator, parsed.value, rules) catch |e| {
         try respondProblem(ctx, 500, @errorName(e));
         return e;
     };

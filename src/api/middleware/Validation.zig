@@ -1,7 +1,10 @@
 //! Request body validation entry point for handlers.
 //!
-//! Rules are `Validator.FieldRules` values keyed by field name; the first
-//! failing field yields a Validation message.
+//! Rules are `FieldRules` values (`validation/FieldRules.zig`, re-exported as
+//! `http.FieldRules`) keyed by field name; the first failing field yields a
+//! Validation message. The engine behind this middleware lives in
+//! `validation/FieldValidation.zig` — not in the deprecated
+//! `validation/Validator.zig`.
 //! On HTTP failure it responds 422 (RFC 7807 when a problem renderer is set),
 //! carrying a **non-zero** business code (`Validation.error_code`, default
 //! `default_error_code`) — see that constant for why 0 is unusable here.
@@ -30,7 +33,7 @@
 //!   }.handle, null);
 
 const std = @import("std");
-const Validator = @import("../../validation/Validator.zig");
+const FieldValidation = @import("../../validation/FieldValidation.zig");
 
 /// Business code written into the `{code,msg,data}` envelope for a validation
 /// failure.
@@ -81,7 +84,7 @@ pub const Validation = struct {
     /// Localization hook applied to the default rule messages, in both body
     /// shapes. `FieldRules.message` overrides are returned verbatim before
     /// the hook runs. Default null = English defaults.
-    message_hook: ?Validator.MessageHook = null,
+    message_hook: ?FieldValidation.MessageHook = null,
 
     /// Configure the business code (`0` → `default_error_code`).
     pub fn withErrorCode(code: i32) Validation {
@@ -94,7 +97,7 @@ pub const Validation = struct {
     }
 
     /// Install a localization hook for the default rule messages.
-    pub fn withMessageHook(v: Validation, hook: Validator.MessageHook) Validation {
+    pub fn withMessageHook(v: Validation, hook: FieldValidation.MessageHook) Validation {
         return .{ .error_code = v.error_code, .structured_errors = v.structured_errors, .message_hook = hook };
     }
 
@@ -107,7 +110,7 @@ pub const Validation = struct {
         // Fast path, byte-for-byte the historical behavior: first failure
         // only, flat string message body, no localization hook consulted.
         if (!self.structured_errors and self.message_hook == null) {
-            const err = Validator.validateStruct(ctx.allocator, value, rules) catch |e| {
+            const err = FieldValidation.validateStruct(ctx.allocator, value, rules) catch |e| {
                 try ctx.sendError(500, @errorName(e));
                 return e;
             };
@@ -120,7 +123,7 @@ pub const Validation = struct {
             return;
         }
 
-        var collected = Validator.validateStructCollect(ctx.allocator, value, rules, self.message_hook) catch |e| {
+        var collected = FieldValidation.validateStructCollect(ctx.allocator, value, rules, self.message_hook) catch |e| {
             try ctx.sendError(500, @errorName(e));
             return e;
         };
@@ -144,7 +147,7 @@ pub const Validation = struct {
 /// `error_renderer` installed (RFC 7807) the renderer is invoked with the
 /// first message — that shape has no business code and no `data` slot, so
 /// the array is only representable in the legacy envelope.
-fn sendStructuredErrors(ctx: anytype, code: i32, violations: Validator.Violations) !void {
+fn sendStructuredErrors(ctx: anytype, code: i32, violations: FieldValidation.Violations) !void {
     const first = violations.firstMessage();
     if (api.error_renderer) |render| {
         return render(ctx, 422, first);
@@ -230,16 +233,16 @@ test "validateRequest passes for valid data" {
     };
 
     const rules = .{
-        .name = Validator.FieldRules{ .required = true, .min_len = 2 },
-        .email = Validator.FieldRules{ .required = true, .email = true },
-        .age = Validator.FieldRules{ .min = 0, .max = 150 },
+        .name = FieldValidation.FieldRules{ .required = true, .min_len = 2 },
+        .email = FieldValidation.FieldRules{ .required = true, .email = true },
+        .age = FieldValidation.FieldRules{ .min = 0, .max = 150 },
     };
 
     const user = User{ .name = "Alice", .email = "alice@example.com", .age = 30 };
 
     // Direct validation (no HTTP context)
     const allocator = std.testing.allocator;
-    const err = try Validator.validateStruct(allocator, user, rules);
+    const err = try FieldValidation.validateStruct(allocator, user, rules);
     try std.testing.expect(err == null);
     if (err) |e| allocator.free(e);
 }
@@ -252,15 +255,15 @@ test "validateRequest catches invalid email" {
     };
 
     const rules = .{
-        .name = Validator.FieldRules{ .required = true, .min_len = 2 },
-        .email = Validator.FieldRules{ .required = true, .email = true },
-        .age = Validator.FieldRules{ .min = 0, .max = 150 },
+        .name = FieldValidation.FieldRules{ .required = true, .min_len = 2 },
+        .email = FieldValidation.FieldRules{ .required = true, .email = true },
+        .age = FieldValidation.FieldRules{ .min = 0, .max = 150 },
     };
 
     const user = User{ .name = "Bob", .email = "not-an-email", .age = 25 };
 
     const allocator = std.testing.allocator;
-    const err = try Validator.validateStruct(allocator, user, rules);
+    const err = try FieldValidation.validateStruct(allocator, user, rules);
     try std.testing.expect(err != null);
     if (err) |e| allocator.free(e);
 }
@@ -272,14 +275,14 @@ test "validateRequest catches empty required field" {
     };
 
     const rules = .{
-        .name = Validator.FieldRules{ .required = true, .min_len = 2 },
-        .email = Validator.FieldRules{ .required = true, .email = true },
+        .name = FieldValidation.FieldRules{ .required = true, .min_len = 2 },
+        .email = FieldValidation.FieldRules{ .required = true, .email = true },
     };
 
     const user = User{ .name = "", .email = "test@test.com" };
 
     const allocator = std.testing.allocator;
-    const err = try Validator.validateStruct(allocator, user, rules);
+    const err = try FieldValidation.validateStruct(allocator, user, rules);
     try std.testing.expect(err != null);
     if (err) |e| allocator.free(e);
 }
@@ -291,14 +294,14 @@ test "validateRequest catches age out of range" {
     };
 
     const rules = .{
-        .name = Validator.FieldRules{ .required = true },
-        .age = Validator.FieldRules{ .min = 0, .max = 150 },
+        .name = FieldValidation.FieldRules{ .required = true },
+        .age = FieldValidation.FieldRules{ .min = 0, .max = 150 },
     };
 
     const user = User{ .name = "Test", .age = 999 };
 
     const allocator = std.testing.allocator;
-    const err = try Validator.validateStruct(allocator, user, rules);
+    const err = try FieldValidation.validateStruct(allocator, user, rules);
     try std.testing.expect(err != null);
     if (err) |e| allocator.free(e);
 }
@@ -309,7 +312,7 @@ test "validateRequest oneOf validation" {
     };
 
     const rules = .{
-        .role = Validator.FieldRules{ .one_of = "admin,user,guest" },
+        .role = FieldValidation.FieldRules{ .one_of = "admin,user,guest" },
     };
 
     const valid_req = Request{ .role = "admin" };
@@ -317,18 +320,18 @@ test "validateRequest oneOf validation" {
 
     const allocator = std.testing.allocator;
 
-    const err1 = try Validator.validateStruct(allocator, valid_req, rules);
+    const err1 = try FieldValidation.validateStruct(allocator, valid_req, rules);
     try std.testing.expect(err1 == null);
     if (err1) |e| allocator.free(e);
 
-    const err2 = try Validator.validateStruct(allocator, invalid_req, rules);
+    const err2 = try FieldValidation.validateStruct(allocator, invalid_req, rules);
     try std.testing.expect(err2 != null);
     if (err2) |e| allocator.free(e);
 }
 
 test "validateRequest answers 422 with a non-zero business code by default" {
     const User = struct { email: []const u8 };
-    const rules = .{ .email = Validator.FieldRules{ .required = true, .email = true } };
+    const rules = .{ .email = FieldValidation.FieldRules{ .required = true, .email = true } };
 
     const allocator = std.testing.allocator;
     var ctx = try api.Context.init(allocator, .POST, "/users");
@@ -354,7 +357,7 @@ test "validateRequest answers 422 with a non-zero business code by default" {
 
 test "validateRequest: the business code is configurable, and 0 is refused" {
     const User = struct { email: []const u8 };
-    const rules = .{ .email = Validator.FieldRules{ .required = true, .email = true } };
+    const rules = .{ .email = FieldValidation.FieldRules{ .required = true, .email = true } };
     const allocator = std.testing.allocator;
 
     // Configured through the field …
@@ -403,7 +406,7 @@ test "validateRequest: the business code is configurable, and 0 is refused" {
 
 test "validateRequest structured mode: a single failure is a one-element errors array" {
     const User = struct { email: []const u8 };
-    const rules = .{ .email = Validator.FieldRules{ .required = true, .email = true } };
+    const rules = .{ .email = FieldValidation.FieldRules{ .required = true, .email = true } };
     const allocator = std.testing.allocator;
 
     var ctx = try api.Context.init(allocator, .POST, "/users");
@@ -427,9 +430,9 @@ test "validateRequest structured mode: a single failure is a one-element errors 
 test "validateRequest structured mode: failures aggregate one entry per field" {
     const User = struct { name: []const u8, email: []const u8, age: u32 };
     const rules = .{
-        .name = Validator.FieldRules{ .required = true, .min_len = 2 },
-        .email = Validator.FieldRules{ .required = true, .email = true },
-        .age = Validator.FieldRules{ .min = 0, .max = 150 },
+        .name = FieldValidation.FieldRules{ .required = true, .min_len = 2 },
+        .email = FieldValidation.FieldRules{ .required = true, .email = true },
+        .age = FieldValidation.FieldRules{ .min = 0, .max = 150 },
     };
     const allocator = std.testing.allocator;
 
@@ -454,7 +457,7 @@ test "validateRequest structured mode: failures aggregate one entry per field" {
 
 test "validateRequest structured mode: FieldRules.message override is verbatim in the entry" {
     const User = struct { email: []const u8 };
-    const rules = .{ .email = Validator.FieldRules{ .required = true, .email = true, .message = "邮箱格式不正确" } };
+    const rules = .{ .email = FieldValidation.FieldRules{ .required = true, .email = true, .message = "邮箱格式不正确" } };
     const allocator = std.testing.allocator;
 
     var ctx = try api.Context.init(allocator, .POST, "/users");
@@ -472,7 +475,7 @@ test "validateRequest structured mode: FieldRules.message override is verbatim i
 
 test "validateRequest structured mode: the business code stays configurable, 0 still refused" {
     const User = struct { email: []const u8 };
-    const rules = .{ .email = Validator.FieldRules{ .required = true, .email = true } };
+    const rules = .{ .email = FieldValidation.FieldRules{ .required = true, .email = true } };
     const allocator = std.testing.allocator;
 
     var ctx = try api.Context.init(allocator, .POST, "/users");
@@ -492,8 +495,8 @@ test "validateRequest structured mode: the business code stays configurable, 0 s
 test "validateRequest: message hook localizes the flat envelope, default shape unchanged otherwise" {
     const User = struct { name: []const u8, email: []const u8 };
     const rules = .{
-        .name = Validator.FieldRules{ .required = true },
-        .email = Validator.FieldRules{ .required = true, .email = true },
+        .name = FieldValidation.FieldRules{ .required = true },
+        .email = FieldValidation.FieldRules{ .required = true, .email = true },
     };
     const allocator = std.testing.allocator;
 
@@ -512,8 +515,8 @@ test "validateRequest: message hook localizes the flat envelope, default shape u
 test "validateRequest structured mode: message hook applies to the entries too" {
     const User = struct { email: []const u8, age: u32 };
     const rules = .{
-        .email = Validator.FieldRules{ .required = true, .email = true },
-        .age = Validator.FieldRules{ .max = 150 },
+        .email = FieldValidation.FieldRules{ .required = true, .email = true },
+        .age = FieldValidation.FieldRules{ .max = 150 },
     };
     const allocator = std.testing.allocator;
 

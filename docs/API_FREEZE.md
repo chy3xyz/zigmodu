@@ -79,18 +79,25 @@
 
 - 横幅仍在**文件头 1500 字节**内，且仍点名替代路径；
 - `src/extensions.zig` 仍被 `src/tests.zig` 的编译门禁 import；`src/validation/Validator.zig` 不在那份直接
-  import 名单里（那里 import 的是 `validation/ObjectValidator.zig` 与 `validation/FieldRules.zig`），由门禁自己
-  `@import` 并**真调两次**（`notEmpty` 与 `validateStruct`），所以它的签名同样不会静默烂掉；
-- `src/validation/Validator.zig` 与 `http.FieldRules` 的**依赖方向**（本批起，从"钉住耦合"改成"钉住解耦"）：
-  `http.FieldRules` 与 `http.validateRequest` 仍在；`FieldRules` 的**规范声明**在
+  import 名单里（那里 import 的是 `validation/ObjectValidator.zig` / `validation/FieldRules.zig` /
+  `validation/FieldValidation.zig`），由门禁自己 `@import` 并**真调** `notEmpty`、`validateStruct`、`email`、
+  `validateStructCollect`，所以它的签名同样不会静默烂掉；
+- `src/validation/Validator.zig` 与 `http.FieldRules` 的**依赖方向**（从"钉住耦合"改成"钉住解耦"）：
+  `http.FieldRules` 与 `http.validateRequest` / `http.extractJsonValidated` 仍在；`FieldRules` 的**规范声明**在
   `src/validation/FieldRules.zig`，且 `http.FieldRules` / `src/api/Extract.zig` 的再导出 / 弃用文件上的
-  `Validator.FieldRules` 别名**三处是同一个类型**；新家**不得** `@import` 弃用文件，弃用文件**必须**仍指向新家；
-  弃用文件里**不得**再出现规范声明本身。三条合起来证明"删掉 `Validator.zig` 不会再打断 `http.FieldRules`"。
+  `Validator.FieldRules` 别名**三处是同一个类型**；规范实现**不得**再出现在弃用文件里；新家**不得** `@import`
+  弃用文件，弃用文件**必须**仍指向新家。三条合起来证明"删掉 `Validator.zig` 不会再打断 `http.FieldRules`"。
   （`@import` 匹配用的是带引号的拼写，所以散文里提到文件名不算依赖 —— 反向的假绿堵住了。）
   替代品 `zigmodu.Validator` 仍解析到 `validation/ObjectValidator.zig` 的**另一个**类型（`!=` 是断言的一部分：
   那是真迁移，不是自指）。
-  这半条现在说明的是**还剩什么挡着 v1.0 删除** —— `validateStruct` / `validateStructCollect` 这条链
-  （`http.validateRequest`、`http.extractJsonValidated`）与 `Validator.*` 越路径拼写本身，不再是 `http.FieldRules`。
+- **`validateStruct*` 链的依赖方向**（第二批收口，见 `FIELD_VALIDATION_HOME`）：求值引擎的规范声明（16 条
+  `pub fn` / `pub const … = struct {`）在 `src/validation/FieldValidation.zig`，逐条断言"新家有、弃用文件没有"；
+  弃用文件里**不得**出现任何 `pub fn `（它整层都是 `pub const <名字> = ` 别名，17 个拼写逐个断言）；
+  新家**不得** `@import` 弃用文件，弃用文件**必须**指向 `FieldValidation.zig`；两个 `http.*` 调用方
+  （`src/api/Extract.zig`、`src/api/middleware/Validation.zig`）**必须**直连新家且**不得**出现弃用文件的 import；
+  别名与规范类型逐个 `==`，两个入口再各真调一次（`http.extractJsonValidated`、`http.validateRequest`）。
+  **这半条现在说明的是：已经没有消费方阻塞项了** —— `Validator.*` 越路径拼写从"规范实现"降级成"别名转发"，删文件时
+  把门禁里那两处 `@import` 与对应断言一起删掉即可。
 
 ## 覆盖不到的部分（只能人工看）
 
@@ -115,10 +122,10 @@
      （表在 `docs/UPGRADING.md:18-22`）。四条 `send*` 是**一族**：`scripts/check-production.sh` 的"信封泄漏"
      扫描把它们当同一形状处理。
    - **整模块横幅已归类，不在这张表里**：`src/validation/Validator.zig` 与 `src/extensions.zig`
-     （见上面「整模块级弃用横幅」一节）。前者**还活着**，但理由在本批换了：`http.FieldRules` 已经解耦（规范声明
-     搬去 `src/validation/FieldRules.zig`），现在挡着删除的是 `validateStruct*` 这条链（`http.validateRequest`、
-     `http.extractJsonValidated`）与 `Validator.*` 越路径拼写；所以按"可达"处理而不是"已移除"；
-     后者是**命名空间级**的移除，已记进「已移除」的记录并由门禁钉住 `@hasDecl(zmodu, "extensions")` 为假。
+     （见上面「整模块级弃用横幅」一节）。前者**已经是薄兼容层**：`http.FieldRules` 与 `validateStruct*` 两条链都
+     已解耦（规范声明分别搬到 `src/validation/FieldRules.zig` 与 `src/validation/FieldValidation.zig`），
+     **没有消费方阻塞项** —— 唯一仍 `@import` 它的是门禁自己（为了钉住那 17 个拼写必须真调），所以按"可达"处理
+     而不是"已移除"；后者是**命名空间级**的移除，已记进「已移除」的记录并由门禁钉住 `@hasDecl(zmodu, "extensions")` 为假。
    - **仍未收口**：没有。四处都已在文档与门禁里各就各位；下次再发现表外标记，照同样的三步走（归类 → 入表/入档 → 加断言）。
    - **规则 3（回指本节）的逐条现状**写在 `docs/UPGRADING.md`（表下方"规则 3 的现状"）：只有 `ctx.paramPath`
      （`:929` 起那节，`v0.15.46`）与 `RateLimiter.acquire`（`v0.15.45` 那节）能回指 —— 两条都已完成；其余四组
