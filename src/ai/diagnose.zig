@@ -167,12 +167,8 @@ fn buildOutboxPayload(
     try skill.putJsonField(allocator, &obj, "source", .{ .string = case.source });
     try skill.putJsonField(allocator, &obj, "subject", .{ .string = case.subject });
     try skill.putJsonField(allocator, &obj, "summary", .{ .string = summary });
-    var causes_v = std.json.Array.init(allocator);
-    for (causes) |c| try causes_v.append(.{ .string = try allocator.dupe(u8, c) });
-    try skill.putJsonField(allocator, &obj, "causes", .{ .array = causes_v });
-    var actions_v = std.json.Array.init(allocator);
-    for (actions) |a| try actions_v.append(.{ .string = try allocator.dupe(u8, a) });
-    try skill.putJsonField(allocator, &obj, "actions", .{ .array = actions_v });
+    try skill.putJsonField(allocator, &obj, "causes", .{ .array = try stringArray(allocator, causes) });
+    try skill.putJsonField(allocator, &obj, "actions", .{ .array = try stringArray(allocator, actions) });
 
     // The tree is released here and the only statement left cannot fail, so the
     // `errdefer` above cannot double-free. (`valueAlloc` takes `anytype`, so the
@@ -182,6 +178,54 @@ fn buildOutboxPayload(
     const out = try std.json.Stringify.valueAlloc(allocator, tree, .{});
     skill.freeValue(allocator, tree);
     return out;
+}
+
+/// An owned `.array` of owned `.string`s, ready for `putJsonField`.
+///
+/// The guard belongs here rather than at the call site: `putJsonField` takes
+/// ownership of a non-string value **even when it fails**, so a caller-side
+/// `errdefer` would free the array a second time when the field is rejected.
+/// Built here, the guard is disarmed by the `return` — and an element is
+/// appended only after its copy exists, so no `append` failure can strand one
+/// either.
+fn stringArray(allocator: std.mem.Allocator, items: []const []const u8) !std.json.Array {
+    var arr = std.json.Array.init(allocator);
+    errdefer skill.freeValue(allocator, .{ .array = arr });
+    for (items) |s| {
+        const copy = try allocator.dupe(u8, s);
+        errdefer allocator.free(copy);
+        try arr.append(.{ .string = copy });
+    }
+    return arr;
+}
+
+// `checkAllAllocationFailures` fails one allocation at a time inside the call
+// and compares allocated/freed bytes, so it covers the copy that the elements
+// are made of, the growth of the arrays and the field copies in `obj`.
+//
+// Red before `stringArray` (the inline `try causes_v.append(…)` loop), on the
+// fail index that lands on the first element's `append`: `fail_index: 8/15`,
+// `FAIL (MemoryLeakDetected)`, `leaked [len: 24]` — the copy of
+// "provider said \"declined\"" — allocated at that line.
+test "buildOutboxPayload hands back its tree at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    const causes = [_][]const u8{"provider said \"declined\""};
+    const actions = [_][]const u8{"retry after \"backoff\""};
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, cs: []const []const u8, as: []const []const u8) !void {
+            const payload = try buildOutboxPayload(
+                a,
+                .{ .source = "alert", .subject = "orders \"eu\"", .severity = .critical, .description = "failed orders" },
+                "2 failed orders",
+                cs,
+                as,
+            );
+            defer a.free(payload);
+            try std.testing.expect(std.mem.indexOf(u8, payload, "declined") != null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{ &causes, &actions });
 }
 
 test "DiagnosisFlow gathers evidence, diagnoses and writes outbox" {

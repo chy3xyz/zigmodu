@@ -271,19 +271,9 @@ pub fn ApprovalApi(comptime QueueT: type) type {
         /// `step_name` can come from a model-authored escalation, and a quote in
         /// any of them used to make the response body unparseable.
         fn buildPendingBody(allocator: std.mem.Allocator, items: []const PendingApproval) ![]u8 {
-            var rows = std.json.Array.init(allocator);
-            for (items) |item| {
-                var row = std.json.ObjectMap{};
-                try skill.putJsonField(allocator, &row, "run_id", .{ .string = item.run_id });
-                try skill.putJsonField(allocator, &row, "subject", .{ .string = item.subject });
-                try skill.putJsonField(allocator, &row, "amount", .{ .integer = item.amount });
-                try skill.putJsonField(allocator, &row, "note", .{ .string = item.note });
-                try skill.putJsonField(allocator, &row, "step", .{ .string = item.step_name });
-                try rows.append(.{ .object = row });
-            }
             var obj = std.json.ObjectMap{};
             errdefer skill.freeValue(allocator, .{ .object = obj });
-            try skill.putJsonField(allocator, &obj, "pending", .{ .array = rows });
+            try skill.putJsonField(allocator, &obj, "pending", .{ .array = try buildPendingRows(allocator, items) });
             // Freed here; the only statement left cannot fail, so the `errdefer`
             // above cannot double-free. (`valueAlloc` takes `anytype`, so the
             // value must be typed `std.json.Value` — an inline literal would be
@@ -293,7 +283,57 @@ pub fn ApprovalApi(comptime QueueT: type) type {
             skill.freeValue(allocator, tree);
             return out;
         }
+
+        /// Each row is built and guarded on its own, then appended only once it
+        /// is complete: a `putJsonField` into a map nobody owns yet strands
+        /// every key/value already in it when a later field fails, and a row
+        /// handed to `append` mid-build is stranded the same way.
+        fn buildPendingRows(allocator: std.mem.Allocator, items: []const PendingApproval) !std.json.Array {
+            var rows = std.json.Array.init(allocator);
+            errdefer skill.freeValue(allocator, .{ .array = rows });
+            for (items) |item| {
+                const row = try buildPendingRow(allocator, item);
+                errdefer skill.freeValue(allocator, .{ .object = row });
+                try rows.append(.{ .object = row });
+            }
+            return rows;
+        }
+
+        fn buildPendingRow(allocator: std.mem.Allocator, item: PendingApproval) !std.json.ObjectMap {
+            var row = std.json.ObjectMap{};
+            errdefer skill.freeValue(allocator, .{ .object = row });
+            try skill.putJsonField(allocator, &row, "run_id", .{ .string = item.run_id });
+            try skill.putJsonField(allocator, &row, "subject", .{ .string = item.subject });
+            try skill.putJsonField(allocator, &row, "amount", .{ .integer = item.amount });
+            try skill.putJsonField(allocator, &row, "note", .{ .string = item.note });
+            try skill.putJsonField(allocator, &row, "step", .{ .string = item.step_name });
+            return row;
+        }
     };
+}
+
+// The body is built field by field and row by row, so
+// `checkAllAllocationFailures` walks every one of those copies, the growth of
+// both arrays and the object map behind `pending`.
+//
+// Red before `buildPendingRows`: `fail_index: 3/25`, `FAIL
+// (MemoryLeakDetected)` with `allocated bytes: 238` against `freed bytes: 0` —
+// the rows array and the row being built had no owner on that path.
+test "buildPendingBody hands back its rows at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    const items = [_]PendingApproval{
+        .{ .run_id = "ap-1", .subject = "order \"9\"", .amount = 50000, .note = "needs \\ CFO", .step_name = "finance" },
+        .{ .run_id = "ap-2", .subject = "order-10", .amount = 1, .note = "", .step_name = "ops" },
+    };
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, rows: []const PendingApproval) !void {
+            const body = try ApprovalApi(ApprovalQueue).buildPendingBody(a, rows);
+            defer a.free(body);
+            try std.testing.expect(std.mem.indexOf(u8, body, "ap-1") != null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{&items});
 }
 
 const approval_api_mod = @This();

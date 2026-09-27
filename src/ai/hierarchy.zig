@@ -42,14 +42,20 @@ pub const HierarchyResult = struct {
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *HierarchyResult) void {
-        for (self.tasks.items) |t| {
-            self.allocator.free(t.name);
-            if (t.output.len > 0) self.allocator.free(t.output);
-        }
+        for (self.tasks.items) |t| freeSubTaskResult(self.allocator, t);
         self.tasks.deinit(self.allocator);
         self.* = undefined;
     }
 };
+
+/// Release the strings an executor put into a result. `deinit` above and the
+/// wave's tail guard in `run` share this one definition of what a result owns,
+/// so a result released on one path cannot be released differently on the
+/// other.
+fn freeSubTaskResult(allocator: std.mem.Allocator, r: SubTaskResult) void {
+    allocator.free(r.name);
+    if (r.output.len > 0) allocator.free(r.output);
+}
 
 const TaskState = struct {
     executor: ExecutorFn,
@@ -126,7 +132,20 @@ pub const Hierarchy = struct {
             // Append the whole wave before destroying any of it. Destroying
             // in-loop handed the `errdefer` above states it had already freed —
             // one failed `append` and the wave was destroyed twice.
-            for (states) |st| try result.tasks.append(allocator, st.result);
+            //
+            // The counter moves only past a *successful* `append`, so the guard
+            // frees exactly the results that never reached `result` (all of them
+            // when the first append fails): those strings have no other owner,
+            // while the appended ones belong to `result` and to its own
+            // `errdefer result.deinit()`.
+            {
+                var transferred: usize = 0;
+                errdefer for (states[transferred..spawned]) |st| freeSubTaskResult(allocator, st.result);
+                for (states) |st| {
+                    try result.tasks.append(allocator, st.result);
+                    transferred += 1;
+                }
+            }
             for (states) |st| allocator.destroy(st);
         }
 

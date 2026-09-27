@@ -321,8 +321,11 @@ pub const Agent = struct {
                 if (chunks.len > 0) {
                     const ctx_block = try retriever_mod.KeywordRetriever.formatContext(allocator, chunks);
                     defer allocator.free(ctx_block);
-                    const merged = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ self.system_prompt, ctx_block });
-                    try owned_strs.append(allocator, merged);
+                    const merged = try appendTakenString(
+                        allocator,
+                        &owned_strs,
+                        try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ self.system_prompt, ctx_block }),
+                    );
                     system_content = merged;
                 }
             } else |_| {}
@@ -344,9 +347,12 @@ pub const Agent = struct {
                 break :blk null;
             };
             if (block) |b| {
-                try owned_strs.append(allocator, b);
-                const merged = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ system_content, b });
-                try owned_strs.append(allocator, merged);
+                _ = try appendTakenString(allocator, &owned_strs, b);
+                const merged = try appendTakenString(
+                    allocator,
+                    &owned_strs,
+                    try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ system_content, b }),
+                );
                 system_content = merged;
             }
         }
@@ -490,14 +496,16 @@ pub const Agent = struct {
                             }
                             // Machine-readable reason so the model can pivot
                             // (a denied `execute` is a cue to propose).
-                            const err_s = try std.fmt.allocPrint(
+                            const err_s = try appendTakenString(
                                 allocator,
-                                "{{\"error\":\"ToolDenied\",\"reason\":\"{s}\"}}",
-                                .{@tagName(decision)},
+                                &owned_strs,
+                                try std.fmt.allocPrint(
+                                    allocator,
+                                    "{{\"error\":\"ToolDenied\",\"reason\":\"{s}\"}}",
+                                    .{@tagName(decision)},
+                                ),
                             );
-                            try owned_strs.append(allocator, err_s);
-                            const tid = try allocator.dupe(u8, tc.id);
-                            try owned_strs.append(allocator, tid);
+                            const tid = try appendOwnedString(allocator, &owned_strs, tc.id);
                             try messages.append(allocator, .{
                                 .role = "tool",
                                 .tool_call_id = tid,
@@ -515,10 +523,8 @@ pub const Agent = struct {
                         if (self.audit) |log| {
                             log.record(.tool_denied, tc.name, "denied", skill_ctx.tenant_id orelse 0, skill_ctx.user_id orelse 0);
                         }
-                        const err_s = try allocator.dupe(u8, "{\"error\":\"ToolDenied\"}");
-                        try owned_strs.append(allocator, err_s);
-                        const tid = try allocator.dupe(u8, tc.id);
-                        try owned_strs.append(allocator, tid);
+                        const err_s = try appendOwnedString(allocator, &owned_strs, "{\"error\":\"ToolDenied\"}");
+                        const tid = try appendOwnedString(allocator, &owned_strs, tc.id);
                         try messages.append(allocator, .{
                             .role = "tool",
                             .tool_call_id = tid,
@@ -552,10 +558,12 @@ pub const Agent = struct {
                     if (self.audit) |log| {
                         log.record(.tool_err, tc.name, @errorName(err), skill_ctx.tenant_id orelse 0, skill_ctx.user_id orelse 0);
                     }
-                    const err_s = try std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
-                    try owned_strs.append(allocator, err_s);
-                    const tid = try allocator.dupe(u8, tc.id);
-                    try owned_strs.append(allocator, tid);
+                    const err_s = try appendTakenString(
+                        allocator,
+                        &owned_strs,
+                        try std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}),
+                    );
+                    const tid = try appendOwnedString(allocator, &owned_strs, tc.id);
                     try messages.append(allocator, .{
                         .role = "tool",
                         .tool_call_id = tid,
@@ -574,10 +582,8 @@ pub const Agent = struct {
                 // `Agent.run` while the handler follows `SkillContext`) — freeing
                 // it with the wrong one is an invalid free.
                 defer skill_mod.freeValue(skill_ctx.allocator, result);
-                const result_s = try std.json.Stringify.valueAlloc(allocator, result, .{});
-                try owned_strs.append(allocator, result_s);
-                const tid = try allocator.dupe(u8, tc.id);
-                try owned_strs.append(allocator, tid);
+                const result_s = try appendTakenString(allocator, &owned_strs, try std.json.Stringify.valueAlloc(allocator, result, .{}));
+                const tid = try appendOwnedString(allocator, &owned_strs, tc.id);
                 try messages.append(allocator, .{
                     .role = "tool",
                     .tool_call_id = tid,
@@ -668,6 +674,21 @@ fn appendOwnedString(
     errdefer allocator.free(copy);
     try list.append(allocator, copy);
     return copy;
+}
+
+/// Append a string the caller already owns and hand it over to `list`, which
+/// releases it with its `defer`. The transfer happens inside this function, so
+/// its guard is disarmed before the caller resumes — a site-local `errdefer`
+/// would stay armed for the rest of the enclosing scope and free a string
+/// `list` already owns the moment a later call there fails.
+fn appendTakenString(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList([]const u8),
+    s: []const u8,
+) ![]const u8 {
+    errdefer allocator.free(s);
+    try list.append(allocator, s);
+    return s;
 }
 
 test "Spec.build carries identity, authority and memory into the agent" {

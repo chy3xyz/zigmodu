@@ -461,21 +461,36 @@ pub const Workflow = struct {
                 // Nothing above this point may destroy a state: the `errdefer`
                 // is still in scope over the whole prefix, and the destroy loop
                 // at the end of the wave runs only after every `try` here.
-                for (states) |st| {
-                    if (st.outcome) |o| {
-                        try self.appendCompleted(result, allocator, st.step, st.index, o);
-                        try recordCompleted(allocator, completed, st.step.name);
-                        if (o.budget_exhausted) {
-                            try self.maybeEscalate(ctx, .budget_exhausted, st.step.name, allocator);
-                            result.status = .budget_exhausted;
+                //
+                // `recorded` counts the leading states whose record — and with
+                // it the executor's `output` — is already owned by `result`; the
+                // two appenders move it past a step right after the record is
+                // appended and *before* `persistStep` can fail, which is the one
+                // place the hand-over is unconditional. The guard below therefore
+                // frees exactly the outputs that never reached a record: a
+                // `persistStep` failure must not free one (`result` still points
+                // at it), an earlier failure must.
+                {
+                    var recorded: usize = 0;
+                    errdefer for (states[recorded..spawned]) |st| {
+                        if (st.outcome) |o| allocator.free(o.output);
+                    };
+                    for (states) |st| {
+                        if (st.outcome) |o| {
+                            try self.appendCompleted(result, allocator, st.step, st.index, o, &recorded);
+                            try recordCompleted(allocator, completed, st.step.name);
+                            if (o.budget_exhausted) {
+                                try self.maybeEscalate(ctx, .budget_exhausted, st.step.name, allocator);
+                                result.status = .budget_exhausted;
+                            }
+                        } else {
+                            try self.appendFailed(result, allocator, st.step, st.index, st.last_err, &recorded);
+                            try self.maybeEscalate(ctx, .step_failed, st.step.name, allocator);
+                            result.status = .failed;
                         }
-                    } else {
-                        try self.appendFailed(result, allocator, st.step, st.index, st.last_err);
-                        try self.maybeEscalate(ctx, .step_failed, st.step.name, allocator);
-                        result.status = .failed;
-                    }
-                    if (st.outcome) |o| {
-                        if (o.pending_human) result.status = .pending_human;
+                        if (st.outcome) |o| {
+                            if (o.pending_human) result.status = .pending_human;
+                        }
                     }
                 }
                 for (states) |st| allocator.destroy(st);
@@ -497,11 +512,18 @@ pub const Workflow = struct {
         step_index: usize,
         result: *WorkflowResult,
     ) !?StepOutcome {
+        var recorded: usize = 0;
         const outcome = self.attemptStep(allocator, ctx, step) catch |err| {
-            try self.appendFailed(result, allocator, step, step_index, err);
+            try self.appendFailed(result, allocator, step, step_index, err, &recorded);
             return null;
         };
-        try self.appendCompleted(result, allocator, step, step_index, outcome);
+        self.appendCompleted(result, allocator, step, step_index, outcome, &recorded) catch |err| {
+            // The counter is still zero when the record never landed — the
+            // appender moves it as soon as `result` owns `outcome.output`,
+            // before the WAL write — so this output has no owner here.
+            if (recorded == 0) allocator.free(outcome.output);
+            return err;
+        };
         return outcome;
     }
 
@@ -525,6 +547,11 @@ pub const Workflow = struct {
         return last_err;
     }
 
+    /// Append the completed record — handing `outcome.output` to `result` —
+    /// and move `recorded` past the step as soon as the record lands, i.e.
+    /// before `persistStep` can fail. That ordering is what a caller's tail
+    /// guard relies on: after this point the output has an owner, so only a
+    /// failure *before* the append leaves it unowned.
     fn appendCompleted(
         self: Workflow,
         result: *WorkflowResult,
@@ -532,16 +559,28 @@ pub const Workflow = struct {
         step: Step,
         step_index: usize,
         outcome: StepOutcome,
+        recorded: *usize,
     ) !void {
         if (self.metrics) |m| m.completed_steps += 1;
-        try result.steps.append(allocator, .{
-            .name = try allocator.dupe(u8, step.name),
-            .status = .completed,
-            .output = outcome.output,
-        });
+        {
+            // The `errdefer` covers the append only: once the record is in
+            // `result` the name is `result`'s, and a `persistStep` failure must
+            // not free it.
+            const name = try allocator.dupe(u8, step.name);
+            errdefer allocator.free(name);
+            try result.steps.append(allocator, .{
+                .name = name,
+                .status = .completed,
+                .output = outcome.output,
+            });
+        }
+        recorded.* += 1;
         try self.persistStep(allocator, step_index, step.name, "completed", null, outcome.output);
     }
 
+    /// Same hand-over (and same `recorded` ordering) as `appendCompleted`; a
+    /// failed step has no output, so its record is what the counter accounts
+    /// for.
     fn appendFailed(
         self: Workflow,
         result: *WorkflowResult,
@@ -549,16 +588,24 @@ pub const Workflow = struct {
         step: Step,
         step_index: usize,
         last_err: anyerror,
+        recorded: *usize,
     ) !void {
         if (self.metrics) |m| m.failed_steps += 1;
-        try result.steps.append(allocator, .{
-            .name = try allocator.dupe(u8, step.name),
-            .status = .failed,
-            .error_message = if (last_err != error.Unknown)
+        {
+            const name = try allocator.dupe(u8, step.name);
+            errdefer allocator.free(name);
+            const err_msg = if (last_err != error.Unknown)
                 try allocator.dupe(u8, @errorName(last_err))
             else
-                null,
-        });
+                null;
+            errdefer if (err_msg) |em| allocator.free(em);
+            try result.steps.append(allocator, .{
+                .name = name,
+                .status = .failed,
+                .error_message = err_msg,
+            });
+        }
+        recorded.* += 1;
         try self.persistStep(
             allocator,
             step_index,
