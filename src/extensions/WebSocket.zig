@@ -2415,16 +2415,9 @@ test "WebSocketClient: a second writer waits for the frame lock instead of inter
     var client = WebSocketClient.init(std.testing.allocator, pair.stream, io, &server);
 
     const Probe = struct {
-        var lock_held: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
         var send_returned: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
         var send_ok: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
-        fn hold(c: *WebSocketClient, owner_io: std.Io) void {
-            c.write_mutex.lock(owner_io) catch return;
-            lock_held.store(true, .release);
-            std.Io.sleep(owner_io, std.Io.Duration.fromMilliseconds(300), .awake) catch {};
-            c.write_mutex.unlock(owner_io);
-        }
         fn send(c: *WebSocketClient) void {
             if (c.sendText("x")) |_| {
                 send_ok.store(true, .release);
@@ -2432,30 +2425,22 @@ test "WebSocketClient: a second writer waits for the frame lock instead of inter
             send_returned.store(true, .release);
         }
     };
-    Probe.lock_held.store(false, .release);
     Probe.send_returned.store(false, .release);
     Probe.send_ok.store(false, .release);
 
-    // A fan-out is mid-frame on this client: `broadcast` holds `write_mutex`
-    // across the whole write, which is what makes it one writer per socket.
-    var hold_fut = try io.concurrent(Probe.hold, .{ &client, io });
-    var spins: usize = 0;
-    while (spins < wait_for_parked_fiber_rounds and !Probe.lock_held.load(.acquire)) : (spins += 1) {
-        std.atomic.spinLoopHint();
-    }
-    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(60), .awake);
-    try std.testing.expect(Probe.lock_held.load(.acquire));
-
-    // The client's own connection fiber writes through the same entry point
-    // (`sendPong` → `sendFrame`, and a handler's `sendText` directly): it has to
-    // wait for that write, not write alongside it. Writing alongside is how the
-    // peer receives half of each frame — one corrupt frame, and it closes.
+    // The *test* holds the lock, the way a fan-out mid-frame would, and a
+    // fiber is the second writer. An earlier shape had a second fiber hold it
+    // while it slept — on a loaded CI runner that fiber's sleep can come back
+    // early (or the fiber start late), and the assertion then measured the
+    // scheduler instead of the lock. Here the only ordering the test depends on
+    // is its own: the sender cannot reach the socket until this unlock.
+    try client.write_mutex.lock(io);
     var send_fut = try io.concurrent(Probe.send, .{&client});
     try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(120), .awake);
     try std.testing.expect(!Probe.send_returned.load(.acquire));
 
+    client.write_mutex.unlock(io);
     send_fut.await(io);
-    hold_fut.await(io);
     try std.testing.expect(Probe.send_ok.load(.acquire));
     // ...and once the lock was free the frame went out whole: FINAL|text, 1-byte
     // payload, no mask (server → client).
