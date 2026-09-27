@@ -27,10 +27,10 @@
 #   deliberately narrow so a new weak-seed line in an exempted file still fails.
 #
 # A third scan (mode=inlinealloc, same shared lexer) flags an allocation built
-# inline as the argument of a fallible `.append(`/`.put(` — the value is
-# stranded when the outer call fails. Enforced under src/ai/ (the prefix the
-# batch series just cleaned), warn-only elsewhere until those hits are fixed;
-# see the INLINE_ALLOC_ENFORCED block below.
+# inline as the argument of a fallible `.append(`/`.put(`, or inside the
+# argument list of a `*Owned` hand-over helper (`putOwned`) — the value is
+# stranded when the outer call fails. The prefixes whose hits the batch series
+# cleaned are enforced (see INLINE_ALLOC_ENFORCED below); the rest still warn.
 #
 # Scope (see scripts/lib/zig-scan.awk, shared with check-version.sh):
 #   * whole file, not "up to the first `test \"` line" — that truncation used to
@@ -169,13 +169,13 @@ fi
 # last. Test blocks are skipped by the shared scanner; the consuming helpers
 # never match (they are not spelled `.append(` / `.put(`).
 #
-# Enforcement is scoped to src/ai/ for now — that prefix was just cleaned of
-# this class, and this keeps it from coming back. Everywhere else the scan
-# warns: the remaining hits (src/messaging, src/migration, src/http, src/core,
-# src/security, tools/zmodu/src) are the promotion backlog, the same ratchet
-# model as the catch rule above — fix a prefix's hits, then add it to
-# INLINE_ALLOC_ENFORCED.
-INLINE_ALLOC_ENFORCED=(src/ai/)
+# Enforcement is scoped to the prefixes whose hits this ratchet has cleaned:
+# src/ai/ first (batches 80–84), then src/core/, src/http/, src/messaging/,
+# src/migration/, src/security/ and tools/zmodu/src/ in the batch that fixed the
+# remaining 18. Everywhere else the scan still only warns — the rest of the tree
+# happens to be clean today, but a prefix goes in here only once a batch has
+# walked its hits, the same ratchet model as the catch rule above.
+INLINE_ALLOC_ENFORCED=(src/ai/ src/core/ src/http/ src/messaging/ src/migration/ src/security/ tools/zmodu/src/)
 inlinealloc_fail=0
 while IFS= read -r f; do
   [[ -f "$f" ]] || continue

@@ -18,6 +18,7 @@ const SkillRegistry = @import("skill.zig").SkillRegistry;
 const SkillContext = @import("skill.zig").SkillContext;
 const run_audit = @import("run_audit.zig");
 const freeValue = @import("skill.zig").freeValue;
+const putJsonField = @import("skill.zig").putJsonField;
 const json_shape = @import("json_shape.zig");
 
 pub const CacheHandle = struct {
@@ -137,8 +138,14 @@ pub fn registerAdminSkills(registry: *SkillRegistry) !void {
                 const handle = findCache(ac.caches, cache_v.string) orelse return error.CacheNotAllowed;
                 handle.delete(handle.userdata, key_v.string);
                 var out = std.json.ObjectMap{};
+                // The string field goes through `putJsonField`, which copies the
+                // value itself and frees that copy if the map refuses the field —
+                // a `dupe` built as the `put` argument had nothing to guard it.
+                // This guard covers the fields already placed, and the `return`
+                // below disarms it at the hand-over.
+                errdefer freeValue(sctx.allocator, .{ .object = out });
                 try putOwned(&out, sctx.allocator, "ok", .{ .bool = true });
-                try putOwned(&out, sctx.allocator, "cache", .{ .string = try sctx.allocator.dupe(u8, cache_v.string) });
+                try putJsonField(sctx.allocator, &out, "cache", .{ .string = cache_v.string });
                 return .{ .object = out };
             }
         }.h,
@@ -187,8 +194,9 @@ pub fn registerAdminSkills(registry: *SkillRegistry) !void {
                 if (key_v != .string) return error.InvalidArguments;
                 const value = store.get(key_v.string) orelse return error.ConfigKeyNotFound;
                 var out = std.json.ObjectMap{};
-                try putOwned(&out, sctx.allocator, "key", .{ .string = try sctx.allocator.dupe(u8, key_v.string) });
-                try putOwned(&out, sctx.allocator, "value", .{ .string = try sctx.allocator.dupe(u8, value) });
+                errdefer freeValue(sctx.allocator, .{ .object = out });
+                try putJsonField(sctx.allocator, &out, "key", .{ .string = key_v.string });
+                try putJsonField(sctx.allocator, &out, "value", .{ .string = value });
                 return .{ .object = out };
             }
         }.h,
@@ -257,16 +265,21 @@ pub fn registerAdminSkills(registry: *SkillRegistry) !void {
                 }
                 try store.list(sctx.allocator, &entries, kind, tenant, limit);
                 var arr = std.json.Array.init(sctx.allocator);
+                errdefer freeValue(sctx.allocator, .{ .array = arr });
                 for (entries.items) |e| {
                     var rec = std.json.ObjectMap{};
-                    try putOwned(&rec, sctx.allocator, "run_id", .{ .string = try sctx.allocator.dupe(u8, e.run_id) });
-                    try putOwned(&rec, sctx.allocator, "kind", .{ .string = try sctx.allocator.dupe(u8, @tagName(e.kind)) });
-                    try putOwned(&rec, sctx.allocator, "status", .{ .string = try sctx.allocator.dupe(u8, e.status) });
+                    // The append is the last statement of the loop body, so this
+                    // guard is disarmed exactly when `arr` takes ownership.
+                    errdefer freeValue(sctx.allocator, .{ .object = rec });
+                    try putJsonField(sctx.allocator, &rec, "run_id", .{ .string = e.run_id });
+                    try putJsonField(sctx.allocator, &rec, "kind", .{ .string = @tagName(e.kind) });
+                    try putJsonField(sctx.allocator, &rec, "status", .{ .string = e.status });
                     try putOwned(&rec, sctx.allocator, "steps", .{ .integer = @intCast(e.steps) });
                     if (e.tenant_id) |tid| try putOwned(&rec, sctx.allocator, "tenant_id", .{ .integer = tid });
                     try arr.append(.{ .object = rec });
                 }
                 var out = std.json.ObjectMap{};
+                errdefer freeValue(sctx.allocator, .{ .object = out });
                 try putOwned(&out, sctx.allocator, "runs", .{ .array = arr });
                 return .{ .object = out };
             }

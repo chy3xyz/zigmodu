@@ -2889,7 +2889,9 @@ fn introspectDatabaseSqlite(io: std.Io, allocator: std.mem.Allocator, db_path: [
     while (iter.next()) |tok| {
         const t = std.mem.trim(u8, tok, " \t\n\r");
         if (t.len > 0 and !std.mem.eql(u8, t, "sqlite_sequence")) {
-            try table_names.append(allocator, try allocator.dupe(u8, t));
+            const copy = try allocator.dupe(u8, t);
+            errdefer allocator.free(copy);
+            try table_names.append(allocator, copy);
         }
     }
 
@@ -3155,7 +3157,11 @@ fn introspectDatabaseMysql(io: std.Io, allocator: std.mem.Allocator, host: []con
     var tlines = std.mem.splitScalar(u8, list_result.stdout, '\n');
     while (tlines.next()) |t| {
         const trimmed = std.mem.trim(u8, t, " \t\r");
-        if (trimmed.len > 0) try table_names.append(allocator, try allocator.dupe(u8, trimmed));
+        if (trimmed.len > 0) {
+            const copy = try allocator.dupe(u8, trimmed);
+            errdefer allocator.free(copy);
+            try table_names.append(allocator, copy);
+        }
     }
 
     for (table_names.items) |tname| {
@@ -3530,7 +3536,11 @@ fn groupTablesByModule(allocator: std.mem.Allocator, tables: []const TableDef) !
         const key = k.*;
         if (key.len > 1 and key[key.len - 1] == 's') {
             const singular = key[0 .. key.len - 1];
-            if (module_map.get(singular)) |_| try merge_keys.append(allocator, try allocator.dupe(u8, key));
+            if (module_map.get(singular)) |_| {
+                const copy = try allocator.dupe(u8, key);
+                errdefer allocator.free(copy);
+                try merge_keys.append(allocator, copy);
+            }
         }
     }
     for (merge_keys.items) |key| {
@@ -3586,7 +3596,9 @@ fn detectSubsystems(allocator: std.mem.Allocator, module_map: *std.StringHashMap
             } else {
                 gop.value_ptr.* = .empty;
             }
-            try gop.value_ptr.append(allocator, try allocator.dupe(u8, name));
+            const copy = try allocator.dupe(u8, name);
+            errdefer allocator.free(copy);
+            try gop.value_ptr.append(allocator, copy);
         }
     }
 
@@ -3603,14 +3615,19 @@ fn detectSubsystems(allocator: std.mem.Allocator, module_map: *std.StringHashMap
                 if (std.mem.startsWith(u8, full_name, prefix) and full_name.len > prefix.len and full_name[prefix.len] == '_') {
                     remainder = full_name[prefix.len + 1 ..]; // strip "prefix_"
                 }
-                try modules.append(allocator, try allocator.dupe(u8, remainder));
                 // Re-key the module map entry: "<module>" → "<prefix>/<module>".
                 // fetchRemove hands back the old key so it can be freed here.
+                // This runs before the copy below so the copy's guard is the last
+                // statement of the loop body: still armed at the hand-over it
+                // would free a string `modules` already owns.
                 if (module_map.fetchRemove(full_name)) |removed| {
                     allocator.free(removed.key);
                     const new_key = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, remainder });
                     try module_map.put(new_key, removed.value);
                 }
+                const copy = try allocator.dupe(u8, remainder);
+                errdefer allocator.free(copy);
+                try modules.append(allocator, copy);
             }
             try subsystem_map.put(try allocator.dupe(u8, entry.key_ptr.*), modules);
         }
@@ -3650,7 +3667,9 @@ fn detectSubsystems(allocator: std.mem.Allocator, module_map: *std.StringHashMap
                     } else {
                         gop.value_ptr.* = .empty;
                     }
-                    try gop.value_ptr.append(allocator, try allocator.dupe(u8, key));
+                    const copy = try allocator.dupe(u8, key);
+                    errdefer allocator.free(copy);
+                    try gop.value_ptr.append(allocator, copy);
                 }
             }
         }

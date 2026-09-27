@@ -161,8 +161,13 @@ pub const TestEventCollector = struct {
 
     pub fn collect(self: *Self, event: anytype, event_type: []const u8) !void {
         const ptr: *anyopaque = @ptrCast(@constCast(&event));
+        // The type copy needs its own guard: built as the `append` argument it
+        // was stranded whenever the list refused it. The appends below end the
+        // fallible part of the function, so the successful `return` disarms it.
+        const owned_type = try self.allocator.dupe(u8, event_type);
+        errdefer self.allocator.free(owned_type);
         try self.collected_events.append(self.allocator, ptr);
-        try self.event_types.append(self.allocator, try self.allocator.dupe(u8, event_type));
+        try self.event_types.append(self.allocator, owned_type);
     }
 
     pub fn getEventCount(self: *Self) usize {

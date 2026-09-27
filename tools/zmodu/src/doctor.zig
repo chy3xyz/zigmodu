@@ -171,7 +171,9 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8, opts: *Opti
         } else if (std.mem.eql(u8, a, "--allow")) {
             if (i + 1 >= args.len) return Error.CliUsage;
             i += 1;
-            try opts.allowed.append(allocator, try allocator.dupe(u8, args[i]));
+            const copy = try allocator.dupe(u8, args[i]);
+            errdefer allocator.free(copy);
+            try opts.allowed.append(allocator, copy);
         } else if (a.len > 0 and a[0] == '-') {
             return Error.CliUsage;
         } else {

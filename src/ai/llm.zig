@@ -282,8 +282,13 @@ pub fn llmVerify(
 
 fn fakeJson(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!std.json.Value {
     var obj = std.json.ObjectMap{};
-    try putOwned(&obj, allocator, "decision", .{ .string = try allocator.dupe(u8, "approve") });
-    try putOwned(&obj, allocator, "note", .{ .string = try allocator.dupe(u8, "ok by policy") });
+    // A value built as the `putOwned` argument had nothing to guard it when the
+    // map refused the field: `putJsonField` copies the `.string` itself (and
+    // frees that copy when the put fails), and the guard below covers the
+    // fields already placed.
+    errdefer freeValue(allocator, .{ .object = obj });
+    try putJsonField(allocator, &obj, "decision", .{ .string = "approve" });
+    try putJsonField(allocator, &obj, "note", .{ .string = "ok by policy" });
     return .{ .object = obj };
 }
 

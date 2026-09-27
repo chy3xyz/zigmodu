@@ -60,7 +60,11 @@ pub fn permissionsCsv(allocator: std.mem.Allocator, client: *sqlx.Client, roles:
                     break;
                 }
             }
-            if (!dup) try list.append(allocator, try allocator.dupe(u8, p));
+            if (!dup) {
+                const copy = try allocator.dupe(u8, p);
+                errdefer allocator.free(copy);
+                try list.append(allocator, copy);
+            }
         }
     }
 

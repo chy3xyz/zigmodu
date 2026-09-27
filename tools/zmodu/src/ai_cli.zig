@@ -187,7 +187,14 @@ fn renderOpenApi(allocator: std.mem.Allocator, catalog_json: []const u8) ![]u8 {
 }
 
 fn putString(obj: *std.json.ObjectMap, allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
-    try obj.put(allocator, try allocator.dupe(u8, key), .{ .string = try allocator.dupe(u8, value) });
+    // Both copies need a guard: built as the `put` arguments they were stranded
+    // whenever the map refused the field. The `put` is the last statement, so
+    // neither guard outlives the hand-over.
+    const k = try allocator.dupe(u8, key);
+    errdefer allocator.free(k);
+    const v = try allocator.dupe(u8, value);
+    errdefer allocator.free(v);
+    try obj.put(allocator, k, .{ .string = v });
 }
 
 fn writeFile(io: std.Io, path: []const u8, data: []const u8) !void {

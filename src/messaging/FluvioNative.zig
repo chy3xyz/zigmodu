@@ -102,7 +102,9 @@ pub const NativeTransport = struct {
             defer self.allocator.free(line);
             if (std.mem.eql(u8, line, "END")) break;
             if (!std.mem.startsWith(u8, line, "TOPIC ")) return error.ProtocolError;
-            try topics.append(self.allocator, try self.allocator.dupe(u8, line["TOPIC ".len..]));
+            const copy = try self.allocator.dupe(u8, line["TOPIC ".len..]);
+            errdefer self.allocator.free(copy);
+            try topics.append(self.allocator, copy);
         }
         return try topics.toOwnedSlice(self.allocator);
     }

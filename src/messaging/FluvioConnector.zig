@@ -288,7 +288,9 @@ fn parseTopicList(allocator: std.mem.Allocator, stdout: []const u8) ![]const []c
         const name_end = std.mem.indexOfAnyPos(u8, line, 0, " \t") orelse line.len;
         const name = line[0..name_end];
         if (name.len > 0) {
-            try topics.append(allocator, try allocator.dupe(u8, name));
+            const copy = try allocator.dupe(u8, name);
+            errdefer allocator.free(copy);
+            try topics.append(allocator, copy);
         }
     }
 

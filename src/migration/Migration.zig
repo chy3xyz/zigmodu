@@ -63,7 +63,11 @@ fn splitSqlStatements(allocator: std.mem.Allocator, sql: []const u8) ![][]const 
             },
             ';' => {
                 const stmt = std.mem.trim(u8, sql[start..i], " \t\r\n");
-                if (stmt.len > 0) try out.append(allocator, try allocator.dupe(u8, stmt));
+                if (stmt.len > 0) {
+                    const copy = try allocator.dupe(u8, stmt);
+                    errdefer allocator.free(copy);
+                    try out.append(allocator, copy);
+                }
                 i += 1;
                 start = i;
             },
@@ -71,7 +75,14 @@ fn splitSqlStatements(allocator: std.mem.Allocator, sql: []const u8) ![][]const 
         }
     }
     const tail = std.mem.trim(u8, sql[start..], " \t\r\n");
-    if (tail.len > 0) try out.append(allocator, try allocator.dupe(u8, tail));
+    if (tail.len > 0) {
+        // The copy's guard ends with this block, before `toOwnedSlice` — that
+        // call failing frees `out`'s items, so a guard still armed here would
+        // free this one a second time.
+        const copy = try allocator.dupe(u8, tail);
+        errdefer allocator.free(copy);
+        try out.append(allocator, copy);
+    }
     return try out.toOwnedSlice(allocator);
 }
 

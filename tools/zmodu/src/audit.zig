@@ -203,7 +203,12 @@ pub fn run(io: Io, allocator: std.mem.Allocator, args: []const []const u8) u8 {
 fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli {
     var cli = Cli{};
     var base = std.ArrayList([]const u8).empty;
-    errdefer base.deinit(allocator);
+    // The list owns its copies, so this guard releases them too — the
+    // per-append guard below only covers the copy the failing append refused.
+    errdefer {
+        for (base.items) |b| allocator.free(b);
+        base.deinit(allocator);
+    }
     var dir_owned = try allocator.dupe(u8, ".");
     errdefer allocator.free(dir_owned);
 
@@ -238,7 +243,9 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli {
             while (it.next()) |part| {
                 const t = std.mem.trim(u8, part, " \t");
                 if (t.len == 0) continue;
-                try base.append(allocator, try allocator.dupe(u8, t));
+                const copy = try allocator.dupe(u8, t);
+                errdefer allocator.free(copy);
+                try base.append(allocator, copy);
             }
         } else if (arg.len > 0 and arg[0] == '-') {
             return error.CliUsage;
@@ -454,7 +461,9 @@ fn extractModuleInfo(
                 var rest = cur;
                 while (std.mem.indexOf(u8, rest, "\"")) |qpos| {
                     const value = readQuoted(rest, qpos + 1) orelse break;
-                    try deps.append(allocator, try allocator.dupe(u8, value));
+                    const copy = try allocator.dupe(u8, value);
+                    errdefer allocator.free(copy);
+                    try deps.append(allocator, copy);
                     // Skip opening quote + value + closing quote.
                     rest = rest[qpos + value.len + 2 ..];
                 }
@@ -880,6 +889,10 @@ fn lintFile(
         // putJsonField / appendOwnedString / appendEntry) and append/put last.
         // The consuming helpers never match: they are not spelled `.append(`
         // / `.put(` (see inlineAllocIntoFallibleCall for the exact 口径).
+        // check-production's scan carries a second half that b25 deliberately
+        // does not: an inline allocation as an argument of a `*Owned(`
+        // hand-over helper — `putOwned` is a framework-internal name that app
+        // code has no equivalent of (see inline_alloc_owned in zig-scan.awk).
         if (!config.disabled.contains("b25")) {
             if (inlineAllocIntoFallibleCall(trimmed)) {
                 try pushViolation(violations, allocator, "b25", rel_path, idx, "把分配直接写在 fallible append/put 的实参里 —— 外层调用一旦失败，内层刚分配的值无人持有即泄漏。先把分配绑到带 errdefer 的局部值（或走会接管失败的 helper：putJsonField / appendOwnedString / appendEntry），append/put 放最后；确属误报在同一行加 // audit: ignore b25 并注明缘由", .{});

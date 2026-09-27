@@ -187,7 +187,9 @@ pub const OpenApiGenerator = struct {
                 }
             }
             if (!found) {
-                try self.tags.append(self.allocator, try self.allocator.dupe(u8, tag));
+                const copy = try self.allocator.dupe(u8, tag);
+                errdefer self.allocator.free(copy);
+                try self.tags.append(self.allocator, copy);
             }
         }
     }

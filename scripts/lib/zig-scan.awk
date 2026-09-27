@@ -31,20 +31,26 @@
 #       broader exemptions.
 #   awk -v mode=inlinealloc -f scripts/lib/zig-scan.awk <file>
 #       scripts/check-production.sh — one line per inline allocation handed
-#       straight to a fallible `append`/`put`, e.g.
+#       straight to a fallible `append`/`put` or to a `*Owned` hand-over
+#       helper, e.g.
 #           try list.append(allocator, try allocator.dupe(u8, s))
 #           try map.put(allocator, try allocator.dupe(u8, key), value)
+#           try putOwned(&o, a, "k", .{ .string = try a.dupe(u8, v) })
 #       When the outer call fails, the value the inner call just made has no
 #       owner and leaks (the "allocated then lost on the next fallible call"
-#       class the src/ai batches 80–83 chased). Test blocks, comments and
+#       class the src/ai batches 80–84 chased). Test blocks, comments and
 #       string literals are already gone via zig_skip(); the `(` right after
-#       the verb is what keeps the *consuming* helpers out of it —
+#       the verb is what keeps the *consuming* helpers out of the narrow half —
 #       appendOwnedString / appendTakenString / appendEntry / putJsonField /
-#       putOwned / recordCompleted & co. are not spelled `.append(` / `.put(`.
-#       Deliberately line-shaped, and blind on the side of silence: only the
-#       `allocator` / `alloc` / `self.allocator` spellings, only single-line
-#       calls, and a `put(try dupe(k), try dupe(v))` (first argument inline)
-#       is not seen either.
+#       recordCompleted & co. are not spelled `.append(` / `.put(`, and the
+#       widened half (inline_alloc_owned) requires the callee name to *end* in
+#       `Owned(`, which none of them do.
+#       Deliberately line-shaped, and blind on the side of silence: the narrow
+#       half knows only the `allocator` / `alloc` / `self.allocator`
+#       spellings while the widened half takes any dotted allocator expression
+#       (its callee filter is what pays for that), both want single-line calls,
+#       and a `put(try dupe(k), try dupe(v))` (first argument inline) is not
+#       seen either.
 #
 # `zig_in_test(raw)` is the one definition of "this line is inside a `test`
 # block", found by brace balancing (top level or indented); `zig_skip()` is
@@ -181,6 +187,24 @@ function inline_alloc(s) {
   return s ~ /\.(append|put)\([ \t]*(self\.allocator|allocator|alloc)[ \t]*,[ \t]*try[ \t]+(self\.allocator|allocator|alloc)\.(allocPrintSentinel|allocPrint|alloc|dupeZ|dupe)\(/
 }
 
+# The same fingerprint in a later argument: an allocation built inline inside a
+# call to a hand-over helper whose name *ends* in `Owned(` —
+# `putOwned(&o, a, "k", .{ .string = try a.dupe(u8, v) })`. putOwned and
+# appendOwnedString transfer their value unconditionally (on failure too), so a
+# value built in their argument list has no local to hang an errdefer on and is
+# stranded when they fail. Requiring `Owned(` at the end of the callee name is
+# what keeps the consuming helpers out (`appendOwnedString(`'s name continues
+# past `Owned`; `putJsonField(` has none), and it is narrow enough to afford a
+# looser allocator spelling than inline_alloc's three — the src/ai handlers
+# write `sctx.allocator` / `a`. Test blocks and comments are gone via zig_skip().
+# Sharp edge, accepted: a local declared on the same line as the hand-over
+# (`const v = try a.dupe(u8, s); try putOwned(&o, a, "k", .{ .string = v });`)
+# would also match; this tree never formats that way, and splitting the line is
+# the fix if it ever does.
+function inline_alloc_owned(s) {
+  return s ~ /[A-Za-z_][A-Za-z0-9_]*Owned\(/ && s ~ /=[ \t]*try[ \t]+[A-Za-z_][A-Za-z0-9_.()]*\.(allocPrintSentinel|allocPrint|alloc|dupeZ|dupe)\(/
+}
+
 # 1 when `s` seeds/names a PRNG that is not a CSPRNG. `std.Random.DefaultPrng`
 # is an alias for `Xoshiro256`, and `Xoroshiro128`/`Pcg`/`Isaac64`/`Sfc64`/
 # `RomuTrio`/`SplitMix64` are the same class: a few outputs recover the state,
@@ -264,7 +288,7 @@ BEGIN { in_test = 0; depth = 0; kw = 0; open = 0; seen = 0 }
     next
   }
   if (mode == "inlinealloc") {
-    if (inline_alloc(code)) print NR "\t" rtrim(ltrim(code))
+    if (inline_alloc(code) || inline_alloc_owned(code)) print NR "\t" rtrim(ltrim(code))
     next
   }
   # mode == "catch": resolve a `catch` whose body starts on an earlier line.

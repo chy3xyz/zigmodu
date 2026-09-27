@@ -2451,7 +2451,12 @@ pub const KafkaWireFormat = struct {
                 allocator.free(values);
             }
             for (values) |v| {
-                try out.append(allocator, try allocator.dupe(u8, v));
+                // One guard per copy: the enclosing `errdefer` releases only the
+                // values `out` already holds, so a copy built as the `append`
+                // argument was stranded on that failure.
+                const copy = try allocator.dupe(u8, v);
+                errdefer allocator.free(copy);
+                try out.append(allocator, copy);
             }
             i = batch_end -| 1;
         }
