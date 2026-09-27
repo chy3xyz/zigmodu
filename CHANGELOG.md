@@ -2,6 +2,54 @@
 
 ## [Unreleased]
 
+### 第 70 批：第三轮复核换面（`src/ai/**`、`Server.zig` 请求路径、`Http2Server`/`WebSocket`/`ws_uring`）—— 修掉 **2 个 P0**，其余按核实状态入队（**破坏性：否**）
+
+读数：全量 `-Ddb=all` → **2056/2114 passed · 58 skipped · 0 failed**（223s）；`cron parse` 族 5 条全通过。
+
+前两轮的覆盖面是"锁"与"错误路径/算术/取消"但**只碰了部分文件**。这一轮专挑**从没被真正看过**的三块：
+`src/ai/` 全目录（二十多个文件）、`src/api/Server.zig` 的请求路径（9381 行只抽查过）、
+`Http2Server.zig` + `WebSocket.zig` + `ws_uring.zig`（此前只抽查）。同样三个只读子代理 + 主代理逐条复核。
+
+**修掉的 2 个 P0**（都已核实为真、都已修）
+
+1. **`src/ai/notify.zig`：`notification.send` 工具在正常路径上 use-after-free。**
+   ```zig
+   const named = blk: {
+       var list = std.ArrayList(NotificationChannel).empty;
+       defer list.deinit(sctx.allocator);   // ← 块退出即释放
+       ...
+       break :blk list.items;               // ← 返回的切片随即悬空
+   };
+   nc.hub.channels = named;                 // 之后 deliver 遍历它
+   ```
+   触发就是**成功路径**：agent 调 `notification.send` 且 channel 命中已注册的任一名 → `deliver`
+   遍历已释放的数组。修法：把 list 提到块外（`defer` 在 `deliver` 之后才跑）。
+
+2. **`src/scheduler/Cron.zig`：表达式里的 `*/0` 与越界端点 —— 死循环与 panic，且经 agent 的
+   `schedule_job` 可由模型文本触发。**
+   ```zig
+   const step = try parseInt(u8, step_str, 10);
+   while (i <= max) : (i += step) target[i] = true;   // step==0 → i 不前进
+   ...
+   while (i <= end) : (i += 1) target[i] = true;      // end 未收窄 → 越界
+   ```
+   修法：`step == 0` 与 `end > max` 都返回 `error.InvalidCronExpr`（与解析器其他错误同形）。
+   测试 `cron parse refuses a zero step and an out-of-range endpoint`：三例断言报错、边界值
+   （`0-59`）仍接受（跑之前它会是"挂住/崩"，现在是可断言的失败）。
+
+**核实后入队的其余项**（我逐条核过 P0/P1 的那些行，结论是"真、但需要各自的一批"）：
+
+| 来源 | 位置 | 判定 | 为什么不在这一批 |
+|---|---|---|---|
+| ai | `llm.zig:148/185/215/241`、`mcp.zig:84/158`、`business.zig:168/286`、`admin.zig:222-224`、`actions.zig:180/328`、`approval_api.zig:154` | **真**：LLM/JSON-RPC 返回的 union 字段被直接取（`.string`/`.integer`/`.bool`）或 `@intCast`/`@intFromFloat` 无范围检查 → 类型不符或越界即 panic。审批/风控/质量门因此可能崩而不是"安全回退" | 这是一**类**修法（统一的取值助手 + 默认回退），且落在安全边界上，行为要逐处定（approve/deny 的默认方向不能猜） |
+| ai | `trigger.zig:107-111` | **真**：`registerCron` 失败路径对已入表的 `c` 再 `destroy`（双释放/UAF） | 小，下一批即可 |
+| ai | `provider.zig:937/949`、`cooldown_store.zig:227/321`、`recon/memory/agent/diagnose` 的 OOM 泄漏、手拼 JSON 未转义 | 真（P2 级） | 批量收尾 |
+| Server.zig | `3717+3762`：**streaming 响应返回后连接被复用**，10 s 后把 408 响应写进未终止的 SSE/chunked 响应体 | **真**（这是本轮最重的 P1） | 要动 keep-alive 决策与 streaming 生命周期，必须配 e2e（会返回的 SSE handler 就是仓库自带示例的写法） |
+| Server.zig | `3359`：`arena.reset(.retain_capacity)` 在该 Zig 版本等于"整块保留"，一次 8 MB POST 后该连接常驻峰值，`max_connections` 默认不限 | **真**（语义已核） | 改 `.free_all` 或给 arena 设上限会影响热路径分配行为，要带 benchmark |
+| Http2Server | `1581/1596`：`header_block` 从不清空 → trailers/游离 CONTINUATION 触发**二次解码 + HPACK 动态表分叉** | **真**（协议级） | 要补 HPACK/流语义测试 |
+| WebSocket | `1015` vs `755`：`sendPong`/`writeFrame` 不取 `write_mutex`，与 `broadcast` 并发写同 socket（半帧交叠） | **真** | 需要并发测试（与第 58 批的写预算同域） |
+| Http2Server / ws_uring | PADDED 未处理、`max_frames` 耗尽不发 GOAWAY、stream 0 的 DATA 静默吞、ws_uring 的 fd 0 事件被丢 / `start()` 重复调用无 guard / 交接时丢 `StreamReader` 已缓冲字节 | 真（P2，多为协议宽松与边界） | 各自小批 |
+
 ### 第 69 批：第 67 批队列里的两条（sqlx arena 归位、RESP 递归/体积上界）（**破坏性：否**）
 
 **① `sqlx mysqlReadRowsAfterQuery` 的 arena 在错误路径整段泄漏。** 它按值收 `ArenaAllocator`，

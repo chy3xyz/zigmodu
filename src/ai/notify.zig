@@ -147,14 +147,17 @@ pub fn registerNotifySkills(registry: *SkillRegistry) !void {
                 if (!allowed) return error.ChannelNotAllowed;
 
                 // Find the named channel; deliver to it only.
-                const named = blk: {
-                    var list = std.ArrayList(NotificationChannel).empty;
-                    defer list.deinit(sctx.allocator);
-                    for (nc.hub.channels) |c| {
-                        if (std.mem.eql(u8, c.name, ch_v.string)) try list.append(sctx.allocator, c);
-                    }
-                    break :blk list.items;
-                };
+                //
+                // The filtered list is declared *outside* the block on purpose: with
+                // it inside, the `defer` freed the buffer at block exit while the
+                // slice it returned was then walked by `deliver` — a use-after-free
+                // on the ordinary path (the agent names a channel, the filter
+                // matches, so the list is not empty).
+                var named = std.ArrayList(NotificationChannel).empty;
+                defer named.deinit(sctx.allocator);
+                for (nc.hub.channels) |c| {
+                    if (std.mem.eql(u8, c.name, ch_v.string)) try named.append(sctx.allocator, c);
+                }
 
                 const payload = try std.fmt.allocPrint(
                     sctx.allocator,
@@ -164,7 +167,7 @@ pub fn registerNotifySkills(registry: *SkillRegistry) !void {
                 defer sctx.allocator.free(payload);
 
                 const saved_channels = nc.hub.channels;
-                nc.hub.channels = named;
+                nc.hub.channels = named.items;
                 defer nc.hub.channels = saved_channels;
                 const report = try nc.hub.deliver(sctx.allocator, sctx, payload);
 

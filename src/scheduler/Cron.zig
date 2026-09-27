@@ -85,6 +85,10 @@ fn parseField(part: []const u8, target: []bool, max: u8) !void {
             const base = s[0..slash];
             const step_str = s[slash + 1 ..];
             const step = std.fmt.parseInt(u8, step_str, 10) catch return error.InvalidCronExpr;
+            // Both of these come from the expression text, which is caller- (and, via
+            // the agent's `schedule_job`, model-) supplied: `*/0` spun `i += 0`
+            // forever, and a range end past `max` indexed straight past `target`.
+            if (step == 0) return error.InvalidCronExpr;
             if (std.mem.eql(u8, base, "*")) {
                 var i: u8 = 0;
                 while (i <= max) : (i += step) target[i] = true;
@@ -98,6 +102,7 @@ fn parseField(part: []const u8, target: []bool, max: u8) !void {
             const end_str = s[dash + 1 ..];
             const start = std.fmt.parseInt(u8, start_str, 10) catch return error.InvalidCronExpr;
             const end = std.fmt.parseInt(u8, end_str, 10) catch return error.InvalidCronExpr;
+            if (end > max) return error.InvalidCronExpr;
             var i = start;
             while (i <= end) : (i += 1) target[i] = true;
         } else {
@@ -363,6 +368,23 @@ test "cron parse range" {
     try std.testing.expect(expr.hours[9]);
     try std.testing.expect(expr.hours[17]);
     try std.testing.expect(!expr.hours[8]);
+}
+
+test "cron parse refuses a zero step and an out-of-range endpoint" {
+    // Both fields are text the caller (or, through the agent's `schedule_job`
+    // tool, the model) writes: `*/0` made the fill loop spin on `i += 0` forever,
+    // and `0-200` indexed `target[60..200]` on a 60-entry array — a hang and a
+    // panic, neither of them reachable as an error before the guards.
+    try std.testing.expectError(error.InvalidCronExpr, Expression.parse("*/0 * * * *"));
+    try std.testing.expectError(error.InvalidCronExpr, Expression.parse("0-200 * * * *"));
+    try std.testing.expectError(error.InvalidCronExpr, Expression.parse("0 0 0 0 0-99"));
+
+    // The boundary itself is still accepted.
+    const ok = try Expression.parse("0-59 * * * *");
+    try std.testing.expect(ok.minutes[0] and ok.minutes[59]);
+    // (A *range* with a step is not part of this parser's grammar — the base must
+    // be `*` or a single number — so it keeps failing as it always did.)
+    try std.testing.expectError(error.InvalidCronExpr, Expression.parse("10-50/10 * * * *"));
 }
 
 test "scheduler tick fires a matching job once per minute" {
