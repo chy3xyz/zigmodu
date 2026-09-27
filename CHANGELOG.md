@@ -2,6 +2,63 @@
 
 ## [Unreleased]
 
+### 第 86 批：`zmodu` 的一个 OOM 双释放；§12.16 那条 flake 查清（是测试本身在快照一个活的环）（**破坏性：否**）
+
+1. **`tools/zmodu/src/audit.zig` `parseArgs`：`free(dir_owned); dir_owned = try dupe(...)`。** 那条
+   `errdefer allocator.free(dir_owned)` 在 dupe 失败时抓的是**已释放**的指针 —— OOM 下双释放。
+   改成先 dupe 到 `next`、成功后再 free 旧的、最后赋值。红/绿：`tools/zmodu` 的 `zig build test`
+   在旧写法下 `98 pass, 1 crash`（崩在 `errdefer allocator.free(dir_owned)` 那一行），修后 99/99。
+   新增一条 `checkAllAllocationFailures` 扫描（两个位置参数强制走替换分支）。
+
+2. **§12.16 那条"连续两批在全量里红"的 flake，查清了，而且结论和最初的猜测都不一样。**
+
+   先把最初那条报告出来的失败钉死：`error.WaitTimeout`（`runtime.zig:7413`）**一千次直接跑 + 一千次
+   带 20 个 CPU 自旋 + ~9000 次六路并行 + 一次全量，一次都没复现**；每次 `claim_misses=0`、
+   `push_failures=0`。所以**没有任何证据**支持"调度器真的饿死了一个 worker"。
+
+   真正复现的是**同一条测试的另一个断言**：`expected 0, found 1`（`runtime.zig:7516`，
+   `expectEqual(0, pool.ready_len)`）。频率：空载 1/1000、20 个自旋下 3/1000、六路并行 ~9000 次里
+   15 次。失败时那些跑基本是健康的（`sent == received`，两个探针各 3000/3000 全处理，
+   `handler_errors=0`），所以那个多出来的 token 后面**没有消息**。
+
+   机制（有证据，不是推断）：`Handle.send` 是**先发布消息、再 announce**。消息落进一个已经在
+   drain 该 worker 的 claim 里时，会被那次 claim 取走；随后生产者的 announce 发现 `queued` 已清，
+   于是推了一个**后面什么都没有**的 token（`scheduler.zig` 的 `announce`）。这个 token 无害 ——
+   下一轮跑到该 worker 发现没消息就把 claim 还回去、不重新 arm —— 但它要**下一次 poll** 才被
+   排掉，于是在 joins 之后立刻读 `poolStats()` 的那一瞬可能看到 `ready_len == 1`。
+
+   结论：**测试缺陷**（在快照一个活的环），既不是"预算太紧"也不是饿死。修法是加一个
+   `PoolSettled` 探针（`claimed == 0 and ready_len == 0`）并在快照前等它 —— 与既有的
+   `PoolUnclaimed` 同一套纪律；**卡住的** token 永远到不了零，所以断言没有被削弱。
+   （那条测试自身只加了这一处等待，其余断言一字未动；60 s 的 `observation_budget_ms` 也没动。）
+
+   顺带两个只有好处的东西：(a) 探针循环失败时打一行 `reportStalledProbe`，把"丢了唤醒"
+   （mailbox 非空 + `queued=false` + `ready_len=0`）与"只是调度迟"（`queued`/token 在）分开 ——
+   万一最初那条 WaitTimeout 真的回来，输出直接告诉你是哪一类；(b) `scheduler.zig` 加了一条
+   **确定性**测试钉住上面那个"announce 在消息被消费之后到达"的机制。
+
+   读数：全量 `-Ddb=all` → **2127/2185 passed · 58 skipped · 0 failed**；`tools/zmodu` 99/99。
+
+### 第 85 批：18 处警告级命中全修 + 规则加宽 + 六个前缀 promote 为强制（**破坏性：否**）
+
+（上一条提交的 commit message 完整，这里补上条目。）
+
+`scripts/check-production.sh` 的 `inline-alloc` 规则：18 处警告级命中逐条核实，**没有一条是误报**
+（每处宿主函数都拿的是调用方给的 GPA/testing allocator，没有 arena）。逐处按配方修：本地值 +
+`errdefer`、append/put 放最后、守卫在移交点解除；其中 `migration.zig:74`、`CatalogPermDb.zig:63`
+**必须**用内层块作用域的守卫 —— 函数级守卫会在 `toOwnedSlice`/`defer` 已经接住该项之后仍然 armed，
+反成双释放。修完把 `src/core`、`src/http`、`src/messaging`、`src/migration`、`src/security`、
+`tools/zmodu/src` 六个前缀一起 promote 进 `INLINE_ALLOC_ENFORCED` —— **警告层清零**。
+
+规则同时加宽（新增 `inline_alloc_owned`，捕 `…Owned(` 后接 `= try <allocator>.(alloc|dupe|…)` 的
+值拷贝形状）：全树命中 8 处，全是真漏，修完为 0；反面探针矩阵确认打不到 `putJsonField` /
+`appendOwnedString` / "局部变量 + append"，测试块仍被跳过。`b25` 保持窄口径。
+顺带 `src/ai/admin.zig` 三个 handler 的字符串字段改走 `skill.putJsonField`、补树级 `errdefer`。
+
+门禁红证据：`check-production: inline allocation into fallible append/put in src/core/EventLogger.zig:168 … exit=1`（撤销即 OK）。
+坑记一笔：BWK awk 里 `or` 不是关键字，`if (a(code) or b(code))` 会当字符串连接（非空串恒真），
+门禁一度把每一行都报出来；必须用 `||`。
+
 ### 第 84 批：把这个类的修复从"口诀"变成"门禁" + 生产路径剩余的收尾（**破坏性：否**）
 
 **门禁（本批的重点）：** 在 `scripts/check-production.sh`（`zig build check` 走的那个，扫

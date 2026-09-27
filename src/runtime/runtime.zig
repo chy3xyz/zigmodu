@@ -4799,6 +4799,35 @@ fn PoolUnclaimed(comptime RT: type) type {
     };
 }
 
+/// Probe: the pool has nothing left to *schedule*, not just nothing left to run
+/// — no claim held and the ready ring empty.
+///
+/// Those are two different moments, and the §12.16 fairness run is the shape
+/// that tells them apart. A producer announces **after** `mailbox.send` has
+/// published the message (`Handle.send` → `announceReady`), so a message that
+/// lands inside a claim already draining that worker is picked up by *that*
+/// claim — and the producer's announce then finds `queued` cleared, so it pushes
+/// a token with nothing behind it (scheduler.zig's `announce`; pinned by the
+/// scheduler test "a producer that announces after its message was consumed").
+/// The token is harmless — the next turn runs the worker, finds nothing, and
+/// hands the claim back without re-arming — but it is drained **one park away**
+/// (the pool's idle loop is a poll), so a `poolStats()` read taken straight
+/// after the joins can see `ready_len == 1` in a run where every message was
+/// handled (`sent == received`, and every probe's log full). Waiting on the
+/// reading the assertions take is the same discipline as `PoolUnclaimed`; a
+/// token that is *stuck* rather than merely un-drained never reaches zero, so
+/// the assertions below keep their teeth.
+fn PoolSettled(comptime RT: type) type {
+    return struct {
+        rt: *RT,
+
+        pub fn ready(self: @This()) bool {
+            const s = self.rt.poolStats() orelse return true;
+            return s.claimed == 0 and s.ready_len == 0;
+        }
+    };
+}
+
 /// Probe: an atomic *counter* another thread publishes, waiting for `>= want`.
 fn Published(comptime V: type, comptime T: type) type {
     return struct {
@@ -7276,6 +7305,39 @@ fn median3(v: [3]f64) f64 {
     return v[0] + v[1] + v[2] - lo - hi;
 }
 
+/// Printed when a probe round gives up, *before* the failure is reported: the
+/// states a stalled probe can be in want different investigations, and the
+/// failure output is the only place they can still be told apart afterwards.
+///
+/// * `mailbox != 0` with `queued == false` and `ready_len == 0` is a **lost
+///   wake-up** — the message sits in the mailbox, nothing owns the worker, and no
+///   token is coming. That is a runtime bug, and precisely the starvation this
+///   test exists to notice.
+/// * `queued == true` or `ready_len != 0` is a *scheduling* delay: the worker has
+///   an owner (or a token), so the message is late rather than lost.
+/// * `handled >= want` says the first wait was satisfied and the **round** wait
+///   expired instead — A ran no message after the round opened, so the stalled
+///   worker is the busy one, not the probe.
+fn reportStalledProbe(what: []const u8, h: anytype, log: *LatencyLog, rt: anytype, want: usize) void {
+    const pool = rt.poolStats();
+    std.debug.print(
+        "[§12.16 stall] {s}: waited for handled >= {d} (it is {d}); worker queued={} claimed={} mailbox={d}; pool ready_len={d} claimed={d} dispatches={d} idle_waits={d} push_failures={d}\n",
+        .{
+            what,
+            want,
+            log.observed(),
+            h.queued.load(.acquire),
+            h.claimed.load(.acquire),
+            h.mailbox.len(),
+            if (pool) |p| p.ready_len else 0,
+            if (pool) |p| p.claimed else 0,
+            if (pool) |p| p.dispatches else 0,
+            if (pool) |p| p.idle_waits else 0,
+            if (pool) |p| p.ready_push_failures else 0,
+        },
+    );
+}
+
 test "Pooled (§12.16): a continuously busy worker starves nobody — the wait is one batch of its messages" {
     const allocator = std.testing.allocator;
     // Probe messages *per channel*: 2 × this, one at a time, while the busy
@@ -7417,11 +7479,17 @@ test "Pooled (§12.16): a continuously busy worker starves nobody — the wait i
     };
 
     for (0..probes) |k| {
-        ran[k] = try Probes.once(b, &b_log, witness[0..probes], k, &round, opened, k, &refused);
+        ran[k] = Probes.once(b, &b_log, witness[0..probes], k, &round, opened, k, &refused) catch |err| {
+            reportStalledProbe("B", b, &b_log, &rt, k + 1);
+            return err;
+        };
     }
     const a_after_b = a_log.observed();
     for (0..probes) |k| {
-        ran[probes + k] = try Probes.once(c, &c_log, witness[probes..], k, &round, opened, probes + k, &refused);
+        ran[probes + k] = Probes.once(c, &c_log, witness[probes..], k, &round, opened, probes + k, &refused) catch |err| {
+            reportStalledProbe("C", c, &c_log, &rt, k + 1);
+            return err;
+        };
     }
     const a_after_probes = a_log.observed();
 
@@ -7434,6 +7502,11 @@ test "Pooled (§12.16): a continuously busy worker starves nobody — the wait i
     b.join();
     c.stop();
     c.join();
+
+    // The joins say nothing is left to *run*; the ring is a later moment than
+    // that (`PoolSettled` has the mechanism), so wait for the reading the
+    // assertions below take instead of snapshotting it.
+    try waitUntil(PoolSettled(@TypeOf(rt)){ .rt = &rt }, observation_budget_ms);
 
     const pool = rt.poolStats().?;
     const stats = rt.stats();

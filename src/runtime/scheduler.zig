@@ -982,6 +982,43 @@ test "scheduler: a message arriving as the batch ends is never lost" {
     try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, fake.handled[0..2]);
 }
 
+test "scheduler: a producer that announces after its message was consumed leaves a token with nothing behind it" {
+    // The other half of the hand-off, and the reason "a token is in the ring" is
+    // weaker than "work is waiting": `Handle.send` publishes the message and only
+    // *then* announces, so a producer whose message a claim already running the
+    // worker picked up announces into a mailbox that is empty again. The announce
+    // finds `queued` cleared by the hand-back and pushes anyway — a token for
+    // nothing. It is legal and harmless (the next turn runs the worker, finds
+    // nothing, hands the claim back and does not re-arm), but it means the ring
+    // is settled only one turn after the last producer, not at the last
+    // `join` — which is what the §12.16 fairness test's `ready_len` assertion
+    // was snapshotting (`PoolSettled` in runtime.zig has the reading).
+    var sched = try testScheduler(.{ .max_pooled_workers = 1 });
+    defer sched.deinit();
+
+    var fake = FakeWorker{};
+    fake.scheduler = sched;
+    fake.produce(1);
+
+    // The claim runs the message and hands the worker back with the mailbox
+    // empty: no re-arm, because there is nothing to arm for.
+    try std.testing.expect(sched.step());
+    try std.testing.expectEqual(@as(usize, 1), fake.handled_len);
+    try std.testing.expectEqual(@as(usize, 0), sched.readyLen());
+
+    // ...and only now does the producer's announce run (it was behind the
+    // mailbox's own bookkeeping): `queued` is clear, so it wins the bit and
+    // pushes for a message that no longer exists.
+    announce(fake.ready());
+    try std.testing.expectEqual(@as(usize, 1), sched.readyLen());
+
+    // The next turn buys an empty dispatch, not a delivery: nothing is lost, and
+    // the ring is empty afterwards.
+    try std.testing.expect(sched.step());
+    try std.testing.expectEqual(@as(usize, 1), fake.handled_len);
+    try std.testing.expectEqual(@as(usize, 0), sched.readyLen());
+}
+
 // ─────────────────────────────────────────────────
 // The dequeue window, and the token it must not eat
 // ─────────────────────────────────────────────────

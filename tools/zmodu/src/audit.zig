@@ -250,8 +250,12 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli {
         } else if (arg.len > 0 and arg[0] == '-') {
             return error.CliUsage;
         } else {
+            // dupe first: if this fails `dir_owned` still owns the old buffer, so
+            // the `errdefer` above frees exactly one live pointer (free-then-try
+            // would double-free on OOM and leave `dir_owned` dangling).
+            const next = try allocator.dupe(u8, arg);
             allocator.free(dir_owned);
-            dir_owned = try allocator.dupe(u8, arg);
+            dir_owned = next;
         }
     }
     cli.dir = dir_owned;
@@ -2727,4 +2731,20 @@ test "audit b25 flags inline allocations handed to a fallible append/put" {
         if (std.mem.eql(u8, v.rule, "b25")) b25 += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), b25);
+}
+
+test "audit parseArgs: OOM replacing the positional dir frees exactly one pointer" {
+    // Two positional args force the free-and-replace branch; failing the second
+    // dupe is the case where a free-then-try sequence double-frees the dir and
+    // leaves the errdefer holding a dangling pointer.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn check(allocator: std.mem.Allocator) !void {
+            const cli = try parseArgs(allocator, &.{ "src", "lib" });
+            defer {
+                allocator.free(cli.dir);
+                allocator.free(cli.base_modules);
+            }
+            try std.testing.expectEqualStrings("lib", cli.dir);
+        }
+    }.check, .{});
 }
