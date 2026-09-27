@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+### 第 90 批：把"测试有没有真的在跑"变成门禁 —— 顺带在框架侧量出 13 条从未运行的测试和一个真漏（**破坏性：否**）
+
+上一批靠手动 `_ = @import(...)` 捞回 16 条从未运行过的测试。这一批把它做成**不可能忘**：
+
+* **机制选的是"数出来的"，不是"猜导入图"**：`builtin.test_functions` 就是 runner 迭代的那个列表，
+  每个 FQN 以声明文件的路径开头（`core/Time.zig` → `core.Time.…`）。门禁走进目录树，按文件文本数
+  `test` 声明数、按文件数收集到的名字，二者不一致就**点名报出文件**；另外还核对"收集到但没声明"
+  与总数是否吻合（计数器不能悄悄漂移）。选它的原因有实测支撑：文本可达性在两个同形边上给出相反
+  答案（`incremental.zig` 被 import 且被使用，测试不收集；`orm_tpl.zig` 一模一样的位置，测试**收
+  集到了**），所以"import 图"这条路对这个门禁要抓的 case 是错的。
+* 新增 `src/test/TestCollection.zig`（机制本体，做成 build module，CLI 与框架共用）+
+  `scripts/check-test-collection.sh`（核对 `other_artifacts` 里的每条声明在那个包的 `build.zig` 里
+  真是 `b.path(...)` 编译根 —— 排除项不能变成藏文件的地方）+ CI 一步 + `AGENTS.md` 一行。
+* 红/绿（放一个没人 import 的探针文件即红，点名它；删掉即绿）：见提交信息里的逐字输出。另外把
+  那九行 `_ = @import(…)` 全撤掉能复现历史状态，门禁一次点名 **8 个文件、123 声明 vs 77 收集**。
+
+**框架侧（`src/**`）也已量过，但故意没有落地** —— 它会当场红，要落地就得先修它找到的东西：
+
+* **13 条从未跑过的测试**：`src/security/PathSanitizer.zig` 6 条、`src/util/csv.zig` 5 条、
+  `src/redis/RateLimiter.zig` 2 条（都不在 `tests.zig` 的聚合清单里）。
+* **一个真的生产泄漏**（因为把 csv 的测试跑起来才暴露）：`zig test src/util/csv.zig` →
+  `2 tests leaked memory`，栈在 `Reader.readAll`：`src/util/csv.zig:86` 的
+  `_ = try self.readHeader();` 把那个 owned row 丢了。
+* 合法的排除项：`log_level.zig`(3) / `runtime_stress.zig`(1) / `soak.zig`(2) / `soak_cluster.zig`(1)
+  —— 各自是另一个 build step 的编译根。
+* 落地配方（约 4 处编辑 + 一次全量）：`src/tests.zig` 的调用点（`.root_candidates = &.{"src"}`、
+  `.marker = "root.zig"` + 上面的排除项）、把三个文件加进聚合测试、修 csv 的 header 泄漏、把框架
+  那一行加进脚本的 `GATES`。
+
+读数：全量 `-Ddb=all` → **2162/2220 passed · 58 skipped · 0 failed**；`tools/zmodu` **137/137**；
+`check-production` / `check-deadcode` / `fmt` 全 OK。
+
 ### 第 89 批：两个"静默不跑"的测试文件打开（+10 条）；第 87 批撤销的三处重做并验证（**破坏性：否**）
 
 1. **测试收集盲区再补两个**：`tools/zmodu/src/main.zig` 的 `cli submodule coverage gates` 测试里

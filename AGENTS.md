@@ -32,6 +32,7 @@
 | 外部反馈核实与处置 | `docs/ISSUES_FROM_ZAPI.md` · `docs/ISSUES_FROM_ZIGSHOP.md` |
 | CLI 生成 | `docs/ZMODU_CLI_INTEGRATION.md` · `zig build zmodu -- scaffold …`（**必须从仓库根跑**，见下方"两个 zmodu 入口"） |
 | 只跑一个/一组测试、filter 为什么不能瞎用 | 本文 §Testing「只跑匹配的测试」+ `scripts/test-fast.sh --help` |
+| 「某个文件的测试根本没被收集」（绿着跑了个空） | `src/test/TestCollection.zig`（闸门本体，按 `builtin.test_functions` 对账）+ `scripts/check-test-collection.sh`（排除项是否真是别的 build step 的编译根 + 强制重跑；`zig build test` 缓存重放不会执行它） |
 | LLM 对话模块（产品功能） | `docs/AI.md`（**不是** agent 指南） |
 | AI 业务接入（KeyManager/Agent/Workflow/Skill/接入） | `docs/AI_DEV_GUIDE.md` + `docs/AI_SKILLS.md` + `docs/LLM_POLICIES.md` |
 

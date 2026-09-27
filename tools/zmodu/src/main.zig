@@ -39,6 +39,7 @@ const runtime_mod = @import("runtime.zig");
 const ci_mod = @import("ci.zig");
 const saas_mod = @import("saas.zig");
 const market_mod = @import("market.zig");
+const test_collection = @import("test_collection");
 
 // ==== §1  Options & CLI helpers ====
 
@@ -968,6 +969,29 @@ test "cli submodule coverage gates (saas + market + audit + doctor + verify)" {
     // 10 tests (server + protocol types) were never collected.
     _ = @import("mcp_server.zig");
     _ = @import("mcp_types.zig");
+}
+
+/// Source files under `tools/zmodu/src/` whose tests are compiled by the *other*
+/// test artifacts `tools/zmodu/build.zig` declares — they are legitimately absent
+/// from this binary. Every entry is checked against build.zig by
+/// `scripts/check-test-collection.sh`, so the list cannot be used to silence a
+/// file whose tests nothing runs.
+const tests_in_other_artifacts = [_][]const u8{
+    "deadcode/analyze.zig", // addTest in tools/zmodu/build.zig
+    "deadcode/scanner.zig", // addTest in tools/zmodu/build.zig
+};
+
+// The gate that keeps the list above honest: the coverage-gates test is a manual
+// list, and this is what makes forgetting an entry a build failure instead of a
+// green suite that ran nothing. See src/test/TestCollection.zig for the
+// mechanism and its limits.
+test "test-collection gate: every source file with tests is collected" {
+    try test_collection.assertAllCollected(std.testing.io, std.testing.allocator, .{
+        .label = "tools/zmodu/src",
+        .root_candidates = &.{ "tools/zmodu/src", "src" },
+        .marker = "main.zig",
+        .other_artifacts = &tests_in_other_artifacts,
+    });
 }
 
 fn cmdVerify(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {

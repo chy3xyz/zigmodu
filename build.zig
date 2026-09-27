@@ -292,6 +292,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     zmodu_cli_mod.addImport("module_graph", cli_graph_mod);
+    // Test-collection gate (src/test/TestCollection.zig). Shared as a module so
+    // the CLI and the framework run one implementation of the check — the CLI
+    // tests the same tree shape in `cd tools/zmodu && zig build test`.
+    const cli_test_collection_mod = b.createModule(.{
+        .root_source_file = b.path("src/test/TestCollection.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zmodu_cli_mod.addImport("test_collection", cli_test_collection_mod);
     const zmodu_cli_exe = b.addExecutable(.{
         .name = "zmodu",
         .root_module = zmodu_cli_mod,

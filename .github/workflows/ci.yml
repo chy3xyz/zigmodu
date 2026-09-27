@@ -232,6 +232,16 @@ jobs:
         # above: fixtures that must fail/succeed, asserted by compiling them.
         run: bash scripts/check-pool-guard.sh
 
+      - name: Test-collection gate
+        # A file whose tests the compiler never collects is a green suite that
+        # ran nothing (16 such tests plus a deliberate `expect(false)` in this
+        # repo's history). The gate compares each file's declarations against
+        # `builtin.test_functions` and runs *inside* the test artifacts — so it
+        # needs the `Run tests` step's cold compile to see every file, and this
+        # forced re-run is what makes a newly added, imported-by-nobody file fail
+        # here. See src/test/TestCollection.zig.
+        run: bash scripts/check-test-collection.sh
+
       - name: Build framework examples
         # Keep this list identical to the `Build all examples` step of the
         # `examples` job below — the two drifted once (zent-modulith was built
