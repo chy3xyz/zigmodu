@@ -348,6 +348,20 @@ pub const Context = struct {
     stream: ?std.Io.net.Stream = null,
     io: ?std.Io = null,
     streaming: bool = false,
+    /// Set by `endStream` — i.e. "this streaming response is complete". It exists
+    /// because `streaming` alone cannot tell the two cases apart after a handler
+    /// returns: a chunked response that ended is a finished message on a reusable
+    /// connection, while one that never ended has left the message open (and an SSE
+    /// stream — raw event bytes, no transfer coding — only ever ends at EOF).
+    /// Without the distinction the connection was reused either way, so the next
+    /// response (or the keep-alive timeout's 408) was written into the previous,
+    /// unterminated body.
+    /// Set by `startChunked` — i.e. "this stream carries `Transfer-Encoding:
+    /// chunked`". An SSE stream does not: `http.sse` writes raw event bytes with no
+    /// transfer coding, so its message ends at EOF and writing a chunk terminator
+    /// into it would be body corruption.
+    chunked_framing: bool = false,
+    stream_ended: bool = false,
     upgraded: bool = false,
     /// Send bound for the writes this context makes *itself* — the streaming
     /// ones (`flushHeadersToSocket`, `writeChunk`, `endStream`) and, through
@@ -863,6 +877,7 @@ pub const Context = struct {
         try self.setHeader("Content-Type", content_type);
         self.responded = true;
         self.streaming = true;
+        self.chunked_framing = true;
         // Flush status line + headers to socket immediately
         if (self.stream != null and self.io != null) {
             try self.flushHeadersToSocket();
@@ -919,6 +934,10 @@ pub const Context = struct {
     /// rest of it (RFC 9112 §6.3: a response to `HEAD` ends at the first empty
     /// line after the field section, whatever the framing fields say).
     pub fn endStream(self: *Context) !void {
+        // Recorded before the `HEAD` early-return on purpose: a response to `HEAD`
+        // is complete at its field section (RFC 9112 §6.3), so the connection is
+        // reusable in both cases.
+        self.stream_ended = true;
         if (self.method == .HEAD) return;
         if (self.stream != null and self.io != null) {
             var write_buf: [16]u8 = undefined;
@@ -3759,6 +3778,25 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
             };
         }
 
+        // A streaming response that never called `endStream` leaves the message
+        // open — and `writeResponse` above is skipped for it, so the bytes already
+        // on the wire are all the client has. Reusing this connection would write
+        // the *next* response (or the keep-alive timeout's 408) straight into that
+        // body; the client parses it as trailing chunk data or as more SSE events.
+        // Finish the message for a chunked stream, then end the connection: an SSE
+        // stream has no transfer coding at all, so EOF is what ends it.
+        // A `HEAD` response is complete at its field section (RFC 9112 §6.3) even
+        // on a streaming route: nothing follows it, so that connection stays
+        // reusable — `Sse.zig`'s HEAD test pins exactly that, pipelining a GET
+        // behind it.
+        if (ctx.streaming and !ctx.stream_ended and ctx.method != .HEAD) {
+            // Only a chunked stream has a terminator to send; an SSE stream ends at
+            // EOF (writing `0\r\n\r\n` there would corrupt the event body). Either
+            // way the connection ends here rather than being reused.
+            if (ctx.chunked_framing) ctx.endStream() catch |err| std.log.debug("[Server] failed to terminate a streaming response: {}", .{err});
+            return;
+        }
+
         // Keep-alive decision: default keep-alive unless Connection: close
         if (ctx.headers.get("connection")) |conn_val| {
             if (std.ascii.eqlIgnoreCase(conn_val, "close")) return;
@@ -5378,6 +5416,80 @@ fn chunkedFlood(ctx: *Context) anyerror!void {
         };
     }
     ctx.endStream() catch |err| std.log.debug("[test] flooding handler's endStream failed: {s}", .{@errorName(err)});
+}
+
+/// A streaming handler that writes one chunk and returns *without* `endStream` —
+/// the shape every SSE handler has (raw event bytes, no transfer coding) and the
+/// shape a chunked handler has when it forgets to finish.
+fn unfinishedStreamHandler(ctx: *Context) anyerror!void {
+    try ctx.startChunked(200, "text/plain");
+    try ctx.writeChunk("half");
+}
+
+test "a streaming response that never ended is terminated and the connection closed" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{
+        .port = 0,
+        // Short, so the *old* behaviour — reuse the connection, then let the
+        // keep-alive timeout write a 408 into the body still open on it — shows up
+        // inside this test's read budget instead of after ten seconds.
+        .header_timeout_ms = 200,
+        .response_write_timeout_ms = 1000,
+    });
+    defer server.deinit();
+    var group = server.group("");
+    try group.get("unfinished", unfinishedStreamHandler, null);
+
+    var running = try TestServer.start(&server);
+    var joined = false;
+    defer if (!joined) {
+        server.stop();
+        running.thread.join();
+    };
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", running.port);
+    var stream = try addr.connect(std.testing.io, .{ .mode = .stream });
+    var closed_client = false;
+    defer if (!closed_client) stream.close(std.testing.io);
+
+    var wbuf: [256]u8 = undefined;
+    var w = stream.writer(std.testing.io, &wbuf);
+    try w.interface.writeAll("GET /unfinished HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try w.interface.flush();
+
+    var reply: [4096]u8 = undefined;
+    var total: usize = 0;
+    var eof = false;
+    var waited_ms: usize = 0;
+    while (waited_ms < 3000) : (waited_ms += 10) {
+        var fds = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&fds, 20) catch break;
+        if (ready == 0) continue;
+        const n = std.posix.read(stream.socket.handle, reply[total..]) catch break;
+        if (n == 0) {
+            eof = true;
+            break;
+        }
+        total += n;
+        if (total == reply.len) break;
+    }
+    stream.close(std.testing.io);
+    closed_client = true;
+    server.stop();
+    running.thread.join();
+    joined = true;
+
+    const got = reply[0..total];
+    // `half` is four bytes, so the chunk header is the hex length: `4\r\nhalf\r\n`.
+    try std.testing.expect(std.mem.indexOf(u8, got, "4\r\nhalf\r\n") != null);
+    // The framework finished the message the handler left open …
+    try std.testing.expect(std.mem.endsWith(u8, got, "0\r\n\r\n"));
+    // … and ended the connection there: exactly one response, and no keep-alive
+    // timeout's 408 written into the unfinished body behind it.
+    try std.testing.expect(eof);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "HTTP/1.1 "));
 }
 
 /// The shared body of the streaming tests: a server whose write budget is

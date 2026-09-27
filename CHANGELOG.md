@@ -2,6 +2,52 @@
 
 ## [Unreleased]
 
+### 第 71 批：streaming 响应没结束时连接被复用 —— 下一个响应（或 keep-alive 的 408）被写进未终止的响应体（**破坏性：否**）
+
+来源是第 70 批在 `Server.zig` 请求路径上翻出的那条 P1。**动手前核实了**：`ctx.streaming = true`
+的两条路径 —— `startChunked`（chunked）与 `Sse.zig:85`（`http.sse`，**裸事件字节、没有传输编码、
+只以 EOF 结束**）—— 都会走到 `connFiber` 里这一句：
+
+```zig
+if (ctx.responded and !ctx.streaming) { writeResponse(...) }   // streaming 时整段跳过
+...
+if (ctx.headers.get("connection")) |conn_val| { ... }          // keep-alive 只看**请求**头
+```
+
+于是 `streaming` 为真时框架不再写任何东西，而连接**照旧被复用**。后果分两种形状：
+
+* **handler 忘了 `endStream()`**（或中途出错返回）：chunked 体没有 `0\r\n\r\n` 终止，客户端把
+  之后的字节当成 chunk 数据 —— 而 `header_timeout_ms`（默认 10 s）到点后，
+  `writeErrorResponse(408, ...)` 会把**一整份 HTTP/1.1 408 响应写进上一条响应体**。
+  仓库自带的 SSE 示例（`examples/zent-modulith/.../catalog/api.zig`：`sendEvent` + `done()` 后
+  return）就是这条路径 —— SSE 亦然，它只有 EOF 能结束。
+* 正常结束的 chunked 响应（调了 `endStream`）本来可以复用连接，却和上面那种情况**无法区分**。
+
+**修法**：加一个 `Context.stream_ended`，由 `endStream()` 置位（在 `HEAD` 早退**之前**置 ——
+HEAD 的响应在字段段就完整了）；`connFiber` 在 handler 返回后、keep-alive 决策之前判定：
+
+```zig
+if (ctx.streaming and !ctx.stream_ended) {
+    if (ctx.method != .HEAD) ctx.endStream() catch |err| std.log.debug(...);
+    return;      // 消息由框架补上终止符，然后关连接 —— 换一条连接去服务下一个请求
+}
+```
+
+最终的规则（两处细节是被既有测试逼出来的，值得记下）：
+
+* **只对 chunked 补终止符**：初次实现对所有 streaming 都补 `0\r\n\r\n` —— `http.Sse` 是**裸事件字节、
+  没有传输编码**，补进去就是往事件体里写垃圾（`Sse.zig` 的 HEAD 测试立刻红）。所以新增
+  `Context.chunked_framing`（`startChunked` 置位），只对它补终止符。
+* **`HEAD` 不受这条守卫影响**：`HEAD` 的响应在字段段就完整（RFC 9112 §6.3），连接照旧可复用 ——
+  那条测试把「HEAD 之后再管道一个 GET」钉死了，第一次实现把它也关了，于是第二个响应没被答。
+* 其余（GET + 未结束的 chunked / SSE）→ 补终止符（仅 chunked）+ **关连接**；已 `endStream` 的
+  照旧复用（快路径没牺牲）。
+
+**红证据（实测）**：测试 `a streaming response that never ended is terminated and the connection
+closed` —— 一个只写一个 chunk 就 return 的 handler，客户端断言「收到 `4\r\nhalf\r\n`、以
+`0\r\n\r\n` 结尾、连接在 EOF 处结束、整段回复里只有**一个** `HTTP/1.1`」。把守卫拿掉（回到修前形状）
+它立刻 FAIL，加回即 OK。
+
 ### 第 70 批：第三轮复核换面（`src/ai/**`、`Server.zig` 请求路径、`Http2Server`/`WebSocket`/`ws_uring`）—— 修掉 **2 个 P0**，其余按核实状态入队（**破坏性：否**）
 
 读数：全量 `-Ddb=all` → **2056/2114 passed · 58 skipped · 0 failed**（223s）；`cron parse` 族 5 条全通过。
