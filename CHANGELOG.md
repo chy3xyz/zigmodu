@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+### 第 89 批：两个"静默不跑"的测试文件打开（+10 条）；第 87 批撤销的三处重做并验证（**破坏性：否**）
+
+1. **测试收集盲区再补两个**：`tools/zmodu/src/main.zig` 的 `cli submodule coverage gates` 测试里
+   加上 `_ = @import("mcp_server.zig");` / `_ = @import("mcp_types.zig");` —— 收集数
+   126 → **136**（`mcp_server` 7 条 + `mcp_types` 3 条）。**这 10 条全过**，说明那两个文件没藏 bug，
+   只是从来没有被跑过。
+2. **`Partitioner.zig`**：`routeWithBackups` 原本是**编译不过的死代码**（非 error union 里写
+   `try` + `toOwnedSlice()`，全仓库零调用点）；因为它是公开类型的一部分（`zmodu.Partitioner`，
+   `root.zig:211` 再导出），选择**修好**而不是删：签名改 `!RouteResult`、`backup_nodes` 明确自持、
+   顺手修掉"走到环尾就停"而不是绕回去的遍历错误，两处继承守卫。`addNode` 的三处**多行实参**版
+   （行式扫描器看不见的那类）改用显式 `catch |err| { free; return err; }` —— 并且**实测**了
+   "块作用域的 errdefer 在块出口就解除武装"（草稿 `/tmp` 里的例子），所以这里不能用函数级 errdefer
+   （那正是双释放）。另外把同类的死代码 `getNodes` 一并修好。三处各配一条"逐分配点扫描"。
+3. **`web4/middleware.zig`**：`presentProof` 改走新的 `putOwnedHeader`（两份拷贝先绑定、`put` 放
+   最后），配 OOM 扫描。红证据：
+   `leaked [len 7] at middleware.zig:602 presentProof` + `leaked [len 12] ×2` →
+   `1 passed; 1 leaked` → 修后 `12 passed; 0 leaked`。
+4. **`benchmark.zig`** 两个 handler 的键绑定 + `errdefer`。**它没法加测试**（`benchmark.zig` 是独立
+   可执行体的根、零测试、不在测试图里 —— 加了也永远不会跑），所以用一份与 handler 逐字相同的草稿
+   复现做证据：旧形状 `fail_index 1/8 allocated 2 freed 0 FAIL (OutOfMemory)` + `leaked [len 2]`，
+   新形状 `allocated 2 freed 2` exit 0。
+
+读数：全量 `-Ddb=all` → **2161/2219 passed · 58 skipped · 0 failed**；`tools/zmodu` **136/136**；
+`fmt` / `check-production`（警告层为零）全 OK。
+
+（两处判断留档：`routeWithBackups` 选择"修"而非"删"、以及顺手修 `getNodes` —— 都是自包含的，若想
+丢掉可以直接撤。）
+
 ### 第 88 批：`tools/zmodu` 的真漏（含"每次调用都漏"的两处）与一个**段错误级的双释放**；外加一个测试收集盲区（**破坏性：否**）
 
 1. **`main.zig` `introspectDatabaseMysql`：两处"每次调用都漏"**，不只 OOM —— `-p{pass}` 拼出来的

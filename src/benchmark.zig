@@ -1293,7 +1293,13 @@ fn benchWorkflow(allocator: std.mem.Allocator, io: std.Io, steps_count: usize, i
         .handler = struct {
             fn h(c: *zigmodu.ai.SkillContext, _: std.json.Value) anyerror!std.json.Value {
                 var o = std.json.ObjectMap{};
-                try o.put(c.allocator, try c.allocator.dupe(u8, "ok"), .{ .bool = true });
+                // Bound to a local before the `put`: inside its argument list an
+                // allocation failure leaves this copy unreachable and unfreed.
+                // `put` is the last fallible step, so the guard dies with the
+                // hand-over instead of freeing a key the map now owns.
+                const key = try c.allocator.dupe(u8, "ok");
+                errdefer c.allocator.free(key);
+                try o.put(c.allocator, key, .{ .bool = true });
                 return .{ .object = o };
             }
         }.h,
@@ -1660,7 +1666,13 @@ fn allocWorkflow(io: std.Io, steps_count: usize, iterations: usize) !AllocReadin
         .handler = struct {
             fn h(c: *zigmodu.ai.SkillContext, _: std.json.Value) anyerror!std.json.Value {
                 var o = std.json.ObjectMap{};
-                try o.put(c.allocator, try c.allocator.dupe(u8, "ok"), .{ .bool = true });
+                // Bound to a local before the `put`: inside its argument list an
+                // allocation failure leaves this copy unreachable and unfreed.
+                // `put` is the last fallible step, so the guard dies with the
+                // hand-over instead of freeing a key the map now owns.
+                const key = try c.allocator.dupe(u8, "ok");
+                errdefer c.allocator.free(key);
+                try o.put(c.allocator, key, .{ .bool = true });
                 return .{ .object = o };
             }
         }.h,

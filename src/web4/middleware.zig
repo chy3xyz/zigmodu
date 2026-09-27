@@ -596,11 +596,66 @@ test "x402Middleware still issues an invoice without an Io handle" {
     try std.testing.expect(deadline <= now + 3601);
 }
 
-/// The two headers an x402 proof arrives in. Values are owned by the context
+/// The two headers an x402 proof arrives in. Each copy is owned by the context
 /// allocator and freed with the context.
 fn presentProof(allocator: std.mem.Allocator, ctx: *api.Context, tx_hash: []const u8, invoice_id: []const u8) !void {
-    try ctx.headers.put(try allocator.dupe(u8, "x402-tx-hash"), try allocator.dupe(u8, tx_hash));
-    try ctx.headers.put(try allocator.dupe(u8, "x402-invoice-id"), try allocator.dupe(u8, invoice_id));
+    try putOwnedHeader(allocator, &ctx.headers, "x402-tx-hash", tx_hash);
+    try putOwnedHeader(allocator, &ctx.headers, "x402-invoice-id", invoice_id);
+}
+
+/// Insert a header whose name and value are copies owned by `headers`.
+///
+/// Both copies are bound to locals before the `put`: as arguments inside the
+/// call — the shape this had — an allocation failure left the first copy (and,
+/// when the map had to grow, both) allocated with nothing pointing at them. The
+/// `errdefer`s cover the two failures up to the hand-over; `put` is the last
+/// statement, so the guard cannot outlive it and free a key the map now owns.
+fn putOwnedHeader(allocator: std.mem.Allocator, headers: *std.StringHashMap([]const u8), name: []const u8, value: []const u8) !void {
+    const name_copy = try allocator.dupe(u8, name);
+    errdefer allocator.free(name_copy);
+    const value_copy = try allocator.dupe(u8, value);
+    errdefer allocator.free(value_copy);
+    try headers.put(name_copy, value_copy);
+}
+
+test "presentProof hands every header copy to the context or frees it" {
+    const base = std.testing.allocator;
+
+    // Every allocation from `Context.init` through both `putOwnedHeader` calls,
+    // in turn: an allocator that fails at index N has to leave a context whose
+    // `deinit` can still free what it owns, with nothing owned twice and nothing
+    // dropped. `base` is the testing allocator, so a copy the map refused — or a
+    // map growth that failed after both copies were made — is reported as a leak
+    // instead of hiding in a counter.
+    var failures: usize = 0;
+    var fail_index: usize = 0;
+    while (fail_index < 32) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(base, .{ .fail_index = fail_index });
+        const allocator = failing.allocator();
+
+        var ctx = api.Context.init(allocator, .GET, "/api/paid") catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            failures += 1;
+            continue;
+        };
+        presentProof(allocator, &ctx, "0xalice", "inv-1") catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            ctx.deinit();
+            failures += 1;
+            continue;
+        };
+        // Past the last allocation in the chain: both headers are in the map and
+        // the context owns them.
+        try std.testing.expectEqualStrings("0xalice", ctx.header("x402-tx-hash").?);
+        try std.testing.expectEqualStrings("inv-1", ctx.header("x402-invoice-id").?);
+        ctx.deinit();
+        break;
+    }
+
+    // Both outcomes were reached: at least one allocation was refused, and the
+    // loop ran off the end of the chain's allocations.
+    try std.testing.expect(failures > 0);
+    try std.testing.expect(fail_index < 32);
 }
 
 test "x402Middleware refuses a payment proof from a payer the invoice was not issued to" {

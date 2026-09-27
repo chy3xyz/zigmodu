@@ -964,6 +964,10 @@ test "cli submodule coverage gates (saas + market + audit + doctor + verify)" {
     // Same reason: nothing in `incremental.zig` is referenced from a test, so
     // its tests (including the manifest OOM scan) were never collected.
     _ = @import("incremental.zig");
+    // Same reason: nothing in the MCP files is referenced from a test, so their
+    // 10 tests (server + protocol types) were never collected.
+    _ = @import("mcp_server.zig");
+    _ = @import("mcp_types.zig");
 }
 
 fn cmdVerify(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
