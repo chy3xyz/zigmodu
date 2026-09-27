@@ -961,6 +961,9 @@ test "cli submodule coverage gates (saas + market + audit + doctor + verify)" {
     // Without this, verify.zig's tests are not part of the test graph at all
     // (nothing else in it is referenced from a test) and silently never run.
     _ = @import("verify.zig");
+    // Same reason: nothing in `incremental.zig` is referenced from a test, so
+    // its tests (including the manifest OOM scan) were never collected.
+    _ = @import("incremental.zig");
 }
 
 fn cmdVerify(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -2630,22 +2633,38 @@ pub fn parseSqlSchema(allocator: std.mem.Allocator, sql: []const u8) ![]TableDef
     return tables.toOwnedSlice(allocator);
 }
 
+/// Free the strings owned by one parsed column row.
+fn freeColumnDef(allocator: std.mem.Allocator, c: ColumnDef) void {
+    allocator.free(c.name);
+    if (c.comment) |cm| allocator.free(cm);
+}
+
+/// Free a slice of column rows and the strings inside it.
+fn freeColumnDefs(allocator: std.mem.Allocator, columns: []ColumnDef) void {
+    for (columns) |c| freeColumnDef(allocator, c);
+    allocator.free(columns);
+}
+
+/// Free a slice of foreign-key rows and the strings inside it.
+fn freeForeignKeyDefs(allocator: std.mem.Allocator, fks: []ForeignKey) void {
+    for (fks) |fk| {
+        allocator.free(fk.column_name);
+        allocator.free(fk.ref_table);
+        allocator.free(fk.ref_column);
+    }
+    allocator.free(fks);
+}
+
+/// Free the strings a single table row owns (not the row itself).
+fn freeTableDefContents(allocator: std.mem.Allocator, t: TableDef) void {
+    allocator.free(t.name);
+    freeColumnDefs(allocator, t.columns);
+    freeForeignKeyDefs(allocator, t.foreign_keys);
+}
+
 /// Free all memory owned by a slice of TableDefs (including internal strings).
 pub fn freeTableDefs(allocator: std.mem.Allocator, tables: []const TableDef) void {
-    for (tables) |t| {
-        allocator.free(t.name);
-        for (t.columns) |c| {
-            allocator.free(c.name);
-            if (c.comment) |cm| allocator.free(cm);
-        }
-        allocator.free(t.columns);
-        for (t.foreign_keys) |fk| {
-            allocator.free(fk.column_name);
-            allocator.free(fk.ref_table);
-            allocator.free(fk.ref_column);
-        }
-        allocator.free(t.foreign_keys);
-    }
+    for (tables) |t| freeTableDefContents(allocator, t);
     allocator.free(tables);
 }
 
@@ -3040,16 +3059,24 @@ fn introspectDatabasePostgres(io: std.Io, allocator: std.mem.Allocator, host: []
         const nullable = std.mem.eql(u8, std.mem.trim(u8, is_nullable_str, " \t"), "YES");
         const has_default = default_val != null and default_val.?.len > 0 and !std.mem.eql(u8, default_val.?, "NULL");
 
-        const table_key = try allocator.dupe(u8, table_name);
-        const gop = try col_map.getOrPut(table_key);
-        if (gop.found_existing) {
-            // getOrPut keeps the key already in the map.
-            allocator.free(table_key);
-        } else {
-            gop.value_ptr.* = .empty;
-        }
+        const gop = blk: {
+            // Same guard scoping as the other `getOrPut` keys in this file: the
+            // guard ends at the hand-over.
+            const table_key = try allocator.dupe(u8, table_name);
+            errdefer allocator.free(table_key);
+            const g = try col_map.getOrPut(table_key);
+            if (g.found_existing) {
+                // getOrPut keeps the key already in the map.
+                allocator.free(table_key);
+            } else {
+                g.value_ptr.* = .empty;
+            }
+            break :blk g;
+        };
+        const owned_name = try allocator.dupe(u8, col_name);
+        errdefer allocator.free(owned_name);
         try gop.value_ptr.append(allocator, .{
-            .name = try allocator.dupe(u8, col_name),
+            .name = owned_name,
             .col_type = col_type,
             .nullable = nullable,
             .has_default = has_default,
@@ -3125,35 +3152,97 @@ fn colsToOwned(allocator: std.mem.Allocator, cols: std.ArrayList(ColumnDef)) ![]
     return result;
 }
 
+/// `mysql` invocation arguments, owning every element — so `deinit` is a
+/// complete teardown, rather than only releasing the backing array.
+const MysqlArgv = struct {
+    args: std.ArrayList([]const u8) = .empty,
+
+    fn deinit(self: *MysqlArgv, allocator: std.mem.Allocator) void {
+        for (self.args.items) |arg| allocator.free(arg);
+        self.args.deinit(allocator);
+    }
+
+    /// Copy `arg` into the list.
+    fn push(self: *MysqlArgv, allocator: std.mem.Allocator, arg: []const u8) !void {
+        const copy = try allocator.dupe(u8, arg);
+        errdefer allocator.free(copy);
+        try self.args.append(allocator, copy);
+    }
+
+    /// Take over an allocation the caller already holds.
+    fn pushOwned(self: *MysqlArgv, allocator: std.mem.Allocator, arg: []u8) !void {
+        errdefer allocator.free(arg);
+        try self.args.append(allocator, arg);
+    }
+
+    fn clone(self: *const MysqlArgv, allocator: std.mem.Allocator) !MysqlArgv {
+        var out = MysqlArgv{};
+        errdefer out.deinit(allocator);
+        for (self.args.items) |arg| try out.push(allocator, arg);
+        return out;
+    }
+};
+
+/// Arguments for the `mysql` CLI up to and including `-e`; the query itself is
+/// appended by the caller. Every element is owned by the returned list.
+fn buildMysqlArgv(allocator: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, pass: []const u8, database: []const u8) !MysqlArgv {
+    var argv = MysqlArgv{};
+    errdefer argv.deinit(allocator);
+    try argv.push(allocator, "mysql");
+    try argv.push(allocator, "-h");
+    try argv.push(allocator, host);
+    try argv.push(allocator, "-P");
+    const port_str = try std.fmt.allocPrint(allocator, "{d}", .{port});
+    try argv.pushOwned(allocator, port_str);
+    try argv.push(allocator, "-u");
+    try argv.push(allocator, user);
+    try argv.push(allocator, "-N");
+    try argv.push(allocator, "-B");
+    if (pass.len > 0) {
+        // Built as an `append` argument this leaked on *every* call, not just on
+        // OOM: the list frees only its own backing array, so nothing ever
+        // released the formatted `-p<pass>` string.
+        const pass_arg = try std.fmt.allocPrint(allocator, "-p{s}", .{pass});
+        try argv.pushOwned(allocator, pass_arg);
+    }
+    try argv.push(allocator, database);
+    try argv.push(allocator, "-e");
+    return argv;
+}
+
 /// MySQL introspection via mysql CLI + information_schema.
 fn introspectDatabaseMysql(io: std.Io, allocator: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, pass: []const u8, database: []const u8) ![]TableDef {
-    var tables = std.ArrayList(TableDef).empty;
-
-    const port_str = try std.fmt.allocPrint(allocator, "{d}", .{port});
-    defer allocator.free(port_str);
-
-    // Build mysql args
-    var argv = std.ArrayList([]const u8).empty;
+    var argv = try buildMysqlArgv(allocator, host, port, user, pass, database);
     defer argv.deinit(allocator);
-    try argv.appendSlice(allocator, &.{ "mysql", "-h", host, "-P", port_str, "-u", user, "-N", "-B" });
-    if (pass.len > 0) {
-        try argv.append(allocator, try std.fmt.allocPrint(allocator, "-p{s}", .{pass}));
-    }
-    try argv.append(allocator, database);
-    try argv.append(allocator, "-e");
 
     // Get table list
     const table_list_query = "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE' ORDER BY table_name";
     var argv_list = try argv.clone(allocator);
     defer argv_list.deinit(allocator);
-    try argv_list.append(allocator, table_list_query);
+    try argv_list.push(allocator, table_list_query);
 
-    const list_result = try std.process.run(allocator, io, .{ .argv = argv_list.items });
+    const list_result = try std.process.run(allocator, io, .{ .argv = argv_list.args.items });
     defer allocator.free(list_result.stdout);
     defer allocator.free(list_result.stderr);
 
+    var tables = std.ArrayList(TableDef).empty;
+    // Rows already appended own their strings (the per-table lists were
+    // converted before the hand-over), so unwinding frees each row's contents
+    // plus the list's backing array.
+    errdefer {
+        for (tables.items) |t| freeTableDefContents(allocator, t);
+        tables.deinit(allocator);
+    }
+
     var table_names = std.ArrayList([]const u8).empty;
-    defer table_names.deinit(allocator);
+    // A plain `defer`, not an `errdefer`: the copies are only ever read (rows
+    // keep their own `dupe`), so the success path has to release them too. The
+    // old `defer table_names.deinit` freed the backing array and leaked every
+    // name — one per table, on every call.
+    defer {
+        for (table_names.items) |name| allocator.free(name);
+        table_names.deinit(allocator);
+    }
     var tlines = std.mem.splitScalar(u8, list_result.stdout, '\n');
     while (tlines.next()) |t| {
         const trimmed = std.mem.trim(u8, t, " \t\r");
@@ -3166,16 +3255,21 @@ fn introspectDatabaseMysql(io: std.Io, allocator: std.mem.Allocator, host: []con
 
     for (table_names.items) |tname| {
         // SHOW COLUMNS
-        const col_query = try std.fmt.allocPrint(allocator, "SHOW COLUMNS FROM `{s}`", .{tname});
-        defer allocator.free(col_query);
         var argv_col = try argv.clone(allocator);
         defer argv_col.deinit(allocator);
-        try argv_col.append(allocator, col_query);
-        const col_result = try std.process.run(allocator, io, .{ .argv = argv_col.items });
+        const col_query = try std.fmt.allocPrint(allocator, "SHOW COLUMNS FROM `{s}`", .{tname});
+        try argv_col.pushOwned(allocator, col_query);
+        const col_result = try std.process.run(allocator, io, .{ .argv = argv_col.args.items });
         defer allocator.free(col_result.stdout);
         defer allocator.free(col_result.stderr);
 
         var columns = std.ArrayList(ColumnDef).empty;
+        // Freed on the way out if the row never reaches `tables`; once
+        // `toOwnedSlice` runs the list is empty and this is a no-op.
+        errdefer {
+            for (columns.items) |c| freeColumnDef(allocator, c);
+            columns.deinit(allocator);
+        }
         var clines = std.mem.splitScalar(u8, col_result.stdout, '\n');
         while (clines.next()) |line| {
             const trimmed = std.mem.trim(u8, line, " \t\r");
@@ -3193,8 +3287,10 @@ fn introspectDatabaseMysql(io: std.Io, allocator: std.mem.Allocator, host: []con
             const is_pk = std.mem.eql(u8, std.mem.trim(u8, key_str, " \t"), "PRI");
             const has_default = default_val != null and default_val.?.len > 0 and !std.mem.eql(u8, std.mem.trim(u8, default_val.?, " \t"), "NULL");
 
+            const owned_name = try allocator.dupe(u8, col_name);
+            errdefer allocator.free(owned_name);
             try columns.append(allocator, .{
-                .name = try allocator.dupe(u8, col_name),
+                .name = owned_name,
                 .col_type = col_type,
                 .nullable = nullable,
                 .has_default = has_default,
@@ -3205,20 +3301,27 @@ fn introspectDatabaseMysql(io: std.Io, allocator: std.mem.Allocator, host: []con
         }
 
         // FK query
+        var argv_fk = try argv.clone(allocator);
+        defer argv_fk.deinit(allocator);
         const fk_query = try std.fmt.allocPrint(allocator,
             \\SELECT kcu.column_name, kcu.referenced_table_name, kcu.referenced_column_name
             \\FROM information_schema.key_column_usage kcu
             \\WHERE kcu.table_schema = DATABASE() AND kcu.table_name = '{s}' AND kcu.referenced_table_name IS NOT NULL
         , .{tname});
-        defer allocator.free(fk_query);
-        var argv_fk = try argv.clone(allocator);
-        defer argv_fk.deinit(allocator);
-        try argv_fk.append(allocator, fk_query);
-        const fk_result = try std.process.run(allocator, io, .{ .argv = argv_fk.items });
+        try argv_fk.pushOwned(allocator, fk_query);
+        const fk_result = try std.process.run(allocator, io, .{ .argv = argv_fk.args.items });
         defer allocator.free(fk_result.stdout);
         defer allocator.free(fk_result.stderr);
 
         var foreign_keys = std.ArrayList(ForeignKey).empty;
+        errdefer {
+            for (foreign_keys.items) |fk| {
+                allocator.free(fk.column_name);
+                allocator.free(fk.ref_table);
+                allocator.free(fk.ref_column);
+            }
+            foreign_keys.deinit(allocator);
+        }
         var flines = std.mem.splitScalar(u8, fk_result.stdout, '\n');
         while (flines.next()) |line| {
             const trimmed = std.mem.trim(u8, line, " \t\r");
@@ -3227,17 +3330,32 @@ fn introspectDatabaseMysql(io: std.Io, allocator: std.mem.Allocator, host: []con
             const fcol = fs.next() orelse continue;
             const rtable = fs.next() orelse continue;
             const rcol = fs.next() orelse continue;
+            const fk_col = try allocator.dupe(u8, fcol);
+            errdefer allocator.free(fk_col);
+            const fk_ref_table = try allocator.dupe(u8, rtable);
+            errdefer allocator.free(fk_ref_table);
+            const fk_ref_column = try allocator.dupe(u8, rcol);
+            errdefer allocator.free(fk_ref_column);
             try foreign_keys.append(allocator, .{
-                .column_name = try allocator.dupe(u8, fcol),
-                .ref_table = try allocator.dupe(u8, rtable),
-                .ref_column = try allocator.dupe(u8, rcol),
+                .column_name = fk_col,
+                .ref_table = fk_ref_table,
+                .ref_column = fk_ref_column,
             });
         }
 
+        // Hand the row over to `tables`. The two slices leave the loop-local
+        // lists empty, so those guards free nothing from here on; they are
+        // guarded in turn until the append takes them.
+        const cols_slice = try columns.toOwnedSlice(allocator);
+        errdefer freeColumnDefs(allocator, cols_slice);
+        const fks_slice = try foreign_keys.toOwnedSlice(allocator);
+        errdefer freeForeignKeyDefs(allocator, fks_slice);
+        const row_name = try allocator.dupe(u8, tname);
+        errdefer allocator.free(row_name);
         try tables.append(allocator, .{
-            .name = try allocator.dupe(u8, tname),
-            .columns = try columns.toOwnedSlice(allocator),
-            .foreign_keys = try foreign_keys.toOwnedSlice(allocator),
+            .name = row_name,
+            .columns = cols_slice,
+            .foreign_keys = fks_slice,
         });
     }
 
@@ -3518,14 +3636,20 @@ fn groupTablesByModule(allocator: std.mem.Allocator, tables: []const TableDef) !
     }
 
     for (tables) |table| {
-        const mod_name = try inferModuleName(allocator, table.name, prefix_len);
-        const gop = try module_map.getOrPut(mod_name);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = mod_name;
-            gop.value_ptr.* = .empty;
-        } else {
-            allocator.free(mod_name);
-        }
+        // Same shape as `detectSubsystems`' prefix key: the guard has to end at
+        // the hand-over, not with the loop body.
+        const gop = blk: {
+            const mod_name = try inferModuleName(allocator, table.name, prefix_len);
+            errdefer allocator.free(mod_name);
+            const g = try module_map.getOrPut(mod_name);
+            if (!g.found_existing) {
+                g.key_ptr.* = mod_name;
+                g.value_ptr.* = .empty;
+            } else {
+                allocator.free(mod_name);
+            }
+            break :blk g;
+        };
         try gop.value_ptr.append(allocator, table);
     }
 
@@ -3570,72 +3694,102 @@ fn detectSubsystems(allocator: std.mem.Allocator, module_map: *std.StringHashMap
     var kit = module_map.keyIterator();
     while (kit.next()) |k| try names.append(allocator, k.*);
 
-    // Group by first segment (before first '_')
-    var prefix_groups = std.StringHashMap(std.ArrayList([]const u8)).init(allocator);
-    errdefer {
-        var pit = prefix_groups.iterator();
-        while (pit.next()) |e| {
-            for (e.value_ptr.items) |n| allocator.free(n);
-            e.value_ptr.deinit(allocator);
-            allocator.free(e.key_ptr.*);
-        }
-        prefix_groups.deinit();
-    }
-    for (names.items) |name| {
-        const first_seg = if (std.mem.indexOf(u8, name, "_")) |idx|
-            name[0..idx]
-        else
-            name;
-        // Only consider as subsystem prefix if the module has an underscore (multi-word)
-        if (first_seg.len < name.len and first_seg.len > 1) {
-            const prefix_key = try allocator.dupe(u8, first_seg);
-            const gop = try prefix_groups.getOrPut(prefix_key);
-            if (gop.found_existing) {
-                // getOrPut keeps the key already in the map.
-                allocator.free(prefix_key);
-            } else {
-                gop.value_ptr.* = .empty;
-            }
-            const copy = try allocator.dupe(u8, name);
-            errdefer allocator.free(copy);
-            try gop.value_ptr.append(allocator, copy);
-        }
-    }
-
     // Subsystems: any shared prefix counts (even single-table modules get nested)
     var subsystem_map = std.StringHashMap(std.ArrayList([]const u8)).init(allocator);
-    var pit = prefix_groups.iterator();
-    while (pit.next()) |entry| {
-        if (entry.value_ptr.items.len >= 1) {
-            // This prefix IS a subsystem. Strip prefix from module names.
-            var modules = std.ArrayList([]const u8).empty;
-            for (entry.value_ptr.items) |full_name| {
-                const prefix = entry.key_ptr.*;
-                var remainder: []const u8 = full_name;
-                if (std.mem.startsWith(u8, full_name, prefix) and full_name.len > prefix.len and full_name[prefix.len] == '_') {
-                    remainder = full_name[prefix.len + 1 ..]; // strip "prefix_"
-                }
-                // Re-key the module map entry: "<module>" → "<prefix>/<module>".
-                // fetchRemove hands back the old key so it can be freed here.
-                // This runs before the copy below so the copy's guard is the last
-                // statement of the loop body: still armed at the hand-over it
-                // would free a string `modules` already owns.
-                if (module_map.fetchRemove(full_name)) |removed| {
-                    allocator.free(removed.key);
-                    const new_key = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, remainder });
-                    try module_map.put(new_key, removed.value);
-                }
-                const copy = try allocator.dupe(u8, remainder);
-                errdefer allocator.free(copy);
-                try modules.append(allocator, copy);
+    // Entries that are already in own their key and every copied name in the
+    // value list; `prefix_groups` holds *copies*, so an error below must tear
+    // this map down on its own.
+    errdefer freeSubsystemMap(allocator, &subsystem_map);
+    {
+        // Group by first segment (before first '_'). One `defer` releases every
+        // entry on both exits — the loop below deliberately does *not* free the
+        // entries it has finished with, because freeing them while iterating
+        // would leave this teardown iterating already-freed entries whenever a
+        // later iteration fails (a use-after-free the OOM scan catches).
+        var prefix_groups = std.StringHashMap(std.ArrayList([]const u8)).init(allocator);
+        defer {
+            var pit = prefix_groups.iterator();
+            while (pit.next()) |e| {
+                for (e.value_ptr.items) |n| allocator.free(n);
+                e.value_ptr.deinit(allocator);
+                allocator.free(e.key_ptr.*);
             }
-            try subsystem_map.put(try allocator.dupe(u8, entry.key_ptr.*), modules);
+            prefix_groups.deinit();
         }
-        for (entry.value_ptr.items) |n| allocator.free(n);
-        entry.value_ptr.deinit(allocator);
-        allocator.free(entry.key_ptr.*);
+        for (names.items) |name| {
+            const first_seg = if (std.mem.indexOf(u8, name, "_")) |idx|
+                name[0..idx]
+            else
+                name;
+            // Only consider as subsystem prefix if the module has an underscore (multi-word)
+            if (first_seg.len < name.len and first_seg.len > 1) {
+                const gop = blk: {
+                    // `getOrPut` is fallible, so the key is duped inside a block
+                    // that ends at the hand-over: the guard covers exactly the
+                    // refused `getOrPut` and is gone once the map owns the key (an
+                    // `errdefer` in the loop body would stay armed and double-free
+                    // it on a later failure).
+                    const prefix_key = try allocator.dupe(u8, first_seg);
+                    errdefer allocator.free(prefix_key);
+                    const g = try prefix_groups.getOrPut(prefix_key);
+                    if (g.found_existing) {
+                        // getOrPut keeps the key already in the map.
+                        allocator.free(prefix_key);
+                    } else {
+                        g.value_ptr.* = .empty;
+                    }
+                    break :blk g;
+                };
+                const copy = try allocator.dupe(u8, name);
+                errdefer allocator.free(copy);
+                try gop.value_ptr.append(allocator, copy);
+            }
+        }
+        var pit = prefix_groups.iterator();
+        while (pit.next()) |entry| {
+            if (entry.value_ptr.items.len >= 1) {
+                // This prefix IS a subsystem. Strip prefix from module names.
+                var modules = std.ArrayList([]const u8).empty;
+                // Not in `subsystem_map` yet, so it needs its own guard until the
+                // hand-over below takes it.
+                errdefer {
+                    for (modules.items) |m| allocator.free(m);
+                    modules.deinit(allocator);
+                }
+                for (entry.value_ptr.items) |full_name| {
+                    const prefix = entry.key_ptr.*;
+                    var remainder: []const u8 = full_name;
+                    if (std.mem.startsWith(u8, full_name, prefix) and full_name.len > prefix.len and full_name[prefix.len] == '_') {
+                        remainder = full_name[prefix.len + 1 ..]; // strip "prefix_"
+                    }
+                    // Re-key the module map entry: "<module>" → "<prefix>/<module>".
+                    // fetchRemove hands back the old key so it can be freed here.
+                    // This runs before the copy below so the copy's guard is the last
+                    // statement of the loop body: still armed at the hand-over it
+                    // would free a string `modules` already owns.
+                    if (module_map.fetchRemove(full_name)) |removed| {
+                        allocator.free(removed.key);
+                        // The entry is out of `module_map`, so nothing else owns its
+                        // value any more: hold it here, or a failing re-key loses the
+                        // table list the caller lent us.
+                        var moved = removed.value;
+                        errdefer moved.deinit(allocator);
+                        const new_key = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, remainder });
+                        errdefer allocator.free(new_key);
+                        try module_map.put(new_key, moved);
+                    }
+                    const copy = try allocator.dupe(u8, remainder);
+                    errdefer allocator.free(copy);
+                    try modules.append(allocator, copy);
+                }
+                const sub_key = try allocator.dupe(u8, entry.key_ptr.*);
+                errdefer allocator.free(sub_key);
+                try subsystem_map.put(sub_key, modules);
+            }
+            // No per-entry teardown here: the block's `defer` above releases
+            // every entry exactly once, including the ones already consumed.
+        }
     }
-    prefix_groups.deinit();
 
     // Post-process: merge modules within same subsystem that share deeper prefix
     // e.g., shop/orders + shop/order_items → shop/order
@@ -3659,14 +3813,19 @@ fn detectSubsystems(allocator: std.mem.Allocator, module_map: *std.StringHashMap
                 if (std.mem.lastIndexOf(u8, mod, "_")) |us| {
                     const parent = mod[0..us];
                     const sub = key[0..slash];
-                    const merge_key = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ sub, parent });
-                    const gop = try merge_candidates.getOrPut(merge_key);
-                    if (gop.found_existing) {
-                        // getOrPut keeps the key already in the map.
-                        allocator.free(merge_key);
-                    } else {
-                        gop.value_ptr.* = .empty;
-                    }
+                    const gop = blk: {
+                        // Same guard scoping as the prefix key above.
+                        const merge_key = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ sub, parent });
+                        errdefer allocator.free(merge_key);
+                        const g = try merge_candidates.getOrPut(merge_key);
+                        if (g.found_existing) {
+                            // getOrPut keeps the key already in the map.
+                            allocator.free(merge_key);
+                        } else {
+                            g.value_ptr.* = .empty;
+                        }
+                        break :blk g;
+                    };
                     const copy = try allocator.dupe(u8, key);
                     errdefer allocator.free(copy);
                     try gop.value_ptr.append(allocator, copy);
@@ -3680,6 +3839,9 @@ fn detectSubsystems(allocator: std.mem.Allocator, module_map: *std.StringHashMap
                 if (module_map.get(entry.key_ptr.*)) |_| {} else {
                     // Move first module's tables to the parent key
                     var merged = std.ArrayList(TableDef).empty;
+                    // Only borrows the TableDefs (they stay owned by the caller's
+                    // table slice), so unwinding just releases this list's buffer.
+                    errdefer merged.deinit(allocator);
                     for (entry.value_ptr.items) |child_key| {
                         if (module_map.fetchRemove(child_key)) |removed| {
                             allocator.free(removed.key);
@@ -3688,7 +3850,9 @@ fn detectSubsystems(allocator: std.mem.Allocator, module_map: *std.StringHashMap
                             for (child_data.items) |t| try merged.append(allocator, t);
                         }
                     }
-                    try module_map.put(try allocator.dupe(u8, entry.key_ptr.*), merged);
+                    const parent_key = try allocator.dupe(u8, entry.key_ptr.*);
+                    errdefer allocator.free(parent_key);
+                    try module_map.put(parent_key, merged);
                 }
             }
         }
@@ -10377,4 +10541,78 @@ test "graph --dot renders a Graphviz digraph (CLI scanner + framework renderer)"
     defer allocator.free(filtered);
     try std.testing.expect(std.mem.indexOf(u8, filtered, "biling") == null);
     try std.testing.expect(std.mem.indexOf(u8, filtered, "\"order\" -> \"user\";") != null);
+}
+
+test "buildMysqlArgv owns every element, -p<pass> included" {
+    const allocator = std.testing.allocator;
+    var argv = try buildMysqlArgv(allocator, "127.0.0.1", 3306, "root", "s3cret", "shop");
+    defer argv.deinit(allocator);
+    // The clone is exercised too: one per query, each owning its own copies.
+    var clone = try argv.clone(allocator);
+    clone.deinit(allocator);
+
+    const want = [_][]const u8{ "mysql", "-h", "127.0.0.1", "-P", "3306", "-u", "root", "-N", "-B", "-ps3cret", "shop", "-e" };
+    try std.testing.expectEqual(want.len, argv.args.items.len);
+    for (want, argv.args.items) |expected, actual| try std.testing.expectEqualStrings(expected, actual);
+}
+
+test "buildMysqlArgv: no empty password argument" {
+    const allocator = std.testing.allocator;
+    var argv = try buildMysqlArgv(allocator, "db", 5432, "app", "", "shop");
+    defer argv.deinit(allocator);
+    for (argv.args.items) |arg| try std.testing.expect(!std.mem.startsWith(u8, arg, "-p"));
+}
+
+test "buildMysqlArgv: OOM at any point leaves nothing behind" {
+    // The formatted `-p<pass>` used to be built inside the `append` argument
+    // list of a list that freed only its backing array: it leaked on every
+    // call, OOM or not. `deinit` now releases every element, so the harness can
+    // catch any element that the builder fails to hand over.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn check(allocator: std.mem.Allocator) !void {
+            var argv = try buildMysqlArgv(allocator, "127.0.0.1", 3306, "root", "s3cret", "shop");
+            argv.deinit(allocator);
+        }
+    }.check, .{});
+}
+
+test "groupTablesByModule: OOM at any point leaves nothing behind" {
+    // The map owns its keys (and re-keys them for the singular/plural merge), so
+    // a key stranded by a refused `getOrPut` only shows up as bytes in versus
+    // bytes out.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn check(allocator: std.mem.Allocator) !void {
+            var tables = [_]TableDef{
+                .{ .name = "shop_orders", .columns = &.{}, .foreign_keys = &.{} },
+                .{ .name = "shop_products", .columns = &.{}, .foreign_keys = &.{} },
+                .{ .name = "user_roles", .columns = &.{}, .foreign_keys = &.{} },
+            };
+            var map = try groupTablesByModule(allocator, &tables);
+            freeModuleMap(allocator, &map);
+        }
+    }.check, .{});
+}
+
+test "detectSubsystems: OOM at any point leaves nothing behind" {
+    // The incoming map is re-keyed in place, and the returned subsystem map owns
+    // its keys plus the copied names in every value list — all separate
+    // allocations, so only the byte balance shows a dropped hand-over. The names
+    // exercise the plain-subsystem path, the re-key, and the deeper-prefix merge
+    // that moves two children under a parent that does not exist yet.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn check(allocator: std.mem.Allocator) !void {
+            var module_map = std.StringHashMap(std.ArrayList(TableDef)).init(allocator);
+            defer freeModuleMap(allocator, &module_map);
+            for ([_][]const u8{ "shop_order_items", "shop_order_lines", "user", "user_role" }) |name| {
+                const key = try allocator.dupe(u8, name);
+                errdefer allocator.free(key);
+                try module_map.put(key, .empty);
+            }
+
+            if (try detectSubsystems(allocator, &module_map)) |subsystems_const| {
+                var subsystems = subsystems_const;
+                freeSubsystemMap(allocator, &subsystems);
+            }
+        }
+    }.check, .{});
 }

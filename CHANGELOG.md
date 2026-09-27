@@ -2,6 +2,41 @@
 
 ## [Unreleased]
 
+### 第 88 批：`tools/zmodu` 的真漏（含"每次调用都漏"的两处）与一个**段错误级的双释放**；外加一个测试收集盲区（**破坏性：否**）
+
+1. **`main.zig` `introspectDatabaseMysql`：两处"每次调用都漏"**，不只 OOM —— `-p{pass}` 拼出来的
+   参数字符串，以及 `table_names` 的每份拷贝：旧代码只释放了 list 的**底层数组**。现在有一个
+   自持的 `MysqlArgv`（`buildMysqlArgv`）+ 各处拷贝的守卫与移交守卫。`detectSubsystems` 的
+   `modules`/`sub_key`/`moved`/`new_key`/`merged`/`parent_key` 同批收口，四处 `…dupe()→getOrPut`
+   的内联键也一并提出（含 `groupTablesByModule` 与 `introspectDatabasePostgres`）。
+2. **`detectSubsystems`：一个段错误级的双释放（既有缺陷，本批找到并修掉）。** 那个子系统循环
+   一边遍历一边**销毁** `prefix_groups` 的每一项，于是后面某一轮失败时，块的清理守卫会去
+   **重复释放已经释放过的项** —— 新写的 OOM 扫描直接 `Segmentation fault at 0xaaaaaaaaaaaaaaaa`。
+   修法需要两半，缺一不可：(a) 删掉循环内那三行逐项释放；(b) 把块级 `errdefer` 改成 **`defer`**
+   —— 逐项释放没了以后，成功路径也必须靠它释放每一项（否则从漏变成全漏）。重新加回的
+   `detectSubsystems: OOM at any point leaves nothing behind` 扫描现在绿。
+3. **`audit.zig`**：`loadRuleConfig` 的键守卫；`path.join`/`parseFromSlice` 的 `catch` 以前把
+   **OOM 伪装成"没有 rules.json"**，现在让 OOM 传播；`compareBaseline` 两处
+   `put(try dupe(...))`。红证据（恢复旧形状）：`run test 106 pass, 1 fail (107 total); 1 leaks` ·
+   `fail_index: 10/14 · allocated 4419 · freed 4388` · `error.MemoryLeakDetected`。
+4. **`incremental.zig`**：`parseManifest` 的键守卫；`loadManifest` 的 `catch` 以前把已经读进来的
+   键**直接丢掉**（`clearRetainingCapacity` 之前没释放）—— 这条 0.17 的 `checkAllAllocationFailures`
+   看不见（该 `catch` 故意吞 OOM），所以用手驱的 `FailingAllocator` 循环做测试。
+   **顺带发现一个测试收集盲区**：Zig 0.17 只从"被某个 test body 引用到"的文件里收集测试，
+   `incremental.zig` 的 6 条**一直在静默不跑**（把 `expect(false)` 塞进去都还是 113/113 exit 0）。
+   在 `main.zig` 的 coverage-gates 测试里加 `_ = @import("incremental.zig");` 之后收集数
+   113 → 126。仍在盲区里（既有）：`mcp_server.zig` 7 条、`mcp_types.zig` 3 条。
+5. **`ai_cli.zig` 的 17 处判定为不是漏**（全部落在每次调用自己的 arena 上），与第 87 批的判定一致，
+   未改。
+
+读数：`cd tools/zmodu && zig build test` → **126/126 passed**（改动前 113/113，其中 6 条从没跑过）；
+`fmt` / `check-production`（警告层为零）全 OK。
+
+**未做完**：第 87 批撤销的 stage 2（`Partitioner.zig` 的死代码 + `addNode` 多行实参版本、
+`web4/middleware.zig` 的 `presentProof`、`benchmark.zig` 的两个 handler）本轮没动。
+**未能验证**：需要活的 `mysql`/`psql` 才能跑到的那两段（`introspectDatabaseMysql` 的调用方 ——
+它的参数构造器本身有测试；`introspectDatabasePostgres` 完全没法测）。
+
 ### 第 87 批：`src/ai/**` 的 arena 判定与几个真漏（**破坏性：否**）
 
 同一形状（分配后失败即丢）在更宽的口径下又扫出一批。逐条核实后的结论：

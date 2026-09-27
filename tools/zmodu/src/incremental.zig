@@ -91,6 +91,12 @@ pub fn loadManifest(allocator: std.mem.Allocator, io: Io, project_dir: []const u
     defer allocator.free(content);
 
     parseManifest(allocator, content, &map) catch {
+        // The keys are separate allocations (`freeManifest` releases them), so
+        // dropping the entries without freeing them would strand every key read
+        // before the failure. The entries array is kept and released by
+        // `freeManifest` via `map.deinit`.
+        var keys = map.keyIterator();
+        while (keys.next()) |key| allocator.free(key.*);
         map.clearRetainingCapacity();
     };
 
@@ -126,7 +132,13 @@ fn parseManifest(allocator: std.mem.Allocator, content: []const u8, map: *std.St
 
         var hash: [64]u8 = undefined;
         @memcpy(&hash, value);
-        try map.put(try allocator.dupe(u8, key), hash);
+        // The key copy is built before the `put` instead of inside its argument
+        // list: `map` holds its keys as separate allocations, so a `put` that
+        // refuses the entry would strand the copy. The guard is scoped to this
+        // iteration and disarms at the hand-over.
+        const owned = try allocator.dupe(u8, key);
+        errdefer allocator.free(owned);
+        try map.put(owned, hash);
     }
 }
 
@@ -202,6 +214,46 @@ test "manifest round-trips through saveManifest/loadManifest" {
     }
     try std.testing.expect(manifest.get("generated_at") == null);
     try std.testing.expect(manifest.get("files") == null);
+}
+
+test "loadManifest balances every allocation it makes (OOM at each point)" {
+    // `loadManifest` swallows a parse failure on purpose (an unreadable manifest
+    // means "nothing is ours", so everything gets regenerated), which is exactly
+    // why the leak cannot be caught with `checkAllAllocationFailures` — the OOM
+    // never reaches the harness. Drive a `FailingAllocator` by hand instead:
+    // every injected failure must leave bytes-in == bytes-out, whether the
+    // manifest came back full, partial or empty.
+    const backing = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", backing);
+    defer backing.free(dir);
+
+    const entries = [_]HashEntry{
+        .{ .path = "src/main.zig", .hash = sha256Hex("a") },
+        .{ .path = "src/other.zig", .hash = sha256Hex("b") },
+        .{ .path = "build.zig.zon", .hash = sha256Hex("c") },
+    };
+    try saveManifest(backing, io, dir, &entries, "test");
+
+    // A clean run counts the allocation points the read + parse touch.
+    var probe = std.testing.FailingAllocator.init(backing, .{});
+    {
+        var manifest = loadManifest(probe.allocator(), io, dir);
+        freeManifest(probe.allocator(), &manifest);
+    }
+    const points = probe.alloc_index;
+    try std.testing.expect(points >= entries.len);
+
+    var fail: usize = 0;
+    while (fail < points) : (fail += 1) {
+        var fa = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail });
+        var manifest = loadManifest(fa.allocator(), io, dir);
+        freeManifest(fa.allocator(), &manifest);
+        try std.testing.expectEqual(fa.allocated_bytes, fa.freed_bytes);
+    }
 }
 
 test "loadManifest reports nothing for an absent manifest" {

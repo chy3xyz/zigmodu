@@ -269,7 +269,10 @@ fn loadRuleConfig(io: Io, allocator: std.mem.Allocator, project_dir: []const u8)
     rc.disabled = std.StringHashMap(void).init(allocator);
     errdefer rc.deinit(allocator);
 
-    const path = std.fs.path.join(allocator, &.{ project_dir, ".zmodu", "rules.json" }) catch return rc;
+    // `path.join`'s only error is an allocation failure — propagating it keeps
+    // an out-of-memory from masquerading as "no overrides", which would
+    // silently drop the project's rule configuration.
+    const path = try std.fs.path.join(allocator, &.{ project_dir, ".zmodu", "rules.json" });
     defer allocator.free(path);
     const content = Dir.cwd().readFileAlloc(io, path, allocator, Io.Limit.limited(64 * 1024)) catch |err| {
         if (err == error.FileNotFound) return rc;
@@ -277,7 +280,10 @@ fn loadRuleConfig(io: Io, allocator: std.mem.Allocator, project_dir: []const u8)
     };
     defer allocator.free(content);
 
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return rc;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return rc, // malformed rules.json → run with the built-in defaults
+    };
     defer parsed.deinit();
     if (parsed.value != .object) return rc;
     if (parsed.value.object.get("max_deps")) |md| {
@@ -286,7 +292,16 @@ fn loadRuleConfig(io: Io, allocator: std.mem.Allocator, project_dir: []const u8)
     if (parsed.value.object.get("disabled")) |dis| {
         if (dis == .array) {
             for (dis.array.items) |item| {
-                if (item == .string) try rc.disabled.put(try allocator.dupe(u8, item.string), {});
+                if (item == .string) {
+                    // The map's keys are separate allocations (`RuleConfig.deinit`
+                    // frees them); building the copy inside the `put` argument
+                    // list strands it whenever the map refuses the entry. This
+                    // block's guard disarms at the hand-over, so the function's
+                    // own errdefer never sees a key `put` already owns.
+                    const owned = try allocator.dupe(u8, item.string);
+                    errdefer allocator.free(owned);
+                    try rc.disabled.put(owned, {});
+                }
             }
         }
     }
@@ -1985,7 +2000,15 @@ fn compareBaseline(
                     if (rule != .string or file != .string or line != .integer) continue;
                     var key_buf: [1024]u8 = undefined;
                     const key = baselineKey(rule.string, file.string, @intCast(line.integer), &key_buf);
-                    if (key.len > 0) try baseline.put(try allocator.dupe(u8, key), {});
+                    if (key.len > 0) {
+                        // `baseline` holds its keys as separate allocations (the
+                        // `defer` above frees them), so the copy must exist
+                        // before the `put` — built inline it would be stranded
+                        // whenever the map refused the entry.
+                        const owned = try allocator.dupe(u8, key);
+                        errdefer allocator.free(owned);
+                        try baseline.put(owned, {});
+                    }
                 }
             }
         }
@@ -2013,7 +2036,14 @@ fn compareBaseline(
     for (violations) |v| {
         var key_buf: [1024]u8 = undefined;
         const key = baselineKey(v.rule, v.file, v.line, &key_buf);
-        if (key.len > 0) try current.put(try allocator.dupe(u8, key), {});
+        if (key.len > 0) {
+            // Same shape as `baseline` above: the `defer` frees the keys held by
+            // `current`, so the copy is made before the `put`, never in its
+            // argument list.
+            const owned = try allocator.dupe(u8, key);
+            errdefer allocator.free(owned);
+            try current.put(owned, {});
+        }
     }
     var removed: usize = 0;
     var it = baseline.iterator();
@@ -2745,6 +2775,86 @@ test "audit parseArgs: OOM replacing the positional dir frees exactly one pointe
                 allocator.free(cli.base_modules);
             }
             try std.testing.expectEqualStrings("lib", cli.dir);
+        }
+    }.check, .{});
+}
+
+test "audit loadRuleConfig: disabled keys survive an injected OOM" {
+    // `disabled` holds its keys as separate allocations, so `RuleConfig.deinit`
+    // is the only thing that releases them — a key built inside the `put`
+    // argument list is stranded whenever the map refuses the entry. The rules
+    // file below has three disabled rules, so the failing `put` is not the
+    // first ones: everything read before the failure has to come back out.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn check(allocator: std.mem.Allocator) !void {
+            const io = std.testing.io;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+
+            const dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+            defer allocator.free(dir);
+            try tmp.dir.createDirPath(io, ".zmodu");
+            try tmp.dir.writeFile(io, .{
+                .sub_path = ".zmodu/rules.json",
+                .data = "{\"max_deps\":8,\"disabled\":[\"b3\",\"b9\",\"a0\"]}",
+            });
+
+            var cfg = try loadRuleConfig(io, allocator, dir);
+            defer cfg.deinit(allocator);
+            try std.testing.expectEqual(@as(usize, 8), cfg.max_deps);
+            try std.testing.expect(cfg.disabled.contains("a0"));
+            try std.testing.expect(cfg.disabled.contains("b9"));
+        }
+    }.check, .{});
+}
+
+test "audit compareBaseline: baseline keys survive an injected OOM" {
+    // Two baseline entries and one current violation: the failing allocation can
+    // land on the second `put` of either map, after a key has already been
+    // handed over. Both maps free their keys through a `defer`, which cannot
+    // see a copy that a refused `put` never took ownership of.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn check(allocator: std.mem.Allocator) !void {
+            const io = std.testing.io;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+
+            const dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+            defer allocator.free(dir);
+            try tmp.dir.createDirPath(io, ".zmodu");
+            try tmp.dir.writeFile(io, .{
+                .sub_path = ".zmodu/audit-baseline.json",
+                .data = "{\"items\":[{\"rule\":\"b3\",\"file\":\"src/modules/x/service.zig\",\"line\":12}," ++
+                    "{\"rule\":\"b9\",\"file\":\"src/modules/y/api.zig\",\"line\":3}]}",
+            });
+
+            const path = try std.fs.path.join(allocator, &.{ dir, ".zmodu", "audit-baseline.json" });
+            defer allocator.free(path);
+
+            var violations = std.ArrayList(Violation).empty;
+            defer {
+                for (violations.items) |*v| v.deinit(allocator);
+                violations.deinit(allocator);
+            }
+            {
+                // Block scope on purpose: these guards must be disarmed once the
+                // list owns the strings, or the `defer` above double-frees them.
+                const file = try allocator.dupe(u8, "src/modules/x/service.zig");
+                errdefer allocator.free(file);
+                const message = try allocator.dupe(u8, "suppressed by baseline");
+                errdefer allocator.free(message);
+                try violations.append(allocator, .{
+                    .rule = "b3",
+                    .file = file,
+                    .line = 12,
+                    .message = message,
+                });
+            }
+
+            const res = try compareBaseline(io, allocator, path, violations.items);
+            try std.testing.expectEqual(@as(usize, 0), res.added);
+            try std.testing.expectEqual(@as(usize, 1), res.suppressed);
+            try std.testing.expectEqual(@as(usize, 1), res.removed);
         }
     }.check, .{});
 }
