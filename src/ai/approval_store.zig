@@ -94,15 +94,21 @@ pub const PersistentApprovalQueue = struct {
         var cursor = try self.backend.client.queryCursorEx(sql, &.{}, .{});
         defer cursor.deinit();
         while (try cursor.next()) |row| {
-            try out.append(allocator, .{
-                .run_id = try allocator.dupe(u8, row.get("run_id").?.string),
-                .subject = try allocator.dupe(u8, row.get("subject").?.string),
-                .amount = row.get("amount").?.int,
-                .note = try allocator.dupe(u8, row.get("note").?.string),
-                .step_name = try allocator.dupe(u8, row.get("step_name").?.string),
-                .tenant_id = if (row.get("tenant_id")) |t| t.int else null,
-            });
+            try approval_api.appendPending(allocator, out, rowToItem(row));
         }
+    }
+
+    /// One row as a `PendingApproval`. The slices borrow the row (and its
+    /// arena): `appendPending` copies them before `cursor.next()` moves on.
+    fn rowToItem(row: *sqlx.Row) PendingApproval {
+        return .{
+            .run_id = row.get("run_id").?.string,
+            .subject = row.get("subject").?.string,
+            .amount = row.get("amount").?.int,
+            .note = row.get("note").?.string,
+            .step_name = row.get("step_name").?.string,
+            .tenant_id = if (row.get("tenant_id")) |t| t.int else null,
+        };
     }
 
     /// Mark the first pending row with `run_id` resolved. Returns true when
@@ -158,6 +164,41 @@ pub fn queuedEscalationPersistent(
         .step_name = step_name,
         .tenant_id = ctx.tenant_id,
     });
+}
+
+// The rows live in an in-memory SQLite table created and filled with the test
+// allocator before the scan; the failing allocator covers only the copies
+// `listPending` makes (and the growth of `out`), so the induced failures never
+// reach the driver.
+test "PersistentApprovalQueue.listPending hands back its rows at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+
+    var queue = PersistentApprovalQueue.init(allocator, &backend);
+    try queue.migrate();
+    try queue.push(.{ .run_id = "ap-1", .subject = "order \"9\"", .amount = 50000, .note = "needs \\ CFO", .step_name = "finance" });
+    try queue.push(.{ .run_id = "ap-2", .subject = "order-10", .amount = 200, .note = "", .step_name = "ops manager", .tenant_id = 7 });
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, q: *PersistentApprovalQueue) !void {
+            var out = std.ArrayList(PendingApproval).empty;
+            defer {
+                for (out.items) |item| {
+                    a.free(item.run_id);
+                    a.free(item.subject);
+                    a.free(item.note);
+                    a.free(item.step_name);
+                }
+                out.deinit(a);
+            }
+            try q.listPending(a, &out, null);
+            try std.testing.expectEqual(@as(usize, 2), out.items.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{&queue});
 }
 
 test "PersistentApprovalQueue push, list and resolve across queries" {

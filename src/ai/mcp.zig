@@ -14,6 +14,7 @@ const std = @import("std");
 const SkillRegistry = @import("skill.zig").SkillRegistry;
 const SkillContext = @import("skill.zig").SkillContext;
 const freeValue = @import("skill.zig").freeValue;
+const putJsonField = @import("skill.zig").putJsonField;
 const json_shape = @import("json_shape.zig");
 
 /// Render the registry as the MCP `tools/list` result
@@ -220,25 +221,39 @@ fn rpcSuccess(allocator: std.mem.Allocator, arena_alloc: std.mem.Allocator, id: 
 }
 
 fn rpcError(allocator: std.mem.Allocator, id: ?i64, code: i64, message: []const u8) ![]const u8 {
+    // Every field goes in through `putJsonField`, which copies the key (and a
+    // `.string` value) and releases what it cannot place. The tree is built on
+    // the caller's allocator — this runs before the per-line arena exists, and
+    // on the paths where it does not matter — so the guard below is what keeps
+    // an error answer from stranding its keys and values when a later field or
+    // the stringify fails.
     var resp = std.json.ObjectMap{};
+    errdefer freeValue(allocator, .{ .object = resp });
     try putString(&resp, allocator, "jsonrpc", "2.0");
-    if (id) |i| try resp.put(allocator, try allocator.dupe(u8, "id"), .{ .integer = i });
-    var err = std.json.ObjectMap{};
-    try err.put(allocator, try allocator.dupe(u8, "code"), .{ .integer = code });
-    try err.put(allocator, try allocator.dupe(u8, "message"), .{ .string = try allocator.dupe(u8, message) });
-    try resp.put(allocator, try allocator.dupe(u8, "error"), .{ .object = err });
+    if (id) |i| try putJsonField(allocator, &resp, "id", .{ .integer = i });
+    // The error object gets its own scope: `putJsonField` takes ownership of an
+    // `.object` value even when it fails, so a guard that outlived the hand-over
+    // into `resp` would free the same map a second time.
+    const err_obj = blk: {
+        var err = std.json.ObjectMap{};
+        errdefer freeValue(allocator, .{ .object = err });
+        try putJsonField(allocator, &err, "code", .{ .integer = code });
+        try putJsonField(allocator, &err, "message", .{ .string = message });
+        break :blk err;
+    };
+    try putJsonField(allocator, &resp, "error", .{ .object = err_obj });
     const value: std.json.Value = .{ .object = resp };
     const out = try std.json.Stringify.valueAlloc(allocator, value, .{});
-    // The tree above is built on the caller's allocator (this runs before the
-    // per-line arena exists, and on the paths where it does not matter), so
-    // every error answer used to strand its keys and values: a malformed
-    // request leaked a handful of small allocations in a long-lived server.
+    // Freed here; the only statement left cannot fail, so the `errdefer` above
+    // cannot double-free (the shape `skill.encodeJsonObject` uses too).
     freeValue(allocator, value);
     return out;
 }
 
+/// `ObjectMap` copies neither the key nor the value: `putJsonField` copies both
+/// and hands the map ownership, so nothing is stranded by a failed `put`.
 fn putString(obj: *std.json.ObjectMap, allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
-    try obj.put(allocator, try allocator.dupe(u8, key), .{ .string = try allocator.dupe(u8, value) });
+    try putJsonField(allocator, obj, key, .{ .string = value });
 }
 
 test "a peer line of the wrong shape is answered, not fatal" {
@@ -260,6 +275,25 @@ test "a peer line of the wrong shape is answered, not fatal" {
     const resp = try serveLine(allocator, &registry, &ctx, "{\"method\":\"tools/call\",\"id\":1,\"params\":\"x\"}");
     defer allocator.free(resp);
     try std.testing.expect(std.mem.indexOf(u8, resp, "-32602") != null);
+}
+
+// `serveLine` answers a malformed line with `rpcError`, whose tree is built on
+// the allocator the caller passed in — no per-line arena on that path — so the
+// scan covers the field copies, the error sub-object and the stringify.
+test "an RPC error answer hands back its tree at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    var ctx = SkillContext{ .allocator = allocator };
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, reg: *SkillRegistry, c: *SkillContext) !void {
+            const resp = try serveLine(a, reg, c, "not json");
+            defer a.free(resp);
+            try std.testing.expect(std.mem.indexOf(u8, resp, "-32700") != null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{ &registry, &ctx });
 }
 
 test "toMcpTools renders skills and handleToolCall dispatches" {

@@ -21,6 +21,7 @@ const sqlx = @import("../data.zig").sqlx;
 const SkillRegistry = @import("skill.zig").SkillRegistry;
 const SkillContext = @import("skill.zig").SkillContext;
 const freeValue = @import("skill.zig").freeValue;
+const putJsonField = @import("skill.zig").putJsonField;
 const json_shape = @import("json_shape.zig");
 
 pub const max_rows: usize = 100;
@@ -95,15 +96,18 @@ fn readArgs(ctx: *SkillContext, v: ?std.json.Value) ![]sqlx.Value {
 
 fn rowToJson(row: *sqlx.Row, allocator: std.mem.Allocator) !std.json.Value {
     var obj = std.json.ObjectMap{};
+    // ObjectMap neither copies keys nor frees them on deinit, so every key and
+    // string value has to be a copy this tree owns; `putJsonField` makes that
+    // copy and releases it again if the map refuses the field. The guard covers
+    // the columns already placed when a later column fails, and it is disarmed
+    // by the `return` below.
+    errdefer freeValue(allocator, .{ .object = obj });
     for (row.columns, 0..) |col, i| {
         const v = valueToJson(row.values[i]);
-        // ObjectMap does not copy keys and does not free them on deinit;
-        // dupe both keys and string values so freeValue can release them.
-        const key = try allocator.dupe(u8, col);
         if (v == .string) {
-            try obj.put(allocator, key, .{ .string = try allocator.dupe(u8, v.string) });
+            try putJsonField(allocator, &obj, col, .{ .string = v.string });
         } else {
-            try obj.put(allocator, key, v);
+            try putJsonField(allocator, &obj, col, v);
         }
     }
     return .{ .object = obj };
@@ -465,6 +469,29 @@ test "db.query refuses a tenant-scoped call with no declared tenant column" {
     ctx.tenant_id = null;
     const res = try registry.dispatch("db.query", &ctx, .{ .object = args_map });
     try std.testing.expectEqual(@as(i64, 2), res.object.get("count").?.integer);
+}
+
+// `rowToJson` reads exactly a row's `columns` / `values` pair, so the scan can
+// drive it with a hand-built row instead of a live cursor: every allocation
+// point is a key or value copy, the map growth behind them and the string.
+test "rowToJson hands back its object at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const columns = [_][]const u8{ "run_id", "amount", "note" };
+    const values = [_]?sqlx.Value{ .{ .string = "run-1" }, .{ .int = 7 }, .null };
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, ar: *std.heap.ArenaAllocator, cols: []const []const u8, vals: []const ?sqlx.Value) !void {
+            var row = sqlx.Row{ .arena = ar, .columns = cols, .values = vals };
+            const value = try rowToJson(&row, a);
+            defer freeValue(a, value);
+            try std.testing.expectEqualStrings("run-1", value.object.get("run_id").?.string);
+            try std.testing.expectEqual(@as(i64, 7), value.object.get("amount").?.integer);
+            try std.testing.expect(value.object.get("note").? == .null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{ &arena, &columns, &values });
 }
 
 test "db.query/entity.list results are freeValue-safe (no literal keys)" {

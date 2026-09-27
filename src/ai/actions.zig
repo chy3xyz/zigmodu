@@ -37,7 +37,24 @@ fn jsonToValue(v: std.json.Value) error{InvalidArguments}!sqlx.Value {
 }
 
 fn putOwned(obj: *std.json.ObjectMap, allocator: std.mem.Allocator, key: []const u8, value: std.json.Value) !void {
-    try obj.put(allocator, try allocator.dupe(u8, key), value);
+    // The key copy needs its own guard: built as the `put` argument it was
+    // stranded whenever the map refused the field (found by the OOM scan on
+    // `writeEntity`). The disarmed-by-`return` guard leaves the value's
+    // contract alone — a `.string` here is still owned by the caller.
+    const k = try allocator.dupe(u8, key);
+    errdefer allocator.free(k);
+    try obj.put(allocator, k, value);
+}
+
+/// Copy `s` and hand the copy to `list`, which releases it with its `defer`.
+/// The transfer happens inside this function, so a failed `append` frees the
+/// copy instead of stranding it — and a caller-side `errdefer` would stay armed
+/// for the rest of the enclosing scope and free a string `list` already owns.
+fn appendOwnedString(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8), s: []const u8) ![]const u8 {
+    const copy = try allocator.dupe(u8, s);
+    errdefer allocator.free(copy);
+    try list.append(allocator, copy);
+    return copy;
 }
 
 fn findEntity(entities: []const business.EntitySpec, name: []const u8) ?business.EntitySpec {
@@ -151,8 +168,7 @@ fn writeEntity(sctx: *SkillContext, wctx: *WriteCtx, args: std.json.Value, kind:
         try cols.append(sctx.allocator, col);
         const v = try jsonToValue(e.value_ptr.*);
         if (v == .string) {
-            const owned = try sctx.allocator.dupe(u8, v.string);
-            try val_owned.append(sctx.allocator, owned);
+            const owned = try appendOwnedString(sctx.allocator, &val_owned, v.string);
             try vals.append(sctx.allocator, .{ .string = owned });
         } else {
             try vals.append(sctx.allocator, v);
@@ -198,6 +214,10 @@ fn writeEntity(sctx: *SkillContext, wctx: *WriteCtx, args: std.json.Value, kind:
 
     const result = try wctx.backend.exec(sql_buf.items, vals.items);
     var out = std.json.ObjectMap{};
+    // The result tree is handed to the caller by the `return` below; without
+    // this, a field that fails to go in strands the ones already placed (the
+    // OOM scan on this function found the same shape inside `putOwned`).
+    errdefer freeValue(sctx.allocator, .{ .object = out });
     if (kind == .create) {
         if (result.last_insert_id) |lid| {
             try putOwned(&out, sctx.allocator, "id", .{ .integer = lid });
@@ -468,6 +488,57 @@ test "entity.create enforces tenant and writable whitelist" {
     try putOwned(&bad_args, allocator, "fields", .{ .object = bad_fields });
     defer freeValue(allocator, .{ .object = bad_args });
     try std.testing.expectError(error.TenantColumnForbidden, registry.dispatch("entity.create", &sctx, .{ .object = bad_args }));
+}
+
+// The table, the entity spec and the args tree are built with the test
+// allocator before the scan; the failing allocator covers the dispatch itself
+// (the skill context's allocator is swapped for it) — the copies in
+// `val_owned`, the SQL text and the result value.
+test "entity.create hands back its values at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    var client = sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    _ = try client.exec("CREATE TABLE orders (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id INTEGER NOT NULL, amount INTEGER, note TEXT)", &.{});
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    const entities = [_]business.EntitySpec{
+        .{ .name = "order", .table = "orders", .tenant_column = "tenant_id", .writable = &.{ "amount", "note" } },
+    };
+    var wctx = WriteCtx{ .backend = &backend, .entities = &entities };
+    var registry = try setupRegistry(allocator, std.testing.io);
+    defer registry.deinit();
+    try registerWriteSkills(&registry);
+    const perms = [_][]const u8{"entity:write"};
+    var base_ctx = SkillContext{ .allocator = allocator, .tenant_id = 7, .permissions = &perms, .userdata = &wctx };
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, reg: *SkillRegistry, base: *SkillContext) !void {
+            var sctx = base.*;
+            sctx.allocator = a;
+            // Built with `putJsonField`, which copies the keys *and* the
+            // string values (this file's `putOwned` hands values over as-is, so
+            // a literal put through it must not be freed).
+            const fields = blk: {
+                var map = std.json.ObjectMap{};
+                errdefer freeValue(a, .{ .object = map });
+                try skill.putJsonField(a, &map, "amount", .{ .integer = 9900 });
+                try skill.putJsonField(a, &map, "note", .{ .string = "rush \"today\"" });
+                break :blk map;
+            };
+            var args = std.json.ObjectMap{};
+            defer freeValue(a, .{ .object = args });
+            // The transfer is the very next statement, and `putJsonField`
+            // releases an `.object` value it cannot place — so `fields` needs no
+            // guard of its own here, and none may outlive this put (that would
+            // free what `args` owns).
+            try skill.putJsonField(a, &args, "fields", .{ .object = fields });
+            try skill.putJsonField(a, &args, "entity", .{ .string = "order" });
+            const res = try reg.dispatch("entity.create", &sctx, .{ .object = args });
+            defer freeValue(a, res);
+            try std.testing.expectEqual(@as(bool, true), res.object.get("created").?.bool);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{ &registry, &base_ctx });
 }
 
 test "command.execute writes an idempotent outbox event" {

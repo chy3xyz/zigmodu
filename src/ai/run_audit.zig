@@ -125,16 +125,34 @@ pub const RunAuditStore = struct {
         var cursor = try self.backend.client.queryCursorEx(sql, args.items, .{});
         defer cursor.deinit();
         while (try cursor.next()) |row| {
-            try out.append(allocator, .{
-                .run_id = try allocator.dupe(u8, row.get("run_id").?.string),
-                .kind = std.meta.stringToEnum(RunKind, row.get("kind").?.string) orelse .workflow,
-                .status = try allocator.dupe(u8, row.get("status").?.string),
-                .tenant_id = if (row.get("tenant_id")) |t| t.int else null,
-                .steps = @intCast(row.get("steps").?.int),
-                .duration_ms = row.get("duration_ms").?.int,
-                .model = if (row.get("model")) |m| try allocator.dupe(u8, m.string) else null,
-            });
+            try appendRow(allocator, out, row);
         }
+    }
+
+    /// Copy one audit row into `out`, which owns it from here.
+    ///
+    /// Each copy is guarded as it is made and the guards are disarmed by this
+    /// `return`: built inside the `append` argument, a failed `status` /
+    /// `model` copy stranded the copies before it and a failed `append`
+    /// stranded all three (a call-site `errdefer` would instead stay armed past
+    /// the hand-over and free what `out` already owns). The row's slices are
+    /// borrowed from its arena, so they must be copied before `next()` moves on.
+    fn appendRow(allocator: std.mem.Allocator, out: *std.ArrayList(RunAuditEntry), row: *sqlx.Row) !void {
+        const run_id = try allocator.dupe(u8, row.get("run_id").?.string);
+        errdefer allocator.free(run_id);
+        const status = try allocator.dupe(u8, row.get("status").?.string);
+        errdefer allocator.free(status);
+        const model: ?[]const u8 = if (row.get("model")) |m| try allocator.dupe(u8, m.string) else null;
+        errdefer if (model) |mm| allocator.free(mm);
+        try out.append(allocator, .{
+            .run_id = run_id,
+            .kind = std.meta.stringToEnum(RunKind, row.get("kind").?.string) orelse .workflow,
+            .status = status,
+            .tenant_id = if (row.get("tenant_id")) |t| t.int else null,
+            .steps = @intCast(row.get("steps").?.int),
+            .duration_ms = row.get("duration_ms").?.int,
+            .model = model,
+        });
     }
 
     pub fn count(self: *Self) !usize {
@@ -146,6 +164,38 @@ pub const RunAuditStore = struct {
         return @intCast((try cursor.next()).?.get("n").?.int);
     }
 };
+
+// The rows are inserted with the test allocator before the scan; the failing
+// allocator covers `appendRow`'s copies and the growth of `out`, never the
+// driver's own storage (the client has its own allocator).
+test "RunAuditStore.list hands back its rows at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    var store = RunAuditStore.init(allocator, &backend);
+    try store.migrate();
+    try store.record(.{ .run_id = "r1", .kind = .workflow, .status = "completed", .tenant_id = 1, .steps = 3, .duration_ms = 12, .model = "deepseek-v4" });
+    try store.record(.{ .run_id = "r2", .kind = .agent, .status = "failed", .steps = 1, .duration_ms = 4 });
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, s: *RunAuditStore) !void {
+            var out = std.ArrayList(RunAuditEntry).empty;
+            defer {
+                for (out.items) |e| {
+                    a.free(e.run_id);
+                    a.free(e.status);
+                    if (e.model) |m| a.free(m);
+                }
+                out.deinit(a);
+            }
+            try s.list(a, &out, null, null, 10);
+            try std.testing.expectEqual(@as(usize, 2), out.items.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{&store});
+}
 
 test "RunAuditStore records, filters and lists run history" {
     const allocator = std.testing.allocator;

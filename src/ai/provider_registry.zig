@@ -315,10 +315,26 @@ pub const ProviderRegistry = struct {
             errdefer allocator.free(keys);
             const models = try allocator.alloc([]const u8, p.models.len);
             errdefer allocator.free(models);
-            for (p.models, 0..) |m, i| models[i] = try allocator.dupe(u8, m);
+            var copied: usize = 0;
+            errdefer {
+                for (models[0..copied]) |m| allocator.free(m);
+            }
+            for (p.models, 0..) |m, i| {
+                models[i] = try allocator.dupe(u8, m);
+                copied += 1;
+            }
+            // The two field copies are guarded like the model strings above:
+            // built inside the `append` argument, a failed `endpoint` copy
+            // stranded the `name` copy and a failed `append` stranded both. The
+            // `append` is the last statement of the iteration, so every guard
+            // here is out of scope before `out` owns the entry.
+            const name = try allocator.dupe(u8, p.name);
+            errdefer allocator.free(name);
+            const endpoint = try allocator.dupe(u8, p.endpoint);
+            errdefer allocator.free(endpoint);
             try out.append(allocator, .{
-                .name = try allocator.dupe(u8, p.name),
-                .endpoint = try allocator.dupe(u8, p.endpoint),
+                .name = name,
+                .endpoint = endpoint,
                 .enabled = p.enabled,
                 .models = models,
                 .keys = keys,
@@ -519,6 +535,29 @@ test "every allocation failure inside register and deinit is reported and leaks 
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Scan.run, .{});
+}
+
+// The registry is filled with the test allocator before the scan, so the
+// failing allocator covers the snapshot's copies (keys, each model string, name,
+// endpoint) and the growth of `out` — not the registry's own storage.
+test "listProviders hands back its snapshot at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    var reg = ProviderRegistry.init(allocator);
+    defer reg.deinit();
+    try reg.register(std.testing.io, "p", "https://p/v1/chat/completions", &.{ "sk-p", "sk-q" }, .{ .models = &.{ "m1", "m2" } });
+    try reg.register(std.testing.io, "q", "https://q/v1/chat/completions", &.{"sk-r"}, .{ .models = &.{"m1"} });
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, r: *ProviderRegistry) !void {
+            const infos = try r.listProviders(std.testing.io, a);
+            defer {
+                for (infos) |*info| info.deinit(a);
+                a.free(infos);
+            }
+            try std.testing.expectEqual(@as(usize, 2), infos.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{&reg});
 }
 
 /// Park `read` on `mutex` with a cancel request already placed on its thread, then

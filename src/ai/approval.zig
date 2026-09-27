@@ -134,11 +134,7 @@ pub const ApprovalFlow = struct {
         for (steps, 0..) |step, idx| {
             var note: []const u8 = "";
             const decision = try self.policy(allocator, ctx, subject, amount, idx, step.name, context_block, &note);
-            try entries.append(allocator, .{
-                .step = try allocator.dupe(u8, step.name),
-                .decision = decision,
-                .note = note,
-            });
+            try appendEntry(allocator, &entries, step.name, decision, note);
             try self.writeOutbox(allocator, run_id, subject, amount, step.name, decision, note);
             if (decision == .rejected) {
                 status = .rejected;
@@ -223,6 +219,30 @@ pub const ApprovalFlow = struct {
         });
     }
 };
+
+/// Copy the step name and hand the entry to `entries`.
+///
+/// The `append` happens inside this call. A step name allocated at the call
+/// site and appended as part of a struct literal was stranded when the append
+/// failed, and a call-site `errdefer` would instead stay armed past the
+/// hand-over — `entries` (and the flow's own guard for it) already owns every
+/// entry it holds. A `note` the policy allocated transfers with the entry; if
+/// the append fails it is released here rather than leaked.
+fn appendEntry(
+    allocator: std.mem.Allocator,
+    entries: *std.ArrayList(ApprovalEntry),
+    step_name: []const u8,
+    decision: ApprovalDecision,
+    note: []const u8,
+) !void {
+    // Armed before the first fallible call: `note` is already owned by the
+    // caller, so it has to be released even when the name copy is the
+    // allocation that fails.
+    errdefer if (note.len > 0) allocator.free(note);
+    const name = try allocator.dupe(u8, step_name);
+    errdefer allocator.free(name);
+    try entries.append(allocator, .{ .step = name, .decision = decision, .note = note });
+}
 
 /// Default policy: escalate every step to a human (safe default). Apps replace
 /// this with rule/LLM-driven policies.
@@ -358,6 +378,33 @@ test "ApprovalFlow advances, escalates and rejects with outbox audit" {
         n += 1;
     }
     try std.testing.expectEqual(@as(usize, 6), n);
+}
+
+// `checkAllAllocationFailures` walks the name copy, the hand-over of the
+// policy's note and the growth of `entries`.
+//
+// Red before `appendEntry`: the name was duplicated inside the `append`
+// argument, so a failed append stranded it (and the note with it).
+test "an appended approval entry hands back its copy at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var entries = std.ArrayList(ApprovalEntry).empty;
+            defer {
+                for (entries.items) |e| {
+                    a.free(e.step);
+                    if (e.note.len > 0) a.free(e.note);
+                }
+                entries.deinit(a);
+            }
+            const note = try a.dupe(u8, "needs CFO sign-off");
+            try appendEntry(a, &entries, "finance", .escalated, note);
+            try std.testing.expectEqual(@as(usize, 1), entries.items.len);
+            try std.testing.expectEqualStrings("needs CFO sign-off", entries.items[0].note);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{});
 }
 
 test "ApprovalFlow default policy escalates every step to a human" {

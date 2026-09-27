@@ -25,14 +25,20 @@ pub const Retriever = struct {
     }
 
     fn defaultFree(_: *anyopaque, allocator: std.mem.Allocator, chunks: []RetrievedChunk) void {
-        for (chunks) |c| {
-            if (c.id.len > 0) allocator.free(c.id);
-            if (c.text.len > 0) allocator.free(c.text);
-            if (c.source.len > 0) allocator.free(c.source);
-        }
+        for (chunks) |c| freeChunk(allocator, c);
         allocator.free(chunks);
     }
 };
+
+/// Release one chunk's owned strings — the same fields in the same order as
+/// `Retriever.defaultFree`, minus the slice. `id` / `source` are only ever the
+/// shared empty literal when the producer did not copy one, which is why each
+/// free is length-guarded.
+fn freeChunk(allocator: std.mem.Allocator, c: RetrievedChunk) void {
+    if (c.id.len > 0) allocator.free(c.id);
+    if (c.text.len > 0) allocator.free(c.text);
+    if (c.source.len > 0) allocator.free(c.source);
+}
 
 /// Tiny keyword retriever for tests / demos (not a vector index).
 pub const KeywordRetriever = struct {
@@ -77,19 +83,35 @@ pub const KeywordRetriever = struct {
     fn retrieveImpl(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, top_k: usize) anyerror![]RetrievedChunk {
         const self: *KeywordRetriever = @ptrCast(@alignCast(ptr));
         var scored: std.ArrayList(RetrievedChunk) = .empty;
-        defer scored.deinit(allocator);
+        errdefer {
+            for (scored.items) |c| freeChunk(allocator, c);
+            scored.deinit(allocator);
+        }
 
         for (self.docs.items) |d| {
             if (!containsIgnoreCase(d.text, query) and !containsIgnoreCase(d.id, query)) continue;
-            try scored.append(allocator, .{
-                .id = try allocator.dupe(u8, d.id),
-                .text = try allocator.dupe(u8, d.text),
-                .source = if (d.source.len > 0) try allocator.dupe(u8, d.source) else "",
-                .score = 1.0,
-            });
+            try appendChunk(allocator, &scored, d);
             if (scored.items.len >= top_k) break;
         }
         return try scored.toOwnedSlice(allocator);
+    }
+
+    /// Copy one matching doc into `scored`, which owns the copies from here.
+    ///
+    /// The three copies used to be built inside the `append` argument, so a
+    /// failed `text` / `source` copy stranded the `id` copy and a failed
+    /// `append` stranded all three; an `errdefer` in the loop would instead
+    /// stay armed for the rest of the loop and free what `scored` already owns.
+    /// The list-level guard above is what releases the entries appended before
+    /// a later iteration (or the `toOwnedSlice`) fails.
+    fn appendChunk(allocator: std.mem.Allocator, scored: *std.ArrayList(RetrievedChunk), d: Doc) !void {
+        const id = try allocator.dupe(u8, d.id);
+        errdefer allocator.free(id);
+        const text = try allocator.dupe(u8, d.text);
+        errdefer allocator.free(text);
+        const source = if (d.source.len > 0) try allocator.dupe(u8, d.source) else "";
+        errdefer if (source.len > 0) allocator.free(source);
+        try scored.append(allocator, .{ .id = id, .text = text, .source = source, .score = 1.0 });
     }
 
     /// Format chunks into a system-prompt block. Caller frees.
@@ -114,6 +136,27 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
     }
     return false;
+}
+
+// The docs are added with the test allocator before the scan, so the failing
+// allocator covers the chunk copies, the growth of the list and the final
+// `toOwnedSlice`.
+test "KeywordRetriever.retrieve hands back its chunks at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    var kr = KeywordRetriever.init(allocator);
+    defer kr.deinit();
+    try kr.add("doc-1", "Order 42 ships tomorrow", "orders");
+    try kr.add("doc-2", "Order 43 is refunded", "");
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, r: *KeywordRetriever) !void {
+            const retriever = r.asRetriever();
+            const chunks = try retriever.retrieve(a, "order", 10);
+            defer retriever.free(a, chunks);
+            try std.testing.expectEqual(@as(usize, 2), chunks.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{&kr});
 }
 
 test "KeywordRetriever retrieve and format" {

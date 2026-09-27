@@ -272,12 +272,7 @@ pub const Workflow = struct {
             defer parsed.deinit();
             const rec = parsed.value;
             if (rec.index >= next_index) next_index = rec.index + 1;
-            try result.steps.append(allocator, .{
-                .name = try allocator.dupe(u8, rec.name),
-                .status = if (std.mem.eql(u8, rec.status, "failed")) .failed else .completed,
-                .error_message = if (rec.err_msg) |em| try allocator.dupe(u8, em) else null,
-                .output = if (rec.output) |o| try allocator.dupe(u8, o) else "",
-            });
+            try appendReplayedStep(allocator, &result.steps, rec);
             if (std.mem.eql(u8, rec.status, "failed")) replayed_failed = true;
             if (std.mem.eql(u8, rec.status, "completed")) try recordCompleted(allocator, &completed, rec.name);
         }
@@ -300,6 +295,34 @@ pub const Workflow = struct {
             try @import("run_audit.zig").recordRun(a, allocator, ctx, run_id, .workflow, @tagName(result.status), result.steps.items.len, Time.monotonicNowMilliseconds() - started_ms);
         }
         return result;
+    }
+
+    /// Copy one replayed step into `steps`, which owns it from here.
+    ///
+    /// The three copies used to be built inside the `append` argument, where
+    /// nothing owned them until the append returned: a failed `error_message` /
+    /// `output` copy stranded the `name` copy, and a failed `append` stranded
+    /// all three. Built here, each guard is disarmed by this `return`, so the
+    /// caller's `append` is the only hand-over. `output` stays the shared empty
+    /// literal when the record has none (`WorkflowResult.deinit` frees only a
+    /// non-empty one).
+    fn appendReplayedStep(
+        allocator: std.mem.Allocator,
+        steps: *std.ArrayList(StepRecord),
+        rec: StepRecordJson,
+    ) !void {
+        const name = try allocator.dupe(u8, rec.name);
+        errdefer allocator.free(name);
+        const error_message: ?[]const u8 = if (rec.err_msg) |em| try allocator.dupe(u8, em) else null;
+        errdefer if (error_message) |em| allocator.free(em);
+        const output = if (rec.output) |o| try allocator.dupe(u8, o) else "";
+        errdefer if (output.len > 0) allocator.free(output);
+        try steps.append(allocator, .{
+            .name = name,
+            .status = if (std.mem.eql(u8, rec.status, "failed")) .failed else .completed,
+            .error_message = error_message,
+            .output = output,
+        });
     }
 
     // ==== §5  Execution engines ====
@@ -740,6 +763,42 @@ fn deinitCompleted(allocator: std.mem.Allocator, completed: *std.StringHashMap(v
     var kit = completed.keyIterator();
     while (kit.next()) |k| allocator.free(k.*);
     completed.deinit();
+}
+
+// `checkAllAllocationFailures` walks the three copies and the growth of the
+// list one allocation point at a time.
+//
+// Red before `appendReplayedStep` (the copies built inside the `append`
+// argument): the first copy to fail stranded the copies made before it, and a
+// failed `append` stranded all three — nothing owned them until it returned.
+test "the replayed step record hands back its copies at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var steps: std.ArrayList(StepRecord) = .empty;
+            defer {
+                for (steps.items) |rec| {
+                    a.free(rec.name);
+                    if (rec.error_message) |em| a.free(em);
+                    if (rec.output.len > 0) a.free(rec.output);
+                }
+                steps.deinit(a);
+            }
+            try Workflow.appendReplayedStep(a, &steps, .{
+                .run_id = "run-1",
+                .index = 3,
+                .name = "step \"a\"",
+                .status = "failed",
+                .err_msg = "provider said \"declined\"",
+                .output = "partial output",
+            });
+            try std.testing.expectEqual(@as(usize, 1), steps.items.len);
+            try std.testing.expectEqual(StepStatus.failed, steps.items[0].status);
+            try std.testing.expectEqualStrings("provider said \"declined\"", steps.items[0].error_message.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{});
 }
 
 test "resume records step names it owns, not slices of the parse result" {

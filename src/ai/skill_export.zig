@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const SkillRegistry = @import("skill.zig").SkillRegistry;
+const putJsonField = @import("skill.zig").putJsonField;
 
 pub const OpenApiOpts = struct {
     title: []const u8 = "AI Skills",
@@ -138,8 +139,12 @@ pub fn toOpenApi(registry: *SkillRegistry, allocator: std.mem.Allocator, opts: O
     return try std.json.Stringify.valueAlloc(allocator, out_value, .{});
 }
 
+/// `ObjectMap` copies neither the key nor the value: `putJsonField` copies both
+/// and releases them again if the map refuses the field. The document is built
+/// on one arena either way, so this is the shape that cannot strand a copy —
+/// the arena only bounds what is already unreachable.
 fn putString(obj: *std.json.ObjectMap, allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
-    try obj.put(allocator, try allocator.dupe(u8, key), .{ .string = try allocator.dupe(u8, value) });
+    try putJsonField(allocator, obj, key, .{ .string = value });
 }
 
 fn collectNames(registry: *SkillRegistry, allocator: std.mem.Allocator, out: *std.ArrayList([]const u8)) !void {

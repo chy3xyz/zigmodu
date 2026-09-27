@@ -116,17 +116,38 @@ pub const ApprovalQueue = struct {
         defer self.mu.unlock(self.io);
         for (self.items.items) |item| {
             if (!tenantMatches(tenant_id, item.tenant_id)) continue;
-            try out.append(allocator, .{
-                .run_id = try allocator.dupe(u8, item.run_id),
-                .subject = try allocator.dupe(u8, item.subject),
-                .amount = item.amount,
-                .note = try allocator.dupe(u8, item.note),
-                .step_name = try allocator.dupe(u8, item.step_name),
-                .tenant_id = item.tenant_id,
-            });
+            try appendPending(allocator, out, item);
         }
     }
 };
+
+/// Copy one pending item into `out`, which owns it from here.
+///
+/// Every copy is guarded as it is made and the guards are disarmed by this
+/// `return`. A struct literal at the call site allocated `run_id` … `step_name`
+/// in order ahead of the `append`, so a copy that failed stranded the ones
+/// before it and a failed `append` stranded all four; a call-site `errdefer`
+/// would instead stay armed past the hand-over and free what `out` already
+/// owns. Shared by the in-memory queue and the SQL-backed one, whose rows carry
+/// the same shape.
+pub fn appendPending(allocator: std.mem.Allocator, out: *std.ArrayList(PendingApproval), item: PendingApproval) !void {
+    const run_id = try allocator.dupe(u8, item.run_id);
+    errdefer allocator.free(run_id);
+    const subject = try allocator.dupe(u8, item.subject);
+    errdefer allocator.free(subject);
+    const note = try allocator.dupe(u8, item.note);
+    errdefer allocator.free(note);
+    const step_name = try allocator.dupe(u8, item.step_name);
+    errdefer allocator.free(step_name);
+    try out.append(allocator, .{
+        .run_id = run_id,
+        .subject = subject,
+        .amount = item.amount,
+        .note = note,
+        .step_name = step_name,
+        .tenant_id = item.tenant_id,
+    });
+}
 
 /// Hook for `ApprovalFlow.on_escalated` that copies the escalated run into
 /// the queue (userdata must be `*ApprovalQueue`).
@@ -334,6 +355,50 @@ test "buildPendingBody hands back its rows at every allocation point (OOM scan)"
         }
     };
     try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{&items});
+}
+
+// The queue is filled with the test allocator *before* the scan, so the failing
+// allocator covers the item copies and the growth of `out` — not the queue's
+// own storage.
+test "ApprovalQueue.listPending hands back its rows at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    var queue = ApprovalQueue.init(allocator, std.testing.io);
+    defer queue.deinit();
+    // The queue owns the item strings it is handed (`deinit` frees them), so
+    // the pushes get copies — a literal would be freed by `deinit`.
+    try queue.push(.{
+        .run_id = try allocator.dupe(u8, "ap-1"),
+        .subject = try allocator.dupe(u8, "order \"9\""),
+        .amount = 50000,
+        .note = try allocator.dupe(u8, "needs \\ CFO"),
+        .step_name = try allocator.dupe(u8, "finance"),
+    });
+    try queue.push(.{
+        .run_id = try allocator.dupe(u8, "ap-2"),
+        .subject = try allocator.dupe(u8, "order-10"),
+        .amount = 200,
+        .note = "",
+        .step_name = try allocator.dupe(u8, "ops manager"),
+        .tenant_id = 7,
+    });
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, q: *ApprovalQueue) !void {
+            var out = std.ArrayList(PendingApproval).empty;
+            defer {
+                for (out.items) |item| {
+                    a.free(item.run_id);
+                    a.free(item.subject);
+                    a.free(item.note);
+                    a.free(item.step_name);
+                }
+                out.deinit(a);
+            }
+            try q.listPending(a, &out, null);
+            try std.testing.expectEqual(@as(usize, 2), out.items.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{&queue});
 }
 
 const approval_api_mod = @This();
