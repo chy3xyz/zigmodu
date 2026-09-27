@@ -2040,6 +2040,15 @@ const Router = struct {
     /// Walk the route trie and collect all registered routes as RouteInfo entries (method, path).
     pub fn listRoutes(self: *const Router, alloc: std.mem.Allocator) ![]const RouteInfo {
         var result = std.ArrayList(RouteInfo).empty;
+        // Entries already collected by a failed walk own their two strings, and
+        // the caller never sees a failed `listRoutes` to free them.
+        errdefer {
+            for (result.items) |r| {
+                alloc.free(r.method);
+                alloc.free(r.path);
+            }
+            result.deinit(alloc);
+        }
 
         var method_iter = self.roots.iterator();
         while (method_iter.next()) |entry| {
@@ -2142,10 +2151,7 @@ fn collectRoutes(
     if (node.route) |_| {
         const path = try std.fmt.allocPrint(alloc, "/{s}", .{prefix});
         defer alloc.free(path);
-        try result.append(alloc, .{
-            .method = try alloc.dupe(u8, method.toString()),
-            .path = try alloc.dupe(u8, path),
-        });
+        try appendRouteInfo(alloc, result, method, path);
     }
     for (node.children.items) |child| {
         const sep = if (prefix.len > 0 and prefix[prefix.len - 1] != '/') "/" else "";
@@ -2153,6 +2159,22 @@ fn collectRoutes(
         defer alloc.free(full);
         try collectRoutes(child, method, full, alloc, result);
     }
+}
+
+/// Hand one `RouteInfo` over to `result`.
+///
+/// The two copies cannot be built in `collectRoutes`'s argument list (a failed
+/// `path` copy strands `method`, a failed `append` strands both), and a guard
+/// inside `collectRoutes` itself would be equally wrong: the function recurses,
+/// so the guard would still be armed while a child call fails and would then
+/// free an entry `result` already owns. Returning at the hand-over is what lets
+/// the guards die here.
+fn appendRouteInfo(alloc: std.mem.Allocator, result: *std.ArrayList(RouteInfo), method: Method, path: []const u8) !void {
+    const method_copy = try alloc.dupe(u8, method.toString());
+    errdefer alloc.free(method_copy);
+    const path_copy = try alloc.dupe(u8, path);
+    errdefer alloc.free(path_copy);
+    try result.append(alloc, .{ .method = method_copy, .path = path_copy });
 }
 
 /// Parameters captured by a match. Borrowed, not owned: the keys are the trie's
@@ -4587,6 +4609,34 @@ test "integration: router + handler + response" {
         try std.testing.expect(ctx.responded);
         try std.testing.expect(std.mem.indexOf(u8, ctx.response_body.items, "found") != null);
     }
+}
+
+// The entries belong to `listRoutes` until it returns them; a failure inside
+// the walk used to leave the ones already collected unreachable.
+test "router.listRoutes hands back its entries at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    var router = Router.init(allocator);
+    defer router.deinit();
+    try router.addRoute(.{ .method = .GET, .path = "/health", .handler = struct {
+        fn handle(_: *Context) !void {}
+    }.handle });
+    try router.addRoute(.{ .method = .POST, .path = "/users/{id}", .handler = struct {
+        fn handle(_: *Context) !void {}
+    }.handle });
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, r: *const Router) !void {
+            const routes = try r.listRoutes(a);
+            defer {
+                for (routes) |info| {
+                    a.free(info.method);
+                    a.free(info.path);
+                }
+                a.free(routes);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{&router});
 }
 
 test "router listRoutes" {

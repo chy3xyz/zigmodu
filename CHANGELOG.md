@@ -2,6 +2,48 @@
 
 ## [Unreleased]
 
+### 第 93 批：`retriever.add` 与另外 8 处的真漏；`ai_cli` 的 arena 证据；两条门禁的口径写进文档；CI 补两行 env（**破坏性：否**）
+
+1. **真漏，修了 11 处**（全是调用方给的非 arena allocator，没有一处是"已经在守卫里"）：
+   `src/ai/retriever.zig:67`（`add` 的三个拷贝内联在 `append` 实参里 —— 只用测试覆盖、但它是公开
+   API）、`src/api/Server.zig:2145`（`collectRoutes` **递归**，所以拷贝既不能留在实参里也不能挂
+   函数级 errdefer：那个守卫会越过移交点变成双释放；抽成 `appendRouteInfo`；顺带 `listRoutes`
+   补了从来没有的 list 级 errdefer）、`parseSqlSchema`/`colsToOwned`/`parseColumnDef`/`parseColumns`
+   （tools/zmodu）、`doctor.zig` 三处、`runtime.zig` 四处、`market.zig` 的 `buildEntry`（旧代码连
+   **部分填好的 `tags`** 一起漏）。红证据（先加测试、再把修复撤掉）：
+   ```
+   2/3 retriever.test.KeywordRetriever.add hands back its copies at every allocation point (OOM scan)...
+   fail_index: 1/4  allocated 5  freed 0  leaked [len 5]  FAIL (MemoryLeakDetected)
+   ```
+2. **一条语义结论（实测的，不是想当然）**：**循环体里的 `errdefer` 是"每轮作用域"的** —— 三行探针
+   验证：在 i=2 处失败时 i=0/1 的已分配项并没有被释放。所以 `colsToOwned`/`buildEntry` 这类地方
+   必须用"计数式 errdefer"或抽成 helper，**不能**用循环内的 errdefer。这条与第 90 批那条（门禁判据
+   必须对着编译器的答案）是同一类教训。
+3. **`ai_cli.renderOpenApi` 的 arena 证据测试**：加测试时**门禁当场点名**
+   `ai_cli.zig declares 1 test(s); this test binary collects none of them` —— 补上
+   `_ = @import("ai_cli.zig");` 后收集数 133 → 134，测试真的跑起来了（生产代码里 import 它不算数）。
+4. **两条门禁的口径写进文档**：`docs/BEST_PRACTICES.md` 新增 §F —— 仓库侧门禁（`zig-scan.awk` 的
+   两条谓词 + `INLINE_ALLOC_ENFORCED`）是**更严**的那条；b25 刻意更窄（它扫消费方 `src/modules/**`，
+   不含 `*Owned(` 那半，且 needle 要求首参是 allocator 拼写，所以"首参内联"那种形状直接排除在外）；
+   并明确写出**共同的盲点**（`put(try a.dupe(k), try a.dupe(v))` 两条都看不见），免得有人把"更严"
+   读成"完备"。b25 的注释块与 `AGENTS.md`（照 b10 那条的样式）同步。
+5. **CI 补两行**（`.github/workflows/ci.yml`）：`ZMODU_TEST_PG_URL` / `ZMODU_TEST_MYSQL_URL` 分别加进
+   两个 job 的测试 step。**有一处刻意偏离**：PG 的 DSN **不带密码** —— `introspectDatabasePostgres`
+   忽略 DSN 里的密码（`_: []const u8`），它 shell 出 `psql -h -U -d`，密码由那个 job 既有的
+   `PGPASSWORD` 提供；URL 里写密码在这个路径上是死字。MySQL 那条**必须**带密码（那条路径真的传
+   `-p<pass>`）。**这部分本机无法验证，下一次 CI 跑就是证据。**
+
+读数：`check-test-collection` 两行 OK（`tools/zmodu` 146/148，2 skip = 那两条门控）；全量
+**2186/2247 passed · 61 skipped · 0 failed**；`check-production` / `fmt` 全 OK。
+
+**一条要追的观察**：这次全量 `skipped=61`，而上一批刚做的"打印被跳过的测试名"**在全量输出里没有
+出现**（`test-fast.sh` 的聚合路径把每个 binary 的 `zm-test-runner:` 行吃掉了/没回显）—— 也就是说
+这个功能目前只在**单 binary 过滤跑**时可见。61（而不是 60）多出来的那一条因此仍然定位不到。
+
+**未做**：`market.zig:63` `dupEntry`（同一类两处：tags 循环部分失败 + `return .{…}` 字面量后段
+失败）、`market.zig:100` 的 `append(…, try dupEntry(…))`；`doctor.zig:249` 与 `runtime.zig:494/513`
+的 FS-walk 形态没有独立扫描（同文件同形状的谓词已被现有扫描覆盖）。
+
 ### 第 92 批：runner 打印被跳过的测试名；DB 内省的活库测试（含一条真跑的 sqlite 往返）；`extractForeignKeys` 的真漏（**破坏性：否**）
 
 1. **`scripts/test-runner.zig` 现在打印被跳过的测试名**（此前只有计数，"skipped 从 58 变 59"永远只能猜）：

@@ -251,6 +251,7 @@ pub fn deinit() void {}  // reverse order
 ### Error handling
 - Use `ZigModuError` from `zmodu.ZigModuError` (NOT raw `error{...}`)
 - Log errors — never **swallow** a failure you depend on. `catch {}` on an I/O or DB call whose result the rest of the code needs is a violation (audit `b10`); on *best-effort cleanup* — `errdefer` teardown, a `rollback` you can no longer act on, `sendError` writing to an already-failing response — the original error is what matters and the cleanup failure is secondary, so a bare `catch {}` is idiomatic there. **但两条链的口径不同，别只看这一条**：`zmodu audit` 的 b10 豁免是**整行子串匹配** `errdefer` / `rollback` / `sendError`（行尾注释、`self.rollback_cmd`、`self.sendError_queue.peek()` 这类同名列同样会被豁免——实测如此），`// audit: ignore b10` 也必须与该行同处一行；而 `zig build check` 的 hot-path catch 扫描（`scripts/check-production.sh`）**不豁免这三类、也没有 ignore 标记**，在它 `ENFORCED_PREFIXES` 下的生产代码里写这三种形状照样判红。要两边都过就按扫描器的口径写：`catch |err|` + 非空 body（清理场景可以只降级成 debug 日志）。
+- 「分配后失败即丢」（inline alloc）同样有两条链，且**仓库侧那条更严**：`scripts/lib/zig-scan.awk` 的 `inline_alloc` + `inline_alloc_owned`（经 `check-production.sh` 的 `INLINE_ALLOC_ENFORCED` **强制**，exit 非 0）比 `zmodu audit` 的 **b25** 多认半条 —— `*Owned(` 交接 helper 上的内联分配；b25 只扫消费方应用代码（`src/modules/**`），且不含那半条（`putOwned` 是框架内部名）。两条共同盲区：**首参本身内联**的写法（`put(try dupe(k), try dupe(v))`）都看不见。细则见 `docs/BEST_PRACTICES.md`「实践 ↔ 门禁一致性」§F。
 - Use `zmodu.Result(T)` for fallible operations
 
 ### Security

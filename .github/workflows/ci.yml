@@ -620,6 +620,11 @@ jobs:
           # service container below has no TLS. Production keeps the secure
           # default; this only relaxes the throwaway test database.
           ZIGMODU_TEST_PG: "1"
+          # Enables the `zmodu introspectDatabasePostgres` live round-trip in
+          # tools/zmodu/src/main.zig. The DSN deliberately carries no password:
+          # that test shells out to `psql`, which takes the password from
+          # PGPASSWORD above (the DSN's password field is unused on this path).
+          ZMODU_TEST_PG_URL: postgres://postgres@localhost:5432/postgres
           PGSSLMODE: disable
           PGHOST: localhost
           PGPORT: "5432"
@@ -685,6 +690,12 @@ jobs:
           MYSQL_USER: root
           MYSQL_PASSWORD: secret
           MYSQL_DATABASE: zigzero_test
+          # Enables the `zmodu introspectDatabaseMysql` live round-trip in
+          # tools/zmodu/src/main.zig. Unlike the postgres path, that one passes
+          # `-p<pass>` to the CLI, so the password has to be in the DSN —
+          # matched to this job's service container (root / secret /
+          # zigzero_test on 3306).
+          ZMODU_TEST_MYSQL_URL: mysql://root:secret@127.0.0.1:3306/zigzero_test
         run: |
           bash scripts/ci-run-logged.sh "$RUNNER_TEMP/mysql-test.log" zig build test --test-timeout 300s
 

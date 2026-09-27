@@ -65,11 +65,13 @@ pub const KeywordRetriever = struct {
     }
 
     pub fn add(self: *KeywordRetriever, id: []const u8, text: []const u8, source: []const u8) !void {
-        try self.docs.append(self.allocator, .{
-            .id = try self.allocator.dupe(u8, id),
-            .text = try self.allocator.dupe(u8, text),
-            .source = if (source.len > 0) try self.allocator.dupe(u8, source) else "",
-        });
+        const id_copy = try self.allocator.dupe(u8, id);
+        errdefer self.allocator.free(id_copy);
+        const text_copy = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(text_copy);
+        const source_copy = if (source.len > 0) try self.allocator.dupe(u8, source) else "";
+        errdefer if (source_copy.len > 0) self.allocator.free(source_copy);
+        try self.docs.append(self.allocator, .{ .id = id_copy, .text = text_copy, .source = source_copy });
     }
 
     pub fn asRetriever(self: *KeywordRetriever) Retriever {
@@ -157,6 +159,22 @@ test "KeywordRetriever.retrieve hands back its chunks at every allocation point 
         }
     };
     try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{&kr});
+}
+
+// `add` copies into the retriever's own allocator, which the caller chooses
+// (not an arena), so a failure after the `id` copy must hand it back.
+test "KeywordRetriever.add hands back its copies at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var kr = KeywordRetriever.init(a);
+            defer kr.deinit();
+            try kr.add("doc-1", "Order 42 ships tomorrow", "orders");
+            try std.testing.expectEqual(@as(usize, 1), kr.docs.items.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{});
 }
 
 test "KeywordRetriever retrieve and format" {

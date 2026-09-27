@@ -986,6 +986,10 @@ const tests_in_other_artifacts = [_][]const u8{
 // green suite that ran nothing. See src/test/TestCollection.zig for the
 // mechanism and its limits.
 test "test-collection gate: every source file with tests is collected" {
+    // `ai_cli.zig` is imported and used by production code, which the gate
+    // documents as *not* enough to collect a file's tests — its test body is
+    // pulled in here instead.
+    _ = @import("ai_cli.zig");
     try test_collection.assertAllCollected(std.testing.io, std.testing.allocator, .{
         .label = "tools/zmodu/src",
         .root_candidates = &.{ "tools/zmodu/src", "src" },
@@ -2517,6 +2521,8 @@ fn parseColumnDef(allocator: std.mem.Allocator, text: []const u8) !ColumnDef {
     }
 
     const name = try parseIdentifier(allocator, text, &i);
+    // The row's first owned string: every step below can still fail.
+    errdefer allocator.free(name);
     skipWhitespaceAndComments(text, &i);
     const col_type = parseColumnTypeName(text, &i);
 
@@ -2550,13 +2556,20 @@ fn parseColumnDef(allocator: std.mem.Allocator, text: []const u8) !ColumnDef {
             comment = try allocator.dupe(u8, text[cstart..ci]);
         }
     }
+    errdefer if (comment) |cm| allocator.free(cm);
 
     return ColumnDef{ .name = name, .col_type = col_type, .nullable = nullable, .is_primary_key = is_primary_key, .is_unique = is_unique, .has_default = has_default, .comment = comment };
 }
 
 fn parseColumns(allocator: std.mem.Allocator, text: []const u8, i: *usize) ![]ColumnDef {
     var cols: std.ArrayList(ColumnDef) = std.ArrayList(ColumnDef).empty;
-    defer cols.deinit(allocator);
+    // Rows already appended own their strings, so unwinding frees each row's
+    // contents plus the list's backing array (same shape as
+    // `introspectDatabasePostgres`).
+    errdefer {
+        for (cols.items) |c| freeColumnDef(allocator, c);
+        cols.deinit(allocator);
+    }
     var depth: usize = 0;
     var in_single_quote: bool = false;
     var in_double_quote: bool = false;
@@ -2573,7 +2586,12 @@ fn parseColumns(allocator: std.mem.Allocator, text: []const u8, i: *usize) ![]Co
                 if (depth == 0) {
                     if (i.* > start) {
                         const col = try parseColumnDef(allocator, text[start..i.*]);
-                        if (col.name.len > 0) try cols.append(allocator, col) else allocator.free(col.name);
+                        if (col.name.len == 0) {
+                            allocator.free(col.name);
+                        } else {
+                            errdefer freeColumnDef(allocator, col);
+                            try cols.append(allocator, col);
+                        }
                     }
                     i.* += 1;
                     skipWhitespaceAndComments(text, i);
@@ -2585,7 +2603,12 @@ fn parseColumns(allocator: std.mem.Allocator, text: []const u8, i: *usize) ![]Co
             }
             if (c == ',' and depth == 0) {
                 const col = try parseColumnDef(allocator, text[start..i.*]);
-                if (col.name.len > 0) try cols.append(allocator, col) else allocator.free(col.name);
+                if (col.name.len == 0) {
+                    allocator.free(col.name);
+                } else {
+                    errdefer freeColumnDef(allocator, col);
+                    try cols.append(allocator, col);
+                }
                 i.* += 1;
                 start = i.*;
                 continue;
@@ -2629,7 +2652,13 @@ fn markPrimaryKeyColumns(allocator: std.mem.Allocator, sql: []const u8, body_sta
 
 pub fn parseSqlSchema(allocator: std.mem.Allocator, sql: []const u8) ![]TableDef {
     var tables: std.ArrayList(TableDef) = std.ArrayList(TableDef).empty;
-    defer tables.deinit(allocator);
+    // Rows already appended own their strings, so unwinding frees each row's
+    // contents plus the list's backing array (same shape as
+    // `introspectDatabasePostgres`).
+    errdefer {
+        for (tables.items) |t| freeTableDefContents(allocator, t);
+        tables.deinit(allocator);
+    }
     var i: usize = 0;
     while (i < sql.len) {
         skipWhitespaceAndComments(sql, &i);
@@ -2643,8 +2672,10 @@ pub fn parseSqlSchema(allocator: std.mem.Allocator, sql: []const u8) ![]TableDef
                     i += 1;
                     const body_start = i;
                     const columns = try parseColumns(allocator, sql, &i);
+                    errdefer freeColumnDefs(allocator, columns);
                     const body_end = i;
                     const fks = try extractForeignKeys(allocator, sql, body_start, body_end);
+                    errdefer freeForeignKeyDefs(allocator, fks);
                     // Mark table-level PRIMARY KEY columns
                     markPrimaryKeyColumns(allocator, sql, body_start, body_end, columns);
                     try tables.append(allocator, .{ .name = table_name, .columns = columns, .foreign_keys = fks });
@@ -3225,18 +3256,35 @@ fn introspectDatabasePostgres(io: std.Io, allocator: std.mem.Allocator, host: []
 
 fn colsToOwned(allocator: std.mem.Allocator, cols: std.ArrayList(ColumnDef)) ![]ColumnDef {
     const result = try allocator.alloc(ColumnDef, cols.items.len);
+    errdefer allocator.free(result);
+    var done: usize = 0;
+    // Rows already built own their strings; the counter is what releases them
+    // when a later row (or the return) fails — an `errdefer` in the loop body
+    // is gone as soon as its own iteration ends.
+    errdefer for (result[0..done]) |c| freeColumnDef(allocator, c);
     for (cols.items, 0..) |c, i| {
-        result[i] = .{
-            .name = try allocator.dupe(u8, c.name),
-            .col_type = c.col_type,
-            .nullable = c.nullable,
-            .has_default = c.has_default,
-            .is_primary_key = c.is_primary_key,
-            .is_unique = c.is_unique,
-            .comment = if (c.comment) |com| try allocator.dupe(u8, com) else null,
-        };
+        result[i] = try ownedColumnDef(allocator, c);
+        done = i + 1;
     }
     return result;
+}
+
+/// Copy one column row's owned strings. Function-scoped guards, so a failed
+/// second copy cannot strand the first.
+fn ownedColumnDef(allocator: std.mem.Allocator, c: ColumnDef) !ColumnDef {
+    const name = try allocator.dupe(u8, c.name);
+    errdefer allocator.free(name);
+    const comment = if (c.comment) |com| try allocator.dupe(u8, com) else null;
+    errdefer if (comment) |cm| allocator.free(cm);
+    return .{
+        .name = name,
+        .col_type = c.col_type,
+        .nullable = c.nullable,
+        .has_default = c.has_default,
+        .is_primary_key = c.is_primary_key,
+        .is_unique = c.is_unique,
+        .comment = comment,
+    };
 }
 
 /// `mysql` invocation arguments, owning every element — so `deinit` is a
@@ -10008,6 +10056,38 @@ test "formatNestTuple splits module path" {
     try std.testing.expectEqualStrings(".{ \"shop\", \"order\" }", nested);
 }
 
+test "colsToOwned copies every row at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    const Scan = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var cols: std.ArrayList(ColumnDef) = .empty;
+            defer cols.deinit(a);
+            try cols.append(a, .{
+                .name = "id",
+                .col_type = .int,
+                .nullable = false,
+                .is_primary_key = true,
+                .is_unique = true,
+                .has_default = false,
+                .comment = null,
+            });
+            try cols.append(a, .{
+                .name = "name",
+                .col_type = .string,
+                .nullable = true,
+                .is_primary_key = false,
+                .is_unique = false,
+                .has_default = true,
+                .comment = "display name",
+            });
+            const owned = try colsToOwned(a, cols);
+            defer freeColumnDefs(a, owned);
+            try std.testing.expectEqual(@as(usize, 2), owned.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{});
+}
+
 test "renderMigrationSql emits CREATE/ALTER/DROP statements" {
     const allocator = std.testing.allocator;
     const old_tables = [_]TableDef{
@@ -10502,6 +10582,32 @@ test "parseOrmCli: missing value after --out" {
     const r = parseOrmCli(&a);
     try std.testing.expect(r == .err_missing_value);
     try std.testing.expectEqualStrings("--out", r.err_missing_value);
+}
+
+// The schema tests below hand `parseSqlSchema` an arena, which hides a stranded
+// row; this one runs it on the testing allocator itself, failing at every
+// allocation point.
+test "parseSqlSchema frees every row it built at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    const sql =
+        \\CREATE TABLE users (
+        \\    id INTEGER PRIMARY KEY,
+        \\    name TEXT NOT NULL,
+        \\    shop_id INTEGER REFERENCES shops(id)
+        \\);
+        \\CREATE TABLE shops (
+        \\    shop_id INTEGER PRIMARY KEY,
+        \\    label TEXT
+        \\);
+    ;
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, schema: []const u8) !void {
+            const tables = try parseSqlSchema(a, schema);
+            defer freeTableDefs(a, tables);
+            try std.testing.expectEqual(@as(usize, 2), tables.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{sql});
 }
 
 test "parseSqlSchema: no CREATE TABLE yields empty list" {

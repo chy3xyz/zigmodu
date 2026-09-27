@@ -908,10 +908,19 @@ fn lintFile(
         // putJsonField / appendOwnedString / appendEntry) and append/put last.
         // The consuming helpers never match: they are not spelled `.append(`
         // / `.put(` (see inlineAllocIntoFallibleCall for the exact 口径).
-        // check-production's scan carries a second half that b25 deliberately
-        // does not: an inline allocation as an argument of a `*Owned(`
-        // hand-over helper — `putOwned` is a framework-internal name that app
-        // code has no equivalent of (see inline_alloc_owned in zig-scan.awk).
+        //
+        // Deliberately the narrower of the two gates that look for this shape.
+        // b25 runs over **consumer app code** (`src/modules/**`), and its
+        // needle requires the *first* argument to be an allocator spelling, so
+        // a first-argument-inline `put(try dupe(k), try dupe(v))` is excluded
+        // outright. The stricter gate is the repo-side scan
+        // (`scripts/lib/zig-scan.awk`): `inline_alloc` matches b25's narrow
+        // shape, and `inline_alloc_owned` additionally catches an inline
+        // allocation handed to a `*Owned(` helper — `putOwned` is a
+        // framework-internal name app code has no equivalent of, which is why
+        // b25 leaves that half out. That gate is also the enforced one
+        // (`check-production.sh`, `INLINE_ALLOC_ENFORCED`), while b25 reports
+        // through `.zmodu/audit-baseline.json`.
         if (!config.disabled.contains("b25")) {
             if (inlineAllocIntoFallibleCall(trimmed)) {
                 try pushViolation(violations, allocator, "b25", rel_path, idx, "把分配直接写在 fallible append/put 的实参里 —— 外层调用一旦失败，内层刚分配的值无人持有即泄漏。先把分配绑到带 errdefer 的局部值（或走会接管失败的 helper：putJsonField / appendOwnedString / appendEntry），append/put 放最后；确属误报在同一行加 // audit: ignore b25 并注明缘由", .{});

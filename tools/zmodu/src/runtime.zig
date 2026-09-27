@@ -491,10 +491,11 @@ fn collectSources(io: Io, allocator: std.mem.Allocator, project_dir: []const u8,
                     if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
                     const content = entry.dir.readFileAlloc(io, entry.basename, allocator, Io.Limit.limited(max_file_bytes)) catch continue;
                     errdefer allocator.free(content);
-                    try out.append(allocator, .{
-                        .path = try std.fs.path.join(allocator, &.{ "src", entry.path }),
-                        .content = content,
-                    });
+                    // Copies leave the argument list so a failed append cannot
+                    // strand them: each guard dies with this iteration.
+                    const path = try std.fs.path.join(allocator, &.{ "src", entry.path });
+                    errdefer allocator.free(path);
+                    try out.append(allocator, .{ .path = path, .content = content });
                 },
                 else => {},
             }
@@ -510,10 +511,9 @@ fn collectSources(io: Io, allocator: std.mem.Allocator, project_dir: []const u8,
         if (std.mem.startsWith(u8, entry.name, "build")) continue;
         const content = root.readFileAlloc(io, entry.name, allocator, Io.Limit.limited(max_file_bytes)) catch continue;
         errdefer allocator.free(content);
-        try out.append(allocator, .{
-            .path = try allocator.dupe(u8, entry.name),
-            .content = content,
-        });
+        const path = try allocator.dupe(u8, entry.name);
+        errdefer allocator.free(path);
+        try out.append(allocator, .{ .path = path, .content = content });
     }
 }
 
@@ -567,13 +567,19 @@ fn analyzeSource(
             // the mode, and this scan does not fill that in.
             const config = parseSpawnConfig(arg2);
             const cap_expr: ?[]const u8 = if (config) |c| c.capacity_expr else arg2;
+            const type_copy = try allocator.dupe(u8, type_name);
+            errdefer allocator.free(type_copy);
+            const cap_expr_copy = if (cap_expr) |e| try allocator.dupe(u8, e) else null;
+            errdefer if (cap_expr_copy) |e| allocator.free(e);
+            const file_copy = try allocator.dupe(u8, rel);
+            errdefer allocator.free(file_copy);
             try out.workers.append(allocator, .{
                 .kind = n.kind,
-                .type_name = try allocator.dupe(u8, type_name),
-                .capacity_expr = if (cap_expr) |e| try allocator.dupe(u8, e) else null,
+                .type_name = type_copy,
+                .capacity_expr = cap_expr_copy,
                 .capacity = if (cap_expr) |e| resolveCapacity(allocator, sources, index, e) else null,
                 .mode = if (config) |c| c.mode else null,
-                .file = try allocator.dupe(u8, rel),
+                .file = file_copy,
                 .line = lineOf(content, at),
             });
         }
@@ -1323,6 +1329,25 @@ fn writeJsonString(value: []const u8, w: anytype) !void {
 // ─────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────
+
+test "analyzeSource hands every record to its Report at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\pub fn init() !void {
+        \\    risk = try rt.spawn(Risk, .{}, 256);
+        \\    audit = try rt.spawnActor(Audit, .{}, 64, .{ .max_errors = 3 });
+        \\}
+    ;
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, content: []const u8) !void {
+            const sources = [_]Source{.{ .path = "src/main.zig", .content = content }};
+            var report = Report{};
+            defer report.deinit(a);
+            try analyzeSource(a, &sources, 0, &report);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{src});
+}
 
 test "runtime reads worker type names and mailbox capacities out of source" {
     const allocator = std.testing.allocator;

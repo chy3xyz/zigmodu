@@ -514,6 +514,16 @@ std.Io.Dir.cwd().rename(self.io, old_name, new_name)   // 0.17 之前的签名
 
 **同批收尾**：`check-production.sh` 的强制前缀补 `src/log/`、`src/runtime/`（此前只剩 3 条 WARN）；`zig build zmodu` 现在**同时安装**二进制（此前只 build+run，`zig-out/bin/zmodu` 会静默留着旧的，调用方驱动到陈旧 CLI）；`http.Testkit` 删掉查询解析的手工孪生实现，改为直接调 `Server.zig` 的 `parseQueryInto`（现在两边**不可能**再漂移）。
 
+**F. 同一形状、两条门禁，宽严不同：inline alloc 只有**仓库侧**那条是强制的**
+
+`zmodu audit` 的 **b25** 与 `zig build check` 的 inline-allocation 扫描（`scripts/lib/zig-scan.awk` 的 `inline_alloc` / `inline_alloc_owned`，由 `scripts/check-production.sh` 驱动）查的是同一类缺陷 —— 把新鲜分配直接写进 fallible `append`/`put` 的实参，外层调用一失败，内层刚分配的值就无人持有。**两者不互为镜像：仓库侧那条更严**，差在三处：
+
+- **谓词多一半**：`inline_alloc` 与 b25 同形（`.append(` / `.put(` + 首参是分配器拼写 + 次参 `try <分配器>.<分配调用>(`）；`inline_alloc_owned` 另认以 `*Owned(` 收尾的交接 helper —— `putOwned(&o, a, "k", .{ .string = try a.dupe(u8, v) })`。
+- **b25 故意不带那半条**：它的扫描对象是**消费方应用代码**（`src/modules/**`），而 `putOwned` 是框架内部名，应用侧没有对应物。
+- **落点与效力不同**：`check-production.sh` 扫框架自身源码，并在 `INLINE_ALLOC_ENFORCED`（`src/ai/` `src/core/` `src/http/` `src/messaging/` `src/migration/` `src/security/` `tools/zmodu/src/`）下**强制**（exit 非 0），其余前缀只警告；b25 的结论走 `.zmodu/audit-baseline.json`。
+
+**共同的盲区（别读成「仓库侧全包」）**：两条都是行形状，都只看单行调用；`inline_alloc` 与 b25 还都要求**首参**是分配器拼写，`inline_alloc_owned` 则要求被调名以 `*Owned(` 收尾 —— 于是 `put(try a.dupe(k), try a.dupe(v))` 这类**首参本身就内联**的写法，两边都看不见。`zig-scan.awk` 的契约注释把这一点写成"偏向沉默"的已知盲区；b25 的针同样把该形状排除在外（`inlineAllocIntoFallibleCall` 先要求首参是 `allocator` / `alloc` / `self.allocator`）。
+
 ## 🚀 渐进式架构演进路线图
 
 ZigModu 核心设计理念：**从单体部署到分布式集群，随着用户规模增长平滑演进**。

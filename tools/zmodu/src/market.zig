@@ -221,25 +221,56 @@ fn parseCatalog(allocator: std.mem.Allocator, content: []const u8) !Catalog {
     errdefer catalog.deinit();
     for (entries_v.array.items) |ev| {
         if (ev != .object) return error.InvalidCatalog;
-        const tags_v = ev.object.get("tags") orelse return error.InvalidCatalog;
-        const tags = try allocator.alloc([]const u8, tags_v.array.items.len);
-        errdefer allocator.free(tags);
-        for (tags_v.array.items, 0..) |t, i| {
-            tags[i] = try allocator.dupe(u8, t.string);
-        }
-        try catalog.entries.append(allocator, .{
-            .id = try allocator.dupe(u8, ev.object.get("id").?.string),
-            .name = try allocator.dupe(u8, ev.object.get("name").?.string),
-            .kind = try allocator.dupe(u8, ev.object.get("kind").?.string),
-            .path = if (ev.object.get("path")) |p| (if (p == .string) try allocator.dupe(u8, p.string) else null) else null,
-            .summary = try allocator.dupe(u8, ev.object.get("summary").?.string),
-            .tags = tags,
-            .min_version = try allocator.dupe(u8, ev.object.get("min_version").?.string),
-            .doc = if (ev.object.get("doc")) |d| (if (d == .string) try allocator.dupe(u8, d.string) else null) else null,
-            .status = if (ev.object.get("status")) |s| (if (s == .string) try allocator.dupe(u8, s.string) else null) else null,
-        });
+        var entry = try buildEntry(allocator, ev);
+        errdefer entry.deinit(allocator);
+        try catalog.entries.append(allocator, entry);
     }
     return catalog;
+}
+
+/// Build one row's worth of owned copies (tags included). Every guard lives in
+/// this function, so none of them can outlive the hand-over to
+/// `catalog.entries`; a value left in the caller's argument list would be
+/// stranded by a later copy or by the append.
+fn buildEntry(allocator: std.mem.Allocator, ev: std.json.Value) !Entry {
+    const tags_v = ev.object.get("tags") orelse return error.InvalidCatalog;
+    const tags = try allocator.alloc([]const u8, tags_v.array.items.len);
+    errdefer allocator.free(tags);
+    var done: usize = 0;
+    errdefer for (tags[0..done]) |t| allocator.free(t);
+    for (tags_v.array.items, 0..) |t, i| {
+        tags[i] = try allocator.dupe(u8, t.string);
+        done = i + 1;
+    }
+
+    const id = try allocator.dupe(u8, ev.object.get("id").?.string);
+    errdefer allocator.free(id);
+    const name = try allocator.dupe(u8, ev.object.get("name").?.string);
+    errdefer allocator.free(name);
+    const kind = try allocator.dupe(u8, ev.object.get("kind").?.string);
+    errdefer allocator.free(kind);
+    const path = if (ev.object.get("path")) |p| (if (p == .string) try allocator.dupe(u8, p.string) else null) else null;
+    errdefer if (path) |p| allocator.free(p);
+    const summary = try allocator.dupe(u8, ev.object.get("summary").?.string);
+    errdefer allocator.free(summary);
+    const min_version = try allocator.dupe(u8, ev.object.get("min_version").?.string);
+    errdefer allocator.free(min_version);
+    const doc = if (ev.object.get("doc")) |d| (if (d == .string) try allocator.dupe(u8, d.string) else null) else null;
+    errdefer if (doc) |d| allocator.free(d);
+    const status = if (ev.object.get("status")) |s| (if (s == .string) try allocator.dupe(u8, s.string) else null) else null;
+    errdefer if (status) |s| allocator.free(s);
+
+    return .{
+        .id = id,
+        .name = name,
+        .kind = kind,
+        .path = path,
+        .summary = summary,
+        .tags = tags,
+        .min_version = min_version,
+        .doc = doc,
+        .status = status,
+    };
 }
 
 fn matches(e: *const Entry, q: []const u8) bool {
@@ -464,6 +495,26 @@ fn printEntries(stdout: anytype, entries: []const Entry, query: ?[]const u8, jso
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────
+
+// The entries are the catalog's to free only once `parseCatalog` returns them;
+// a failure while a later row is built used to strand the ones before it.
+test "parseCatalog hands every entry to the catalog at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"entries":[
+        \\  {"id":"a/b","name":"B","kind":"example","summary":"s","tags":["x","y"],"min_version":"0.1.0"},
+        \\  {"id":"c/d","name":"D","kind":"plugin","path":"p","summary":"t","tags":[],"min_version":"0.2.0","doc":"d","status":"stable"}
+        \\]}
+    ;
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, content: []const u8) !void {
+            var catalog = try parseCatalog(a, content);
+            defer catalog.deinit();
+            try std.testing.expectEqual(@as(usize, 2), catalog.entries.items.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{json});
+}
 
 test "market parses embedded catalog" {
     const allocator = std.testing.allocator;

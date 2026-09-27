@@ -202,3 +202,25 @@ fn writeFile(io: std.Io, path: []const u8, data: []const u8) !void {
     defer file.close(io);
     try file.writeStreamingAll(io, data);
 }
+
+// Every allocation `renderOpenApi` makes after parsing the catalog goes on the
+// per-call arena (`a`), so the inline `a.dupe(…)` keys are not the "no owner
+// when the outer call fails" class the inline-allocation rule chases: a failed
+// `put` can only strand memory the arena still owns, and `defer arena.deinit()`
+// releases it (only the parse and the final stringify touch the caller's
+// allocator, and both are freed or returned). This scan is that claim, at every
+// allocation point, on the testing allocator itself.
+test "renderOpenApi is arena-bounded at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    const catalog = try renderSkillsJson(allocator);
+    defer allocator.free(catalog);
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, json: []const u8) !void {
+            const doc = try renderOpenApi(a, json);
+            defer a.free(doc);
+            try std.testing.expect(std.mem.indexOf(u8, doc, "\"/skills/db.query\"") != null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{catalog});
+}

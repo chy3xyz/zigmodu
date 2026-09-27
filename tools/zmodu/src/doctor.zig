@@ -246,10 +246,16 @@ fn scanEntanglements(
                 }
                 if (skip) continue;
 
+                const from_module = try allocator.dupe(u8, mod.name);
+                errdefer allocator.free(from_module);
+                const to_module = try allocator.dupe(u8, target_module);
+                errdefer allocator.free(to_module);
+                const file = try std.fs.path.join(allocator, &.{ "src", "modules", mod.name, entry.path });
+                errdefer allocator.free(file);
                 try out.append(allocator, .{
-                    .from_module = try allocator.dupe(u8, mod.name),
-                    .to_module = try allocator.dupe(u8, target_module),
-                    .file = try std.fs.path.join(allocator, &.{ "src", "modules", mod.name, entry.path }),
+                    .from_module = from_module,
+                    .to_module = to_module,
+                    .file = file,
                     .line = line_no,
                 });
             }
@@ -447,8 +453,10 @@ fn scanWiringSource(allocator: std.mem.Allocator, rel_file: []const u8, content:
         const file = try allocator.dupe(u8, rel_file);
         errdefer allocator.free(file);
         if (stringArgAt(content, at)) |name| {
+            const name_copy = try allocator.dupe(u8, name);
+            errdefer allocator.free(name_copy);
             try out.declarations.append(allocator, .{
-                .name = try allocator.dupe(u8, name),
+                .name = name_copy,
                 .file = file,
                 .line = lineOf(content, at),
             });
@@ -464,9 +472,13 @@ fn scanWiringSource(allocator: std.mem.Allocator, rel_file: []const u8, content:
         const file = try allocator.dupe(u8, rel_file);
         errdefer allocator.free(file);
         if (stringArgAt(content, at)) |name| {
+            const name_copy = try allocator.dupe(u8, name);
+            errdefer allocator.free(name_copy);
+            const module_copy = try allocator.dupe(u8, module);
+            errdefer allocator.free(module_copy);
             try out.services.append(allocator, .{
-                .name = try allocator.dupe(u8, name),
-                .module = try allocator.dupe(u8, module),
+                .name = name_copy,
+                .module = module_copy,
                 .file = file,
                 .line = lineOf(content, at),
             });
@@ -483,10 +495,16 @@ fn scanWiringSource(allocator: std.mem.Allocator, rel_file: []const u8, content:
             out.blind_bus_calls += 1;
             continue;
         };
+        const event_copy = try allocator.dupe(u8, event);
+        errdefer allocator.free(event_copy);
+        const module_copy = try allocator.dupe(u8, module);
+        errdefer allocator.free(module_copy);
+        const file_copy = try allocator.dupe(u8, rel_file);
+        errdefer allocator.free(file_copy);
         try out.events.append(allocator, .{
-            .event = try allocator.dupe(u8, event),
-            .module = try allocator.dupe(u8, module),
-            .file = try allocator.dupe(u8, rel_file),
+            .event = event_copy,
+            .module = module_copy,
+            .file = file_copy,
             .line = lineOf(content, at),
             .publishes = publishes,
             .subscribes = subscribes,
@@ -773,6 +791,26 @@ fn renderJson(
 // ─────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────
+
+test "scanWiringSource hands every record to its Wiring at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\pub fn initWith(ctx: *zmodu.ModuleContext) !void {
+        \\    const db = ctx.service(Db, "db") orelse return error.MissingService;
+        \\    try ctx.withService(Cache, "cache", &cache);
+        \\    const bus = try ctx.eventBus(Tick);
+        \\    _ = .{ db, bus };
+        \\}
+    ;
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, rel: []const u8, content: []const u8) !void {
+            var wiring = Wiring{};
+            defer wiring.deinit(a);
+            try scanWiringSource(a, rel, content, &wiring);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{ "src/modules/order/module.zig", src });
+}
 
 test "moduleOfImport finds the module name behind any number of .." {
     try std.testing.expectEqualStrings("billing", moduleOfImport("../billing/x.zig").?);
