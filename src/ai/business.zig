@@ -201,18 +201,36 @@ pub fn registerBusinessSkillsWith(
                 var cursor = try b.client.queryCursorEx(effective_sql, args_list.items, .{});
                 defer cursor.deinit();
 
-                var rows = std.json.Array.init(ctx.allocator);
                 var count: usize = 0;
-                while (try cursor.next()) |row| {
-                    if (count >= limit) break;
-                    try rows.append(try rowToJson(row, ctx.allocator));
-                    count += 1;
-                }
+                const rows = blk: {
+                    var list = std.json.Array.init(ctx.allocator);
+                    // Covers the rows already placed when a later row (or the
+                    // append handing one over) fails; the `break` is the
+                    // hand-over and disarms it — a guard that lived past this
+                    // block would free what `out` is about to own.
+                    errdefer freeValue(ctx.allocator, .{ .array = list });
+                    while (try cursor.next()) |row| {
+                        if (count >= limit) break;
+                        const tree = try rowToJson(row, ctx.allocator);
+                        // Freed only when its own append fails: the loop body
+                        // ends right after the hand-over, so the guard is gone
+                        // exactly when `list` takes ownership of the row.
+                        errdefer freeValue(ctx.allocator, tree);
+                        try list.append(tree);
+                        count += 1;
+                    }
+                    break :blk list;
+                };
                 var out = std.json.ObjectMap{};
-                // Keys must be allocator-owned: freeValue releases every key,
-                // and ObjectMap.put stores keys by reference (no copy).
-                try out.put(ctx.allocator, try ctx.allocator.dupe(u8, "rows"), .{ .array = rows });
-                try out.put(ctx.allocator, try ctx.allocator.dupe(u8, "count"), .{ .integer = @intCast(count) });
+                // `out` owns every key and value placed from here; the guard is
+                // disarmed by the `return` that hands the tree to the caller.
+                errdefer freeValue(ctx.allocator, .{ .object = out });
+                // putJsonField copies the key itself and consumes the array
+                // even when the put fails — a key dupe built as the `put`
+                // argument was stranded whenever the map refused the field, and
+                // the whole rows tree went with it.
+                try putJsonField(ctx.allocator, &out, "rows", .{ .array = rows });
+                try putJsonField(ctx.allocator, &out, "count", .{ .integer = @intCast(count) });
                 return .{ .object = out };
             }
         }.h,
@@ -323,18 +341,36 @@ pub fn registerBusinessSkillsWith(
                 var cursor = try b.client.queryCursorEx(sql_buf.items, args_list.items, .{});
                 defer cursor.deinit();
 
-                var rows = std.json.Array.init(ctx.allocator);
                 var count: usize = 0;
-                while (try cursor.next()) |row| {
-                    if (count >= limit) break;
-                    try rows.append(try rowToJson(row, ctx.allocator));
-                    count += 1;
-                }
+                const rows = blk: {
+                    var list = std.json.Array.init(ctx.allocator);
+                    // Covers the rows already placed when a later row (or the
+                    // append handing one over) fails; the `break` is the
+                    // hand-over and disarms it — a guard that lived past this
+                    // block would free what `out` is about to own.
+                    errdefer freeValue(ctx.allocator, .{ .array = list });
+                    while (try cursor.next()) |row| {
+                        if (count >= limit) break;
+                        const tree = try rowToJson(row, ctx.allocator);
+                        // Freed only when its own append fails: the loop body
+                        // ends right after the hand-over, so the guard is gone
+                        // exactly when `list` takes ownership of the row.
+                        errdefer freeValue(ctx.allocator, tree);
+                        try list.append(tree);
+                        count += 1;
+                    }
+                    break :blk list;
+                };
                 var out = std.json.ObjectMap{};
-                // Keys must be allocator-owned: freeValue releases every key,
-                // and ObjectMap.put stores keys by reference (no copy).
-                try out.put(ctx.allocator, try ctx.allocator.dupe(u8, "rows"), .{ .array = rows });
-                try out.put(ctx.allocator, try ctx.allocator.dupe(u8, "count"), .{ .integer = @intCast(count) });
+                // `out` owns every key and value placed from here; the guard is
+                // disarmed by the `return` that hands the tree to the caller.
+                errdefer freeValue(ctx.allocator, .{ .object = out });
+                // putJsonField copies the key itself and consumes the array
+                // even when the put fails — a key dupe built as the `put`
+                // argument was stranded whenever the map refused the field, and
+                // the whole rows tree went with it.
+                try putJsonField(ctx.allocator, &out, "rows", .{ .array = rows });
+                try putJsonField(ctx.allocator, &out, "count", .{ .integer = @intCast(count) });
                 return .{ .object = out };
             }
         }.h,
@@ -534,6 +570,96 @@ test "db.query/entity.list results are freeValue-safe (no literal keys)" {
     const l = try registry.dispatch("entity.list", &ctx, list_args.value);
     defer freeValue(allocator, l);
     try std.testing.expectEqual(@as(i64, 1), l.object.get("count").?.integer);
+}
+
+// The table, backend and registry are built with the test allocator before the
+// scan; the failing allocator is the skill context's own, so the scan walks
+// every handler-side copy: the tenant-wrapped statement, the bound arguments,
+// each row tree, the rows array behind them and the result map.
+//
+// Red before the fix: a row tree built as the `append` argument was stranded
+// when the append failed, and the rows array (plus the `rows`/`count` key
+// copies) had no owner when a later put failed.
+test "db.query hands back its rows at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    var client = sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, tenant_id INTEGER)", &.{});
+    _ = try client.exec("INSERT INTO users (name, tenant_id) VALUES ('alice', 1), ('bob', 2), ('carol', 1)", &.{});
+
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    try registerBusinessSkillsWith(&registry, &.{}, .{ .db_query_tenant_column = "tenant_id" });
+    var base_ctx = SkillContext{ .allocator = allocator, .backend_ptr = &backend, .tenant_id = 1 };
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, reg: *SkillRegistry, base: *SkillContext) !void {
+            var ctx = base.*;
+            ctx.allocator = a;
+            var args = std.json.ObjectMap{};
+            defer freeValue(a, .{ .object = args });
+            try putJsonField(a, &args, "sql", .{ .string = "SELECT id, name, tenant_id FROM users WHERE id > ?" });
+            // Bound arguments go through `readArgs`, which allocates — the
+            // array is consumed by `putJsonField` even when the put fails, so
+            // its guard ends at the labeled block's `break`.
+            const sql_args = blk: {
+                var arr = std.json.Array.init(a);
+                errdefer freeValue(a, .{ .array = arr });
+                try arr.append(.{ .integer = 0 });
+                break :blk arr;
+            };
+            try putJsonField(a, &args, "args", .{ .array = sql_args });
+            const res = try reg.dispatch("db.query", &ctx, .{ .object = args });
+            defer freeValue(a, res);
+            try std.testing.expectEqual(@as(i64, 2), res.object.get("count").?.integer);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{ &registry, &base_ctx });
+}
+
+// Same harness as the db.query scan; here the filter loop and the tenant
+// predicate add their own buffer growth ahead of the row loop.
+test "entity.list hands back its rows at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    var client = sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, tenant_id INTEGER)", &.{});
+    _ = try client.exec("INSERT INTO users (name, tenant_id) VALUES ('alice', 1), ('bob', 2)", &.{});
+
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    const entities = [_]EntitySpec{.{ .name = "user", .table = "users", .pk = "id", .tenant_column = "tenant_id" }};
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    try registerBusinessSkillsWith(&registry, &entities, .{});
+    var base_ctx = SkillContext{ .allocator = allocator, .backend_ptr = &backend, .tenant_id = 1 };
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, reg: *SkillRegistry, base: *SkillContext) !void {
+            var ctx = base.*;
+            ctx.allocator = a;
+            var args = std.json.ObjectMap{};
+            defer freeValue(a, .{ .object = args });
+            try putJsonField(a, &args, "entity", .{ .string = "user" });
+            // The transfer is the very next statement after the block, and
+            // `putJsonField` consumes the object even when the put fails — so
+            // `filters` needs no guard of its own past this point, and none may
+            // outlive the put (that would free what `args` owns).
+            const filters = blk: {
+                var map = std.json.ObjectMap{};
+                errdefer freeValue(a, .{ .object = map });
+                try putJsonField(a, &map, "name", .{ .string = "alice" });
+                break :blk map;
+            };
+            try putJsonField(a, &args, "filters", .{ .object = filters });
+            const res = try reg.dispatch("entity.list", &ctx, .{ .object = args });
+            defer freeValue(a, res);
+            try std.testing.expectEqual(@as(i64, 1), res.object.get("count").?.integer);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{ &registry, &base_ctx });
 }
 
 test "db.query rejects non-SELECT and free-form literals" {

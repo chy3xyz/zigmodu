@@ -2,6 +2,61 @@
 
 ## [Unreleased]
 
+### 第 83 批：把"分配后失败即丢"这一类在 `src/ai/**` 的最后 6 处收掉（**破坏性：否**）
+
+这个类的两个失败形状，修每一处时都要同时避开：
+
+* **(a) 本地值没有守卫** → 后面的 `try` 一失败它就丢（泄漏）；
+* **(b) 守卫越过移交点** → 同一个值被守卫和它的新主人各放一次（双释放）。
+
+修法就一条：**本地值各自 `errdefer`，`append`/`put`/`insert` 放最后，值交给别人的那一刻守卫必须已经解除**（交给一个 `return` 就解除的 helper，或一个带标号的块）。
+
+6 处：`approval_api.queuedEscalation`（四连 dupe 进结构体字面量再 push）、`llm.llmDiagnose` 两个循环、`provider` 的两个测试用 `onDelta` 回调、`business` 的 `db.query` / `entity.list`（`rows.append(try rowToJson(...))` —— 顺带把 `out` 的
+`put(allocator, try dupe(key), …)` 尾部也换成 `putJsonField`，否则新加的扫描自己就红）、
+`actions.report.generate` 的 JSON 分支（`arr` + 每行 `rec` 的守卫；列写入改走 `putJsonField`）。
+**多出一处**：`actions.executeCommand`（结果 map 缺 `errdefer freeValue`，`topic`/`run_id` 是
+内联 `dupe` 进 `putOwned`）—— 不一起修，这个类就在这个文件里活下来。
+
+红证据（把 `queuedEscalation` 换回结构体字面量即红）：
+
+```text
+fail_index: 1/5   allocated 7   freed 0   allocations 1   deallocations 0
+FAIL (MemoryLeakDetected)
+[SafeAllocator] leaked [len 7] at approval_api.zig:166 queuedEscalation .run_id = try allocator.dupe(...)
+```
+
+新增 7 条 OOM 扫描测试（每个改动的函数一条）。**一条偏差要知道**：`StreamAccum.onChunk` 不能
+整体扫 —— `extractStreamDelta*` 是故意 `catch return null` 吞掉注入的 OOM 的，
+`checkAllAllocationFailures` 会按 `SwallowedOutOfMemoryError` 判红，所以 `provider` 的扫描直接驱动
+两个改动过的回调，整条流由两条既有的累积测试管着。
+
+读数：全量 `-Ddb=all` → **2111/2169 passed · 58 skipped · 0 failed**（+7 条测试）；`ai.` 过滤
+228 passed · leaked=0。
+
+### 第 82 批：把"分配后失败即丢"这一类在 `src/ai/**` 收干净（11 处 + 2 处顺带）（**破坏性：否**）
+
+（上一条提交的 commit message 完整，这里补上条目。）
+
+11 处清单逐处处理，统一形状同上：本地值各自 `errdefer`、append/put 放最后。有移交的地方抽小
+助手：`Workflow.appendReplayedStep`、`approval.appendEntry`、`approval_api.appendPending`
+（两个队列共用）、`run_audit.appendRow`、`retriever.appendChunk`、`actions.appendOwnedString`。
+顺带抓到**一个真漏**：`actions.putOwned` 的 key 拷贝没有 `errdefer`，`writeEntity` 的 `"id"` 键
+在 `put` 失败时漏；以及 `writeEntity` 结果树的 `errdefer`。
+
+红证据（临时恢复 retriever 的旧形状，`checkAllAllocationFailures` 扫描）：
+
+```text
+fail_index: 1/7   allocated 5   freed 0   allocations 1   deallocations 0
+FAIL (MemoryLeakDetected)
+[SafeAllocator] leaked [len 5] at retriever.zig:109 appendChunk .id = try allocator.dupe(...)
+```
+
+新增 10 条 OOM 扫描测试。`skill_export.putString` 只改形状不加测试（它跑在函数自己的 arena 上，
+扫描不可能变红，是个空测试）。
+
+读数：全量 `-Ddb=all` → **2104/2162 passed · 58 skipped · 0 failed**；`ai.` 过滤 221 passed ·
+leaked=0。
+
 ### 第 81 批：OOM-only 泄漏收尾（agent 的 append 序列、两个数组 builder、两处 append 失败尾段）（**破坏性：否**）
 
 (A) `agent.zig`：四处 `X = try allocator…; try owned_strs.append(allocator, X)`（工具 error/result

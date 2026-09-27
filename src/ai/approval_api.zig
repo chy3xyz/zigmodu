@@ -161,12 +161,28 @@ pub fn queuedEscalation(
     note: []const u8,
 ) anyerror!void {
     const queue: *ApprovalQueue = @ptrCast(@alignCast(userdata));
+    // Every copy is guarded as it is made, and `push` — the hand-over to the
+    // queue, which owns the item's strings from there (`ApprovalQueue.deinit`)
+    // — is the last statement: the guards are disarmed by the normal return at
+    // exactly the moment the queue takes ownership. Built inside the struct
+    // literal, the copies were allocated in order ahead of the `push`, so a
+    // failed dupe stranded the ones before it and a failed `push` stranded all
+    // four; a single guard around the whole literal would instead stay armed
+    // past the hand-over and free what the queue already owns.
+    const run_id = try allocator.dupe(u8, subject);
+    errdefer allocator.free(run_id);
+    const subject_copy = try allocator.dupe(u8, subject);
+    errdefer allocator.free(subject_copy);
+    const note_copy = try allocator.dupe(u8, note);
+    errdefer allocator.free(note_copy);
+    const step_name_copy = try allocator.dupe(u8, step_name);
+    errdefer allocator.free(step_name_copy);
     try queue.push(.{
-        .run_id = try allocator.dupe(u8, subject),
-        .subject = try allocator.dupe(u8, subject),
+        .run_id = run_id,
+        .subject = subject_copy,
         .amount = amount,
-        .note = try allocator.dupe(u8, note),
-        .step_name = try allocator.dupe(u8, step_name),
+        .note = note_copy,
+        .step_name = step_name_copy,
         // The escalation carries the tenant the run is scoped to; without this
         // the item is tenant-less and a scoped listing cannot see it (see
         // `ApprovalQueue.tenantMatches`).
@@ -399,6 +415,28 @@ test "ApprovalQueue.listPending hands back its rows at every allocation point (O
         }
     };
     try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{&queue});
+}
+
+// The queue itself is built with the failing allocator inside the scan, so
+// every allocation the push path makes is walked: the four field copies and
+// the growth of the queue's item list. A failed run must leave the queue
+// untouched and every copy freed.
+//
+// Red before the fix: the struct-literal copies ahead of a failed dupe (or
+// all four, when the `push` itself failed) had no owner on the error path.
+test "queuedEscalation hands back its copies at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var queue = ApprovalQueue.init(a, std.testing.io);
+            defer queue.deinit();
+            var sctx = SkillContext{ .allocator = a, .tenant_id = 7 };
+            try queuedEscalation(&queue, a, &sctx, "order-9", 50000, "finance", "needs CFO");
+            try std.testing.expectEqual(@as(usize, 1), queue.count());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{});
 }
 
 const approval_api_mod = @This();

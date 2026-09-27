@@ -1097,7 +1097,13 @@ test "AiProvider StreamAccum accumulates reasoning_content" {
         fn onDelta(ctx: *anyopaque, d: AiProvider.StreamDelta) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             if (d.reasoning_delta) |c| {
-                try self.parts.append(self.allocator, try self.allocator.dupe(u8, c));
+                // Copy first, append last: built as the `append` argument the
+                // copy was stranded when the append failed. The guard ends with
+                // this block — right after the hand-over — because `parts`
+                // owns every item it holds (the test's defer frees them).
+                const copy = try self.allocator.dupe(u8, c);
+                errdefer self.allocator.free(copy);
+                try self.parts.append(self.allocator, copy);
             }
         }
     };
@@ -1205,7 +1211,13 @@ test "AiProvider StreamAccum parses SSE lines" {
                 return;
             }
             if (d.content_delta) |c| {
-                try self.parts.append(self.allocator, try self.allocator.dupe(u8, c));
+                // Copy first, append last: built as the `append` argument the
+                // copy was stranded when the append failed. The guard ends with
+                // this block — right after the hand-over — because `parts`
+                // owns every item it holds (the test's defer frees them).
+                const copy = try self.allocator.dupe(u8, c);
+                errdefer self.allocator.free(copy);
+                try self.parts.append(self.allocator, copy);
             }
         }
     };
@@ -1229,6 +1241,45 @@ test "AiProvider StreamAccum parses SSE lines" {
     try std.testing.expectEqualStrings("Hel", ctx.parts.items[0]);
     try std.testing.expectEqualStrings("lo", ctx.parts.items[1]);
     try std.testing.expectEqualStrings("Hello", acc.content.items);
+}
+
+// The two accumulation callbacks above hand a copy of each delta to `parts`.
+// The scan drives that shape directly rather than through `onChunk`: the SSE
+// parse helpers turn an induced OOM into a plain `null` (a delta that never
+// arrived), and `checkAllAllocationFailures` reports a run that completes
+// despite an induced failure as SwallowedOutOfMemoryError — not as the leak
+// this scan is looking for. The callbacks are the functions this fix changed.
+test "StreamAccum delta callback hands back its copy at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+
+    const Scan = struct {
+        const Ctx = struct {
+            parts: std.ArrayList([]const u8),
+            allocator: std.mem.Allocator,
+
+            fn onDelta(ctx: *anyopaque, d: AiProvider.StreamDelta) anyerror!void {
+                const self: *@This() = @ptrCast(@alignCast(ctx));
+                const text = d.content_delta orelse (d.reasoning_delta orelse return);
+                const copy = try self.allocator.dupe(u8, text);
+                errdefer self.allocator.free(copy);
+                try self.parts.append(self.allocator, copy);
+            }
+        };
+
+        fn run(a: std.mem.Allocator) !void {
+            var ctx = Ctx{ .parts = .empty, .allocator = a };
+            defer {
+                for (ctx.parts.items) |p| a.free(p);
+                ctx.parts.deinit(a);
+            }
+            try Ctx.onDelta(&ctx, .{ .content_delta = "Hel" });
+            try Ctx.onDelta(&ctx, .{ .reasoning_delta = "think" });
+            try Ctx.onDelta(&ctx, .{ .done = true });
+            try std.testing.expectEqual(@as(usize, 2), ctx.parts.items.len);
+            try std.testing.expectEqualStrings("think", ctx.parts.items[1]);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{});
 }
 
 test "AiProvider cacheHitRatio" {

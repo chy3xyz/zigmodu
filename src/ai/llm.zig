@@ -8,6 +8,7 @@ const std = @import("std");
 const provider_mod = @import("provider.zig");
 const SkillContext = @import("skill.zig").SkillContext;
 const freeValue = @import("skill.zig").freeValue;
+const putJsonField = @import("skill.zig").putJsonField;
 const diagnose_mod = @import("diagnose.zig");
 const approval_mod = @import("approval.zig");
 const risk_mod = @import("risk.zig");
@@ -162,10 +163,22 @@ pub fn llmDiagnose(
         return error.MalformedLlmResponse;
 
     out_summary.* = try allocator.dupe(u8, summary);
-    for (causes.items) |c| try out_causes.append(allocator, try allocator.dupe(u8, json_shape.string(c) catch
-        return error.MalformedLlmResponse));
-    for (actions.items) |a| try out_actions.append(allocator, try allocator.dupe(u8, json_shape.string(a) catch
-        return error.MalformedLlmResponse));
+    // Every element is copied and handed over in one guarded step: the copy is
+    // freed only when its own `append` fails, and the guard ends with the loop
+    // body — right after the append — so it is gone exactly when the out-list
+    // takes ownership. Elements already appended are the caller's to release
+    // on the error path (see the field-checks comment above); a guard armed
+    // for the whole function would free what the out-lists already own.
+    for (causes.items) |c| {
+        const copy = try allocator.dupe(u8, json_shape.string(c) catch return error.MalformedLlmResponse);
+        errdefer allocator.free(copy);
+        try out_causes.append(allocator, copy);
+    }
+    for (actions.items) |a| {
+        const copy = try allocator.dupe(u8, json_shape.string(a) catch return error.MalformedLlmResponse);
+        errdefer allocator.free(copy);
+        try out_actions.append(allocator, copy);
+    }
 }
 
 /// Approval policy: asks the model for `{"decision":"approve|escalate|reject",
@@ -274,15 +287,35 @@ fn fakeJson(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: []con
     return .{ .object = obj };
 }
 
+// Built the way a handler must build it — every level guarded until its
+// hand-over — because the OOM scan on `llmDiagnose` drives this fake with a
+// failing allocator: a value dupe as a `put` argument or an unguarded
+// intermediate array leaks there exactly as it would in production.
 fn diagnoseJson(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!std.json.Value {
     var obj = std.json.ObjectMap{};
-    try putOwned(&obj, allocator, "summary", .{ .string = try allocator.dupe(u8, "gateway rejected") });
-    var causes = std.json.Array.init(allocator);
-    try causes.append(.{ .string = try allocator.dupe(u8, "bad credentials") });
-    try putOwned(&obj, allocator, "causes", .{ .array = causes });
-    var actions = std.json.Array.init(allocator);
-    try actions.append(.{ .string = try allocator.dupe(u8, "rotate credentials") });
-    try putOwned(&obj, allocator, "actions", .{ .array = actions });
+    errdefer freeValue(allocator, .{ .object = obj });
+    try putJsonField(allocator, &obj, "summary", .{ .string = "gateway rejected" });
+    // `putJsonField` consumes an array/object even when the put fails, so each
+    // array's own guard must end before the put — the labeled block's `break`
+    // disarms it at exactly the hand-over.
+    const causes = blk: {
+        var arr = std.json.Array.init(allocator);
+        errdefer freeValue(allocator, .{ .array = arr });
+        const s = try allocator.dupe(u8, "bad credentials");
+        errdefer allocator.free(s);
+        try arr.append(.{ .string = s });
+        break :blk arr;
+    };
+    try putJsonField(allocator, &obj, "causes", .{ .array = causes });
+    const actions = blk: {
+        var arr = std.json.Array.init(allocator);
+        errdefer freeValue(allocator, .{ .array = arr });
+        const s = try allocator.dupe(u8, "rotate credentials");
+        errdefer allocator.free(s);
+        try arr.append(.{ .string = s });
+        break :blk arr;
+    };
+    try putJsonField(allocator, &obj, "actions", .{ .array = actions });
     return .{ .object = obj };
 }
 
@@ -403,6 +436,50 @@ test "llmDiagnose parses summary, causes and actions" {
     try std.testing.expectEqual(@as(usize, 1), causes.items.len);
     try std.testing.expectEqualStrings("bad credentials", causes.items[0]);
     try std.testing.expectEqualStrings("rotate credentials", actions.items[0]);
+}
+
+// The canned reply drives every copy the policy makes: the summary dupe, the
+// per-element copies into `out_causes`/`out_actions` and the growth of both
+// out-lists. Elements appended before a failure are the caller's to release on
+// the error path (the policy contract), so the scan frees them here.
+//
+// Red before the fix: an element copy built as the `append` argument was
+// stranded when the append failed.
+test "llmDiagnose hands back its out-parameters at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var policy_ctx = LlmPolicyCtx{ .json_fn = diagnoseJson };
+            var ctx = SkillContext{ .allocator = a, .userdata = &policy_ctx };
+            var causes = std.ArrayList([]const u8).empty;
+            defer {
+                for (causes.items) |c| a.free(c);
+                causes.deinit(a);
+            }
+            var actions = std.ArrayList([]const u8).empty;
+            defer {
+                for (actions.items) |x| a.free(x);
+                actions.deinit(a);
+            }
+            var summary: []const u8 = "";
+            defer if (summary.len > 0) a.free(summary);
+            const evidence = [_]diagnose_mod.EvidenceBlock{};
+            try llmDiagnose(
+                a,
+                &ctx,
+                .{ .source = "alert", .subject = "orders", .severity = .critical, .description = "spike" },
+                &evidence,
+                &causes,
+                &actions,
+                &summary,
+            );
+            try std.testing.expectEqualStrings("gateway rejected", summary);
+            try std.testing.expectEqual(@as(usize, 1), causes.items.len);
+            try std.testing.expectEqualStrings("rotate credentials", actions.items[0]);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{});
 }
 
 /// A canned reply with the shapes `llmJson` can hand a policy — including the

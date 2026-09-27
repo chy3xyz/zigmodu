@@ -316,9 +316,14 @@ fn executeCommand(sctx: *SkillContext, cctx: *CommandCtx, args: std.json.Value) 
     });
 
     var out = std.json.ObjectMap{};
+    // `out` owns every key and value placed into it; the guard is disarmed by
+    // the `return` that hands the tree to the caller. The string values go
+    // through putJsonField, which makes its own copy — a `dupe` built as the
+    // `put` argument was stranded whenever the map refused the field.
+    errdefer freeValue(sctx.allocator, .{ .object = out });
     try putOwned(&out, sctx.allocator, "ok", .{ .bool = true });
-    try putOwned(&out, sctx.allocator, "topic", .{ .string = try sctx.allocator.dupe(u8, topic) });
-    try putOwned(&out, sctx.allocator, "run_id", .{ .string = try sctx.allocator.dupe(u8, run_id) });
+    try skill.putJsonField(sctx.allocator, &out, "topic", .{ .string = topic });
+    try skill.putJsonField(sctx.allocator, &out, "run_id", .{ .string = run_id });
     if (result.last_insert_id) |lid| try putOwned(&out, sctx.allocator, "event_id", .{ .integer = lid });
     return .{ .object = out };
 }
@@ -414,23 +419,31 @@ fn generateReport(sctx: *SkillContext, rctx: *ReportCtx, args: std.json.Value) a
     }
 
     var arr = std.json.Array.init(sctx.allocator);
+    // Covers the records already placed when a later column or row fails; the
+    // `return` hands the tree to the caller and disarms the guard — one that
+    // outlived the hand-over is how a tree gets freed twice.
+    errdefer freeValue(sctx.allocator, .{ .array = arr });
     var rows: usize = 0;
     while (try cursor.next()) |row| {
         if (rows >= rctx.max_rows) break;
         rows += 1;
         var rec = std.json.ObjectMap{};
+        // The append is the last statement of the loop body, so this guard is
+        // gone — disarmed by the normal scope exit — exactly when `arr` takes
+        // ownership of the record.
+        errdefer freeValue(sctx.allocator, .{ .object = rec });
         for (row.columns, 0..) |c, i| {
             const v = row.values[i] orelse .null;
-            if (v == .string) {
-                try putOwned(&rec, sctx.allocator, c, .{ .string = try sctx.allocator.dupe(u8, v.string) });
-            } else {
-                try putOwned(&rec, sctx.allocator, c, switch (v) {
-                    .bool => |b| .{ .bool = b },
-                    .int => |n| .{ .integer = n },
-                    .float => |f| .{ .float = f },
-                    else => .null,
-                });
-            }
+            // putJsonField copies the key and a `.string` value itself (and
+            // frees both copies when the map refuses the field) — a `dupe`
+            // built as the `put` argument was stranded on exactly that failure.
+            try skill.putJsonField(sctx.allocator, &rec, c, switch (v) {
+                .bool => |b| .{ .bool = b },
+                .int => |n| .{ .integer = n },
+                .float => |f| .{ .float = f },
+                .string => |s| .{ .string = s },
+                else => .null,
+            });
         }
         try arr.append(.{ .object = rec });
     }
@@ -536,6 +549,107 @@ test "entity.create hands back its values at every allocation point (OOM scan)" 
             const res = try reg.dispatch("entity.create", &sctx, .{ .object = args });
             defer freeValue(a, res);
             try std.testing.expectEqual(@as(bool, true), res.object.get("created").?.bool);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{ &registry, &base_ctx });
+}
+
+// Same harness as the entity.create scan: the table, backend, outbox and
+// registry ride the test allocator; the failing allocator is the context's,
+// walking the payload buffer, the encoded envelope, the topic copy and the
+// result map.
+//
+// Red before the fix: the `topic`/`run_id` copies were built as `put`
+// arguments and stranded when the map refused the field, and the result map
+// had no guard at all.
+test "command.execute hands back its event at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    var client = sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    _ = try client.exec(
+        "CREATE TABLE event_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, payload TEXT, status INTEGER DEFAULT 0, tenant_id INTEGER, retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 5, created_at INTEGER, updated_at INTEGER, error_message TEXT)",
+        &.{},
+    );
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    var outbox = OutboxPublisher.init(allocator, .{ .max_retries = 3 });
+    const commands = [_]CommandSpec{
+        .{ .name = "refund", .description = "refund an order" },
+    };
+    var cctx = CommandCtx{ .backend = &backend, .outbox = &outbox, .commands = &commands };
+    var registry = try setupRegistry(allocator, std.testing.io);
+    defer registry.deinit();
+    try registerCommandSkills(&registry);
+    const perms = [_][]const u8{"command:execute"};
+    var base_ctx = SkillContext{ .allocator = allocator, .run_id = "run-42", .permissions = &perms, .userdata = &cctx };
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, reg: *SkillRegistry, base: *SkillContext) !void {
+            var sctx = base.*;
+            sctx.allocator = a;
+            var args = std.json.ObjectMap{};
+            defer freeValue(a, .{ .object = args });
+            const payload = blk: {
+                var map = std.json.ObjectMap{};
+                errdefer freeValue(a, .{ .object = map });
+                try skill.putJsonField(a, &map, "order_id", .{ .integer = 7 });
+                break :blk map;
+            };
+            try skill.putJsonField(a, &args, "payload", .{ .object = payload });
+            try skill.putJsonField(a, &args, "command", .{ .string = "refund" });
+            const res = try reg.dispatch("command.execute", &sctx, .{ .object = args });
+            defer freeValue(a, res);
+            try std.testing.expectEqualStrings("ai.command.refund", res.object.get("topic").?.string);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{ &registry, &base_ctx });
+}
+
+// Read-only sibling of the command.execute scan: the failing allocator walks
+// the row records, the rows array and — for the CSV leg — the buffer and its
+// per-value formatting copies.
+//
+// Red before the fix: a record's string copy was built as the `put` argument
+// and stranded when the map refused the field, and the `rec`/`arr` trees had
+// no guard while they were being built.
+test "report.generate hands back its rows at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    var client = sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    _ = try client.exec("CREATE TABLE orders (id INTEGER PRIMARY KEY, tenant_id INTEGER, amount INTEGER)", &.{});
+    _ = try client.exec("INSERT INTO orders (tenant_id, amount) VALUES (1, 100), (1, 200), (2, 50)", &.{});
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    const reports = [_]ReportSpec{
+        .{ .name = "revenue", .sql = "SELECT tenant_id, SUM(amount) AS total FROM orders GROUP BY tenant_id ORDER BY tenant_id" },
+    };
+    var rctx = ReportCtx{ .backend = &backend, .reports = &reports };
+    var registry = try setupRegistry(allocator, std.testing.io);
+    defer registry.deinit();
+    try registerReportSkills(&registry);
+    var base_ctx = SkillContext{ .allocator = allocator, .userdata = &rctx };
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, reg: *SkillRegistry, base: *SkillContext) !void {
+            var sctx = base.*;
+            sctx.allocator = a;
+            {
+                var args = std.json.ObjectMap{};
+                defer freeValue(a, .{ .object = args });
+                try skill.putJsonField(a, &args, "report", .{ .string = "revenue" });
+                const res = try reg.dispatch("report.generate", &sctx, .{ .object = args });
+                defer freeValue(a, res);
+                try std.testing.expectEqual(@as(usize, 2), res.array.items.len);
+            }
+            {
+                var args = std.json.ObjectMap{};
+                defer freeValue(a, .{ .object = args });
+                try skill.putJsonField(a, &args, "report", .{ .string = "revenue" });
+                try skill.putJsonField(a, &args, "format", .{ .string = "csv" });
+                const res = try reg.dispatch("report.generate", &sctx, .{ .object = args });
+                defer freeValue(a, res);
+                try std.testing.expect(std.mem.indexOf(u8, res.string, "1,300") != null);
+            }
         }
     };
     try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{ &registry, &base_ctx });
