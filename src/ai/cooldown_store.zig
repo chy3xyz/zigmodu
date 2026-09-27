@@ -318,7 +318,11 @@ pub const RedisCooldownStore = struct {
             self.redis.expire(fkey, 3600) catch |err| {
                 std.log.debug("[RedisCooldownStore] expire of failure key failed ({s})", .{@errorName(err)});
             };
-            return @intCast(@max(n, 0));
+            // `INCR` answers whatever the peer likes, and the count is only ever
+            // compared against a threshold: clamp instead of `@intCast`-panicking
+            // on a value past `u32` (that cast was a process kill waiting for a
+            // hostile or broken Redis).
+            return @intCast(@min(@max(n, 0), std.math.maxInt(u32)));
         } else |err| {
             std.log.warn("[RedisCooldownStore] incr failed ({}), using local count {d} for '{s}'", .{ err, count, key });
             return count;

@@ -298,6 +298,9 @@ pub const MemoryStore = struct {
         }
 
         var buf = std.ArrayList(u8).empty;
+        // Freed on the way out if any append below fails: `toOwnedSlice` is the
+        // only path that hands the buffer to the caller.
+        errdefer buf.deinit(allocator);
         try buf.appendSlice(allocator, "Relevant context:\n");
         const limit = @min(recalled.items.len, max_items);
         for (recalled.items[0..limit]) |e| {

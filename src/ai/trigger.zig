@@ -105,9 +105,16 @@ pub const Trigger = struct {
         input: []const u8,
     ) !void {
         const c = try self.allocator.create(CronCtx);
-        errdefer self.allocator.destroy(c);
+        var registered = false;
+        errdefer if (!registered) self.allocator.destroy(c);
         c.* = .{ .trigger = self, .input = try self.allocator.dupe(u8, input) };
         try self.cron_ctxs.append(self.allocator, c);
+        // Past this point the trigger owns `c` (and frees it in `deinit`), so the
+        // guard above must stop firing: `Expression.parse` rejecting a malformed
+        // expression — a config/agent-supplied string, not an OOM-only path — used
+        // to destroy `c` while `cron_ctxs` still held the pointer, and `deinit`
+        // then freed it a second time.
+        registered = true;
         try scheduler.addJob(name, try Expression.parse(expr), cronTask, c);
     }
 };

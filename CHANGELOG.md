@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### 第 72 批：第 70 批队列里三条同性质的小修（异常/错误路径的收尾）（**破坏性：否**）
+
+三条都自己核实过，都是"错误路径上没收尾"，其中第一条**不是 OOM-only**：
+
+1. **`src/ai/trigger.zig` `registerCron`：失败路径双释放。** `errdefer destroy(c)` 在 `c` 已进
+   `cron_ctxs` 之后仍然挂着，于是 `Expression.parse` 拒绝一个**写错的 cron 表达式**（配置/agent 给的串，
+   与内存无关）或 `addJob` 失败时，`c` 被销毁而列表里还留着指针 —— `Trigger.deinit` 再
+   `free(c.input)` + `destroy(c)`。修法：`registered` 标志，进表后 errdefer 不再生效（此后由 deinit 拥有）。
+2. **`src/ai/cooldown_store.zig`：Redis `INCR` 的返回值 `@intCast` 到 `u32`。** 该值只用于与阈值比较，
+   超过 `u32` 上限即 panic —— 一个被控/损坏的 Redis 就能打死进程。修法：`@min(@max(n, 0), maxInt(u32))`
+   钳位。
+3. **`src/ai/memory.zig` `formatContext`：`buf` 无 `errdefer`。** 循环中任一 `appendSlice` 失败即整段
+   泄漏（同文件 `recallBlockAlloc` 有）。修法：声明后立刻 `errdefer buf.deinit(allocator)`。
+
+读数：全量 `-Ddb=all` → **2057/2115 passed · 58 skipped · 0 failed**；`ai.` 族 185 条全通过。
+
 ### 第 71 批：streaming 响应没结束时连接被复用 —— 下一个响应（或 keep-alive 的 408）被写进未终止的响应体（**破坏性：否**）
 
 来源是第 70 批在 `Server.zig` 请求路径上翻出的那条 P1。**动手前核实了**：`ctx.streaming = true`
