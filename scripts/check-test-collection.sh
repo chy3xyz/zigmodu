@@ -28,12 +28,11 @@
 #
 #   <package build.zig>|<gate call site>|<source path prefix in build.zig>
 #
-# The framework row (`build.zig|src/tests.zig|src`) is *not* listed: its gate can
-# only run inside the library artifact, whose forced run is the whole 5-artifact
-# suite (minutes, not seconds), and CI's `Run tests` step already executes it on
-# a cold cache — the state where the gate sees every file. Landing it needs the
-# three hidden-test files wired first; see the test-collection findings in the
-# handoff / `src/test/TestCollection.zig`.
+# The framework row (`build.zig|src/tests.zig|src`) is listed too. Its gate can
+# only run inside the library artifact, so the forced run below is the whole
+# 5-artifact suite (minutes, not seconds) rather than the CLI's seconds. CI's
+# `Run tests` step executes the same gate on a cold cache; this script is what
+# forces it to look at the tree *now* instead of replaying a cached verdict.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -41,6 +40,7 @@ export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$ROOT/.zig-global-cache}"
 
 GATES=(
   "tools/zmodu/build.zig|tools/zmodu/src/main.zig|src"
+  "build.zig|src/tests.zig|src"
 )
 
 fail=0

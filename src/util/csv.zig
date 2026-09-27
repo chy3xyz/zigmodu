@@ -82,8 +82,13 @@ pub const Reader = struct {
     /// Read all rows into an ArrayList of string slices.
     pub fn readAll(self: *Self) !std.ArrayList([][]const u8) {
         var rows = std.ArrayList([][]const u8).empty;
+        errdefer {
+            for (rows.items) |row| self.allocator.free(row);
+            rows.deinit(self.allocator);
+        }
         if (self.has_header) {
-            _ = try self.readHeader();
+            const header = try self.readHeader();
+            self.allocator.free(header);
         }
         while (try self.readRow()) |row| {
             try rows.append(self.allocator, row);

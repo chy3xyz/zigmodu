@@ -38,14 +38,17 @@ pub const RateLimiter = struct {
 };
 
 test "RateLimiter denies when max is zero" {
-    var redis = Redis.init(std.testing.allocator);
+    var redis = try Redis.new(std.testing.allocator, std.testing.io, .{ .pool_size = 1 });
     defer redis.deinit();
     var rl = RateLimiter.init(&redis);
     try std.testing.expect(!(try rl.allow("k", 0, 60)));
 }
 
 test "RateLimiter fail-closed when Redis is not connected" {
-    var redis = Redis.init(std.testing.allocator);
+    // `pool_size = 1` stops `Redis.new` from installing a pool. A pool fills
+    // lazily on first use and would dial the default 127.0.0.1:6379, so the
+    // "not connected" premise would hold only on a machine with no Redis.
+    var redis = try Redis.new(std.testing.allocator, std.testing.io, .{ .pool_size = 1 });
     defer redis.deinit();
     var rl = RateLimiter.init(&redis);
     // No connection → incr returns error.RedisError (fail-closed).

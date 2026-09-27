@@ -1,4 +1,5 @@
 const std = @import("std");
+const test_collection = @import("test/TestCollection.zig");
 
 // ========================================
 // Compilation Gate: Ensure all source files compile
@@ -124,6 +125,7 @@ test "compile all source files" {
     _ = @import("security/AuthMiddleware.zig");
     _ = @import("security/AppSecurity.zig");
     _ = @import("security/JwksKeyRing.zig");
+    _ = @import("security/PathSanitizer.zig");
 
     // Test
     _ = @import("test/Benchmark.zig");
@@ -215,6 +217,7 @@ test "compile all source files" {
 
     // Redis
     _ = @import("redis/redis.zig");
+    _ = @import("redis/RateLimiter.zig");
 
     // Pool
     _ = @import("pool/Pool.zig");
@@ -346,6 +349,9 @@ test "compile all source files" {
     _ = @import("util.zig");
     _ = @import("kit/json.zig");
     _ = @import("kit/random.zig");
+
+    // Util
+    _ = @import("util/csv.zig");
 }
 
 // ========================================
@@ -431,4 +437,29 @@ test "domain modules stay independent of the optional src/ai domain" {
             return error.AiDomainLeakedIntoCore;
         }
     }
+}
+
+/// Source files under `src/` whose tests are compiled by a *different* build
+/// step `build.zig` declares — they are legitimately absent from the library
+/// test binary. Every entry is checked against build.zig by
+/// `scripts/check-test-collection.sh`, so the list cannot be used to silence a
+/// file whose tests nothing runs.
+const tests_in_other_artifacts = [_][]const u8{
+    "log_level.zig", // addTest in build.zig (needs the build_options module)
+    "runtime_stress.zig", // addTest in build.zig
+    "soak.zig", // addExecutable in build.zig (`zig build soak`)
+    "soak_cluster.zig", // addExecutable in build.zig (`zig build soak-cluster`)
+};
+
+// The gate that keeps the list above honest: `_ = @import(…)` inside the
+// compilation-gate test is a manual list, and this is what makes forgetting an
+// entry a build failure instead of a green suite that ran nothing. See
+// src/test/TestCollection.zig for the mechanism and its limits.
+test "test-collection gate: every source file with tests is collected" {
+    try test_collection.assertAllCollected(std.testing.io, std.testing.allocator, .{
+        .label = "src",
+        .root_candidates = &.{"src"},
+        .marker = "root.zig",
+        .other_artifacts = &tests_in_other_artifacts,
+    });
 }

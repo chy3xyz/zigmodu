@@ -2,6 +2,37 @@
 
 ## [Unreleased]
 
+### 第 91 批：框架侧的 test-collection 门禁落地 —— 顺带修了一个真漏、一个编译不过的测试文件（**破坏性：否**）
+
+上一批只把门禁落在 `tools/zmodu`；框架侧当时是"量过、故意没落"，因为它会当场红。这一批把它修
+绿并落地：
+
+1. **`src/util/csv.zig:86` 的真漏**（`Reader.readAll` 里 `_ = try self.readHeader();` 丢掉了
+   owned 的 header row）。契约先核对了：`parse`/`readAll` 是**故意**丢弃 header 的（`parse simple
+   CSV` 那条测试就期望 3 行输入出 2 行），所以是"要释放"而不是"要保留"。现在
+   `const header = try self.readHeader(); self.allocator.free(header);`，另给 `readAll` 补了
+   中途失败时释放已 append 行的 errdefer（成功路径行为不变）。
+   红证据（修前 `zig test src/util/csv.zig`）：`All 5 tests passed.` → `2 tests leaked memory.` →
+   `exit code 1`；修后 5/5 干净。
+2. **13 条从未运行过的测试现在都在跑，而且全过** —— 但其中**一条文件根本编译不过**：
+   `src/redis/RateLimiter.zig` 的测试是照旧 API 写的（`Redis.init(...)`，而它已被
+   `Redis.new(allocator, io, cfg)` 取代）。**代码是对的、测试是烂的**：只修了 setup（`.pool_size = 1`
+   是刻意的 —— 默认 100 会懒加载出一个池子去连 `127.0.0.1:6379`，那条"not connected"的前提就只在
+   没有 Redis 的机器上成立，注释里写了原因），**两条断言一字未动**。
+   至此这个门禁已经捞出三样东西：16 条静默不跑的测试、一个真漏、一个烂掉的文件 —— "从不运行的
+   测试会腐烂"这句话现在是本仓库的实测结论，不是格言。
+3. **框架行接进门禁并确认它真的在拦**：`src/tests.zig` 里加 `test/TestCollection.zig` 的调用点
+   （`.root_candidates = &.{"src"}`、`.marker = "root.zig"` + 四个合法排除项 log_level /
+   runtime_stress / soak / soak_cluster —— 每个都是 `build.zig` 里真实的编译根，脚本会核对这一点），
+   `scripts/check-test-collection.sh` 的 `GATES` 加一行；顺手删掉那句"框架行故意不列"的过时说明。
+   反证（把 `_ = @import("util/csv.zig");` 注释掉即红，点名文件 + 总数不符 2093 vs 2088）→ 撤销即绿。
+
+读数：全量 `-Ddb=all` → **2176/2234 passed · 58 skipped · 0 failed**（+14 = 13 条恢复的 + 门禁自己
+那条）；`check-test-collection` **两行都 OK**；`tools/zmodu` 137/137；`check-production` / `fmt` 全 OK。
+
+未能命名的一条观察：有一次全量报 `skipped=59`（下一次又回到 58），`scripts/test-runner.zig` 不打印
+跳过项的名字，所以定位不到 —— 已确认不是这 14 条里的任何一条（它们单跑时 `skipped=0`）。
+
 ### 第 90 批：把"测试有没有真的在跑"变成门禁 —— 顺带在框架侧量出 13 条从未运行的测试和一个真漏（**破坏性：否**）
 
 上一批靠手动 `_ = @import(...)` 捞回 16 条从未运行过的测试。这一批把它做成**不可能忘**：
