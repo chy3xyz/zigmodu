@@ -2,6 +2,45 @@
 
 ## [Unreleased]
 
+### 第 81 批：OOM-only 泄漏收尾（agent 的 append 序列、两个数组 builder、两处 append 失败尾段）（**破坏性：否**）
+
+(A) `agent.zig`：四处 `X = try allocator…; try owned_strs.append(allocator, X)`（工具 error/result
+路径）全部收口，同函数同列表的另两处（retriever/memory 合并串）一并处理。新增
+`appendTakenString`：接收已拥有的串，**在 helper 内部**完成 append 的移交（失败即释放、成功即
+返回指针）。它比"站点本地 `errdefer`"安全的原因写在注释里 —— 站点的 errdefer 会一直武装到所属
+作用域结束，后面任一 `try` 失败就会释放一个**已经进了列表**的串（双释放）。
+
+(B) `diagnose.buildOutboxPayload` 的 causes/actions、`approval_api.buildPendingBody` 的每一行：
+改成"元素本地分配 + `errdefer` + 最后 append"。数组级守卫必须放在 builder **内部**：`putJsonField`
+对非 `.string` 值是**失败也接管**，放在调用点会在字段被拒时二次释放。
+红证据（临时恢复旧形状，用仓库既有的 `checkAllAllocationFailures` 逐分配点扫描）：
+
+```text
+80/2037  buildOutboxPayload hands back its tree at every allocation point...FAIL (MemoryLeakDetected)
+         fail_index: 8/15  allocated 303  freed 279  leaked [len 24] at diagnose.zig:172
+94/2037  buildPendingBody hands back its rows at every allocation point...FAIL (MemoryLeakDetected)
+         fail_index: 3/25  allocated 238  freed 0    leaked [len 228]
+```
+
+(C) 两处 append 失败尾段（上一批判定"贸然修有重新引入双释放的风险"而没做）—— 都用**转移计数**
+做成了：
+
+* `hierarchy`：`transferred += 1` 紧跟 `result.tasks.append`；不变式"下标 < transferred ⟺ 该
+  `SubTaskResult` 的字符串已被 `result.tasks` 引用"，guard 从 `group.await` 之后才开始，不碰
+  执行器仍可能写入的结果。
+* `workflow`：计数器只在"记录已 append 成功"与"`persistStep` 可能失败"之间的那一条语句 +1，
+  所以 `persistStep` 失败**不会**被尾段二次释放，而更早的失败（含 `name` dupe 失败）会被释放；
+  线性路径 `executeStep` 同步收口；两个 appender 内 `name`/`error_message` 的副本加块级 errdefer。
+
+读数：全量 `-Ddb=all` → **2093/2152 passed · 59 skipped · 0 failed**；`ai.` 过滤 211 passed ·
+leaked=0。（跳过数从 58 变 59，本批没有新增 `SkipZigTest` 语句，多出来的那条未定位到 —— 记在这里。）
+
+**同一形状仍未收口（已列出、留下批）**：`workflow.zig:275`（resume 三连 dupe 聚合）、
+`approval.zig:137`、`approval_api.zig:119`、`approval_store.zig:97`、`run_audit.zig:128`、
+`retriever.zig:84`、`provider_registry.zig:319`、`actions.zig:154-155`，以及
+`put(k_dupe, .{ .string = try dupe(v) })` 形态的 `mcp.zig:228/241`、`skill_export.zig:142`、
+`business.zig:104`。这些都是"分配后失败即丢"的同一类，与 (A)(B) 的修法相同。
+
 ### 第 80 批：tools JSON 是最后一个手拼点；`putJsonField` 的失败路径；五处 OOM-only errdefer；一处分配器错配（**破坏性：否**）
 
 1. **`SkillRegistry.toOpenAiFunctionsAlloc`** —— 上一批同一形状的最后一处：工具名/描述由应用在
