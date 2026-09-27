@@ -88,15 +88,26 @@ pub fn handleToolCall(
     const result = try registry.dispatch(name, ctx, args);
     defer freeValue(ctx.allocator, result);
     const text = try std.json.Stringify.valueAlloc(ctx.allocator, result, .{});
-    // Ownership of `text` transfers into the content object (freed by the
-    // caller via freeValue on the returned tree).
-    var content = std.json.Array.init(ctx.allocator);
-    var item = std.json.ObjectMap{};
-    try putString(&item, ctx.allocator, "type", "text");
-    try item.put(ctx.allocator, try ctx.allocator.dupe(u8, "text"), .{ .string = text });
-    try content.append(.{ .object = item });
+    // The tree is built on the *caller's* allocator (this is the path with no
+    // per-line arena), so each level is guarded on its own. `text` is released
+    // unconditionally — `putJsonField` copies a `.string` value, so no level
+    // ever owns this pointer and the copy inside `item` is the tree's own.
+    defer ctx.allocator.free(text);
     var out = std.json.ObjectMap{};
-    try out.put(ctx.allocator, try ctx.allocator.dupe(u8, "content"), .{ .array = content });
+    errdefer freeValue(ctx.allocator, .{ .object = out });
+    var content = std.json.Array.init(ctx.allocator);
+    {
+        // The array hand-over is *outside* this block on purpose: `putJsonField`
+        // releases a non-string value itself when the map refuses the field, so
+        // a guard still armed at that call would free the same array twice.
+        errdefer freeValue(ctx.allocator, .{ .array = content });
+        var item = std.json.ObjectMap{};
+        errdefer freeValue(ctx.allocator, .{ .object = item });
+        try putString(&item, ctx.allocator, "type", "text");
+        try putJsonField(ctx.allocator, &item, "text", .{ .string = text });
+        try content.append(.{ .object = item });
+    }
+    try putJsonField(ctx.allocator, &out, "content", .{ .array = content });
     return .{ .object = out };
 }
 
@@ -338,4 +349,40 @@ test "toMcpTools renders skills and handleToolCall dispatches" {
     const content = result.object.get("content").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), content.len);
     try std.testing.expect(std.mem.indexOf(u8, content[0].object.get("text").?.string, "42") != null);
+}
+
+// `handleToolCall` is the one path in this file that builds its answer on the
+// caller's allocator instead of the per-line arena, so every allocation point
+// in it — the stringified payload, the `text` field, the content array and the
+// root map — is reachable under an allocation failure.
+test "handleToolCall hands back its content tree at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    try registry.register(.{
+        .name = "kpi.query",
+        .description = "Query a business metric",
+        .parameters = &.{},
+        .handler = struct {
+            fn h(_: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+                return .{ .integer = 42 };
+            }
+        }.h,
+    });
+
+    var params = std.json.ObjectMap{};
+    defer freeValue(allocator, .{ .object = params });
+    try putString(&params, allocator, "name", "kpi.query");
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, reg: *SkillRegistry, args: std.json.ObjectMap) !void {
+            var sctx = SkillContext{ .allocator = a };
+            const result = try handleToolCall(reg, &sctx, .{ .object = args });
+            defer freeValue(a, result);
+            const content = result.object.get("content").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), content.len);
+            try std.testing.expect(std.mem.indexOf(u8, content[0].object.get("text").?.string, "42") != null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{ &registry, params });
 }

@@ -213,3 +213,40 @@ test "toSkillsJson and toOpenApi render a registry" {
     const op = secured_parsed.value.object.get("paths").?.object.get("/skills/kpi.query").?.object.get("post").?.object;
     try std.testing.expect(op.get("security") != null);
 }
+
+// Every allocation in both renderers above is made on the per-call arena
+// (`a`), not on the caller's allocator — the inline `a.dupe(…)` keys are
+// therefore not the "no owner when the outer call fails" class the
+// inline-allocation rule chases: a failed `put` can only strand memory the
+// arena still owns and `defer arena.deinit()` releases. This scan is the proof,
+// at every allocation point, including the `security_scheme` branch.
+test "both renderers are arena-bounded at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    try registry.register(.{
+        .name = "kpi.query",
+        .description = "Query a business metric",
+        .parameters = &.{
+            .{ .name = "metric", .type = .string, .description = "Metric name", .required = true },
+            .{ .name = "window", .type = .number, .description = "Lookback days", .required = false },
+        },
+        .handler = struct {
+            fn h(_: *@import("skill.zig").SkillContext, _: std.json.Value) anyerror!std.json.Value {
+                return .null;
+            }
+        }.h,
+    });
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, reg: *SkillRegistry) !void {
+            const catalog = try toSkillsJson(reg, a);
+            defer a.free(catalog);
+            try std.testing.expect(std.mem.indexOf(u8, catalog, "\"name\":\"kpi.query\"") != null);
+            const doc = try toOpenApi(reg, a, .{ .security_scheme = "BearerAuth" });
+            defer a.free(doc);
+            try std.testing.expect(std.mem.indexOf(u8, doc, "\"/skills/kpi.query\"") != null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{&registry});
+}

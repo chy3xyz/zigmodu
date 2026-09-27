@@ -2,6 +2,37 @@
 
 ## [Unreleased]
 
+### 第 87 批：`src/ai/**` 的 arena 判定与几个真漏（**破坏性：否**）
+
+同一形状（分配后失败即丢）在更宽的口径下又扫出一批。逐条核实后的结论：
+
+* **真漏，修了**：`admin.cache.clear` 缺 `errdefer`；`admin.audit.export` 的清理循环没释放
+  `e.model`（**无条件**漏，不只 OOM）；`mcp.handleToolCall` 的树重建（2 处，`ctx.allocator`、
+  没有 arena）；`workflow.PingSkill.ping` 的字段改走 `skill.putJsonField`。
+* **判定不是漏，留原样并加测试钉住**：`skill_export.zig` 25 处与 `ai_cli.zig` 17 处、`mcp.zig` 12 处
+  —— 全部落在每次调用自己的 arena 上（`defer arena.deinit()`），这一层不存在"丢给长期分配器"的问题。
+  新增一条 `both renderers are arena-bounded` 的扫描把这件事钉住，而不是改写它们。
+* 新增 4 条 admin handler 的 OOM 扫描（此前只有 `ConfigStore.set` / `putOwned` 有）。
+
+**规则没有加宽，这是刻意的**：更宽的谓词全树跑出 54 处命中，全部是 arena 作用域 —— 54 个误报，
+所以按"只有零误报才加宽"的纪律**不加宽**，这些拼写暂时不受门禁保护（如实记录）。更窄的那一种变体
+（只认三种已核实的 allocator 拼写、位置无关）确实是零误报的，但它会与 `b25` 已写明的口径冲突
+（`audit.zig:2731-2734` 的 fixture 把"首参内联"钉成"不是这条规则的 needle"），而 b25 是面向用户的，
+所以对齐口径留给下一批决定。
+
+红证据（把 `web4` 的 `presentProof` 换回旧形状即红，该文件本批**未提交**，见下）：
+`fail_index: 1/5  allocated 12  freed 0  FAIL (MemoryLeakDetected)  leaked [len 12] at middleware.zig:614`
+
+读数：全量 `-Ddb=all` → **2133/2191 passed · 58 skipped · 0 failed**；`ai.` 过滤 247 passed · leaked=0。
+
+**未落地的部分（本批只提交了上面那 4 个文件）**：同一轮里还改了
+`src/core/eventbus/Partitioner.zig`、`src/web4/middleware.zig`、`src/benchmark.zig`、
+`tools/zmodu/src/{ai_cli,audit,incremental,main}.zig`（含 `Partitioner.routeWithBackups` 从
+`RouteResult` 改成 `!RouteResult` —— 它原来是**编译不过的死代码**，零调用点），但那一组只做过
+fmt 检查、扫描与 `tools/zmodu` 的测试都没跑：合并后的树全量红、`tools/zmodu` 100 pass / 1 fail。
+我把它们**整组撤销**（`git checkout --`），而不是把红的树推上去。那组的具体改动记录在这条提交的
+对话里，重做一次即可；`Partitioner.addNode` 还有同一形状的多行实参版本（行式扫描器看不见）。
+
 ### 第 86 批：`zmodu` 的一个 OOM 双释放；§12.16 那条 flake 查清（是测试本身在快照一个活的环）（**破坏性：否**）
 
 1. **`tools/zmodu/src/audit.zig` `parseArgs`：`free(dir_owned); dir_owned = try dupe(...)`。** 那条

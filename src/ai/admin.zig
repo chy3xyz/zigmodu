@@ -170,6 +170,10 @@ pub fn registerAdminSkills(registry: *SkillRegistry) !void {
                 const handle = findCache(ac.caches, cache_v.string) orelse return error.CacheNotAllowed;
                 handle.clear(handle.userdata);
                 var out = std.json.ObjectMap{};
+                // Same contract as the handlers below: `putOwned` leaves a field
+                // it cannot place, so a second field's failure used to strand the
+                // first one. The `return` disarms the guard at the hand-over.
+                errdefer freeValue(sctx.allocator, .{ .object = out });
                 try putOwned(&out, sctx.allocator, "ok", .{ .bool = true });
                 try putOwned(&out, sctx.allocator, "cleared", .{ .bool = true });
                 return .{ .object = out };
@@ -260,6 +264,11 @@ pub fn registerAdminSkills(registry: *SkillRegistry) !void {
                     for (entries.items) |e| {
                         sctx.allocator.free(e.run_id);
                         sctx.allocator.free(e.status);
+                        // `appendRow` copies `model` too when the row has one —
+                        // without this the export leaked it for every run whose
+                        // model was captured (the `runs` tree only reports the
+                        // other fields).
+                        if (e.model) |m| sctx.allocator.free(m);
                     }
                     entries.deinit(sctx.allocator);
                 }
@@ -469,6 +478,140 @@ test "ConfigStore.set hands back its copies at every allocation point (OOM scan)
         }
     };
     try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{});
+}
+
+fn noopCacheDelete(_: *anyopaque, _: []const u8) void {}
+fn noopCacheClear(_: *anyopaque) void {}
+
+// The four cache/config/audit handlers build their answer field-by-field on the
+// caller's allocator. The scan walks every allocation point: the key copy, the
+// value copy and the map growth inside `putOwned` / `putJsonField`, plus the
+// `freeValue` of a partially built tree.
+test "admin.cache.invalidate hands back its tree at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    var dummy: u8 = 0;
+    const handles = [_]CacheHandle{.{
+        .name = "orders",
+        .delete = noopCacheDelete,
+        .clear = noopCacheClear,
+        .userdata = &dummy,
+    }};
+    var admin_ctx = AdminCtx{ .backend = undefined, .caches = &handles };
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    try registerAdminSkills(&registry);
+
+    var args_map = std.json.ObjectMap{};
+    defer freeValue(allocator, .{ .object = args_map });
+    try putOwned(&args_map, allocator, "cache", .{ .string = try allocator.dupe(u8, "orders") });
+    try putOwned(&args_map, allocator, "key", .{ .string = try allocator.dupe(u8, "order:1") });
+
+    const Scan = struct {
+        const perms = [_][]const u8{"admin:cache"};
+        fn run(a: std.mem.Allocator, reg: *SkillRegistry, ac: *AdminCtx, args: std.json.ObjectMap) !void {
+            var sctx = SkillContext{ .allocator = a, .userdata = ac, .permissions = &perms };
+            const res = try reg.dispatch("admin.cache.invalidate", &sctx, .{ .object = args });
+            defer freeValue(a, res);
+            try std.testing.expect(res.object.get("ok").?.bool);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{ &registry, &admin_ctx, args_map });
+}
+
+// Red before the guard was added: with two fields and no `errdefer`, a failure
+// on the second one stranded the first.
+test "admin.cache.clear hands back its tree at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    var dummy: u8 = 0;
+    const handles = [_]CacheHandle{.{
+        .name = "orders",
+        .delete = noopCacheDelete,
+        .clear = noopCacheClear,
+        .userdata = &dummy,
+    }};
+    var admin_ctx = AdminCtx{ .backend = undefined, .caches = &handles };
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    try registerAdminSkills(&registry);
+
+    var args_map = std.json.ObjectMap{};
+    defer freeValue(allocator, .{ .object = args_map });
+    try putOwned(&args_map, allocator, "cache", .{ .string = try allocator.dupe(u8, "orders") });
+    try putOwned(&args_map, allocator, "all", .{ .bool = true });
+
+    const Scan = struct {
+        const perms = [_][]const u8{"admin:cache"};
+        fn run(a: std.mem.Allocator, reg: *SkillRegistry, ac: *AdminCtx, args: std.json.ObjectMap) !void {
+            var sctx = SkillContext{ .allocator = a, .userdata = ac, .permissions = &perms };
+            const res = try reg.dispatch("admin.cache.clear", &sctx, .{ .object = args });
+            defer freeValue(a, res);
+            try std.testing.expect(res.object.get("cleared").?.bool);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{ &registry, &admin_ctx, args_map });
+}
+
+test "admin.config.get hands back its tree at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    const mutable = [_][]const u8{"feature.flag"};
+    var store = ConfigStore.init(allocator, &mutable);
+    defer store.deinit();
+    try std.testing.expect(try store.set("feature.flag", "dark"));
+    var admin_ctx = AdminCtx{ .backend = undefined, .config = &store };
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    try registerAdminSkills(&registry);
+
+    var args_map = std.json.ObjectMap{};
+    defer freeValue(allocator, .{ .object = args_map });
+    try putOwned(&args_map, allocator, "key", .{ .string = try allocator.dupe(u8, "feature.flag") });
+
+    const Scan = struct {
+        const perms = [_][]const u8{"admin:config"};
+        fn run(a: std.mem.Allocator, reg: *SkillRegistry, ac: *AdminCtx, args: std.json.ObjectMap) !void {
+            var sctx = SkillContext{ .allocator = a, .userdata = ac, .permissions = &perms };
+            const res = try reg.dispatch("admin.config.get", &sctx, .{ .object = args });
+            defer freeValue(a, res);
+            try std.testing.expectEqualStrings("dark", res.object.get("value").?.string);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{ &registry, &admin_ctx, args_map });
+}
+
+// The row copies (`RunAuditStore.list` takes the handler's allocator) and the
+// record tree both go through the failing allocator; the driver's own storage
+// does not — the client is built on the test allocator, as in the scan for
+// `RunAuditStore.list` itself.
+test "admin.audit.export hands back its tree at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    var store = run_audit.RunAuditStore.init(allocator, &backend);
+    try store.migrate();
+    // A row with a `model` — the field the export's cleanup used to miss.
+    try store.record(.{ .run_id = "r1", .kind = .workflow, .status = "completed", .tenant_id = 1, .steps = 2, .duration_ms = 3, .model = "deepseek-v4" });
+
+    var admin_ctx = AdminCtx{ .backend = &backend };
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    try registerAdminSkills(&registry);
+
+    var args_map = std.json.ObjectMap{};
+    defer freeValue(allocator, .{ .object = args_map });
+    try putOwned(&args_map, allocator, "limit", .{ .integer = 5 });
+
+    const Scan = struct {
+        const perms = [_][]const u8{"admin:audit"};
+        fn run(a: std.mem.Allocator, reg: *SkillRegistry, ac: *AdminCtx, args: std.json.ObjectMap) !void {
+            var sctx = SkillContext{ .allocator = a, .userdata = ac, .permissions = &perms };
+            const res = try reg.dispatch("admin.audit.export", &sctx, .{ .object = args });
+            defer freeValue(a, res);
+            try std.testing.expectEqual(@as(usize, 1), res.object.get("runs").?.array.items.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{ &registry, &admin_ctx, args_map });
 }
 
 // The map refuses the field only when it cannot grow; the key copy built as

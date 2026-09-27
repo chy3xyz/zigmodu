@@ -1295,7 +1295,10 @@ test "workflow escalates when a step fails after retries" {
 const PingSkill = struct {
     fn ping(ctx: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
         var out = std.json.ObjectMap{};
-        try out.put(ctx.allocator, try ctx.allocator.dupe(u8, "ok"), .{ .bool = true });
+        // `putJsonField` copies the value and releases both copies if the map
+        // refuses the field — the inline `dupe` it replaces had no owner at all
+        // on that path.
+        try skill_mod.putJsonField(ctx.allocator, &out, "ok", .{ .bool = true });
         return .{ .object = out };
     }
 };
