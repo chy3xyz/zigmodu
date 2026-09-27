@@ -748,7 +748,9 @@ pub const WebSocketServer = struct {
         for (recipients.items) |client| {
             defer client.release();
 
-            // One writer per client, or two fan-outs would interleave
+            // One writer per client, or two fan-outs — or a fan-out and this
+            // client's own connection fiber answering a keepalive (`sendPong`
+            // takes the same lock inside `sendFrame`) — would interleave
             // half-frames on the same socket. Cancelable for the same reason the
             // registry lock is: a canceled publisher must not stay parked on
             // someone else's peer.
@@ -758,7 +760,9 @@ pub const WebSocketServer = struct {
             };
             defer client.write_mutex.unlock(self.io);
 
-            client.sendText(message) catch |err| {
+            // The lock is already held here, so this is the raw write rather
+            // than `sendText` (which would take it again).
+            client.writeFrameLocked(0x1, message) catch |err| {
                 // A peer that stopped reading (or went away) is not a server
                 // fault, and this is now a *bounded* failure rather than a park
                 // (`write_timeout_ms`) — `warn`, not `err`: `scripts/test-runner.zig`
@@ -989,11 +993,23 @@ pub const WebSocketClient = struct {
         try self.sendFrame(0xA, &[_]u8{});
     }
 
-    /// Send one frame.
+    /// Send one frame, holding the client's write lock for its duration.
     ///
-    /// Two failures with two different names, so a caller can act:
+    /// The lock is taken **here**, not at the call sites, because one socket has
+    /// two writers: the connection fiber answers a keepalive (`sendPong`) and a
+    /// handler pushes (`sendText`), while a `broadcast` from another fiber writes
+    /// the same client. Only `broadcast` used to hold `write_mutex`, so a pong
+    /// racing a fan-out put half of each frame on the wire — the peer's parser
+    /// sees one corrupt frame and closes the connection. `broadcast` holds this
+    /// lock across its whole write and calls `writeFrameLocked` directly, so both
+    /// agree on one writer per client without taking the lock twice.
+    ///
+    /// Three failures with three different names, so a caller can act:
     ///  * `error.NotConnected` — this client was *already* known dead, so not a
     ///    byte was attempted (the guard below). Nothing to do but drop it.
+    ///  * `error.WriteCanceled` — the lock wait was canceled (the task is being
+    ///    torn down). The peer is fine and the frame is simply not sent; the
+    ///    client is *not* marked disconnected, so a later send can still work.
     ///  * `error.WriteFailed` — the write itself failed. The client is marked
     ///    disconnected before returning, because a frame that fails partway
     ///    through leaves the stream **mid-frame**: a retry would prepend a second
@@ -1009,10 +1025,18 @@ pub const WebSocketClient = struct {
     /// write, and the flag stops lying`.
     fn sendFrame(self: *Self, opcode: u8, payload: []const u8) !void {
         if (!self.is_connected) return error.NotConnected;
-        try self.writeFrame(opcode, payload);
+        self.write_mutex.lock(self.io) catch |err| {
+            std.log.debug("[ws] frame not sent: the write lock wait was canceled ({s})", .{@errorName(err)});
+            return error.WriteCanceled;
+        };
+        defer self.write_mutex.unlock(self.io);
+        try self.writeFrameLocked(opcode, payload);
     }
 
-    fn writeFrame(self: *Self, opcode: u8, payload: []const u8) error{WriteFailed}!void {
+    /// The frame write itself. **The caller must hold `write_mutex`** — see
+    /// `sendFrame`; `broadcast` is the other caller and holds it across the whole
+    /// fan-out write.
+    pub fn writeFrameLocked(self: *Self, opcode: u8, payload: []const u8) error{WriteFailed}!void {
         var header_buf: [14]u8 = undefined;
         var header_len: usize = 2;
 
@@ -2380,4 +2404,60 @@ test "WebSocketServer: deinit waits for the registry lock instead of freeing und
     // rule is that it waits.
     try std.testing.expect(!returned_under_the_lock);
     try std.testing.expect(Probe.deinit_returned.load(.acquire));
+}
+
+test "WebSocketClient: a second writer waits for the frame lock instead of interleaving" {
+    const io = std.testing.io;
+    const pair = TestSocketPair.open() orelse return error.SkipZigTest;
+    defer pair.closePeer();
+    var server = WebSocketServer.init(std.testing.allocator, io, 0);
+    defer server.deinit();
+    var client = WebSocketClient.init(std.testing.allocator, pair.stream, io, &server);
+
+    const Probe = struct {
+        var lock_held: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+        var send_returned: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+        var send_ok: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+        fn hold(c: *WebSocketClient, owner_io: std.Io) void {
+            c.write_mutex.lock(owner_io) catch return;
+            lock_held.store(true, .release);
+            std.Io.sleep(owner_io, std.Io.Duration.fromMilliseconds(300), .awake) catch {};
+            c.write_mutex.unlock(owner_io);
+        }
+        fn send(c: *WebSocketClient) void {
+            if (c.sendText("x")) |_| {
+                send_ok.store(true, .release);
+            } else |_| {}
+            send_returned.store(true, .release);
+        }
+    };
+    Probe.lock_held.store(false, .release);
+    Probe.send_returned.store(false, .release);
+    Probe.send_ok.store(false, .release);
+
+    // A fan-out is mid-frame on this client: `broadcast` holds `write_mutex`
+    // across the whole write, which is what makes it one writer per socket.
+    var hold_fut = try io.concurrent(Probe.hold, .{ &client, io });
+    var spins: usize = 0;
+    while (spins < wait_for_parked_fiber_rounds and !Probe.lock_held.load(.acquire)) : (spins += 1) {
+        std.atomic.spinLoopHint();
+    }
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(60), .awake);
+    try std.testing.expect(Probe.lock_held.load(.acquire));
+
+    // The client's own connection fiber writes through the same entry point
+    // (`sendPong` → `sendFrame`, and a handler's `sendText` directly): it has to
+    // wait for that write, not write alongside it. Writing alongside is how the
+    // peer receives half of each frame — one corrupt frame, and it closes.
+    var send_fut = try io.concurrent(Probe.send, .{&client});
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(120), .awake);
+    try std.testing.expect(!Probe.send_returned.load(.acquire));
+
+    send_fut.await(io);
+    hold_fut.await(io);
+    try std.testing.expect(Probe.send_ok.load(.acquire));
+    // ...and once the lock was free the frame went out whole: FINAL|text, 1-byte
+    // payload, no mask (server → client).
+    try std.testing.expectEqual(@as(usize, 3), pair.drain(3));
 }

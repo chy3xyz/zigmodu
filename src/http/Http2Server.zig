@@ -1588,12 +1588,37 @@ const StreamState = struct {
         try self.data.appendSlice(allocator, chunk);
     }
 
+    /// Decode one header block for this stream.
+    ///
+    /// A second block on the same stream is trailers (RFC 9113 §8.1), and two
+    /// things have to be true of it — the old shape had neither:
+    ///
+    ///  * it must be **fed to the decoder**: HPACK's dynamic table is
+    ///    connection-wide (`Hpack.Decoder` is shared by every stream), so a block
+    ///    that is never decoded desynchronizes every later block on the
+    ///    connection;
+    ///  * it must not be *appended* to the request's block, nor become the
+    ///    stream's header list. `header_block` was never cleared, so a trailer
+    ///    block was decoded as "request ++ trailer" against a dynamic table that
+    ///    had already advanced past the request — wrong values, or
+    ///    `COMPRESSION_ERROR` on a connection that was behaving. And a trailer
+    ///    block carries no `:path`/`:method`/`content-type`, so the defaults
+    ///    below would have rewritten the request to `GET /`.
+    ///
+    /// Trailers are decoded and dropped: this server does not read them, it only
+    /// has to stay in step with the decoder.
     fn decodeHeaders(self: *StreamState, allocator: std.mem.Allocator, dec: *Hpack.Decoder) !void {
-        if (self.decoded) |old| {
-            Hpack.freeHeaders(allocator, old);
-            self.decoded = null;
-        }
+        const is_trailers = self.decoded != null;
+        // Cleared on both paths, including a failed decode: that one either killed
+        // the connection or reset the stream, and the next block on a surviving
+        // stream starts from empty either way. `clearRetainingCapacity` keeps the
+        // buffer for the shape this exists for — one block per request.
+        defer self.header_block.clearRetainingCapacity();
         const headers = try dec.decode(self.header_block.items);
+        if (is_trailers) {
+            Hpack.freeHeaders(allocator, headers);
+            return;
+        }
         self.decoded = headers;
 
         var method: []const u8 = "GET";
@@ -3322,6 +3347,44 @@ test "StreamState append caps header block and body bytes" {
     try st.appendData(allocator, "xyz", 3);
     try std.testing.expectError(error.BodyTooLarge, st.appendData(allocator, "w", 3));
     try std.testing.expectEqualStrings("xyz", st.data.items);
+}
+
+test "a decoded header block leaves the stream, so trailers cannot re-decode the request" {
+    const allocator = std.testing.allocator;
+    var st = StreamState.init();
+    defer st.deinit(allocator);
+    var dec = Hpack.Decoder.init(allocator);
+    defer dec.deinit();
+    var enc = Hpack.Encoder.init(allocator);
+
+    const request = try enc.encodeLiterals(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/orders" },
+    });
+    defer allocator.free(request);
+    try st.appendHeaders(allocator, request, 4096);
+    try st.decodeHeaders(allocator, &dec);
+    try std.testing.expectEqualStrings("POST", st.method);
+    try std.testing.expectEqualStrings("/orders", st.path);
+
+    // The block is consumed, not retained. Keeping it made the *next* block on
+    // this stream decode as "request ++ next" — against a dynamic table that had
+    // already advanced past the request, and `Hpack.Decoder` is shared by every
+    // stream on the connection, so the divergence would not have stayed here.
+    try std.testing.expectEqual(@as(usize, 0), st.header_block.items.len);
+
+    // A trailer block (RFC 9113 §8.1) is decoded for the decoder's sake and
+    // dropped for the stream's. It carries no pseudo-headers, so under the old
+    // shape it also rewrote `method`/`path` back to their defaults.
+    const trailers = try enc.encodeLiterals(&.{.{ .name = "x-checksum", .value = "abc" }});
+    defer allocator.free(trailers);
+    try st.appendHeaders(allocator, trailers, 4096);
+    try st.decodeHeaders(allocator, &dec);
+    try std.testing.expectEqualStrings("POST", st.method);
+    try std.testing.expectEqualStrings("/orders", st.path);
+    try std.testing.expectEqual(@as(usize, 0), st.header_block.items.len);
+    const kept = st.decoded orelse return error.TestUnexpectedResultWithMessage;
+    for (kept) |h| try std.testing.expect(!std.mem.eql(u8, h.name, "x-checksum"));
 }
 
 test "inbound limit errors map to ENHANCE_YOUR_CALM, OOM stays INTERNAL_ERROR" {

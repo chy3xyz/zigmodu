@@ -2,6 +2,45 @@
 
 ## [Unreleased]
 
+### 第 75 批：H2 的 header block 解码后不清空（HPACK 分叉）与 WS 的第二写者（半帧交叠）（**破坏性：否**）
+
+两条都是"同一段内存/同一个 socket 上有两个所有者"，都补了可复现的测试。
+
+**1. `StreamState.header_block` 解码后从不清空** —— 同一个 stream 上的第二个 HEADERS 帧是
+trailers（RFC 9113 §8.1），而 `appendHeaders` 是 `appendSlice`：于是 trailers 被**接在请求的
+块后面**一起解码，`decodeHeaders` 拿到的字节是 "request ++ trailers"，而 HPACK 解码器早就
+越过请求块了。`Hpack.Decoder` 是整个连接共享的，所以这不是"这个流错了"而是"这条连接从这往后
+全错"：要么解出错值，要么 `COMPRESSION_ERROR` 把一个本来正常的连接 GOAWAY 掉。顺带还有一条：
+trailers 块里没有 `:path`/`:method`，而 `decodeHeaders` 的默认值是 `GET` / `/` —— 只要它被当成
+普通块处理，就会把请求改写成 `GET /`。
+
+修法两条：(a) 解码后 `clearRetainingCapacity`（失败路径也清，那个流已经 reset 或连接已 GOAWAY）；
+(b) 第二个块按 trailers 处理 —— **仍然喂给解码器**（不喂就是让后面的块全部错位），但解出来的
+header 直接释放，`decoded` 保持请求的那份（`finishStreamScheduled` 就是把它交给 site handler 的）。
+
+```text
+905/2015 http.Http2Server.test.a decoded header block leaves the stream, so trailers cannot
+         re-decode the request...expected 0, found 29      ← 29 字节的请求块留在块里
+```
+
+**2. `WebSocketClient.sendFrame` 不取 `write_mutex`** —— `broadcast` 取，而且注释写得很清楚：
+"One writer per client, or two fan-outs would interleave half-frames on the same socket"。但
+每条连接的 fiber 自己也在写同一个 socket：keepalive 的 `sendPong`（以及 handler 的 `sendText`）
+走的是 `sendFrame` → `writeFrame`，**没有锁**。于是"一个 fan-out 正在写 128 KiB 帧"和"这条连接
+回一个 pong"可以同时进行，各写各的一半 —— 对端解析器看到的是一个坏帧，然后按协议关连接。
+
+修法：锁下沉到唯一的那一层 —— `sendFrame` 取锁后调 `writeFrameLocked`，`broadcast` 保持它已有的
+锁并直接调 `writeFrameLocked`（不再经由 `sendText`，否则会二次取锁）。新增第三种失败名字
+`error.WriteCanceled`：锁等待被取消**不是**写失败，不能把 `is_connected` 标成 false（旧形状下
+`broadcast` 遇到取消只是 debug 日志 + 跳过这个客户端）。
+
+```text
+1354/2015 extensions.WebSocket.test.WebSocketClient: a second writer waits for the frame
+          lock instead of interleaving...FAIL (TestUnexpectedResult)
+```
+
+读数：全量 `-Ddb=all` → **2072/2130 passed · 58 skipped · 0 failed**（+2 条测试）。
+
 ### 第 74 批：模型/对端发来的一段文本就能打死进程 —— `src/ai/**` 的 union 直取与无界数值转换（**破坏性：否**，但有两处语义收紧，见末段）
 
 `std.json.Value` 是 union：在错误的 tag 上取 `.object` / `.string` / `.integer`，Debug 与 ReleaseSafe
