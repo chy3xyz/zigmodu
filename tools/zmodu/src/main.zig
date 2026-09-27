@@ -2923,6 +2923,12 @@ fn introspectDatabase(io: std.Io, allocator: std.mem.Allocator, dsn: []const u8)
 /// SQLite-specific introspection: PRAGMA table_info + foreign_key_list
 fn introspectDatabaseSqlite(io: std.Io, allocator: std.mem.Allocator, db_path: []const u8) ![]TableDef {
     var tables = std.ArrayList(TableDef).empty;
+    // Rows already appended own their strings, so unwinding frees each row's
+    // contents plus the list's backing array (same shape as the mysql path).
+    errdefer {
+        for (tables.items) |t| freeTableDefContents(allocator, t);
+        tables.deinit(allocator);
+    }
 
     // Get table list
     const list_result = try std.process.run(allocator, io, .{
@@ -2931,7 +2937,14 @@ fn introspectDatabaseSqlite(io: std.Io, allocator: std.mem.Allocator, db_path: [
     defer allocator.free(list_result.stdout);
     defer allocator.free(list_result.stderr);
     var table_names = std.ArrayList([]const u8).empty;
-    defer table_names.deinit(allocator);
+    // A plain `defer`, not an `errdefer`: the copies are only ever read (the rows
+    // keep their own `dupe`), so the success path has to release them too. The
+    // old `defer table_names.deinit` freed the backing array and leaked every
+    // name — one per table, on every call.
+    defer {
+        for (table_names.items) |name| allocator.free(name);
+        table_names.deinit(allocator);
+    }
     var iter = std.mem.splitScalar(u8, list_result.stdout, ' ');
     while (iter.next()) |tok| {
         const t = std.mem.trim(u8, tok, " \t\n\r");
@@ -2953,6 +2966,12 @@ fn introspectDatabaseSqlite(io: std.Io, allocator: std.mem.Allocator, db_path: [
         defer allocator.free(col_result.stderr);
 
         var columns = std.ArrayList(ColumnDef).empty;
+        // Freed on the way out if the row never reaches `tables`; once
+        // `toOwnedSlice` runs the list is empty and this is a no-op.
+        errdefer {
+            for (columns.items) |c| freeColumnDef(allocator, c);
+            columns.deinit(allocator);
+        }
         var lines = std.mem.splitScalar(u8, col_result.stdout, '\n');
         while (lines.next()) |line| {
             const trimmed = std.mem.trim(u8, line, " \t\r");
@@ -2966,6 +2985,7 @@ fn introspectDatabaseSqlite(io: std.Io, allocator: std.mem.Allocator, db_path: [
             const pk_str = fields.next() orelse continue;
 
             const col_name = try allocator.dupe(u8, std.mem.trim(u8, name_f, " \t\r"));
+            errdefer allocator.free(col_name);
             var i: usize = 0;
             const col_type = parseColumnTypeName(type_str, &i);
             const nullable = !std.mem.eql(u8, std.mem.trim(u8, notnull_str, " \t\r"), "1");
@@ -2991,6 +3011,14 @@ fn introspectDatabaseSqlite(io: std.Io, allocator: std.mem.Allocator, db_path: [
         defer allocator.free(fk_result.stdout);
         defer allocator.free(fk_result.stderr);
         var foreign_keys = std.ArrayList(ForeignKey).empty;
+        errdefer {
+            for (foreign_keys.items) |fk| {
+                allocator.free(fk.column_name);
+                allocator.free(fk.ref_table);
+                allocator.free(fk.ref_column);
+            }
+            foreign_keys.deinit(allocator);
+        }
         var fk_lines = std.mem.splitScalar(u8, fk_result.stdout, '\n');
         while (fk_lines.next()) |fline| {
             const trimmed = std.mem.trim(u8, fline, " \t\r");
@@ -3001,17 +3029,28 @@ fn introspectDatabaseSqlite(io: std.Io, allocator: std.mem.Allocator, db_path: [
             const ref_table = fields.next() orelse continue;
             const col = fields.next() orelse continue;
             const ref_col = fields.next() orelse continue;
-            try foreign_keys.append(allocator, .{
-                .column_name = try allocator.dupe(u8, std.mem.trim(u8, col, " \t\r")),
-                .ref_table = try allocator.dupe(u8, std.mem.trim(u8, ref_table, " \t\r")),
-                .ref_column = try allocator.dupe(u8, std.mem.trim(u8, ref_col, " \t\r")),
-            });
+            try appendForeignKeyRow(
+                allocator,
+                &foreign_keys,
+                std.mem.trim(u8, col, " \t\r"),
+                std.mem.trim(u8, ref_table, " \t\r"),
+                std.mem.trim(u8, ref_col, " \t\r"),
+            );
         }
 
+        // Hand the row over to `tables`. The two slices leave the loop-local
+        // lists empty, so those guards free nothing from here on; they are
+        // guarded in turn until the append takes them.
+        const cols_slice = try columns.toOwnedSlice(allocator);
+        errdefer freeColumnDefs(allocator, cols_slice);
+        const fks_slice = try foreign_keys.toOwnedSlice(allocator);
+        errdefer freeForeignKeyDefs(allocator, fks_slice);
+        const row_name = try allocator.dupe(u8, tname);
+        errdefer allocator.free(row_name);
         try tables.append(allocator, .{
-            .name = try allocator.dupe(u8, tname),
-            .columns = try columns.toOwnedSlice(allocator),
-            .foreign_keys = try foreign_keys.toOwnedSlice(allocator),
+            .name = row_name,
+            .columns = cols_slice,
+            .foreign_keys = fks_slice,
         });
     }
 
@@ -3021,6 +3060,12 @@ fn introspectDatabaseSqlite(io: std.Io, allocator: std.mem.Allocator, db_path: [
 /// PostgreSQL introspection via psql + information_schema.
 fn introspectDatabasePostgres(io: std.Io, allocator: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, _: []const u8, database: []const u8) ![]TableDef {
     var tables = std.ArrayList(TableDef).empty;
+    // Rows already appended own their strings, so unwinding frees each row's
+    // contents plus the list's backing array (same shape as the mysql path).
+    errdefer {
+        for (tables.items) |t| freeTableDefContents(allocator, t);
+        tables.deinit(allocator);
+    }
 
     const port_str = try std.fmt.allocPrint(allocator, "{d}", .{port});
     defer allocator.free(port_str);
@@ -3137,6 +3182,14 @@ fn introspectDatabasePostgres(io: std.Io, allocator: std.mem.Allocator, host: []
         const cols = col_map.get(tname).?;
         // Extract FKs for this table from fk_result
         var foreign_keys = std.ArrayList(ForeignKey).empty;
+        errdefer {
+            for (foreign_keys.items) |fk| {
+                allocator.free(fk.column_name);
+                allocator.free(fk.ref_table);
+                allocator.free(fk.ref_column);
+            }
+            foreign_keys.deinit(allocator);
+        }
         var fk2 = std.mem.splitScalar(u8, fk_result.stdout, '\n');
         while (fk2.next()) |line| {
             const t = std.mem.trim(u8, line, " \t\r");
@@ -3147,17 +3200,23 @@ fn introspectDatabasePostgres(io: std.Io, allocator: std.mem.Allocator, host: []
             const rtable = fs.next() orelse continue;
             const rcol = fs.next() orelse continue;
             if (std.mem.eql(u8, ftable, tname)) {
-                try foreign_keys.append(allocator, .{
-                    .column_name = try allocator.dupe(u8, fcol),
-                    .ref_table = try allocator.dupe(u8, rtable),
-                    .ref_column = try allocator.dupe(u8, rcol),
-                });
+                try appendForeignKeyRow(allocator, &foreign_keys, fcol, rtable, rcol);
             }
         }
+
+        // Hand the row over to `tables`. The two slices leave the loop-local
+        // list empty, so that guard frees nothing from here on; both are
+        // guarded in turn until the append takes them.
+        const cols_slice = try colsToOwned(allocator, cols);
+        errdefer freeColumnDefs(allocator, cols_slice);
+        const fks_slice = try foreign_keys.toOwnedSlice(allocator);
+        errdefer freeForeignKeyDefs(allocator, fks_slice);
+        const row_name = try allocator.dupe(u8, tname);
+        errdefer allocator.free(row_name);
         try tables.append(allocator, .{
-            .name = try allocator.dupe(u8, tname),
-            .columns = try colsToOwned(allocator, cols),
-            .foreign_keys = try foreign_keys.toOwnedSlice(allocator),
+            .name = row_name,
+            .columns = cols_slice,
+            .foreign_keys = fks_slice,
         });
     }
 
@@ -3422,8 +3481,44 @@ fn lastWordStart(s: []const u8) ?usize {
     return idx;
 }
 
+/// Append one foreign-key row, copying the three strings out of the slices the
+/// caller parsed them from. The copies are made *here* and the row is handed to
+/// `fks` only once they exist: built inline in the `append` argument list
+/// (`try fks.append(a, .{ .ref_table = try a.dupe(…) })`) the first copy is
+/// stranded whenever a later one — or the append itself — fails. Nothing
+/// fallible follows the append inside this helper, so the guards cannot outlive
+/// the hand-over.
+fn appendForeignKeyRow(
+    allocator: std.mem.Allocator,
+    fks: *std.ArrayList(ForeignKey),
+    column_name: []const u8,
+    ref_table: []const u8,
+    ref_column: []const u8,
+) !void {
+    const col = try allocator.dupe(u8, column_name);
+    errdefer allocator.free(col);
+    const tbl = try allocator.dupe(u8, ref_table);
+    errdefer allocator.free(tbl);
+    const rcol = try allocator.dupe(u8, ref_column);
+    errdefer allocator.free(rcol);
+    try fks.append(allocator, .{ .column_name = col, .ref_table = tbl, .ref_column = rcol });
+}
+
 fn extractForeignKeys(allocator: std.mem.Allocator, sql: []const u8, body_start: usize, body_end: usize) ![]ForeignKey {
     var fks: std.ArrayList(ForeignKey) = std.ArrayList(ForeignKey).empty;
+    // Every row in `fks` owns three strings and the list is the only owner until
+    // `toOwnedSlice` hands it to the caller — which simply propagates this
+    // function's error. So a failure in a later iteration must release the rows
+    // already built; without this they are stranded, and this allocator is the
+    // CLI's general-purpose allocator, not an arena.
+    errdefer {
+        for (fks.items) |fk| {
+            allocator.free(fk.column_name);
+            allocator.free(fk.ref_table);
+            allocator.free(fk.ref_column);
+        }
+        fks.deinit(allocator);
+    }
     const body = sql[body_start..@min(body_end, sql.len)];
 
     var i: usize = 0;
@@ -3446,7 +3541,6 @@ fn extractForeignKeys(allocator: std.mem.Allocator, sql: []const u8, body_start:
             while (j < rest.len and rest[j] != ')') j += 1;
             const trimmed_end = std.mem.trimEnd(u8, rest[col_start..j], " \t\n\r`");
             const trimmed_start = std.mem.trimStart(u8, trimmed_end, " \t\n\r`");
-            const col_name = try allocator.dupe(u8, trimmed_start);
             j += 1;
 
             // Find REFERENCES
@@ -3461,28 +3555,20 @@ fn extractForeignKeys(allocator: std.mem.Allocator, sql: []const u8, body_start:
                     const ref_start = j;
                     while (j < rest.len and (std.ascii.isAlphanumeric(rest[j]) or rest[j] == '_' or rest[j] == '`')) j += 1;
                     const ref_table = std.mem.trim(u8, rest[ref_start..j], "`");
-                    if (ref_table.len == 0) {
-                        allocator.free(col_name);
-                        break;
-                    }
+                    if (ref_table.len == 0) break;
 
-                    // Skip ref column in parens if present
+                    // Skip ref column in parens if present. Bounds only — the
+                    // copy is made by `appendForeignKeyRow`.
                     var ref_column: []const u8 = "id";
                     if (j < rest.len and rest[j] == '(') {
                         j += 1;
                         const rc_start = j;
                         while (j < rest.len and rest[j] != ')') j += 1;
-                        ref_column = try allocator.dupe(u8, std.mem.trim(u8, rest[rc_start..j], " \t\n\r`"));
+                        ref_column = std.mem.trim(u8, rest[rc_start..j], " \t\n\r`");
                         j += 1;
-                    } else {
-                        ref_column = try allocator.dupe(u8, ref_column);
                     }
 
-                    try fks.append(allocator, .{
-                        .column_name = col_name,
-                        .ref_table = try allocator.dupe(u8, ref_table),
-                        .ref_column = ref_column,
-                    });
+                    try appendForeignKeyRow(allocator, &fks, trimmed_start, ref_table, ref_column);
                     break;
                 }
             }
@@ -3563,22 +3649,17 @@ fn extractForeignKeys(allocator: std.mem.Allocator, sql: []const u8, body_start:
             if (ref_seen.contains(col_name)) continue;
             try ref_seen.put(col_name, {});
 
-            // Read ref column if present
+            // Read ref column if present. Bounds only — `appendForeignKeyRow`
+            // makes the copy.
             var ref_column: []const u8 = "id";
             if (r < body.len and body[r] == '(') {
                 r += 1;
                 const rc_start = r;
                 while (r < body.len and body[r] != ')') r += 1;
-                ref_column = try allocator.dupe(u8, std.mem.trim(u8, body[rc_start..r], " \t\n\r`"));
-            } else {
-                ref_column = try allocator.dupe(u8, ref_column);
+                ref_column = std.mem.trim(u8, body[rc_start..r], " \t\n\r`");
             }
 
-            try fks.append(allocator, .{
-                .column_name = try allocator.dupe(u8, col_name),
-                .ref_table = try allocator.dupe(u8, ref_table),
-                .ref_column = ref_column,
-            });
+            try appendForeignKeyRow(allocator, &fks, col_name, ref_table, ref_column);
         }
     }
     return fks.toOwnedSlice(allocator);
@@ -10440,6 +10521,191 @@ test "parseSqlSchema: no CREATE TABLE yields empty list" {
         a.free(tables);
     }
     try std.testing.expectEqual(@as(usize, 0), tables.len);
+}
+
+// The schema tests above hand `parseSqlSchema` an arena, which hides a stranded
+// row (the arena bounds what is already unreachable). These two run
+// `extractForeignKeys` on the testing allocator itself: the first at every
+// allocation point, the second on the path that used to strand a `dupe` without
+// any allocation failing at all.
+test "extractForeignKeys frees every row it built at every allocation point (OOM scan)" {
+    const body =
+        "id INTEGER PRIMARY KEY, " ++
+        "user_id INTEGER NOT NULL REFERENCES users(id), " ++
+        "shop_id INTEGER, " ++
+        "FOREIGN KEY (shop_id) REFERENCES shops(shop_id), " ++
+        "region_id INTEGER REFERENCES regions";
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, sql: []const u8) !void {
+            const fks = try extractForeignKeys(a, sql, 0, sql.len);
+            defer freeForeignKeyDefs(a, fks);
+            try std.testing.expectEqual(@as(usize, 3), fks.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scan.run, .{body});
+}
+
+test "extractForeignKeys strands no column name when a FOREIGN KEY has no REFERENCES" {
+    const allocator = std.testing.allocator;
+    const sql = "CREATE TABLE t (a INTEGER, FOREIGN KEY (a) NOTHING)";
+    const fks = try extractForeignKeys(allocator, sql, 0, sql.len);
+    defer allocator.free(fks);
+    try std.testing.expectEqual(@as(usize, 0), fks.len);
+}
+
+/// Environment probe for the live-database tests below.
+///
+/// `std.testing.environ` is the block the test runner was handed, so a test reads
+/// the same variables `zmodu --from-db` would. The `REDIS_URL`-gated tests in
+/// `src/redis/redis.zig` read through `std.c.getenv` because that module links
+/// libc; this package does not, so the libc-free `getPosix` walk is used
+/// instead. Windows keeps a different block representation, and none of the
+/// paths gated here run there.
+fn testEnvVar(name: []const u8) ?[]const u8 {
+    if (@import("builtin").os.tag == .windows) return null;
+    const value = std.process.Environ.getPosix(std.testing.environ, name) orelse return null;
+    return if (value.len == 0) null else value;
+}
+
+/// Run an external CLI and fail on a non-zero exit. The report carries the CLI's
+/// own output: "psql exited 1" is useless without its stderr.
+fn runDbCli(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
+    const result = try std.process.run(allocator, io, .{ .argv = argv });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) {
+        std.debug.print("zmodu tests: {s} failed: {s}{s}\n", .{ argv[0], result.stdout, result.stderr });
+        return error.DatabaseError;
+    }
+}
+
+fn isSqliteCliAvailable(allocator: std.mem.Allocator, io: std.Io) bool {
+    const result = std.process.run(allocator, io, .{ .argv = &.{ "sqlite3", "--version" } }) catch return false;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    return result.term == .exited and result.term.exited == 0;
+}
+
+/// The live round-trip both env-gated database tests run: create a
+/// self-referencing probe table through the CLI, introspect through
+/// `introspectDatabase` (the real `--from-db` entry point), assert the probe came
+/// back with its columns and its foreign key, then drop it again. `dsn` is the
+/// value of the env var the caller gated on.
+fn liveIntrospectionRoundTrip(allocator: std.mem.Allocator, io: std.Io, dsn: []const u8) !void {
+    const probe = "zm_introspect_probe";
+    const db = try parseDsn(allocator, dsn);
+    defer {
+        if (!std.mem.eql(u8, db.driver, "sqlite")) {
+            if (db.user.len > 0) allocator.free(db.user);
+            if (db.pass.len > 0) allocator.free(db.pass);
+            if (db.host.len > 0 and !std.mem.eql(u8, db.host, "localhost")) allocator.free(db.host);
+            if (db.database.len > 0) allocator.free(db.database);
+        }
+    }
+    const is_mysql = std.mem.eql(u8, db.driver, "mysql");
+
+    const drop_sql = try std.fmt.allocPrint(allocator, "DROP TABLE IF EXISTS {s}", .{probe});
+    defer allocator.free(drop_sql);
+    // MySQL wants the FK declared separately; PostgreSQL takes the inline form.
+    const ddl = if (is_mysql)
+        try std.fmt.allocPrint(allocator, "CREATE TABLE {s} (id INT PRIMARY KEY, parent_id INT, FOREIGN KEY (parent_id) REFERENCES {s}(id))", .{ probe, probe })
+    else
+        try std.fmt.allocPrint(allocator, "CREATE TABLE {s} (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES {s}(id))", .{ probe, probe });
+    defer allocator.free(ddl);
+
+    const run_query = struct {
+        fn mysql(a: std.mem.Allocator, io_: std.Io, conn: DbConnection, sql: []const u8) !void {
+            var argv = try buildMysqlArgv(a, conn.host, conn.port, conn.user, conn.pass, conn.database);
+            defer argv.deinit(a);
+            try argv.push(a, "-e");
+            try argv.push(a, sql);
+            try runDbCli(a, io_, argv.args.items);
+        }
+        fn postgres(a: std.mem.Allocator, io_: std.Io, conn: DbConnection, sql: []const u8) !void {
+            const port_str = try std.fmt.allocPrint(a, "{d}", .{conn.port});
+            defer a.free(port_str);
+            try runDbCli(a, io_, &.{ "psql", "-h", conn.host, "-p", port_str, "-U", conn.user, "-d", conn.database, "-c", sql });
+        }
+    };
+
+    if (is_mysql) {
+        try run_query.mysql(allocator, io, db, drop_sql);
+        try run_query.mysql(allocator, io, db, ddl);
+    } else {
+        try run_query.postgres(allocator, io, db, drop_sql);
+        try run_query.postgres(allocator, io, db, ddl);
+    }
+    // Drop even when the assertions below fail: a leftover probe would make the
+    // next run's `CREATE TABLE` fail (and leave junk in the database).
+    defer {
+        if (is_mysql) {
+            run_query.mysql(allocator, io, db, drop_sql) catch |err|
+                std.debug.print("zmodu tests: probe cleanup failed: {s}\n", .{@errorName(err)});
+        } else {
+            run_query.postgres(allocator, io, db, drop_sql) catch |err|
+                std.debug.print("zmodu tests: probe cleanup failed: {s}\n", .{@errorName(err)});
+        }
+    }
+
+    const tables = try introspectDatabase(io, allocator, dsn);
+    defer freeTableDefs(allocator, tables);
+    const probe_row = findTable(tables, probe) orelse return error.ProbeTableMissing;
+    try std.testing.expectEqual(@as(usize, 2), probe_row.columns.len);
+    try std.testing.expectEqual(@as(usize, 1), probe_row.foreign_keys.len);
+    try std.testing.expectEqualStrings(probe, probe_row.foreign_keys[0].ref_table);
+}
+
+// `sqlite3` is an external CLI, so this skips where it is missing instead of
+// failing. Where it exists (this laptop, the standard CI images) it exercises the
+// real introspection path end to end on the testing allocator: the per-table name
+// copies used to be released only by `deinit` of the *list*, which leaked one
+// name per table on every call.
+test "introspectDatabaseSqlite: real database round-trip (sqlite3 CLI)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    if (!isSqliteCliAvailable(allocator, io)) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    const db_path = try std.fmt.allocPrint(allocator, "{s}/schema.db", .{path_buf[0..path_len]});
+    defer allocator.free(db_path);
+
+    try runDbCli(allocator, io, &.{ "sqlite3", db_path, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);" ++
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id));" });
+
+    const tables = try introspectDatabaseSqlite(io, allocator, db_path);
+    defer freeTableDefs(allocator, tables);
+    try std.testing.expectEqual(@as(usize, 2), tables.len);
+    const orders = findTable(tables, "orders") orelse return error.ProbeTableMissing;
+    try std.testing.expectEqual(@as(usize, 2), orders.columns.len);
+    try std.testing.expectEqual(@as(usize, 1), orders.foreign_keys.len);
+    try std.testing.expectEqualStrings("users", orders.foreign_keys[0].ref_table);
+    try std.testing.expectEqualStrings("user_id", orders.foreign_keys[0].column_name);
+}
+
+// Env-gated, the `REDIS_URL` convention: the variable carries a DSN and the test
+// skips when it is absent, so a laptop run verifies nothing and a run with a
+// server is the real end-to-end exercise of `psql` + information_schema parsing.
+//
+//   ZMODU_TEST_PG_URL=postgres://postgres@127.0.0.1:5432/zigmodu_test
+//
+// The introspection passes no password to `psql`, so the server must accept the
+// connection without one — the official image's
+// `POSTGRES_HOST_AUTH_METHOD=trust`, which is also what a CI service container
+// would use.
+test "introspectDatabasePostgres: live schema round-trip (ZMODU_TEST_PG_URL)" {
+    const dsn = testEnvVar("ZMODU_TEST_PG_URL") orelse return error.SkipZigTest;
+    try liveIntrospectionRoundTrip(std.testing.allocator, std.testing.io, dsn);
+}
+
+// Same shape, with a DSN that may carry a password (`mysql` gets `-p<pass>`):
+//
+//   ZMODU_TEST_MYSQL_URL=mysql://root:secret@127.0.0.1:3306/zigmodu_test
+test "introspectDatabaseMysql: live schema round-trip (ZMODU_TEST_MYSQL_URL)" {
+    const dsn = testEnvVar("ZMODU_TEST_MYSQL_URL") orelse return error.SkipZigTest;
+    try liveIntrospectionRoundTrip(std.testing.allocator, std.testing.io, dsn);
 }
 
 test "stripUtf8BomAndTrimSql" {

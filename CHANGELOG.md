@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+### 第 92 批：runner 打印被跳过的测试名；DB 内省的活库测试（含一条真跑的 sqlite 往返）；`extractForeignKeys` 的真漏（**破坏性：否**）
+
+1. **`scripts/test-runner.zig` 现在打印被跳过的测试名**（此前只有计数，"skipped 从 58 变 59"永远只能猜）：
+   ```
+   700/2093 redis.redis.test.redis client...SKIP
+   zm-test-runner: skipped 1 test(s) — each returned error.SkipZigTest:
+   zm-test-runner:   redis.redis.test.redis client
+   ```
+   `zm-test-count:` 那些行**逐字节不变**（`test-fast.sh` 的 sed 依赖它们；新行同前缀但不匹配，脚本原样回显）。收集用的是 `builtin.test_functions` 指针 + page allocator，OOM 时打 `(list truncated…)` 而不是让 runner 失败。
+2. **DB 内省路径的活库测试**（这是之前"无法验证"的那两段）：
+   * `introspectDatabaseSqlite` 的往返测试**本机真跑并通过**（sqlite3 CLI 在就真跑，不在就 skip）—— 顺带修掉它**成功路径上每一张表名都漏**的真漏。
+   * `introspectDatabasePostgres` / `Mysql` 的往返测试按 `ZMODU_TEST_PG_URL` / `ZMODU_TEST_MYSQL_URL` **门控**（本机缺服务时干净 skip，证据在提交信息里），断言探针表带着 2 列 + 1 条外键回来。
+   * **CI 里这两个服务已经存在**：`.github/workflows/ci.yml:569-638`（`postgres:16`）与 `:640-697`（`mariadb:11`），所以只需在那两个 step 的 `env:` 里加
+     `ZMODU_TEST_PG_URL: postgres://postgres@localhost:5432/postgres` /
+     `ZMODU_TEST_MYSQL_URL: mysql://root:secret@127.0.0.1:3306/zigzero_test`。**这两行本批没加**（本机无法验证 CI 的 DSN 与认证细节），列为下一批第一件事 —— 不加的话这两条测试在 CI 里也永远只是 skip。
+3. **`tools/zmodu/src/main.zig` `extractForeignKeys` 的真漏**：`col_name` 在 `dupe` 之后如果这一行没有 `REFERENCES` 就被丢掉、list append 失败时也会 strand。重写为 `appendForeignKeyRow`（行级元素先建好 + list 级 `errdefer`）。红证据：
+   ```
+   'extractForeignKeys frees every row it built at every allocation point (OOM scan)' failed:
+     leaked [addr: 102998fd0, len 7] at main.zig:3449:48 in extractForeignKeys
+   'extractForeignKeys strands no column name when a FOREIGN KEY has no REFERENCES' leaked 1 allocations
+   ```
+   另把 `introspectDatabaseSqlite` / `Postgres` 按第 88 批 mysql 路径的做法补齐守卫（Postgres 那侧**只做了编译验证**）。
+4. **更宽拼写那批的判定**：`mcp` 13 / `skill_export` 25 / `ai_cli` 17 / `workflow` 3 处**全部**落在每次调用或循环自己的 arena 上（`skill_export` 已有 `both renderers are arena-bounded` 那条扫描钉住），**不是漏**，不动。
+
+读数：`check-test-collection` 两行 OK（`tools/zmodu` 140/142，2 skip = 那两条门控）；全量 2179/2239 passed · 60 skipped；`check-production` / `fmt` 全 OK。
+（`tools/zmodu` 的 2 skip 就是新增的两条活库门控；本机没有 pg/mysql 服务。）
+
+**仍未做**（下一批）：① 上面那两行 CI `env:`；② `docs/BEST_PRACTICES.md` + b25 注释里那句"仓库侧门禁比 b25 更严"的口径声明；③ `ai_cli.renderOpenApi` 的 arena 证据测试；④ 同一形状、尚未处理：`src/ai/retriever.zig:68`（**非 arena，很可能是真漏**）、`src/api/Server.zig:2145`、`parseSqlSchema` 的 `tables.append`、`colsToOwned`、`doctor.zig:249/450/467/486`、`runtime.zig:513/570`、`market.zig:230`。
+
 ### 第 91 批：框架侧的 test-collection 门禁落地 —— 顺带修了一个真漏、一个编译不过的测试文件（**破坏性：否**）
 
 上一批只把门禁落在 `tools/zmodu`；框架侧当时是"量过、故意没落"，因为它会当场红。这一批把它修

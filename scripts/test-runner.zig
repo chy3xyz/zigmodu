@@ -26,6 +26,15 @@
 //! `test` step has five test binaries and a filter normally matches in only one
 //! of them.
 //!
+//! Skipped tests are named twice on purpose: the per-test line already carries
+//! the name (`N/M name...SKIP`), and a `zm-test-runner: skipped N test(s) …`
+//! block right before the summary lists those same names one per line. That
+//! block is what turns a `skipped=` drift (58 → 59) into a set difference over
+//! a few dozen lines instead of a grep through every `N/M name...` line of a
+//! ~1450-test run. Its lines share the `zm-test-runner: ` prefix — the count
+//! parsers in `scripts/test-fast.sh` key on `selected N of M tests`, so extra
+//! lines in that family are ignored for counting and echoed at the end of a run.
+//!
 //! Modeled on the compiler's default runner (`lib/compiler/test_runner.zig`,
 //! `mainTerminal`) so per-test allocator/io setup — and therefore leak
 //! detection — behaves the same. Only the default (unfiltered) path is
@@ -117,6 +126,14 @@ pub fn main(init: std.process.Init.Minimal) void {
     var leak_count: usize = 0;
     var unnamed_skipped: usize = 0;
 
+    // Skipped names, collected so the summary can name them (see the module doc).
+    // Entries are pointers into `builtin.test_functions`, which lives for the
+    // whole process — nothing is copied and nothing is freed per entry. The
+    // bookkeeping allocation is the runner's own, so it uses `page_allocator`
+    // and never touches the per-test allocator that is leak-checked.
+    var skipped_names: std.ArrayListUnmanaged([]const u8) = .empty;
+    var skipped_names_oom = false;
+
     for (test_fn_list, 0..) |test_fn, i| {
         if (isUnnamedTest(test_fn.name)) {
             // `test { _ = @import(…); }` blocks are compile-time aggregates: under
@@ -169,6 +186,16 @@ pub fn main(init: std.process.Init.Minimal) void {
         } else |err| switch (err) {
             error.SkipZigTest => {
                 skip_count += 1;
+                // `error.SkipZigTest` is the whole vocabulary of "this test did
+                // not run": `std.testing.skip()` returns it and Zig has no other
+                // skip signal, so it is also the one-line reason the summary
+                // block prints. Collect it while it is in hand; the `…SKIP` line
+                // above already names the test, this only regroups the names.
+                if (!skipped_names_oom) {
+                    skipped_names.append(std.heap.page_allocator, test_fn.name) catch {
+                        skipped_names_oom = true;
+                    };
+                }
                 std.debug.print("SKIP\n", .{});
             },
             else => {
@@ -178,6 +205,15 @@ pub fn main(init: std.process.Init.Minimal) void {
             },
         }
     }
+
+    if (skip_count != 0) {
+        std.debug.print("zm-test-runner: skipped {d} test(s) — each returned error.SkipZigTest:\n", .{skip_count});
+        for (skipped_names.items) |name| std.debug.print("zm-test-runner:   {s}\n", .{name});
+        if (skipped_names_oom) {
+            std.debug.print("zm-test-runner:   (list truncated: out of memory while collecting names)\n", .{});
+        }
+    }
+    skipped_names.deinit(std.heap.page_allocator);
 
     if (filter) |f| {
         std.debug.print("zm-test-runner: selected {d} of {d} tests (filter \"{s}\")", .{
