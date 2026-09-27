@@ -665,6 +665,74 @@ pub fn stripHeadersPriority(payload: []const u8, flags: u8) PriorityError!struct
     return .{ .priority = pri, .header_block = payload[5..] };
 }
 
+pub const PaddingError = error{
+    /// PADDED on a frame type that has no padding (RFC 9113 §6.2).
+    UnexpectedPadding,
+    /// A pad length that runs past the payload — including the zero-length
+    /// payload, where the pad-length byte itself is missing.
+    InvalidPadding,
+};
+
+pub const Unpadded = struct {
+    /// The frame's field-block/body bytes, with the pad-length byte and the
+    /// trailing padding removed. Equal to the input when PADDED is not set.
+    payload: []const u8,
+    pad_len: u8,
+};
+
+/// Split off HTTP/2's padding framing (RFC 9113 §6.2).
+///
+/// With PADDED set the payload is `Pad Length (1) | data | Padding (pad_len)`,
+/// and the padding is **not** part of the body or of the header block: a padded
+/// DATA frame's padding used to be appended to the request body, and a padded
+/// HEADERS frame's pad-length byte went into the HPACK decoder as if it were a
+/// field representation — one connection error per well-behaved client that
+/// pads (RFC 9113 §10.7 is why they exist).
+///
+/// The *wire* length (padding included) is what flow control counts
+/// (RFC 9113 §6.9.1), so callers keep using the original `payload.len` for
+/// window accounting and this result only for the bytes.
+///
+/// PADDED may be set on DATA, HEADERS and PUSH_PROMISE only; on anything else
+/// the flag itself is the protocol error. The priority fields, when both flags
+/// are set, sit *after* the pad-length byte and before the fragment, so the
+/// caller strips this first and `stripHeadersPriority` second.
+pub fn stripPadding(typ: FrameType, flags: u8, payload: []const u8) PaddingError!Unpadded {
+    if ((flags & FrameFlags.padded) == 0) return .{ .payload = payload, .pad_len = 0 };
+    if (typ != .data and typ != .headers and typ != .push_promise) return error.UnexpectedPadding;
+    if (payload.len < 1) return error.InvalidPadding;
+    const pad_len = payload[0];
+    if (@as(usize, pad_len) + 1 > payload.len) return error.InvalidPadding;
+    return .{ .payload = payload[1 .. payload.len - pad_len], .pad_len = pad_len };
+}
+
+test "stripPadding removes the pad length and the padding, and refuses nonsense" {
+    // `pad_len | data | padding`.
+    try std.testing.expectEqualStrings("body", (try stripPadding(.data, FrameFlags.padded, "\x02body\x00\x00")).payload);
+    // An all-padding frame is an empty body, which is legal.
+    try std.testing.expectEqualStrings("", (try stripPadding(.data, FrameFlags.padded, "\x00")).payload);
+    // Unpadded frames pass through untouched.
+    try std.testing.expectEqualStrings("body", (try stripPadding(.data, 0, "body")).payload);
+    // A pad length that runs past the payload, and a padded frame with no
+    // pad-length byte at all.
+    try std.testing.expectError(error.InvalidPadding, stripPadding(.data, FrameFlags.padded, "\x04ab"));
+    try std.testing.expectError(error.InvalidPadding, stripPadding(.data, FrameFlags.padded, ""));
+    // RFC 9113 §6.2: DATA, HEADERS and PUSH_PROMISE are the padded types.
+    try std.testing.expectError(error.UnexpectedPadding, stripPadding(.continuation, FrameFlags.padded, "\x00x"));
+    try std.testing.expectError(error.UnexpectedPadding, stripPadding(.ping, FrameFlags.padded, "\x00x"));
+}
+
+test "PADDED + PRIORITY: the pad length comes first, then the priority fields" {
+    // RFC 9113 §6.2 field order: Pad Length, Priority fields, fragment, padding.
+    const payload = "\x01" ++ "\x00\x00\x00\x03\x0f" ++ "block" ++ "\x00";
+    const flags = FrameFlags.padded | FrameFlags.priority;
+    const unpadded = try stripPadding(.headers, flags, payload);
+    const stripped = try stripHeadersPriority(unpadded.payload, flags);
+    try std.testing.expectEqualStrings("block", stripped.header_block);
+    try std.testing.expectEqual(@as(u31, 3), stripped.priority.?.depends_on);
+    try std.testing.expectEqual(@as(u8, 15), stripped.priority.?.weight);
+}
+
 /// Case-insensitive substring search for ASCII haystack.
 fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
     if (needle.len == 0) return 0;

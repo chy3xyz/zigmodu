@@ -2,6 +2,36 @@
 
 ## [Unreleased]
 
+### 第 77 批：HTTP/2 的 PADDED 帧从来没人处理（合法帧打死连接 / 污染请求体）（**破坏性：否**）
+
+`FrameFlags.padded = 0x8` 在 `Http2.zig` 里定义着，全树没有任何消费点。于是：
+
+* **带 PADDED 的 HEADERS**：payload 是 `pad_len | fragment | padding`，而框架把整个 payload
+  当作 HPACK 块 —— `pad_len` 那个字节被当成一条 field representation（`0x02` = 带增量索引的
+  literal、name 索引 0，即空名），解码失败 → `COMPRESSION_ERROR` GOAWAY。**一个完全合法的帧把
+  连接打掉**，而 RFC 9113 §10.7 那句"padding 用于防止流量分析"正是客户端会发它的原因。
+* **带 PADDED 的 DATA**：填充字节被 `appendData` 当请求体收下 —— 静默污染 body（长度也对不上）。
+* **PADDED 出现在 DATA/HEADERS/PUSH_PROMISE 之外**（CONTINUATION、PING…）：按 §6.2 该报
+  PROTOCOL_ERROR，而旧路径各分支自己忽略这个 flag，等于把非法帧当合法收下。
+
+修法：`Http2.stripPadding(typ, flags, payload)`（纯函数，非 Linux 也能测）返回去掉 pad-length
+字节与尾部 padding 的切片，以及两个拒绝条件（`InvalidPadding` / `UnexpectedPadding`）。接线：
+
+* `.headers` 先 `stripPadding` 再 `stripHeadersPriority` —— §6.2 的字段顺序是 pad length、
+  priority 字段、fragment、padding，所以顺序不能反（`PADDED + PRIORITY` 有测试钉住这个顺序）；
+* `.data` 用去填充后的切片作 body，但**窗口记账仍用整段 payload 长度**：RFC 9113 §6.9.1 规定
+  padding 也计入流控，用去填充后的长度会少扣；
+* 帧类型检查放在 switch 之前：PADDED 只允许出现在三种帧上。
+
+红证据（把 `.headers` 的 `stripPadding` 去掉即红）：
+
+```text
+900/2022  h2 session decodes a padded HEADERS frame instead of failing the connection...
+          FAIL (TestUnexpectedResult)
+```
+
+读数：全量 `-Ddb=all` → **2079/2137 passed · 58 skipped · 0 failed**（+3 条测试）。
+
 ### 第 76 批：H2 协议四条 + ws_uring 的两处（fd 0 的完成事件被丢、`start()` 可以起两条线程）+ `addRoute` 的失败泄漏（**破坏性：否**）
 
 1. **`DATA` 帧的 stream 0 被静默吞掉。** RFC 9113 §6.1 要求 `PROTOCOL_ERROR` 连接错误；旧路径把

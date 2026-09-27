@@ -686,6 +686,21 @@ fn serveSession(
             }
         }
 
+        // RFC 9113 §6.2: PADDED is defined for DATA, HEADERS and PUSH_PROMISE.
+        // On any other frame the flag itself is the protocol error, and it has
+        // to be caught here — the branches below would either ignore the flag
+        // (PING, SETTINGS: the pad bytes become part of the payload) or treat a
+        // continuation's pad-length byte as HPACK input.
+        if ((frame.header.flags & Http2.FrameFlags.padded) != 0) {
+            switch (frame.header.typ) {
+                .data, .headers, .push_promise => {},
+                else => {
+                    try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.PROTOCOL_ERROR, &goaway_sent);
+                    return;
+                },
+            }
+        }
+
         switch (frame.header.typ) {
             .settings => {
                 if ((frame.header.flags & Http2.FrameFlags.ack) == 0) {
@@ -805,7 +820,16 @@ fn serveSession(
                 if (!gop.found_existing) gop.value_ptr.* = StreamState.initWithPeerWindow(conn_flow.peer_initial);
                 try priority_tree.ensureStream(sid);
                 const header_chunk = blk: {
-                    const stripped = Http2.stripHeadersPriority(frame.payload, frame.header.flags) catch break :blk frame.payload;
+                    // PADDED first: the pad-length byte precedes the priority
+                    // fields, and both precede the fragment (RFC 9113 §6.2).
+                    // Without this the pad-length byte went into the HPACK
+                    // decoder as if it were a field representation — one
+                    // connection error per client that pads.
+                    const unpadded = Http2.stripPadding(.headers, frame.header.flags, frame.payload) catch {
+                        try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.PROTOCOL_ERROR, &goaway_sent);
+                        return;
+                    };
+                    const stripped = Http2.stripHeadersPriority(unpadded.payload, frame.header.flags) catch break :blk unpadded.payload;
                     if (stripped.priority) |pri| {
                         gop.value_ptr.priority = pri;
                         try priority_tree.setPriority(sid, pri);
@@ -955,6 +979,13 @@ fn serveSession(
                     try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.PROTOCOL_ERROR, &goaway_sent);
                     return;
                 }
+                // PADDED: `pad_len | data | padding`, and the padding is not
+                // body. The wire length below stays the whole payload, because
+                // flow control counts the padding too (RFC 9113 §6.9.1).
+                const unpadded = Http2.stripPadding(.data, frame.header.flags, frame.payload) catch {
+                    try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.PROTOCOL_ERROR, &goaway_sent);
+                    return;
+                };
                 const data_len: u31 = @intCast(frame.payload.len);
                 onInboundData(&writer, allocator, &conn_flow, 0, data_len) catch {
                     try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.FLOW_CONTROL_ERROR, &goaway_sent);
@@ -980,7 +1011,7 @@ fn serveSession(
                     st.end_stream = true;
                 }
                 if (st.bidi_live) {
-                    pumpLiveBidiData(&writer, allocator, sid, st, &conn_flow, conn_max_frame_size, opts, frame.payload) catch |err| {
+                    pumpLiveBidiData(&writer, allocator, sid, st, &conn_flow, conn_max_frame_size, opts, unpadded.payload) catch |err| {
                         try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, streamErrorFromAny(err));
                         continue;
                     };
@@ -993,7 +1024,7 @@ fn serveSession(
                         abortStream(&outbound, &priority_tree, &streams, allocator, sid);
                     }
                 } else {
-                    st.appendData(allocator, frame.payload, opts.inbound.max_body_bytes) catch |err| {
+                    st.appendData(allocator, unpadded.payload, opts.inbound.max_body_bytes) catch |err| {
                         try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, inboundLimitCode(err));
                         continue;
                     };
@@ -3125,6 +3156,41 @@ test "h2 session answers GOAWAY PROTOCOL_ERROR for a CONTINUATION that continues
     const n = try runLoopbackH2Session(.{}, cont, &out, .goaway);
     const goaway = findFrameInReply(out[0..n], .goaway, 0) orelse return error.TestUnexpectedResultWithMessage;
     try std.testing.expectEqual(Http2.ErrorCode.PROTOCOL_ERROR, (try Http2.decodeGoAway(goaway.payload)).error_code);
+}
+
+test "h2 session decodes a padded HEADERS frame instead of failing the connection" {
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var enc = Hpack.Encoder.init(allocator);
+    const block = try enc.encodeSmart(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":authority", .value = "localhost" },
+    });
+    defer allocator.free(block);
+    // RFC 9113 §6.2: `pad_len | fragment | padding`, and the *fragment* is what
+    // the decoder must see. The pad-length byte used to go in with it, so this
+    // well-formed (if pointless) frame answered COMPRESSION_ERROR and the
+    // connection died — RFC 9113 §10.7 is the reason clients pad at all.
+    const padded = try std.fmt.allocPrint(allocator, "\x02{s}\x00\x00", .{block});
+    defer allocator.free(padded);
+    const frame = try Http2.encodeFrame(
+        allocator,
+        .headers,
+        Http2.FrameFlags.padded | Http2.FrameFlags.end_stream | Http2.FrameFlags.end_headers,
+        1,
+        padded,
+    );
+    defer allocator.free(frame);
+
+    var out: [4096]u8 = undefined;
+    const n = try runLoopbackH2Session(.{}, frame, &out, null);
+    // Nothing to answer with (no site handler here), so the assertion is the
+    // absence of the failure: the session did not GOAWAY the request away.
+    try std.testing.expect(n > 0);
+    try std.testing.expect(findFrameInReply(out[0..n], .goaway, 0) == null);
 }
 
 test "h2 session says GOAWAY NO_ERROR when its frame budget is spent" {
