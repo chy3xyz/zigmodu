@@ -104,10 +104,26 @@ const ReplyReader = struct {
     }
 };
 
+/// How deep a RESP reply may nest. A `*1\r\n` array costs four bytes per level
+/// and this decoder recurses once per level, so an unbounded peer could flatten
+/// the stack with a short stream — the reason a limit exists at all. 32 is far
+/// past anything a real command answers with (the deepest shapes are ~3).
+const max_reply_depth: u32 = 32;
+
+/// Largest single `$` bulk string accepted, in bytes. The length comes from the
+/// peer, and `readExact` grows `out` to match it, so without a cap a peer picks
+/// how much heap this client allocates for one reply. 64 MiB is well past any
+/// value a sane deployment stores in one key.
+const max_reply_bytes: u64 = 64 * 1024 * 1024;
+
 /// Frame one complete RESP reply into `out`, keeping the wire shape
 /// (`+OK\r\n`, `:12\r\n`, `$5\r\nhello\r\n`, `*-1\r\n`) so a command's
 /// existing parsing keeps working on a now-complete buffer.
 fn readWholeReply(reader: *ReplyReader, out: *std.ArrayList(u8)) !void {
+    return readWholeReplyAt(reader, out, 0);
+}
+
+fn readWholeReplyAt(reader: *ReplyReader, out: *std.ArrayList(u8), depth: u32) !void {
     const type_byte = try reader.readByte();
     try out.append(reader.allocator, type_byte);
     switch (type_byte) {
@@ -116,14 +132,16 @@ fn readWholeReply(reader: *ReplyReader, out: *std.ArrayList(u8)) !void {
         '$' => {
             const len = try reader.readCount(out);
             if (len >= 0) {
+                if (@as(u64, @intCast(len)) > max_reply_bytes) return error.RedisError;
                 try reader.readExact(out, @intCast(len));
                 try reader.readCrlf(out);
             }
         },
         '*' => {
             const count = try reader.readCount(out);
+            if (depth >= max_reply_depth) return error.RedisError;
             var i: i64 = 0;
-            while (i < count) : (i += 1) try readWholeReply(reader, out);
+            while (i < count) : (i += 1) try readWholeReplyAt(reader, out, depth + 1);
         },
         else => return error.RedisError,
     }
@@ -1470,6 +1488,35 @@ test "readWholeReply frames values larger than one read and nested arrays" {
     defer out2.deinit(allocator);
     try readWholeReply(&reader, &out2);
     try std.testing.expectEqualStrings("*2\r\n$-1\r\n:7\r\n", out2.items);
+}
+
+test "readWholeReply refuses a reply nested deeper than its bound" {
+    const allocator = std.testing.allocator;
+    const fds = testPair() orelse return error.SkipZigTest;
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = fds[0], .address = undefined } };
+    defer stream.close(std.testing.io);
+    defer _ = std.posix.system.close(fds[1]);
+
+    // Each `*1\r\n` is four bytes and one level of recursion, so without the bound
+    // the *peer* picks how deep this decoder goes — i.e. whether the stack
+    // survives a short hostile stream. 200 levels is far past the bound (32) and
+    // still a byte count any peer can send.
+    const Peer = struct {
+        fn run(fd: std.posix.socket_t) void {
+            var level: usize = 0;
+            while (level < 200) : (level += 1) peerWriteAll(fd, "*1\r\n");
+        }
+    };
+    const peer = try std.Thread.spawn(.{}, Peer.run, .{fds[1]});
+    defer peer.join();
+
+    var reader = testReader(stream, allocator, 5000);
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    try std.testing.expectError(error.RedisError, readWholeReply(&reader, &out));
+    // The bound fires while framing, so the buffer holds what was framed up to it
+    // and nothing is claimed to be complete.
+    try std.testing.expect(out.items.len > 0);
 }
 
 test "readWholeReply honors the read deadline instead of blocking forever" {

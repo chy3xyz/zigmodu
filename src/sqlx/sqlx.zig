@@ -3137,6 +3137,14 @@ fn formatQuery(allocator: std.mem.Allocator, sql: []const u8, args: []const Valu
 /// all-NULL row.
 fn mysqlReadRowsAfterQuery(mysql: ?*libmysql_c.MYSQL, arena: std.heap.ArenaAllocator) errors.ResultT(Rows) {
     var arena_mut = arena;
+    // Taken **by value** on purpose here, but with the copy released on the error
+    // path: every node this call allocates is linked into `arena_mut`, so without
+    // this the caller's `errdefer arena.deinit()` would free an empty list and leak
+    // the partially built rows — the same reasoning `mysqlStmtReadRows` gives for
+    // taking a *pointer* (`:3418`). The copy is freed here instead, and on success
+    // it travels out in `Rows.arena`; the two lists never share a node, so neither
+    // path can double-free.
+    errdefer arena_mut.deinit();
     const arena_alloc = arena_mut.allocator();
     const res = libmysql_c.mysql_store_result(mysql);
     if (res) |r| {

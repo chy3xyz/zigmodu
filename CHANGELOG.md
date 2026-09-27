@@ -1,5 +1,30 @@
 # Changelog
 
+## [Unreleased]
+
+### 第 69 批：第 67 批队列里的两条（sqlx arena 归位、RESP 递归/体积上界）（**破坏性：否**）
+
+**① `sqlx mysqlReadRowsAfterQuery` 的 arena 在错误路径整段泄漏。** 它按值收 `ArenaAllocator`，
+函数内所有节点都链进**副本**，于是出错时调用方的 `errdefer arena.deinit()` 清的是一个空链表 ——
+部分建好的行（含每行的字段名与每个字符串）全部泄漏。修法不是改签名（那要动 3 个调用点），
+而是在副本上挂 `errdefer arena_mut.deinit()`：两条链表从不共享节点，所以出错时由本函数释放、
+成功时随 `Rows.arena` 走出去，两条路径都不会双重释放。同文件 `mysqlStmtReadRows` 取**指针**是
+另一种同样正确的形状，两条注释互相指认。
+
+**② `redis` 的 RESP 分帧有两个"由对端决定规模"的口子**（`readWholeReply`）：
+
+* **递归无深度上限**：`*1\r\n` 每层只 4 字节、直接递归一层 —— 一个短流即可按对端的意愿把栈压穿。
+  修法：`max_reply_depth = 32`（真实回复最深约 3 层），递归改成带 `depth` 的内层函数，
+  外层签名不变（**不动 16 个调用点**）。
+* **`$` 批量串长度无上界**：长度来自对端，`readExact` 会照着它扩 `out` —— 对端可以决定这个客户端
+  为一条回复分配多少堆内存。修法：`max_reply_bytes = 64 MiB` 前置拒绝（远超任何合理部署单键的大小）。
+
+测试 `readWholeReply refuses a reply nested deeper than its bound`：对端连发 200 层 `*1\r\n`，
+断言得到 `error.RedisError`，而不是把栈压穿。
+
+读数：全量 `-Ddb=all` **2055/2113 passed · 58 skipped · 0 failed**；redis 族 20 条（15 通过 5 跳过，
+跳过的是需要真实 Redis 的那些）、`readWholeReply` 族 4 条全通过。
+
 ## [0.35.1] - 2026-09-27
 
 ### 第 68 批：第 67 批记下的那条并发协议洞（`cancelTimerSync` 的 use-after-return）按设计修掉（**破坏性：否**）
