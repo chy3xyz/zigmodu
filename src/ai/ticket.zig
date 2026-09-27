@@ -9,6 +9,7 @@ const SqlxBackend = @import("../data.zig").SqlxBackend;
 const SkillContext = @import("skill.zig").SkillContext;
 const OutboxPublisher = @import("../messaging/OutboxPublisher.zig").OutboxPublisher;
 const reporter = @import("reporter.zig");
+const skill = @import("skill.zig");
 
 pub const ClassifyFn = *const fn (
     allocator: std.mem.Allocator,
@@ -87,11 +88,13 @@ pub const TicketFlow = struct {
         if (self.on_send) |f| try f(allocator, ctx, out.category, out.draft, &out);
 
         if (self.outbox) |ob| {
-            const payload = try std.fmt.allocPrint(
-                allocator,
-                "{{\"category\":\"{s}\",\"draft\":\"{s}\",\"sent\":{s}}}",
-                .{ out.category, out.draft, if (out.sent) "true" else "false" },
-            );
+            // Encoder-escaped: `draft` is LLM output, so one quote used to make
+            // the triage event unparseable.
+            const payload = try skill.encodeJsonObject(allocator, &.{
+                .{ .key = "category", .value = .{ .string = out.category } },
+                .{ .key = "draft", .value = .{ .string = out.draft } },
+                .{ .key = "sent", .value = .{ .bool = out.sent } },
+            });
             defer allocator.free(payload);
             const insert = try ob.buildInsert(self.outbox_topic, payload);
             _ = try self.backend.exec(insert.sql, &.{
@@ -154,4 +157,49 @@ test "TicketFlow triages with context and writes to outbox" {
     const row = (try cursor.next()) orelse return error.NoOutboxRow;
     try std.testing.expectEqualStrings("ai.ticket", row.get("topic").?.string);
     try std.testing.expect(std.mem.indexOf(u8, row.get("payload").?.string, "billing") != null);
+}
+
+test "TicketFlow outbox payload escapes quotes in the drafted reply" {
+    const allocator = std.testing.allocator;
+    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    _ = try client.exec(
+        "CREATE TABLE event_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, payload TEXT, status INTEGER DEFAULT 0, tenant_id INTEGER, retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 5, created_at INTEGER, updated_at INTEGER, error_message TEXT)",
+        &.{},
+    );
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    var outbox = OutboxPublisher.init(allocator, .{ .max_retries = 3 });
+
+    const T = struct {
+        fn classify(a: std.mem.Allocator, _: *SkillContext, _: []const u8, cat: *[]const u8) anyerror!void {
+            cat.* = try a.dupe(u8, "billing \"eu\"");
+        }
+        fn draft(a: std.mem.Allocator, _: *SkillContext, _: []const u8, _: []const u8, _: []const u8, d: *[]const u8) anyerror!void {
+            d.* = try a.dupe(u8, "Hi \"Alice\", a \\ b");
+        }
+        fn send(_: std.mem.Allocator, _: *SkillContext, _: []const u8, _: []const u8, out: *TicketOutcome) anyerror!void {
+            out.sent = true;
+        }
+    };
+
+    var flow = TicketFlow.init(allocator, &backend);
+    flow.classify = T.classify;
+    flow.draft = T.draft;
+    flow.on_send = T.send;
+    flow.outbox = &outbox;
+
+    var ctx = SkillContext{ .allocator = allocator };
+    var outcome = try flow.handle(allocator, &ctx, "my invoice is wrong");
+    defer outcome.deinit(allocator);
+
+    var cursor = try client.queryCursorEx("SELECT payload FROM event_outbox", &.{}, .{});
+    defer cursor.deinit();
+    const row = (try cursor.next()) orelse return error.NoOutboxRow;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, row.get("payload").?.string, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("billing \"eu\"", obj.get("category").?.string);
+    try std.testing.expectEqualStrings("Hi \"Alice\", a \\ b", obj.get("draft").?.string);
+    try std.testing.expectEqual(true, obj.get("sent").?.bool);
 }

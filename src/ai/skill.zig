@@ -87,6 +87,55 @@ pub fn freeValue(allocator: std.mem.Allocator, v: std.json.Value) void {
     }
 }
 
+/// One field of a flat JSON object, as accepted by `encodeJsonObject`. `key`
+/// and a `.string` value may borrow — both are copied into the tree.
+pub const JsonField = struct {
+    key: []const u8,
+    value: std.json.Value,
+};
+
+/// Render a flat JSON object with every string escaped **by the encoder**.
+///
+/// A hand-rolled `allocPrint(… "{{\"body\":\"{s}\"}}", .{text})` writes `text`
+/// verbatim, so a single `"` or `\` in an LLM- or app-authored value produces a
+/// malformed payload (or injects sibling fields) for every consumer. Going
+/// through `std.json.Value` cannot: the value tree is escaped on the way out,
+/// and the intermediate tree is released before returning.
+///
+/// Returns a slice owned by `allocator`.
+pub fn encodeJsonObject(allocator: std.mem.Allocator, fields: []const JsonField) ![]u8 {
+    var obj = std.json.ObjectMap{};
+    errdefer freeValue(allocator, .{ .object = obj });
+    for (fields) |f| {
+        try putJsonField(allocator, &obj, f.key, f.value);
+    }
+    // Past this point the tree is freed here, and the one statement left
+    // (`return out`) cannot fail — so the `errdefer` above cannot double-free.
+    const tree: std.json.Value = .{ .object = obj };
+    const out = try std.json.Stringify.valueAlloc(allocator, tree, .{});
+    freeValue(allocator, tree);
+    return out;
+}
+
+/// Append one owned field. The key is always copied; a `.string` value is
+/// copied too (so the caller keeps its copy), everything else transfers as-is
+/// and must already be owned. Pair with `freeValue` to release the tree.
+pub fn putJsonField(
+    allocator: std.mem.Allocator,
+    obj: *std.json.ObjectMap,
+    key: []const u8,
+    value: std.json.Value,
+) error{OutOfMemory}!void {
+    const k = try allocator.dupe(u8, key);
+    errdefer allocator.free(k);
+    const v: std.json.Value = switch (value) {
+        .string => |s| .{ .string = try allocator.dupe(u8, s) },
+        else => value,
+    };
+    errdefer if (v == .string) allocator.free(v.string);
+    try obj.put(allocator, k, v);
+}
+
 /// What a `guard.Permissions` policy does to the tools that are actually
 /// registered — judged by each tool's **declared class**, which is exactly what
 /// `Guard`/`Permissions` cannot see.
@@ -1106,4 +1155,22 @@ test "auditPolicy, toOpenAiFunctionsAlloc and dispatchWith report a canceled loc
     DispatchRead.seen = null;
     try readUnderCanceledLockWait(SkillRegistry, &reg, &reg.mutex, io, DispatchRead.read);
     try std.testing.expectEqual(@as(?anyerror, error.Canceled), DispatchRead.seen);
+}
+
+test "encodeJsonObject escapes string values instead of interpolating them" {
+    const allocator = std.testing.allocator;
+    const payload = try encodeJsonObject(allocator, &.{
+        .{ .key = "title", .value = .{ .string = "a \"b\" \\ c" } },
+        .{ .key = "n", .value = .{ .integer = 7 } },
+        .{ .key = "ok", .value = .{ .bool = true } },
+    });
+    defer allocator.free(payload);
+
+    // Field order is the declaration order, and the quote/backslash are escaped
+    // by the encoder rather than written verbatim.
+    try std.testing.expectEqualStrings("{\"title\":\"a \\\"b\\\" \\\\ c\",\"n\":7,\"ok\":true}", payload);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("a \"b\" \\ c", parsed.value.object.get("title").?.string);
 }

@@ -8,6 +8,7 @@ const std = @import("std");
 const SqlxBackend = @import("../data.zig").SqlxBackend;
 const SkillContext = @import("skill.zig").SkillContext;
 const OutboxPublisher = @import("../messaging/OutboxPublisher.zig").OutboxPublisher;
+const skill = @import("skill.zig");
 const Time = @import("../core/Time.zig");
 
 pub const SlaLevel = enum { warn, breach };
@@ -61,11 +62,16 @@ pub const SlaTracker = struct {
 
             if (self.on_sla) |cb| try cb(self.userdata, allocator, ctx, item, level, remaining_s);
             if (self.outbox) |ob| {
-                const payload = try std.fmt.allocPrint(
-                    allocator,
-                    "{{\"id\":\"{s}\",\"kind\":\"{s}\",\"subject\":\"{s}\",\"level\":\"{s}\",\"remaining_s\":{d},\"priority\":{d}}}",
-                    .{ item.id, item.kind, item.subject, @tagName(level), remaining_s, item.priority },
-                );
+                // Encoder-escaped: id/kind/subject are app-supplied, and a quote
+                // in any of them used to make the SLA event unparseable.
+                const payload = try skill.encodeJsonObject(allocator, &.{
+                    .{ .key = "id", .value = .{ .string = item.id } },
+                    .{ .key = "kind", .value = .{ .string = item.kind } },
+                    .{ .key = "subject", .value = .{ .string = item.subject } },
+                    .{ .key = "level", .value = .{ .string = @tagName(level) } },
+                    .{ .key = "remaining_s", .value = .{ .integer = remaining_s } },
+                    .{ .key = "priority", .value = .{ .integer = item.priority } },
+                });
                 defer allocator.free(payload);
                 const insert = try ob.buildInsert(self.outbox_topic, payload);
                 _ = try self.backend.exec(insert.sql, &.{
@@ -131,4 +137,46 @@ test "SlaTracker fires warn before deadline and breach after" {
     const row = (try cursor.next()).?;
     try std.testing.expectEqualStrings("ai.sla", row.get("topic").?.string);
     try std.testing.expect(std.mem.indexOf(u8, row.get("payload").?.string, "warn") != null);
+}
+
+test "SlaTracker outbox payload escapes quotes in the item text" {
+    const allocator = std.testing.allocator;
+    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    _ = try client.exec(
+        "CREATE TABLE event_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, payload TEXT, status INTEGER DEFAULT 0, tenant_id INTEGER, retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 5, created_at INTEGER, updated_at INTEGER, error_message TEXT)",
+        &.{},
+    );
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    var outbox = OutboxPublisher.init(allocator, .{ .max_retries = 3 });
+
+    const now = Time.monotonicNowSeconds();
+    const items = [_]SlaItem{
+        .{
+            .id = "t\"1\"",
+            .kind = "ticket",
+            .subject = "refund for order \"A\\B\"",
+            .deadline_s = now + 600,
+            .priority = 1,
+        },
+    };
+    var tracker = SlaTracker.init(allocator, &backend);
+    tracker.items = &items;
+    tracker.warn_before_s = 3600;
+    tracker.outbox = &outbox;
+
+    var ctx = SkillContext{ .allocator = allocator };
+    try std.testing.expectEqual(@as(usize, 1), try tracker.check(allocator, &ctx));
+
+    var cursor = try client.queryCursorEx("SELECT payload FROM event_outbox", &.{}, .{});
+    defer cursor.deinit();
+    const row = (try cursor.next()).?;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, row.get("payload").?.string, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings(items[0].id, obj.get("id").?.string);
+    try std.testing.expectEqualStrings(items[0].subject, obj.get("subject").?.string);
+    try std.testing.expectEqualStrings("warn", obj.get("level").?.string);
+    try std.testing.expectEqual(@as(i64, 1), obj.get("priority").?.integer);
 }

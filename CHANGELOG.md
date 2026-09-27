@@ -2,6 +2,45 @@
 
 ## [Unreleased]
 
+### 第 79 批：手拼 JSON 没转义 —— 一句带引号的话就写坏 outbox 事件 / 响应体（**破坏性：否**）
+
+`src/ai/**` 里 12 处用 `allocPrint` / `buf.print` 拼 JSON，被拼的字符串来自模型或调用方
+（`notification.send` 的正文、`ai.diagnose` 的 summary/causes、审批的 subject/note、工单草稿、
+`GET /approvals/pending` 的每一行…）。一个 `"` 或 `\` 就让整个 payload 变成畸形 JSON，或者把
+后面的字段"注射"进去 —— 不崩、不报错，但**每一个消费这个 payload 的人拿到的东西都是坏的**。
+
+修法：新增 `skill.encodeJsonObject(allocator, fields)` + `skill.putJsonField(allocator, &obj, key, value)`
+—— 走 `std.json.Value` → `std.json.Stringify.valueAlloc`，转义交给编码器。两个约定写进了注释：
+`key` 与 `.string` 值一律**复制**（调用方的字符串不被接管，否则 `freeValue` 会释放别人的内存），
+其余值按"已经归你"处理；中间树在返回前 `freeValue` 掉（构建期出错走函数级 `errdefer`，成功路径
+只剩一条不能失败的 `return`，没有双释放窗口）。
+
+改动 10 个文件、12 处：`notify` / `diagnose`（含 `buildOutboxPayload`）/ `risk` / `ticket` /
+`approval`（两处）/ `approval_api`（`buildPendingBody` + `resolveOne`）/ `sla` / `trigger` /
+`actions`（`command.execute` 的信封 —— 只去掉自己那半个 `}`，`data` 成员仍是原样拼接的字节）。
+字段名与顺序不变（`ObjectMap` 按插入序）。每处返回的都是同一个 allocator 的所有权切片，
+由原来那个 `defer allocator.free(...)` 在同一位置释放 —— 调用方的所有权契约一个都没变。
+
+红证据（把 `risk.zig:81` 换回 `allocPrint` 插值即红）：
+
+```text
+82/2033  ai.risk.test.RiskReview outbox payload escapes a quoted subject...FAIL (SyntaxError)
+         …/std/json/Scanner.zig:1139:29: 0x105116317 in peekNextTokenType (test)
+             else => return error.SyntaxError,
+         risk.zig:158:18  var parsed = try std.json.parseFromSlice(std.json.Value, allocator, row.get("payload").?.string, .{});
+```
+
+读数：全量 `-Ddb=all` → **2090/2148 passed · 58 skipped · 0 failed**（+10 条测试）；
+`ai.` 过滤 207 passed · **leaked=0**。
+
+**判定为误报、故意不改**（免得下次再翻）：`refund.zig:74` 两个字段都是 `{d}` 整数，
+`agent.zig:496/556` 插的是 `@tagName`/`@errorName`（编译器产出的标识符，不可能含 `"`），
+`llm.zig` 的 `{{"summary":…}}` 是**发给模型的提示词**不是 payload，`agent.zig:135-155` 的
+Prometheus label 是另一类（标签转义）。**留给下次**：`skill.zig:333/336` 的
+`toOpenAiFunctionsAlloc` 是同一形状（工具名/描述由应用在 Zig 里声明，不在本批的"模型/用户输入"
+范围内，但一句带引号的 `description` 就会产出非法 tools JSON）；`putJsonField` 在 `put` 失败时
+只释放 `.string` 值，非 string 值（array）会漏 —— 仅 OOM 可达。
+
 ### 第 78 批：`resumeRun` 的 completed 集合存的是解析结果里的切片 —— 一个 step 名字里带引号就是 use-after-free（**破坏性：否**）
 
 `Workflow.resumeRun` 回放 WAL 时把"已完成的步骤名"放进一个 `StringHashMap(void)`，插入的是

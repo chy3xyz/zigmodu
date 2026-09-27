@@ -9,6 +9,7 @@ const std = @import("std");
 const SqlxBackend = @import("../data.zig").SqlxBackend;
 const SkillContext = @import("skill.zig").SkillContext;
 const SkillRegistry = @import("skill.zig").SkillRegistry;
+const skill = @import("skill.zig");
 const OutboxPublisher = @import("../messaging/OutboxPublisher.zig").OutboxPublisher;
 const HttpClient = @import("../http/HttpClient.zig").HttpClient;
 
@@ -159,11 +160,11 @@ pub fn registerNotifySkills(registry: *SkillRegistry) !void {
                     if (std.mem.eql(u8, c.name, ch_v.string)) try named.append(sctx.allocator, c);
                 }
 
-                const payload = try std.fmt.allocPrint(
-                    sctx.allocator,
-                    "{{\"channel\":\"{s}\",\"title\":\"{s}\",\"body\":\"{s}\"}}",
-                    .{ ch_v.string, title_v.string, body_v.string },
-                );
+                const payload = try skill.encodeJsonObject(sctx.allocator, &.{
+                    .{ .key = "channel", .value = .{ .string = ch_v.string } },
+                    .{ .key = "title", .value = .{ .string = title_v.string } },
+                    .{ .key = "body", .value = .{ .string = body_v.string } },
+                });
                 defer sctx.allocator.free(payload);
 
                 const saved_channels = nc.hub.channels;
@@ -290,4 +291,50 @@ test "NotificationHub webhook posts to loopback server" {
     const report = try hub.deliver(allocator, &ctx, "{\"ping\":1}");
     try std.testing.expectEqual(@as(usize, 1), report.delivered);
     try std.testing.expect(std.mem.indexOf(u8, body_buf[0..body_len], "{\"ping\":1}") != null);
+}
+
+test "notification.send payload escapes quotes and backslashes in the message text" {
+    const allocator = std.testing.allocator;
+    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    var http = HttpClient.init(allocator, std.testing.io, 1, 1000);
+    defer http.deinit();
+
+    // The sink records exactly the bytes the hub was handed, so parsing that
+    // back is the same check a downstream webhook consumer would do.
+    var seen = std.ArrayList(u8).empty;
+    defer seen.deinit(allocator);
+    var sink_state = SinkState{ .seen = &seen };
+    const channels = [_]NotificationChannel{
+        .{ .name = "ops", .kind = .{ .sink = .{ .userdata = &sink_state, .call = SinkState.sink } } },
+    };
+    var hub = NotificationHub.init(allocator, &backend, &http);
+    hub.channels = &channels;
+    var nc = NotificationCtx{ .hub = &hub };
+
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    try registerNotifySkills(&registry);
+
+    const title = "disk \"full\" on /var";
+    const body = "line1\nline2 with a \\ backslash";
+    var args_map = std.json.ObjectMap{};
+    try putOwned(&args_map, allocator, "channel", .{ .string = try allocator.dupe(u8, "ops") });
+    try putOwned(&args_map, allocator, "title", .{ .string = try allocator.dupe(u8, title) });
+    try putOwned(&args_map, allocator, "body", .{ .string = try allocator.dupe(u8, body) });
+
+    var sctx = SkillContext{ .allocator = allocator, .userdata = &nc };
+    const res = try registry.dispatch("notification.send", &sctx, .{ .object = args_map });
+    defer skill.freeValue(allocator, res);
+    defer skill.freeValue(allocator, .{ .object = args_map });
+
+    try std.testing.expectEqual(@as(i64, 1), res.object.get("delivered").?.integer);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, seen.items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("ops", parsed.value.object.get("channel").?.string);
+    try std.testing.expectEqualStrings(title, parsed.value.object.get("title").?.string);
+    try std.testing.expectEqualStrings(body, parsed.value.object.get("body").?.string);
 }

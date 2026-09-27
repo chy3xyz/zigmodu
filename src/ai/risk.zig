@@ -7,6 +7,7 @@ const SqlxBackend = @import("../data.zig").SqlxBackend;
 const SkillContext = @import("skill.zig").SkillContext;
 const OutboxPublisher = @import("../messaging/OutboxPublisher.zig").OutboxPublisher;
 const sqlx = @import("../data.zig").sqlx;
+const skill = @import("skill.zig");
 
 /// A rule whose SQL returns a row when the risk factor applies; each match
 /// adds `score` to the subject's risk score.
@@ -75,11 +76,14 @@ pub const RiskReview = struct {
         };
 
         if (self.outbox) |ob| {
-            const payload = try std.fmt.allocPrint(
-                allocator,
-                "{{\"subject\":\"{s}\",\"score\":{d},\"level\":\"{s}\",\"decision\":\"{s}\"}}",
-                .{ subject, score, @tagName(level), @tagName(decision) },
-            );
+            // Encoder-escaped: `subject` is caller/LLM-authored, so one quote
+            // used to make the audit event unparseable.
+            const payload = try skill.encodeJsonObject(allocator, &.{
+                .{ .key = "subject", .value = .{ .string = subject } },
+                .{ .key = "score", .value = .{ .integer = score } },
+                .{ .key = "level", .value = .{ .string = @tagName(level) } },
+                .{ .key = "decision", .value = .{ .string = @tagName(decision) } },
+            });
             defer allocator.free(payload);
             const insert = try ob.buildInsert(self.outbox_topic, payload);
             _ = try self.backend.exec(insert.sql, &.{
@@ -128,4 +132,36 @@ test "RiskReview scores rules and applies threshold decisions" {
     const row = (try cursor.next()) orelse return error.NoOutboxRow;
     try std.testing.expectEqualStrings("ai.risk", row.get("topic").?.string);
     try std.testing.expect(std.mem.indexOf(u8, row.get("payload").?.string, "reject") != null);
+}
+
+test "RiskReview outbox payload escapes a quoted subject" {
+    const allocator = std.testing.allocator;
+    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    _ = try client.exec(
+        "CREATE TABLE event_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, payload TEXT, status INTEGER DEFAULT 0, tenant_id INTEGER, retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 5, created_at INTEGER, updated_at INTEGER, error_message TEXT)",
+        &.{},
+    );
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    var outbox = OutboxPublisher.init(allocator, .{ .max_retries = 3 });
+    var review = RiskReview.init(allocator, &backend);
+    review.outbox = &outbox;
+
+    const subject = "order \"7\" \\ draft";
+    var ctx = SkillContext{ .allocator = allocator };
+    const res = try review.review(allocator, &ctx, subject);
+    try std.testing.expectEqualStrings(subject, res.subject);
+
+    var cursor = try client.queryCursorEx("SELECT payload FROM event_outbox", &.{}, .{});
+    defer cursor.deinit();
+    const row = (try cursor.next()) orelse return error.NoOutboxRow;
+    // A hand-interpolated `"subject":"{s}"` produced `{"subject":"order "7" \ draft",…}`,
+    // which no consumer can parse.
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, row.get("payload").?.string, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(subject, parsed.value.object.get("subject").?.string);
+    try std.testing.expectEqual(@as(i64, 0), parsed.value.object.get("score").?.integer);
+    try std.testing.expectEqualStrings("low", parsed.value.object.get("level").?.string);
+    try std.testing.expectEqualStrings("approve", parsed.value.object.get("decision").?.string);
 }

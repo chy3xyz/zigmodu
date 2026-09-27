@@ -14,6 +14,7 @@ const OutboxPublisher = @import("../messaging/OutboxPublisher.zig").OutboxPublis
 const Scheduler = @import("../scheduler/Cron.zig").Scheduler;
 const Expression = @import("../scheduler/Cron.zig").Expression;
 const sqlx = @import("../data.zig").sqlx;
+const skill = @import("skill.zig");
 const Time = @import("../core/Time.zig");
 
 pub const TriggerResult = struct {
@@ -76,11 +77,14 @@ pub const Trigger = struct {
 
         if (self.outbox) |ob| {
             if (self.backend) |b| {
-                const payload = try std.fmt.allocPrint(
-                    allocator,
-                    "{{\"run_id\":\"{s}\",\"ok\":{s},\"message\":\"{s}\"}}",
-                    .{ result.run_id, if (result.ok) "true" else "false", result.message },
-                );
+                // Encoder-escaped: `message` is whatever the workflow wrote back
+                // (often LLM text), so a quote in it used to make the run event
+                // unparseable.
+                const payload = try skill.encodeJsonObject(allocator, &.{
+                    .{ .key = "run_id", .value = .{ .string = result.run_id } },
+                    .{ .key = "ok", .value = .{ .bool = result.ok } },
+                    .{ .key = "message", .value = .{ .string = result.message } },
+                });
                 defer allocator.free(payload);
                 const insert = try ob.buildInsert(self.outbox_topic, payload);
                 _ = try b.exec(insert.sql, &.{
@@ -216,4 +220,44 @@ test "trigger registerCron fires on scheduler tick" {
     const now = Time.monotonicNowSeconds();
     scheduler.tick(now);
     try std.testing.expectEqual(@as(usize, 1), runs);
+}
+
+test "trigger outbox payload escapes quotes in the run outcome" {
+    const allocator = std.testing.allocator;
+    var sqlx_client = sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer sqlx_client.deinit();
+    try sqlx_client.connect();
+    _ = try sqlx_client.exec(
+        "CREATE TABLE event_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, payload TEXT, status INTEGER DEFAULT 0, tenant_id INTEGER, retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 5, created_at INTEGER, updated_at INTEGER, error_message TEXT)",
+        &.{},
+    );
+
+    var backend = SqlxBackend{ .allocator = allocator, .client = &sqlx_client };
+    var outbox = OutboxPublisher.init(allocator, .{ .max_retries = 3 });
+
+    const T = struct {
+        fn run(alloc: std.mem.Allocator, _: *SkillContext, _: []const u8, out: *TriggerResult) anyerror!void {
+            _ = alloc;
+            out.ok = true;
+            out.run_id = "run\"1\"";
+            out.message = "workflow said \"ok\" \\ done";
+        }
+    };
+    const ctx = SkillContext{ .allocator = allocator };
+    var trigger = Trigger.init(allocator, std.testing.io, T.run, ctx);
+    defer trigger.deinit();
+    trigger.outbox = &outbox;
+    trigger.backend = &backend;
+
+    _ = try trigger.fire(allocator, "webhook");
+
+    var cursor = try sqlx_client.queryCursorEx("SELECT payload FROM event_outbox", &.{}, .{});
+    defer cursor.deinit();
+    const row = (try cursor.next()) orelse return error.NoOutboxRow;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, row.get("payload").?.string, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("run\"1\"", obj.get("run_id").?.string);
+    try std.testing.expectEqual(true, obj.get("ok").?.bool);
+    try std.testing.expectEqualStrings("workflow said \"ok\" \\ done", obj.get("message").?.string);
 }

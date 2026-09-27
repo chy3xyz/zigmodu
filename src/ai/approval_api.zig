@@ -12,6 +12,7 @@ const approval = @import("approval.zig");
 const SkillContext = @import("skill.zig").SkillContext;
 const SkillRegistry = @import("skill.zig").SkillRegistry;
 const freeValue = @import("skill.zig").freeValue;
+const skill = @import("skill.zig");
 const json_shape = @import("json_shape.zig");
 
 /// `X-Tenant-ID` as a scope. Absent means the caller did not scope the request
@@ -230,26 +231,10 @@ pub fn ApprovalApi(comptime QueueT: type) type {
             };
             try self.queue.listPending(ctx.allocator, &items, tenant_id);
 
-            var buf = std.ArrayList(u8).empty;
-            defer buf.deinit(ctx.allocator);
-            try buf.appendSlice(ctx.allocator, "{\"pending\":[");
-            var first = true;
-            for (items.items) |item| {
-                if (!first) try buf.appendSlice(ctx.allocator, ",");
-                first = false;
-                try buf.appendSlice(ctx.allocator, "{\"run_id\":\"");
-                try buf.appendSlice(ctx.allocator, item.run_id);
-                try buf.appendSlice(ctx.allocator, "\",\"subject\":\"");
-                try buf.appendSlice(ctx.allocator, item.subject);
-                try buf.print(ctx.allocator, "\",\"amount\":{d},\"note\":\"", .{item.amount});
-                try buf.appendSlice(ctx.allocator, item.note);
-                try buf.appendSlice(ctx.allocator, "\",\"step\":\"");
-                try buf.appendSlice(ctx.allocator, item.step_name);
-                try buf.appendSlice(ctx.allocator, "\"}");
-            }
-            try buf.appendSlice(ctx.allocator, "]}");
+            const body = try buildPendingBody(ctx.allocator, items.items);
+            defer ctx.allocator.free(body);
             try ctx.setHeader("Content-Type", "application/json");
-            try ctx.json(200, buf.items);
+            try ctx.json(200, body);
         }
 
         fn approve(ctx: *http.Context, self: *State) !void {
@@ -272,10 +257,41 @@ pub fn ApprovalApi(comptime QueueT: type) type {
                 try ctx.json(404, "{\"err\":\"not found or already resolved\"}");
                 return;
             }
-            const body = try std.fmt.allocPrint(ctx.allocator, "{{\"ok\":true,\"run_id\":\"{s}\",\"decision\":\"{s}\"}}", .{ id, if (approved) "approved" else "rejected" });
+            const body = try skill.encodeJsonObject(ctx.allocator, &.{
+                .{ .key = "ok", .value = .{ .bool = true } },
+                .{ .key = "run_id", .value = .{ .string = id } },
+                .{ .key = "decision", .value = .{ .string = if (approved) "approved" else "rejected" } },
+            });
             defer ctx.allocator.free(body);
             try ctx.setHeader("Content-Type", "application/json");
             try ctx.json(200, body);
+        }
+
+        /// The pending list, rendered by the encoder: `subject` / `note` /
+        /// `step_name` can come from a model-authored escalation, and a quote in
+        /// any of them used to make the response body unparseable.
+        fn buildPendingBody(allocator: std.mem.Allocator, items: []const PendingApproval) ![]u8 {
+            var rows = std.json.Array.init(allocator);
+            for (items) |item| {
+                var row = std.json.ObjectMap{};
+                try skill.putJsonField(allocator, &row, "run_id", .{ .string = item.run_id });
+                try skill.putJsonField(allocator, &row, "subject", .{ .string = item.subject });
+                try skill.putJsonField(allocator, &row, "amount", .{ .integer = item.amount });
+                try skill.putJsonField(allocator, &row, "note", .{ .string = item.note });
+                try skill.putJsonField(allocator, &row, "step", .{ .string = item.step_name });
+                try rows.append(.{ .object = row });
+            }
+            var obj = std.json.ObjectMap{};
+            errdefer skill.freeValue(allocator, .{ .object = obj });
+            try skill.putJsonField(allocator, &obj, "pending", .{ .array = rows });
+            // Freed here; the only statement left cannot fail, so the `errdefer`
+            // above cannot double-free. (`valueAlloc` takes `anytype`, so the
+            // value must be typed `std.json.Value` — an inline literal would be
+            // stringified as an anonymous struct instead.)
+            const tree: std.json.Value = .{ .object = obj };
+            const out = try std.json.Stringify.valueAlloc(allocator, tree, .{});
+            skill.freeValue(allocator, tree);
+            return out;
         }
     };
 }
@@ -606,4 +622,47 @@ test "push, resolve, listPending and count answer a canceled lock wait honestly"
     CountRead.seen = 0;
     try readUnderCanceledLockWait(ApprovalQueue, &queue, &queue.mu, io, CountRead.read);
     try std.testing.expectEqual(@as(usize, 1), CountRead.seen);
+}
+
+test "GET /approvals/pending escapes quotes in the pending rows" {
+    const allocator = std.testing.allocator;
+
+    var queue = ApprovalQueue.init(allocator, std.testing.io);
+    defer queue.deinit();
+    try queue.push(.{
+        .run_id = try allocator.dupe(u8, "ap-\"1\""),
+        .subject = try allocator.dupe(u8, "order \"9\""),
+        .amount = 50000,
+        .note = try allocator.dupe(u8, "needs \\ CFO"),
+        .step_name = try allocator.dupe(u8, "finance"),
+    });
+
+    const Api = ApprovalApi(ApprovalQueue);
+    var api_state = Api{ .queue = &queue };
+    const AppState = struct {};
+    var app: AppState = .{};
+    var server = @import("../api/Server.zig").Server.initWithConfig(std.testing.io, allocator, .{ .port = 18097 });
+    defer server.deinit();
+    var router = http.Router(AppState).init(std.testing.io, allocator, &server, &app);
+    defer router.deinit();
+    var root = router.scope("");
+    try root.mount(Api, &api_state);
+    var slot: @import("../api/ComptimeRouter.zig").CatalogSlot = .{};
+    defer slot.deinit();
+    slot.set(try router.finish());
+
+    var resp = try @import("../http/Testkit.zig").dispatch(&server, .GET, "/approvals/pending", null);
+    defer resp.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, resp.body, .{});
+    defer parsed.deinit();
+    const pending = parsed.value.object.get("pending").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    const row = pending[0].object;
+    try std.testing.expectEqualStrings("ap-\"1\"", row.get("run_id").?.string);
+    try std.testing.expectEqualStrings("order \"9\"", row.get("subject").?.string);
+    try std.testing.expectEqual(@as(i64, 50000), row.get("amount").?.integer);
+    try std.testing.expectEqualStrings("needs \\ CFO", row.get("note").?.string);
+    try std.testing.expectEqualStrings("finance", row.get("step").?.string);
 }

@@ -9,6 +9,7 @@ const SqlxBackend = @import("../data.zig").SqlxBackend;
 const SkillContext = @import("skill.zig").SkillContext;
 const OutboxPublisher = @import("../messaging/OutboxPublisher.zig").OutboxPublisher;
 const reporter = @import("reporter.zig");
+const skill = @import("skill.zig");
 
 pub const AnomalyCase = struct {
     /// Source: "alert" | "recon" | "sla" | "app".
@@ -136,31 +137,10 @@ pub const DiagnosisFlow = struct {
         actions: []const []const u8,
     ) !void {
         const ob = self.outbox.?;
-        var buf = std.ArrayList(u8).empty;
-        defer buf.deinit(allocator);
-        try buf.appendSlice(allocator, "{\"source\":\"");
-        try buf.appendSlice(allocator, case.source);
-        try buf.appendSlice(allocator, "\",\"subject\":\"");
-        try buf.appendSlice(allocator, case.subject);
-        try buf.appendSlice(allocator, "\",\"summary\":\"");
-        try buf.appendSlice(allocator, summary);
-        try buf.appendSlice(allocator, "\",\"causes\":[");
-        for (causes, 0..) |c, i| {
-            if (i > 0) try buf.appendSlice(allocator, ",");
-            try buf.appendSlice(allocator, "\"");
-            try buf.appendSlice(allocator, c);
-            try buf.appendSlice(allocator, "\"");
-        }
-        try buf.appendSlice(allocator, "],\"actions\":[");
-        for (actions, 0..) |a, i| {
-            if (i > 0) try buf.appendSlice(allocator, ",");
-            try buf.appendSlice(allocator, "\"");
-            try buf.appendSlice(allocator, a);
-            try buf.appendSlice(allocator, "\"");
-        }
-        try buf.appendSlice(allocator, "]}");
+        const payload = try buildOutboxPayload(allocator, case, summary, causes, actions);
+        defer allocator.free(payload);
 
-        const insert = try ob.buildInsert(self.outbox_topic, buf.items);
+        const insert = try ob.buildInsert(self.outbox_topic, payload);
         _ = try self.backend.exec(insert.sql, &.{
             .{ .string = insert.params.topic },
             .{ .string = insert.params.payload },
@@ -170,6 +150,39 @@ pub const DiagnosisFlow = struct {
         });
     }
 };
+
+/// The `ai.diagnose` payload: source, subject, summary, causes, actions.
+/// Rendered from a `std.json.Value`, so the anomaly text and the diagnoser's
+/// causes/actions (LLM output) are escaped instead of interpolated: one quote
+/// used to produce an unparseable event for every consumer.
+fn buildOutboxPayload(
+    allocator: std.mem.Allocator,
+    case: AnomalyCase,
+    summary: []const u8,
+    causes: []const []const u8,
+    actions: []const []const u8,
+) ![]u8 {
+    var obj = std.json.ObjectMap{};
+    errdefer skill.freeValue(allocator, .{ .object = obj });
+    try skill.putJsonField(allocator, &obj, "source", .{ .string = case.source });
+    try skill.putJsonField(allocator, &obj, "subject", .{ .string = case.subject });
+    try skill.putJsonField(allocator, &obj, "summary", .{ .string = summary });
+    var causes_v = std.json.Array.init(allocator);
+    for (causes) |c| try causes_v.append(.{ .string = try allocator.dupe(u8, c) });
+    try skill.putJsonField(allocator, &obj, "causes", .{ .array = causes_v });
+    var actions_v = std.json.Array.init(allocator);
+    for (actions) |a| try actions_v.append(.{ .string = try allocator.dupe(u8, a) });
+    try skill.putJsonField(allocator, &obj, "actions", .{ .array = actions_v });
+
+    // The tree is released here and the only statement left cannot fail, so the
+    // `errdefer` above cannot double-free. (`valueAlloc` takes `anytype`, so the
+    // value must be typed `std.json.Value` — an inline literal would be
+    // stringified as an anonymous struct instead.)
+    const tree: std.json.Value = .{ .object = obj };
+    const out = try std.json.Stringify.valueAlloc(allocator, tree, .{});
+    skill.freeValue(allocator, tree);
+    return out;
+}
 
 test "DiagnosisFlow gathers evidence, diagnoses and writes outbox" {
     const allocator = std.testing.allocator;
@@ -292,4 +305,61 @@ test "DiagnosisFlow writeOutbox fills every NOT NULL column of the shipped DDL" 
     const created_at = row.get("created_at").?.int;
     try std.testing.expect(created_at > 0);
     try std.testing.expectEqual(created_at, row.get("updated_at").?.int);
+}
+
+test "DiagnosisFlow outbox payload escapes quotes in the diagnosed text" {
+    const allocator = std.testing.allocator;
+    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    _ = try client.exec(
+        "CREATE TABLE event_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, payload TEXT, status INTEGER DEFAULT 0, tenant_id INTEGER, retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 5, created_at INTEGER, updated_at INTEGER, error_message TEXT)",
+        &.{},
+    );
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    var outbox = OutboxPublisher.init(allocator, .{ .max_retries = 3 });
+
+    // Every one of these is what a diagnoser wired to an LLM hands back.
+    const summary = "spike of \"failed\" orders \\ retried";
+    const cause = "provider said \"declined\"";
+    const action = "retry after \"backoff\"";
+    const Diagnoser = struct {
+        fn run(
+            a: std.mem.Allocator,
+            _: *SkillContext,
+            _: AnomalyCase,
+            _: []const EvidenceBlock,
+            out_causes: *std.ArrayList([]const u8),
+            out_actions: *std.ArrayList([]const u8),
+            out_summary: *[]const u8,
+        ) anyerror!void {
+            try out_causes.append(a, try a.dupe(u8, "provider said \"declined\""));
+            try out_actions.append(a, try a.dupe(u8, "retry after \"backoff\""));
+            out_summary.* = try a.dupe(u8, "spike of \"failed\" orders \\ retried");
+        }
+    };
+
+    var flow = DiagnosisFlow.init(allocator, &backend, Diagnoser.run);
+    flow.outbox = &outbox;
+    var ctx = SkillContext{ .allocator = allocator };
+    var res = try flow.run(allocator, &ctx, .{
+        .source = "alert",
+        .subject = "orders \"eu\"",
+        .severity = .critical,
+        .description = "failed orders",
+    });
+    defer res.deinit(allocator);
+
+    var cursor = try client.queryCursorEx("SELECT payload FROM event_outbox", &.{}, .{});
+    defer cursor.deinit();
+    const row = (try cursor.next()) orelse return error.NoOutboxRow;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, row.get("payload").?.string, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("alert", obj.get("source").?.string);
+    try std.testing.expectEqualStrings("orders \"eu\"", obj.get("subject").?.string);
+    try std.testing.expectEqualStrings(summary, obj.get("summary").?.string);
+    try std.testing.expectEqual(@as(usize, 1), obj.get("causes").?.array.items.len);
+    try std.testing.expectEqualStrings(cause, obj.get("causes").?.array.items[0].string);
+    try std.testing.expectEqualStrings(action, obj.get("actions").?.array.items[0].string);
 }

@@ -18,6 +18,7 @@ const SkillContext = @import("skill.zig").SkillContext;
 const OutboxPublisher = @import("../messaging/OutboxPublisher.zig").OutboxPublisher;
 const business = @import("business.zig");
 const freeValue = @import("skill.zig").freeValue;
+const skill = @import("skill.zig");
 const json_shape = @import("json_shape.zig");
 
 pub const max_report_rows: usize = 100;
@@ -261,9 +262,19 @@ fn executeCommand(sctx: *SkillContext, cctx: *CommandCtx, args: std.json.Value) 
 
     var payload_buf = std.ArrayList(u8).empty;
     defer payload_buf.deinit(sctx.allocator);
-    const head = try std.fmt.allocPrint(sctx.allocator, "{{\"run_id\":\"{s}\",\"command\":\"{s}\",\"data\":", .{ run_id, name_v.string });
+    // The two interpolated fields go through the encoder: `run_id` is
+    // caller-supplied and one `"` in it used to make the event (and everything
+    // downstream of it) unparseable. `payload_buf` only splices the rendered
+    // envelope and the already-valid `data` member.
+    const head = try skill.encodeJsonObject(sctx.allocator, &.{
+        .{ .key = "run_id", .value = .{ .string = run_id } },
+        .{ .key = "command", .value = .{ .string = name_v.string } },
+    });
     defer sctx.allocator.free(head);
-    try payload_buf.appendSlice(sctx.allocator, head);
+    // `head` is exactly `{"run_id":…,"command":…}` — drop its closing brace and
+    // re-close with the `data` member.
+    try payload_buf.appendSlice(sctx.allocator, head[0 .. head.len - 1]);
+    try payload_buf.appendSlice(sctx.allocator, ",\"data\":");
     if (obj.get("payload")) |p| {
         const data = try std.json.Stringify.valueAlloc(sctx.allocator, p, .{});
         defer sctx.allocator.free(data);
@@ -535,4 +546,49 @@ test "report.generate returns JSON and CSV" {
     defer freeValue(allocator, .{ .object = csv_args });
     try std.testing.expect(std.mem.indexOf(u8, csv.string, "tenant_id,total") != null);
     try std.testing.expect(std.mem.indexOf(u8, csv.string, "1,300") != null);
+}
+
+test "command.execute outbox payload escapes quotes in the run id" {
+    const allocator = std.testing.allocator;
+    var client = sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    _ = try client.exec(
+        "CREATE TABLE event_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, payload TEXT, status INTEGER DEFAULT 0, tenant_id INTEGER, retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 5, created_at INTEGER, updated_at INTEGER, error_message TEXT)",
+        &.{},
+    );
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    var outbox = OutboxPublisher.init(allocator, .{ .max_retries = 3 });
+    const commands = [_]CommandSpec{
+        .{ .name = "refund", .description = "refund an order" },
+    };
+    var cctx = CommandCtx{ .backend = &backend, .outbox = &outbox, .commands = &commands };
+    var registry = try setupRegistry(allocator, std.testing.io);
+    defer registry.deinit();
+    try registerCommandSkills(&registry);
+    const perms = [_][]const u8{"command:execute"};
+    const run_id = "run-\"42\"-\\x";
+    var sctx = SkillContext{ .allocator = allocator, .run_id = run_id, .permissions = &perms, .userdata = &cctx };
+
+    var payload = std.json.ObjectMap{};
+    try putOwned(&payload, allocator, "order_id", .{ .integer = 7 });
+    try putOwned(&payload, allocator, "note", .{ .string = try allocator.dupe(u8, "a \"quoted\" note") });
+    var args_map = std.json.ObjectMap{};
+    try putOwned(&args_map, allocator, "command", .{ .string = try allocator.dupe(u8, "refund") });
+    try putOwned(&args_map, allocator, "payload", .{ .object = payload });
+    const res = try registry.dispatch("command.execute", &sctx, .{ .object = args_map });
+    defer freeValue(allocator, res);
+    defer freeValue(allocator, .{ .object = args_map });
+
+    var cursor = try client.queryCursorEx("SELECT payload FROM event_outbox", &.{}, .{});
+    defer cursor.deinit();
+    const row = (try cursor.next()) orelse return error.NoOutboxRow;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, row.get("payload").?.string, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings(run_id, obj.get("run_id").?.string);
+    try std.testing.expectEqualStrings("refund", obj.get("command").?.string);
+    // `data` is the model's own object, spliced as the valid JSON it already is.
+    try std.testing.expectEqual(@as(i64, 7), obj.get("data").?.object.get("order_id").?.integer);
+    try std.testing.expectEqualStrings("a \"quoted\" note", obj.get("data").?.object.get("note").?.string);
 }

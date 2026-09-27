@@ -13,6 +13,7 @@ const SkillContext = @import("skill.zig").SkillContext;
 const SkillRegistry = @import("skill.zig").SkillRegistry;
 const OutboxPublisher = @import("../messaging/OutboxPublisher.zig").OutboxPublisher;
 const sqlx = @import("../data.zig").sqlx;
+const skill = @import("skill.zig");
 
 /// What happened at one approval step.
 pub const ApprovalDecision = enum { approved, escalated, rejected };
@@ -173,11 +174,16 @@ pub const ApprovalFlow = struct {
         note: []const u8,
     ) !void {
         const ob = self.outbox orelse return;
-        const payload = try std.fmt.allocPrint(
-            allocator,
-            "{{\"run_id\":\"{s}\",\"subject\":\"{s}\",\"amount\":{d},\"step\":\"{s}\",\"decision\":\"{s}\",\"note\":\"{s}\"}}",
-            .{ run_id, subject, amount, step, @tagName(decision), note },
-        );
+        // Encoder-escaped: `subject` / `note` are caller- or LLM-authored, so a
+        // quote in either used to make the audit event unparseable.
+        const payload = try skill.encodeJsonObject(allocator, &.{
+            .{ .key = "run_id", .value = .{ .string = run_id } },
+            .{ .key = "subject", .value = .{ .string = subject } },
+            .{ .key = "amount", .value = .{ .integer = amount } },
+            .{ .key = "step", .value = .{ .string = step } },
+            .{ .key = "decision", .value = .{ .string = @tagName(decision) } },
+            .{ .key = "note", .value = .{ .string = note } },
+        });
         defer allocator.free(payload);
         const insert = try ob.buildInsert(self.outbox_topic, payload);
         _ = try self.backend.exec(insert.sql, &.{
@@ -199,11 +205,13 @@ pub const ApprovalFlow = struct {
         steps_done: usize,
     ) !void {
         const ob = self.outbox orelse return;
-        const payload = try std.fmt.allocPrint(
-            allocator,
-            "{{\"run_id\":\"{s}\",\"subject\":\"{s}\",\"amount\":{d},\"status\":\"{s}\",\"steps_done\":{d}}}",
-            .{ run_id, subject, amount, @tagName(status), steps_done },
-        );
+        const payload = try skill.encodeJsonObject(allocator, &.{
+            .{ .key = "run_id", .value = .{ .string = run_id } },
+            .{ .key = "subject", .value = .{ .string = subject } },
+            .{ .key = "amount", .value = .{ .integer = amount } },
+            .{ .key = "status", .value = .{ .string = @tagName(status) } },
+            .{ .key = "steps_done", .value = .{ .integer = @intCast(steps_done) } },
+        });
         defer allocator.free(payload);
         const insert = try ob.buildInsert(self.outbox_topic, payload);
         _ = try self.backend.exec(insert.sql, &.{
@@ -368,4 +376,54 @@ test "ApprovalFlow default policy escalates every step to a human" {
     var res = try flow.submit(allocator, &ctx, "order-9", 1, &steps);
     defer res.deinit(allocator);
     try std.testing.expectEqual(ApprovalStatus.pending_human, res.status);
+}
+
+test "ApprovalFlow outbox payload escapes quotes in the subject and note" {
+    const allocator = std.testing.allocator;
+    var client = sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    _ = try client.exec(
+        "CREATE TABLE event_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, payload TEXT, status INTEGER DEFAULT 0, tenant_id INTEGER, retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 5, created_at INTEGER, updated_at INTEGER, error_message TEXT)",
+        &.{},
+    );
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    var outbox = OutboxPublisher.init(allocator, .{ .max_retries = 3 });
+
+    const T = struct {
+        fn policy(
+            a: std.mem.Allocator,
+            _: *SkillContext,
+            _: []const u8,
+            _: i64,
+            _: usize,
+            _: []const u8,
+            _: []const u8,
+            out_note: *[]const u8,
+        ) anyerror!ApprovalDecision {
+            out_note.* = try a.dupe(u8, "ok \"from\" \\ finance");
+            return .approved;
+        }
+    };
+
+    var flow = ApprovalFlow.init(allocator, &backend, T.policy);
+    flow.outbox = &outbox;
+    const steps = [_]ApprovalStep{.{ .name = "finance \"eu\"" }};
+    var ctx = SkillContext{ .allocator = allocator };
+    const subject = "order \"9\" \\ x";
+    var res = try flow.submit(allocator, &ctx, subject, 100, &steps);
+    defer res.deinit(allocator);
+
+    var cursor = try client.queryCursorEx("SELECT payload FROM event_outbox WHERE topic = 'ai.approval'", &.{}, .{});
+    defer cursor.deinit();
+    var rows: usize = 0;
+    while (try cursor.next()) |row| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, row.get("payload").?.string, .{});
+        defer parsed.deinit();
+        const obj = parsed.value.object;
+        try std.testing.expectEqualStrings(subject, obj.get("subject").?.string);
+        try std.testing.expectEqual(@as(i64, 100), obj.get("amount").?.integer);
+        rows += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), rows);
 }
