@@ -2,6 +2,47 @@
 
 ## [Unreleased]
 
+### 第 80 批：tools JSON 是最后一个手拼点；`putJsonField` 的失败路径；五处 OOM-only errdefer；一处分配器错配（**破坏性：否**）
+
+1. **`SkillRegistry.toOpenAiFunctionsAlloc`** —— 上一批同一形状的最后一处：工具名/描述由应用在
+   Zig 里声明，一句带 `"` 的 `description` 就产出**非法 tools JSON**，发给每个 provider。改成
+   建 `std.json.Value` 树（嵌套 ObjectMap + 两个 Array）一次 `Stringify.valueAlloc` 渲染；
+   六个私有构建函数各管自己那一层（各自 `errdefer`，交给父层之后源守卫就死了 —— 这正是
+   "局部值 + errdefer + 后续失败" 的双释放陷阱）。字段顺序与旧输出逐字节相同，有一条按字节比较
+   的测试钉住。
+   红证据（换回旧 `buf.print` 插值即红）：
+   ```text
+   75/2034  toOpenAiFunctionsAlloc escapes app-authored names and descriptions...INVALID tools_json: SyntaxError
+            [{"type":"function","function":{"name":"we"ird\tool","description":"a "quoted" \ slash",...
+            FAIL (SyntaxError)
+   ```
+2. **`putJsonField` 的失败路径**：值守卫从"只放 `.string`"改成 `errdefer freeValue(allocator, v)`
+   —— 调用方交进来的 array/object 在 `put` 失败时也要释放，否则每处都漏一个刚建好的数组。
+   同时把值的构造提到第一个可能失败的调用之前，让守卫覆盖全部出口。
+3. **五处只可能由 OOM 触发的 errdefer**（第 78 批列的清单）：`recon.zig` 三个结构体字面量连做
+   两三个 dupe（改成本地值各带 errdefer、append 放最后）、`hierarchy.zig` 的 wave 先整体 append
+   再统一 destroy（原来 append 失败会与已执行的 destroy 叠成**双释放**）、`workflow.zig`
+   `runDag` 的 `create` 循环加 `spawned` 计数 + errdefer、`agent.zig` 的三段 dupe 与
+   `appendOwnedToolCalls`/`appendOwnedString`（先建好再 append，`defer` 释放的列表再也不会
+   拿到半成品）、`context.zig` 的 `new_summary` 守卫挪进产生 `merged` 的 `blk:`（否则后面
+   `summary.* = merged` 会把它释放两次）。
+4. **一处真的分配器错配**：`agent.zig` 用 `Agent.run` 的 allocator 释放 skill handler 的返回值，
+   而 handler 按 `SkillContext` 的 allocator 分配；`workflow.zig` 的 `.agent` 分支恰好传的是
+   workflow 自己的 allocator（同文件的 `.skill` 分支早就写明要用 `ctx.allocator`）。改用
+   `skill_ctx.allocator`。
+
+读数：全量 `-Ddb=all` → **2092/2150 passed · 58 skipped · 0 failed**（+2 条测试）；`ai.` 过滤
+209 passed · leaked=0。（另有一条与本次无关的 flake：`RaftTransport` 的 black-holed dial 在
+一次全量跑里报了 `HostUnreachable` 而非 `ConnectTimeout`，单独跑与后续两次全量都过 —— 记在这里
+免得下次当成回归。）
+
+**仍未做（同一形状，已列入队列）**：`agent.zig` 还有四处
+`X = try allocator.alloc…; try owned_strs.append(allocator, X)`（工具 error/result 路径，仅 OOM），
+`diagnose.zig` 与 `approval_api.zig` 里两处 `dupe`+`append` 循环；`hierarchy`/`workflow` 的
+append 失败路径上"executor 产出但没交到 result 的字符串"无主 —— 要修得给转移点加计数，
+而 `runDag` 的转移点在 `appendCompleted` 内部（`persistStep` 失败发生在交接之后），贸然加
+尾部释放有重新引入双释放的风险，故本批只取"销毁单所有者"这一半。
+
 ### 第 79 批：手拼 JSON 没转义 —— 一句带引号的话就写坏 outbox 事件 / 响应体（**破坏性：否**）
 
 `src/ai/**` 里 12 处用 `allocPrint` / `buf.print` 拼 JSON，被拼的字符串来自模型或调用方

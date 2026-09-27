@@ -425,18 +425,24 @@ pub const Agent = struct {
                     log.record(.run_finish, "", resp.content, skill_ctx.tenant_id orelse 0, skill_ctx.user_id orelse 0);
                 }
                 try self.recordRunAudit(allocator, skill_ctx, steps + 1, started_ms, if (budget_stopped) "budget_exhausted" else if (canceled_stopped) "canceled" else "completed", if (resp.model.len > 0) resp.model else null);
+                // Each of these three is owned until the `return` hands them
+                // over; the `errdefer`s fire only if a later dupe fails, so a
+                // failure cannot drop the ones already allocated.
                 const answer = try allocator.dupe(u8, resp.content);
+                errdefer allocator.free(answer);
                 // Surface the reasoning chain from reasoning models.
                 const reasoning = if (resp.reasoning_content.len > 0)
                     try allocator.dupe(u8, resp.reasoning_content)
                 else
                     "";
+                errdefer if (reasoning.len > 0) allocator.free(reasoning);
                 // Surface the actual model that answered (may differ from the
                 // configured one under provider aliasing/failover).
                 const model = if (resp.model.len > 0)
                     try allocator.dupe(u8, resp.model)
                 else
                     "";
+                errdefer if (model.len > 0) allocator.free(model);
                 return .{
                     .answer = answer,
                     .steps = steps + 1,
@@ -450,18 +456,11 @@ pub const Agent = struct {
                 };
             }
 
-            const tc_copy = try allocator.alloc(AiProvider.ToolCall, resp.tool_calls.len);
-            for (resp.tool_calls, 0..) |tc, i| {
-                tc_copy[i] = .{
-                    .id = try allocator.dupe(u8, tc.id),
-                    .name = try allocator.dupe(u8, tc.name),
-                    .arguments = try allocator.dupe(u8, tc.arguments),
-                };
-            }
-            try owned_tool_call_slices.append(allocator, tc_copy);
-
-            const content_copy = try allocator.dupe(u8, resp.content);
-            try owned_strs.append(allocator, content_copy);
+            // Both copies land in a list freed by a `defer`, so they are built
+            // and appended inside the helpers: a `try` that fails between the
+            // dupe and the append used to leak the copy (nothing owned it yet).
+            const tc_copy = try appendOwnedToolCalls(allocator, &owned_tool_call_slices, resp.tool_calls);
+            const content_copy = try appendOwnedString(allocator, &owned_strs, resp.content);
 
             try messages.append(allocator, .{
                 .role = "assistant",
@@ -569,7 +568,12 @@ pub const Agent = struct {
                 if (self.audit) |log| {
                     log.record(.tool_ok, tc.name, "", skill_ctx.tenant_id orelse 0, skill_ctx.user_id orelse 0);
                 }
-                defer skill_mod.freeValue(allocator, result);
+                // The handler built this value with `ctx.allocator`, which is
+                // not necessarily the allocator this run was handed
+                // (`Workflow.runStep` passes the workflow's own allocator to
+                // `Agent.run` while the handler follows `SkillContext`) — freeing
+                // it with the wrong one is an invalid free.
+                defer skill_mod.freeValue(skill_ctx.allocator, result);
                 const result_s = try std.json.Stringify.valueAlloc(allocator, result, .{});
                 try owned_strs.append(allocator, result_s);
                 const tid = try allocator.dupe(u8, tc.id);
@@ -617,6 +621,54 @@ pub const Agent = struct {
         });
     }
 };
+
+/// Deep-copy `calls` (each `id`/`name`/`arguments` owns its bytes) and append
+/// the slice to `list`, which is released by a `defer` — so a slice must never
+/// reach it half-built, and the caller cannot free it afterwards either.
+///
+/// Built here and appended last: any OOM frees exactly what this allocated
+/// (each entry's three strings, then the slice itself) and leaves `list`
+/// untouched.
+fn appendOwnedToolCalls(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList([]AiProvider.ToolCall),
+    calls: []const AiProvider.ToolCall,
+) ![]AiProvider.ToolCall {
+    const copy = try allocator.alloc(AiProvider.ToolCall, calls.len);
+    errdefer allocator.free(copy);
+    var filled: usize = 0;
+    errdefer for (copy[0..filled]) |tc| {
+        allocator.free(tc.id);
+        allocator.free(tc.name);
+        allocator.free(tc.arguments);
+    };
+    for (calls, 0..) |tc, i| {
+        const id = try allocator.dupe(u8, tc.id);
+        errdefer allocator.free(id);
+        const name = try allocator.dupe(u8, tc.name);
+        errdefer allocator.free(name);
+        const arguments = try allocator.dupe(u8, tc.arguments);
+        errdefer allocator.free(arguments);
+        copy[i] = .{ .id = id, .name = name, .arguments = arguments };
+        filled += 1;
+    }
+    try list.append(allocator, copy);
+    return copy;
+}
+
+/// Dupe `s`, append the copy to `list` and return it. Both failures leave
+/// `list` unchanged and nothing allocated: `list` is released by a `defer`,
+/// which cannot tell an appended slice from one that was dropped here.
+fn appendOwnedString(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList([]const u8),
+    s: []const u8,
+) ![]const u8 {
+    const copy = try allocator.dupe(u8, s);
+    errdefer allocator.free(copy);
+    try list.append(allocator, copy);
+    return copy;
+}
 
 test "Spec.build carries identity, authority and memory into the agent" {
     const allocator = std.testing.allocator;

@@ -118,21 +118,29 @@ pub fn encodeJsonObject(allocator: std.mem.Allocator, fields: []const JsonField)
 }
 
 /// Append one owned field. The key is always copied; a `.string` value is
-/// copied too (so the caller keeps its copy), everything else transfers as-is
-/// and must already be owned. Pair with `freeValue` to release the tree.
+/// copied too (so the caller keeps its own bytes), everything else transfers
+/// as-is and must already be owned. Pair with `freeValue` to release the tree
+/// once it is built.
+///
+/// The transfer is unconditional, failure included: an array or object passed
+/// here is released with `freeValue` if this returns an error (the string-only
+/// `free` this used to do dropped it whole), so the caller must treat it as
+/// consumed either way and must not free it a second time.
 pub fn putJsonField(
     allocator: std.mem.Allocator,
     obj: *std.json.ObjectMap,
     key: []const u8,
     value: std.json.Value,
 ) error{OutOfMemory}!void {
-    const k = try allocator.dupe(u8, key);
-    errdefer allocator.free(k);
+    // For everything but `.string` this switch cannot fail, so `v` is created
+    // before the first fallible call below and the guard covers every exit.
     const v: std.json.Value = switch (value) {
         .string => |s| .{ .string = try allocator.dupe(u8, s) },
         else => value,
     };
-    errdefer if (v == .string) allocator.free(v.string);
+    errdefer freeValue(allocator, v);
+    const k = try allocator.dupe(u8, key);
+    errdefer allocator.free(k);
     try obj.put(allocator, k, v);
 }
 
@@ -366,37 +374,34 @@ pub const SkillRegistry = struct {
     }
 
     /// Generate OpenAI-compatible tools JSON (owned slice).
+    ///
+    /// Built as a `std.json.Value` tree and rendered by the encoder, not
+    /// interpolated with `buf.print`: a tool name or description is
+    /// app-declared and may contain `"` or `\`, and interpolating one produced
+    /// byte-for-byte invalid tools JSON — which every provider rejects
+    /// wholesale, taking the whole request (and so every tool) with it.
     pub fn toOpenAiFunctionsAlloc(self: *Self, allocator: std.mem.Allocator) ![]u8 {
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
 
-        var buf = std.ArrayList(u8).empty;
-        errdefer buf.deinit(allocator);
-        try buf.append(allocator, '[');
-        var first = true;
+        var tools = std.json.Array.init(allocator);
+        errdefer freeValue(allocator, .{ .array = tools });
+
         var it = self.tools.iterator();
         while (it.next()) |entry| {
             const t = entry.value_ptr;
-            if (!first) try buf.append(allocator, ',');
-            first = false;
-            try buf.print(allocator, "{{\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"description\":\"{s}\",\"parameters\":{{\"type\":\"object\",\"properties\":{{", .{ t.name, t.description });
-            for (t.parameters, 0..) |p, pi| {
-                if (pi > 0) try buf.append(allocator, ',');
-                try buf.print(allocator, "\"{s}\":{{\"type\":\"{s}\",\"description\":\"{s}\"}}", .{ p.name, @tagName(p.type), p.description });
-            }
-            try buf.appendSlice(allocator, "},\"required\":[");
-            var req_first = true;
-            for (t.parameters) |p| {
-                if (p.required) {
-                    if (!req_first) try buf.append(allocator, ',');
-                    req_first = false;
-                    try buf.print(allocator, "\"{s}\"", .{p.name});
-                }
-            }
-            try buf.appendSlice(allocator, "]}}}");
+            const tool = try openAiTool(allocator, t);
+            // `append` consumes `tool` only on success.
+            errdefer freeValue(allocator, tool);
+            try tools.append(tool);
         }
-        try buf.append(allocator, ']');
-        return try buf.toOwnedSlice(allocator);
+        // Past this point the tree is freed here, and the one statement left
+        // (`return out`) cannot fail — so the `errdefer`s above cannot
+        // double-free.
+        const tree: std.json.Value = .{ .array = tools };
+        const out = try std.json.Stringify.valueAlloc(allocator, tree, .{});
+        freeValue(allocator, tree);
+        return out;
     }
 
     /// Generate OpenAI-compatible function calling JSON via writer.interface.writeAll.
@@ -404,6 +409,77 @@ pub const SkillRegistry = struct {
         const json = try self.toOpenAiFunctionsAlloc(self.allocator);
         defer self.allocator.free(json);
         try writer.interface.writeAll(json);
+    }
+
+    /// One tool as an owned JSON value —
+    /// `{"type":"function","function":{…}}`.
+    ///
+    /// Every level is built by a helper of its own, and each helper's `errdefer`
+    /// is scoped to that helper: an error then frees exactly what that level had
+    /// built, and never a value already handed to its parent (a transfer whose
+    /// source guard was still live is how a JSON tree gets freed twice).
+    fn openAiTool(allocator: std.mem.Allocator, t: *const Tool) !std.json.Value {
+        var out = std.json.ObjectMap{};
+        errdefer freeValue(allocator, .{ .object = out });
+        try putJsonField(allocator, &out, "type", .{ .string = "function" });
+        try putJsonField(allocator, &out, "function", try openAiFunction(allocator, t));
+        return .{ .object = out };
+    }
+
+    /// `{"name":…,"description":…,"parameters":{…}}`.
+    fn openAiFunction(allocator: std.mem.Allocator, t: *const Tool) !std.json.Value {
+        var out = std.json.ObjectMap{};
+        errdefer freeValue(allocator, .{ .object = out });
+        try putJsonField(allocator, &out, "name", .{ .string = t.name });
+        try putJsonField(allocator, &out, "description", .{ .string = t.description });
+        try putJsonField(allocator, &out, "parameters", try openAiParameters(allocator, t.parameters));
+        return .{ .object = out };
+    }
+
+    /// `{"type":"object","properties":{…},"required":[…]}`, key order included:
+    /// `required` is emitted even when empty, as it always was.
+    fn openAiParameters(allocator: std.mem.Allocator, params: []const Param) !std.json.Value {
+        var out = std.json.ObjectMap{};
+        errdefer freeValue(allocator, .{ .object = out });
+        try putJsonField(allocator, &out, "type", .{ .string = "object" });
+        try putJsonField(allocator, &out, "properties", try openAiProperties(allocator, params));
+        try putJsonField(allocator, &out, "required", try openAiRequired(allocator, params));
+        return .{ .object = out };
+    }
+
+    /// `{"<param>":{"type":…,"description":…}}`, in declaration order.
+    fn openAiProperties(allocator: std.mem.Allocator, params: []const Param) !std.json.Value {
+        var out = std.json.ObjectMap{};
+        errdefer freeValue(allocator, .{ .object = out });
+        for (params) |p| {
+            try putJsonField(allocator, &out, p.name, try openAiProperty(allocator, p));
+        }
+        return .{ .object = out };
+    }
+
+    /// `{"type":"<tag>","description":…}` — `type` is the parameter's declared
+    /// class, which `validateArgs` enforces on the way back in.
+    fn openAiProperty(allocator: std.mem.Allocator, p: Param) !std.json.Value {
+        var out = std.json.ObjectMap{};
+        errdefer freeValue(allocator, .{ .object = out });
+        try putJsonField(allocator, &out, "type", .{ .string = @tagName(p.type) });
+        try putJsonField(allocator, &out, "description", .{ .string = p.description });
+        return .{ .object = out };
+    }
+
+    /// The names of the required parameters, as an owned array. Each name is a
+    /// fresh copy: the array is released with `freeValue`, which frees every
+    /// string it holds.
+    fn openAiRequired(allocator: std.mem.Allocator, params: []const Param) !std.json.Value {
+        var required = std.json.Array.init(allocator);
+        errdefer freeValue(allocator, .{ .array = required });
+        for (params) |p| {
+            if (!p.required) continue;
+            const name = try allocator.dupe(u8, p.name);
+            errdefer allocator.free(name);
+            try required.append(.{ .string = name });
+        }
+        return .{ .array = required };
     }
 
     /// Validate required parameters against a JSON object — and the **declared
@@ -1173,4 +1249,88 @@ test "encodeJsonObject escapes string values instead of interpolating them" {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("a \"b\" \\ c", parsed.value.object.get("title").?.string);
+}
+
+test "toOpenAiFunctionsAlloc escapes app-authored names and descriptions" {
+    const allocator = std.testing.allocator;
+    var reg = SkillRegistry.init(allocator, std.testing.io);
+    defer reg.deinit();
+    try reg.register(.{
+        .name = "we\"ird\\tool",
+        .description = "a \"quoted\" \\ slash",
+        .parameters = &.{
+            .{ .name = "q", .type = .string, .description = "back\\slash \"here\"", .required = true },
+            .{ .name = "limit", .type = .number, .description = "how many" },
+        },
+        .handler = struct {
+            fn h(_: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+                return .{ .string = "ok" };
+            }
+        }.h,
+    });
+
+    const json = try reg.toOpenAiFunctionsAlloc(allocator);
+    defer allocator.free(json);
+
+    // The name and the parameter description carry `"` and `\`, so an
+    // interpolating builder emits invalid tools JSON here — which each provider
+    // rejects as a whole, taking the request with it.
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch |err| {
+        std.debug.print("INVALID tools_json: {s}\n{s}\n", .{ @errorName(err), json });
+        return err;
+    };
+    defer parsed.deinit();
+
+    // Root is the tools array, and the entry keeps the OpenAI function shape.
+    try std.testing.expect(parsed.value == .array);
+    const tools = parsed.value.array.items;
+    try std.testing.expectEqual(@as(usize, 1), tools.len);
+    const tool = tools[0].object;
+    try std.testing.expectEqualStrings("function", tool.get("type").?.string);
+
+    const func = tool.get("function").?.object;
+    try std.testing.expectEqualStrings("we\"ird\\tool", func.get("name").?.string);
+    try std.testing.expectEqualStrings("a \"quoted\" \\ slash", func.get("description").?.string);
+
+    const parameters = func.get("parameters").?.object;
+    try std.testing.expectEqualStrings("object", parameters.get("type").?.string);
+    const properties = parameters.get("properties").?.object;
+    try std.testing.expectEqualStrings("string", properties.get("q").?.object.get("type").?.string);
+    try std.testing.expectEqualStrings("number", properties.get("limit").?.object.get("type").?.string);
+    // Byte-for-byte equality after a parse/print round trip, not merely "parses".
+    try std.testing.expectEqualStrings("back\\slash \"here\"", properties.get("q").?.object.get("description").?.string);
+
+    const required = parameters.get("required").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), required.len);
+    try std.testing.expectEqualStrings("q", required[0].string);
+}
+
+test "toOpenAiFunctionsAlloc keeps the bytes it always emitted" {
+    const allocator = std.testing.allocator;
+    var reg = SkillRegistry.init(allocator, std.testing.io);
+    defer reg.deinit();
+    try reg.register(.{
+        .name = "plain",
+        .description = "d",
+        .parameters = &.{
+            .{ .name = "n", .type = .number, .description = "count", .required = true },
+            .{ .name = "opt", .type = .boolean, .description = "flag" },
+        },
+        .handler = struct {
+            fn h(_: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+                return .{ .string = "ok" };
+            }
+        }.h,
+    });
+
+    const json = try reg.toOpenAiFunctionsAlloc(allocator);
+    defer allocator.free(json);
+
+    // Byte-for-byte, key order and all: for tool metadata that needs no
+    // escaping, the encoder emits exactly what the interpolating builder did —
+    // so this fix is invisible until a value actually carries `"` or `\`.
+    try std.testing.expectEqualStrings(
+        "[{\"type\":\"function\",\"function\":{\"name\":\"plain\",\"description\":\"d\",\"parameters\":{\"type\":\"object\",\"properties\":{\"n\":{\"type\":\"number\",\"description\":\"count\"},\"opt\":{\"type\":\"boolean\",\"description\":\"flag\"}},\"required\":[\"n\"]}}}]",
+        json,
+    );
 }

@@ -438,6 +438,11 @@ pub const Workflow = struct {
                 const states = try allocator.alloc(*DagState, count);
                 defer allocator.free(states);
                 var group = std.Io.Group.init;
+                // Single owner for the wave: the `create` below used to be
+                // followed by nothing, so a failure mid-spawn (or any `try`
+                // before the destroy loop) dropped every state created so far.
+                var spawned: usize = 0;
+                errdefer for (states[0..spawned]) |st| allocator.destroy(st);
                 for (ready.items[wave..end], 0..) |idx, k| {
                     const st = try allocator.create(DagState);
                     st.* = .{
@@ -448,10 +453,14 @@ pub const Workflow = struct {
                         .index = idx,
                     };
                     states[k] = st;
+                    spawned += 1;
                     group.async(self.io, dagTask, .{st});
                 }
                 try group.await(self.io);
 
+                // Nothing above this point may destroy a state: the `errdefer`
+                // is still in scope over the whole prefix, and the destroy loop
+                // at the end of the wave runs only after every `try` here.
                 for (states) |st| {
                     if (st.outcome) |o| {
                         try self.appendCompleted(result, allocator, st.step, st.index, o);

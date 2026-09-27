@@ -112,20 +112,33 @@ pub const ReconCheck = struct {
         while (it.next()) |entry| {
             const target_value = target_map.get(entry.key_ptr.*) orelse {
                 missing += 1;
+                // One owner per string until the append takes the whole diff:
+                // built inside the struct literal, a failure on the second dupe
+                // (or on the append) leaked the first.
+                const key = try allocator.dupe(u8, entry.key_ptr.*);
+                errdefer allocator.free(key);
+                const source_value = try allocator.dupe(u8, entry.value_ptr.*);
+                errdefer allocator.free(source_value);
                 try diffs.append(allocator, .{
                     .kind = .missing_in_target,
-                    .key = try allocator.dupe(u8, entry.key_ptr.*),
-                    .source_value = try allocator.dupe(u8, entry.value_ptr.*),
+                    .key = key,
+                    .source_value = source_value,
                 });
                 continue;
             };
             if (!std.mem.eql(u8, target_value, entry.value_ptr.*)) {
                 mismatched += 1;
+                const key = try allocator.dupe(u8, entry.key_ptr.*);
+                errdefer allocator.free(key);
+                const source_value = try allocator.dupe(u8, entry.value_ptr.*);
+                errdefer allocator.free(source_value);
+                const target_copy = try allocator.dupe(u8, target_value);
+                errdefer allocator.free(target_copy);
                 try diffs.append(allocator, .{
                     .kind = .mismatch,
-                    .key = try allocator.dupe(u8, entry.key_ptr.*),
-                    .source_value = try allocator.dupe(u8, entry.value_ptr.*),
-                    .target_value = try allocator.dupe(u8, target_value),
+                    .key = key,
+                    .source_value = source_value,
+                    .target_value = target_copy,
                 });
             }
         }
@@ -135,10 +148,14 @@ pub const ReconCheck = struct {
         while (tit.next()) |entry| {
             if (!source_map.contains(entry.key_ptr.*)) {
                 extra += 1;
+                const key = try allocator.dupe(u8, entry.key_ptr.*);
+                errdefer allocator.free(key);
+                const target_copy = try allocator.dupe(u8, entry.value_ptr.*);
+                errdefer allocator.free(target_copy);
                 try diffs.append(allocator, .{
                     .kind = .extra_in_source,
-                    .key = try allocator.dupe(u8, entry.key_ptr.*),
-                    .target_value = try allocator.dupe(u8, entry.value_ptr.*),
+                    .key = key,
+                    .target_value = target_copy,
                 });
             }
         }

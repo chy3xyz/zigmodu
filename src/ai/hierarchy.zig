@@ -123,10 +123,11 @@ pub const Hierarchy = struct {
             }
             try group.await(self.io);
 
-            for (states) |st| {
-                try result.tasks.append(allocator, st.result);
-                allocator.destroy(st);
-            }
+            // Append the whole wave before destroying any of it. Destroying
+            // in-loop handed the `errdefer` above states it had already freed —
+            // one failed `append` and the wave was destroyed twice.
+            for (states) |st| try result.tasks.append(allocator, st.result);
+            for (states) |st| allocator.destroy(st);
         }
 
         for (result.tasks.items) |t| {

@@ -72,12 +72,21 @@ pub const ContextManager = struct {
             if (older.len > 0) {
                 var new_summary: []const u8 = "";
                 try sf(allocator, older, &new_summary);
-                const merged = if (summary.*) |s| blk: {
-                    const m = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ s, new_summary });
-                    allocator.free(new_summary);
-                    allocator.free(s);
-                    break :blk m;
-                } else new_summary;
+                // The merge allocates, and it is the only step between
+                // `new_summary` existing and being stored — a failure there used
+                // to drop it. The guard lives inside `blk` on purpose: past the
+                // break, `merged` is owned by `summary` (or freed by the merge),
+                // so a later failure must not free it again.
+                const merged = blk: {
+                    errdefer allocator.free(new_summary);
+                    if (summary.*) |s| {
+                        const m = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ s, new_summary });
+                        allocator.free(new_summary);
+                        allocator.free(s);
+                        break :blk m;
+                    }
+                    break :blk new_summary;
+                };
                 summary.* = merged;
                 try out.append(allocator, .{ .role = "system", .content = merged });
             }
