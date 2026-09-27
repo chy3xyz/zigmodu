@@ -117,9 +117,40 @@ pub const WsUring = struct {
     }
 
     /// Start the event loop in a dedicated thread.
+    ///
+    /// Idempotent while it is running: a second call would spawn a second thread
+    /// on the same ring, and both would `copy_cqes` and hand the same connection
+    /// to two `processData` calls. The CAS is what makes that true for two
+    /// callers racing as well as for one calling twice.
     pub fn start(self: *Self) !void {
-        self.running.store(true, .monotonic);
-        self.thread = try std.Thread.spawn(.{}, runLoop, .{self});
+        if (self.running.cmpxchgStrong(false, true, .monotonic, .monotonic) != null) return;
+        self.thread = std.Thread.spawn(.{}, runLoop, .{self}) catch |err| {
+            // Never leave the object claiming a thread it does not have: `adopt`
+            // would keep accepting connections into a loop nobody runs.
+            self.running.store(false, .monotonic);
+            return err;
+        };
+    }
+
+    /// The fd a completion carries, encoded so that **fd 0 is not the sentinel**.
+    ///
+    /// `runLoop` skips CQEs with `user_data == 0` (nothing behind them), and the
+    /// field is the fd. fd 0 is a legal descriptor — a daemon started with stdin
+    /// closed gets one — and encoding it as 0 meant that connection's read
+    /// completion was skipped: it never progressed, and nothing said why. Both
+    /// halves of the encoding live here so they can be tested off Linux.
+    pub fn cqeUserData(fd: i32) u64 {
+        return @as(u64, @intCast(fd)) + 1;
+    }
+
+    /// The inverse of `cqeUserData`; null for the no-operation sentinel and for
+    /// a value no fd could produce (`user_data` is peer-adjacent hardware state,
+    /// not something to `@intCast` into a panic).
+    pub fn fdFromUserData(user_data: u64) ?i32 {
+        if (user_data == 0) return null;
+        const raw = user_data - 1;
+        if (raw > std.math.maxInt(i32)) return null;
+        return @intCast(raw);
     }
 
     /// Signal shutdown, wait for the event loop to exit, then release whatever
@@ -205,8 +236,7 @@ pub const WsUring = struct {
             }
 
             for (cqes[0..count]) |*cqe| {
-                if (cqe.user_data == 0) continue;
-                const fd: i32 = @intCast(cqe.user_data);
+                const fd = fdFromUserData(cqe.user_data) orelse continue;
                 const conn = self.connections.get(fd) orelse continue;
 
                 if (cqe.res <= 0) {
@@ -326,7 +356,7 @@ pub const WsUring = struct {
         sqe.fd = conn.fd;
         sqe.addr = @intFromPtr(&conn.buf[conn.data_offset + conn.data_len]);
         sqe.len = @intCast(Conn.BufSize - conn.data_offset - conn.data_len);
-        sqe.user_data = @as(u64, @intCast(conn.fd));
+        sqe.user_data = cqeUserData(conn.fd);
     }
 
     /// Process newly read data. Parse all complete frames, submit next read.
@@ -533,6 +563,20 @@ test "WsUring.start is analysed (the removed std.time.sleep used to hide this fi
     _ = @TypeOf(WsUring.init);
     _ = @TypeOf(parseFrame);
     _ = @TypeOf(writeControl);
+}
+
+test "user_data round-trips fd 0, which is not the no-op sentinel" {
+    // `runLoop` skips a CQE whose `user_data` is 0 (nothing behind it), and the
+    // field carries the fd. fd 0 is legal — a daemon started with stdin closed
+    // gets one — so encoding it as 0 dropped that connection's read completion:
+    // the connection never progressed, and nothing said why.
+    try std.testing.expectEqual(@as(?i32, 0), WsUring.fdFromUserData(WsUring.cqeUserData(0)));
+    try std.testing.expectEqual(@as(?i32, 3), WsUring.fdFromUserData(WsUring.cqeUserData(3)));
+
+    // ...while a CQE with nothing behind it is still skipped, and a value no fd
+    // could produce is refused instead of `@intCast` into a panic.
+    try std.testing.expectEqual(@as(?i32, null), WsUring.fdFromUserData(0));
+    try std.testing.expectEqual(@as(?i32, null), WsUring.fdFromUserData(std.math.maxInt(u64)));
 }
 
 const test_mask_key = [4]u8{ 0x37, 0xfa, 0x21, 0x3d };

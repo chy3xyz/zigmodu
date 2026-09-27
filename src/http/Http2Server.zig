@@ -876,6 +876,16 @@ fn serveSession(
             },
             .continuation => {
                 const sid = frame.header.stream_id;
+                // RFC 9113 §6.2: a CONTINUATION that does not continue a header
+                // block is a connection error. The guard above catches one that
+                // interrupts another block; this catches one that starts a block
+                // of its own — which used to be appended to whatever block that
+                // stream still held and decoded, against a decoder that had
+                // already moved past it.
+                if (continuation_of == null) {
+                    try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.PROTOCOL_ERROR, &goaway_sent);
+                    return;
+                }
                 continuation_frames += 1;
                 if (continuation_frames > opts.inbound.max_continuation_frames) {
                     // CONTINUATION frames may be empty, so the byte budget alone
@@ -935,6 +945,16 @@ fn serveSession(
             },
             .data => {
                 const sid = frame.header.stream_id;
+                // RFC 9113 §6.1: "If a DATA frame is received whose stream
+                // identifier field is 0x00, the recipient MUST respond with a
+                // connection error of type PROTOCOL_ERROR." Falling through took
+                // the bytes into the connection's window, found no stream 0, and
+                // answered nothing at all (`resetStream` refuses to write an
+                // RST_STREAM for stream 0) — so the peer saw silence.
+                if (sid == 0) {
+                    try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.PROTOCOL_ERROR, &goaway_sent);
+                    return;
+                }
                 const data_len: u31 = @intCast(frame.payload.len);
                 onInboundData(&writer, allocator, &conn_flow, 0, data_len) catch {
                     try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.FLOW_CONTROL_ERROR, &goaway_sent);
@@ -1003,6 +1023,15 @@ fn serveSession(
         }
     }
 
+    // The frame budget is spent — that, not the peer leaving, is what reaches
+    // here with frames counted. Say so with a GOAWAY instead of closing the
+    // socket: the peer learns no further stream will be processed and which
+    // stream that boundary is at, where a bare close loses whatever was in
+    // flight. `max_frames` is a per-connection work bound (`http2ServeOptions`
+    // derives it from `max_requests_per_conn`), so this is the session's end.
+    if (opts.max_frames != 0 and frames >= opts.max_frames) {
+        try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.NO_ERROR, &goaway_sent);
+    }
     try outbound.drain(&writer, &priority_tree, &conn_flow, conn_max_frame_size, 0);
     try writer.flush();
 }
@@ -3063,6 +3092,61 @@ test "h2 session answers GOAWAY PROTOCOL_ERROR for an even client stream id" {
     const goaway = findFrameInReply(out[0..n], .goaway, 0) orelse return error.TestUnexpectedResultWithMessage;
     const info = try Http2.decodeGoAway(goaway.payload);
     try std.testing.expectEqual(Http2.ErrorCode.PROTOCOL_ERROR, info.error_code);
+}
+
+test "h2 session answers GOAWAY PROTOCOL_ERROR for DATA on stream 0" {
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    // RFC 9113 §6.1 requires a connection error; the old shape answered nothing
+    // at all — the bytes went into the connection's window, there is no stream 0
+    // state, and `resetStream` refuses to write an RST_STREAM for stream 0.
+    const data = try Http2.encodeData(allocator, 0, "x", false);
+    defer allocator.free(data);
+
+    var out: [4096]u8 = undefined;
+    const n = try runLoopbackH2Session(.{}, data, &out, .goaway);
+    const goaway = findFrameInReply(out[0..n], .goaway, 0) orelse return error.TestUnexpectedResultWithMessage;
+    try std.testing.expectEqual(Http2.ErrorCode.PROTOCOL_ERROR, (try Http2.decodeGoAway(goaway.payload)).error_code);
+}
+
+test "h2 session answers GOAWAY PROTOCOL_ERROR for a CONTINUATION that continues nothing" {
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    // RFC 9113 §6.2. Appending it to the stream's existing block and decoding
+    // that is what the old shape did (and the stream it names need not even
+    // exist, in which case the answer was an RST_STREAM on a stream the client
+    // had never used).
+    const cont = try Http2.encodeFrame(allocator, .continuation, 0, 1, "x");
+    defer allocator.free(cont);
+
+    var out: [4096]u8 = undefined;
+    const n = try runLoopbackH2Session(.{}, cont, &out, .goaway);
+    const goaway = findFrameInReply(out[0..n], .goaway, 0) orelse return error.TestUnexpectedResultWithMessage;
+    try std.testing.expectEqual(Http2.ErrorCode.PROTOCOL_ERROR, (try Http2.decodeGoAway(goaway.payload)).error_code);
+}
+
+test "h2 session says GOAWAY NO_ERROR when its frame budget is spent" {
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    // Four PINGs against a budget of two: the loop ends with the budget spent,
+    // not because the peer left, and this is the session's end — a bare close
+    // would lose whatever was in flight with no word to the peer.
+    var frames = std.ArrayList(u8).empty;
+    defer frames.deinit(allocator);
+    const ping: [8]u8 = @splat('p');
+    for (0..4) |_| {
+        const f = try Http2.encodePing(allocator, false, ping);
+        defer allocator.free(f);
+        try frames.appendSlice(allocator, f);
+    }
+
+    var out: [4096]u8 = undefined;
+    const n = try runLoopbackH2Session(.{ .max_frames = 2 }, frames.items, &out, .goaway);
+    const goaway = findFrameInReply(out[0..n], .goaway, 0) orelse return error.TestUnexpectedResultWithMessage;
+    try std.testing.expectEqual(Http2.ErrorCode.NO_ERROR, (try Http2.decodeGoAway(goaway.payload)).error_code);
 }
 
 test "h2 session answers GOAWAY COMPRESSION_ERROR for a header block the decoder rejects" {

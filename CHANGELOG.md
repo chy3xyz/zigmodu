@@ -2,6 +2,43 @@
 
 ## [Unreleased]
 
+### 第 76 批：H2 协议四条 + ws_uring 的两处（fd 0 的完成事件被丢、`start()` 可以起两条线程）+ `addRoute` 的失败泄漏（**破坏性：否**）
+
+1. **`DATA` 帧的 stream 0 被静默吞掉。** RFC 9113 §6.1 要求 `PROTOCOL_ERROR` 连接错误；旧路径把
+   payload 计进连接窗口后去找 stream 0 的 state（不存在），然后 `resetStream(…, 0, …)` —— 而
+   `resetStream` 自己就拒绝为 stream 0 写 RST_STREAM，所以对端**什么都收不到**。现在按协议 GOAWAY。
+2. **游离的 `CONTINUATION` 被当作 trailers 处理。** RFC 9113 §6.2 要求连接错误。循环开头那条守卫
+   只拦"插在别的块中间"的 CONTINUATION；不接任何块的（`continuation_of == null`）会落到
+   `.continuation` 分支，把字节 `appendSlice` 到那个 stream 仍持有的块上再解码 —— 第 75 批修掉
+   的正是"解码一个已经被越过的块"这条危害，这里是它另一个入口。
+3. **`max_frames` 用尽时不发 GOAWAY。** `max_frames` 是**整个会话**的帧预算
+   （`http2ServeOptions` 取 `max(requests×16, 4096)`），用尽即会话结束，而旧路径直接关连接：对端
+   只看到 TCP 断开，在途的 stream 无从知道边界。现在先发 `GOAWAY NO_ERROR` 再收尾。
+   （核对过 `ServeOptions.max_frames` 的注释 "Max frames to process before returning (tests /
+   idle cap)" 与调用点后确认：这不是"该继续服务却没继续"，所以不改成循环续跑。）
+4. **`ws_uring`：fd 0 的完成事件被当成"没有 user_data"丢掉。** `sqe.user_data = @intCast(conn.fd)`，
+   而 runLoop 跳过 `user_data == 0`。fd 0 是合法描述符（stdin 关掉的守护进程就会拿到），于是那条
+   连接的读完成永远被跳过、连接再不动、也没有任何日志。改成 `fd + 1` 编码并配套反解（两个函数
+   都在 `WsUring` 上，**非 Linux 平台也能测**；越过 i32 的 user_data 拒绝而不是 `@intCast` 崩）。
+5. **`ws_uring.start()` 可重复调用** → 同一条 ring 上两条线程，各自 `copy_cqes`，同一个连接可能被
+   两个 `processData` 同时处理。改成 `cmpxchgStrong` 的幂等（并发调用也只起一条），spawn 失败时
+   把 `running` 复位（否则对象声称有线程却没有，`adopt` 会继续收连接进一个没人跑的环）。
+6. **`Server.addRoute` 的 `combined_middleware` 在 `router.addRoute` 失败时泄漏**（重复路径、OOM）：
+   加 `errdefer`。
+
+红证据（各自换回旧写法即红）：
+
+```text
+898/2019  h2 session answers GOAWAY PROTOCOL_ERROR for DATA on stream 0...
+          [h2 test] no goaway in the first exchange (27 bytes back); retrying once
+          FAIL (TestUnexpectedResultWithMessage)
+900/2019  h2 session says GOAWAY NO_ERROR when its frame budget is spent...
+          [h2 test] no goaway in the first exchange (61 bytes back); retrying once
+          FAIL (TestUnexpectedResultWithMessage)
+```
+
+读数：全量 `-Ddb=all` → **2076/2134 passed · 58 skipped · 0 failed**（+4 条测试）。
+
 ### 第 75 批：H2 的 header block 解码后不清空（HPACK 分叉）与 WS 的第二写者（半帧交叠）（**破坏性：否**）
 
 两条都是"同一段内存/同一个 socket 上有两个所有者"，都补了可复现的测试。

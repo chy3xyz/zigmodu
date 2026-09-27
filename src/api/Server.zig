@@ -2914,6 +2914,9 @@ pub const Server = struct {
         if (self.global_middleware.items.len > 0 or route.middleware.len > 0) {
             const total = self.global_middleware.items.len + route.middleware.len;
             const combined = try self.allocator.alloc(Middleware, total);
+            // `router.addRoute` can still fail — a duplicate path, an allocation —
+            // and until it takes the route nothing owns this slice.
+            errdefer self.allocator.free(combined);
             @memcpy(combined[0..self.global_middleware.items.len], self.global_middleware.items);
             @memcpy(combined[self.global_middleware.items.len..], route.middleware);
             r.combined_middleware = combined;
