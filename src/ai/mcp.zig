@@ -14,6 +14,7 @@ const std = @import("std");
 const SkillRegistry = @import("skill.zig").SkillRegistry;
 const SkillContext = @import("skill.zig").SkillContext;
 const freeValue = @import("skill.zig").freeValue;
+const json_shape = @import("json_shape.zig");
 
 /// Render the registry as the MCP `tools/list` result
 /// (`{"tools":[{name,description,inputSchema}]}`).
@@ -80,8 +81,8 @@ pub fn handleToolCall(
     ctx: *SkillContext,
     params: std.json.Value,
 ) !std.json.Value {
-    const obj = params.object;
-    const name = (obj.get("name") orelse return error.MissingToolName).string;
+    const obj = try json_shape.object(params);
+    const name = (try json_shape.getString(obj, "name")) orelse return error.MissingToolName;
     const args = obj.get("arguments") orelse @as(std.json.Value, .{ .object = .{} });
     const result = try registry.dispatch(name, ctx, args);
     defer freeValue(ctx.allocator, result);
@@ -155,8 +156,14 @@ fn serveLine(
         return rpcError(allocator, null, -32700, "Parse error");
     };
     defer parsed.deinit();
-    const root = parsed.value.object;
-    const method = (root.get("method") orelse return rpcError(allocator, null, -32600, "Missing method")).string;
+    // `parsed` is whatever the peer sent: valid JSON that is not an object
+    // (`123`, `[]`), or an object whose `method` is not a string. Both used to
+    // abort the server on a union-tag mismatch.
+    const root = json_shape.object(parsed.value) catch
+        return rpcError(allocator, null, -32600, "Invalid Request");
+    const method = (json_shape.getString(root, "method") catch
+        return rpcError(allocator, null, -32600, "Method must be a string")) orelse
+        return rpcError(allocator, null, -32600, "Missing method");
     const id: ?i64 = if (root.get("id")) |v| switch (v) {
         .integer => |i| i,
         else => null,
@@ -188,7 +195,13 @@ fn serveLine(
         return rpcSuccess(allocator, a, id, .{ .object = list });
     } else if (std.mem.eql(u8, method, "tools/call")) {
         const params = root.get("params") orelse return rpcError(allocator, id, -32602, "Missing params");
-        const result = try handleToolCall(registry, ctx, params);
+        // `params` and `params.name` are peer-authored: a wrong shape is a
+        // parameter error rather than the -32603 the stdio loop reports for an
+        // internal failure — and rather than the abort it used to be.
+        const result = handleToolCall(registry, ctx, params) catch |err| switch (err) {
+            error.MalformedJson, error.MissingToolName => return rpcError(allocator, id, -32602, "Invalid params"),
+            else => return err,
+        };
         defer freeValue(ctx.allocator, result);
         return rpcSuccess(allocator, a, id, result);
     } else if (std.mem.eql(u8, method, "notifications/initialized")) {
@@ -215,11 +228,38 @@ fn rpcError(allocator: std.mem.Allocator, id: ?i64, code: i64, message: []const 
     try err.put(allocator, try allocator.dupe(u8, "message"), .{ .string = try allocator.dupe(u8, message) });
     try resp.put(allocator, try allocator.dupe(u8, "error"), .{ .object = err });
     const value: std.json.Value = .{ .object = resp };
-    return std.json.Stringify.valueAlloc(allocator, value, .{});
+    const out = try std.json.Stringify.valueAlloc(allocator, value, .{});
+    // The tree above is built on the caller's allocator (this runs before the
+    // per-line arena exists, and on the paths where it does not matter), so
+    // every error answer used to strand its keys and values: a malformed
+    // request leaked a handful of small allocations in a long-lived server.
+    freeValue(allocator, value);
+    return out;
 }
 
 fn putString(obj: *std.json.ObjectMap, allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
     try obj.put(allocator, try allocator.dupe(u8, key), .{ .string = try allocator.dupe(u8, value) });
+}
+
+test "a peer line of the wrong shape is answered, not fatal" {
+    const allocator = std.testing.allocator;
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    var ctx = SkillContext{ .allocator = allocator };
+
+    // Valid JSON that is not a request object, and an object whose `method` is
+    // not a string: both used to abort the server on a union-tag mismatch.
+    inline for (.{ "123", "[]", "\"x\"", "{\"method\":5}" }) |line| {
+        const resp = try serveLine(allocator, &registry, &ctx, line);
+        defer allocator.free(resp);
+        try std.testing.expect(std.mem.indexOf(u8, resp, "-32600") != null);
+    }
+
+    // `params` is peer-authored too: a wrong shape is a parameter error, which
+    // is also what keeps it out of the -32603 the stdio loop uses for failures.
+    const resp = try serveLine(allocator, &registry, &ctx, "{\"method\":\"tools/call\",\"id\":1,\"params\":\"x\"}");
+    defer allocator.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "-32602") != null);
 }
 
 test "toMcpTools renders skills and handleToolCall dispatches" {

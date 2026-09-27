@@ -18,6 +18,7 @@ const SkillContext = @import("skill.zig").SkillContext;
 const OutboxPublisher = @import("../messaging/OutboxPublisher.zig").OutboxPublisher;
 const business = @import("business.zig");
 const freeValue = @import("skill.zig").freeValue;
+const json_shape = @import("json_shape.zig");
 
 pub const max_report_rows: usize = 100;
 
@@ -176,8 +177,10 @@ fn writeEntity(sctx: *SkillContext, wctx: *WriteCtx, args: std.json.Value, kind:
         try sql_buf.append(sctx.allocator, ')');
     } else {
         const id_v = obj.get("id") orelse return error.InvalidArguments;
-        if (id_v != .integer and id_v != .float) return error.InvalidArguments;
-        const id: i64 = if (id_v == .integer) id_v.integer else @intFromFloat(id_v.float);
+        // `.number` is the declared type, so a huge or NaN float (`1e999`)
+        // reaches here: `@intFromFloat` of one is undefined behaviour, and
+        // `@intCast` of a negative is a checked panic.
+        const id = json_shape.numberToI64(id_v) catch return error.InvalidArguments;
         try sql_buf.appendSlice(sctx.allocator, "UPDATE ");
         try sql_buf.appendSlice(sctx.allocator, spec.table);
         try sql_buf.appendSlice(sctx.allocator, " SET ");
@@ -322,10 +325,10 @@ pub fn registerReportSkills(registry: *SkillRegistry) !void {
 }
 
 fn generateReport(sctx: *SkillContext, rctx: *ReportCtx, args: std.json.Value) anyerror!std.json.Value {
-    const obj = args.object;
+    const obj = try json_shape.object(args);
     const name_v = obj.get("report") orelse return error.InvalidArguments;
     if (name_v != .string) return error.InvalidArguments;
-    const format = if (obj.get("format")) |f| f.string else "json";
+    const format = (try json_shape.getString(obj, "format")) orelse "json";
     if (!std.mem.eql(u8, format, "csv") and !std.mem.eql(u8, format, "json")) return error.InvalidArguments;
 
     var spec: ?ReportSpec = null;

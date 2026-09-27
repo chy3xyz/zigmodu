@@ -11,6 +11,7 @@ const freeValue = @import("skill.zig").freeValue;
 const diagnose_mod = @import("diagnose.zig");
 const approval_mod = @import("approval.zig");
 const risk_mod = @import("risk.zig");
+const json_shape = @import("json_shape.zig");
 
 pub const AiProvider = provider_mod.AiProvider;
 
@@ -145,13 +146,26 @@ pub fn llmDiagnose(
 
     const json = try pc.json_fn(pc, allocator, "You are a senior SRE diagnosing business anomalies. Output only JSON.", user);
     defer freeValue(allocator, json);
-    const obj = json.object;
+    // A reply of `"unknown"`, `42` or `{"summary":7}` is not a diagnosis, it is
+    // a malformed one — and reading `json.object` / `.string` without the tag
+    // check is a checked panic, i.e. the process dies where this used to be
+    // `error.MalformedLlmResponse`. The three field reads happen before the
+    // first write, so a reply that is wrong at the field level writes nothing
+    // out at all; a non-string *element* inside `causes` is found later, after
+    // the summary was copied, and is the caller's to free on the error path.
+    const obj = json_shape.object(json) catch return error.MalformedLlmResponse;
+    const summary = (json_shape.getString(obj, "summary") catch return error.MalformedLlmResponse) orelse
+        return error.MalformedLlmResponse;
+    const causes = (json_shape.getArray(obj, "causes") catch return error.MalformedLlmResponse) orelse
+        return error.MalformedLlmResponse;
+    const actions = (json_shape.getArray(obj, "actions") catch return error.MalformedLlmResponse) orelse
+        return error.MalformedLlmResponse;
 
-    out_summary.* = try allocator.dupe(u8, (obj.get("summary") orelse return error.MalformedLlmResponse).string);
-    const causes = (obj.get("causes") orelse return error.MalformedLlmResponse).array;
-    for (causes.items) |c| try out_causes.append(allocator, try allocator.dupe(u8, c.string));
-    const actions = (obj.get("actions") orelse return error.MalformedLlmResponse).array;
-    for (actions.items) |a| try out_actions.append(allocator, try allocator.dupe(u8, a.string));
+    out_summary.* = try allocator.dupe(u8, summary);
+    for (causes.items) |c| try out_causes.append(allocator, try allocator.dupe(u8, json_shape.string(c) catch
+        return error.MalformedLlmResponse));
+    for (actions.items) |a| try out_actions.append(allocator, try allocator.dupe(u8, json_shape.string(a) catch
+        return error.MalformedLlmResponse));
 }
 
 /// Approval policy: asks the model for `{"decision":"approve|escalate|reject",
@@ -182,9 +196,15 @@ pub fn llmApprove(
         return .escalated;
     };
     defer freeValue(allocator, json);
-    const obj = json.object;
-    const decision = (obj.get("decision") orelse return .escalated).string;
-    if (obj.get("note")) |n| out_note.* = try allocator.dupe(u8, n.string);
+    // Every shape question lands on the same answer: escalate. A reply of `42`,
+    // `{"decision":1}` or `{"decision":"approve","note":[]}` is a policy that
+    // did not run, and a policy that did not run does not approve — while
+    // reading `.object` / `.string` unguarded aborted the process *before* this
+    // fallback could be reached.
+    const obj = json_shape.object(json) catch return .escalated;
+    const decision = (json_shape.getString(obj, "decision") catch return .escalated) orelse return .escalated;
+    const note = json_shape.getString(obj, "note") catch return .escalated;
+    if (note) |n| out_note.* = try allocator.dupe(u8, n);
 
     if (std.mem.eql(u8, decision, "approve")) return .approved;
     if (std.mem.eql(u8, decision, "reject")) return .rejected;
@@ -212,7 +232,8 @@ pub fn llmRiskDecide(
 
     const json = pc.json_fn(pc, allocator, "You are a risk officer. Output only JSON.", user) catch return .escalate;
     defer freeValue(allocator, json);
-    const decision = (json.object.get("decision") orelse return .escalate).string;
+    const decision = (json_shape.getString(json_shape.object(json) catch return .escalate, "decision") catch
+        return .escalate) orelse return .escalate;
     if (std.mem.eql(u8, decision, "approve")) return .approve;
     if (std.mem.eql(u8, decision, "reject")) return .reject;
     return .escalate;
@@ -238,7 +259,11 @@ pub fn llmVerify(
 
     const json = pc.json_fn(pc, allocator, "You verify whether an AI output meets a goal. Output only JSON.", user) catch return false;
     defer freeValue(allocator, json);
-    const pass = (json.object.get("pass") orelse return false).bool;
+    // The quality gate defaults to "did not pass": a reply that is not an
+    // object, or whose `pass` is not a boolean (`{"pass":"true"}`), is a gate
+    // that did not run. Reading `.bool` unguarded aborted the process instead.
+    const obj = json_shape.object(json) catch return false;
+    const pass = (json_shape.getBool(obj, "pass") catch return false) orelse return false;
     return pass;
 }
 
@@ -378,6 +403,89 @@ test "llmDiagnose parses summary, causes and actions" {
     try std.testing.expectEqual(@as(usize, 1), causes.items.len);
     try std.testing.expectEqualStrings("bad credentials", causes.items[0]);
     try std.testing.expectEqualStrings("rotate credentials", actions.items[0]);
+}
+
+/// A canned reply with the shapes `llmJson` can hand a policy — including the
+/// ones that are valid JSON and the wrong shape for the policy asking.
+fn replyFn(comptime json_text: []const u8) LlmJsonFn {
+    return struct {
+        fn f(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!std.json.Value {
+            var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_text, .{});
+            defer parsed.deinit();
+            return deepCopyJson(allocator, parsed.value);
+        }
+    }.f;
+}
+
+test "a model reply of the wrong shape escalates instead of aborting the process" {
+    const allocator = std.testing.allocator;
+    inline for (.{
+        "\"I cannot help with that\"", // not an object at all
+        "42",
+        "[]",
+        "{\"decision\":1}", // right key, wrong type
+        "{\"decision\":\"approve\",\"note\":[]}",
+    }) |text| {
+        var policy_ctx = LlmPolicyCtx{ .json_fn = replyFn(text) };
+        var ctx = SkillContext{ .allocator = allocator, .userdata = &policy_ctx };
+        var note: []const u8 = "";
+        const decision = try llmApprove(allocator, &ctx, "order-1", 9000, 0, "finance", "", &note);
+        // `.approved` is unreachable for every one of these: a reply the policy
+        // cannot read is a policy that did not run, and reading it unguarded
+        // aborted the process before this fallback could be reached.
+        try std.testing.expectEqual(approval_mod.ApprovalDecision.escalated, decision);
+        if (note.len > 0) allocator.free(note);
+    }
+}
+
+test "the risk and reflection gates fail closed on a wrong-shaped reply" {
+    const allocator = std.testing.allocator;
+    inline for (.{
+        "\"looks fine to me\"",
+        "42",
+        "{\"pass\":\"true\"}", // a string is not a verdict
+        "{\"decision\":true}",
+    }) |text| {
+        var policy_ctx = LlmPolicyCtx{ .json_fn = replyFn(text) };
+        var ctx = SkillContext{ .allocator = allocator, .userdata = &policy_ctx };
+        try std.testing.expect(!try llmVerify(&ctx, "goal", "output", allocator));
+        try std.testing.expectEqual(risk_mod.RiskDecision.escalate, try llmRiskDecide(allocator, &ctx, "order-1", 60, .medium));
+    }
+}
+
+test "llmDiagnose reports a wrong-shaped reply as an error rather than aborting" {
+    const allocator = std.testing.allocator;
+    inline for (.{
+        "\"no anomalies\"",
+        "42",
+        "{\"summary\":7}",
+        "{\"summary\":\"s\",\"causes\":\"not-an-array\",\"actions\":[]}",
+        "{\"summary\":\"s\",\"causes\":[1],\"actions\":[]}",
+    }) |text| {
+        var policy_ctx = LlmPolicyCtx{ .json_fn = replyFn(text) };
+        var ctx = SkillContext{ .allocator = allocator, .userdata = &policy_ctx };
+        var causes = std.ArrayList([]const u8).empty;
+        var actions = std.ArrayList([]const u8).empty;
+        var summary: []const u8 = "";
+        const evidence = [_]diagnose_mod.EvidenceBlock{};
+        try std.testing.expectError(error.MalformedLlmResponse, llmDiagnose(
+            allocator,
+            &ctx,
+            .{ .source = "alert", .subject = "orders", .severity = .critical, .description = "spike" },
+            &evidence,
+            &causes,
+            &actions,
+            &summary,
+        ));
+        // Nothing that was read into the out-parameters leaks: a non-string
+        // element inside `causes` is the one case found after the summary was
+        // copied, so each is freed here rather than asserted empty.
+        for (causes.items) |c| allocator.free(c);
+        for (actions.items) |a| allocator.free(a);
+        if (summary.len > 0) allocator.free(summary);
+        causes.deinit(allocator);
+        actions.deinit(allocator);
+    }
 }
 
 test "llmApprove works end-to-end against a mock OpenAI endpoint" {

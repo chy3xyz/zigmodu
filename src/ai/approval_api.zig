@@ -12,6 +12,17 @@ const approval = @import("approval.zig");
 const SkillContext = @import("skill.zig").SkillContext;
 const SkillRegistry = @import("skill.zig").SkillRegistry;
 const freeValue = @import("skill.zig").freeValue;
+const json_shape = @import("json_shape.zig");
+
+/// `X-Tenant-ID` as a scope. Absent means the caller did not scope the request
+/// (the queue then answers with everything it holds); **present but
+/// unparseable** is a malformed request, not a missing scope. Reading it as
+/// `null` turned `X-Tenant-ID: abc` into an unscoped listing — a typo away
+/// from crossing tenants.
+fn parseTenantHeader(ctx: *http.Context) error{MalformedTenant}!?i64 {
+    const h = ctx.header("X-Tenant-ID") orelse return null;
+    return std.fmt.parseInt(i64, h, 10) catch error.MalformedTenant;
+}
 
 pub const PendingApproval = struct {
     run_id: []const u8,
@@ -54,12 +65,14 @@ pub const ApprovalQueue = struct {
         try self.items.append(self.allocator, item);
     }
 
-    /// Resolve an item by run_id: returns true when found and removed.
-    pub fn resolve(self: *Self, run_id: []const u8, _tenant_id: ?i64) !bool {
-        _ = _tenant_id;
+    /// Resolve an item by run_id: returns true when found and removed. A
+    /// non-null `tenant_id` narrows the search to that tenant, which is what
+    /// `PersistentApprovalQueue.resolve` does with `WHERE … AND tenant_id = ?`.
+    pub fn resolve(self: *Self, run_id: []const u8, tenant_id: ?i64) !bool {
         try self.mu.lock(self.io);
         defer self.mu.unlock(self.io);
         for (self.items.items, 0..) |item, i| {
+            if (!tenantMatches(tenant_id, item.tenant_id)) continue;
             if (std.mem.eql(u8, item.run_id, run_id)) {
                 _ = self.items.orderedRemove(i);
                 self.allocator.free(item.run_id);
@@ -70,6 +83,18 @@ pub const ApprovalQueue = struct {
             }
         }
         return false;
+    }
+
+    /// `requested == null` is an unscoped caller and sees every item; a
+    /// requested tenant sees only its own rows — an item pushed without a
+    /// tenant is *not* visible under a scope, exactly as `tenant_id = NULL`
+    /// does not match `WHERE tenant_id = 1` in the SQL queue. The framework
+    /// cannot tell which tenant an unscoped escalation belongs to, and guessing
+    /// is how the queue answered across tenants before.
+    fn tenantMatches(requested: ?i64, item_tenant: ?i64) bool {
+        const want = requested orelse return true;
+        const have = item_tenant orelse return false;
+        return want == have;
     }
 
     pub fn count(self: *Self) usize {
@@ -83,12 +108,13 @@ pub const ApprovalQueue = struct {
         return self.items.items.len;
     }
 
-    /// Copy pending items into `out` (caller owns the strings).
-    pub fn listPending(self: *Self, allocator: std.mem.Allocator, out: *std.ArrayList(PendingApproval), _tenant_id: ?i64) !void {
-        _ = _tenant_id;
+    /// Copy pending items into `out` (caller owns the strings). Scoped by
+    /// `tenant_id` the same way `resolve` is.
+    pub fn listPending(self: *Self, allocator: std.mem.Allocator, out: *std.ArrayList(PendingApproval), tenant_id: ?i64) !void {
         try self.mu.lock(self.io);
         defer self.mu.unlock(self.io);
         for (self.items.items) |item| {
+            if (!tenantMatches(tenant_id, item.tenant_id)) continue;
             try out.append(allocator, .{
                 .run_id = try allocator.dupe(u8, item.run_id),
                 .subject = try allocator.dupe(u8, item.subject),
@@ -106,7 +132,7 @@ pub const ApprovalQueue = struct {
 pub fn queuedEscalation(
     userdata: *anyopaque,
     allocator: std.mem.Allocator,
-    _: *SkillContext,
+    sctx: *SkillContext,
     subject: []const u8,
     amount: i64,
     step_name: []const u8,
@@ -119,6 +145,10 @@ pub fn queuedEscalation(
         .amount = amount,
         .note = try allocator.dupe(u8, note),
         .step_name = try allocator.dupe(u8, step_name),
+        // The escalation carries the tenant the run is scoped to; without this
+        // the item is tenant-less and a scoped listing cannot see it (see
+        // `ApprovalQueue.tenantMatches`).
+        .tenant_id = sctx.tenant_id,
     });
 }
 
@@ -146,12 +176,16 @@ pub fn registerApprovalRequestSkills(registry: *SkillRegistry) !void {
             fn h(sctx: *SkillContext, args: std.json.Value) anyerror!std.json.Value {
                 try sctx.checkDeadline();
                 const ac: *ApprovalCtx = @ptrCast(@alignCast(sctx.userdata orelse return error.ApprovalNotConfigured));
-                const obj = args.object;
+                const obj = try json_shape.object(args);
                 const subject_v = obj.get("subject") orelse return error.InvalidArguments;
                 const amount_v = obj.get("amount") orelse return error.InvalidArguments;
-                if (subject_v != .string or amount_v != .float) return error.InvalidArguments;
+                if (subject_v != .string) return error.InvalidArguments;
+                // The declaration is `.number`, so an integral amount arrives as
+                // `.integer` (`{"amount":100}` — what a model usually sends) and
+                // a huge/NaN one must not reach `@intFromFloat`, which is UB.
+                const amount = json_shape.numberToI64(amount_v) catch return error.InvalidArguments;
 
-                var result = try ac.flow.submit(sctx.allocator, sctx, subject_v.string, @intFromFloat(amount_v.float), ac.steps);
+                var result = try ac.flow.submit(sctx.allocator, sctx, subject_v.string, amount, ac.steps);
                 defer result.deinit(sctx.allocator);
                 var out = std.json.ObjectMap{};
                 try putOwned(&out, sctx.allocator, "run_id", .{ .string = try sctx.allocator.dupe(u8, result.run_id) });
@@ -190,9 +224,9 @@ pub fn ApprovalApi(comptime QueueT: type) type {
                 }
                 items.deinit(ctx.allocator);
             }
-            const tenant_id = blk: {
-                const h = ctx.header("X-Tenant-ID") orelse break :blk null;
-                break :blk std.fmt.parseInt(i64, h, 10) catch null;
+            const tenant_id = parseTenantHeader(ctx) catch {
+                try ctx.json(400, "{\"err\":\"malformed X-Tenant-ID\"}");
+                return;
             };
             try self.queue.listPending(ctx.allocator, &items, tenant_id);
 
@@ -228,9 +262,9 @@ pub fn ApprovalApi(comptime QueueT: type) type {
 
         fn resolveOne(ctx: *http.Context, self: *State, approved: bool) !void {
             const id = try ctx.paramStr("id");
-            const tenant_id = blk: {
-                const h = ctx.header("X-Tenant-ID") orelse break :blk null;
-                break :blk std.fmt.parseInt(i64, h, 10) catch null;
+            const tenant_id = parseTenantHeader(ctx) catch {
+                try ctx.json(400, "{\"err\":\"malformed X-Tenant-ID\"}");
+                return;
             };
             const resolved = try self.queue.resolve(id, tenant_id);
             if (!resolved) {
@@ -302,6 +336,61 @@ test "queuedEscalation pushes escalated runs into the queue" {
     try std.testing.expectEqual(@as(usize, 1), queue.count());
     try std.testing.expectEqualStrings("order-1", queue.items.items[0].run_id);
     try std.testing.expectEqualStrings("finance", queue.items.items[0].step_name);
+}
+
+test "a tenant-scoped queue does not answer across tenants" {
+    const allocator = std.testing.allocator;
+    var queue = ApprovalQueue.init(allocator, std.testing.io);
+    defer queue.deinit();
+
+    const push = struct {
+        fn f(q: *ApprovalQueue, a: std.mem.Allocator, run_id: []const u8, tenant: ?i64) !void {
+            try q.push(.{
+                .run_id = try a.dupe(u8, run_id),
+                .subject = try a.dupe(u8, run_id),
+                .amount = 1,
+                .note = try a.dupe(u8, ""),
+                .step_name = try a.dupe(u8, "finance"),
+                .tenant_id = tenant,
+            });
+        }
+    }.f;
+    try push(&queue, allocator, "a", 1);
+    try push(&queue, allocator, "b", 2);
+    try push(&queue, allocator, "c", null); // e.g. an escalation from an unscoped run
+
+    var out = std.ArrayList(PendingApproval).empty;
+    const freeAll = struct {
+        fn f(a: std.mem.Allocator, list: *std.ArrayList(PendingApproval)) void {
+            for (list.items) |item| {
+                a.free(item.run_id);
+                a.free(item.subject);
+                a.free(item.note);
+                a.free(item.step_name);
+            }
+            list.clearRetainingCapacity();
+        }
+    }.f;
+    defer {
+        freeAll(allocator, &out);
+        out.deinit(allocator);
+    }
+
+    // Tenant 1 sees its own row — not tenant 2's, and not the tenant-less one,
+    // which is exactly what `WHERE … AND tenant_id = 1` does in the SQL queue.
+    try queue.listPending(allocator, &out, 1);
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
+    try std.testing.expectEqualStrings("a", out.items[0].run_id);
+    try std.testing.expectEqual(@as(i64, 1), out.items[0].tenant_id.?);
+    freeAll(allocator, &out);
+
+    // ...and cannot resolve another tenant's item, while that tenant can.
+    try std.testing.expect(!try queue.resolve("b", 1));
+    try std.testing.expect(try queue.resolve("b", 2));
+
+    // An unscoped caller is the only one that sees the tenant-less item.
+    try queue.listPending(allocator, &out, null);
+    try std.testing.expectEqual(@as(usize, 2), out.items.len);
 }
 
 test "ApprovalApi mounts with both in-memory and persistent queues" {

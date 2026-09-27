@@ -18,6 +18,7 @@ const SkillRegistry = @import("skill.zig").SkillRegistry;
 const SkillContext = @import("skill.zig").SkillContext;
 const run_audit = @import("run_audit.zig");
 const freeValue = @import("skill.zig").freeValue;
+const json_shape = @import("json_shape.zig");
 
 pub const CacheHandle = struct {
     name: []const u8,
@@ -218,10 +219,20 @@ pub fn registerAdminSkills(registry: *SkillRegistry) !void {
             fn h(sctx: *SkillContext, args: std.json.Value) anyerror!std.json.Value {
                 try sctx.checkDeadline();
                 const ac: *AdminCtx = @ptrCast(@alignCast(sctx.userdata orelse return error.AdminNotConfigured));
-                const obj = args.object;
-                const kind = if (obj.get("kind")) |k| std.meta.stringToEnum(run_audit.RunKind, k.string) else null;
-                const tenant = if (obj.get("tenant_id")) |t| t.integer else null;
-                const limit: usize = if (obj.get("limit")) |l| @intCast(@min(l.integer, 100)) else 20;
+                const obj = try json_shape.object(args);
+                // An unrecognized `kind` used to become `null`, and `null` here
+                // means "no kind filter" — so one typo widened the export to
+                // every kind. A filter that cannot be honored is refused.
+                const kind_str = json_shape.getString(obj, "kind") catch return error.InvalidArguments;
+                const kind: ?run_audit.RunKind = if (kind_str) |k|
+                    std.meta.stringToEnum(run_audit.RunKind, k) orelse return error.InvalidArguments
+                else
+                    null;
+                const tenant = json_shape.getInt(obj, "tenant_id") catch return error.InvalidArguments;
+                // `{"limit":-1}` used to be a checked panic in `@intCast(usize)`
+                // (and `{"limit":"x"}` reached `.integer`): a negative limit is
+                // not a small limit.
+                const limit = (json_shape.getCount(obj, "limit", 100) catch return error.InvalidArguments) orelse 20;
                 var store = run_audit.RunAuditStore.init(sctx.allocator, ac.backend);
                 var entries = std.ArrayList(run_audit.RunAuditEntry).empty;
                 defer {
@@ -262,8 +273,8 @@ pub fn registerAdminSkills(registry: *SkillRegistry) !void {
                 try sctx.checkDeadline();
                 const ac: *AdminCtx = @ptrCast(@alignCast(sctx.userdata orelse return error.AdminNotConfigured));
                 const handler = ac.user_handler orelse return error.UserHandlerNotConfigured;
-                const obj = args.object;
-                const action = (obj.get("action") orelse return error.InvalidArguments).string;
+                const obj = try json_shape.object(args);
+                const action = (try json_shape.getString(obj, "action")) orelse return error.InvalidArguments;
                 const payload = obj.get("args") orelse .null;
                 return handler(sctx.allocator, sctx, action, payload);
             }
@@ -283,8 +294,8 @@ pub fn registerAdminSkills(registry: *SkillRegistry) !void {
                 try sctx.checkDeadline();
                 const ac: *AdminCtx = @ptrCast(@alignCast(sctx.userdata orelse return error.AdminNotConfigured));
                 const handler = ac.tenant_handler orelse return error.TenantHandlerNotConfigured;
-                const obj = args.object;
-                const action = (obj.get("action") orelse return error.InvalidArguments).string;
+                const obj = try json_shape.object(args);
+                const action = (try json_shape.getString(obj, "action")) orelse return error.InvalidArguments;
                 const payload = obj.get("args") orelse .null;
                 return handler(sctx.allocator, sctx, action, payload);
             }
@@ -391,4 +402,24 @@ test "admin.audit.export lists runs with filters" {
     defer freeValue(allocator, res);
     try std.testing.expectEqual(@as(usize, 1), res.object.get("runs").?.array.items.len);
     try std.testing.expectEqualStrings("r1", res.object.get("runs").?.array.items[0].object.get("run_id").?.string);
+
+    // An unrecognized kind used to become `null`, which here means "no kind
+    // filter" — one typo away from an export of every kind. A filter that
+    // cannot be honored is refused.
+    var bad_kind = std.json.ObjectMap{};
+    try putOwned(&bad_kind, allocator, "kind", .{ .string = try allocator.dupe(u8, "workflowX") });
+    defer freeValue(allocator, .{ .object = bad_kind });
+    try std.testing.expectError(error.InvalidArguments, registry.dispatch("admin.audit.export", &sctx, .{ .object = bad_kind }));
+
+    // ...and a limit is a count: `{"limit":-1}` used to abort in
+    // `@intCast(usize)`, `{"limit":"many"}` reached `.integer` directly.
+    var neg_limit = std.json.ObjectMap{};
+    try putOwned(&neg_limit, allocator, "limit", .{ .integer = -1 });
+    defer freeValue(allocator, .{ .object = neg_limit });
+    try std.testing.expectError(error.InvalidArguments, registry.dispatch("admin.audit.export", &sctx, .{ .object = neg_limit }));
+
+    var str_limit = std.json.ObjectMap{};
+    try putOwned(&str_limit, allocator, "limit", .{ .string = try allocator.dupe(u8, "many") });
+    defer freeValue(allocator, .{ .object = str_limit });
+    try std.testing.expectError(error.InvalidToolArgType, registry.dispatch("admin.audit.export", &sctx, .{ .object = str_limit }));
 }

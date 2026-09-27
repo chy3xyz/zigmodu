@@ -357,14 +357,57 @@ pub const SkillRegistry = struct {
         try writer.interface.writeAll(json);
     }
 
-    /// Validate required parameters against a JSON object.
+    /// Validate required parameters against a JSON object — and the **declared
+    /// type** of every parameter that is present.
+    ///
+    /// The type is not decoration: a handler reads its own parameters straight
+    /// out of `std.json.Value`, so `{"limit":"many"}` used to arrive at
+    /// `v.integer` and abort the process (a checked panic in Debug and
+    /// ReleaseSafe). `Param.Type` is the only place the caller has said what it
+    /// will send, so this is where the shape is checked — once, before the
+    /// handler runs — instead of in every handler.
+    ///
+    /// A tool that declares no parameters still has to be called with an
+    /// object, or with nothing at all (`.null`): its handler reads its
+    /// parameters out of an object, and `{"arguments":[]}` — a shape a model
+    /// does produce — used to arrive at `args.object` and abort the process.
+    /// With the shape enforced here, a handler may read `args.object` directly.
     pub fn validateArgs(tool: Tool, args: std.json.Value) !void {
-        if (tool.parameters.len == 0) return;
-        if (args == .null) return error.MissingToolArg;
+        if (args == .null) {
+            for (tool.parameters) |p| {
+                if (p.required) return error.MissingToolArg;
+            }
+            return;
+        }
         if (args != .object) return error.InvalidToolArgs;
         for (tool.parameters) |p| {
-            if (p.required and args.object.get(p.name) == null) return error.MissingToolArg;
+            const got = args.object.get(p.name) orelse {
+                if (p.required) return error.MissingToolArg;
+                continue;
+            };
+            if (!paramTypeMatches(p.type, got)) return error.InvalidToolArgType;
         }
+    }
+
+    /// JSON has one number type, so `.number` admits every shape `std.json`
+    /// produces for one: `.integer` for `5`, `.float` for `5.5` or `1e3`, and
+    /// `.number_string` for a literal that fits neither (`1e999`).
+    ///
+    /// `.string` also admits the other scalars. `Param.Type` is one enum and
+    /// JSON Schema gives no "string or number", while a primary key
+    /// (`entity.lookup.id`) may legitimately be written either way and the
+    /// handlers that take one accept both. What this gate must refuse is the
+    /// value a handler will *convert* — a string where a number was declared
+    /// (`{"limit":"many"}` reaching `@intCast`), an array or object where a
+    /// scalar was declared — because that is where the abort was.
+    fn paramTypeMatches(t: Param.Type, v: std.json.Value) bool {
+        return switch (t) {
+            .string => v == .string or v == .integer or v == .float,
+            .number => v == .integer or v == .float or v == .number_string,
+            .boolean => v == .bool,
+            .array => v == .array,
+            .object => v == .object,
+        };
     }
 
     /// Dispatch with optional name allowlist (security boundary).
@@ -548,6 +591,85 @@ test "a rejected dispatch does not leave the registry locked" {
     defer parsed.deinit();
     const ok = try reg.dispatch("echo", &ctx, parsed.value);
     try std.testing.expectEqualStrings("hi", ok.string);
+}
+
+test "validateArgs checks a declared parameter's type, not just its presence" {
+    const allocator = std.testing.allocator;
+    var reg = SkillRegistry.init(allocator, std.testing.io);
+    defer reg.deinit();
+
+    try reg.register(.{
+        .name = "report",
+        .description = "report",
+        .parameters = &.{
+            .{ .name = "limit", .type = .number, .description = "max rows" },
+            .{ .name = "format", .type = .string, .description = "json|csv" },
+            .{ .name = "fields", .type = .array, .description = "columns" },
+        },
+        .handler = struct {
+            fn h(_: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+                return .{ .bool = true };
+            }
+        }.h,
+    });
+
+    var ctx = SkillContext{ .allocator = allocator };
+    // Every one of these is a shape a model produces; each used to reach the
+    // handler's own `v.integer` / `v.string` and abort the process there.
+    inline for (.{
+        "{\"limit\":\"many\"}",
+        "{\"limit\":true}",
+        "{\"limit\":[1]}",
+        "{\"limit\":{}}",
+        "{\"format\":[]}",
+        "{\"format\":null}",
+        "{\"fields\":{}}",
+    }) |bad| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bad, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidToolArgType, reg.dispatch("report", &ctx, parsed.value));
+    }
+
+    // ...and everything the declaration admits still goes through: the three
+    // shapes a JSON number can take, a scalar written where a string was
+    // declared (see `paramTypeMatches`), and a missing optional key.
+    inline for (.{
+        "{\"limit\":5}",
+        "{\"limit\":5.5}",
+        "{\"limit\":1e999}",
+        "{\"format\":7}",
+        "{\"limit\":5,\"format\":\"json\",\"fields\":[]}",
+    }) |good| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, good, .{});
+        defer parsed.deinit();
+        try std.testing.expect((try reg.dispatch("report", &ctx, parsed.value)).bool);
+    }
+}
+
+test "a tool that declares no parameters still answers a non-object call" {
+    const allocator = std.testing.allocator;
+    var reg = SkillRegistry.init(allocator, std.testing.io);
+    defer reg.deinit();
+    try reg.register(.{
+        .name = "tick",
+        .description = "tick",
+        .parameters = &.{},
+        .handler = struct {
+            fn h(_: *SkillContext, args: std.json.Value) anyerror!std.json.Value {
+                _ = args;
+                return .{ .bool = true };
+            }
+        }.h,
+    });
+
+    var ctx = SkillContext{ .allocator = allocator };
+    // `{"arguments":[]}` is a shape a model produces for a tool it was not told
+    // the parameters of; a zero-parameter tool used to accept any shape, and a
+    // handler reading `args.object` then aborted on it.
+    const arr = try std.json.parseFromSlice(std.json.Value, allocator, "[]", .{});
+    defer arr.deinit();
+    try std.testing.expectError(error.InvalidToolArgs, reg.dispatch("tick", &ctx, arr.value));
+    try std.testing.expect((try reg.dispatch("tick", &ctx, .null)).bool);
 }
 
 test "SkillRegistry cooperative deadline" {

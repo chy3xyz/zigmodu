@@ -933,8 +933,11 @@ fn mapProviderTransportError(err: anyerror) anyerror {
 fn jsonInt(v: ?std.json.Value) usize {
     const x = v orelse return 0;
     return switch (x) {
-        .integer => |i| if (i < 0) 0 else @intCast(i),
-        .float => |f| if (f < 0) 0 else @intFromFloat(f),
+        .integer => |i| if (i < 0) 0 else std.math.lossyCast(usize, i),
+        // A token count is a float in some APIs, and `@intFromFloat` of a huge
+        // or non-finite one (`1e999` parses to inf) is undefined behaviour —
+        // `f < 0` alone does not catch either.
+        .float => |f| if (std.math.isFinite(f) and f >= 0) std.math.lossyCast(usize, f) else 0,
         else => 0,
     };
 }
@@ -947,7 +950,10 @@ fn extractIntField(body: []const u8, field: []const u8) ?usize {
     if (i >= body.len) return null;
     var n: usize = 0;
     while (i < body.len and body[i] >= '0' and body[i] <= '9') : (i += 1) {
-        n = n * 10 + (body[i] - '0');
+        // Saturate rather than wrap: a long digit run is a malformed counter,
+        // and `n * 10 + d` is a checked panic in Debug/ReleaseSafe.
+        n = std.math.mul(usize, n, 10) catch return std.math.maxInt(usize);
+        n = std.math.add(usize, n, body[i] - '0') catch return std.math.maxInt(usize);
     }
     return n;
 }

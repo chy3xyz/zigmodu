@@ -21,6 +21,7 @@ const sqlx = @import("../data.zig").sqlx;
 const SkillRegistry = @import("skill.zig").SkillRegistry;
 const SkillContext = @import("skill.zig").SkillContext;
 const freeValue = @import("skill.zig").freeValue;
+const json_shape = @import("json_shape.zig");
 
 pub const max_rows: usize = 100;
 pub const default_limit: usize = 20;
@@ -85,7 +86,7 @@ fn valueToJson(v: ?sqlx.Value) std.json.Value {
 
 /// Convert a JSON `args` array into sqlx values (caller owns the slice).
 fn readArgs(ctx: *SkillContext, v: ?std.json.Value) ![]sqlx.Value {
-    const arr = (v orelse return &.{}).array;
+    const arr = if (v) |args| json_shape.array(args) catch return error.InvalidArguments else return &.{};
     const out = try ctx.allocator.alloc(sqlx.Value, arr.items.len);
     errdefer ctx.allocator.free(out);
     for (arr.items, 0..) |item, i| out[i] = try jsonToValue(item);
@@ -156,17 +157,16 @@ pub fn registerBusinessSkillsWith(
             fn h(ctx: *SkillContext, args: std.json.Value) anyerror!std.json.Value {
                 try ctx.checkDeadline();
                 const b: *SqlxBackend = @ptrCast(@alignCast(ctx.backend_ptr orelse return error.BackendNotConfigured));
-                const obj = args.object;
+                const obj = try json_shape.object(args);
                 const sql_value = obj.get("sql") orelse return error.InvalidArguments;
-                if (sql_value != .string) return error.InvalidArguments;
-                const sql = std.mem.trim(u8, sql_value.string, " \t\r\n");
+                const sql = std.mem.trim(u8, try json_shape.string(sql_value), " \t\r\n");
                 if (sql.len < 6 or !std.ascii.eqlIgnoreCase(sql[0..6], "SELECT")) return error.ReadOnlyQueryRequired;
                 try sqlx.validateSqlStatement(sql); // rejects literals/comments/`;` — forces ? args
 
-                const limit: usize = if (obj.get("limit")) |lv| blk: {
-                    if (lv != .integer) return error.InvalidArguments;
-                    break :blk @min(@as(usize, @intCast(lv.integer)), max_rows);
-                } else default_limit;
+                // The declaration is `.number`, so `{"limit":-1}` is well-typed
+                // and `@intCast(usize)` of it is a checked panic. A negative
+                // limit is not a small limit.
+                const limit = (json_shape.getCount(obj, "limit", max_rows) catch return error.InvalidArguments) orelse default_limit;
 
                 const sql_args = try readArgs(ctx, obj.get("args"));
                 defer ctx.allocator.free(sql_args);
@@ -226,7 +226,7 @@ pub fn registerBusinessSkillsWith(
             fn h(ctx: *SkillContext, args: std.json.Value) anyerror!std.json.Value {
                 try ctx.checkDeadline();
                 const b: *SqlxBackend = @ptrCast(@alignCast(ctx.backend_ptr orelse return error.BackendNotConfigured));
-                const obj = args.object;
+                const obj = try json_shape.object(args);
                 const ent_v = obj.get("entity") orelse return error.InvalidArguments;
                 const id_v = obj.get("id") orelse return error.InvalidArguments;
                 if (ent_v != .string or (id_v != .string and id_v != .integer)) return error.InvalidArguments;
@@ -275,16 +275,13 @@ pub fn registerBusinessSkillsWith(
             fn h(ctx: *SkillContext, args: std.json.Value) anyerror!std.json.Value {
                 try ctx.checkDeadline();
                 const b: *SqlxBackend = @ptrCast(@alignCast(ctx.backend_ptr orelse return error.BackendNotConfigured));
-                const obj = args.object;
+                const obj = try json_shape.object(args);
                 const ent_v = obj.get("entity") orelse return error.InvalidArguments;
                 if (ent_v != .string) return error.InvalidArguments;
                 const spec = findEntity(entities, ent_v.string) orelse return error.UnknownEntity;
                 if (!isValidIdentifier(spec.table)) return error.UnsafeSqlIdentifier;
 
-                const limit: usize = if (obj.get("limit")) |lv| blk: {
-                    if (lv != .integer) return error.InvalidArguments;
-                    break :blk @min(@as(usize, @intCast(lv.integer)), max_rows);
-                } else default_limit;
+                const limit = (json_shape.getCount(obj, "limit", max_rows) catch return error.InvalidArguments) orelse default_limit;
 
                 var sql_buf = std.ArrayList(u8).empty;
                 defer sql_buf.deinit(ctx.allocator);
@@ -370,6 +367,39 @@ test "db.query runs a parameterized SELECT and caps rows" {
     const rows = res.object.get("rows").?.array.items;
     try std.testing.expectEqualStrings("alice", rows[0].object.get("name").?.string);
     try std.testing.expectEqualStrings("carol", rows[1].object.get("name").?.string);
+}
+
+test "db.query refuses a negative limit and a wrong-shaped args value" {
+    const allocator = std.testing.allocator;
+    var client = sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, tenant_id INTEGER)", &.{});
+    _ = try client.exec("INSERT INTO users (name, tenant_id) VALUES ('alice', 1)", &.{});
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    try registerBusinessSkillsWith(&registry, &.{}, .{ .db_query_tenant_column = "tenant_id" });
+    var ctx = SkillContext{ .allocator = a, .backend_ptr = &backend, .tenant_id = 1 };
+
+    // `limit` is declared `.number`, so a negative one is well-typed all the way
+    // into the handler, where `@intCast(usize)` of it is a checked panic.
+    {
+        const bad = try std.json.parseFromSlice(std.json.Value, a, "{\"sql\":\"SELECT id FROM users WHERE tenant_id = ?\",\"limit\":-1,\"args\":[1]}", .{});
+        defer bad.deinit();
+        try std.testing.expectError(error.InvalidArguments, registry.dispatch("db.query", &ctx, bad.value));
+    }
+    // `args` is declared `.array`: a scalar there is refused before the handler
+    // reads `.array` off it.
+    {
+        const bad = try std.json.parseFromSlice(std.json.Value, a, "{\"sql\":\"SELECT id FROM users\",\"args\":5}", .{});
+        defer bad.deinit();
+        try std.testing.expectError(error.InvalidToolArgType, registry.dispatch("db.query", &ctx, bad.value));
+    }
 }
 
 test "db.query filters rows the model did not scope itself" {

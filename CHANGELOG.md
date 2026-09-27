@@ -2,6 +2,67 @@
 
 ## [Unreleased]
 
+### 第 74 批：模型/对端发来的一段文本就能打死进程 —— `src/ai/**` 的 union 直取与无界数值转换（**破坏性：否**，但有两处语义收紧，见末段）
+
+`std.json.Value` 是 union：在错误的 tag 上取 `.object` / `.string` / `.integer`，Debug 与 ReleaseSafe
+是 checked panic（ReleaseFast 是 UB）。而 `src/ai/**` 里有大量"对面是模型 / 对端"的取值点直接这么读 ——
+于是一句 `"I cannot help with that"` 就能把读审批策略的进程打死，**而且死在文档承诺的兜底之前**
+（`llmApprove` 的注释写着 "malformed → escalate"，可它先崩了，永远走不到 escalate）。
+
+新增 `src/ai/json_shape.zig`：tag-checked 取值助手（`object` / `string` / `array` / `boolean` /
+`count` / `numberToI64` / `getString` / `getInt` / `getBool` / `getCount` / `getArray`），失败一律
+`error.MalformedJson`，**由调用点决定兜底方向**。各处默认方向按"它是安全边界还是展示路径"分别定：
+
+* **审批 / 风控 / 质量门（政策）→ fail-closed**：`llmApprove` 任何形状疑问 → `.escalated`；
+  `llmRiskDecide` → `.escalate`；`llmVerify`（reflection 门）→ `false`；`llmDiagnose` →
+  `error.MalformedLlmResponse`。
+* **工具入参 → 拒绝**：`db.query` / `entity.list` 的负数 `limit`、`admin.audit.export` 的
+  `{"limit":-1}`、`entity.update` 的 `@intFromFloat(1e30)`、`approval.request` 的
+  `{"amount":1e30}`（含 `1e999` 解析成 inf 的那条）→ 一律 `error.InvalidArguments`。
+* **JSON-RPC / MCP → 协议错误码**：对端发 `123` / `[]` / `{"method":5}` → `-32600`；
+  `params` 形状不对 → `-32602`（不再是进程崩，也不再被 stdio 循环折成 `-32603`）。
+
+### 顺带修掉的（都是"必须打崩"的反面）
+
+1. **`SkillRegistry.validateArgs` 现在核对声明类型**，不只核对键在不在。`Param.Type` 是调用方唯一
+   声明过形状的地方：`{"limit":"many"}` 以前直达 handler 的 `@intCast(lv.integer)`。零参数工具也
+   收紧了（以前任何形状都放行，而 `{"arguments":[]}` 是模型真会产出的形状）。
+2. **`admin.audit.export` 的未知 `kind`** 以前 `stringToEnum(...) orelse null`，而 `null` 在这里
+   意思是"没有 kind 过滤" —— 一个拼写错误就把导出放大到全部 kind。改成拒绝。
+3. **`Mcp.rpcError` 每次都在漏**（本批的 mcp 测试抓到的，属于意外收获）：它用调用方 allocator 搭了
+   一棵 `std.json.Value` 树，`Stringify` 出响应串后没释放，于是**每一个错误响应**都漏掉
+   几个小分配。已 `freeValue`。
+4. **`provider.jsonInt` 的 `.float` 分支**：`if (f < 0) 0 else @intFromFloat(f)` —— `1e999` 解析成
+   `inf`（`f < 0` 为假）和 `1e30`（有限但超界）都会走到 UB 的 `@intFromFloat`。改 `isFinite` 守卫 +
+   `std.math.lossyCast`；`extractIntField` 的 `n = n * 10 + d` 改饱和（长数字串在 Debug 下是 panic）。
+
+### 审批队列的租户作用域（本批唯一的语义收紧）
+
+`ApprovalQueue.resolve` / `listPending` 此前是 `_ = _tenant_id;` —— **HTTP 层收 `X-Tenant-ID`、
+在内存队列里直接丢掉**，而 `PersistentApprovalQueue` 是带 `WHERE tenant_id = ?` 的：同一份
+`ApprovalApi` 换个 QueueT 就是跨租户读/批。现在改成与 SQL 版一致的判定（`tenant_id = NULL` 的条目
+在带作用域的查询里不可见，正如 SQL 里 `NULL` 不匹配 `= 1`），并且 `queuedEscalation` 从
+`SkillContext.tenant_id` 记下租户（原来忽略 `_: *SkillContext`，条目永远是 null）。配置项之外的另一半：
+`X-Tenant-ID: abc` 以前 `catch null` 静默变成"没作用域"，现在回 400。
+
+**消费方需要注意的两点**（都是收紧，都是宁可拒绝不可猜）：
+* `validateArgs` 会拒绝以前"能跑通"的类型写错的调用（例如给声明 `.number` 的参数传字符串）——
+  以前那不是能跑通，是在 handler 里崩或静默钳位。
+* 带 `X-Tenant-ID` 的审批列表只看得见该租户的条目；若你的审批流本身没有租户上下文
+  （`SkillContext.tenant_id` 为空），条目是租户无关的，只有不带作用域的列表能看见它。
+
+红证据（三处，各自换回旧写法即红）：
+
+```
+62/2013  ai.skill.test.validateArgs checks a declared parameter's type, not just its presence...
+         expected error.InvalidToolArgType, found .{ .bool = true }     ← 类型错的入参照样进了 handler
+53/2013  ai.llm.test.a model reply of the wrong shape escalates instead of aborting the process...
+         thread 6798093 panic: access of union field 'object' while field 'string' is active
+         src/ai/llm.zig:432                                          ← 模型回一句纯文本就打崩进程
+86/2013  ai.approval_api.test.a tenant-scoped queue does not answer across tenants...
+         expected 1, found 3                                          ← 租户 1 的列表拿到三个租户的条目
+```
+
 ### 第 73 批：一个 8 MiB 的 POST 让这条 keep-alive 连接把 8 MiB 常驻到断开（**破坏性：否**）
 
 `connFiber` 的每条连接只有一个请求 arena，每轮循环用 `.retain_capacity` 重置。该模式的定义就是
