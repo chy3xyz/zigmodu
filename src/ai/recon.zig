@@ -91,7 +91,17 @@ pub const ReconCheck = struct {
         try self.load(allocator, self.target_sql, self.target_args, &target_map);
 
         var diffs = std.ArrayList(ReconDiff).empty;
-        errdefer diffs.deinit(allocator);
+        errdefer {
+            // The strings, not only the buffer: every diff owns up to three
+            // dupes, and all three exits below can fail after they exist — the
+            // `on_diff` callback, the outbox write, and `toOwnedSlice`.
+            for (diffs.items) |d| {
+                allocator.free(d.key);
+                if (d.source_value) |s| allocator.free(s);
+                if (d.target_value) |t| allocator.free(t);
+            }
+            diffs.deinit(allocator);
+        }
 
         var missing: usize = 0;
         var extra: usize = 0;
@@ -173,8 +183,8 @@ pub const ReconCheck = struct {
         while (try cursor.next()) |row| {
             const key = self.keyOf(row, &key_buf) orelse continue;
             const key_owned = try allocator.dupe(u8, key);
-            const canonical = try self.canonicalValue(allocator, row);
             errdefer allocator.free(key_owned);
+            const canonical = try self.canonicalValue(allocator, row);
             errdefer allocator.free(canonical);
             const gop = try map.getOrPut(key_owned);
             if (gop.found_existing) {

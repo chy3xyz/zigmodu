@@ -2,6 +2,43 @@
 
 ## [Unreleased]
 
+### 第 78 批：`resumeRun` 的 completed 集合存的是解析结果里的切片 —— 一个 step 名字里带引号就是 use-after-free（**破坏性：否**）
+
+`Workflow.resumeRun` 回放 WAL 时把"已完成的步骤名"放进一个 `StringHashMap(void)`，插入的是
+`rec.name` —— **`parsed` 里的切片**，而 `defer parsed.deinit()` 在那一轮循环结束时就释放它。
+`runSteps` 之后才读这个集合（`completed.contains(step.name)`），所以：
+
+* 名字需要反转义时（带 `"`、`\`、换行 —— WAL 是自己写出去的，`Stringify` 一定会转义），
+  解析器为它单独分配一块，`parsed.deinit()` 一跑，哈希表里那个 key 就悬空；接下来的
+  `contains` 读到已释放内存。
+* 名字不需要反转义时它 alias `e.payload`，而 `entries` 活到函数末尾 —— **这正是它一直没被发现的原因**。
+
+修法：`recordCompleted(allocator, set, name)` 是唯一写入口，它 dupe 一份再由集合持有；
+`deinitCompleted` 负责把每个 key 连同哈希表一起释放（`StringHashMap` 不拥有 key，`deinit`
+单独跑会漏掉每个 key）。`runLinear` / `runDag` 里那两处 `completed.put(...)` 也一并走这个入口,
+否则集合里会同时存在"有主的"和"借来的"两种 key —— 释放借来的那一个就是崩溃。
+
+红证据（把 `recordCompleted` 换回借用即红）：
+
+```text
+21/2023  ai.workflow.test.resume records step names it owns, not slices of the parse result...
+         thread 7021341 panic: free of invalid memory [addr: 1061301e0, len: 3 (0x3) align: 1]
+         or corrupted metadata
+         error: process terminated with signal ABRT
+```
+
+同批还收掉两处**错误路径**泄漏（都可达，不是 OOM-only）：
+
+* `ReconCheck.check` 的 `errdefer diffs.deinit(allocator)` 只释放数组缓冲，**不释放每条 diff 的
+  key/source_value/target_value**：`on_diff` 回调返错、outbox 写失败、`toOwnedSlice` 失败这三条
+  出口全漏。改成遍历 items 释放字符串再释放缓冲。
+* `DiagnoseFlow.check` 的 `summary`（回调分配的）在任何出错路径上都没人释放（`causes`/`actions`
+  各有 errdefer，唯独它没有）：`try self.diagnose(...)` 之后立刻 `errdefer`。
+
+读数：全量 `-Ddb=all` → **2080/2138 passed · 58 skipped · 0 failed**（+1 条测试）。
+`recon` / `hierarchy` / `agent` 里**只可能由 OOM 触发**的那几处（结构体字面量连做多个 dupe、
+`owned_strs.append` 失败、DagState 的 create 循环无 errdefer）**本批未动**，已在队列里单列。
+
 ### 第 77 批：HTTP/2 的 PADDED 帧从来没人处理（合法帧打死连接 / 污染请求体）（**破坏性：否**）
 
 `FrameFlags.padded = 0x8` 在 `Http2.zig` 里定义着，全树没有任何消费点。于是：

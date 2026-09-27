@@ -102,6 +102,9 @@ pub const DiagnosisFlow = struct {
         }
         var summary: []const u8 = "";
         try self.diagnose(allocator, ctx, case, blocks.items, &causes, &actions, &summary);
+        // The callback's summary is owned by us from here on, and every exit
+        // below can fail (the two `toOwnedSlice`s, then the outbox write).
+        errdefer if (summary.len > 0) allocator.free(summary);
 
         const causes_slice = try causes.toOwnedSlice(allocator);
         errdefer {

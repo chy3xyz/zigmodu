@@ -221,7 +221,7 @@ pub const Workflow = struct {
         };
         errdefer result.deinit();
         var completed = std.StringHashMap(void).init(allocator);
-        defer completed.deinit();
+        defer deinitCompleted(allocator, &completed);
         if (self.metrics) |m| m.runs += 1;
         try self.runSteps(allocator, ctx, 0, &completed, &result);
         if (self.audit) |a| {
@@ -255,7 +255,13 @@ pub const Workflow = struct {
 
         var next_index: usize = 0;
         var completed = std.StringHashMap(void).init(allocator);
-        defer completed.deinit();
+        defer {
+            // The keys are owned (`recordCompleted` dupes them): this map does
+            // not own keys, so deinit alone would leak every one of them.
+            var kit = completed.keyIterator();
+            while (kit.next()) |k| allocator.free(k.*);
+            completed.deinit();
+        }
         var replayed_failed = false;
         for (entries) |e| {
             if (!std.mem.eql(u8, e.source_node, run_id)) continue;
@@ -273,7 +279,7 @@ pub const Workflow = struct {
                 .output = if (rec.output) |o| try allocator.dupe(u8, o) else "",
             });
             if (std.mem.eql(u8, rec.status, "failed")) replayed_failed = true;
-            if (std.mem.eql(u8, rec.status, "completed")) try completed.put(rec.name, {});
+            if (std.mem.eql(u8, rec.status, "completed")) try recordCompleted(allocator, &completed, rec.name);
         }
         if (replayed_failed) {
             result.status = .failed;
@@ -340,7 +346,7 @@ pub const Workflow = struct {
                 result.status = .failed;
                 break;
             }
-            try completed.put(step.name, {});
+            try recordCompleted(allocator, completed, step.name);
             if (outcome.?.budget_exhausted) {
                 try self.maybeEscalate(ctx, .budget_exhausted, step.name, allocator);
                 result.status = .budget_exhausted;
@@ -449,7 +455,7 @@ pub const Workflow = struct {
                 for (states) |st| {
                     if (st.outcome) |o| {
                         try self.appendCompleted(result, allocator, st.step, st.index, o);
-                        try completed.put(st.step.name, {});
+                        try recordCompleted(allocator, completed, st.step.name);
                         if (o.budget_exhausted) {
                             try self.maybeEscalate(ctx, .budget_exhausted, st.step.name, allocator);
                             result.status = .budget_exhausted;
@@ -653,6 +659,54 @@ pub const Workflow = struct {
 };
 
 // ==== §7  Tests ====
+
+/// Record a completed step name in the resume set, **owning the key**.
+///
+/// `rec.name` borrows the parse result, which `defer parsed.deinit()` releases
+/// at the end of the iteration that read it — while `runSteps` reads this set
+/// afterwards. A name the JSON has to unescape (a quote, a backslash, a newline)
+/// is allocated by the parser, so inserting the borrowed slice was a
+/// use-after-free; a name it does not escape aliased the WAL payload, which is
+/// why this went unnoticed. Either way the set has to own what it holds for the
+/// rest of the resume.
+fn recordCompleted(allocator: std.mem.Allocator, completed: *std.StringHashMap(void), name: []const u8) !void {
+    const owned = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned);
+    const gop = try completed.getOrPut(owned);
+    if (gop.found_existing) allocator.free(owned);
+}
+
+/// Free a completed-set together with every key it owns — `recordCompleted` is
+/// the only writer, so every key in it came from `dupe`. `StringHashMap` never
+/// frees keys itself, so `deinit` alone would strand one string per completed
+/// step (and freeing a *borrowed* key would be the crash this exists to avoid).
+fn deinitCompleted(allocator: std.mem.Allocator, completed: *std.StringHashMap(void)) void {
+    var kit = completed.keyIterator();
+    while (kit.next()) |k| allocator.free(k.*);
+    completed.deinit();
+}
+
+test "resume records step names it owns, not slices of the parse result" {
+    const allocator = std.testing.allocator;
+    var completed = std.StringHashMap(void).init(allocator);
+    defer {
+        var kit = completed.keyIterator();
+        while (kit.next()) |k| allocator.free(k.*);
+        completed.deinit();
+    }
+
+    const Rec = struct { name: []const u8 };
+    {
+        // `a"b` has to be escaped in JSON, so the parser allocates it inside
+        // `parsed`; the set outlives `parsed` here exactly as it does in
+        // `resumeRun`, where `runSteps` reads it after `parsed.deinit()`.
+        const parsed = try std.json.parseFromSlice(Rec, allocator, "{\"name\":\"a\\\"b\"}", .{});
+        defer parsed.deinit();
+        try recordCompleted(allocator, &completed, parsed.value.name);
+    }
+
+    try std.testing.expect(completed.contains("a\"b"));
+}
 
 test "workflow runs skill steps and records results" {
     const allocator = std.testing.allocator;
