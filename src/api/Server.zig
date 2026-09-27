@@ -3352,6 +3352,69 @@ fn wsHandshakeValid(ctx: *const Context) bool {
     return connectionHasUpgrade(ctx.headers.get("connection") orelse "");
 }
 
+/// Ceiling on what one connection's request arena is allowed to keep between
+/// keep-alive requests. `.retain_capacity` re-heats the arena to the *peak* of
+/// the previous request, so a single 8 MiB `POST` (`max_body_size`'s default)
+/// would leave 8 MiB resident on that connection until it closes — and
+/// `max_connections` defaults to unlimited. `retain_with_limit` keeps the fast
+/// path (no backing-allocator call) for requests that fit under it, which is
+/// every request whose body is not itself large.
+const request_arena_retain_limit: usize = 64 * 1024;
+
+fn resetRequestArena(arena: *std.heap.ArenaAllocator) void {
+    _ = arena.reset(.{ .retain_with_limit = request_arena_retain_limit });
+}
+
+test "the request arena keeps the fast path but not a large request's peak" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // An ordinary request stays under the limit, so the chunk is kept and the
+    // next request on this keep-alive connection never calls the allocator.
+    // (`free_all` would pass every other assertion here and slow that path down,
+    // which is why this one is stated.)
+    _ = try a.alloc(u8, 4 * 1024);
+    resetRequestArena(&arena);
+    try std.testing.expect(arena.queryCapacity() > 0);
+
+    // A request carrying a large body must not leave its peak resident: with
+    // `.retain_capacity` the 4 MiB below is still the capacity after the reset.
+    const big = try a.alloc(u8, 4 * 1024 * 1024);
+    @memset(big, 0xAB);
+    try std.testing.expect(arena.queryCapacity() >= 4 * 1024 * 1024);
+    resetRequestArena(&arena);
+    try std.testing.expect(arena.queryCapacity() <= request_arena_retain_limit);
+
+    // ...and the arena is still usable for the next request.
+    try std.testing.expectEqual(@as(usize, 512), (try a.alloc(u8, 512)).len);
+}
+
+test "a reset under the limit leaves the backing allocator alone" {
+    // The fast path is the point of retaining anything: a request that fits
+    // under the limit must still cost zero backing-allocator calls between
+    // requests, exactly as `.retain_capacity` did. Only the request that went
+    // over pays for the shrink.
+    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var arena = std.heap.ArenaAllocator.init(probe.allocator());
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    _ = try a.alloc(u8, 4 * 1024);
+    const allocs_before = probe.allocations;
+    const resizes_before = probe.resize_index;
+    resetRequestArena(&arena);
+    try std.testing.expectEqual(allocs_before, probe.allocations);
+    try std.testing.expectEqual(resizes_before, probe.resize_index);
+
+    _ = try a.alloc(u8, 1 * 1024 * 1024);
+    resetRequestArena(&arena);
+    // Either a shrink in place or a free-and-reallocate: both are the backing
+    // allocator being told the megabyte is no longer needed.
+    try std.testing.expect(probe.resize_index > resizes_before or probe.allocations > allocs_before or probe.deallocations > 0);
+    try std.testing.expect(arena.queryCapacity() <= request_arena_retain_limit);
+}
+
 /// Connection fiber — handles one HTTP connection
 fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allocator) void {
     defer _ = server.active_connections.fetchSub(1, .monotonic);
@@ -3375,7 +3438,7 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
 
     var req_count: usize = 0;
     while (req_count < server.max_requests_per_conn and server.running.load(.monotonic)) : (req_count += 1) {
-        _ = arena.reset(.retain_capacity);
+        resetRequestArena(&arena);
 
         const start_time = std.Io.Timestamp.now(server.io, .real);
 

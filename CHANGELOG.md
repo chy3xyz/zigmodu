@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+### 第 73 批：一个 8 MiB 的 POST 让这条 keep-alive 连接把 8 MiB 常驻到断开（**破坏性：否**）
+
+`connFiber` 的每条连接只有一个请求 arena，每轮循环用 `.retain_capacity` 重置。该模式的定义就是
+"按**上一轮峰值**预热"（`std.heap.ArenaAllocator.ResetMode.retain_capacity` 的文档原文：
+"allocating a large enough buffer for all previously done allocations"），所以：
+
+```zig
+_ = arena.reset(.retain_capacity);   // ← 上一次请求申请了 8 MiB，这次就把 8 MiB 留着
+```
+
+而请求体进 arena 的路径是有的（`RequestParser` → `ctx.body = arena_alloc.dupe(...)`），
+`max_body_size` 默认 **8 MiB**，`max_connections` 默认 **0（不限）**。于是
+"发一个 8 MiB 的 POST、之后什么都不发"就能让每条连接占住 8 MiB —— 与连接数同阶放大，
+且这条连接在 `requests_per_conn` / 空闲超时之前一直是这个占用。
+
+修法：`retain_with_limit`（同一枚举的第三种模式，"与 `retain_capacity` 相同，但超过上限就缩到上限"），
+上限 **64 KiB** —— 普通请求（请求行 + 头 + 小体，几 KB）仍在限内，快路径一点不变；只有真正
+超过 64 KiB 的那次请求付一次 `rawResize`。
+
+红证据（两条都在 `src/api/Server.zig`，把这一行换回 `.retain_capacity` 即红）：
+
+* `the request arena keeps the fast path but not a large request's peak` ——
+  `717/2002 ... FAIL (TestUnexpectedResult)`：4 MiB 分配后重置，`queryCapacity()` 仍是 4 MiB。
+* `a reset under the limit leaves the backing allocator alone` —— 用
+  `std.testing.FailingAllocator` 计数，钉住"限内重置 = 0 次后端分配/0 次 resize"，
+  这条防的是"为了省内存干脆每次 `free_all`"（那样也对，但把每条连接的最热路径变成每次都要
+  重新向后端要内存）。第一条测试里 `queryCapacity() > 0` 那一行就是专门为此留的。
+
+读数：全量 `-Ddb=all` → **2059/2117 passed · 58 skipped · 0 failed**（本批 +2 条测试）；
+`check-bench` 两遍 32/32 门内 + 32/32 分配预算保持（本轮改的是 HTTP 连接的 arena，不在 bench 的
+op 循环里，bench 作为"别处没退化"的对照）。
+
 ### 第 72 批：第 70 批队列里三条同性质的小修（异常/错误路径的收尾）（**破坏性：否**）
 
 三条都自己核实过，都是"错误路径上没收尾"，其中第一条**不是 OOM-only**：
