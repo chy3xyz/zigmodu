@@ -61,7 +61,14 @@ pub const ConfigStore = struct {
             self.allocator.free(old.key);
             self.allocator.free(old.value);
         }
-        try self.values.put(try self.allocator.dupe(u8, key), try self.allocator.dupe(u8, value));
+        // Each copy is guarded on its own until the `put` takes it: built as
+        // `put` arguments, the key copy was stranded when the value copy
+        // failed, and both were stranded when the `put` itself failed.
+        const key_copy = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(key_copy);
+        const value_copy = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(value_copy);
+        try self.values.put(key_copy, value_copy);
         return true;
     }
 
@@ -88,7 +95,13 @@ pub const AdminCtx = struct {
 };
 
 fn putOwned(obj: *std.json.ObjectMap, allocator: std.mem.Allocator, key: []const u8, value: std.json.Value) !void {
-    try obj.put(allocator, try allocator.dupe(u8, key), value);
+    // The key copy needs its own guard: built as the `put` argument it was
+    // stranded whenever the map refused the field. The disarmed-by-`return`
+    // guard leaves the value's contract alone — a `.string` here is still
+    // owned by the caller.
+    const k = try allocator.dupe(u8, key);
+    errdefer allocator.free(k);
+    try obj.put(allocator, k, value);
 }
 
 fn hasWildcard(key: []const u8) bool {
@@ -422,4 +435,41 @@ test "admin.audit.export lists runs with filters" {
     try putOwned(&str_limit, allocator, "limit", .{ .string = try allocator.dupe(u8, "many") });
     defer freeValue(allocator, .{ .object = str_limit });
     try std.testing.expectError(error.InvalidToolArgType, registry.dispatch("admin.audit.export", &sctx, .{ .object = str_limit }));
+}
+
+// `checkAllAllocationFailures` walks the key copy, the value copy and the
+// map's growth on both the insert and the replace path.
+//
+// Red before the fix: both copies were built as the `put` arguments, so a
+// failed value copy stranded the key copy and a failed `put` stranded both.
+test "ConfigStore.set hands back its copies at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const mutable = [_][]const u8{"feature.flag"};
+            var store = ConfigStore.init(a, &mutable);
+            defer store.deinit();
+            try std.testing.expect(try store.set("feature.flag", "dark"));
+            try std.testing.expect(try store.set("feature.flag", "light"));
+            try std.testing.expectEqualStrings("light", store.get("feature.flag").?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{});
+}
+
+// The map refuses the field only when it cannot grow; the key copy built as
+// the `put` argument used to be stranded on exactly that failure.
+test "putOwned hands back its key copy at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var map = std.json.ObjectMap{};
+            defer freeValue(a, .{ .object = map });
+            try putOwned(&map, a, "k", .{ .integer = 7 });
+            try std.testing.expectEqual(@as(i64, 7), map.get("k").?.integer);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{});
 }

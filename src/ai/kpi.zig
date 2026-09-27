@@ -9,6 +9,7 @@ const sqlx = @import("../data.zig").sqlx;
 const SkillRegistry = @import("skill.zig").SkillRegistry;
 const SkillContext = @import("skill.zig").SkillContext;
 const freeValue = @import("skill.zig").freeValue;
+const skill = @import("skill.zig");
 
 /// A named business metric. `sql` must return exactly one row; `value_column`
 /// selects the numeric value.
@@ -82,9 +83,16 @@ pub fn registerKpiSkills(registry: *SkillRegistry) !void {
 
                 const res = try query(sctx.allocator, kc.backend, metric);
                 var out = std.json.ObjectMap{};
-                try putOwned(&out, sctx.allocator, "metric", .{ .string = try sctx.allocator.dupe(u8, res.name) });
+                // The result tree is handed to the caller by the `return`
+                // below; without this guard a field that fails to go in
+                // strands the ones already placed. The string fields are
+                // copied by `putJsonField` (which frees its own copies when
+                // the put fails) — a dupe built as the `putOwned` argument had
+                // no owner on that path.
+                errdefer freeValue(sctx.allocator, .{ .object = out });
+                try skill.putJsonField(sctx.allocator, &out, "metric", .{ .string = res.name });
                 try putOwned(&out, sctx.allocator, "value", .{ .float = res.value });
-                try putOwned(&out, sctx.allocator, "description", .{ .string = try sctx.allocator.dupe(u8, metric.description) });
+                try skill.putJsonField(sctx.allocator, &out, "description", .{ .string = metric.description });
                 return .{ .object = out };
             }
         }.h,
@@ -94,7 +102,13 @@ pub fn registerKpiSkills(registry: *SkillRegistry) !void {
 /// ObjectMap does not copy keys and deinit does not free them; results must
 /// own every key so `freeValue` can release them.
 fn putOwned(obj: *std.json.ObjectMap, allocator: std.mem.Allocator, key: []const u8, value: std.json.Value) !void {
-    try obj.put(allocator, try allocator.dupe(u8, key), value);
+    // The key copy needs its own guard: built as the `put` argument it was
+    // stranded whenever the map refused the field. The disarmed-by-`return`
+    // guard leaves the value's contract alone — a `.string` here is still
+    // owned by the caller.
+    const k = try allocator.dupe(u8, key);
+    errdefer allocator.free(k);
+    try obj.put(allocator, k, value);
 }
 
 test "kpi.query returns an app-registered metric" {
@@ -132,4 +146,50 @@ test "kpi.query returns an app-registered metric" {
 
     try std.testing.expectEqual(@as(f64, 100), res.object.get("value").?.float);
     try std.testing.expectEqualStrings("Revenue from paid orders", res.object.get("description").?.string);
+}
+
+// Same harness as the "kpi.query returns an app-registered metric" test, with
+// the failing allocator on the dispatch: the walk covers the handler's result
+// map (the query itself runs on the backend's client, not the context's
+// allocator).
+//
+// Red before the handler fix: the metric/description fields were dupes built
+// as `putOwned` arguments — a failed put stranded the value copy, and a later
+// field's failure stranded the keys and values already placed.
+test "kpi.query hands back its result at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    var client = sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    _ = try client.exec("CREATE TABLE orders (id INTEGER PRIMARY KEY, amount INTEGER, status TEXT)", &.{});
+    _ = try client.exec("INSERT INTO orders (amount, status) VALUES (100, 'paid'), (50, 'failed')", &.{});
+
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    const metrics = [_]KpiMetric{
+        .{
+            .name = "paid_revenue",
+            .description = "Revenue from paid orders",
+            .sql = "SELECT SUM(amount) AS value FROM orders WHERE status = 'paid'",
+        },
+    };
+    var kpi_ctx = KpiCtx{ .backend = &backend, .metrics = &metrics };
+
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    try registerKpiSkills(&registry);
+    var base_ctx = SkillContext{ .allocator = allocator, .userdata = &kpi_ctx };
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, reg: *SkillRegistry, base: *SkillContext) !void {
+            var sctx = base.*;
+            sctx.allocator = a;
+            var args = std.json.ObjectMap{};
+            defer freeValue(a, .{ .object = args });
+            try skill.putJsonField(a, &args, "metric", .{ .string = "paid_revenue" });
+            const res = try reg.dispatch("kpi.query", &sctx, .{ .object = args });
+            defer freeValue(a, res);
+            try std.testing.expectEqual(@as(f64, 100), res.object.get("value").?.float);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{ &registry, &base_ctx });
 }

@@ -13,7 +13,7 @@
 //! STRUCTURE:
 //!   §1  CLI entry, args & rule config —— usage, run, parseArgs, loadRuleConfig
 //!   §2  Architecture rules —— collectArchitecture, module graph, cycle detection
-//!   §3  Business lint —— lintFile & the b1–b24 rules, helpers, rule config
+//!   §3  Business lint —— lintFile & the b1–b25 rules, helpers, rule config
 //!   §4  Baseline —— read / write `.zmodu/audit-baseline.json`
 //!   §5  Output —— text & JSON rendering, exit codes
 //!   §6  Tests —— architecture fixtures, per-rule fixtures
@@ -43,7 +43,9 @@ pub const usage =
     \\                column-index scan (use typed row.scan), multi-write
     \\                service methods without a transaction, non-CSPRNG entropy
     \\                (use std.Io.randomSecure — seeding a PRNG from a clock or
-    \\                pointer is the same defect)
+    \\                pointer is the same defect), allocation built inline as a
+    \\                fallible append/put argument (bind it to a guarded local;
+    \\                append/put last)
     \\
     \\Options:
     \\  -j, --json              machine-readable JSON output
@@ -870,6 +872,20 @@ fn lintFile(
             }
         }
 
+        // b25 — a value allocated inline as the argument of a fallible
+        // `append`/`put`: `try list.append(allocator, try allocator.dupe(u8,
+        // s))`. When the outer call fails, the value the inner call just made
+        // has no owner and leaks（「分配后失败即丢」）. Bind it to a local with
+        // its own errdefer (or route through a consuming helper —
+        // putJsonField / appendOwnedString / appendEntry) and append/put last.
+        // The consuming helpers never match: they are not spelled `.append(`
+        // / `.put(` (see inlineAllocIntoFallibleCall for the exact 口径).
+        if (!config.disabled.contains("b25")) {
+            if (inlineAllocIntoFallibleCall(trimmed)) {
+                try pushViolation(violations, allocator, "b25", rel_path, idx, "把分配直接写在 fallible append/put 的实参里 —— 外层调用一旦失败，内层刚分配的值无人持有即泄漏。先把分配绑到带 errdefer 的局部值（或走会接管失败的 helper：putJsonField / appendOwnedString / appendEntry），append/put 放最后；确属误报在同一行加 // audit: ignore b25 并注明缘由", .{});
+            }
+        }
+
         // b16 — track the current service method: count write calls, look for
         // a transaction, and flag 2+ writes without one when the method ends.
         if (std.mem.eql(u8, file_name, "service.zig") and !config.disabled.contains("b16")) {
@@ -1516,6 +1532,64 @@ fn isCrudName(name: []const u8) bool {
         std.mem.eql(u8, name, "create") or
         std.mem.eql(u8, name, "update") or
         std.mem.eql(u8, name, "delete");
+}
+
+/// b25 — does this line hand a fresh allocation straight to a fallible
+/// `append`/`put`? `try list.append(allocator, try allocator.dupe(u8, s))`:
+/// the `append` failing strands the value the `dupe` just made (「分配后失败即丢」).
+///
+/// The `(` right after the verb is what keeps the consuming helpers out of
+/// it — `appendEntry(` / `appendOwnedString(` / `putJsonField(` / `putOwned(`
+/// are not spelled `append(` / `put(`. Line-shaped, and blind on the side of
+/// silence: only the `allocator` / `alloc` / `self.allocator` spellings, only
+/// single-line calls, and a `put(try dupe(k), try dupe(v))` (first argument
+/// inline) is not seen. audit has no test-block state, so a `test "…"` body
+/// in a module file that demonstrates the shape on purpose needs
+/// `// audit: ignore b25` on that line.
+fn inlineAllocIntoFallibleCall(line: []const u8) bool {
+    const verbs = [_][]const u8{ ".append(", ".put(" };
+    for (verbs) |verb| {
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, line, from, verb)) |at| {
+            from = at + verb.len;
+            const args = std.mem.trim(u8, line[from..], " \t");
+            // First argument must be an allocator spelling …
+            const comma = std.mem.indexOfScalar(u8, args, ',') orelse break;
+            const first = std.mem.trim(u8, args[0..comma], " \t");
+            if (!isAllocatorSpelling(first)) continue;
+            // … and the second must begin `try <allocator>.<allocating call>(`.
+            if (isAllocatingTryArg(std.mem.trim(u8, args[comma + 1 ..], " \t"))) return true;
+        }
+    }
+    return false;
+}
+
+/// b25 — the three allocator spellings this rule knows.
+fn isAllocatorSpelling(s: []const u8) bool {
+    return std.mem.eql(u8, s, "allocator") or
+        std.mem.eql(u8, s, "alloc") or
+        std.mem.eql(u8, s, "self.allocator");
+}
+
+/// b25 — true for `try <allocator>.<allocating call>(…`: the inner call can
+/// fail after it allocated, which is exactly the window in which the outer
+/// `append`/`put` has not taken ownership yet.
+fn isAllocatingTryArg(arg: []const u8) bool {
+    if (!std.mem.startsWith(u8, arg, "try ")) return false;
+    const rest = std.mem.trim(u8, arg["try ".len..], " \t");
+    const names = [_][]const u8{ "self.allocator", "allocator", "alloc" };
+    for (names) |name| {
+        if (!std.mem.startsWith(u8, rest, name)) continue;
+        const after = rest[name.len..];
+        if (after.len == 0 or after[0] != '.') continue;
+        const call = after[1..];
+        const allocating = [_][]const u8{ "allocPrintSentinel(", "allocPrint(", "alloc(", "dupeZ(", "dupe(" };
+        for (allocating) |n| {
+            if (std.mem.startsWith(u8, call, n)) return true;
+        }
+        return false;
+    }
+    return false;
 }
 
 /// b24 — does this line name a banned entropy source?
@@ -2608,4 +2682,36 @@ test "audit b17 resolves each allocation point on its own" {
         if (std.mem.eql(u8, v.rule, "b17")) b17 += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), b17);
+}
+
+test "audit b25 flags inline allocations handed to a fallible append/put" {
+    const allocator = std.testing.allocator;
+    var cfg = RuleConfig{};
+    cfg.disabled = std.StringHashMap(void).init(allocator);
+    defer cfg.deinit(allocator);
+
+    var violations = std.ArrayList(Violation).empty;
+    defer {
+        for (violations.items) |*v| v.deinit(allocator);
+        violations.deinit(allocator);
+    }
+
+    // b25 — the dupe is built inside the fallible call's argument list.
+    try lintFile(allocator, "service.zig", "pub fn f(self: *@This(), allocator: std.mem.Allocator, s: []const u8) !void {\n    try self.items.append(allocator, try allocator.dupe(u8, s));\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b25 — same shape for a map put (self.allocator spelling, allocPrint).
+    try lintFile(allocator, "service.zig", "pub fn g(self: *@This(), k: []const u8, v: V) !void {\n    try self.map.put(self.allocator, try self.allocator.allocPrint(u8, \"{s}\", .{k}), v);\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b25 negative — the fixed form: a local with its own guard, append last.
+    try lintFile(allocator, "service.zig", "pub fn h(self: *@This(), allocator: std.mem.Allocator, s: []const u8) !void {\n    const copy = try allocator.dupe(u8, s);\n    errdefer allocator.free(copy);\n    try self.items.append(allocator, copy);\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b25 negative — the consuming helpers are not spelled `.append(` / `.put(`,
+    // and neither is a plain value append.
+    try lintFile(allocator, "service.zig", "pub fn i(self: *@This(), allocator: std.mem.Allocator, s: []const u8) !void {\n    try appendEntry(allocator, &self.entries, s, .approved, \"\");\n    try skill.putJsonField(allocator, &self.out, \"k\", .{ .string = s });\n    try self.items.append(allocator, s);\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b25 negative — a `put` whose FIRST argument is the inline allocation is a
+    // different shape (the map's own key contract); not this rule's needle.
+    try lintFile(allocator, "service.zig", "pub fn j(self: *@This(), k: []const u8, v: []const u8) !void {\n    try self.map.put(try self.allocator.dupe(u8, k), try self.allocator.dupe(u8, v));\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+
+    var b25: usize = 0;
+    for (violations.items) |v| {
+        if (std.mem.eql(u8, v.rule, "b25")) b25 += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), b25);
 }

@@ -320,7 +320,13 @@ fn diagnoseJson(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: [
 }
 
 fn putOwned(obj: *std.json.ObjectMap, allocator: std.mem.Allocator, key: []const u8, value: std.json.Value) !void {
-    try obj.put(allocator, try allocator.dupe(u8, key), value);
+    // The key copy needs its own guard: built as the `put` argument it was
+    // stranded whenever the map refused the field. The disarmed-by-`return`
+    // guard leaves the value's contract alone — a `.string` here is still
+    // owned by the caller.
+    const k = try allocator.dupe(u8, key);
+    errdefer allocator.free(k);
+    try obj.put(allocator, k, value);
 }
 
 test "buildContext injects retrieved policy chunks into the approval prompt" {
@@ -614,4 +620,20 @@ test "llmApprove works end-to-end against a mock OpenAI endpoint" {
     defer if (note.len > 0) allocator.free(note);
     try std.testing.expectEqual(approval_mod.ApprovalDecision.approved, decision);
     try std.testing.expectEqualStrings("ok by mock", note);
+}
+
+// The map refuses the field only when it cannot grow; the key copy built as
+// the `put` argument used to be stranded on exactly that failure.
+test "putOwned hands back its key copy at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var map = std.json.ObjectMap{};
+            defer freeValue(a, .{ .object = map });
+            try putOwned(&map, a, "k", .{ .integer = 7 });
+            try std.testing.expectEqual(@as(i64, 7), map.get("k").?.integer);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{});
 }

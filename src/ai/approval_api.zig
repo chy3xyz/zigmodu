@@ -226,8 +226,15 @@ pub fn registerApprovalRequestSkills(registry: *SkillRegistry) !void {
                 var result = try ac.flow.submit(sctx.allocator, sctx, subject_v.string, amount, ac.steps);
                 defer result.deinit(sctx.allocator);
                 var out = std.json.ObjectMap{};
-                try putOwned(&out, sctx.allocator, "run_id", .{ .string = try sctx.allocator.dupe(u8, result.run_id) });
-                try putOwned(&out, sctx.allocator, "status", .{ .string = try sctx.allocator.dupe(u8, @tagName(result.status)) });
+                // The result tree is handed to the caller by the `return`
+                // below; without this guard a field that fails to go in
+                // strands the ones already placed. The string fields are
+                // copied by `putJsonField` (which frees its own copies when
+                // the put fails) — a dupe built as the `putOwned` argument had
+                // no owner on that path.
+                errdefer freeValue(sctx.allocator, .{ .object = out });
+                try skill.putJsonField(sctx.allocator, &out, "run_id", .{ .string = result.run_id });
+                try skill.putJsonField(sctx.allocator, &out, "status", .{ .string = @tagName(result.status) });
                 return .{ .object = out };
             }
         }.h,
@@ -441,10 +448,77 @@ test "queuedEscalation hands back its copies at every allocation point (OOM scan
 
 const approval_api_mod = @This();
 
+// Same harness as the "approval.request skill submits" test, with the failing
+// allocator on the dispatch: the walk covers the handler's result map and the
+// flow's chain underneath it.
+//
+// Red before the handler fix: both string fields were dupes built as
+// `putOwned` arguments — a failed put stranded the value copy, and the second
+// field's failure stranded the first field's key with it.
+test "approval.request hands back its response at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    var backend = @import("../data.zig").SqlxBackend{ .allocator = allocator, .client = &client };
+
+    const Escalate = struct {
+        fn policy(_: std.mem.Allocator, _: *SkillContext, _: []const u8, _: i64, _: usize, _: []const u8, _: []const u8, _: *[]const u8) anyerror!approval.ApprovalDecision {
+            return .escalated;
+        }
+    };
+    var flow = approval.ApprovalFlow.init(allocator, &backend, Escalate.policy);
+    const steps = [_]approval.ApprovalStep{.{ .name = "finance" }};
+    var ac = ApprovalCtx{ .flow = &flow, .steps = &steps };
+
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    try registerApprovalRequestSkills(&registry);
+    const perms = [_][]const u8{"approval:decide"};
+    var base_ctx = SkillContext{ .allocator = allocator, .userdata = &ac, .permissions = &perms };
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, reg: *SkillRegistry, base: *SkillContext) !void {
+            var sctx = base.*;
+            sctx.allocator = a;
+            var args = std.json.ObjectMap{};
+            defer freeValue(a, .{ .object = args });
+            try skill.putJsonField(a, &args, "subject", .{ .string = "order-7" });
+            try skill.putJsonField(a, &args, "amount", .{ .integer = 9000 });
+            const res = try reg.dispatch("approval.request", &sctx, .{ .object = args });
+            defer freeValue(a, res);
+            try std.testing.expectEqualStrings("pending_human", res.object.get("status").?.string);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{ &registry, &base_ctx });
+}
+
+// The map refuses the field only when it cannot grow; the key copy built as
+// the `put` argument used to be stranded on exactly that failure.
+test "putOwned hands back its key copy at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var map = std.json.ObjectMap{};
+            defer freeValue(a, .{ .object = map });
+            try putOwned(&map, a, "k", .{ .integer = 7 });
+            try std.testing.expectEqual(@as(i64, 7), map.get("k").?.integer);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{});
+}
+
 /// ObjectMap does not copy keys and deinit does not free them; results must
 /// own every key so the caller can free them with `freeValue`.
 fn putOwned(obj: *std.json.ObjectMap, allocator: std.mem.Allocator, key: []const u8, value: std.json.Value) !void {
-    try obj.put(allocator, try allocator.dupe(u8, key), value);
+    // The key copy needs its own guard: built as the `put` argument it was
+    // stranded whenever the map refused the field. The disarmed-by-`return`
+    // guard leaves the value's contract alone — a `.string` here is still
+    // owned by the caller.
+    const k = try allocator.dupe(u8, key);
+    errdefer allocator.free(k);
+    try obj.put(allocator, k, value);
 }
 
 test "ApprovalQueue push/resolve lifecycle" {

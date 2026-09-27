@@ -173,6 +173,10 @@ pub fn registerNotifySkills(registry: *SkillRegistry) !void {
                 const report = try nc.hub.deliver(sctx.allocator, sctx, payload);
 
                 var out = std.json.ObjectMap{};
+                // The tree is the caller's on success and freed here on
+                // failure — a second field's failure used to strand the first
+                // field's key.
+                errdefer skill.freeValue(sctx.allocator, .{ .object = out });
                 try putOwned(&out, sctx.allocator, "delivered", .{ .integer = @intCast(report.delivered) });
                 try putOwned(&out, sctx.allocator, "channels", .{ .integer = @intCast(report.channels) });
                 return .{ .object = out };
@@ -184,7 +188,13 @@ pub fn registerNotifySkills(registry: *SkillRegistry) !void {
 /// ObjectMap does not copy keys and deinit does not free them; results must
 /// own every key so `freeValue` can release them.
 fn putOwned(obj: *std.json.ObjectMap, allocator: std.mem.Allocator, key: []const u8, value: std.json.Value) !void {
-    try obj.put(allocator, try allocator.dupe(u8, key), value);
+    // The key copy needs its own guard: built as the `put` argument it was
+    // stranded whenever the map refused the field. The disarmed-by-`return`
+    // guard leaves the value's contract alone — a `.string` here is still
+    // owned by the caller.
+    const k = try allocator.dupe(u8, key);
+    errdefer allocator.free(k);
+    try obj.put(allocator, k, value);
 }
 
 const SinkState = struct {
@@ -337,4 +347,58 @@ test "notification.send payload escapes quotes and backslashes in the message te
     try std.testing.expectEqualStrings("ops", parsed.value.object.get("channel").?.string);
     try std.testing.expectEqualStrings(title, parsed.value.object.get("title").?.string);
     try std.testing.expectEqualStrings(body, parsed.value.object.get("body").?.string);
+}
+
+// The failing allocator is swapped into the `SkillContext`: the walk covers
+// the handler's payload encoding, the channel filter list and the result map
+// (the sink below allocates nothing, so the delivery itself adds no points).
+// The production context allocator is the agent worker's, not an arena — this
+// path must own its failure exits.
+//
+// Red before the fix: the result map had no guard, so a failed second put
+// stranded the first field's key; and inside `putOwned` the key copy built as
+// the `put` argument was stranded whenever the map refused the field.
+test "notification.send hands back its report at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    var http = HttpClient.init(allocator, std.testing.io, 1, 1000);
+    defer http.deinit();
+
+    const NoopSink = struct {
+        var calls: usize = 0;
+        fn sink(_: *anyopaque, _: std.mem.Allocator, _: *SkillContext, _: []const u8, _: []const u8) anyerror!void {
+            calls += 1;
+        }
+    };
+    var sink_ud: u8 = 0;
+    const channels = [_]NotificationChannel{
+        .{ .name = "ops", .kind = .{ .sink = .{ .userdata = &sink_ud, .call = NoopSink.sink } } },
+    };
+    var hub = NotificationHub.init(allocator, &backend, &http);
+    hub.channels = &channels;
+    var nc = NotificationCtx{ .hub = &hub };
+
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    try registerNotifySkills(&registry);
+    var base_ctx = SkillContext{ .allocator = allocator, .userdata = &nc };
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, reg: *SkillRegistry, base: *SkillContext) !void {
+            var sctx = base.*;
+            sctx.allocator = a;
+            var args = std.json.ObjectMap{};
+            defer skill.freeValue(a, .{ .object = args });
+            try skill.putJsonField(a, &args, "channel", .{ .string = "ops" });
+            try skill.putJsonField(a, &args, "title", .{ .string = "disk full" });
+            try skill.putJsonField(a, &args, "body", .{ .string = "/var at 99%" });
+            const res = try reg.dispatch("notification.send", &sctx, .{ .object = args });
+            defer skill.freeValue(a, res);
+            try std.testing.expectEqual(@as(i64, 1), res.object.get("delivered").?.integer);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{ &registry, &base_ctx });
 }

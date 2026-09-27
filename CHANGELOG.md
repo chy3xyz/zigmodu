@@ -2,6 +2,53 @@
 
 ## [Unreleased]
 
+### 第 84 批：把这个类的修复从"口诀"变成"门禁" + 生产路径剩余的收尾（**破坏性：否**）
+
+**门禁（本批的重点）：** 在 `scripts/check-production.sh`（`zig build check` 走的那个，扫
+`src/**` + `tools/zmodu/src/**`）加了一条 `inline-alloc` 规则，匹配的是"把分配**内联**进
+fallible 的 append/put 的实参里"这个形状 ——
+
+```
+.(append|put)( allocator|alloc|self.allocator , try (self.allocator|allocator|alloc).(alloc|dupe|dupeZ|allocPrint|allocPrintSentinel)(
+```
+
+这个形状是**不可守卫**的：值在调用的参数里，上面没有本地变量可以挂 errdefer —— 所以它在
+静态上就能认出来，根本不用跑。消费助手（`putJsonField` / `appendOwnedString` / …）匹配不到
+（它们不是 `append`/`put`），测试块被共享的 lexer 状态机跳过。在 `src/ai/` 下**强制**（exit 1），
+其余路径先警告（18 处既有的打在 `EventLogger`/`KafkaConnector`/`OpenApi`/`Fluvio`/`Migration`/
+`CatalogPermDb`/`ai_cli`/`doctor`/`main.zig`/`audit.zig`，是一页"先修再promote"的回扣清单，
+模型与 catch 规则相同）。消费方同一条规则进了 `zmodu audit` 作为 **b25**。
+
+门禁红证据（往 `schedule.zig` 的 putOwned 里塞一条即红）：
+
+```text
+check-production: inline allocation into fallible append/put in src/ai/schedule.zig:
+20	_ = try std.ArrayList(u8).empty.append(allocator, try allocator.dupe(u8, ));
+check-production: bind the allocation to a local with its own errdefer (or use a consuming helper
+like skill.putJsonField) and append/put last — a value built inside the call's argument list is
+stranded when the call fails
+```
+
+**收尾（同一形状，生产路径）：** `approval`（submit 尾部 + `approval.submit` handler + `putOwned`
+—— `putOwned` 删了，它再无调用点）、`approval_api`（`approval.request` + `putOwned`）、`kpi`、
+`admin`（`ConfigStore.set` 的 `put(dupe, dupe)` + `putOwned`）、`schedule`（`putOwned` + 4 个
+handler）、`notify`、`llm` 的 `putOwned` —— 全部是"本地值 + errdefer，移交放最后"。
+
+OOM 扫描红证据（把 `admin.putOwned` 换回旧形状即红）：
+
+```text
+1191/2067  putOwned hands back its key copy at every allocation point (OOM scan)...
+           fail_index: 1/2  allocated 1  freed 0  FAIL (MemoryLeakDetected)
+           [SafeAllocator] leaked [len 1] at admin.zig:98 putOwned  try obj.put(allocator, try allocator.dupe(u8, key), value);
+```
+
+读数：全量 `-Ddb=all` → **2125/2183 passed · 58 skipped · 0 failed**（+14 条测试）；`ai.` 过滤
+241 passed · leaked=0；门禁：树绿（exit 0，18 处警告）/ 塞入一条即红（exit 1）。
+
+**一个要诚实标注的点**：全量第一次跑挂了**一条未捕获名字的测试**（`tail` 截掉了名字），什么都没
+改再跑一遍就是 2125/2183 绿；判定为 flake（本批没有时序敏感的改动，所有 ai 测试在三次跑里都过），
+但名字丢了 —— 如果再出现，要用全捕获再跑一次。
+
 ### 第 83 批：把"分配后失败即丢"这一类在 `src/ai/**` 的最后 6 处收掉（**破坏性：否**）
 
 这个类的两个失败形状，修每一处时都要同时避开：

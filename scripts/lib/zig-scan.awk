@@ -29,6 +29,22 @@
 #       literal in a comment or in a `\\…` template line outside a test block is
 #       still a version literal, so this mode must not inherit zig_skip()'s
 #       broader exemptions.
+#   awk -v mode=inlinealloc -f scripts/lib/zig-scan.awk <file>
+#       scripts/check-production.sh — one line per inline allocation handed
+#       straight to a fallible `append`/`put`, e.g.
+#           try list.append(allocator, try allocator.dupe(u8, s))
+#           try map.put(allocator, try allocator.dupe(u8, key), value)
+#       When the outer call fails, the value the inner call just made has no
+#       owner and leaks (the "allocated then lost on the next fallible call"
+#       class the src/ai batches 80–83 chased). Test blocks, comments and
+#       string literals are already gone via zig_skip(); the `(` right after
+#       the verb is what keeps the *consuming* helpers out of it —
+#       appendOwnedString / appendTakenString / appendEntry / putJsonField /
+#       putOwned / recordCompleted & co. are not spelled `.append(` / `.put(`.
+#       Deliberately line-shaped, and blind on the side of silence: only the
+#       `allocator` / `alloc` / `self.allocator` spellings, only single-line
+#       calls, and a `put(try dupe(k), try dupe(v))` (first argument inline)
+#       is not seen either.
 #
 # `zig_in_test(raw)` is the one definition of "this line is inside a `test`
 # block", found by brace balancing (top level or indented); `zig_skip()` is
@@ -156,6 +172,15 @@ function weak_io_random(s,   t, i) {
   return 0
 }
 
+# 1 when `s` hands a fresh allocation straight to a fallible `append`/`put` —
+# see the mode=inlinealloc contract above. `try` is required on the inner call
+# so a non-fallible producer never matches; the allocator spellings are the
+# three this tree uses. POSIX awk: alternation groups are fine, interval
+# regexes and `\s` are not (hence [ \t] and the spelled-out name list).
+function inline_alloc(s) {
+  return s ~ /\.(append|put)\([ \t]*(self\.allocator|allocator|alloc)[ \t]*,[ \t]*try[ \t]+(self\.allocator|allocator|alloc)\.(allocPrintSentinel|allocPrint|alloc|dupeZ|dupe)\(/
+}
+
 # 1 when `s` seeds/names a PRNG that is not a CSPRNG. `std.Random.DefaultPrng`
 # is an alias for `Xoshiro256`, and `Xoroshiro128`/`Pcg`/`Isaac64`/`Sfc64`/
 # `RomuTrio`/`SplitMix64` are the same class: a few outputs recover the state,
@@ -236,6 +261,10 @@ BEGIN { in_test = 0; depth = 0; kw = 0; open = 0; seen = 0 }
   if (zig_skip(raw)) next
   if (mode == "entropy") {
     if (weak_entropy(code) && !entropy_exempt(FILENAME, code)) print NR "\t" rtrim(ltrim(code))
+    next
+  }
+  if (mode == "inlinealloc") {
+    if (inline_alloc(code)) print NR "\t" rtrim(ltrim(code))
     next
   }
   # mode == "catch": resolve a `catch` whose body starts on an earlier line.

@@ -26,6 +26,12 @@
 #   scripts/lib/zig-scan.awk — that comment is the 口径, and its anchors are
 #   deliberately narrow so a new weak-seed line in an exempted file still fails.
 #
+# A third scan (mode=inlinealloc, same shared lexer) flags an allocation built
+# inline as the argument of a fallible `.append(`/`.put(` — the value is
+# stranded when the outer call fails. Enforced under src/ai/ (the prefix the
+# batch series just cleaned), warn-only elsewhere until those hits are fixed;
+# see the INLINE_ALLOC_ENFORCED block below.
+#
 # Scope (see scripts/lib/zig-scan.awk, shared with check-version.sh):
 #   * whole file, not "up to the first `test \"` line" — that truncation used to
 #     hide ~3000 lines of src/api/Server.zig and everything after the first test
@@ -150,6 +156,48 @@ done < <(find "${SCAN_ROOTS[@]}" -name '*.zig' | sort)
 
 if [[ "$entropy_fail" -ne 0 ]]; then
   echo "check-production: use std.Io.randomSecure(io, buf) — std.Io.random falls back to pid+wall-clock+ASLR, std.crypto.random does not exist here, and a seeded non-crypto PRNG (std.Random.DefaultPrng & co.) is predictable from a handful of outputs (AGENTS.md \"CSPRNG\")" >&2
+  exit 1
+fi
+
+# Inline allocation into a fallible append/put: `try list.append(allocator,
+# try allocator.dupe(u8, s))` / `try map.put(allocator, try allocator.dupe(u8,
+# k), …)`. When the outer call fails, the value the inner call just made has
+# no owner and leaks — the "allocated then lost on the next fallible call"
+# class that src/ai batches 80–83 chased (40+ instances). Bind the allocation
+# to a local with its own errdefer (or route through a consuming helper such
+# as skill.putJsonField / appendOwnedString / appendEntry) and append/put
+# last. Test blocks are skipped by the shared scanner; the consuming helpers
+# never match (they are not spelled `.append(` / `.put(`).
+#
+# Enforcement is scoped to src/ai/ for now — that prefix was just cleaned of
+# this class, and this keeps it from coming back. Everywhere else the scan
+# warns: the remaining hits (src/messaging, src/migration, src/http, src/core,
+# src/security, tools/zmodu/src) are the promotion backlog, the same ratchet
+# model as the catch rule above — fix a prefix's hits, then add it to
+# INLINE_ALLOC_ENFORCED.
+INLINE_ALLOC_ENFORCED=(src/ai/)
+inlinealloc_fail=0
+while IFS= read -r f; do
+  [[ -f "$f" ]] || continue
+  hits="$(awk -v mode=inlinealloc -f "$LEX" "$f" || true)"
+  [[ -n "$hits" ]] || continue
+  enforced_here=0
+  for pfx in "${INLINE_ALLOC_ENFORCED[@]}"; do
+    [[ "$f" == ${pfx}* ]] && { enforced_here=1; break; }
+  done
+  if [[ "$enforced_here" -eq 1 ]]; then
+    echo "check-production: inline allocation into fallible append/put in ${f}:" >&2
+    printf '%s\n' "$hits" >&2
+    inlinealloc_fail=1
+  else
+    echo "check-production: WARN (not yet enforced) inline allocation into fallible append/put in ${f}:" >&2
+    printf '%s\n' "$hits" >&2
+    warned=$(( warned + $(printf '%s\n' "$hits" | wc -l | tr -d ' ') ))
+  fi
+done < <(find "${SCAN_ROOTS[@]}" -name '*.zig' | sort)
+
+if [[ "$inlinealloc_fail" -ne 0 ]]; then
+  echo "check-production: bind the allocation to a local with its own errdefer (or use a consuming helper like skill.putJsonField) and append/put last — a value built inside the call's argument list is stranded when the call fails" >&2
   exit 1
 fi
 

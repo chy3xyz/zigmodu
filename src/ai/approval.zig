@@ -14,6 +14,7 @@ const SkillRegistry = @import("skill.zig").SkillRegistry;
 const OutboxPublisher = @import("../messaging/OutboxPublisher.zig").OutboxPublisher;
 const sqlx = @import("../data.zig").sqlx;
 const skill = @import("skill.zig");
+const freeValue = @import("skill.zig").freeValue;
 
 /// What happened at one approval step.
 pub const ApprovalDecision = enum { approved, escalated, rejected };
@@ -150,12 +151,18 @@ pub const ApprovalFlow = struct {
         // Final event summarizes the chain outcome.
         try self.writeFinal(allocator, run_id, subject, amount, status, entries.items.len);
 
+        // Each piece of the result is guarded on its own until the `return`
+        // hands it over: built inside the struct literal, the subject copy was
+        // stranded whenever `toOwnedSlice` failed after it.
+        const subject_copy = try allocator.dupe(u8, subject);
+        errdefer allocator.free(subject_copy);
+        const owned_entries = try entries.toOwnedSlice(allocator);
         return .{
             .run_id = run_id,
-            .subject = try allocator.dupe(u8, subject),
+            .subject = subject_copy,
             .amount = amount,
             .status = status,
-            .entries = try entries.toOwnedSlice(allocator),
+            .entries = owned_entries,
         };
     }
 
@@ -293,18 +300,19 @@ pub fn registerApprovalSkills(registry: *SkillRegistry) !void {
                 var result = try ac.flow.submit(sctx.allocator, sctx, subj_v.string, amt_v.integer, ac.steps);
                 defer result.deinit(sctx.allocator);
                 var out = std.json.ObjectMap{};
-                try putOwned(&out, sctx.allocator, "run_id", .{ .string = try sctx.allocator.dupe(u8, result.run_id) });
-                try putOwned(&out, sctx.allocator, "status", .{ .string = try sctx.allocator.dupe(u8, @tagName(result.status)) });
+                // The result tree is handed to the caller by the `return`
+                // below; without this guard a field that fails to go in
+                // strands the ones already placed. The string fields are
+                // copied by `putJsonField` (which frees its own copies when
+                // the put fails) — a dupe built as the `putOwned` argument had
+                // no owner on that path.
+                errdefer freeValue(sctx.allocator, .{ .object = out });
+                try skill.putJsonField(sctx.allocator, &out, "run_id", .{ .string = result.run_id });
+                try skill.putJsonField(sctx.allocator, &out, "status", .{ .string = @tagName(result.status) });
                 return .{ .object = out };
             }
         }.h,
     });
-}
-
-/// ObjectMap does not copy keys and deinit does not free them; results must
-/// own every key so `freeValue` can release them.
-fn putOwned(obj: *std.json.ObjectMap, allocator: std.mem.Allocator, key: []const u8, value: std.json.Value) !void {
-    try obj.put(allocator, try allocator.dupe(u8, key), value);
 }
 
 test "ApprovalFlow advances, escalates and rejects with outbox audit" {
@@ -405,6 +413,106 @@ test "an appended approval entry hands back its copy at every allocation point (
         }
     };
     try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{});
+}
+
+// Same walk over the whole chain: the failing allocator covers the run id, the
+// policy's note, both `appendEntry` copies, the subject copy and the final
+// `toOwnedSlice` (the outbox is unset, so `writeOutbox`/`writeFinal` return
+// before touching the backend).
+//
+// Red before the tail fix: the subject dupe was built inside the returned
+// struct literal, so a failed `toOwnedSlice` stranded it.
+test "ApprovalFlow.submit hands back its result at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    var client = sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+
+    const T = struct {
+        fn policy(
+            a: std.mem.Allocator,
+            _: *SkillContext,
+            _: []const u8,
+            _: i64,
+            step_index: usize,
+            _: []const u8,
+            _: []const u8,
+            out_note: *[]const u8,
+        ) anyerror!ApprovalDecision {
+            if (step_index == 0) return .approved;
+            out_note.* = try a.dupe(u8, "needs CFO sign-off");
+            return .escalated;
+        }
+    };
+
+    var flow = ApprovalFlow.init(allocator, &backend, T.policy);
+    const steps = [_]ApprovalStep{ .{ .name = "line manager" }, .{ .name = "finance" } };
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, f: *ApprovalFlow, s: []const ApprovalStep) !void {
+            var ctx = SkillContext{ .allocator = a };
+            var res = try f.submit(a, &ctx, "order-1", 50000, s);
+            defer res.deinit(a);
+            try std.testing.expectEqual(ApprovalStatus.pending_human, res.status);
+            try std.testing.expectEqual(@as(usize, 2), res.entries.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{ &flow, &steps });
+}
+
+// The skill bridge drives the same chain through `registry.dispatch`; the
+// failing allocator covers the handler's result map on top of the submit path
+// (args are built field by field with `putJsonField`, which copies and
+// self-guards).
+//
+// Red before the handler fix: both string fields were dupes built as
+// `putOwned` arguments — a failed put stranded the value copy, and the second
+// field's failure stranded the first field's key with it.
+test "approval.submit hands back its response at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    var client = sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+
+    const T = struct {
+        fn policy(
+            _: std.mem.Allocator,
+            _: *SkillContext,
+            _: []const u8,
+            _: i64,
+            step_index: usize,
+            _: []const u8,
+            _: []const u8,
+            _: *[]const u8,
+        ) anyerror!ApprovalDecision {
+            if (step_index == 0) return .approved;
+            return .rejected;
+        }
+    };
+
+    var flow = ApprovalFlow.init(allocator, &backend, T.policy);
+    const steps = [_]ApprovalStep{ .{ .name = "line manager" }, .{ .name = "finance" } };
+    var ac = ApprovalCtx{ .flow = &flow, .steps = &steps };
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    try registerApprovalSkills(&registry);
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, reg: *SkillRegistry, actx: *ApprovalCtx) !void {
+            var sctx = SkillContext{ .allocator = a, .userdata = actx };
+            var args = std.json.ObjectMap{};
+            defer freeValue(a, .{ .object = args });
+            try skill.putJsonField(a, &args, "subject", .{ .string = "order-1" });
+            try skill.putJsonField(a, &args, "amount", .{ .integer = 50000 });
+            try skill.putJsonField(a, &args, "request", .{ .string = "restock" });
+            const res = try reg.dispatch("approval.submit", &sctx, .{ .object = args });
+            defer freeValue(a, res);
+            try std.testing.expectEqualStrings("rejected", res.object.get("status").?.string);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{ &registry, &ac });
 }
 
 test "ApprovalFlow default policy escalates every step to a human" {
