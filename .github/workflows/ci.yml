@@ -50,7 +50,7 @@ jobs:
         shell: bash
         run: |
           case "$RUNNER_OS" in
-            Linux) ART="zig-x86_64-linux" ;;
+            Linux) case "$(uname -m)" in aarch64|arm64) ART="zig-aarch64-linux" ;; *) ART="zig-x86_64-linux" ;; esac ;;
             macOS) ART="zig-aarch64-macos" ;;
             *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
           esac
@@ -77,7 +77,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # ubuntu-24.04-arm is aarch64 Linux: the ARM64-Linux evidence leg.
+        # macOS already covers aarch64/Darwin; until this leg existed, no
+        # linux-gated branch (`builtin.os.tag == .linux`) was ever analysed or
+        # run on aarch64 anywhere.
+        os: [ubuntu-latest, macos-latest, ubuntu-24.04-arm]
 
     steps:
       - uses: actions/checkout@v4
@@ -90,7 +94,7 @@ jobs:
         shell: bash
         run: |
           case "$RUNNER_OS" in
-            Linux) ART="zig-x86_64-linux" ;;
+            Linux) case "$(uname -m)" in aarch64|arm64) ART="zig-aarch64-linux" ;; *) ART="zig-x86_64-linux" ;; esac ;;
             macOS) ART="zig-aarch64-macos" ;;
             *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
           esac
@@ -105,8 +109,11 @@ jobs:
           path: |
             ~/.cache/zig
             .zig-cache
-          key: zig-${{ runner.os }}-${{ hashFiles('build.zig.zon') }}
-          restore-keys: zig-${{ runner.os }}-
+          # runner.arch: x86_64 and aarch64 Linux runners share runner.os ==
+          # "Linux" — without the arch in the key they would restore each
+          # other's caches.
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: zig-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Install system deps (Linux)
         if: runner.os == 'Linux'
@@ -378,7 +385,7 @@ jobs:
         shell: bash
         run: |
           case "$RUNNER_OS" in
-            Linux) ART="zig-x86_64-linux" ;;
+            Linux) case "$(uname -m)" in aarch64|arm64) ART="zig-aarch64-linux" ;; *) ART="zig-x86_64-linux" ;; esac ;;
             macOS) ART="zig-aarch64-macos" ;;
             *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
           esac
@@ -458,7 +465,7 @@ jobs:
         shell: bash
         run: |
           case "$RUNNER_OS" in
-            Linux) ART="zig-x86_64-linux" ;;
+            Linux) case "$(uname -m)" in aarch64|arm64) ART="zig-aarch64-linux" ;; *) ART="zig-x86_64-linux" ;; esac ;;
             macOS) ART="zig-aarch64-macos" ;;
             *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
           esac
@@ -522,7 +529,7 @@ jobs:
         shell: bash
         run: |
           case "$RUNNER_OS" in
-            Linux) ART="zig-x86_64-linux" ;;
+            Linux) case "$(uname -m)" in aarch64|arm64) ART="zig-aarch64-linux" ;; *) ART="zig-x86_64-linux" ;; esac ;;
             macOS) ART="zig-aarch64-macos" ;;
             *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
           esac
@@ -598,7 +605,7 @@ jobs:
         shell: bash
         run: |
           case "$RUNNER_OS" in
-            Linux) ART="zig-x86_64-linux" ;;
+            Linux) case "$(uname -m)" in aarch64|arm64) ART="zig-aarch64-linux" ;; *) ART="zig-x86_64-linux" ;; esac ;;
             macOS) ART="zig-aarch64-macos" ;;
             *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
           esac
@@ -671,7 +678,7 @@ jobs:
         shell: bash
         run: |
           case "$RUNNER_OS" in
-            Linux) ART="zig-x86_64-linux" ;;
+            Linux) case "$(uname -m)" in aarch64|arm64) ART="zig-aarch64-linux" ;; *) ART="zig-x86_64-linux" ;; esac ;;
             macOS) ART="zig-aarch64-macos" ;;
             *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
           esac
@@ -751,7 +758,7 @@ jobs:
         shell: bash
         run: |
           case "$RUNNER_OS" in
-            Linux) ART="zig-x86_64-linux" ;;
+            Linux) case "$(uname -m)" in aarch64|arm64) ART="zig-aarch64-linux" ;; *) ART="zig-x86_64-linux" ;; esac ;;
             macOS) ART="zig-aarch64-macos" ;;
             *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
           esac
@@ -793,7 +800,7 @@ jobs:
         shell: bash
         run: |
           case "$RUNNER_OS" in
-            Linux) ART="zig-x86_64-linux" ;;
+            Linux) case "$(uname -m)" in aarch64|arm64) ART="zig-aarch64-linux" ;; *) ART="zig-x86_64-linux" ;; esac ;;
             macOS) ART="zig-aarch64-macos" ;;
             *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
           esac
@@ -823,7 +830,11 @@ jobs:
       - name: Soak (cross-tenant leak assertions + frozen-registry concurrency)
         # Larger than the local defaults: the point of running this nightly is
         # to widen the window, not to re-run the fast suite.
-        run: zig build soak -Dsoak-clients=64 -Dsoak-iterations=200
+        # `tee` into the nightly log bundle; the default bash shell here runs
+        # with `pipefail`, so the step's status stays the harness's.
+        run: |
+          mkdir -p "$RUNNER_TEMP/nightly-logs"
+          zig build soak -Dsoak-clients=64 -Dsoak-iterations=200 2>&1 | tee "$RUNNER_TEMP/nightly-logs/soak.log"
 
       - name: Cluster soak (raft election/replication + event-bus invariants)
         # `soak` above covers HTTP + tenant isolation only; `soak-cluster` is the
@@ -842,12 +853,12 @@ jobs:
         # CHANGELOG entry for this batch.
         env:
           SOAK_CLUSTER_RSS_BUDGET_MIB: "192"
-        run: zig build soak-cluster
+        run: zig build soak-cluster 2>&1 | tee "$RUNNER_TEMP/nightly-logs/soak-cluster.log"
 
       - name: Runtime stress (supervision tree / pools / timers)
         # The runtime harness asserts the things a short single-threaded test
         # cannot: claims, ready-ring fairness, timer ownership under churn.
-        run: zig build runtime-stress -Druntime-stress-duration-ms=60000
+        run: zig build runtime-stress -Druntime-stress-duration-ms=60000 2>&1 | tee "$RUNNER_TEMP/nightly-logs/runtime-stress.log"
 
       - name: Fuzz (bounded)
         # `--fuzz` with no limit opens the webui and never exits, so the bound is
@@ -887,6 +898,18 @@ jobs:
             exit 1
           fi
 
+      - name: Upload nightly soak/stress logs
+        # The nightly's verdicts as a downloadable series — one artifact per
+        # night, named by commit, 30 days. Raw material for the commit → soak
+        # result history; the assertions stay the harnesses' own. `always()`:
+        # a red night is exactly the one whose log must survive.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-soak-${{ github.sha }}
+          path: ${{ runner.temp }}/nightly-logs/
+          retention-days: 30
+
   benchmark:
     name: Benchmark
     runs-on: ubuntu-latest
@@ -903,7 +926,7 @@ jobs:
         shell: bash
         run: |
           case "$RUNNER_OS" in
-            Linux) ART="zig-x86_64-linux" ;;
+            Linux) case "$(uname -m)" in aarch64|arm64) ART="zig-aarch64-linux" ;; *) ART="zig-x86_64-linux" ;; esac ;;
             macOS) ART="zig-aarch64-macos" ;;
             *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
           esac
@@ -917,6 +940,20 @@ jobs:
 
       - name: Run benchmarks
         run: zig build benchmark -Doptimize=ReleaseFast
+
+      - name: Upload bench results (the commit → numbers series)
+        # The commit-addressed raw series the gh-pages history action below
+        # cannot provide while the branch does not exist: one artifact per
+        # push, named by commit, 90 days, downloadable via `gh run download`.
+        # `if: always()` on purpose — a regression run is exactly the one
+        # whose numbers are worth keeping, and a failed step skips the rest of
+        # a job by default.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-${{ github.sha }}
+          path: bench-results.json
+          retention-days: 90
 
       # History only — this action needs a `gh-pages` branch, which this repo
       # does not have, so it can neither store nor compare. It stays
@@ -1058,7 +1095,7 @@ jobs:
         shell: bash
         run: |
           case "$RUNNER_OS" in
-            Linux) ART="zig-x86_64-linux" ;;
+            Linux) case "$(uname -m)" in aarch64|arm64) ART="zig-aarch64-linux" ;; *) ART="zig-x86_64-linux" ;; esac ;;
             macOS) ART="zig-aarch64-macos" ;;
             *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
           esac
@@ -1114,7 +1151,7 @@ jobs:
         shell: bash
         run: |
           case "$RUNNER_OS" in
-            Linux) ART="zig-x86_64-linux" ;;
+            Linux) case "$(uname -m)" in aarch64|arm64) ART="zig-aarch64-linux" ;; *) ART="zig-x86_64-linux" ;; esac ;;
             macOS) ART="zig-aarch64-macos" ;;
             *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
           esac

@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### 第 101 批：证据链基建——ARM64 Linux 进测试矩阵 + bench/nightly 结果沉淀为按 commit 寻址的 artifact 序列（**破坏性：否**）
+
+外部评估把"ARM64 Linux 无证据"与"commit→stress 结果没有沉淀为可比序列"列为 v1.0 前缺口。本批落地：
+
+1. **`ubuntu-24.04-arm`（aarch64 Linux）加入 Build & Test 矩阵**（第三腿，与 ubuntu/macos 并列、门禁效力
+   相同）。此前 aarch64 证据只有 macOS（Darwin）；Linux 专属分支（`builtin.os.tag == .linux`：io_uring、
+   epoll、timerfd 等）从未在任何 aarch64 上被分析/执行过。配套：12 处 Setup Zig 下载步骤全部改为按
+   `uname -m` 选架构（x86_64 行为不变）；zig 缓存 key 加 `runner.arch`（x86_64 与 aarch64 的
+   `runner.os` 都是 `Linux`，不加会互相恢复对方的缓存）。Linux-only 步骤（apt 依赖、soak-compile、
+   soak-smoke）随之自动覆盖 ARM。
+2. **bench 结果序列**：Benchmark job 新增 `bench-results-${{ github.sha }}` artifact（`always()`，90 天）
+   ——gh-pages 历史动作在分支不存在时存不了数，这是不依赖新基建的原始序列，回归那一跑的数据尤其要留下。
+3. **nightly soak 序列**：soak / soak-cluster / runtime-stress 三个步骤的输出 tee 进日志包，job 尾部
+   `always()` 上传 `nightly-soak-${{ github.sha }}`（30 天）——红夜正是日志必须留下的那一夜；
+   `pipefail`（GA bash 默认）保证步骤状态仍是 harness 的而不是 tee 的。
+
+读数：YAML 语法校验通过；本批为 CI-only 变更，本地门禁（test-collection 2204/2264 等）不受影响；
+ARM64 腿的首次结果由本批 push 后的 CI 给出。
+
 ### 第 100 批：确定性边界的核查结论 + 两条回归门（**破坏性：否**）
 
 外部评估建议"统一 Clock/Random/Sequencer/ordering 成 `DeterministicRuntime`"。核查结论：**runtime 核心
