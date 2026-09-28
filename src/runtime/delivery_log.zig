@@ -126,10 +126,12 @@
 //!
 //! * No recorder/`DeliveryLog` wiring and no `TrackRef.payload_codec` — that
 //!   needs the codec contract §13.3 Q4 asks for.
-//! * No CLI, no metrics, no compaction or deletion of *valid* records, no
+//! * No metrics, no compaction or deletion of *valid* records, no
 //!   `max_segments` retention: there is no committed index in this layer, so
 //!   "which segments are safe to delete" is a question only the caller can
-//!   answer.
+//!   answer. (The CLI that used to be on this list landed as
+//!   `src/replay_inspect.zig` — `zig build replay-inspect` — a *reader* of this
+//!   format and nothing else; §13.10 D7.)
 //! * No concurrent writers. One `Writer` per directory. A reader running beside
 //!   an appending writer sees at worst the half-written frame that writer is in
 //!   the middle of — reported as `.torn`, exactly as a crash's would be — and
@@ -923,7 +925,9 @@ fn parseSegmentId(name: []const u8) ?u64 {
     return std.fmt.parseInt(u64, digits, 10) catch null;
 }
 
-fn segmentIds(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) ![]u64 {
+/// Segment ids found in `dir`, ascending. Shared with `src/replay_inspect.zig`
+/// (the §13.10 D7 CLI) so the file-name format has exactly one owner.
+pub fn segmentIds(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) ![]u64 {
     var ids: std.ArrayList(u64) = .empty;
     errdefer ids.deinit(allocator);
     var it = dir.iterate();

@@ -603,4 +603,42 @@ pub fn build(b: *std.Build) void {
     const soak_smoke_step = b.step("soak-smoke", "Run the soak assertions a push never reached (cross-tenant leak + cluster leader/fd/RSS/log invariants) at a fixed small budget");
     soak_smoke_step.dependOn(&run_soak_smoke.step);
     soak_smoke_step.dependOn(&run_cluster_smoke.step);
+
+    // Delivery-log inspection (`replay-inspect <dir> [--from N] [--to N]`) —
+    // the offline reader for the §13.9/§13.10 delivery log and the §13.10 D7
+    // "CLI" item: verified record count, seq range, per-track and per-kind
+    // counts, holes in the seq chain, and the damage that stopped the scan. It
+    // is a *reader* of the files `drainTo` writes — the format lives in
+    // `src/runtime/delivery_log.zig`'s header, byte for byte, and the tool does
+    // not link the framework module (no libc, no DB drivers) so it stays a
+    // seconds-fast build.
+    //
+    // Invocation is the *installed binary* (`zig build` →
+    // `zig-out/bin/replay-inspect <dir>`), not `zig build replay-inspect --
+    // <dir>`: this pinned toolchain (0.17.0-dev) removed `b.args`, so args
+    // after `--` never reach a run step. The run step below stays as the
+    // self-documenting entry point — run without args the tool prints its
+    // usage, which names the binary form.
+    const replay_inspect_mod = b.createModule(.{
+        .root_source_file = b.path("src/replay_inspect.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const replay_inspect_exe = b.addExecutable(.{
+        .name = "replay-inspect",
+        .root_module = replay_inspect_mod,
+    });
+    b.installArtifact(replay_inspect_exe);
+    const run_replay_inspect = b.addRunArtifact(replay_inspect_exe);
+    // Without this, a cached run result prints nothing on the second
+    // invocation — and printing the usage is all this step does.
+    run_replay_inspect.has_side_effects = true;
+    const replay_inspect_step = b.step("replay-inspect", "Inspect a delivery-log directory (records, tracks, holes, damage); args via the installed binary: zig-out/bin/replay-inspect <dir> [--from N] [--to N]");
+    replay_inspect_step.dependOn(&run_replay_inspect.step);
+
+    // Its unit tests ride the default suite (the same file is the tool's root),
+    // so a push gate cannot lose it the way the nightly-only soaks were lost
+    // before `soak-compile` existed.
+    const replay_inspect_tests = b.addTest(.{ .root_module = replay_inspect_mod });
+    addTest(b, test_step, replay_inspect_tests, test_filter, test_skip_names, test_force_run, test_llvm_forced orelse false);
 }

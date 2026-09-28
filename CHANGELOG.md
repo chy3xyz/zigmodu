@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+### 第 103 批：`replay-inspect` —— delivery log 的离线检视工具落地（收口 §13.10 D7 的 "CLI" 项；**破坏性：否**）
+
+1. **新增 `src/replay_inspect.zig`**（~650 行，独立小工具根模块）：读 `DeliveryLog.drainTo` 写出的
+   segment 目录（格式逐字节以 `src/runtime/delivery_log.zig` 文件头为准），校验 magic/version/记录
+   CRC，输出 segment 列表、已验证记录数、seq 范围、按轨/按 kind 计数、seq 链上的洞，以及让扫描停下
+   的损伤点。退出码：0 干净（含洞，洞是正常事件）；1 用法/路径错误；2 数据损伤（CRC 坏、撕裂尾、
+   头部非法）；3 内部错误。`--from N --to N` 窗口过滤沿用第 99 批 `ReplayFromLog` 的同契约语义。
+2. **调用形态是装出来的二进制**：`zig build` → `zig-out/bin/replay-inspect <dir> [--from N] [--to N]`。
+   同名 run step 仅作自文档入口。**原因**：本仓锁定的 0.17.0-dev.2151 工具链已移除 `b.args`，
+   `zig build <step> -- args` 的 `--` 后参数**根本到不了 run step**（实测
+   `zig build zmodu -- version` 也只打 usage）——`docs/ZMODU_CLI_INTEGRATION.md` 里
+   `zig build zmodu -- scaffold …` 的形态同样受影响，属既有文档债，本批不动，后续单独批收。
+3. **不链框架模块**：无 libc、无 DB 驱动，构建秒级；usage 走 stderr（`catch {}` 进不了门禁，
+   用 `std.debug.print`）。
+4. **`DeliveryLog.segmentIds` 提为 `pub`**（带 doc 注释；原 `pub` 缺文档仅内部用），delivery_log
+   文件头的 "No CLI" 声明同步改为"CLI 已落地（`replay-inspect`）"。
+5. **测试 6 条挂默认套件**（`tests_in_other_artifacts`，工具根即测试根，不会被 push 门禁丢掉）：
+   干净目录全量 / 窗口过滤（边界内外 + skipped 计数）/ CRC 坏记录报 damage exit 2 / 撕裂尾报字节数
+   （38 = 32 头 + 4 轨 + 2 载荷，截 3 字节后剩 45 → `torn tail — 45 byte(s)`）/ 不存在目录 exit 1 /
+   空目录零记录 exit 0。真机 e2e 全过。修过两个自伤：`StringHashMap.getOrPut` 新键的
+   `value_ptr` 未初始化读到 0xAA 垃圾；撕裂尾字节数期望写错。
+6. `docs/RUNTIME.md` 新增 **§13.14**（工具用法、退出码、与 §13.9/§13.10 的关系）。
+
 ### 第 102 批：交叉编译把**主机**路径交给了外来链接（Mach-O 归档进 Linux 链接；实测 `homebrew` 16 → 0）——驱动探测改为面向目标 + `XCOMPILE_ROOT`（**破坏性：否**）
 
 1. **真缺陷（维护者报告核实）：`examples/_shared/db_link.zig` 的 `detectPqPaths` / `detectMysqlPaths`

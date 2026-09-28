@@ -2344,3 +2344,39 @@ cluster 层：Raft 选举超时、负载均衡、TLS CSPRNG，它们不进 Worke
 为什么没有新 API：加一个 `DeterministicMode` 开关意味着**存在**一个需要切换的非确定模式 —— 而核心的
 非确定性全部来自边界外的三件事，开关管不到它们。这两条测试的作用是**回归门**：任何未来改动若给核心
 引入隐藏随机源（或让重放的投递序依赖时序），它们会红。
+
+### 13.14 `replay-inspect`：事故现场的离线读盘工具（§13.10 D7 的 CLI 项收口）
+
+D7 清单里的 "CLI" 一项落地为 `src/replay_inspect.zig` + 安装产物 `zig-out/bin/replay-inspect`。
+它是**只读**的：事故后第一件事是回答"这份 log 里到底有什么、值不值得重放、从哪个 seq 开始"，
+而不是先起一个 runtime。
+
+**调用形态**：`zig build` 装出 `zig-out/bin/replay-inspect <dir> [--from N] [--to N]`。
+（锁定的 0.17 工具链移除了 `b.args`，`zig build replay-inspect -- <args>` 的参数**到不了** run step
+—— 本仓 `zig build zmodu -- …` 的文档形态同样受影响，属既有文档债，不在本节范围。）
+`zig build replay-inspect` 本身保留为自文档入口：无参运行时打印用法并退出。
+
+**报告什么**（全部来自 `delivery_log.scan` 的已验证前缀，工具自己不猜任何字节）：
+段数、已验证记录数、`seq` 范围、按轨计数（计数降序 + 名字升序，输出字节级稳定可 diff）、
+kind 分布、**洞列表**（`after/before/缺多少条`，§13.9 D3 的两类洞源都落在这一条上）、
+非递增记录计数（单 `Writer` 不可能产生，非零即"这文件不是一个写者写的"）、
+以及停下扫描的原因：`none` / `torn`（带字节数，指明 `repair` 可截）/ `corrupt`
+（带段号、偏移、索引、原因，并明说 `repair` 会拒）。
+
+**窗口**：`--from N`（含）/ `--to N`（不含），语义与 §13.12 的 `[from, to)` 一字不差 ——
+`from >= to` 是空窗不是错误。窗口只决定**列哪几条**；洞与 damage 的报告始终覆盖整份 log
+（完整性是 log 的属性，不是窗口的属性）。`skipped before/after` 两个计数让"窗口外有多少"
+始终可见。载荷只按长度报告 —— 解码与投递是 `ReplayFromLog` 的事，本节不越界。
+
+**退出码即门禁**：`0` clean · `1` 用法/IO · `2` torn tail · `3` corrupt record ——
+脚本可以 `replay-inspect data/delivery || exit` 直接当"log 是否完整"的探针用。
+
+**编译门禁**：该文件是独立根模块（同 `runtime_stress.zig` 路线），单元测试经 `addTest` 进
+`zig build test` 默认套件（6 条：干净 log 全字段 / 窗口五态含单边与空窗 / 撕裂尾字节数 +
+exit 2 / 翻转字节 → corrupt 定位 + exit 3 / 空 log / 目录缺失是错误不是空报告），
+`src/tests.zig` 的 `tests_in_other_artifacts` 有对应条目 —— 不进任何编译单元而烂掉的
+那类事故（`RequestParser.parse`、`PanicHook`）在这个文件上不可能重演。
+
+**照旧没做**（§13.9 D5 / §13.10 D7 的其余项不变）：边写边读（跟随活跃 log）、压实/保留、
+跨进程/跨机、压缩加密、修复操作（`repair` 保持 API 级显式调用，不进 CLI —— 报告里指名它，
+是让运维决定，不是让工具替他决定）。
