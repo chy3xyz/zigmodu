@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.37.0] - 2026-09-29
 
 ### 第 104 批：`zig build zmodu -- …` 文档债收口 + todo 三代加历史快照头（**破坏性：否**）
 
