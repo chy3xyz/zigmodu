@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### 第 100 批：确定性边界的核查结论 + 两条回归门（**破坏性：否**）
+
+外部评估建议"统一 Clock/Random/Sequencer/ordering 成 `DeterministicRuntime`"。核查结论：**runtime 核心
+本来就没有随机性可统一**——`src/runtime/` 全目录零 RNG seed（随机性集中在 cluster 层：Raft 选举超时 /
+负载均衡 / TLS CSPRNG，不进 Worker/Mailbox/Scheduler/TimerWheel）。确定性是现有三部件（可注入
+`Clock.Manual`、无随机 `Sequencer`、唯一投递序来源）的组合性质，不需要新 API。新增两条回归门锁死这个
+性质（`docs/RUNTIME.md` 新增 **§13.13**，含边界表：活的多生产者跨线程交错、`pool_threads>1` 的 claim
+先后、真实墙钟在边界外）：
+
+1. `Deterministic runtime (§13.13): two live runs with the same driver produce the same handler log`——
+   同一驱动序列喂两个独立 Runtime，handler 日志（worker / payload 指纹 / handler 读到的时钟）逐条一致。
+2. `Deterministic runtime (§13.13): the same records replay bit-identically into two fresh runtimes`——
+   同一份记录（含一个内部洞）重放进两个全新 Runtime：交付数 / 洞数 / 首个洞 seq / 终态时钟全部一致，
+   且两侧在同一点拒绝、同样 `allowHoles()` 跨过。
+
+读数：`Deterministic runtime` 聚焦 2/2 绿；`ReplayFromLog` 11/11、`Replay` 家族原样绿。
+
 ### 第 99 批：`ReplayFromLog` 补齐窗口/轨过滤（与 `Replayer` 同契约）+ CHANGELOG 陈旧 `[Unreleased]` 清理与防复发（**破坏性：否**）
 
 1. **`ReplayFromLog` 新增 `open(from, to?)` / `seekTo(from)` / `onlyTracks(ids)` / `clearTrackFilter()` /

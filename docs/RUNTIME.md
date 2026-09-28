@@ -2317,3 +2317,30 @@ e2e 同报 `expected .message, found .timer`）。
 
 **照旧没做**（§13.9 D5、§13.10 D7 不变）：边写边读、压实/保留、CLI、跨进程/跨机、压缩加密 ——
 窗口/过滤是**读者侧**能力，段格式一字未动。
+
+### 13.13 确定性边界：不需要 `DeterministicMode`，需要的是把边界钉死
+
+外部评估建议"统一 Clock/Random/Sequencer/ordering 成一个 `DeterministicRuntime`"。核查后的结论：
+**runtime 核心本来就没有随机性可统一** —— `src/runtime/` 全目录无一处 RNG seed（随机性全部集中在
+cluster 层：Raft 选举超时、负载均衡、TLS CSPRNG，它们不进 Worker/Mailbox/Scheduler/TimerWheel）。
+确定性不是某个模式开关，而是现有三个部件的组合性质：
+
+1. **时钟可注入**（`Clock.Manual` —— 投递的 stamp 由驱动者设定，不由墙钟）；
+2. **序号无随机**（`Sequencer` 单调计数，全局 seq 的发放顺序即调用顺序）；
+3. **投递序有唯一来源**（活跑：单驱动线程的发送序，逐条 await 即锁死；重放：文件的全局 seq，
+   `ReplayFromLog` 按它归并，`step` 不等任何人）。
+
+**可复现的边界**（什么条件下"同样输入 → 同样输出"成立）：
+
+| 场景 | 条件 | 钉住它的测试 |
+|------|------|--------------|
+| 活跑复现 | 单驱动线程 + `Clock.Manual`（默认 `pool_threads=1`，或逐条 await） | `Deterministic runtime (§13.13): two live runs with the same driver produce the same handler log` |
+| 文件重放复现 | `ReplayFromLog` + `Clock.Manual` + 同一绑定 | `Deterministic runtime (§13.13): the same records replay bit-identically into two fresh runtimes` |
+
+**会破坏确定性的三件事**（都不是 bug，是边界外）：活的多生产者**跨线程**交错发送（顺序由时序定）、
+`pool_threads > 1` 时同一 ready 批次的 claim 先后、真实墙钟。跨进程/跨机的"同一输入"则仍属于
+§13.9 D5 / §13.10 D7 的未做清单。
+
+为什么没有新 API：加一个 `DeterministicMode` 开关意味着**存在**一个需要切换的非确定模式 —— 而核心的
+非确定性全部来自边界外的三件事，开关管不到它们。这两条测试的作用是**回归门**：任何未来改动若给核心
+引入隐藏随机源（或让重放的投递序依赖时序），它们会红。

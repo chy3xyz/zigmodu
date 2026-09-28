@@ -6609,6 +6609,207 @@ test "ReplayFromLog e2e (§13.10): a drained delivery log replays into a fresh r
     beta.join();
 }
 
+// ─────────────────────────────────────────────────
+// Deterministic runtime (docs/RUNTIME.md §13.13)
+// ─────────────────────────────────────────────────
+
+test "Deterministic runtime (§13.13): two live runs with the same driver produce the same handler log" {
+    // The live half of the determinism claim: no file involved. Same topology,
+    // same send sequence, same manual-clock stamps, one driver thread — so the
+    // two handler logs must agree entry for entry. The runtime core holds no
+    // randomness of its own (nothing in `src/runtime` seeds an RNG), so what
+    // this pins is: given the same inputs, the runtime adds none.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const DetLive = struct {
+        pub const Message = u32;
+        log: *HandlerLog,
+        name: []const u8,
+
+        pub fn handle(self: *@This(), msg: u32, ctx: anytype) anyerror!void {
+            self.log.note(self.name, payloadFingerprint(u32, msg), ctx.clock().nowMs());
+        }
+    };
+
+    const Driver = struct {
+        fn run(log: *HandlerLog) !void {
+            var clock = Clock.Manual{ .now_ms = 0 };
+            var rt = Runtime.init(allocator, io, clock.clock());
+            defer rt.deinit();
+            const alpha = try rt.spawn(DetLive, .{ .log = log, .name = "alpha" }, 8);
+            const beta = try rt.spawn(DetLive, .{ .log = log, .name = "beta" }, 8);
+            defer {
+                alpha.stop();
+                alpha.join();
+                beta.stop();
+                beta.join();
+            }
+            for (0..16) |i| {
+                clock.set(@intCast(i * 250));
+                // Awaited one at a time, so the driver's send order *is* the
+                // invocation order — the same discipline the §13.10 e2e states
+                // on its recording run.
+                if (i % 2 == 0) try alpha.send(@intCast(i * 3)) else try beta.send(@intCast(i * 3));
+                try awaitHandled(log, i + 1);
+            }
+        }
+    };
+
+    var log_a = HandlerLog{};
+    var log_b = HandlerLog{};
+    try Driver.run(&log_a);
+    try Driver.run(&log_b);
+
+    const a = log_a.taken();
+    const b = log_b.taken();
+    try std.testing.expectEqual(@as(usize, 16), a.len);
+    try std.testing.expectEqual(a.len, b.len);
+    for (a, b) |x, y| {
+        try std.testing.expectEqualStrings(x.worker, y.worker);
+        try std.testing.expectEqual(x.fingerprint, y.fingerprint);
+        try std.testing.expectEqual(x.clock_ms, y.clock_ms);
+    }
+    // And the stamps really are the driver's clock, not a wall clock that
+    // happened to agree: the last handler read 15 × 250 ms.
+    try std.testing.expectEqual(@as(i64, 3_750), a[15].clock_ms);
+}
+
+test "Deterministic runtime (§13.13): the same records replay bit-identically into two fresh runtimes" {
+    // The file half: the same drained records drive two independent fresh
+    // runtimes, and the two handler logs must be identical — worker, payload
+    // fingerprint, and the stamp each handler read off its own manual clock.
+    // Determinism includes refusing at the same place: the records have a hole
+    // at seq 4, and both replays must refuse it and cross it identically.
+    const dlog = @import("delivery_log.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const DetCodec = struct {
+        pub const name: []const u8 = "det:u32";
+        pub const version: u16 = 1;
+
+        pub fn encode(alloc: std.mem.Allocator, value: u32) ![]u8 {
+            const bytes = try alloc.alloc(u8, @sizeOf(u32));
+            std.mem.writeInt(u32, bytes[0..4], value, .little);
+            return bytes;
+        }
+
+        pub fn decode(alloc: std.mem.Allocator, bytes: []const u8) !u32 {
+            _ = alloc;
+            if (bytes.len != @sizeOf(u32)) return error.BadPayloadLength;
+            return std.mem.readInt(u32, bytes[0..4], .little);
+        }
+    };
+
+    const DetProbe = struct {
+        pub const Message = u32;
+        log: *HandlerLog,
+        name: []const u8,
+
+        pub fn handle(self: *@This(), msg: u32, ctx: anytype) anyerror!void {
+            self.log.note(self.name, payloadFingerprint(u32, msg), ctx.clock().nowMs());
+        }
+    };
+
+    // Eight deliveries alternating alpha/beta, seq 4 missing — an interior hole,
+    // so the reader has something to refuse in both runs.
+    const seqs = [_]u64{ 0, 1, 2, 3, 5, 6, 7, 8 };
+    var payloads: [seqs.len][4]u8 = undefined;
+    var records: [seqs.len]dlog.Record = undefined;
+    for (seqs, 0..) |seq, i| {
+        std.mem.writeInt(u32, &payloads[i], @intCast(seq * 100 + 7), .little);
+        records[i] = .{
+            .seq = seq,
+            .track_id = if (seq % 2 == 0) "alpha" else "beta",
+            .kind = .message,
+            .recorded_ns = @as(i64, @intCast(seq)) * 1_000 * std.time.ns_per_ms,
+            .payload = &payloads[i],
+        };
+    }
+
+    const ReplayOutcome = struct {
+        delivered: usize,
+        holes: u64,
+        first_hole: ?u64,
+        final_clock: i64,
+    };
+
+    const Driver = struct {
+        fn replayOnce(recs: []const dlog.Record, log: *HandlerLog) !ReplayOutcome {
+            var clock = Clock.Manual{ .now_ms = 0 };
+            var rt = Runtime.init(allocator, io, clock.clock());
+            defer rt.deinit();
+            // A fresh graph each time — and no tracks declared on it, so the
+            // replay cannot feed the records it is reading (§13.10's e2e pins
+            // the same shape).
+            const alpha = try rt.spawn(DetProbe, .{ .log = log, .name = "alpha" }, 8);
+            const beta = try rt.spawn(DetProbe, .{ .log = log, .name = "beta" }, 8);
+            defer {
+                alpha.stop();
+                alpha.join();
+                beta.stop();
+                beta.join();
+            }
+
+            var loader = try ReplayFromLog.init(allocator, &clock, recs);
+            defer loader.deinit();
+            try loader.setCodec("alpha", DetCodec, u32);
+            try loader.setCodec("beta", DetCodec, u32);
+            try loader.bindDecoded("alpha", alpha);
+            try loader.bindDecoded("beta", beta);
+            if (!loader.isFullyBound()) return error.NotFullyBound;
+
+            var delivered: usize = 0;
+            while (true) {
+                const maybe = loader.step() catch |err| switch (err) {
+                    // The declaration a hole demands, made the same way both
+                    // times: refuse by default, then the caller says it knows.
+                    error.LogHasHoles => {
+                        loader.allowHoles();
+                        continue;
+                    },
+                    else => return err,
+                };
+                if (maybe == null) break;
+                delivered += 1;
+                try awaitHandled(log, delivered);
+            }
+            return .{
+                .delivered = delivered,
+                .holes = loader.crossedHoles(),
+                .first_hole = loader.firstHoleSeq(),
+                .final_clock = clock.now_ms,
+            };
+        }
+    };
+
+    var log_a = HandlerLog{};
+    var log_b = HandlerLog{};
+    const outcome_a = try Driver.replayOnce(&records, &log_a);
+    const outcome_b = try Driver.replayOnce(&records, &log_b);
+
+    // The outcomes agree on every number the reader reports …
+    try std.testing.expectEqual(@as(usize, 8), outcome_a.delivered);
+    try std.testing.expectEqual(@as(u64, 1), outcome_a.holes);
+    try std.testing.expectEqual(@as(?u64, 4), outcome_a.first_hole);
+    try std.testing.expectEqual(@as(i64, 8_000), outcome_a.final_clock);
+    try std.testing.expectEqual(outcome_a.delivered, outcome_b.delivered);
+    try std.testing.expectEqual(outcome_a.holes, outcome_b.holes);
+    try std.testing.expectEqual(outcome_a.first_hole, outcome_b.first_hole);
+    try std.testing.expectEqual(outcome_a.final_clock, outcome_b.final_clock);
+
+    // … and the handler-visible sequences are identical entry for entry.
+    const a = log_a.taken();
+    const b = log_b.taken();
+    try std.testing.expectEqual(a.len, b.len);
+    for (a, b) |x, y| {
+        try std.testing.expectEqualStrings(x.worker, y.worker);
+        try std.testing.expectEqual(x.fingerprint, y.fingerprint);
+        try std.testing.expectEqual(x.clock_ms, y.clock_ms);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Supervision groups (docs/RUNTIME.md §14)
 //
