@@ -1,5 +1,33 @@
 # Changelog
 
+## [Unreleased]
+
+### 第 98 批：`PanicHook` 的广告接线在 0.17 下**编译不过**——`std.posix.write` 已移除，树内全程绿灯（**破坏性：否**）
+
+1. **真缺陷（用户报告核实）：`PanicHook.zig:68` 的 `writeStderr` 调了 `std.posix.write`，该函数在
+   Zig 0.17 已从 posix 命名空间移除（fd IO 迁去 `std.Io.File`）。** 树内任何构建都看不到它：Zig 是
+   惰性分析的，`writeStderr ← panicWithRequestContext ← hook.call` 的**函数体**只有在消费者 root
+   声明 `pub const panic = zmodu.panicHook;`、编译器把 panic lowering 接进 `hook.call` 时才会被分析
+   ——框架自身的测试、examples 没有任何一处做这个声明。与 zweq 反馈的 `RequestParser.parse` 同一
+   失败类（「编译不过所以没人发现」），只是这次发生在**文档头条推荐的接线上**：消费者按文档写第一行
+   就收到框架内部的编译错误。红证据（消费者形态的最小复现，`pub const panic` + 空 main）：
+   `error: root source file struct 'posix' has no member named 'write'`，引用链
+   `integerOutOfBounds → panicWithRequestContext → writeStderr`。
+2. **修复：`writeStderr` 改用 `std.debug.lockStderr`**——`std.debug.print` 自己基于的原语：绕过
+   `Io` 接口、用最基础的 syscall 直写 stderr、不切栈不挂起，正是 panic 路径唯一允许的形状（hook 也
+   没有 `io` 可给 `std.Io.File`）。
+3. **永久门禁：`examples/basic` 接上 `pub const panic = zigmodu.panicHook;`**——只有消费者 root 的
+   声明能让编译器真正分析 hook 链的函数体，Build Examples CI job 自此每推必编译它。拆守卫验证：
+   把旧调用装回 → example 构建红（`PanicHook.zig:77:28: no member named 'write'`）；装回修复 →
+   绿。**教训一并刻在 `hook` 的 doc 上**：树内 `_ = hook;` 只到签名级分析，证明不了函数体可编译
+   （本批先写了这样一个测试，它虚过——已删，换成 example 接线这个真门禁）。
+
+读数：`PanicHook` 过滤跑 2/2 绿；`examples/basic` 构建绿（含 wire-up）；门禁 fmt /
+check-production / check-version / check-deadcode 全绿。
+
+**未做**：这值得一个 v0.36.1——广告功能对任何真实消费者编译不过，属于 patch 级修复（发不发、
+何时发由发布节奏定）。
+
 ## [0.36.0] - 2026-09-28
 
 ### 第 97 批：mysql live 测试的双 `-e`（CI ERROR 1049）——`buildMysqlArgv` 契约的调用方违规，stub 钉死全 argv（**破坏性：否**）

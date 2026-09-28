@@ -63,16 +63,31 @@ pub fn panicWithRequestContext(msg: []const u8, first_trace_addr: ?usize) noretu
 }
 
 fn writeStderr(bytes: []const u8) void {
-    var rest = bytes;
-    while (rest.len > 0) {
-        const n = std.posix.write(std.posix.STDERR_FILENO, rest) catch return;
-        if (n == 0) return;
-        rest = rest[n..];
-    }
+    // `std.debug.lockStderr` — the primitive `std.debug.print` itself is built
+    // on: bypasses the `Io` interface and writes with the most basic syscalls
+    // available, no stack switch, no suspend. That is the only shape a panic
+    // path may use, and a hook has no `io` to offer `std.Io.File` anyway.
+    // (`std.posix.write` is gone in 0.17 — fd IO moved off the posix
+    // namespace; this file compiled green regardless because nothing in-tree
+    // ever analyzed the hook chain until a consumer wired `pub const panic =
+    // zmodu.panicHook;` — which then failed to compile. The wire-up now lives
+    // in examples/basic, so CI compiles this chain on every push.)
+    var buffer: [64]u8 = undefined;
+    const stderr = std.debug.lockStderr(&buffer);
+    defer std.debug.unlockStderr();
+    stderr.file_writer.interface.writeAll(bytes) catch return;
 }
 
 /// Drop-in panic namespace for the application root:
 /// `pub const panic = zmodu.panicHook;`
+///
+/// Compile-coverage note: an in-tree `_ = hook;` reference analyzes the chain
+/// only at signature level — the bodies stay uncompiled, which is how the
+/// 0.17-removed `std.posix.write` in `writeStderr` stayed green for weeks.
+/// The chain's bodies are analyzed only from a *consumer root* that declares
+/// the wire-up (the compiler then lowers panic sites through `hook.call`);
+/// `examples/basic` carries that declaration, so the Build Examples CI job is
+/// the gate that keeps this file honestly compiled.
 pub const hook = std.debug.FullPanic(panicWithRequestContext);
 
 test "PanicHook: set/clear request context round-trip" {

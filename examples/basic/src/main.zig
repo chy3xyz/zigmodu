@@ -1,6 +1,14 @@
 const std = @import("std");
 const zigmodu = @import("zigmodu");
 
+// The documented panic-hook wire-up. It lives in this example on purpose: only
+// a consumer root's `pub const panic` makes the compiler lower panic sites
+// through the hook chain and thereby analyze its bodies — an in-tree reference
+// stays at signature level (that is how `writeStderr` shipped a call to
+// `std.posix.write`, removed in 0.17, behind a green tree). Build Examples is
+// the gate that keeps `PanicHook.zig` honestly compiled.
+pub const panic = zigmodu.panicHook;
+
 // ============================================
 // Example 1: Basic E-commerce - Core Features
 // ============================================
