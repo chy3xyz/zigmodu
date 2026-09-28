@@ -489,7 +489,13 @@ fn collectSources(io: Io, allocator: std.mem.Allocator, project_dir: []const u8,
                 },
                 .file => {
                     if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
-                    const content = entry.dir.readFileAlloc(io, entry.basename, allocator, Io.Limit.limited(max_file_bytes)) catch continue;
+                    // Skip an unreadable file, but never a failed *allocation*: a
+                    // swallowed `OutOfMemory` here would leave the report quietly
+                    // missing a file instead of failing the scan.
+                    const content = entry.dir.readFileAlloc(io, entry.basename, allocator, Io.Limit.limited(max_file_bytes)) catch |err| switch (err) {
+                        error.OutOfMemory => return err,
+                        else => continue,
+                    };
                     errdefer allocator.free(content);
                     // Copies leave the argument list so a failed append cannot
                     // strand them: each guard dies with this iteration.
@@ -509,7 +515,10 @@ fn collectSources(io: Io, allocator: std.mem.Allocator, project_dir: []const u8,
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".zig")) continue;
         if (std.mem.startsWith(u8, entry.name, "build")) continue;
-        const content = root.readFileAlloc(io, entry.name, allocator, Io.Limit.limited(max_file_bytes)) catch continue;
+        const content = root.readFileAlloc(io, entry.name, allocator, Io.Limit.limited(max_file_bytes)) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => continue,
+        };
         errdefer allocator.free(content);
         const path = try allocator.dupe(u8, entry.name);
         errdefer allocator.free(path);
@@ -1347,6 +1356,48 @@ test "analyzeSource hands every record to its Report at every allocation point (
         }
     };
     try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{src});
+}
+
+// The append site in `collectSources` is the same "hand over or the guard frees
+// it" shape as `analyzeSource` above, but it is reached through a filesystem
+// walk, so it needs a real tree. Two small files is enough: the walk, the
+// per-file read, the path join and the append each have to survive an injected
+// failure without stranding an allocation.
+//
+// It is also the test that catches the loop's `catch continue`: with a bare
+// `catch continue` the *injected* failure inside `readFileAlloc` is swallowed and
+// the scan never fails, which is exactly `SwallowedOutOfMemoryError` — the
+// reason the read now re-raises `OutOfMemory` and only skips real I/O errors.
+test "collectSources hands every source to out at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &path_buf);
+    const project_dir = path_buf[0..dir_len];
+
+    try tmp.dir.createDirPath(io, "src/order");
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/order/module.zig", .data = "pub const order = 1;\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.zig", .data = "pub const main = 1;\n" });
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, project: []const u8) !void {
+            var out = std.ArrayList(Source).empty;
+            defer {
+                for (out.items) |s| {
+                    a.free(s.path);
+                    a.free(s.content);
+                }
+                out.deinit(a);
+            }
+            try collectSources(std.testing.io, a, project, &out);
+            // The scan only means something if both files were reached: with an
+            // empty `out` no `append` was ever attempted.
+            if (out.items.len != 2) return error.WalkMissedFiles;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{project_dir});
 }
 
 test "runtime reads worker type names and mailbox capacities out of source" {

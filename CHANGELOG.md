@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+### 第 95 批：`zmodu scaffold --from-db mysql://…` 的两处 argv 缺陷（第 94 批只修了内省那条，导入这条一直坏着）；两处 FS 走查的 OOM 扫描（**破坏性：否**）
+
+1. **`importSqlToDatabase` 的 mysql 分支**同时犯了第 94 批刚在内省路径里修掉的两个错：database 作为
+   **位置参数**放在 `-e` 之前（MySQL 客户端遇到第一个非位置选项就停止解析选项 → 追加的 `-e` 变成
+   第二个位置参数 → 打帮助、exit 1），而且 `-e` 里用的是**客户端命令** `source`（`-e` 下不生效）。
+   现在：`mysql -h <host> -P <port> -u <user> --database=<db>`，SQL 走 **stdin**（新的
+   `runCliWithStdin`：`stdin = .pipe` 写入后并发排空 stdout/stderr，非零退出即失败）。
+   **用假 `mysql` 可执行文件验证**（临时目录里放一个 `/bin/sh` stub，记录 argv 与 stdin）——
+   这一步不需要服务器，是本条改动的真正证据：stub 记到的 argv 恰好是
+   `-h 127.0.0.1 -P 3306 -u root --database=shopdb`（没有裸位置参数、没有 `-e`/`source`），stdin
+   恰好等于 SQL 文件内容。红证据（旧形态）：stub 记到 `… shopdb -e source /tmp/zmodu_import.sql`。
+2. **两处 FS 走查的 OOM 扫描**：`doctor.scanEntanglements` 与 `runtime.collectSources` 现在有各自的
+   扫描测试（临时目录里真放文件，让记录真的被 append）。顺带把两处读文件的 `catch continue` 改成
+   只吞真实 I/O 错误、**让 OOM 传播**（原来 OOM 会被静默当成"这个文件读不了"）。到达性证据：
+   拿掉 `doctor` 的 `errdefer allocator.free(from_module)` → `error.MemoryLeakDetected`；两处读都吞掉
+   OOM 时 → 扫描红（`WalkMissedFiles`）。
+   **如实标注两个未证明点**：`collectSources` 根循环那条 `errdefer` 拿掉后扫描**不红**（第二次
+   `append` 复用了 ArrayList 的富余容量 → 又是第 94 批那个陷阱）；只吞 src 循环那一处的形态也不红。
+   所以那条扫描对"根循环的守卫"覆盖不到。另外两个测试文件里的注释有一处**说过头了**（写的是
+   `SwallowedOutOfMemoryError`，实测只有"两处都吞"的形态会红，且是 `WalkMissedFiles`）—— 下一批
+   改掉措辞。
+
+读数：`tools/zmodu` 138 passed · 2 skipped · 0 failed（新测试在内）；`fmt` / `check-production` /
+`check-test-collection` OK。
+
+**未做**：`docs/AI_METHODOLOGY.md` 那三条复现教训（按身份而非按值判所有权 / 门禁判据要对着编译器
+的答案 / 先证明 harness 真的碰到了失败点）的成文。
+
 ### 第 94 批：CI 红的两条活库测试（一条真漏 + 一条参数被拒）；跳过的名字进整跑输出；`market.zig` 两处（**破坏性：否**）
 
 1. **`Test (DB=postgres)` 红 = 真漏，根因是"按文本判断所有权"。** `parseDsn` 把 DSN 里写出来的

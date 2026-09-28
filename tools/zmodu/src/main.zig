@@ -2897,6 +2897,14 @@ fn writeTempSql(io: std.Io, allocator: std.mem.Allocator, sql: []const u8) ![]co
 
 /// Import SQL file content into database via CLI tools.
 fn importSqlToDatabase(io: std.Io, allocator: std.mem.Allocator, dsn: []const u8, sql: []const u8) !void {
+    return importSqlToDatabaseWith(io, allocator, dsn, sql, "mysql");
+}
+
+/// `mysql_program` is the MySQL client executable. It is a parameter so a test
+/// can aim the branch at a stub on disk: `argv[0]` is resolved against the PATH
+/// the io instance captured (once), which a test cannot override — so on POSIX
+/// the only injection point is an explicit path here.
+fn importSqlToDatabaseWith(io: std.Io, allocator: std.mem.Allocator, dsn: []const u8, sql: []const u8, mysql_program: []const u8) !void {
     const db = try parseDsn(allocator, dsn);
     defer db.deinit(allocator);
 
@@ -2933,16 +2941,62 @@ fn importSqlToDatabase(io: std.Io, allocator: std.mem.Allocator, dsn: []const u8
         }
         std.log.info("SQL imported to PostgreSQL: {s}/{s}", .{ db.host, db.database });
     } else if (std.mem.eql(u8, db.driver, "mysql")) {
-        const result = try std.process.run(allocator, io, .{
-            .argv = &.{ "mysql", "-h", db.host, "-P", try std.fmt.allocPrint(allocator, "{d}", .{db.port}), "-u", db.user, db.database, "-e", "source", tmp_file },
-        });
-        defer allocator.free(result.stdout);
-        defer allocator.free(result.stderr);
-        if (result.term != .exited or result.term.exited != 0) {
-            std.log.err("mysql import failed: {s}", .{result.stderr});
-            return error.DatabaseError;
-        }
+        // Two defects used to sit in this one argv, both of them the ones
+        // `buildMysqlArgv` was fixed for: the database went in as a bare
+        // **positional** before `-e` (MySQL stops parsing options at the first
+        // non-option argument, so `-e` and its argument became two more
+        // positionals and the client answered with its help text, exit 1), and
+        // the file was sent as `-e source <file>` — `source` is a client builtin
+        // and does not exist under `-e`. `--database=` keeps every element an
+        // option, and the script goes in on **stdin** instead.
+        const port_str = try std.fmt.allocPrint(allocator, "{d}", .{db.port});
+        defer allocator.free(port_str);
+        const db_arg = try std.fmt.allocPrint(allocator, "--database={s}", .{db.database});
+        defer allocator.free(db_arg);
+        try runCliWithStdin(allocator, io, &.{ mysql_program, "-h", db.host, "-P", port_str, "-u", db.user, db_arg }, sql);
         std.log.info("SQL imported to MySQL: {s}/{s}", .{ db.host, db.database });
+    }
+}
+
+/// Run an external CLI with `input` delivered on its stdin, failing on a
+/// non-zero exit and reporting the CLI's own output like `runDbCli`.
+///
+/// `runDbCli` uses `std.process.run`, which hardwires the child's stdin to
+/// /dev/null — unusable when the script has to go *in* through stdin (see the
+/// MySQL import above). The child is spawned directly with a pipe on stdin and
+/// its stdout/stderr are drained concurrently so a chatty client cannot deadlock
+/// us against a full pipe.
+fn runCliWithStdin(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8, input: []const u8) !void {
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+    defer child.kill(io);
+
+    const stdin_file = child.stdin.?;
+    child.stdin = null;
+    stdin_file.writeStreamingAll(io, input) catch |err| {
+        stdin_file.close(io);
+        return err;
+    };
+    stdin_file.close(io);
+
+    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(allocator, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi_reader.deinit();
+    try multi_reader.fillRemaining(.none);
+
+    const term = try child.wait(io);
+    const stdout = try multi_reader.toOwnedSlice(0);
+    defer allocator.free(stdout);
+    const stderr = try multi_reader.toOwnedSlice(1);
+    defer allocator.free(stderr);
+    if (term != .exited or term.exited != 0) {
+        std.log.err("{s} failed: {s}{s}", .{ argv[0], stdout, stderr });
+        return error.DatabaseError;
     }
 }
 
@@ -10849,6 +10903,60 @@ test "introspectDatabaseSqlite: real database round-trip (sqlite3 CLI)" {
     try std.testing.expectEqual(@as(usize, 1), orders.foreign_keys.len);
     try std.testing.expectEqualStrings("users", orders.foreign_keys[0].ref_table);
     try std.testing.expectEqualStrings("user_id", orders.foreign_keys[0].column_name);
+}
+
+// Item-1 regression, no server needed: a stub executable stands in for `mysql`,
+// records the argv it was handed (one element per line) and copies its stdin to
+// a second file. This pins both halves of the fix the old shape got wrong —
+// `--database=<db>` (never a bare positional, which made MySQL stop parsing
+// options and answer the appended `-e` with its help text) and the SQL arriving
+// on **stdin** (there is no `-e source <file>`, `source` being a client builtin).
+//
+// The stub is passed by absolute path: the child's `argv[0]` is resolved against
+// the PATH the io instance captured once, so PATH injection is not available to
+// a test — see `importSqlToDatabaseWith`.
+test "importSqlToDatabase: mysql gets --database= on argv and the SQL on stdin" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &path_buf);
+    const dir_path = path_buf[0..dir_len];
+
+    const argv_out = try std.fmt.allocPrint(allocator, "{s}/argv.txt", .{dir_path});
+    defer allocator.free(argv_out);
+    const stdin_out = try std.fmt.allocPrint(allocator, "{s}/stdin.sql", .{dir_path});
+    defer allocator.free(stdin_out);
+    const stub = try std.fmt.allocPrint(allocator, "{s}/mysql", .{dir_path});
+    defer allocator.free(stub);
+
+    // The output paths come from the temp dir, so no shell quoting is required.
+    const script = try std.fmt.allocPrint(allocator,
+        \\#!/bin/sh
+        \\printf '%s\n' "$@" > '{s}'
+        \\cat > '{s}'
+        \\
+    , .{ argv_out, stdin_out });
+    defer allocator.free(script);
+    try tmp.dir.writeFile(io, .{ .sub_path = "mysql", .data = script, .flags = .{ .permissions = .executable_file } });
+
+    const sql = "CREATE TABLE widgets (id INT PRIMARY KEY);\nINSERT INTO widgets VALUES (1);\n";
+    try importSqlToDatabaseWith(io, allocator, "mysql://root:secret@127.0.0.1:3306/shopdb", sql, stub);
+
+    // (a) `$@` is the arguments after argv[0] (which the stub executed as), so
+    // this is the whole option list: the database must arrive as `--database=…`
+    // and no element may be the bare database name.
+    const recorded_argv = try std.Io.Dir.cwd().readFileAlloc(io, argv_out, allocator, std.Io.Limit.limited(1 << 20));
+    defer allocator.free(recorded_argv);
+    try std.testing.expectEqualStrings("-h\n127.0.0.1\n-P\n3306\n-u\nroot\n--database=shopdb\n", recorded_argv);
+
+    // (b) The child read exactly the SQL off its stdin.
+    const recorded_stdin = try std.Io.Dir.cwd().readFileAlloc(io, stdin_out, allocator, std.Io.Limit.limited(1 << 20));
+    defer allocator.free(recorded_stdin);
+    try std.testing.expectEqualStrings(sql, recorded_stdin);
 }
 
 // Env-gated, the `REDIS_URL` convention: the variable carries a DSN and the test

@@ -213,7 +213,13 @@ fn scanEntanglements(
 
             const full = try std.fs.path.join(allocator, &.{ mod_dir, entry.path });
             defer allocator.free(full);
-            const content = Dir.cwd().readFileAlloc(io, full, allocator, Io.Limit.limited(1 << 20)) catch continue;
+            // Skip an unreadable file, but never a failed *allocation*: swallowing
+            // an injected `OutOfMemory` here would let the scan pass while missing
+            // files, and would make the OOM scan below meaningless.
+            const content = Dir.cwd().readFileAlloc(io, full, allocator, Io.Limit.limited(1 << 20)) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => continue,
+            };
             defer allocator.free(content);
 
             var line_no: usize = 0;
@@ -810,6 +816,53 @@ test "scanWiringSource hands every record to its Wiring at every allocation poin
         }
     };
     try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{ "src/modules/order/module.zig", src });
+}
+
+// The append site in `scanEntanglements` allocates four things in a row
+// (`from_module`, `to_module`, `file`, then the append) with an `errdefer` guard
+// on each — the same shape as the wiring scan above, but reached only through a
+// filesystem walk. A one-file temp tree that really entangles two modules drives
+// it: without a real record there is no `append`, and the scan would prove
+// nothing. The bare `catch continue` around the file read is the other half —
+// it makes the scan report `SwallowedOutOfMemoryError`, which is why the read now
+// re-raises `OutOfMemory` and skips only real I/O errors.
+test "scanEntanglements hands every record to out at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &path_buf);
+    const project_dir = path_buf[0..dir_len];
+
+    try tmp.dir.createDirPath(io, "src/modules/alpha");
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/modules/alpha/module.zig", .data =
+        \\const svc = @import("../../beta/service.zig");
+        \\pub const x = svc;
+        \\
+    });
+
+    const modules = [_]audit.ModuleRec{
+        .{ .name = "alpha", .description = "", .deps = &.{}, .file = "src/modules/alpha/module.zig", .info_line = 1 },
+        .{ .name = "beta", .description = "", .deps = &.{}, .file = "src/modules/beta/module.zig", .info_line = 1 },
+    };
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, project: []const u8, mods: []const audit.ModuleRec) !void {
+            var out = std.ArrayList(Entanglement).empty;
+            defer {
+                for (out.items) |e| {
+                    a.free(e.from_module);
+                    a.free(e.to_module);
+                    a.free(e.file);
+                }
+                out.deinit(a);
+            }
+            try scanEntanglements(std.testing.io, a, project, mods, &out, &.{});
+            if (out.items.len == 0) return error.NoEntanglementFound;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{ project_dir, modules[0..] });
 }
 
 test "moduleOfImport finds the module name behind any number of .." {
