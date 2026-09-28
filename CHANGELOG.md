@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+### 第 97 批：mysql live 测试的双 `-e`（CI ERROR 1049）——`buildMysqlArgv` 契约的调用方违规，stub 钉死全 argv（**破坏性：否**）
+
+1. **`liveIntrospectionRoundTrip` 的 mysql 助手在 `buildMysqlArgv` 末尾的 `-e` 之后又压了一个 `-e`。**
+   第 94 批把 `buildMysqlArgv` 的契约定为「参数列表**止于 `-e`**，调用方只追加查询文本」，并已有
+   单测钉住该形状（`buildMysqlArgv owns every element`）——但同批写的 live 测试助手
+   `run_query.mysql` 又压了 `-e` + sql。客户端把第二个 `-e` 当作第一个的语句文本，SQL 滑进
+   位置参数槽被解析成**数据库名**：CI mysql 活库 job 报
+   `ERROR 1049 (42000): Unknown database 'DROP TABLE IF EXISTS zm_introspect_probe'`（该 job 在
+   第 94 批 cancelled、第 95 批 skipped，第 96 批首轮真正跑到即红）。修复：助手抽成自由函数
+   **`runMysqlQueryWith`**（`mysql_program` 参数供 stub 注入，与 `importSqlToDatabaseWith` 同一
+   先例），只追加查询文本；`buildMysqlArgv` 相应加 `program` 参数（`argv[0]` 不再硬编码，
+   deinit 逐元素 free 的语义不变），4 处调用点同步。
+2. **stub 钉形测试**（`runMysqlQueryWith: exactly one -e, and the query is its argument`）：
+   假 `mysql` 可执行记录 argv，断言全表逐字为
+   `-h … -N -B -p<pass> --database=<db> -e SELECT 1`——**恰好一个 `-e` 且查询是它的实参**；
+   全程 `std.testing.allocator` 驱动，漏 free 一并变红。红证据：在 `runMysqlQueryWith` 里临时
+   复刻双 `-e` → `1 fail (143 total)`，diff 尾部 `-e\n-e\nSELECT 1`；移除 → 143/143 绿。
+
+读数：`tools/zmodu` **155/157 passed · 2 skipped**（较上批 +1 = 新 stub 测试）；root 侧
+check-test-collection **2198/2258 · 60 skipped · OK**（+1 为收集门禁对同一新测试的计数）；
+门禁 fmt / check-production / check-version / check-deadcode 全绿。
+**已知 flake 一次**：门禁首轮红在 `PrecisionTimer: what the knobs cost`（retry 轮 p50 137µs > 10µs 界，
+第 48/52 批记录在案的负载尖峰 flake——门禁 15 步并行编译时测量窗口撞上 CPU 争用；隔离重跑即过，
+复跑门禁全绿），与本批改动无关（root 源未动）；若第三轮再现，按第 48 批方式重审该断言。
+
+**未做**：mysql 活库 job 的端到端验证只能由 CI 完成（本地无 MySQL 服务，stub 钉的是 argv 形状、
+不是服务器行为）；`run_postgres` 保持局部函数（pg job 本就绿，未动语义）。
+
 ### 第 96 批：CI 两条红的根修——listener「先唤醒、后排干、再关 fd」统一收口（4 处同形竞态）；投递轨迹的 send+record 竞态；tools 三处小修（**破坏性：否**）
 
 1. **WS `acceptLoop` 的 stop/accept 竞态（ubuntu CI 崩溃，`errnoBug: BADF`）。** `stop()` 旧形态是

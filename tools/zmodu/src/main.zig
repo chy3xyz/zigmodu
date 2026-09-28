@@ -3396,11 +3396,17 @@ const MysqlArgv = struct {
 };
 
 /// Arguments for the `mysql` CLI up to and including `-e`; the query itself is
-/// appended by the caller. Every element is owned by the returned list.
-fn buildMysqlArgv(allocator: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, pass: []const u8, database: []const u8) !MysqlArgv {
+/// appended by the caller — **and nothing else**: a second `-e` is itself
+/// consumed as the first one's statement, the query text slides into the
+/// positional slot, and the client parses it as the database name ("ERROR 1049
+/// (42000): Unknown database 'DROP TABLE IF EXISTS zm_introspect_probe'" — the
+/// mysql live job in CI). `program` is `argv[0]`, a parameter so a test can
+/// aim the call at a stub on disk (see `importSqlToDatabaseWith` for why PATH
+/// injection is not available). Every element is owned by the returned list.
+fn buildMysqlArgv(allocator: std.mem.Allocator, program: []const u8, host: []const u8, port: u16, user: []const u8, pass: []const u8, database: []const u8) !MysqlArgv {
     var argv = MysqlArgv{};
     errdefer argv.deinit(allocator);
-    try argv.push(allocator, "mysql");
+    try argv.push(allocator, program);
     try argv.push(allocator, "-h");
     try argv.push(allocator, host);
     try argv.push(allocator, "-P");
@@ -3433,7 +3439,7 @@ fn buildMysqlArgv(allocator: std.mem.Allocator, host: []const u8, port: u16, use
 
 /// MySQL introspection via mysql CLI + information_schema.
 fn introspectDatabaseMysql(io: std.Io, allocator: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, pass: []const u8, database: []const u8) ![]TableDef {
-    var argv = try buildMysqlArgv(allocator, host, port, user, pass, database);
+    var argv = try buildMysqlArgv(allocator, "mysql", host, port, user, pass, database);
     defer argv.deinit(allocator);
 
     // Get table list
@@ -10778,6 +10784,21 @@ fn isSqliteCliAvailable(allocator: std.mem.Allocator, io: std.Io) bool {
     return result.term == .exited and result.term.exited == 0;
 }
 
+/// One SQL statement against a MySQL connection through the `mysql` CLI. The
+/// argv contract is `buildMysqlArgv`'s: it hands back the option list *up to
+/// and including* `-e`, so the caller appends the query **and nothing else** —
+/// a second `-e` is consumed as the first one's statement, the query text
+/// slides into the positional slot, and the client parses it as the database
+/// name ("ERROR 1049 (42000): Unknown database 'DROP TABLE IF EXISTS
+/// zm_introspect_probe'", the mysql live job in CI). `mysql_program` is the
+/// injection point the stub test below uses, same as `importSqlToDatabaseWith`.
+fn runMysqlQueryWith(allocator: std.mem.Allocator, io: std.Io, conn: DbConnection, sql: []const u8, mysql_program: []const u8) !void {
+    var argv = try buildMysqlArgv(allocator, mysql_program, conn.host, conn.port, conn.user, conn.pass, conn.database);
+    defer argv.deinit(allocator);
+    try argv.push(allocator, sql);
+    try runDbCli(allocator, io, argv.args.items);
+}
+
 /// The live round-trip both env-gated database tests run: create a
 /// self-referencing probe table through the CLI, introspect through
 /// `introspectDatabase` (the real `--from-db` entry point), assert the probe came
@@ -10802,20 +10823,13 @@ fn liveIntrospectionRoundTrip(allocator: std.mem.Allocator, io: std.Io, dsn: []c
         try std.fmt.allocPrint(allocator, "CREATE TABLE {s} (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES {s}(id))", .{ probe, probe });
     defer allocator.free(ddl);
 
-    const run_query = struct {
-        fn mysql(a: std.mem.Allocator, io_: std.Io, conn: DbConnection, sql: []const u8) !void {
-            var argv = try buildMysqlArgv(a, conn.host, conn.port, conn.user, conn.pass, conn.database);
-            defer argv.deinit(a);
-            try argv.push(a, "-e");
-            try argv.push(a, sql);
-            try runDbCli(a, io_, argv.args.items);
-        }
-        fn postgres(a: std.mem.Allocator, io_: std.Io, conn: DbConnection, sql: []const u8) !void {
+    const run_postgres = struct {
+        fn run(a: std.mem.Allocator, io_: std.Io, conn: DbConnection, sql: []const u8) !void {
             const port_str = try std.fmt.allocPrint(a, "{d}", .{conn.port});
             defer a.free(port_str);
             try runDbCli(a, io_, &.{ "psql", "-h", conn.host, "-p", port_str, "-U", conn.user, "-d", conn.database, "-c", sql });
         }
-    };
+    }.run;
 
     // Register the cleanup **before** the CREATE: a leftover probe would make the
     // next run's `CREATE TABLE` fail (and leave junk in the database), and the
@@ -10824,19 +10838,19 @@ fn liveIntrospectionRoundTrip(allocator: std.mem.Allocator, io: std.Io, dsn: []c
     // below fail.
     defer {
         if (is_mysql) {
-            run_query.mysql(allocator, io, db, drop_sql) catch |err|
+            runMysqlQueryWith(allocator, io, db, drop_sql, "mysql") catch |err|
                 std.debug.print("zmodu tests: probe cleanup failed: {s}\n", .{@errorName(err)});
         } else {
-            run_query.postgres(allocator, io, db, drop_sql) catch |err|
+            run_postgres(allocator, io, db, drop_sql) catch |err|
                 std.debug.print("zmodu tests: probe cleanup failed: {s}\n", .{@errorName(err)});
         }
     }
     if (is_mysql) {
-        try run_query.mysql(allocator, io, db, drop_sql);
-        try run_query.mysql(allocator, io, db, ddl);
+        try runMysqlQueryWith(allocator, io, db, drop_sql, "mysql");
+        try runMysqlQueryWith(allocator, io, db, ddl, "mysql");
     } else {
-        try run_query.postgres(allocator, io, db, drop_sql);
-        try run_query.postgres(allocator, io, db, ddl);
+        try run_postgres(allocator, io, db, drop_sql);
+        try run_postgres(allocator, io, db, ddl);
     }
     const tables = try introspectDatabase(io, allocator, dsn);
     defer freeTableDefs(allocator, tables);
@@ -11023,6 +11037,45 @@ test "importSqlToDatabase: psql gets the script via -f and leaks nothing" {
     try std.testing.expect(lines.next() == null);
 }
 
+// The mysql live job's CI red, pinned without a server: the live round-trip's
+// query helper once appended its own `-e` behind `buildMysqlArgv`'s trailing
+// one, so the client consumed `-e` as the statement and parsed the query text
+// as the **database** — "ERROR 1049 (42000): Unknown database 'DROP TABLE IF
+// EXISTS zm_introspect_probe'". The stub records argv; the pin is the whole
+// list, ending in exactly one `-e` whose argument is the query.
+test "runMysqlQueryWith: exactly one -e, and the query is its argument" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &path_buf);
+    const dir_path = path_buf[0..dir_len];
+
+    const argv_out = try std.fmt.allocPrint(allocator, "{s}/argv.txt", .{dir_path});
+    defer allocator.free(argv_out);
+    const stub = try std.fmt.allocPrint(allocator, "{s}/mysql", .{dir_path});
+    defer allocator.free(stub);
+
+    const script = try std.fmt.allocPrint(allocator,
+        \\#!/bin/sh
+        \\printf '%s\n' "$@" > '{s}'
+        \\
+    , .{argv_out});
+    defer allocator.free(script);
+    try tmp.dir.writeFile(io, .{ .sub_path = "mysql", .data = script, .flags = .{ .permissions = .executable_file } });
+
+    var db = try parseDsn(allocator, "mysql://root:secret@127.0.0.1:3306/zigzero_test");
+    defer db.deinit(allocator);
+    try runMysqlQueryWith(allocator, io, db, "SELECT 1", stub);
+
+    const recorded_argv = try std.Io.Dir.cwd().readFileAlloc(io, argv_out, allocator, std.Io.Limit.limited(1 << 20));
+    defer allocator.free(recorded_argv);
+    try std.testing.expectEqualStrings("-h\n127.0.0.1\n-P\n3306\n-u\nroot\n-N\n-B\n-psecret\n--database=zigzero_test\n-e\nSELECT 1\n", recorded_argv);
+}
+
 // Env-gated, the `REDIS_URL` convention: the variable carries a DSN and the test
 // skips when it is absent, so a laptop run verifies nothing and a run with a
 // server is the real end-to-end exercise of `psql` + information_schema parsing.
@@ -11177,7 +11230,7 @@ test "graph --dot renders a Graphviz digraph (CLI scanner + framework renderer)"
 
 test "buildMysqlArgv owns every element, -p<pass> included" {
     const allocator = std.testing.allocator;
-    var argv = try buildMysqlArgv(allocator, "127.0.0.1", 3306, "root", "s3cret", "shop");
+    var argv = try buildMysqlArgv(allocator, "mysql", "127.0.0.1", 3306, "root", "s3cret", "shop");
     defer argv.deinit(allocator);
     // The clone is exercised too: one per query, each owning its own copies.
     var clone = try argv.clone(allocator);
@@ -11196,7 +11249,7 @@ test "buildMysqlArgv owns every element, -p<pass> included" {
 
 test "buildMysqlArgv: no empty password argument" {
     const allocator = std.testing.allocator;
-    var argv = try buildMysqlArgv(allocator, "db", 5432, "app", "", "shop");
+    var argv = try buildMysqlArgv(allocator, "mysql", "db", 5432, "app", "", "shop");
     defer argv.deinit(allocator);
     for (argv.args.items) |arg| try std.testing.expect(!std.mem.startsWith(u8, arg, "-p"));
 }
@@ -11208,7 +11261,7 @@ test "buildMysqlArgv: OOM at any point leaves nothing behind" {
     // catch any element that the builder fails to hand over.
     try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
         fn check(allocator: std.mem.Allocator) !void {
-            var argv = try buildMysqlArgv(allocator, "127.0.0.1", 3306, "root", "s3cret", "shop");
+            var argv = try buildMysqlArgv(allocator, "mysql", "127.0.0.1", 3306, "root", "s3cret", "shop");
             argv.deinit(allocator);
         }
     }.check, .{});
