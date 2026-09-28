@@ -79,6 +79,10 @@ v0.31.0 通用 / 集群·Raft 帧解码 / WebSocket 帧解析·握手。
 
 - ~~§2 那 8 份移动而非删除~~ —— **已执行**（2026-09-26，见 §2 与
   [`archive/README.md`](archive/README.md)）。
+- ~~todo 三代（`todo.md`/`todo3.md`/`todo3.1.md`）的状态表过期~~ —— **已处置**
+  （2026-09-29）：三份都被现行文档按路径引用（`HotReloader.zig`、`docs/RUNTIME.md`），
+  **不能移动**，改为各加"历史快照"文件头（COMPLETENESS_REPORT 同款），指向
+  `v1.0-readiness-v0.35.md` 作为现行差距判断。
 - §1 **一律不动**，尤其是 `cluster-*.md` / `alpha-engine-spec.md` /
   `READING_NUMBERS.md`：源码与脚本按字面路径 + `§N` 引用它们。
 - 新增文件时在 §1 或 §2 补一行，并注明取代了谁。

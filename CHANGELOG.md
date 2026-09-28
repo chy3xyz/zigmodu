@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### 第 104 批：`zig build zmodu -- …` 文档债收口 + todo 三代加历史快照头（**破坏性：否**）
+
+1. **`zig build zmodu -- <args>` 的参数传递已死，文档全部改口**（第 103 批实测发现，本批收）：
+   0.17.0-dev.2151 移除了 `b.args`，`--` 后参数到不了 run step（实测 `zig build zmodu -- version`
+   只打 usage 并 exit 0——**绿着什么都没干**，比报错更坏）。涉及处全部改为
+   `zig build zmodu`（装）→ `zig-out/bin/zmodu <args>`（跑）两段式：
+   `docs/ZMODU_CLI_INTEGRATION.md` 三处（§1 快速使用、§2 scaffold、§3.9 `--from-db`，§1 另加
+   一段"为什么不是 `--`"的说明）、`AGENTS.md` 两处（文档地图表 + Quick Reference 注释）、
+   `CLAUDE.md` 一处；`docs/RUNTIME.md` §13.14 里"文档债不在本节范围"的旁注改为指向已修。
+   CHANGELOG 里的历史条目不动。
+2. **todo 三代加"历史快照"文件头**（`COMPLETENESS_REPORT.md` 第 53 批同款处置）：
+   `docs/dev/todo.md`（04-23 / v0.7.0 第一代评估）、`docs/dev/todo3.md`（09-17 方向，
+   v0.26.0 复核）、`docs/dev/todo3.1.md`（09-17 兼容策略）。三份**都不能移动**——
+   `src/extensions/HotReloader.zig`、`docs/RUNTIME.md`（:5/:6/:532）、`CHANGELOG.md`
+   按字面路径引用（`docs/dev/README.md` §0/§1 的硬约束），所以不 `git mv` 进归档区，
+   只在文件头声明：方向/策略的**论述**仍有效，逐条**状态表已过期**，现行差距判断看
+   `v1.0-readiness-v0.35.md`。`docs/dev/README.md` §4 登记此处置。
+
 ### 第 103 批：`replay-inspect` —— delivery log 的离线检视工具落地（收口 §13.10 D7 的 "CLI" 项；**破坏性：否**）
 
 1. **新增 `src/replay_inspect.zig`**（~650 行，独立小工具根模块）：读 `DeliveryLog.drainTo` 写出的

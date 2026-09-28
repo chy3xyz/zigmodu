@@ -1,5 +1,10 @@
 # Modular Runtime for High-Performance Systems
 
+> **方向级历史文档（2026-09-17 立，v0.26.0 复核），条目状态表已过期。** 「升级方向」的论述仍是
+> Runtime 的设计原点（`docs/RUNTIME.md` 按路径引用它），但逐条判定只反映 v0.26.0 当时；
+> 当前能力状态看 `docs/RUNTIME.md` 与 [`v1.0-readiness-v0.35.md`](v1.0-readiness-v0.35.md)，
+> 不要按本表的「仍缺」开工（索引：`docs/dev/README.md` §1）。
+
 > **复核（v0.26.0，2026-09-18）**：8 个方向已从 v0.16 推进到 v0.26 共十一个版本，**零件齐备、装配线全部接通**；
 > 「升级为 Modular Runtime Platform」的目标已经走到"**参考实现也基本完成**"—— 剩余差距只有集群的两个具体缺口
 > （见第 5 行），不再是能力有无、也不再是"存在但没人用"。

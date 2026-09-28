@@ -30,7 +30,7 @@
 | 故障注入 / 契约门禁模板 | `src/test/FaultInjection.zig` · `src/test/ContractGate.zig` |
 | 升级注意事项（breaking / 影响面 / 改法） | `docs/UPGRADING.md` |
 | 外部反馈核实与处置 | `docs/ISSUES_FROM_ZAPI.md` · `docs/ISSUES_FROM_ZIGSHOP.md` |
-| CLI 生成 | `docs/ZMODU_CLI_INTEGRATION.md` · `zig build zmodu -- scaffold …`（**必须从仓库根跑**，见下方"两个 zmodu 入口"） |
+| CLI 生成 | `docs/ZMODU_CLI_INTEGRATION.md` · `zig build zmodu` 装好后跑 `zig-out/bin/zmodu scaffold …`（**必须从仓库根跑**；0.17 移除 `b.args`，`zig build zmodu -- …` 的参数到不了 CLI，见下方"两个 zmodu 入口"） |
 | 只跑一个/一组测试、filter 为什么不能瞎用 | 本文 §Testing「只跑匹配的测试」+ `scripts/test-fast.sh --help` |
 | 「某个文件的测试根本没被收集」（绿着跑了个空） | `src/test/TestCollection.zig`（闸门本体，按 `builtin.test_functions` 对账）+ `scripts/check-test-collection.sh`（排除项是否真是别的 build step 的编译根 + 强制重跑；`zig build test` 缓存重放不会执行它） |
 | LLM 对话模块（产品功能） | `docs/AI.md`（**不是** agent 指南） |
@@ -61,7 +61,7 @@ defer app.deinit();
 try app.start();
 defer app.stop();
 
-// Codegen: zig build zmodu -- scaffold --sql schema.sql --name my_app [--with-auth]
+// Codegen: zig build zmodu → zig-out/bin/zmodu scaffold --sql schema.sql --name my_app [--with-auth]
 ```
 
 **两个 zmodu 入口（踩过两次的坑）**：`zig build zmodu` **从仓库根**跑才装到 `zig-out/bin/zmodu` ——

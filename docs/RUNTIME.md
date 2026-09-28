@@ -2353,7 +2353,8 @@ D7 清单里的 "CLI" 一项落地为 `src/replay_inspect.zig` + 安装产物 `z
 
 **调用形态**：`zig build` 装出 `zig-out/bin/replay-inspect <dir> [--from N] [--to N]`。
 （锁定的 0.17 工具链移除了 `b.args`，`zig build replay-inspect -- <args>` 的参数**到不了** run step
-—— 本仓 `zig build zmodu -- …` 的文档形态同样受影响，属既有文档债，不在本节范围。）
+—— 本仓 `zig build zmodu -- …` 的文档形态曾同样受影响，已在第 104 批改为
+`zig-out/bin/zmodu …` 形态，见 `docs/ZMODU_CLI_INTEGRATION.md`。）
 `zig build replay-inspect` 本身保留为自文档入口：无参运行时打印用法并退出。
 
 **报告什么**（全部来自 `delivery_log.scan` 的已验证前缀，工具自己不猜任何字节）：

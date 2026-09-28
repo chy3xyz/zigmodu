@@ -22,11 +22,17 @@
 
 ### 1. 使用内置统一构建 Step
 
-在 `zigmodu` 根目录下直接构建与运行 `zmodu` CLI 工具：
+在 `zigmodu` 根目录下先构建安装 `zmodu` CLI，再直接调用二进制：
 
 ```bash
-zig build zmodu -- scaffold --sql ./schema.sql --name myapp --tenant-column app_id
+zig build zmodu   # 构建 + 安装到 zig-out/bin/zmodu
+zig-out/bin/zmodu scaffold --sql ./schema.sql --name myapp --tenant-column app_id
 ```
+
+> **为什么不是 `zig build zmodu -- scaffold …`**：本仓锁定的 0.17 工具链已移除
+> `b.args`，`zig build <step> -- args` 的 `--` 后参数**不会**传给 run step（实测
+> `zig build zmodu -- version` 只打 usage）。所有需要参数的子命令都必须走
+> `zig-out/bin/zmodu` 形态。
 
 `--tenant-column`（默认 `tenant_id`）控制生成的 `WHERE` 与 scaffold `main` 里的 `zigmodu.setTenantColumn(...)`。模型字段须与列名一致（如 `app_id: i64`）。
 
@@ -41,7 +47,7 @@ zig build zmodu
 ### 2. 从 SQL DDL 一键生成 Modulith 项目
 
 ```bash
-zig build zmodu -- scaffold \
+zig-out/bin/zmodu scaffold \
   --sql ./schema.sql \
   --name my_shop_app \
   --out ./my_shop_app \
@@ -397,7 +403,7 @@ CLI `--max-deps` 优先于配置文件，配置文件优先于内置默认值。
 | 其它 / sqlite 路径 | `sqlite` |
 
 ```bash
-zig build zmodu -- scaffold --from-db postgresql://user@localhost/db --name myapp
+zig-out/bin/zmodu scaffold --from-db postgresql://user@localhost/db --name myapp
 # → build.zig 中 b.dependency("zigmodu", .{ .db = "postgres", ... })
 ```
 

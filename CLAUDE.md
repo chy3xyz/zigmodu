@@ -13,7 +13,7 @@ zig build -Ddb=sqlite                                  # 应用/示例收窄驱�
 zig build check-api                                    # examples API gate
 bash scripts/ci-integration.sh                         # tenant-mgmt + stress + shopdemo（-Ddb=sqlite）
 zig build docs
-zig build zmodu -- scaffold --sql schema.sql --name my_app --with-auth
+zig build zmodu && zig-out/bin/zmodu scaffold --sql schema.sql --name my_app --with-auth
 ```
 
 ## Architecture (5 domain files)

@@ -1,5 +1,10 @@
 # ZigModu 产品级评估报告
 
+> **历史快照（2026-04-23 / v0.7.0），勿照做。** 评分、行数、测试数全部过期；
+> 其中的 TODO 项早已被后续版本实现或取代。现行的差距判断看
+> [`docs/dev/v1.0-readiness-v0.35.md`](dev/v1.0-readiness-v0.35.md)，
+> 文件留存只因 `src/extensions/HotReloader.zig` 按路径引用（索引：`docs/dev/README.md` §1）。
+
 **评估时间**: 2026-04-23  
 **框架版本**: v0.7.0  
 **Zig版本**: 0.16.0  
