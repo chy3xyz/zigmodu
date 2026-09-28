@@ -2897,14 +2897,16 @@ fn writeTempSql(io: std.Io, allocator: std.mem.Allocator, sql: []const u8) ![]co
 
 /// Import SQL file content into database via CLI tools.
 fn importSqlToDatabase(io: std.Io, allocator: std.mem.Allocator, dsn: []const u8, sql: []const u8) !void {
-    return importSqlToDatabaseWith(io, allocator, dsn, sql, "mysql");
+    return importSqlToDatabaseWith(io, allocator, dsn, sql, "mysql", "psql");
 }
 
-/// `mysql_program` is the MySQL client executable. It is a parameter so a test
-/// can aim the branch at a stub on disk: `argv[0]` is resolved against the PATH
-/// the io instance captured (once), which a test cannot override — so on POSIX
-/// the only injection point is an explicit path here.
-fn importSqlToDatabaseWith(io: std.Io, allocator: std.mem.Allocator, dsn: []const u8, sql: []const u8, mysql_program: []const u8) !void {
+/// `mysql_program` / `psql_program` are the client executables. They are
+/// parameters so a test can aim a branch at a stub on disk: `argv[0]` is
+/// resolved against the PATH the io instance captured (once), which a test
+/// cannot override — so on POSIX the only injection point is an explicit path
+/// here. (The sqlite branch has no such handle: its client is named inside the
+/// `sh -c` string, not in `argv[0]`.)
+fn importSqlToDatabaseWith(io: std.Io, allocator: std.mem.Allocator, dsn: []const u8, sql: []const u8, mysql_program: []const u8, psql_program: []const u8) !void {
     const db = try parseDsn(allocator, dsn);
     defer db.deinit(allocator);
 
@@ -2919,8 +2921,14 @@ fn importSqlToDatabaseWith(io: std.Io, allocator: std.mem.Allocator, dsn: []cons
     }
 
     if (std.mem.eql(u8, db.driver, "sqlite")) {
+        // Built inline in the slice literal this leaked on *every* call — the
+        // same defect class `buildMysqlArgv` was extracted for, one the
+        // inline-alloc gate cannot see (it only watches append/put arguments,
+        // not `&.{...}` literals).
+        const shell_cmd = try std.fmt.allocPrint(allocator, "sqlite3 '{s}' < '{s}'", .{ db.sqlite_path, tmp_file });
+        defer allocator.free(shell_cmd);
         const result = try std.process.run(allocator, io, .{
-            .argv = &.{ "sh", "-c", try std.fmt.allocPrint(allocator, "sqlite3 '{s}' < '{s}'", .{ db.sqlite_path, tmp_file }) },
+            .argv = &.{ "sh", "-c", shell_cmd },
         });
         defer allocator.free(result.stdout);
         defer allocator.free(result.stderr);
@@ -2930,8 +2938,10 @@ fn importSqlToDatabaseWith(io: std.Io, allocator: std.mem.Allocator, dsn: []cons
         }
         std.log.info("SQL imported to SQLite: {s}", .{db.sqlite_path});
     } else if (std.mem.eql(u8, db.driver, "postgresql")) {
+        const port_str = try std.fmt.allocPrint(allocator, "{d}", .{db.port});
+        defer allocator.free(port_str);
         const result = try std.process.run(allocator, io, .{
-            .argv = &.{ "psql", "-h", db.host, "-p", try std.fmt.allocPrint(allocator, "{d}", .{db.port}), "-U", db.user, "-d", db.database, "-f", tmp_file },
+            .argv = &.{ psql_program, "-h", db.host, "-p", port_str, "-U", db.user, "-d", db.database, "-f", tmp_file },
         });
         defer allocator.free(result.stdout);
         defer allocator.free(result.stderr);
@@ -10944,7 +10954,7 @@ test "importSqlToDatabase: mysql gets --database= on argv and the SQL on stdin" 
     try tmp.dir.writeFile(io, .{ .sub_path = "mysql", .data = script, .flags = .{ .permissions = .executable_file } });
 
     const sql = "CREATE TABLE widgets (id INT PRIMARY KEY);\nINSERT INTO widgets VALUES (1);\n";
-    try importSqlToDatabaseWith(io, allocator, "mysql://root:secret@127.0.0.1:3306/shopdb", sql, stub);
+    try importSqlToDatabaseWith(io, allocator, "mysql://root:secret@127.0.0.1:3306/shopdb", sql, stub, "psql");
 
     // (a) `$@` is the arguments after argv[0] (which the stub executed as), so
     // this is the whole option list: the database must arrive as `--database=…`
@@ -10957,6 +10967,60 @@ test "importSqlToDatabase: mysql gets --database= on argv and the SQL on stdin" 
     const recorded_stdin = try std.Io.Dir.cwd().readFileAlloc(io, stdin_out, allocator, std.Io.Limit.limited(1 << 20));
     defer allocator.free(recorded_stdin);
     try std.testing.expectEqualStrings(sql, recorded_stdin);
+}
+
+// Same stub shape as the mysql test above, aimed at the postgres branch. Its
+// value is not the argv pin alone: driving the branch under
+// `std.testing.allocator` is what turns a missing `free` on the formatted
+// `-p` port string into a red — the defect this test's subject line fixes.
+test "importSqlToDatabase: psql gets the script via -f and leaks nothing" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &path_buf);
+    const dir_path = path_buf[0..dir_len];
+
+    const argv_out = try std.fmt.allocPrint(allocator, "{s}/argv.txt", .{dir_path});
+    defer allocator.free(argv_out);
+    const stub = try std.fmt.allocPrint(allocator, "{s}/psql", .{dir_path});
+    defer allocator.free(stub);
+
+    // The output path comes from the temp dir, so no shell quoting is required.
+    const script = try std.fmt.allocPrint(allocator,
+        \\#!/bin/sh
+        \\printf '%s\n' "$@" > '{s}'
+        \\
+    , .{argv_out});
+    defer allocator.free(script);
+    try tmp.dir.writeFile(io, .{ .sub_path = "psql", .data = script, .flags = .{ .permissions = .executable_file } });
+
+    const sql = "CREATE TABLE widgets (id INT PRIMARY KEY);\n";
+    try importSqlToDatabaseWith(io, allocator, "postgres://app:s3cret@127.0.0.1:5433/shopdb", sql, "mysql", stub);
+
+    // `-f`'s argument is the temp file, whose name the test cannot predict —
+    // assert the stable prefix and that the final element starts with `-f`'s
+    // payload shape instead of the whole list verbatim.
+    const recorded_argv = try std.Io.Dir.cwd().readFileAlloc(io, argv_out, allocator, std.Io.Limit.limited(1 << 20));
+    defer allocator.free(recorded_argv);
+    var lines = std.mem.splitScalar(u8, recorded_argv, '\n');
+    try std.testing.expectEqualStrings("-h", lines.next().?);
+    try std.testing.expectEqualStrings("127.0.0.1", lines.next().?);
+    try std.testing.expectEqualStrings("-p", lines.next().?);
+    try std.testing.expectEqualStrings("5433", lines.next().?);
+    try std.testing.expectEqualStrings("-U", lines.next().?);
+    try std.testing.expectEqualStrings("app", lines.next().?);
+    try std.testing.expectEqualStrings("-d", lines.next().?);
+    try std.testing.expectEqualStrings("shopdb", lines.next().?);
+    try std.testing.expectEqualStrings("-f", lines.next().?);
+    const script_path = lines.next().?;
+    try std.testing.expect(std.mem.endsWith(u8, script_path, ".sql"));
+    // The stub's printf leaves one trailing newline, hence a final empty item.
+    if (lines.next()) |trailing| try std.testing.expectEqualStrings("", trailing);
+    try std.testing.expect(lines.next() == null);
 }
 
 // Env-gated, the `REDIS_URL` convention: the variable carries a DSN and the test

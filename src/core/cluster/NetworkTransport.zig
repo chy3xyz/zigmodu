@@ -147,6 +147,15 @@ pub const ClusterServer = struct {
             self.dispatching.store(false, .seq_cst);
         }
 
+        // The loop only ever exits because `stop()` stored `running = false`
+        // and woke the listener. Closing the fd here — on the very thread that
+        // made the last `accept()` — is the one close ordering that cannot
+        // race an in-flight accept into an EBADF panic (see `stop()`).
+        if (self.listener) |*l| {
+            l.deinit(self.io);
+            self.listener = null;
+        }
+
         // No await here: only `stop()` may wait on the group (a second awaiter
         // races the first — `Group.await` is not threadsafe, and asserts on it).
         // Nothing can be dispatched after `stop()` has observed `dispatching`
@@ -158,11 +167,15 @@ pub const ClusterServer = struct {
         // being ordered against its own claim (see `start`).
         self.running.store(false, .seq_cst);
         if (self.listener) |*l| {
-            // `shutdown` before `close`: on Linux `close` does not wake a
-            // thread already blocked in `accept`, so the loop below would never
-            // reach its re-check and `awaitHandlers` would wait forever.
-            sockread.closeListener(self.io, l);
-            self.listener = null;
+            // Wake only — the fd is *not* closed here. The accept loop runs on
+            // `start()`'s own thread, which `stop()` cannot join; closing the
+            // fd now would race that thread's next `accept()` into an EBADF
+            // that `std.Io` punishes with a panic, not an error
+            // (`sockread.wakeListener`). `shutdown` makes the blocked and every
+            // later `accept` fail with EINVAL instead, and `start()` closes the
+            // fd itself once its loop has exited — the only ordering with no
+            // cross-thread close at all.
+            sockread.wakeListener(l);
         }
         // The accept loop may be one dispatch short of handing a connection
         // over; let it finish that step so the await below covers that fiber too

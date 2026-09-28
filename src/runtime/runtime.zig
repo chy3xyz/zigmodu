@@ -626,6 +626,14 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         /// — the default — is what keeps `send` costing one null check, and the
         /// track is what the replay driver reads back.
         track: ?*recorder_mod.TrackRef = null,
+        /// Serializes `mailbox.send` + the track record, so a track's entry order
+        /// *is* the mailbox acceptance order. Without it a producer descheduled
+        /// between the two lets a later sender's record overtake its own — the
+        /// worker still handles in mailbox order, but the replay drives in track
+        /// order, and §13.4's "same sequence" promise is gone. Taken only when
+        /// `track != null`: with nothing to keep in order, the hot path stays one
+        /// null check.
+        record_mutex: std.Io.Mutex = .init,
 
         /// The funnel every delivery goes through — in two flavours, because the
         /// mailbox has two: `send*` and `Handle.after`'s timer delivery all arrive
@@ -643,23 +651,49 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         /// the track holds deliveries, so an `error.Full`/`error.Closed` from the
         /// mailbox must not produce an entry for a message nobody received.
         fn enqueue(self: *Self, envelope: Envelope, kind: delivery_log_mod.Kind) mbox.SendError!void {
+            const track = self.track orelse {
+                try self.mailbox.send(envelope);
+                return;
+            };
+            // Stamped at the top of the critical section: what a replay needs is
+            // "when this delivery was handed over", and a producer descheduled
+            // between the send and the record would otherwise stamp "when the
+            // scheduler got back to it" — with a manual clock moved by another
+            // thread, arbitrarily late (the §13.4 test caught a timer delivery
+            // stamped 5 s past its fire from exactly that window).
+            const stamp = self.runtime.clock.nowMs();
+            self.record_mutex.lockUncancelable(self.runtime.io);
+            defer self.record_mutex.unlock(self.runtime.io);
             try self.mailbox.send(envelope);
-            self.noteDelivery(envelope.message, kind);
+            self.noteDeliveryAt(track, envelope.message, kind, stamp);
         }
 
         /// `enqueue` for the producer that would rather wait for room than drop.
+        ///
+        /// The wait happens *inside* the record critical section: in record mode
+        /// a total order against concurrent senders is worth more than letting
+        /// one overtake a blocked sender. A long `timeout_ms` therefore
+        /// serialises this worker's other producers behind the full mailbox —
+        /// record mode is a debugging configuration, and that is the price.
         fn enqueueBlocking(self: *Self, envelope: Envelope, timeout_ms: u32, kind: delivery_log_mod.Kind) mbox.SendError!void {
+            const track = self.track orelse {
+                try self.mailbox.sendBlocking(envelope, timeout_ms);
+                return;
+            };
+            const stamp = self.runtime.clock.nowMs();
+            self.record_mutex.lockUncancelable(self.runtime.io);
+            defer self.record_mutex.unlock(self.runtime.io);
             try self.mailbox.sendBlocking(envelope, timeout_ms);
-            self.noteDelivery(envelope.message, kind);
+            self.noteDeliveryAt(track, envelope.message, kind, stamp);
         }
 
-        /// Log one delivered message. Zero allocation: the track copies the value
-        /// into its pre-allocated ring (§13.2). A refusal does not fail the send —
-        /// the message *is* in the mailbox — it marks the log incomplete, which the
-        /// runtime counts and the replay refuses.
-        fn noteDelivery(self: *Self, message: Message, kind: delivery_log_mod.Kind) void {
-            const track = self.track orelse return;
-            track.record(track, @ptrCast(&message), kind) catch |err| {
+        /// Log one delivered message, with the stamp the caller captured at
+        /// hand-over time (see `enqueue`). Zero allocation: the track copies the
+        /// value into its pre-allocated ring (§13.2). A refusal does not fail
+        /// the send — the message *is* in the mailbox — it marks the log
+        /// incomplete, which the runtime counts and the replay refuses.
+        fn noteDeliveryAt(self: *Self, track: *recorder_mod.TrackRef, message: Message, kind: delivery_log_mod.Kind, stamp: i64) void {
+            track.record_at(track, @ptrCast(&message), kind, stamp) catch |err| {
                 std.log.warn(
                     "[runtime] delivery to {s} (track {s}) not recorded: {s} — the log is incomplete from here",
                     .{ self.context.name, track.id, @errorName(err) },
@@ -5746,7 +5780,8 @@ const Handled = struct {
 /// so two worker threads cannot collide and neither needs a lock.
 const HandlerLog = struct {
     order: sequencer_mod.Sequencer = sequencer_mod.Sequencer.init(0),
-    slots: [16]Handled = @splat(.{}),
+    // 512, not 16: the §13.4 stress test drives 300 invocations through one log.
+    slots: [512]Handled = @splat(.{}),
 
     fn note(self: *@This(), worker: []const u8, fingerprint: u64, clock_ms: i64) void {
         const slot: usize = @intCast(self.order.next());
@@ -5899,6 +5934,67 @@ test "Runtime Replay (§13.4): a delivery track replays into the same handler se
     // says the timestamps really were the ones it moved to.
     try std.testing.expectEqual(@as(i64, 21_000_000), rep_clock.now_ms);
     try std.testing.expect(elapsed < 1_000);
+}
+
+test "Runtime Replay (§13.4, stress): a timer delivery racing a send keeps hand-over order and stamp" {
+    const rounds = 100;
+    var recorded_log = HandlerLog{};
+
+    var clock = Clock.Manual{ .now_ms = 1_000_000 };
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, clock.clock());
+    defer rt.deinit();
+    try rt.start();
+
+    const alpha = try rt.spawn(AlphaProbe, .{ .log = &recorded_log }, .{
+        .capacity = 64,
+        .record = .{ .id = "alpha", .capacity = rounds * 3 },
+    });
+
+    // The CI race this pins (macOS runner, one red in the wild): the ticker
+    // was descheduled between the timer's `mailbox.send` and its track record,
+    // this thread moved the clock and sent in between, and the timer's entry
+    // landed *after* the send's, stamped with the moved clock. Every round
+    // below is that exact interleave — a due timer on the ticker against a
+    // send on this thread. The record mutex + hand-over stamp in `enqueue`
+    // make the expected sequence a guarantee instead of a likelihood.
+    const offsets = [3]i64{ 0, 1_000, 2_000 };
+    const kinds = [3]delivery_log_mod.Kind{ .message, .timer, .message };
+    var handled: u64 = 0;
+    for (0..rounds) |r| {
+        const base: i64 = 1_000_000 + @as(i64, @intCast(r)) * 10_000;
+        clock.set(base);
+        try alpha.send(@intCast(r * 3));
+        handled += 1;
+        try awaitHandled(&recorded_log, handled);
+
+        clock.set(base + 500);
+        _ = try alpha.after(250, @intCast(r * 3 + 1));
+        clock.set(base + 1_000); // past the deadline: the ticker fires on its next tick
+        handled += 1;
+        try awaitHandled(&recorded_log, handled);
+
+        clock.set(base + 2_000);
+        try alpha.send(@intCast(r * 3 + 2));
+        handled += 1;
+        try awaitHandled(&recorded_log, handled);
+    }
+
+    const track = alpha.track orelse return error.NoDeliveryTrack;
+    try std.testing.expectEqual(@as(usize, rounds * 3), track.len(track));
+    for (0..rounds) |r| {
+        const base: i64 = 1_000_000 + @as(i64, @intCast(r)) * 10_000;
+        for (0..3) |k| {
+            const entry = track.entry(track, r * 3 + k);
+            // One track, one sequencer: the entry order is the hand-over order…
+            try std.testing.expectEqual(@as(u64, r * 3 + k), entry.seq);
+            // …the stamps are the hand-over times, not "when the record landed"…
+            try std.testing.expectEqual(base + offsets[k], entry.clock_ms);
+            // …and the kind survives the funnel.
+            try std.testing.expectEqual(kinds[k], entry.kind);
+            const payload: *const u32 = @ptrCast(@alignCast(entry.payload));
+            try std.testing.expectEqual(@as(u32, @intCast(r * 3 + k)), payload.*);
+        }
+    }
 }
 
 test "Runtime Replay: a track that ran out of room marks the log incomplete, and the replay refuses it" {

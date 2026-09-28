@@ -1,13 +1,6 @@
 {
   "items": [
     {
-      "file": "src/ai/schedule.zig",
-      "line": 14,
-      "kind": "constant",
-      "name": "freeValue",
-      "parent": null
-    },
-    {
       "file": "src/benchmark.zig",
       "line": 241,
       "kind": "field",
@@ -114,7 +107,7 @@
     },
     {
       "file": "src/http/Http2Server.zig",
-      "line": 2065,
+      "line": 2332,
       "kind": "function",
       "name": "readFrame",
       "parent": null
@@ -184,14 +177,14 @@
     },
     {
       "file": "tools/zmodu/src/main.zig",
-      "line": 2215,
+      "line": 2250,
       "kind": "function",
       "name": "hasUncommittedChanges",
       "parent": null
     },
     {
       "file": "tools/zmodu/src/main.zig",
-      "line": 2296,
+      "line": 2331,
       "kind": "function",
       "name": "writeFileGen",
       "parent": null

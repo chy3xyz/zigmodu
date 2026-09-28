@@ -13,6 +13,11 @@ pub const WebMonitor = struct {
     port: u16,
     server: ?std.Io.net.Server,
     is_running: bool,
+    /// The accept loop's thread, kept so `stop()` can join it: only after the
+    /// join is closing the listener fd race-free (an accept already past the
+    /// `is_running` check would otherwise land on a closed fd, and std answers
+    /// that EBADF with a panic — see `sockread.wakeListener`).
+    server_thread: ?std.Thread,
     modules: ?*ApplicationModules,
     buf: [8192]u8,
     /// Send bound for every response this monitor writes (`SO_SNDTIMEO` armed
@@ -29,6 +34,7 @@ pub const WebMonitor = struct {
             .port = port,
             .server = null,
             .is_running = false,
+            .server_thread = null,
             .modules = null,
             .buf = undefined,
         };
@@ -75,17 +81,28 @@ pub const WebMonitor = struct {
         self.is_running = true;
         std.log.info("[WebMonitor] Server started on http://0.0.0.0:{d}", .{self.port});
 
-        // Start server loop
-        const thread = try std.Thread.spawn(.{}, serverLoop, .{self});
-        thread.detach();
+        // Start server loop. The handle is kept (not detached) so `stop()` can
+        // join the loop before it closes the listener — see `stop()`.
+        self.server_thread = try std.Thread.spawn(.{}, serverLoop, .{self});
     }
 
     pub fn stop(self: *Self) void {
         self.is_running = false;
         if (self.server) |*s| {
-            // `shutdown` before `close`: on Linux `close` does not wake the
-            // thread blocked in `accept`, so the loop would keep it alive.
-            sockread.closeListener(self.io, s);
+            // Wake only: `shutdown` ends the blocked `accept` (EINVAL) without
+            // closing the fd — closing now would race an accept that already
+            // passed the `is_running` check into an EBADF, which `std.Io`
+            // punishes with a panic, not an error (`sockread.wakeListener`).
+            sockread.wakeListener(s);
+        }
+        // The join is what makes the close below race-free: after it, no
+        // `accept` can still be in flight on the listener.
+        if (self.server_thread) |thread| {
+            thread.join();
+            self.server_thread = null;
+        }
+        if (self.server) |*s| {
+            s.deinit(self.io);
             self.server = null;
         }
     }

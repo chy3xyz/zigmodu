@@ -356,6 +356,10 @@ pub const TrackRef = struct {
     /// the track copies into its ring — no allocation, and the sender's copy is
     /// not kept.
     record: *const fn (track: *TrackRef, event: *const anyopaque, kind: dlog.Kind) RecordError!void,
+    /// `record`, with the caller's own stamp instead of a clock read at the
+    /// record point — see `DeliveryTrack.recordKindAt` for why the runtime's
+    /// send path stamps at hand-over time.
+    record_at: *const fn (track: *TrackRef, event: *const anyopaque, kind: dlog.Kind, clock_ms: i64) RecordError!void,
     /// Entry `i`, which must be below `len`.
     entry: *const fn (track: *const TrackRef, i: usize) TrackEntry,
     len: *const fn (track: *const TrackRef) usize,
@@ -449,6 +453,7 @@ pub fn Track(comptime E: type, comptime capacity: usize) type {
             .id = "",
             .message_type = @typeName(E),
             .record = recordErased,
+            .record_at = recordAtErased,
             .entry = entryErased,
             .len = lenErased,
             .has_overflowed = overflowedErased,
@@ -474,6 +479,20 @@ pub fn Track(comptime E: type, comptime capacity: usize) type {
         /// full — and the same entry point, because what a drain writes is exactly
         /// the kind it is handed here.
         pub fn recordKind(self: *Self, event: E, kind: dlog.Kind) RecordError!void {
+            return self.recordKindAt(event, kind, self.log.clock.nowMs());
+        }
+
+        /// `recordKind`, with the stamp the *caller* captured at hand-over time
+        /// instead of a fresh clock read at the record point. The runtime's send
+        /// path needs this: between the mailbox's `send` and this record a
+        /// producer can be descheduled, and a clock read *here* then says "when
+        /// the scheduler got back to us" — with a manual clock moved by another
+        /// thread, arbitrarily later than the hand-over (the §13.4 replay test
+        /// caught a timer delivery stamped 5 s past its fire from exactly that
+        /// window). The caller stamps at the top of its send critical section;
+        /// the entry *order* against other producers is that path's record
+        /// mutex, not anything here.
+        pub fn recordKindAt(self: *Self, event: E, kind: dlog.Kind, clock_ms: i64) RecordError!void {
             const seq = self.log.sequencer.next();
             const n = self.writes.next();
             if (n >= capacity) {
@@ -489,7 +508,7 @@ pub fn Track(comptime E: type, comptime capacity: usize) type {
             }
             self.slots.publish(@intCast(n), .{
                 .seq = seq,
-                .clock_ms = self.log.clock.nowMs(),
+                .clock_ms = clock_ms,
                 .kind = kind,
                 .event = event,
             });
@@ -546,6 +565,11 @@ pub fn Track(comptime E: type, comptime capacity: usize) type {
         fn recordErased(ref: *TrackRef, event: *const anyopaque, kind: dlog.Kind) RecordError!void {
             const value: *const E = @ptrCast(@alignCast(event));
             return fromRef(ref).recordKind(value.*, kind);
+        }
+
+        fn recordAtErased(ref: *TrackRef, event: *const anyopaque, kind: dlog.Kind, clock_ms: i64) RecordError!void {
+            const value: *const E = @ptrCast(@alignCast(event));
+            return fromRef(ref).recordKindAt(value.*, kind, clock_ms);
         }
 
         fn entryErased(ref: *const TrackRef, i: usize) TrackEntry {
@@ -2168,6 +2192,34 @@ test "Track: entries carry the log's global sequence, not their slot index" {
     try std.testing.expectEqual(@as(u32, 12), A.entries()[2].event);
     try std.testing.expectEqual(dlog.Kind.timer, A.entries()[2].kind);
     try std.testing.expectEqual(dlog.Kind.message, A.entries()[0].kind);
+}
+
+test "Track.recordKindAt: the entry carries the caller's stamp, not a fresh clock read" {
+    var clock = Clock.Manual{ .now_ms = 1_000 };
+    var log = DeliveryLog.init(std.testing.allocator, clock.clock());
+    defer log.deinit();
+    const track = try log.addTrack(.{ .id = "a", .capacity = 4 }, u32, 4);
+
+    // The stamp the send path captured at hand-over time wins over the clock's
+    // current value — the whole point of the variant: between hand-over and
+    // record the clock may have moved arbitrarily (a manual clock is moved by
+    // *another* thread), and the entry must still say when the delivery was
+    // handed over.
+    clock.set(9_999);
+    try track.recordKindAt(7, .timer, 1_500);
+    try std.testing.expectEqual(@as(i64, 1_500), track.entries()[0].clock_ms);
+    try std.testing.expectEqual(dlog.Kind.timer, track.entries()[0].kind);
+
+    // `recordKind` stays the clock-reading convenience wrapper: no stamp in
+    // hand means "now".
+    try track.recordKind(8, .message);
+    try std.testing.expectEqual(@as(i64, 9_999), track.entries()[1].clock_ms);
+
+    // The erased view reaches the same variant — it is what the runtime's
+    // `noteDeliveryAt` calls through.
+    var value: u32 = 9;
+    try track.ref.record_at(&track.ref, @ptrCast(&value), .message, 2_000);
+    try std.testing.expectEqual(@as(i64, 2_000), track.entries()[2].clock_ms);
 }
 
 test "Track.recordKind: the ring carries the kind, and record() means .message" {

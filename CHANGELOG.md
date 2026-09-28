@@ -2,6 +2,74 @@
 
 ## [Unreleased]
 
+### 第 96 批：CI 两条红的根修——listener「先唤醒、后排干、再关 fd」统一收口（4 处同形竞态）；投递轨迹的 send+record 竞态；tools 三处小修（**破坏性：否**）
+
+1. **WS `acceptLoop` 的 stop/accept 竞态（ubuntu CI 崩溃，`errnoBug: BADF`）。** `stop()` 旧形态是
+   `shutdown+close` 一气呵成：accept 循环若已越过 `is_running` 检查、还没进 `accept()`，下一次
+   accept 就落在已关的 fd 上——POSIX 回 EBADF，而 `std.Io` 把 EBADF 映射成 `errnoBug`（**panic**，
+   不是可捕错误；CI 栈：`WebSocket.zig:417 acceptLoop → netAcceptPosix`）。修法是把「唤醒」与「关
+   fd」拆开：新增 **`sockread.wakeListener`**，**fd 只在 accept 循环确定退场后关闭**。唤醒本身
+   要两条腿，因为两个平台对「什么能叫醒阻塞中的 accept」答案相反：`shutdown()` 管 **Linux**
+   （阻塞中与后续的 accept 都回 `error.SocketNotListening`，可捕、循环看旗标退出），但 macOS 对
+   listener 回 ENOTCONN 且**不唤醒**阻塞中的 accept——wake-only 形态在 macOS 本地直接把 WS 过滤
+   跑挂死（`1406/2097 …handshaken, pushed to, and dropped` 永不 OK，`fiber_group.await` 跟着等），
+   这就是第二腿：**环回 connect（127.0.0.1:port）**——accept 拿到一个有效 fd 醒来，循环见旗标
+   已清即退，派发的 handler 读到的是已挂断的对端（connect 侧立即关），有界且被既有
+   「stopping 即拒」机制兜住（树内四处 listener 全绑 `0.0.0.0`，IPv4 环回必达）。
+   同形四处一并收口：**WebSocket.stop**（排干后关）、**DistributedEventBus.stop/abortStart**
+   （排干后关；abortStart 里 accept 循环可能已派发，同险）、**ClusterServer**（accept 循环跑在
+   `start()` 自己线程上，`stop()` 无法 join——改为 wake-only，由 `start()` 在循环退出后自己关 fd，
+   唯一零跨线程关闭的时序）、**WebMonitor**（循环线程由 detach 改为存柄，`stop()` wake→join→关）。
+   `sockread.closeListener` 文档收窄为「仅用于 accept 循环不可能在途的关停路径」。
+2. **投递轨迹（Runtime Replay 轨道）的 send+record 竞态（macOS CI 红，`§13.4` 期望戳
+   `[1M,6M,11M60,16M,21M]` 实测 `[1M,6M,16M,16M,21M]`）。** 根因：`enqueue` 里 `mailbox.send` 与
+   `noteDelivery` 不是原子的——ticker 在两者之间被抢占后，测试线程的移动时钟 + 后一条 send 会把
+   计时器投递的记录**挤到后面**且**戳读成移动后的时钟**；worker 仍按 mailbox 序处理，但 replay 按
+   轨道序驱动，§13.4 的「同序列」承诺就此落空。修法两半：`enqueue`/`enqueueBlocking` 在
+   `track != null` 时走 **`record_mutex`（send+record 临界区）** 保序，**戳在临界区顶捕获**
+   （hand-over 时刻）；recorder 侧新增带戳变体 **`recordKindAt` / `TrackRef.record_at`**，
+   `recordKind` 仍是读钟便捷壳。非 record 模式的热路径仍是一次 null 检查。
+   **回归测试两条**：`Track.recordKindAt`（确定性钉带戳变体语义）；`§13.4 stress`（100 轮
+   「ticker 计时器 × 本线程 send」的精确交错，逐条断言 seq/戳/kind/payload——旧形态下这就是 CI
+   抓到的那次交错）。`HandlerLog.slots` 顺带 16→512。
+3. **tools：`importSqlToDatabase` 的 sqlite/postgres 分支两处漏 free**（与第 95 批 mysql 分支同类：
+   `allocPrint` 结果内联进 `&.{}` 字面量，inline-alloc 门禁只看 append/put 实参、看不到这个形状——
+   全树仅这两处，已改为命名局部量 + defer）。postgres 分支参照 mysql 镜像了 **stub 测试**
+   （`psql` 假可执行记录 argv；驱动该分支过 `std.testing.allocator` 即把漏 free 变红）。
+   红证据：拆掉 `defer allocator.free(port_str)` → `1 tests leaked memory`；装回 → 绿。
+4. **tools：`collectSources` 根循环 append 失败路径补测。** 旧扫描里根循环的 append 永远复用
+   ArrayList 富余容量（又是第 94 批那个陷阱），两处 `errdefer` 从未被注入考验；新测试让临时树
+   **只含一个根级文件**，使根 append 成为第一次分配。红证据：拆掉根循环两处 errdefer →
+   `FAIL (MemoryLeakDetected)`；装回 → 绿。
+5. **注释措辞改正×2**（doctor.zig / runtime.zig）：吞 OOM 时扫描实际红的是守卫错误
+   （`NoEntanglementFound` / `WalkMissedFiles`，由 `checkAllAllocationFailures` 逐字传播——已核对
+   std 源码 `else => |e| return e`），不是 `SwallowedOutOfMemoryError`（后者只在「注入失败却成功
+   返回」时成立）。
+6. **docs：`AI_METHODOLOGY.md` 新增 §6.5「反模式：修复凭印象（红证据三课）」**——①所有权按身份
+   不按值（parseDsn 文本比较事故）；②门禁判据对着编译器的答案写（import 图同形边相反答案）；
+   ③先证明 harness 碰到失败点（ArrayList 富余容量、循环内 errdefer 每轮作用域），操作化为
+   「拆守卫必红、装回必绿」。
+7. **check-version 门禁假红：tools 扫描漏排 `.zig-global-cache`。** 在 `tools/zmodu/` 里以相对路径
+   `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache` 跑过构建后，缓存落在 `tools/zmodu/.zig-global-cache/`，
+   门禁的 grep 排了 `.zig-cache`/`zig-out`/`.zig-local-cache` 独漏它，于是扫进 zig 自己的
+   `builtin.zig` 弃用注（"to be removed in 0.18.0"）报「tools/ hard-codes version 0.18.0」。
+   红证据：修复前 `check-version.sh` EXIT 1 且全部命中只在缓存目录；补
+   `--exclude-dir=.zig-global-cache` 后 EXIT 0。deadcode 基线顺带收紧 28→27（`ai/schedule.zig`
+   的 `freeValue` 已不存在）。
+
+读数：整跑 **2197/2257 passed · 60 skipped · 0 failed**（`zm-test-count: aggregate`，较第 94 批
+口径 +7：本批 recordKindAt、§13.4 stress 两条，余为第 95 批新增与门禁复跑归位）；
+`check-test-collection` 两行 OK（`tools/zmodu` 154/156，2 skip = 既有门控）；过滤跑
+**WebSocket 28/28**（含此前 macOS 挂死的 `a live client is handshaken, pushed to, and dropped`）、
+DistributedEventBus 50/50、cluster 123/123（1 skip 为 redis 门控）、WebMonitor 2/2、
+Runtime Replay 5/5、recordKindAt 1/1；门禁 fmt / check-production / check-test-collection /
+check-deadcode（基线收紧 28→27）/ check-version 全绿。
+
+**未做**：`writeTempSql` 固定写 `/tmp/zmodu_import.sql`（并发 import 会互相覆盖，进程级工具、
+优先级低）；HttpClient 重试测试在 CI 高负载下的时序敏感度（本批 macOS 红的表象其实是第 2 条，
+HttpClient.zig:515 只是栈帧路过，如复现再单独立项）；WebMonitor 的 handleRequest  detached
+线程生命周期（先于本批存在，不停留在 stop 路径语义内）。
+
 ### 第 95 批：`zmodu scaffold --from-db mysql://…` 的两处 argv 缺陷（第 94 批只修了内省那条，导入这条一直坏着）；两处 FS 走查的 OOM 扫描（**破坏性：否**）
 
 1. **`importSqlToDatabase` 的 mysql 分支**同时犯了第 94 批刚在内省路径里修掉的两个错：database 作为

@@ -54,7 +54,7 @@ done
 # else are allow-listed in `allowed_version` below.
 TOOLS=tools
 tools_grep() {
-  grep -rnE "$1" -I --exclude-dir=.zig-cache --exclude-dir=zig-out --exclude-dir=.zig-local-cache "$TOOLS" 2>/dev/null || true
+  grep -rnE "$1" -I --exclude-dir=.zig-cache --exclude-dir=zig-out --exclude-dir=.zig-local-cache --exclude-dir=.zig-global-cache "$TOOLS" 2>/dev/null || true
 }
 
 # 1. Framework-shaped pins must be the current release.

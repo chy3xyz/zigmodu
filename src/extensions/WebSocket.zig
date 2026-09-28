@@ -264,12 +264,14 @@ pub const WebSocketServer = struct {
     ///
     /// Both waits on this path are ended by a `shutdown`, because both are
     /// blocking syscalls a silent peer can park indefinitely: the accept loop
-    /// (`closeListener`) and, new here, every connection fiber — a peer that
-    /// completes the handshake and then sends neither bytes nor a FIN leaves its
-    /// fiber in a bare `read` (`sockread.readSome`) for as long as it likes, and
-    /// the drain below waits for that fiber. Nothing on the *normal* path gains a
-    /// bound: a quiet connection stays valid, only a socket being torn down is
-    /// disturbed (`wakeConnections`).
+    /// (`wakeListener` — the fd itself is closed only after the drain, so an
+    /// accept already past its flag check can never land on a closed fd and
+    /// trip std's EBADF `errnoBug`) and, new here, every connection fiber — a
+    /// peer that completes the handshake and then sends neither bytes nor a FIN
+    /// leaves its fiber in a bare `read` (`sockread.readSome`) for as long as it
+    /// likes, and the drain below waits for that fiber. Nothing on the *normal*
+    /// path gains a bound: a quiet connection stays valid, only a socket being
+    /// torn down is disturbed (`wakeConnections`).
     ///
     /// **The one wait left that is not bounded is user code**, and it is
     /// reported rather than cut short. `onConnect` / `onMessage` run on the very
@@ -286,14 +288,19 @@ pub const WebSocketServer = struct {
     pub fn stop(self: *Self) void {
         self.is_running = false;
         if (self.server) |*s| {
-            // `shutdown` before `close`: on Linux `close` does not wake a
-            // thread blocked in `accept`, and the await below would wait for a
-            // loop that can never see `is_running` flip.
-            sockread.closeListener(self.io, s);
-            self.server = null;
+            // Wake only — do **not** close the fd yet. `shutdown` ends a blocked
+            // `accept` with EINVAL, and the loop's *next* `accept` after the wake
+            // fails the same way: a plain, catchable error. Closing the fd here
+            // would race an accept loop that had already passed its `is_running`
+            // check — that `accept` lands on a closed fd, POSIX answers EBADF,
+            // and `std.Io` maps EBADF to `errnoBug` (panic), not an error.
+            // Observed: ubuntu CI, `acceptLoop` panicked inside `netAcceptPosix`.
+            // The fd is closed after the drain below, when the loop is gone for
+            // sure.
+            sockread.wakeListener(s);
         }
         // ... and the same maneuver for the connections that loop produced.
-        // Ordered after the listener is closed so the accept loop is already on
+        // Ordered after the listener is woken so the accept loop is already on
         // its way out, and it cannot miss a connection either way: `is_running`
         // is false by now, and a connection fiber records itself in
         // `pending_connections` under the same lock this pass takes, checking
@@ -329,6 +336,13 @@ pub const WebSocketServer = struct {
         self.fiber_group.await(self.io) catch |err| {
             std.log.debug("[ws] draining fiber group failed: {s}", .{@errorName(err)});
         };
+        // Only here is closing the listener race-free: the accept loop is gone
+        // for sure, so no `accept` can still land on the fd (see the wake at
+        // the top for the EBADF panic this ordering avoids).
+        if (self.server) |*s| {
+            s.deinit(self.io);
+            self.server = null;
+        }
         const drain_ms = Time.monotonicNowMilliseconds() - drain_started_ms;
         // Before the cancel below, so a watchdog that is already past its sleep
         // re-reads the flag and stays quiet.
@@ -462,10 +476,10 @@ pub const WebSocketServer = struct {
             std.log.warn("[WebSocketServer] connection refused, cannot reserve it for shutdown: {s}", .{@errorName(err)});
             return;
         };
-        // `stop()` is under way and the listener is closed; the `defer` closes
+        // `stop()` is under way and the listener is woken; the `defer` closes
         // this socket. Refusing here — under the same lock the wake pass takes —
         // is what keeps a connection accepted in the window between the listener
-        // close and the wake pass from parking in a read nobody will wake.
+        // wake and the connection pass from parking in a read nobody will wake.
         if (!pending_registered) return;
 
         var buf: [4096]u8 = undefined;

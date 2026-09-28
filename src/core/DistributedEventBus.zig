@@ -538,12 +538,19 @@ pub const DistributedEventBus = struct {
     fn abortStart(self: *Self, err: std.Io.ConcurrentError) std.Io.ConcurrentError {
         self.is_running = false;
         if (self.listener) |*l| {
-            sockread.closeListener(self.io, l);
-            self.listener = null;
+            // Wake only, close after the drain: an accept loop that *was*
+            // dispatched may be between its `is_running` check and `accept()`,
+            // and accept on a closed fd answers EBADF — a panic in `std.Io`,
+            // not a catchable error (see `sockread.wakeListener`).
+            sockread.wakeListener(l);
         }
         self.fiber_group.await(self.io) catch |await_err| {
             std.log.err("[DistributedEventBus] fiber drain after a failed start: {}", .{await_err});
         };
+        if (self.listener) |*l| {
+            l.deinit(self.io);
+            self.listener = null;
+        }
         // `warn`, not `err`, for the same reason `acceptLoop`'s rejected
         // connection is a `warn`: the caller has the error in hand and is the
         // party that can act on it, and Zig's test runner fails the whole run
@@ -557,11 +564,11 @@ pub const DistributedEventBus = struct {
         self.is_running = false;
         self.heartbeat_thread = null;
         if (self.listener) |*l| {
-            // `shutdown` before `close`: on Linux `close` does not wake a
-            // thread blocked in `accept`, so `acceptLoop` would never reach its
-            // `is_running` re-check and the await below would wait forever.
-            sockread.closeListener(self.io, l);
-            self.listener = null;
+            // Wake only, close after the drain — the same EBADF race as
+            // `abortStart` above: closing now could put an accept that already
+            // passed its `is_running` check onto a closed fd, which `std.Io`
+            // punishes with a panic, not an error.
+            sockread.wakeListener(l);
         }
         // Drain every member of `fiber_group` — the accept / heartbeat / DLQ
         // loops and the per-connection handlers. `Group.await` covers both
@@ -570,6 +577,12 @@ pub const DistributedEventBus = struct {
         // switching the loops from `async` to `concurrent` left this unchanged.
         // Idempotent.
         self.fiber_group.await(self.io) catch |err| std.log.err("[DEB] Fiber await failed: {}", .{err});
+        // The accept loop is gone for sure now — closing the listener is
+        // race-free from here on.
+        if (self.listener) |*l| {
+            l.deinit(self.io);
+            self.listener = null;
+        }
     }
 
     /// Apply `inbound_idle_timeout_ms` as `SO_RCVTIMEO` — to an accepted

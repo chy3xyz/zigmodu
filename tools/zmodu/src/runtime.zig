@@ -1365,9 +1365,17 @@ test "analyzeSource hands every record to its Report at every allocation point (
 // failure without stranding an allocation.
 //
 // It is also the test that catches the loop's `catch continue`: with a bare
-// `catch continue` the *injected* failure inside `readFileAlloc` is swallowed and
-// the scan never fails, which is exactly `SwallowedOutOfMemoryError` — the
-// reason the read now re-raises `OutOfMemory` and only skips real I/O errors.
+// `catch continue` the *injected* failure inside `readFileAlloc` is swallowed,
+// the file goes quietly missing, and the run fails the `WalkMissedFiles` guard
+// below — `checkAllAllocationFailures` propagates any non-OutOfMemory error
+// verbatim, so the red is `WalkMissedFiles`, not `SwallowedOutOfMemoryError`
+// (the latter is only for runs that *succeed* despite a denied allocation).
+// That is why the read now re-raises `OutOfMemory` and only skips real I/O
+// errors.
+//
+// One hole the scan cannot reach: the root loop's `append` (see the companion
+// test below). With two files the first append grows the list past both items,
+// so the second append never allocates and no failure is ever injected there.
 test "collectSources hands every source to out at every allocation point (OOM scan)" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1395,6 +1403,40 @@ test "collectSources hands every source to out at every allocation point (OOM sc
             // The scan only means something if both files were reached: with an
             // empty `out` no `append` was ever attempted.
             if (out.items.len != 2) return error.WalkMissedFiles;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{project_dir});
+}
+
+// The root loop's `append` is the one site the scan above cannot reach: with
+// two files the first append grows the list past both items, so the root
+// file's append reuses spare capacity and no failure is ever injected there —
+// the loop's two `errdefer` guards would be unproven. A tree with *only* a
+// root-level file makes that append the very first one, which always
+// allocates, so the injection lands on it.
+test "collectSources root loop hands its source to out when the append itself fails (OOM scan)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &path_buf);
+    const project_dir = path_buf[0..dir_len];
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.zig", .data = "pub const main = 1;\n" });
+
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, project: []const u8) !void {
+            var out = std.ArrayList(Source).empty;
+            defer {
+                for (out.items) |s| {
+                    a.free(s.path);
+                    a.free(s.content);
+                }
+                out.deinit(a);
+            }
+            try collectSources(std.testing.io, a, project, &out);
+            if (out.items.len != 1) return error.WalkMissedFiles;
         }
     };
     try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{project_dir});

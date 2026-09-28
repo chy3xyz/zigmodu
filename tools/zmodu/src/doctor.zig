@@ -824,8 +824,12 @@ test "scanWiringSource hands every record to its Wiring at every allocation poin
 // filesystem walk. A one-file temp tree that really entangles two modules drives
 // it: without a real record there is no `append`, and the scan would prove
 // nothing. The bare `catch continue` around the file read is the other half —
-// it makes the scan report `SwallowedOutOfMemoryError`, which is why the read now
-// re-raises `OutOfMemory` and skips only real I/O errors.
+// with it, an *injected* read failure is swallowed, no record is produced, and
+// the run fails the `NoEntanglementFound` guard below, which
+// `checkAllAllocationFailures` propagates verbatim (any non-OutOfMemory error is
+// returned as-is; `SwallowedOutOfMemoryError` is only for runs that *succeed*
+// despite a denied allocation). The read now re-raises `OutOfMemory` and skips
+// only real I/O errors, so the red names the actual failure.
 test "scanEntanglements hands every record to out at every allocation point (OOM scan)" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

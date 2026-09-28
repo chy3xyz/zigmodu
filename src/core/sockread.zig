@@ -73,6 +73,44 @@ pub fn wakeBlockedSyscall(fd: std.posix.socket_t) void {
     _ = std.c.shutdown(fd, std.c.SHUT.RDWR);
 }
 
+/// Wake a thread blocked in `accept()` **without** closing the listener.
+///
+/// For shutdown sequences that must not close the fd yet. An accept loop that
+/// had already passed its running-flag check when `stop()` began would make
+/// its *next* `accept()` on a closed fd, and POSIX answers that with EBADF —
+/// which `std.Io` maps to `errnoBug` (a panic, "file descriptor used after
+/// closed"), not a catchable error. Observed in ubuntu CI as a crash of
+/// `WebSocket.acceptLoop` inside `netAcceptPosix`. The fd is therefore closed
+/// only once the loop is known to have exited (after the owner's fiber/thread
+/// drain, or on the accept thread itself) — and this wakes it instead.
+///
+/// Two mechanisms, because the platforms disagree about what wakes a blocked
+/// accept and this must work on both without ever closing the fd:
+///
+/// - `shutdown(SHUT.RDWR)` fails a *Linux* `accept` immediately (EINVAL →
+///   `error.SocketNotListening`, a plain error every in-tree accept loop
+///   already handles), and every later one too. macOS answers ENOTCONN for a
+///   listener — and leaves the parked accept asleep.
+/// - A real connection to our own port is what wakes a macOS/BSD `accept`:
+///   it succeeds with a valid fd, the loop sees the running flag cleared, and
+///   the handler it dispatches finds a peer that already hung up (the connect
+///   side closes at once) — bounded, and refused before any read if the loop
+///   is already stopping. IPv4 loopback, matching how every in-tree listener
+///   binds (`0.0.0.0`).
+pub fn wakeListener(listener: *std.Io.net.Server) void {
+    _ = std.c.shutdown(listener.socket.handle, std.c.SHUT.RDWR);
+    const fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    if (fd < 0) return;
+    defer _ = std.c.close(fd);
+    var sa: std.posix.sockaddr.in = .{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, listener.socket.address.getPort()),
+        .addr = std.mem.nativeToBig(u32, 0x7f000001), // 127.0.0.1
+        .zero = std.mem.zeroes([8]u8),
+    };
+    _ = std.c.connect(fd, @ptrCast(&sa), @sizeOf(std.posix.sockaddr.in));
+}
+
 /// Close a listening socket so a thread already blocked in `accept()` returns.
 ///
 /// `wakeBlockedSyscall` is the shutdown half, and the reason it is not optional:
@@ -83,6 +121,11 @@ pub fn wakeBlockedSyscall(fd: std.posix.socket_t) void {
 /// makes that `accept` fail immediately (EINVAL). Errors are expected (macOS
 /// answers ENOTCONN for a listener) and ignored: the fd is closed either way, and
 /// a caller that gets no error had nothing blocked to begin with.
+///
+/// Only for shutdown paths where **no accept loop can be mid-iteration** (e.g.
+/// the loop was never dispatched). When the loop may be between its
+/// running-flag check and `accept()`, use `wakeListener` and close the fd only
+/// after the loop is known to be gone — see its doc for the EBADF race.
 pub fn closeListener(io: std.Io, listener: *std.Io.net.Server) void {
     wakeBlockedSyscall(listener.socket.handle);
     listener.deinit(io);
