@@ -62,6 +62,18 @@ fi
 
 # 2. CHANGELOG: promote Unreleased to the new version.
 if grep -q "^## \[Unreleased\]" CHANGELOG.md; then
+    # Exactly one heading, or fail: the promote below renames only the FIRST
+    # occurrence (perl s/// without /g), so a second one — a batch leftover
+    # inside a historical section — would silently survive the release. Six
+    # accumulated inside [0.33.0] exactly this way, and misled an audit into
+    # reading a historical section's breaking changes as the new release's.
+    UNRELEASED_COUNT=$(grep -c "^## \[Unreleased\]$" CHANGELOG.md)
+    if [ "$UNRELEASED_COUNT" != "1" ]; then
+        echo "FAIL: CHANGELOG.md has $UNRELEASED_COUNT [Unreleased] headings (want exactly 1):"
+        grep -n "^## \[Unreleased\]$" CHANGELOG.md
+        echo "Remove the stale ones inside historical sections, then re-run."
+        exit 1
+    fi
     perl -0pi -e "s/## \[Unreleased\]/## [$VERSION] - $(date +%F)/" CHANGELOG.md
 elif [ "$SKIP_BUMP" = "1" ]; then
     echo "CHANGELOG already promoted to [$VERSION]"

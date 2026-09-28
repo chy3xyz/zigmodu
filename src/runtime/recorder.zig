@@ -1510,8 +1510,12 @@ const LoadedTrack = struct {
 /// rings), so the window/filter/cursor arithmetic and the
 /// `log.len() == delivered + skipped + …` identity `Replayer` is pinned on do
 /// not carry over. What *is* shared is the contract, and it is deliberately the
-/// same three pieces: an id → handle binding the caller owns, a `post` thunk that
-/// hands the message over **by value**, and a hole that has to be visible.
+/// same pieces: an id → handle binding the caller owns, a `post` thunk that
+/// hands the message over **by value**, a hole that has to be visible — and a
+/// replay that can be **narrowed** to a `seq` range (`open`/`seekTo`) and to a
+/// set of tracks (`onlyTracks`), where whatever is screened out is skipped and
+/// counted (`skippedBefore`, `skippedUnselected`) and an unselected record still
+/// anchors the seq chain, so filtering never manufactures a hole.
 ///
 /// **Load then replay, not tailing** (§13.10 D4): the records are read once
 /// (`dlog.scan`) and live in memory, ordered by global `seq` here. This cannot
@@ -1542,21 +1546,38 @@ pub const ReplayFromLog = struct {
     order: []usize,
     /// Position in `order`.
     cursor: usize = 0,
+    /// The `[from, to)` window this reader is walking, set by `open`/`seekTo`.
+    window: Window = .{},
+    /// The track filter `onlyTracks` set, or null for every track. The slice is
+    /// the caller's and must outlive the reader.
+    only: ?[]const []const u8 = null,
+    /// Records before `window.from` the last positioning walked past.
+    skipped_before: usize = 0,
+    /// Records walked past because their track is not in the filter.
+    skipped_unselected: usize = 0,
     /// Per-id declarations and bindings, in first-mention order. Indices rather
     /// than pointers are handed out by the helpers below: the list grows, and a
     /// pointer into an `ArrayList` would not survive the next `setCodec`.
     tracks: std.ArrayList(LoadedTrack) = .empty,
-    /// The last `seq` this reader delivered, or null before the first one. Holes
-    /// are gaps in this chain.
+    /// The last `seq` this reader walked past — delivered *or* skipped: an
+    /// unselected record still anchors the chain (the file *has* it), so a hole
+    /// stays "what the file does not hold", never "what the filter screened
+    /// out". Holes are gaps in this chain.
     last_seq: ?u64 = null,
     /// Missing seqs behind the cursor, counted when the delivery that follows them
     /// is handed over.
     crossed_holes: u64 = 0,
-    /// Missing seqs between the cursor's predecessor and the entry at the cursor.
-    /// Recomputed by every `step` rather than accumulated, because a refused hole
-    /// leaves the cursor exactly where it is: the caller may allow holes and step
-    /// again, and the same gap must not be counted twice.
+    /// Missing seqs the walk has found and no delivery has crossed yet. Folded in
+    /// as the cursor advances — each record's arrival check runs exactly once
+    /// (see `arrival_folded`) — carried unchanged across a refusal, and moved
+    /// into `crossed_holes` by the delivery that crosses them.
     pending_holes: u64 = 0,
+    /// The lowest uncrossed missing seq — what a `LogHasHoles` refusal names.
+    pending_first: ?u64 = null,
+    /// Whether the record at `cursor` has had its arrival check (duplicate/gap
+    /// folding) run. A refused delivery leaves the cursor where it is, and
+    /// without this the retry would fold the same gap twice.
+    arrival_folded: bool = false,
     /// Records whose `seq` was already delivered. Unreachable through `drainTo`
     /// (`Writer.append` refuses a seq that does not increase), but a hand-built
     /// record slice can hold one, and re-delivering it would make the file look
@@ -1698,28 +1719,50 @@ pub const ReplayFromLog = struct {
     /// the honest bound. Nothing sleeps and no wall clock is read.
     pub fn step(self: *Self) anyerror!?LogStep {
         self.reset();
-        self.pending_holes = 0;
         while (self.cursor < self.order.len) {
             const record = self.records[self.order[self.cursor]];
-            if (self.last_seq) |last| {
-                if (record.seq <= last) {
-                    // A seq the reader has already delivered. The file's writer
-                    // cannot produce one; a hand-built slice can. Counted, not
-                    // replayed (§13.10 D3's rule, applied to the other direction).
-                    self.duplicates += 1;
-                    self.cursor += 1;
-                    continue;
-                }
-                if (record.seq > last + 1) {
-                    self.pending_holes = record.seq - last - 1;
-                    if (self.first_hole_seq == null) self.first_hole_seq = last + 1;
-                    if (!self.allow_holes) {
-                        // The refusal names the *following* delivery's track: it is
-                        // the one the caller will be asked to deliver next.
-                        self.refusal_seq = last + 1;
-                        return self.refuse(record.track_id, error.LogHasHoles);
+            // `to` is a stop, not a filter: records at and after it are not
+            // walked at all — counted nowhere, and the cursor stays put
+            // (`Window.to`'s contract).
+            if (self.window.to) |to| {
+                if (record.seq >= to) return null;
+            }
+            if (!self.arrival_folded) {
+                if (self.last_seq) |last| {
+                    if (record.seq <= last) {
+                        // A seq the reader has already walked past. The file's
+                        // writer cannot produce one; a hand-built slice can.
+                        // Counted, not replayed (§13.10 D3's rule, applied to
+                        // the other direction).
+                        self.duplicates += 1;
+                        self.cursor += 1;
+                        continue;
+                    }
+                    if (record.seq > last + 1) {
+                        self.pending_holes += record.seq - last - 1;
+                        if (self.pending_first == null) self.pending_first = last + 1;
+                        if (self.first_hole_seq == null) self.first_hole_seq = last + 1;
                     }
                 }
+                self.arrival_folded = true;
+            }
+            if (!self.selects(record.track_id)) {
+                // Skipped, advanced and counted — but the record still anchors
+                // the chain: the file *has* it, so "on a track the caller did
+                // not ask for" never reads as "missing from the file".
+                self.last_seq = record.seq;
+                self.cursor += 1;
+                self.skipped_unselected += 1;
+                self.arrival_folded = false;
+                continue;
+            }
+            // The delivery would cross a gap the walk found — refuse by default
+            // (§13.10 D3). The refusal names the *first* missing seq and the
+            // track of the delivery that would cross it, and consumes nothing:
+            // `allowHoles` and a retry hand the very same record over.
+            if (self.pending_holes > 0 and !self.allow_holes) {
+                self.refusal_seq = self.pending_first;
+                return self.refuse(record.track_id, error.LogHasHoles);
             }
             const slot = self.slotIndex(record.track_id) orelse {
                 self.refusal_seq = record.seq;
@@ -1745,6 +1788,8 @@ pub const ReplayFromLog = struct {
             self.last_seq = record.seq;
             self.crossed_holes += self.pending_holes;
             self.pending_holes = 0;
+            self.pending_first = null;
+            self.arrival_folded = false;
             return .{ .seq = record.seq, .clock_ms = clock_ms, .id = record.track_id, .kind = record.kind };
         }
         return null;
@@ -1757,6 +1802,82 @@ pub const ReplayFromLog = struct {
         var delivered: usize = 0;
         while (try self.step()) |_| delivered += 1;
         return delivered;
+    }
+
+    /// Replay from `from` on: reposition to the first record whose `seq` is >=
+    /// `from`, counting what that passed over (`skippedBefore`). `window.to` is
+    /// left as it is — `open` sets both ends.
+    ///
+    /// Recomputes rather than accumulates: the hole/duplicate counters describe
+    /// the walk from the new position, so seeking backwards to re-replay a range
+    /// is a scan, not a second reader (the same contract `Replayer.seekTo` has).
+    pub fn seekTo(self: *Self, from: u64) void {
+        self.window.from = from;
+        self.position();
+    }
+
+    /// `seekTo(from)` plus the exclusive end: replay exactly **`[from, to)`**,
+    /// with `null` for "to the end of the file". `from >= to` is an empty window
+    /// — `step` hands over nothing and `remaining()` is 0, which is an answer,
+    /// not an error.
+    ///
+    /// The seq chain anchors at the last record *before* the window: the reader
+    /// walked past the records that prove the chain up to `from`, so a hole
+    /// inside the window is still refused — and so is a gap that spans the
+    /// window's edge, named from its first missing seq (`refusalSeq`). A window
+    /// positioned at or before the file's first record keeps the standing rule:
+    /// the chain starts where the file starts.
+    pub fn open(self: *Self, from: u64, to: ?u64) void {
+        self.window = .{ .from = from, .to = to };
+        self.position();
+    }
+
+    /// Deliver only from these tracks (`track_id`). A record whose track is not
+    /// named here is **skipped, the cursor advanced, and counted**
+    /// (`skippedUnselected`) — and it still anchors the seq chain, so the filter
+    /// never turns "on a track the caller did not ask for" into "missing from
+    /// the file". An unselected track needs no codec and no binding; a
+    /// *selected* one still does — the filter narrows the check, it does not
+    /// remove it.
+    ///
+    /// The ids are validated against the file: an id it does not mention is
+    /// `error.UnknownTrack` (named by `refusal()`), not a replay that screens
+    /// everything out and looks deliberate. An empty slice selects nothing;
+    /// `clearTrackFilter` goes back to all tracks.
+    ///
+    /// The slice is the caller's and must outlive the reader. Zero allocation.
+    pub fn onlyTracks(self: *Self, ids: []const []const u8) FilterError!void {
+        for (ids) |id| {
+            if (!self.inFile(id)) {
+                self.refusal_id = id;
+                self.refusal_seq = null;
+                return error.UnknownTrack;
+            }
+        }
+        self.only = ids;
+    }
+
+    /// Deliver from every track again. The cursor does not move: what the filter
+    /// already walked past is behind the reader, and `skippedUnselected` keeps
+    /// saying so.
+    pub fn clearTrackFilter(self: *Self) void {
+        self.only = null;
+    }
+
+    /// Records this reader passed over without delivering since it was last
+    /// positioned: `skippedBefore + skippedUnselected`.
+    pub fn skipped(self: *const Self) usize {
+        return self.skipped_before + self.skipped_unselected;
+    }
+
+    /// Records before `window.from` — what `seekTo`/`open` passed over.
+    pub fn skippedBefore(self: *const Self) usize {
+        return self.skipped_before;
+    }
+
+    /// Records walked past because their track is not in the filter.
+    pub fn skippedUnselected(self: *const Self) usize {
+        return self.skipped_unselected;
     }
 
     /// Let the reader step over a gap instead of refusing (`error.LogHasHoles`).
@@ -1799,17 +1920,34 @@ pub const ReplayFromLog = struct {
         return self.duplicates;
     }
 
-    /// Deliveries still to hand over.
+    /// Deliveries still to hand over: records on the selected tracks, with `seq`
+    /// in `[from, to)`, at or after the cursor. A duplicate the file holds ahead
+    /// is not counted — the walk will count it, not deliver it (in the sorted
+    /// order a duplicate is exactly a record whose predecessor claims its seq).
     pub fn remaining(self: *const Self) usize {
-        return self.order.len - self.cursor;
+        var total: usize = 0;
+        var i = self.cursor;
+        while (i < self.order.len) : (i += 1) {
+            const record = self.records[self.order[i]];
+            if (self.window.to) |to| {
+                if (record.seq >= to) break; // sorted: nothing later qualifies
+            }
+            if (!self.selects(record.track_id)) continue;
+            if (i > 0 and self.records[self.order[i - 1]].seq == record.seq) continue;
+            total += 1;
+        }
+        return total;
     }
 
-    /// Whether every track that appears in this file has both a codec and a
-    /// target. False means a step will refuse as soon as it reaches a delivery
-    /// from a track that does not — `CodecRequired` for a bound-but-undecodable
-    /// one, `UnboundTrack` for one with nothing bound at all.
+    /// Whether every *selected* track that appears in this file has both a codec
+    /// and a target. False means a step will refuse as soon as it reaches a
+    /// delivery from a track that does not — `CodecRequired` for a
+    /// bound-but-undecodable one, `UnboundTrack` for one with nothing bound at
+    /// all. A filtered-out track is not part of this replay, so its missing
+    /// binding is not a missing one (the rule `Replayer.isFullyBound` has).
     pub fn isFullyBound(self: *const Self) bool {
         for (self.records) |record| {
+            if (!self.selects(record.track_id)) continue;
             const slot = self.slotIndex(record.track_id) orelse return false;
             const state = &self.tracks.items[slot];
             if (state.deliver == null or state.target == null) return false;
@@ -1848,6 +1986,40 @@ pub const ReplayFromLog = struct {
             if (std.mem.eql(u8, record.track_id, id)) return true;
         }
         return false;
+    }
+
+    /// Is `id` part of this replay? `true` for every track when no filter is set.
+    fn selects(self: *const Self, id: []const u8) bool {
+        const only = self.only orelse return true;
+        for (only) |wanted| {
+            if (std.mem.eql(u8, wanted, id)) return true;
+        }
+        return false;
+    }
+
+    /// Bring the cursor, the seq chain and every counter in line with `window`:
+    /// the reader starts at the first record whose `seq` is >= `window.from`,
+    /// everything before it is counted (`skippedBefore`), and the chain anchors
+    /// at the last of those — so a hole *inside* the window is still refused.
+    /// The single place the counters are reset; allocates nothing.
+    fn position(self: *Self) void {
+        self.cursor = 0;
+        self.skipped_before = 0;
+        self.skipped_unselected = 0;
+        self.last_seq = null;
+        self.crossed_holes = 0;
+        self.pending_holes = 0;
+        self.pending_first = null;
+        self.first_hole_seq = null;
+        self.duplicates = 0;
+        self.arrival_folded = false;
+        while (self.cursor < self.order.len) {
+            const record = self.records[self.order[self.cursor]];
+            if (record.seq >= self.window.from) break;
+            self.last_seq = record.seq;
+            self.cursor += 1;
+            self.skipped_before += 1;
+        }
     }
 
     /// The declared/bound track for `id`, or null.
@@ -3575,4 +3747,345 @@ test "ReplayFromLog: the reader's allocator is real, and nothing a step takes su
     // scratches all balance once it is done.
     loader.deinit();
     try std.testing.expectEqual(probe.allocations, probe.deallocations);
+}
+
+// ─────────────────────────────────────────────────
+// §13.10 — narrowing a file replay: window and track filter
+// ─────────────────────────────────────────────────
+
+test "ReplayFromLog.open: only [from, to) is replayed, and what that passed over is counted" {
+    const allocator = std.testing.allocator;
+
+    // Eight deliveries on one track; each record's payload is ten times its seq,
+    // so a mix-up between "the seq" and "the value" cannot pass silently.
+    var payloads: [8][4]u8 = undefined;
+    var records: [8]dlog.Record = undefined;
+    for (0..8) |i| {
+        std.mem.writeInt(u32, &payloads[i], @intCast(i * 10), .little);
+        records[i] = .{
+            .seq = @intCast(i),
+            .track_id = "a",
+            .kind = .message,
+            .recorded_ns = @as(i64, @intCast(i)) * 100 * std.time.ns_per_ms,
+            .payload = &payloads[i],
+        };
+    }
+
+    var manual = Clock.Manual{ .now_ms = 0 };
+    var target = FakeTarget(u32){};
+    var loader = try ReplayFromLog.init(allocator, &manual, &records);
+    defer loader.deinit();
+    try loader.setCodec("a", U32Codec, u32);
+    try loader.bindDecoded("a", &target);
+
+    // Nothing narrowed: the whole file, i.e. the number `remaining()` has always
+    // returned.
+    try std.testing.expectEqual(@as(usize, 8), loader.remaining());
+    try std.testing.expectEqual(@as(usize, 0), loader.skipped());
+
+    // [2, 6): seq 0 and 1 are skipped and counted, 2..5 are delivered, and 6/7
+    // are never walked — `to` is a stop, not a filter.
+    loader.open(2, 6);
+    try std.testing.expectEqual(@as(usize, 4), loader.remaining());
+    try std.testing.expectEqual(@as(usize, 2), loader.skippedBefore());
+    try std.testing.expectEqual(@as(usize, 0), loader.skippedUnselected());
+
+    try std.testing.expectEqual(@as(usize, 4), try loader.replayAll());
+    try std.testing.expectEqualSlices(u32, &.{ 20, 30, 40, 50 }, target.taken());
+    try std.testing.expectEqual(@as(usize, 0), loader.remaining());
+    try std.testing.expectEqual(@as(?LogStep, null), try loader.step());
+    try std.testing.expectEqual(@as(usize, 2), loader.skipped());
+    // The clock stopped at the last record actually delivered (seq 5, t = 500).
+    try std.testing.expectEqual(@as(i64, 500), manual.now_ms);
+
+    // `from` inclusive, `to` exclusive — one record at a time.
+    loader.open(7, 8);
+    try std.testing.expectEqual(@as(usize, 1), loader.remaining());
+    try std.testing.expectEqual(@as(usize, 7), loader.skippedBefore());
+    try std.testing.expectEqual(@as(usize, 1), try loader.replayAll());
+    try std.testing.expectEqual(@as(u32, 70), target.taken()[target.n - 1]);
+
+    // `from` past the last record, to the end: an empty window is an answer, not
+    // an error.
+    loader.open(8, null);
+    try std.testing.expectEqual(@as(usize, 0), loader.remaining());
+    try std.testing.expectEqual(@as(usize, 0), try loader.replayAll());
+    try std.testing.expectEqual(@as(usize, 8), loader.skippedBefore());
+
+    // …and an inverted range is empty too, rather than replaying backwards.
+    loader.open(6, 2);
+    try std.testing.expectEqual(@as(usize, 0), loader.remaining());
+    try std.testing.expectEqual(@as(usize, 0), try loader.replayAll());
+    try std.testing.expectEqual(@as(usize, 6), loader.skippedBefore());
+
+    // Positioning repositions rather than accumulates: after all of that, a
+    // reader told to start at 2 says "two records are before the position", not
+    // "many were skipped at some point".
+    const before = target.n;
+    loader.open(2, null);
+    try std.testing.expectEqual(@as(usize, 2), loader.skippedBefore());
+    try std.testing.expectEqual(@as(usize, 6), loader.remaining());
+    try std.testing.expectEqual(@as(usize, 6), try loader.replayAll());
+    try std.testing.expectEqualSlices(u32, &.{ 20, 30, 40, 50, 60, 70 }, target.taken()[before..]);
+
+    // `seekTo` is the same positioning with `to` left alone — here it has none,
+    // so the range is open to the end again.
+    loader.seekTo(0);
+    try std.testing.expectEqual(@as(usize, 0), loader.skippedBefore());
+    try std.testing.expectEqual(@as(usize, 8), loader.remaining());
+}
+
+test "ReplayFromLog.onlyTracks: the chain stays the file's, and what is filtered out is counted" {
+    const allocator = std.testing.allocator;
+
+    // Interleaved, one shared sequence: "risk" holds seq 0 and 2, "book" 1, 3, 4
+    // — the same shape `Replayer.onlyTracks`' test pins for the in-memory driver.
+    var risk_payloads: [2][4]u8 = undefined;
+    var book_payloads: [3][4]u8 = undefined;
+    std.mem.writeInt(u32, &risk_payloads[0], 20, .little);
+    std.mem.writeInt(u32, &risk_payloads[1], 40, .little);
+    std.mem.writeInt(u32, &book_payloads[0], 1, .little);
+    std.mem.writeInt(u32, &book_payloads[1], 2, .little);
+    std.mem.writeInt(u32, &book_payloads[2], 3, .little);
+    const records = [_]dlog.Record{
+        .{ .seq = 0, .track_id = "risk", .kind = .message, .recorded_ns = 100 * std.time.ns_per_ms, .payload = &risk_payloads[0] },
+        .{ .seq = 1, .track_id = "book", .kind = .message, .recorded_ns = 200 * std.time.ns_per_ms, .payload = &book_payloads[0] },
+        .{ .seq = 2, .track_id = "risk", .kind = .message, .recorded_ns = 300 * std.time.ns_per_ms, .payload = &risk_payloads[1] },
+        .{ .seq = 3, .track_id = "book", .kind = .message, .recorded_ns = 400 * std.time.ns_per_ms, .payload = &book_payloads[1] },
+        .{ .seq = 4, .track_id = "book", .kind = .message, .recorded_ns = 500 * std.time.ns_per_ms, .payload = &book_payloads[2] },
+    };
+
+    var manual = Clock.Manual{ .now_ms = 0 };
+    var book_target = FakeTarget(u32){};
+    var risk_target = FakeTarget(u32){};
+    var loader = try ReplayFromLog.init(allocator, &manual, &records);
+    defer loader.deinit();
+    try loader.setCodec("book", U32Codec, u32);
+    try loader.setCodec("risk", U32Codec, u32);
+    try loader.bindDecoded("book", &book_target);
+    try loader.bindDecoded("risk", &risk_target);
+
+    // "Replay the book track": the other track's records are skipped, the cursor
+    // advances over them, and the count says how many. The chain is the file's:
+    // seq 0 and 2 are *present*, so the filtered replay reports no hole — the
+    // filter can never manufacture one.
+    try loader.onlyTracks(&.{"book"});
+    try std.testing.expectEqual(@as(usize, 3), loader.remaining());
+    try std.testing.expectEqual(@as(usize, 3), try loader.replayAll());
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, book_target.taken());
+    try std.testing.expectEqual(@as(usize, 0), risk_target.n);
+    try std.testing.expectEqual(@as(usize, 2), loader.skippedUnselected());
+    try std.testing.expectEqual(@as(usize, 2), loader.skipped());
+    try std.testing.expectEqual(@as(usize, 0), loader.remaining());
+    try std.testing.expectEqual(@as(u64, 0), loader.holesSeen());
+    try std.testing.expectEqual(@as(?u64, null), loader.firstHoleSeq());
+    try std.testing.expectEqual(@as(i64, 500), manual.now_ms);
+
+    // A filter that names a track the file does not hold fails here instead of
+    // screening every delivery out — and names the id it refused.
+    try std.testing.expectError(error.UnknownTrack, loader.onlyTracks(&.{"bookk"}));
+    try std.testing.expectEqualStrings("bookk", loader.refusal().?);
+    try std.testing.expectEqual(@as(?u64, null), loader.refusalSeq());
+
+    // An empty filter selects nothing — deliberately, visibly, and with the
+    // whole file counted as skipped rather than silently replayed. Every record
+    // is still present, so an all-skipping walk reports no hole either.
+    var null_manual = Clock.Manual{ .now_ms = 0 };
+    var skipping = try ReplayFromLog.init(allocator, &null_manual, &records);
+    defer skipping.deinit();
+    try skipping.onlyTracks(&.{});
+    try std.testing.expectEqual(@as(usize, 0), skipping.remaining());
+    try std.testing.expectEqual(@as(usize, 0), try skipping.replayAll());
+    try std.testing.expectEqual(@as(usize, 5), skipping.skippedUnselected());
+    try std.testing.expectEqual(@as(u64, 0), skipping.holesSeen());
+
+    // `isFullyBound` follows the filter: a filtered-out track is not part of
+    // this replay, so its missing binding is not a missing binding …
+    var manual2 = Clock.Manual{ .now_ms = 0 };
+    var only_book = FakeTarget(u32){};
+    var loader2 = try ReplayFromLog.init(allocator, &manual2, &records);
+    defer loader2.deinit();
+    try loader2.setCodec("book", U32Codec, u32);
+    try loader2.setCodec("risk", U32Codec, u32);
+    try loader2.bindDecoded("book", &only_book);
+    try std.testing.expect(!loader2.isFullyBound()); // `risk` is still owed a target
+    try loader2.onlyTracks(&.{"book"});
+    try std.testing.expect(loader2.isFullyBound());
+    try std.testing.expectEqual(@as(usize, 3), try loader2.replayAll());
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, only_book.taken());
+
+    // … but a *selected* track with no target still stops the replay: the filter
+    // narrows the binding check, it does not remove it.
+    var manual3 = Clock.Manual{ .now_ms = 0 };
+    var loader3 = try ReplayFromLog.init(allocator, &manual3, &records);
+    defer loader3.deinit();
+    try loader3.onlyTracks(&.{"book"});
+    try std.testing.expectError(error.UnboundTrack, loader3.step());
+    try std.testing.expectEqualStrings("book", loader3.refusal().?);
+    try std.testing.expectEqual(@as(?u64, 1), loader3.refusalSeq());
+    // The record it walked past on the way to that refusal is counted (seq 0 is
+    // "risk"): an error is not a licence to lose track of what was skipped.
+    try std.testing.expectEqual(@as(usize, 1), loader3.skippedUnselected());
+
+    // Clearing the filter goes back to every track — the ones already walked
+    // past are behind the reader, and the counter still accounts for them.
+    var manual4 = Clock.Manual{ .now_ms = 0 };
+    var both_book = FakeTarget(u32){};
+    var both_risk = FakeTarget(u32){};
+    var loader4 = try ReplayFromLog.init(allocator, &manual4, &records);
+    defer loader4.deinit();
+    try loader4.setCodec("book", U32Codec, u32);
+    try loader4.setCodec("risk", U32Codec, u32);
+    try loader4.bindDecoded("book", &both_book);
+    try loader4.bindDecoded("risk", &both_risk);
+    try loader4.onlyTracks(&.{"book"});
+    try std.testing.expectEqual(@as(u64, 1), (try loader4.step()).?.seq);
+    loader4.clearTrackFilter();
+    try std.testing.expectEqual(@as(usize, 3), try loader4.replayAll());
+    try std.testing.expectEqualSlices(u32, &.{40}, both_risk.taken());
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, both_book.taken());
+    try std.testing.expectEqual(@as(usize, 1), loader4.skippedUnselected()); // seq 0, skipped while filtered
+    try std.testing.expectEqual(@as(u64, 0), loader4.holesSeen());
+}
+
+test "ReplayFromLog: a hole inside the window is refused — and one spanning the window's edge is named" {
+    const allocator = std.testing.allocator;
+
+    // seq 0, 1, 2, 6, 7 on one track: the file does not hold 3, 4 or 5.
+    var payloads: [5][4]u8 = undefined;
+    var records: [5]dlog.Record = undefined;
+    for ([_]u64{ 0, 1, 2, 6, 7 }, 0..) |seq, i| {
+        std.mem.writeInt(u32, &payloads[i], @intCast(seq * 10), .little);
+        records[i] = .{
+            .seq = seq,
+            .track_id = "a",
+            .kind = .message,
+            .recorded_ns = @as(i64, @intCast(seq)) * 10 * std.time.ns_per_ms,
+            .payload = &payloads[i],
+        };
+    }
+
+    // A window that starts *inside* the run: the chain anchors at the last
+    // record before the window, so the hole the walk reaches is still refused —
+    // the window narrows what is delivered, not what the file can prove.
+    var manual = Clock.Manual{ .now_ms = 0 };
+    var target = FakeTarget(u32){};
+    var loader = try ReplayFromLog.init(allocator, &manual, &records);
+    defer loader.deinit();
+    try loader.setCodec("a", U32Codec, u32);
+    try loader.bindDecoded("a", &target);
+    loader.open(2, null);
+    try std.testing.expectEqual(@as(usize, 2), loader.skippedBefore());
+    try std.testing.expectEqual(@as(usize, 3), loader.remaining());
+
+    // seq 2 follows the anchor (seq 1) directly: no hole yet …
+    try std.testing.expectEqual(@as(u64, 2), (try loader.step()).?.seq);
+    // … and the next record is 6, across a three-delivery gap.
+    try std.testing.expectError(error.LogHasHoles, loader.step());
+    try std.testing.expectEqualStrings("a", loader.refusal().?);
+    try std.testing.expectEqual(@as(?u64, 3), loader.refusalSeq()); // the first missing seq
+    try std.testing.expectEqual(@as(u64, 3), loader.holesSeen());
+    try std.testing.expectEqual(@as(u64, 0), loader.crossedHoles());
+    // The refusal consumed nothing: two records are still ahead, and a retry
+    // after `allowHoles` delivers exactly them.
+    try std.testing.expectEqual(@as(usize, 2), loader.remaining());
+    loader.allowHoles();
+    try std.testing.expectEqual(@as(usize, 2), try loader.replayAll());
+    try std.testing.expectEqualSlices(u32, &.{ 20, 60, 70 }, target.taken());
+    try std.testing.expectEqual(@as(u64, 3), loader.crossedHoles());
+
+    // A window that starts *past* the hole: positioning walked the records that
+    // prove the chain up to `from`, so the same gap is found and named from its
+    // first missing seq — fail-closed, with `allowHoles` as the caller's
+    // explicit "I know".
+    var manual2 = Clock.Manual{ .now_ms = 0 };
+    var target2 = FakeTarget(u32){};
+    var past = try ReplayFromLog.init(allocator, &manual2, &records);
+    defer past.deinit();
+    try past.setCodec("a", U32Codec, u32);
+    try past.bindDecoded("a", &target2);
+    past.open(6, null);
+    try std.testing.expectEqual(@as(usize, 3), past.skippedBefore());
+    try std.testing.expectError(error.LogHasHoles, past.step());
+    try std.testing.expectEqual(@as(?u64, 3), past.refusalSeq());
+    past.allowHoles();
+    try std.testing.expectEqual(@as(usize, 2), try past.replayAll());
+    try std.testing.expectEqualSlices(u32, &.{ 60, 70 }, target2.taken());
+    try std.testing.expectEqual(@as(u64, 3), past.crossedHoles());
+
+    // … but a reader that walked nothing keeps the standing rule: the chain
+    // starts where the file starts. A file whose first record is seq 5 replays
+    // from 5, hole-free.
+    var first_payload: [1][4]u8 = undefined;
+    std.mem.writeInt(u32, &first_payload[0], 50, .little);
+    const late = [_]dlog.Record{
+        .{ .seq = 5, .track_id = "a", .kind = .message, .recorded_ns = 0, .payload = &first_payload[0] },
+    };
+    var manual3 = Clock.Manual{ .now_ms = 0 };
+    var target3 = FakeTarget(u32){};
+    var from_start = try ReplayFromLog.init(allocator, &manual3, &late);
+    defer from_start.deinit();
+    try from_start.setCodec("a", U32Codec, u32);
+    try from_start.bindDecoded("a", &target3);
+    try std.testing.expectEqual(@as(usize, 1), try from_start.replayAll());
+    try std.testing.expectEqualSlices(u32, &.{50}, target3.taken());
+    try std.testing.expectEqual(@as(u64, 0), from_start.holesSeen());
+}
+
+test "ReplayFromLog: remaining is exact with duplicates ahead, and repositioning recomputes" {
+    const allocator = std.testing.allocator;
+
+    // A hand-built slice can hold a seq twice; the reader counts rather than
+    // replays it, and `remaining` — computed from the sorted order, not from a
+    // walk — already excludes it.
+    var payloads: [4][4]u8 = undefined;
+    var records: [4]dlog.Record = undefined;
+    for ([_]u64{ 0, 1, 1, 2 }, 0..) |seq, i| {
+        std.mem.writeInt(u32, &payloads[i], @intCast(seq * 10), .little);
+        records[i] = .{
+            .seq = seq,
+            .track_id = "a",
+            .kind = .message,
+            .recorded_ns = @as(i64, @intCast(i)) * std.time.ns_per_ms,
+            .payload = &payloads[i],
+        };
+    }
+
+    var manual = Clock.Manual{ .now_ms = 0 };
+    var target = FakeTarget(u32){};
+    var loader = try ReplayFromLog.init(allocator, &manual, &records);
+    defer loader.deinit();
+    try loader.setCodec("a", U32Codec, u32);
+    try loader.bindDecoded("a", &target);
+
+    try std.testing.expectEqual(@as(usize, 3), loader.remaining()); // 0, 1, 2 — not the second 1
+    try std.testing.expectEqual(@as(usize, 3), try loader.replayAll());
+    try std.testing.expectEqualSlices(u32, &.{ 0, 10, 20 }, target.taken());
+    try std.testing.expectEqual(@as(u64, 1), loader.duplicateSeqs());
+    try std.testing.expectEqual(@as(usize, 0), loader.remaining());
+
+    // A window whose edge splits the duplicate pair: the earlier copy is before
+    // `from`, the later one is a duplicate the walk has not reached yet — and
+    // `remaining` says so either way.
+    var manual2 = Clock.Manual{ .now_ms = 0 };
+    var target2 = FakeTarget(u32){};
+    var split = try ReplayFromLog.init(allocator, &manual2, &records);
+    defer split.deinit();
+    try split.setCodec("a", U32Codec, u32);
+    try split.bindDecoded("a", &target2);
+    split.open(1, null);
+    try std.testing.expectEqual(@as(usize, 1), split.skippedBefore()); // seq 0
+    try std.testing.expectEqual(@as(usize, 2), split.remaining()); // 1 and 2; the second 1 is a duplicate-to-be
+    try std.testing.expectEqual(@as(usize, 2), try split.replayAll());
+    try std.testing.expectEqualSlices(u32, &.{ 10, 20 }, target2.taken());
+    try std.testing.expectEqual(@as(u64, 1), split.duplicateSeqs());
+
+    // Re-seeking recomputes rather than accumulates: the second `seekTo(0)`
+    // reports the same counts as the first, not a sum of both walks.
+    split.seekTo(0);
+    try std.testing.expectEqual(@as(usize, 0), split.skippedBefore());
+    try std.testing.expectEqual(@as(usize, 3), split.remaining());
+    try std.testing.expectEqual(@as(u64, 0), split.duplicateSeqs());
+    split.seekTo(0);
+    try std.testing.expectEqual(@as(usize, 3), split.remaining());
 }

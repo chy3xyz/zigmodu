@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+### 第 99 批：`ReplayFromLog` 补齐窗口/轨过滤（与 `Replayer` 同契约）+ CHANGELOG 陈旧 `[Unreleased]` 清理与防复发（**破坏性：否**）
+
+1. **`ReplayFromLog` 新增 `open(from, to?)` / `seekTo(from)` / `onlyTracks(ids)` / `clearTrackFilter()` /
+   `skipped()` / `skippedBefore()` / `skippedUnselected()`**——盘上重放从此能表达"从事故现场那段 seq
+   区间重放"（`replay --from-seq X --to-seq Y` 一类诉求的 API 形态），不必再由调用方手截记录切片。
+   契约与 `Replayer` 逐条对齐（`[from, to)`、空窗口是回答不是报错、`to` 是停不是过滤、重定位重算不累加、
+   未知 id 指名 `UnknownTrack`、选中未绑定仍拒）；实现是冻结切片上的单游标，不动 `Replayer` 一字。
+2. **两条交叉语义定死并有测试**：① 被滤掉的记录照样锚住 seq 链（`last_seq` 随跳过前进）——文件里*有*
+   这条记录，过滤不可能制造假洞；② 窗口左缘锚在窗口前最后一条记录——横跨窗口边缘的洞照样被拒
+   （fail-closed，`allowHoles()` 是调用方明确的"我知道"），而窗口在文件首条之前时维持"链从文件起点
+   开始"。为此 `pending_holes` 从"每步重算"改为"随走随折进、交付时结转"，配 `arrival_folded` 保证
+   "拒洞 → `allowHoles()` → 重试同一条"不重复折同一个洞；无窗口无过滤时与旧实现逐步等价（§13.10 的
+   7 条原样绿）。
+3. **`remaining()` 在 narrowing 下保持精确**（窗口内 ∧ 选中 ∧ 游标后 ∧ 排除尚未走到的重复——有序索引上
+   "将与前一个同 seq" ⇔ "将是重复"）；`isFullyBound()` 跟随过滤器（与 `Replayer` 同规）。
+4. **`delivery_log.zig` 文件头修正**："Wiring it to the recorder is a separate change" 已过时——接线
+   已在 §13.9（`drainTo`）/§13.10（`ReplayFromLog`）落地，文件头改记实际状态。`docs/RUNTIME.md`
+   新增 **§13.12**（窗口/过滤的设计、两条交叉语义、测试名与读数）。
+5. **CHANGELOG 治理**：清掉 `[0.33.0]` 历史段内残留的 **6 个** `## [Unreleased]` 子标题（当批 promote
+   只改第一处遗留的；曾误导一次外部评估把历史段的破坏性变更读成新版本的）；`scripts/release.sh`
+   新增防复发守卫——promote 前断言全文件**恰好一个** `[Unreleased]` 标题，否则列出全部行号并退出。
+
+读数：`ReplayFromLog` 聚焦 11/11 绿（7 条 §13.10 原样 + 4 条本刀新增）；`drainTo` 6/6、`Replayer` 5/5
+原样绿。
+
 ### 第 98 批：`PanicHook` 的广告接线在 0.17 下**编译不过**——`std.posix.write` 已移除，树内全程绿灯（**破坏性：否**）
 
 1. **真缺陷（用户报告核实）：`PanicHook.zig:68` 的 `writeStderr` 调了 `std.posix.write`，该函数在
@@ -4394,7 +4419,7 @@ body 没编码"的响应。红证据：把 `compressResponse` 挖空 → 12 条�
 （`/tmp/zigmodu_2pc_in_doubt.db`、`/tmp/zigzero_sqlx_stmt_test.db`），并发跑同一套件（第二个测试二进制、
 或同一工作树里的另一个代理）会互相 `deleteFile` 拆台——这正解释了并行时偶发的
 `TwoPhaseCommit: in-doubt` / `sqlite prepared statement` 失败。两处改为**按 pid 唯一**并保留了前后清理。
-## [Unreleased]
+
 
 ### soak 的 RSS 增长查明：**是测试分配器这条探针**，不是集群；门禁改成有意义的（**破坏性：否**）
 
@@ -4483,7 +4508,6 @@ RSS 预算从 128 收紧到 **48 MiB**（原来它是"量 Zig 调试 arena"的�
 `AGENTS.md` 与 `docs/ROUTE_TABLE.md` 的背压表补上 h2 一行：h2 跟随 H1 的限额/超时、**没有独立旋钮**，
 并标出"空闲超时与头列预算对 h2 是新行为"。
 
-## [Unreleased]
 
 ### 第 3 组：sqlx 游标所有权/闸门、两处配置串号、CSRF/CSP、web4 顺序与时钟、x402 台账语义（**破坏性：否**，含一处 fail-open 修复）
 
@@ -4551,7 +4575,6 @@ deadcode 全绿；`examples/web4` 的测试（含新 strict 门 403 断言）通
 PG 抽干改用 `PQcancel`（需要新增 libpq 绑定）；游标路径对熔断器/指标"隐形"
 （`queryCursorExPrimary` 不记 success/failure）；`queryScalar` 的 struct 分支仍是 `queryRow` 语义。
 
-## [Unreleased]
 
 ### 协议面加固：HTTP/2 三条「未认证单包打崩进程」、HPACK UAF、sqlx 两条 P0、challenge 弱熵（**破坏性：否**）
 
@@ -4621,7 +4644,6 @@ h2 仍缺"完整 dispatch 链路"的端到端用例（现有 4 条走内置 404 
 验证：全量 `-Ddb=all` **1645/1667（22 skipped，0 failed）**；`zig build check`/`check-version`/deadcode/
 fmt/yaml 全绿；`zig build soak-cluster` 通过（RSS max 66 MiB，预算 128）。
 
-## [Unreleased]
 
 ### 修 CI 红：`poll(&.{})` 在 Linux 上 EFAULT 直接 ABRT；`check-api` 在无 rg 的主机上失败（**破坏性：否**）
 
@@ -4649,7 +4671,6 @@ CI 那次构建的 codegen 下触发，所以"先红"这一步只有 CI 的栈�
 `zigmodu.http_server` 的 fixture，有 rg 与无 rg 两条路径都 exit 1 并打出报文；清理后 exit 0。
 
 
-## [Unreleased]
 
 ### zent 升到 v0.76.2：两个示例改 pin，并采用 0.76.0 的按驱动裁剪（**破坏性：否**）
 
@@ -4682,7 +4703,6 @@ CI 那次构建的 codegen 下触发，所以"先红"这一步只有 CI 的栈�
 "这个示例链哪些驱动"这一事实，而不是因为在本机量到了收益；注释与 `docs/ZENT.md` 都按实测写的。
 
 
-## [Unreleased]
 
 ### HTTP 服务端加固：长响应头曾静默丢整个响应、body 阶段零超时、读错误被吞（**破坏性：否**，行为修复 + 两个新配置/错误值）
 

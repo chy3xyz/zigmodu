@@ -7,8 +7,10 @@
 //! into. This file is that tier's durability half and nothing else. It knows
 //! nothing about `DeliveryLog`, `Track`, `Replayer` or the runtime's wiring —
 //! it appends *records* to segment files and reads them back, verifying what it
-//! reads. Wiring it to the recorder is a separate change with its own contract
-//! (the codec: a payload that leaves the process is bytes, not a live value).
+//! reads. The wiring landed in recorder.zig, on this file's terms (the codec: a
+//! payload that leaves the process is bytes, not a live value):
+//! `DeliveryLog.drainTo` writes through `Writer` (§13.9), and `ReplayFromLog`
+//! reads back what `scan` verified (§13.10).
 //!
 //! ## Why a new format instead of `src/core/eventbus/WAL.zig`
 //!

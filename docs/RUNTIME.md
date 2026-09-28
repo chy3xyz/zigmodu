@@ -2268,3 +2268,52 @@ e2e 同报 `expected .message, found .timer`）。
 **没做什么**：CLI / 保留 / 压实 / 加密压缩 / 跨进程（§13.9 D5、§13.10 D7 照旧）；`Recorder(E)`（HotBus
 发布流）不加种类；重放不把文件里的 kind 回写成目标运行时的投递种类（见上，这是决定不是遗漏）；
 `drainTo` 不对 kind 做额外校验 —— 它是 `enum(u16)`，能进 `Writer.append` 就一定是格式认识的值。
+
+### 13.12 盘上重放的窗口与轨过滤（`ReplayFromLog` 补齐 `Replayer` 的 narrowing 契约）：已补
+
+§13.10 落地时 `Replayer` 已有 `open`/`seekTo`/`onlyTracks` 而 `ReplayFromLog` 没有 —— "从事故现场那十分钟
+重放"（`--from-seq/--to-seq` 那一类诉求）在盘上这一侧只能靠调用方自己截记录切片。本节把它补齐：
+**同一契约，不同实现**（Replayer 是活环上的每轨游标归并；`ReplayFromLog` 是冻结切片上的一条 `seq` 序
+索引 + 单游标）。
+
+**新增**（`src/runtime/recorder.zig`，`Replayer` 签名/行为一字未动）：
+
+- `open(from, to?)` / `seekTo(from)`：`[from, to)` 窗口。`from >= to` 是空窗口（`remaining() == 0`，
+  是回答不是报错）；`to` 是**停**不是过滤 —— 窗口右缘之后的记录**不走也不计**（`Window.to` 的既有契约）。
+  重新定位是**重算不是累加**：洞/重复/跳过计数描述的是新位置开始的那一趟，倒带重放就是一次扫描。
+- `onlyTracks(ids)` / `clearTrackFilter()`：轨过滤。id 先对文件验证（文件没提过的 id 是
+  `error.UnknownTrack`，`refusal()` 指名 —— 不让"全过滤掉"看起来像个故意的过滤器）；空切片 = 全不选。
+  被滤掉的记录**跳过、游标前进、计数**（`skippedUnselected`）；未选中的轨不需要 codec 也不需要绑定，
+  但**选中的**轨照旧要（`UnboundTrack`/`CodecRequired`）—— 过滤收窄检查，不取消检查。
+- `skipped()` / `skippedBefore()` / `skippedUnselected()`：每一条记录落在且只落在一个桶里
+  （交付 / 窗口前 / 未选中 / 重复 / 窗口右缘之外不走不计）。
+
+**两条必须定死的交叉语义**（窗口/过滤 × 洞链）：
+
+1. **被滤掉的记录照样锚住 seq 链**（`last_seq` 随跳过前进）：文件里**有**这条记录，所以"在没选中的轨上"
+   永远不等于"文件里没有" —— 过滤不可能制造假洞。风险轨拿 0/2、账本轨拿 1/3/4 时只看账本，洞计数是 0。
+2. **窗口左缘的锚是窗口前最后一条记录**：定位时走过 `[0, from)` 的记录（计入 `skippedBefore`），链从那里
+   接续 —— 所以**横跨窗口边缘的洞照样被拒**（`open(6, null)` 而文件缺 3/4/5：第一步就
+   `error.LogHasHoles`，`refusalSeq() == 3`），fail-closed，`allowHoles()` 是调用方明确的"我知道"。
+   而窗口在文件首条记录之前（或没有窗口）时维持既有约定：**链从文件开始的地方开始**，之前没有"缺"。
+
+实现上一个值得记的点：洞的"发现"与"跨过"分离之后，跳过未选中记录时可能**已经**发现了洞但还没交付任何东西
+—— `pending_holes` 从"每步重算"改成"随走随折进、交付时结转到 `crossed_holes`"，配 `arrival_folded`
+标记保证"拒洞 → `allowHoles()` → 重试同一条"不会把同一个洞折两次。无窗口无过滤时与旧实现逐步等价
+（§13.10 的 6 条聚焦 + 1 条 e2e 原样绿）。
+
+`remaining()` 在 narrowing 下保持**精确**：窗口内、选中、游标之后，且排除尚未走到的重复（有序索引上
+"将与前一个同 seq" ⇔ "将是重复"），不是约数。`isFullyBound()` 跟随过滤器（与 `Replayer` 同规）。
+
+**测试名**（4 条，聚焦 `filter=ReplayFromLog` 11/11 绿，其中本刀 4 条 + §13.10 的 7 条原样绿）：
+`ReplayFromLog.open: only [from, to) is replayed, and what that passed over is counted`（窗口五态：
+正常 / 单条 / 空 / 倒置 / 重定位重算）·
+`ReplayFromLog.onlyTracks: the chain stays the file's, and what is filtered out is counted`（过滤不报假洞 +
+未知 id 指名 + 空过滤 + `isFullyBound` 跟随 + 选中未绑定仍拒 + 清过滤不回头）·
+`ReplayFromLog: a hole inside the window is refused — and one spanning the window's edge is named`（窗内洞、
+跨缘洞、"链从文件起点开始"三态）·
+`ReplayFromLog: remaining is exact with duplicates ahead, and repositioning recomputes`（dup 不进 remaining、
+窗口切开 dup 对、重复 seek 幂等）。
+
+**照旧没做**（§13.9 D5、§13.10 D7 不变）：边写边读、压实/保留、CLI、跨进程/跨机、压缩加密 ——
+窗口/过滤是**读者侧**能力，段格式一字未动。
