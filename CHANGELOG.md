@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.37.1] - 2026-09-29
 
 ### 第 106 批：`-Ddb=none` 下全套件挂死的隐患 —— `notify.zig` 的 webhook 测试（**破坏性：否**）
 
