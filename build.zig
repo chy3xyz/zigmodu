@@ -419,6 +419,35 @@ pub fn build(b: *std.Build) void {
     const soak_cluster_step = b.step("soak-cluster", "Run the 3-node cluster soak (raft + event bus, leader/fd/RSS invariants)");
     soak_cluster_step.dependOn(&run_soak_cluster.step);
 
+    // Cluster node harness (`zig build cluster-node`) — ONE cluster node as a
+    // standalone process: ClusterBootstrap + RaftElection over a real TCP
+    // transport + DistributedEventBus, argv-driven, logging single greppable
+    // lines (LEADER_ELECTED / RAFT_STATE / MESH / PEER_REPLY_REFUSED /
+    // SHUTDOWN) to stderr. `src/soak_cluster.zig` proves the stack in one
+    // process; this binary is what lets scripts/ci-mixed-version.sh run it
+    // *across* processes — three same-version nodes, and a v0.32.0 binary
+    // against master ones (the same source file cross-compiles into the
+    // v0.32.0 tree; see the file's header for the comptime version bridge).
+    const cluster_node_mod = b.createModule(.{
+        .root_source_file = b.path("src/cluster_node.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    cluster_node_mod.addImport("zigmodu", zigmodu_mod);
+    db_link.link(cluster_node_mod, b, target, features);
+
+    const cluster_node_exe = b.addExecutable(.{
+        .name = "cluster-node",
+        .root_module = cluster_node_mod,
+    });
+    // The mixed-version script runs the *installed* binary: the pinned
+    // toolchain's build runner drops args after `--`, and three nodes of a
+    // cluster must be launched as independent processes anyway.
+    b.installArtifact(cluster_node_exe);
+    const cluster_node_step = b.step("cluster-node", "Build the single-node cluster harness used by scripts/ci-mixed-version.sh (installed as zig-out/bin/cluster-node)");
+    cluster_node_step.dependOn(&b.addInstallArtifact(cluster_node_exe, .{}).step);
+
     // Long-horizon runtime harness (`zig build runtime-stress`). Sibling of
     // `soak`, and deliberately not a second one of it: `soak` is HTTP + tenant
     // isolation and never touches the runtime, while this one drives the
@@ -457,23 +486,24 @@ pub fn build(b: *std.Build) void {
     const stress_step = b.step("runtime-stress", "Run the long-horizon runtime harness (supervision tree, pools, timers, zero-allocation)");
     stress_step.dependOn(&run_stress.step);
 
-    // Compile-only gate for the three targets whose steps only *run* on the
+    // Compile-only gate for the targets whose steps only *run* on the
     // nightly `schedule` (or a manual `workflow_dispatch`): `soak`,
-    // `soak-cluster` and `runtime-stress`. On a push run nothing compiled them —
-    // `zig build test` builds its own root module, and these are three separate
-    // ones — so a compile error in any of them was invisible until 03:17 UTC,
-    // and stayed invisible on every day the nightly was cancelled. That is not
-    // hypothetical: `src/soak_cluster.zig` failed to build for days on Linux
-    // (`no field named 'd_name' in struct 'os.linux.dirent64'`, fixed in the
-    // batch-12 commit) and the only reason anyone saw it was one nightly going
-    // red. This step depends on the three *compile* steps and runs none of them,
+    // `soak-cluster`, `runtime-stress` and `cluster-node`. On a push run nothing
+    // compiled them — `zig build test` builds its own root module, and these are
+    // separate ones — so a compile error in any of them was invisible until
+    // 03:17 UTC, and stayed invisible on every day the nightly was cancelled.
+    // That is not hypothetical: `src/soak_cluster.zig` failed to build for days
+    // on Linux (`no field named 'd_name' in struct 'os.linux.dirent64'`, fixed
+    // in the batch-12 commit) and the only reason anyone saw it was one nightly
+    // going red. This step depends on the *compile* steps and runs none of them,
     // so the push gate pays seconds instead of the minutes a real soak costs.
     // `fuzz` needs no entry here: its step is `zig build test --fuzz=…`, i.e. the
     // root module push runs already compile.
-    const soak_compile_step = b.step("soak-compile", "Compile the nightly-only targets (soak, soak-cluster, runtime-stress) without running them");
+    const soak_compile_step = b.step("soak-compile", "Compile the nightly-only targets (soak, soak-cluster, runtime-stress, cluster-node) without running them");
     soak_compile_step.dependOn(&soak_tests.step);
     soak_compile_step.dependOn(&soak_cluster_tests.step);
     soak_compile_step.dependOn(&stress_exe.step);
+    soak_compile_step.dependOn(&cluster_node_exe.step);
 
     // The same file, compiled into `zig build test` with a *smoke* budget, so
     // the default suite covers the harness's code path and every check while the
@@ -641,4 +671,10 @@ pub fn build(b: *std.Build) void {
     // before `soak-compile` existed.
     const replay_inspect_tests = b.addTest(.{ .root_module = replay_inspect_mod });
     addTest(b, test_step, replay_inspect_tests, test_filter, test_skip_names, test_force_run, test_llvm_forced orelse false);
+
+    // `cluster-node` unit tests (argv parsing, hex keys, peer specs, frame-MAC
+    // verify) ride the default suite the same way — the multi-process runs
+    // themselves stay nightly-only in scripts/ci-mixed-version.sh.
+    const cluster_node_tests = b.addTest(.{ .root_module = cluster_node_mod });
+    addTest(b, test_step, cluster_node_tests, test_filter, test_skip_names, test_force_run, test_llvm_forced orelse false);
 }

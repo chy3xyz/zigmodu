@@ -1,5 +1,56 @@
 # Changelog
 
+## [Unreleased]
+
+### 第 106 批：`-Ddb=none` 下全套件挂死的隐患 —— `notify.zig` 的 webhook 测试（**破坏性：否**）
+
+1. **实测挂死链**：`zig build test -Ddb=none` 时 sqlite 未链接 → 该测试里
+   `sqlx.Client.connect()` 立即 `error.DriverNotEnabled` → `try` 提前返回 → 但服务线程已
+   spawn 且阻塞在**无超时 `accept()`** → `defer th.join()` 永等 → **整个套件挂死、零输出**
+   （sample 实测：主线程 `Thread.join`、服务线程 `__accept`）。CI 从不跑 `-Ddb=none` 的全量，
+   所以这个组合一直是哑弹；本次验收第 105 批时在本机踩中。
+2. **修法**：① 测试开头按编译期事实跳过 —— `sqlx.DriverFeatures.sqlite`（build_options 的
+   `enable_sqlite`，框架已有的公开口径）为假即 `SkipZigTest`；② 服务线程的 accept 前加
+   5 秒 `poll` 上界 —— 即使将来客户端侧再出别的故障，也是**测试失败**而不是套件挂死。
+3. **验证**：`-Ddb=none` 下该用例 SKIP（不再挂）；`-Ddb=sqlite` 下照常 PASS。
+
+### 第 105 批：B-11 落地 —— `cluster-node` 跨进程/跨版本集群对跑 harness（v0.32.0 ↔ master；**破坏性：否**）
+
+1. **新增 `src/cluster_node.zig`**（~900 行）：把"一个集群节点"做成独立进程 —— argv 传
+   id/raft 端口/bus 端口/peers/cluster_secret，经 `ClusterBootstrap` 起真实栈（Raft 真传输
+   入站监听 + bus 凭证握手），主循环驱动 `cluster.tick()`，leader 变化/mesh 连接与拒绝/关闭
+   全部打成单行可 grep 日志（`CN LEADER_ELECTED id=…`、`CN RAFT_STATE …`、`CN MESH …`、
+   `CN PEER_REPLY_REFUSED peer=…`、`CN SHUTDOWN clean`），SIGTERM/SIGINT 干净退出（exit 0）。
+   **同一份源码在 master 与 v0.32.0 两侧都能编译**：v0.32.0 缺的 API
+   （`BootstrapConfig.cluster_secret`、`bus.setOwnKey/setPeerKey/snapshotNodes`、
+   `inbound_idle_timeout_ms`）全部走 comptime 探测（`@hasField`/`@hasDecl`）桥接，
+   旧构建产出的节点说的恰好是旧线格式（裸帧、无握手，BOOT 行 `auth=unsupported`）。
+   **为什么**：`src/soak_cluster.zig` 的三节点同处一个进程，"新旧两个二进制对跑"从未被
+   执行过（v1.0-readiness-v0.35 B-11 的缺口）。
+2. **`build.zig` 新增 `cluster-node` step**（与 soak 同形态的独立根模块，产物装到
+   `zig-out/bin/cluster-node`；本工具链 `b.args` 已死，多进程对跑只能跑装出来的二进制）；
+   `soak-compile` 门禁把它一并编译（nightly-only 目标的编译错误不能再藏到夜里）。
+3. **新增 `scripts/ci-mixed-version.sh`**（真跑，非编译检查）：同版本段起 3 个 master 节点，
+   断言有界时间内恰一个 leader、三方 `LEADER_ELECTED` 同 id、`VIEW members=3`、bus mesh 全连、
+   日志复制到三方、SIGTERM 干净；随后 `git worktree` 拉 v0.32.0、注入 build 块编译旧二进制，
+   起 old+new 混合集群，断言：旧节点裸帧被新侧入站拒绝（`[raft] inbound frame not
+   authenticated` 持续累积）、leader 拒收旧节点裸回复（`CN PEER_REPLY_REFUSED`）、bus 握手
+   双向失败有日志、新侧两节点照常选主复制（`members=2`、日志 len 增长）、旧节点永不为 leader、
+   三方无 panic 且 SIGTERM 全部 exit 0。所有等待都是有界轮询（hang = 红），trap 清理
+   worktree/进程/临时目录。实测一轮 ~50s。
+4. **落地时抓到并修掉的两个真问题**（都在 harness 侧，框架代码零改动）：
+   ① v0.32.0 的 `PeerDiscovery` 早于 `id@host:port` 语法，peer id 落库为 `id@host` 无端口形式，
+   harness 传输的 resolve 需同时匹配两种形状（否则旧节点一票也发不出，混合段"拒绝证据"
+   反而收集不到）；② 两个阶段复用同一端口段会把前一段刚关的 bus 端口撞成 `AddressInUse`
+   （监听器无 SO_REUSEADDR，TIME_WAIT 残留）——同版本/混合两段改用不相交的端口块。
+5. **CI**：`soak` job（`schedule`/`workflow_dispatch` 才跑）新增 "Mixed-version cluster gate"
+   步骤，日志进 nightly artifact 包；脚本在浅克隆里会自取 `v0.32.0` tag。
+6. **文档三处**：`docs/dev/v1.0-readiness-v0.35.md` §七 加 B-11 跟进（判定保留复核时点原样）；
+   `src/soak_cluster.zig` 文件头"out of scope"句改指新 harness；`docs/DISTRIBUTED.md`
+   Multi-node 清单下加滚动升级段（认证线硬切换无协商是设计，指向证据脚本）。
+7. **单测 7 条挂默认套件**（argv 解析/hex 密钥/peer 语法/帧 MAC 验签；`tests_in_other_artifacts`
+   登记，`zig build test` 覆盖），多进程行为本身由脚本在夜间跑。
+
 ## [0.37.0] - 2026-09-29
 
 ### 第 104 批：`zig build zmodu -- …` 文档债收口 + todo 三代加历史快照头（**破坏性：否**）

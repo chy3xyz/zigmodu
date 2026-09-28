@@ -240,6 +240,10 @@ test "NotificationHub delivers to sink and outbox fallback" {
 test "NotificationHub webhook posts to loopback server" {
     const allocator = std.testing.allocator;
     if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    // `-Ddb=none` unlinks sqlite: `client.connect()` below fails fast with
+    // DriverNotEnabled — which used to leave the accept thread blocked and
+    // `defer th.join()` hanging the whole suite forever. Skip instead.
+    if (!@import("../data.zig").sqlx.DriverFeatures.sqlite) return error.SkipZigTest;
 
     const server_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
     var server = try server_addr.listen(std.testing.io, .{ .reuse_address = true });
@@ -252,6 +256,11 @@ test "NotificationHub webhook posts to loopback server" {
         len: *usize,
         mu: *std.Io.Mutex,
         fn run(ctx: *@This()) void {
+            // Bound the accept: a client-side failure must surface as a test
+            // failure (the expects below), never as a suite-wide hang in join.
+            var lfds = [_]std.posix.pollfd{.{ .fd = ctx.server.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+            _ = std.posix.poll(&lfds, 5000) catch return;
+            if (lfds[0].revents & std.posix.POLL.IN == 0) return;
             const accepted = ctx.server.accept(std.testing.io) catch return;
             defer accepted.close(std.testing.io);
             var total: usize = 0;

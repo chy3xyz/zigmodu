@@ -17,7 +17,9 @@
 //! **Scope: this is a concurrency/correctness soak, not a 24h longevity run;
 //! mixed-version (rolling-upgrade) pairs are out of scope here** — the bus
 //! wire format cuts over hard on purpose, so an old/new pair is a refused
-//! handshake by design, not a soak finding.
+//! handshake by design, not a soak finding. That pair has its own harness:
+//! `src/cluster_node.zig` (one node per process, cross-compilable against
+//! v0.32.0) driven by `scripts/ci-mixed-version.sh`.
 //!
 //! ## What it runs
 //!

@@ -328,6 +328,12 @@ defer allocator.free(json);               // 挂到 /cluster/health 或 metrics 
 6. ✅ `KafkaConnector` — Kafka wire client for **RobustMQ** (`initWithIo`, default `127.0.0.1:9092`)
 7. 🔬 WAL/DLQ — durability layer for event bus
 
+> **滚动升级（新旧版本混跑）**：集群认证线（raft 帧 HMAC + bus 握手）是**硬切换、无协商** ——
+> v0.32.x 及更早的裸线节点发来的帧会被新节点**拒绝**（这是设计，不是回归），混跑期间旧节点
+> 选不了主、进不了 membership。对跑证据与 harness：`src/cluster_node.zig` +
+> `scripts/ci-mixed-version.sh`（同版本三节点选主/复制 + v0.32.0↔master 混合对跑；夜间 CI
+> `soak` job 的 "Mixed-version cluster gate" 步骤，见 `docs/dev/v1.0-readiness-v0.35.md` B-11）。
+
 ### Recommended cluster size: 3-7 nodes
 
 ### RobustMQ messaging

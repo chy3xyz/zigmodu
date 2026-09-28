@@ -860,6 +860,20 @@ jobs:
         # cannot: claims, ready-ring fairness, timer ownership under churn.
         run: zig build runtime-stress -Druntime-stress-duration-ms=60000 2>&1 | tee "$RUNNER_TEMP/nightly-logs/runtime-stress.log"
 
+      - name: Mixed-version cluster gate (v0.32.0 node vs master nodes)
+        # B-11 (docs/dev/v1.0-readiness-v0.35.md): the cluster stack's only
+        # cross-process, cross-version exercise. Builds zig-out/bin/cluster-node
+        # from master, runs a 3-node same-version cluster (one leader, one
+        # membership, replicated log, clean SIGTERM), then builds the SAME
+        # harness source against the v0.32.0 tag in a scratch worktree and runs
+        # old+new mixed: the master nodes must visibly refuse the old one's
+        # frames/handshakes while their own quorum elects and replicates — no
+        # panic, no hang (every wait is a bounded poll). The script fetches the
+        # tag itself when the clone is shallow.
+        run: |
+          mkdir -p "$RUNNER_TEMP/nightly-logs"
+          bash scripts/ci-mixed-version.sh 2>&1 | tee "$RUNNER_TEMP/nightly-logs/mixed-version.log"
+
       - name: Fuzz (bounded)
         # `--fuzz` with no limit opens the webui and never exits, so the bound is
         # mandatory. It is also incompatible with `-Dtest-filter` (the filter

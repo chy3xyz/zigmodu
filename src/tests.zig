@@ -450,6 +450,7 @@ const tests_in_other_artifacts = [_][]const u8{
     "soak.zig", // addExecutable in build.zig (`zig build soak`)
     "soak_cluster.zig", // addExecutable in build.zig (`zig build soak-cluster`)
     "replay_inspect.zig", // addTest in build.zig (`zig build replay-inspect`)
+    "cluster_node.zig", // addTest in build.zig (`zig build cluster-node`)
 };
 
 // The gate that keeps the list above honest: `_ = @import(…)` inside the
