@@ -1,4 +1,4 @@
-# ZigModu v0.35.1
+# ZigModu v0.36.0
 
 **Compile-time modular application framework + worker-oriented execution runtime, for Zig 0.17.**
 

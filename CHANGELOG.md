@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.36.0] - 2026-09-28
 
 ### 第 97 批：mysql live 测试的双 `-e`（CI ERROR 1049）——`buildMysqlArgv` 契约的调用方违规，stub 钉死全 argv（**破坏性：否**）
 
