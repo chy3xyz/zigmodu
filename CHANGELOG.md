@@ -2,6 +2,49 @@
 
 ## [Unreleased]
 
+### 第 94 批：CI 红的两条活库测试（一条真漏 + 一条参数被拒）；跳过的名字进整跑输出；`market.zig` 两处（**破坏性：否**）
+
+1. **`Test (DB=postgres)` 红 = 真漏，根因是"按文本判断所有权"。** `parseDsn` 把 DSN 里写出来的
+   host 复制成**自持**的 9 字节 buffer，而释放守卫写的是 `!std.mem.eql(u8, db.host, "localhost")`
+   —— **文本相同，但默认值是借用的 comptime 字面量、DSN 写出来的副本是有主的**。该路径上两次
+   `parseDsn` 各漏一个 9 字节，正是 CI 那句 `leaked 2 allocations` + `len: 9 (0x9)`。
+   修法：默认 host 提成命名常量 `default_host`，新增**唯一一份** `DbConnection.deinit`，规则写进
+   doc —— `host` 只在**指针仍等于 `default_host`** 时不释放；`sqlite_path`/`database` 在 sqlite
+   DSN 上是同一个 buffer，只释放一次。三个调用点改用它。本地同形红证据（把 deinit 换回文本比较）：
+   `leaked [len 9] at main.zig:2823 parseDsn host = try allocator.dupe(...)`。
+   **教训与前两批同源**：所有权要按"身份"判，不能按"值"判 —— 与第 90 批（门禁判据必须对着编译器
+   的答案）、第 93 批（循环里 errdefer 是每轮作用域）是同一条。
+2. **`Test (DB=mysql)` 红 = 参数被拒，不是漏。** `buildMysqlArgv` 把 database 当**唯一位置参数**
+   放在 `-e` 之前；MySQL 客户端遇到第一个非选项参数后就不再解析选项，于是追加的 `-e <query>` 变成
+   第二个位置参数 → "too many arguments" → 打整段 help、exit 1。改用 `--database={s}`，整条 argv
+   再无裸位置参数（与顺序无关）。**这条只能靠下一轮 CI 确认真 mariadb/MySQL 8.0 的行为**（本地只有
+   9.3 客户端，它会做 argv permutation，老形态在本地也能解析）。顺带把探针表的 `defer drop` 提到
+   CREATE **之前**，失败/断言路径也会清理。
+   同类未修（如实报告）：`importSqlToDatabase` 的 mysql 分支既留了位置参数、`-e` 里又用客户端命令
+   `source`（`-e` 下不生效），真修要把临时文件接到 stdin，超出本次 CI 红范围。
+3. **跳过的名字现在进整跑输出，但根因与预想不同**：不加 `-Dtest-filter=` 时工件用 **Zig 自带
+   runner**，走 `--listen=-` 协议**只计数** —— 名字在整条链上**从未存在**，不是被 wrapper 丢掉。
+   所以做成 opt-in：`scripts/test-runner.zig` 增加 server 模式（metadata/run_test/exit，计数仍归
+   build runner，退出前把 skip 名单打到 stderr；`.start_fuzzing` 明确失败退出，不把 `--fuzz` 弄坏），
+   `build.zig` 新增 `-Dtest-skip-names=true`（默认路径一行未动），`scripts/test-fast.sh` 每次传它、
+   并把源判定改成只认 `selected N of M` 摘要行（否则 skip 名单会把 `source=` 从 `build-summary`
+   翻成 `zm-test-runner`，破坏 `zm-test-count:` 那几行）。验收：整跑末尾按二进制分组列出全部 60 个
+   名字，且计数与默认 runner 的跑法**逐字相同**（`2190/2250 · 60 skipped`）。
+4. **`market.zig` 两处**：`dupEntry`（tags 循环改**计数 guard**，九个字段各自 local + errdefer，
+   `return .{…}` 只做交接）、append 站点（抽 `appendMissingEntries`，`var copy = try dupEntry(...);
+   errdefer copy.deinit(...); try base.entries.append(...)`）。红证据：`fail_index 2/11 leaked [len 3]`
+   + append 侧 `fail_index 36/37` 共 7 处。
+   **一条测试教训（实测）**：给 `append` 做 `checkAllAllocationFailures` 扫描时，如果 ArrayList 还
+   有富余容量，`append` **根本不调分配器** —— 旧形态也能 exit 0，等于什么都没覆盖。必须先
+   `shrinkAndFree` 把容量压到长度。
+
+读数：整跑 **2190/2250 passed · 60 skipped · 0 failed**（`zm-test-count:` 行的 `source=` 仍是
+`build-summary`）；`check-test-collection` 两行 OK（`tools/zmodu` 149/151，2 skip = 那两条门控）；
+`check-production` / `fmt` 全 OK。
+
+**未做**：`doctor.zig:249` / `runtime.zig:494,513` 的 FS 走查扫描（预算给了 CI 红与上面两项验证，
+没有留下半成品）。
+
 ### 第 93 批：`retriever.add` 与另外 8 处的真漏；`ai_cli` 的 arena 证据；两条门禁的口径写进文档；CI 补两行 env（**破坏性：否**）
 
 1. **真漏，修了 11 处**（全是调用方给的非 arena allocator，没有一处是"已经在守卫里"）：

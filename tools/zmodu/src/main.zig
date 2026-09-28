@@ -2754,6 +2754,14 @@ fn inferModuleName(allocator: std.mem.Allocator, table_name: []const u8, strip_p
     return try allocator.dupe(u8, table_name);
 }
 
+/// The host `parseDsn` falls back to when the DSN carries none. Named so the two
+/// meanings of "localhost" stay distinguishable: this literal is **borrowed**,
+/// while a host the DSN spells out is **owned** — and a free-guard that compares
+/// the *text* cannot tell them apart, which is exactly what leaked the CI DSN
+/// `postgres://postgres@localhost:5432/postgres` (two 9-byte buffers, one per
+/// `parseDsn` call, reported by the pg job as `leaked 2 allocations`).
+const default_host = "localhost";
+
 /// Parsed database connection info from --from-db DSN.
 const DbConnection = struct {
     driver: []const u8, // "sqlite", "postgresql", "mysql"
@@ -2763,12 +2771,33 @@ const DbConnection = struct {
     pass: []const u8,
     database: []const u8,
     sqlite_path: []const u8,
+
+    /// Release everything `parseDsn` allocated. One implementation, because three
+    /// callers hand-rolling this list is how the CI leak stayed invisible: each
+    /// copy skipped a host whose text reads `localhost`, but `parseDsn` dups the
+    /// host whenever the DSN spells it out. The rule here is the ownership rule,
+    /// not the text: `driver` is a literal, `host` is the `default_host` literal
+    /// only when the DSN had no host, and every other non-empty field is ours.
+    ///
+    /// `sqlite_path` and `database` alias for sqlite DSNs (`database =
+    /// sqlite_path` below), so that buffer is released through `sqlite_path`
+    /// alone; for postgres/mysql `sqlite_path` is empty and `database` is freed.
+    fn deinit(self: *const DbConnection, allocator: std.mem.Allocator) void {
+        if (self.host.ptr != default_host.ptr) allocator.free(self.host);
+        if (self.user.len > 0) allocator.free(self.user);
+        if (self.pass.len > 0) allocator.free(self.pass);
+        if (self.sqlite_path.len > 0) {
+            allocator.free(self.sqlite_path);
+        } else if (self.database.len > 0) {
+            allocator.free(self.database);
+        }
+    }
 };
 
 /// Parse a DSN string: sqlite:///path, postgresql://user:pass@host:port/db, mysql://user:pass@host:port/db
 fn parseDsn(allocator: std.mem.Allocator, dsn: []const u8) !DbConnection {
     var driver: []const u8 = "sqlite";
-    var host: []const u8 = "localhost";
+    var host: []const u8 = default_host;
     var port: u16 = 5432;
     var user: []const u8 = "";
     var pass: []const u8 = "";
@@ -2869,15 +2898,7 @@ fn writeTempSql(io: std.Io, allocator: std.mem.Allocator, sql: []const u8) ![]co
 /// Import SQL file content into database via CLI tools.
 fn importSqlToDatabase(io: std.Io, allocator: std.mem.Allocator, dsn: []const u8, sql: []const u8) !void {
     const db = try parseDsn(allocator, dsn);
-    defer {
-        if (!std.mem.eql(u8, db.driver, "sqlite")) {
-            if (db.user.len > 0) allocator.free(db.user);
-            if (db.pass.len > 0) allocator.free(db.pass);
-            if (db.host.len > 0 and !std.mem.eql(u8, db.host, "localhost")) allocator.free(db.host);
-            if (db.database.len > 0) allocator.free(db.database);
-        }
-        if (db.sqlite_path.len > 0) allocator.free(db.sqlite_path);
-    }
+    defer db.deinit(allocator);
 
     const tmp_file = try writeTempSql(io, allocator, sql);
     defer {
@@ -2928,15 +2949,7 @@ fn importSqlToDatabase(io: std.Io, allocator: std.mem.Allocator, dsn: []const u8
 /// Introspect database schema via CLI tools → TableDef[] for code generation.
 fn introspectDatabase(io: std.Io, allocator: std.mem.Allocator, dsn: []const u8) ![]TableDef {
     const db = try parseDsn(allocator, dsn);
-    defer {
-        if (!std.mem.eql(u8, db.driver, "sqlite")) {
-            if (db.user.len > 0) allocator.free(db.user);
-            if (db.pass.len > 0) allocator.free(db.pass);
-            if (db.host.len > 0 and !std.mem.eql(u8, db.host, "localhost")) allocator.free(db.host);
-            if (db.database.len > 0) allocator.free(db.database);
-        }
-        if (db.sqlite_path.len > 0) allocator.free(db.sqlite_path);
-    }
+    defer db.deinit(allocator);
 
     if (std.mem.eql(u8, db.driver, "sqlite")) {
         return introspectDatabaseSqlite(io, allocator, db.sqlite_path);
@@ -3340,7 +3353,16 @@ fn buildMysqlArgv(allocator: std.mem.Allocator, host: []const u8, port: u16, use
         const pass_arg = try std.fmt.allocPrint(allocator, "-p{s}", .{pass});
         try argv.pushOwned(allocator, pass_arg);
     }
-    try argv.push(allocator, database);
+    // The database goes in as an option, never as the one positional argument:
+    // MySQL's client does not permute argv past the first non-option argument, so
+    // with a bare `<db>` here the `-e <query>` every caller appends behind it
+    // counts as two more positionals and the client answers with its **help text
+    // and exit 1** (no error line — measured: `/usr/bin/mysql 8.0.46` in CI, and
+    // reproduced here with an extra positional on the 9.3 client, which prints the
+    // same banner+usage block). `--database=<name>` leaves every element an
+    // option, which is what makes the callers' trailing `-e` order-independent.
+    const db_arg = try std.fmt.allocPrint(allocator, "--database={s}", .{database});
+    try argv.pushOwned(allocator, db_arg);
     try argv.push(allocator, "-e");
     return argv;
 }
@@ -10700,14 +10722,11 @@ fn isSqliteCliAvailable(allocator: std.mem.Allocator, io: std.Io) bool {
 fn liveIntrospectionRoundTrip(allocator: std.mem.Allocator, io: std.Io, dsn: []const u8) !void {
     const probe = "zm_introspect_probe";
     const db = try parseDsn(allocator, dsn);
-    defer {
-        if (!std.mem.eql(u8, db.driver, "sqlite")) {
-            if (db.user.len > 0) allocator.free(db.user);
-            if (db.pass.len > 0) allocator.free(db.pass);
-            if (db.host.len > 0 and !std.mem.eql(u8, db.host, "localhost")) allocator.free(db.host);
-            if (db.database.len > 0) allocator.free(db.database);
-        }
-    }
+    // `DbConnection.deinit` is the only place that knows the rule (its doc says
+    // why): this call used to carry a hand-rolled copy that skipped a
+    // `localhost` host, which is the leak the pg job reported — and the copy here
+    // never freed `sqlite_path` at all.
+    defer db.deinit(allocator);
     const is_mysql = std.mem.eql(u8, db.driver, "mysql");
 
     const drop_sql = try std.fmt.allocPrint(allocator, "DROP TABLE IF EXISTS {s}", .{probe});
@@ -10734,15 +10753,11 @@ fn liveIntrospectionRoundTrip(allocator: std.mem.Allocator, io: std.Io, dsn: []c
         }
     };
 
-    if (is_mysql) {
-        try run_query.mysql(allocator, io, db, drop_sql);
-        try run_query.mysql(allocator, io, db, ddl);
-    } else {
-        try run_query.postgres(allocator, io, db, drop_sql);
-        try run_query.postgres(allocator, io, db, ddl);
-    }
-    // Drop even when the assertions below fail: a leftover probe would make the
-    // next run's `CREATE TABLE` fail (and leave junk in the database).
+    // Register the cleanup **before** the CREATE: a leftover probe would make the
+    // next run's `CREATE TABLE` fail (and leave junk in the database), and the
+    // initial drop above already made this idempotent, so it can run on every
+    // exit path — a failed CREATE included. It also runs when the assertions
+    // below fail.
     defer {
         if (is_mysql) {
             run_query.mysql(allocator, io, db, drop_sql) catch |err|
@@ -10752,13 +10767,58 @@ fn liveIntrospectionRoundTrip(allocator: std.mem.Allocator, io: std.Io, dsn: []c
                 std.debug.print("zmodu tests: probe cleanup failed: {s}\n", .{@errorName(err)});
         }
     }
-
+    if (is_mysql) {
+        try run_query.mysql(allocator, io, db, drop_sql);
+        try run_query.mysql(allocator, io, db, ddl);
+    } else {
+        try run_query.postgres(allocator, io, db, drop_sql);
+        try run_query.postgres(allocator, io, db, ddl);
+    }
     const tables = try introspectDatabase(io, allocator, dsn);
     defer freeTableDefs(allocator, tables);
     const probe_row = findTable(tables, probe) orelse return error.ProbeTableMissing;
     try std.testing.expectEqual(@as(usize, 2), probe_row.columns.len);
     try std.testing.expectEqual(@as(usize, 1), probe_row.foreign_keys.len);
     try std.testing.expectEqualStrings(probe, probe_row.foreign_keys[0].ref_table);
+}
+
+// The leak the pg job reported (`leaked 2 allocations`, both `len: 9 (0x9)`)
+// came from the two `parseDsn` calls on that test's path: the CI DSN spells its
+// host out as `localhost`, so the host is a *copy* — while every caller's
+// hand-rolled free-list skipped a host whose text reads `localhost`, treating it
+// as the (borrowed) default. That ownership distinction is the one
+// `DbConnection.deinit` now encodes, so it is what this test pins down, on the
+// DSNs the two CI jobs actually use.
+test "parseDsn/deinit: a spelled-out host is ours even when it reads localhost" {
+    const allocator = std.testing.allocator;
+    // CI: ZMODU_TEST_PG_URL — the 9-byte buffer that leaked twice per test run.
+    var db = try parseDsn(allocator, "postgres://postgres@localhost:5432/postgres");
+    defer db.deinit(allocator);
+    try std.testing.expectEqualStrings("localhost", db.host);
+    try std.testing.expectEqualStrings("postgres", db.user);
+    try std.testing.expectEqualStrings("postgres", db.database);
+    try std.testing.expectEqual(@as(u16, 5432), db.port);
+
+    // The implicit-host form: here `host` really is the borrowed default, so
+    // freeing it would be an invalid free rather than a leak.
+    var no_host = try parseDsn(allocator, "postgres://app/orders");
+    defer no_host.deinit(allocator);
+    try std.testing.expectEqualStrings("localhost", no_host.host);
+    try std.testing.expectEqualStrings("app", no_host.user);
+
+    // CI: ZMODU_TEST_MYSQL_URL.
+    var my = try parseDsn(allocator, "mysql://root:secret@127.0.0.1:3306/zigzero_test");
+    defer my.deinit(allocator);
+    try std.testing.expectEqualStrings("secret", my.pass);
+    try std.testing.expectEqualStrings("127.0.0.1", my.host);
+    try std.testing.expectEqual(@as(u16, 3306), my.port);
+
+    // sqlite: `database` aliases `sqlite_path`, so that buffer has to be
+    // released exactly once — twice would be a double free.
+    var sq = try parseDsn(allocator, "sqlite:///tmp/zmodu_contract.db");
+    defer sq.deinit(allocator);
+    try std.testing.expectEqualStrings("sqlite", sq.driver);
+    try std.testing.expect(sq.database.ptr == sq.sqlite_path.ptr);
 }
 
 // `sqlite3` is an external CLI, so this skips where it is missing instead of
@@ -10951,9 +11011,15 @@ test "buildMysqlArgv owns every element, -p<pass> included" {
     var clone = try argv.clone(allocator);
     clone.deinit(allocator);
 
-    const want = [_][]const u8{ "mysql", "-h", "127.0.0.1", "-P", "3306", "-u", "root", "-N", "-B", "-ps3cret", "shop", "-e" };
+    const want = [_][]const u8{ "mysql", "-h", "127.0.0.1", "-P", "3306", "-u", "root", "-N", "-B", "-ps3cret", "--database=shop", "-e" };
     try std.testing.expectEqual(want.len, argv.args.items.len);
     for (want, argv.args.items) |expected, actual| try std.testing.expectEqualStrings(expected, actual);
+    // Nothing here may be a bare *positional*: the callers append `-e <query>`
+    // behind it, and the client stops option parsing at the first non-option
+    // argument — a bare `<db>` makes that query two more positionals, and the
+    // client answers with its help text and exit 1 instead of running SQL. (The
+    // database is in the list above as `--database=shop`, which is the point.)
+    for (argv.args.items) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "shop"));
 }
 
 test "buildMysqlArgv: no empty password argument" {

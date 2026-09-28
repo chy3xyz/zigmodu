@@ -35,6 +35,29 @@
 //! parsers in `scripts/test-fast.sh` key on `selected N of M tests`, so extra
 //! lines in that family are ignored for counting and echoed at the end of a run.
 //!
+//! ## Server mode (`--listen=-`), for unfiltered runs
+//!
+//! A plain `zig build test` never names a skipped test, and the reason is not
+//! this runner: without `-Dtest-filter=` the artifacts keep Zig's own runner,
+//! the build runner drives it over the internal protocol (`--listen=-`) and
+//! **counts** the results itself — it prints `1912 pass, 59 skip (1971 total)`
+//! and a skip is only a `u2` in a result message, so no name is ever written
+//! anywhere. Measured on this repo: the unfiltered log carries the counts and
+//! zero `…SKIP` lines, so nothing downstream can recover the names.
+//!
+//! Server mode below closes that gap without moving the counts: this runner
+//! speaks the same protocol, so the build runner still counts and prints the
+//! same summary — `zm-test-count:` lines and their `source=build-summary` stay
+//! byte-identical — while this process prints the skipped names to stderr on its
+//! way out. `scripts/test-fast.sh` echoes that block, so the aggregate
+//! full-suite output names every skipped test.
+//!
+//! It is opt-in (`-Dtest-skip-names=true` in build.zig) because fuzz mode needs
+//! runner features this file deliberately does not implement: `.start_fuzzing`
+//! hits the `else` arm and exits 1 with a message instead of pretending. So
+//! `zig build test --fuzz=…` keeps Zig's runner, which is also why the default
+//! wiring is untouched.
+//!
 //! Modeled on the compiler's default runner (`lib/compiler/test_runner.zig`,
 //! `mainTerminal`) so per-test allocator/io setup — and therefore leak
 //! detection — behaves the same. Only the default (unfiltered) path is
@@ -62,6 +85,16 @@ pub const std_options: std.Options = .{
 var log_err_count: usize = 0;
 var fba_buffer: [8192]u8 = undefined;
 
+// Server-mode (`--listen=-`) stdio. The buffers and the reader/writer pair live
+// for the whole process, exactly as in the compiler's own runner: `std.zig.Server`
+// holds pointers into them, and every `serve…` call flushes, so nothing here
+// needs an explicit teardown.
+var stdin_buffer: [4096]u8 = undefined;
+var stdout_buffer: [4096]u8 = undefined;
+var stdin_reader: std.Io.File.Reader = undefined;
+var stdout_writer: std.Io.File.Writer = undefined;
+const runner_io: std.Io = std.Io.Threaded.global_single_threaded.io();
+
 /// `test { … }` blocks have no name, so they have no name for a filter to
 /// match. Zig names them `test_0`, `test_1`, … inside their file and the runner
 /// sees the file-qualified form (`root.test_0`). Detecting that shape is what
@@ -85,6 +118,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         @panic("unable to parse command line arguments");
 
     var filter: ?[]const u8 = null;
+    var server_mode = false;
     for (args[1..]) |arg| {
         if (std.mem.startsWith(u8, arg, "--filter=")) {
             filter = arg["--filter=".len..];
@@ -92,10 +126,19 @@ pub fn main(init: std.process.Init.Minimal) void {
             testing.random_seed = std.fmt.parseUnsigned(u32, arg["--seed=".len..], 0) catch
                 @panic("unable to parse --seed command line argument");
         } else if (std.mem.eql(u8, arg, "--listen=-")) {
-            @panic("the zigmodu test runner is used in .simple mode; --listen=- is not supported");
+            server_mode = true;
         }
         // Anything else (e.g. `--cache-dir=`) is accepted and ignored, so the
         // runner keeps working if the build system starts passing more flags.
+    }
+
+    if (server_mode) {
+        // The build runner counts the results over the protocol; this mode only
+        // adds the skipped names to stderr (see the module doc).
+        mainServer(init) catch |err| {
+            std.debug.print("zm-test-runner: internal failure: {t}\n", .{err});
+            std.process.exit(1);
+        };
     }
 
     const test_fn_list = builtin.test_functions;
@@ -206,13 +249,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         }
     }
 
-    if (skip_count != 0) {
-        std.debug.print("zm-test-runner: skipped {d} test(s) — each returned error.SkipZigTest:\n", .{skip_count});
-        for (skipped_names.items) |name| std.debug.print("zm-test-runner:   {s}\n", .{name});
-        if (skipped_names_oom) {
-            std.debug.print("zm-test-runner:   (list truncated: out of memory while collecting names)\n", .{});
-        }
-    }
+    printSkippedBlock(skip_count, skipped_names.items, skipped_names_oom);
     skipped_names.deinit(std.heap.page_allocator);
 
     if (filter) |f| {
@@ -240,10 +277,159 @@ pub fn main(init: std.process.Init.Minimal) void {
     }
 }
 
+/// The one-line-per-name block that turns a `skipped=` drift into a set
+/// difference. Both modes print it through here so the two can never drift
+/// apart: server mode prints it just before `exit`, and `scripts/test-fast.sh`
+/// keys its echo on the `zm-test-runner: ` prefix alone.
+fn printSkippedBlock(skip_count: usize, names: []const []const u8, names_oom: bool) void {
+    if (skip_count == 0) return;
+    std.debug.print("zm-test-runner: skipped {d} test(s) — each returned error.SkipZigTest:\n", .{skip_count});
+    for (names) |name| std.debug.print("zm-test-runner:   {s}\n", .{name});
+    if (names_oom) {
+        std.debug.print("zm-test-runner:   (list truncated: out of memory while collecting names)\n", .{});
+    }
+}
+
+/// Drive the suite over the build system's test protocol (`--listen=-`), the one
+/// `zig build test` uses when the artifact keeps Zig's own runner. Modeled on the
+/// compiler's runner (`lib/compiler/test_runner.zig`, `mainServer`) so the build
+/// runner's counting, time limits, restart-after-crash and leak/bookkeeping
+/// behavior are unchanged; the only addition is the skipped-name block printed
+/// on `.exit` (see the module doc for why the plain path cannot do this).
+fn mainServer(init: std.process.Init.Minimal) !void {
+    @disableInstrumentation();
+
+    stdin_reader = .initStreaming(.stdin(), runner_io, &stdin_buffer);
+    stdout_writer = .initStreaming(.stdout(), runner_io, &stdout_buffer);
+    var server: std.zig.Server = .{
+        .in = &stdin_reader.interface,
+        .out = &stdout_writer.interface,
+    };
+    try server.serveStringMessage(.zig_version, builtin.zig_version_string);
+
+    // Names are pointers into `builtin.test_functions`, which lives for the whole
+    // process; only the index bookkeeping is allocated, out of `page_allocator`,
+    // so the leak-checked per-test allocator is never touched.
+    var skipped_names: std.ArrayListUnmanaged([]const u8) = .empty;
+    var skipped_names_oom = false;
+    var skip_count: usize = 0;
+
+    while (true) {
+        const hdr = try server.receiveMessage();
+        switch (hdr.tag) {
+            .exit => {
+                // The build runner sends this once it has requested every test.
+                // Exit 0 unconditionally: *it* owns the verdict (it fails the step
+                // from the result messages and from this exit status).
+                printSkippedBlock(skip_count, skipped_names.items, skipped_names_oom);
+                skipped_names.deinit(std.heap.page_allocator);
+                std.process.exit(0);
+            },
+            .query_test_metadata => {
+                var sa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
+                defer if (sa.deinit() != 0) @panic("internal test runner memory leak");
+                const gpa = sa.allocator();
+
+                var string_bytes: std.ArrayList(u8) = .empty;
+                defer string_bytes.deinit(gpa);
+                try string_bytes.append(gpa, 0); // Reserve 0 for null.
+
+                const test_fn_list = builtin.test_functions;
+                const names = try gpa.alloc(u32, test_fn_list.len);
+                defer gpa.free(names);
+                const expected_panic_msgs = try gpa.alloc(u32, test_fn_list.len);
+                defer gpa.free(expected_panic_msgs);
+
+                for (test_fn_list, names, expected_panic_msgs) |test_fn, *name, *expected_panic_msg| {
+                    name.* = @intCast(string_bytes.items.len);
+                    try string_bytes.appendSlice(gpa, test_fn.name);
+                    try string_bytes.append(gpa, 0);
+                    expected_panic_msg.* = 0;
+                }
+
+                try server.serveTestMetadata(.{
+                    .names = names,
+                    .expected_panic_msgs = expected_panic_msgs,
+                    .string_bytes = string_bytes.items,
+                });
+            },
+            .run_test => {
+                testing.environ = init.environ;
+                testing.allocator_instance = .init(std.heap.page_allocator, .{
+                    .canary = 0xc3a701ba,
+                    .check_write_after_free = true,
+                });
+                testing.io_instance = .init(testing.allocator, .{
+                    .argv0 = .init(init.args),
+                    .environ = init.environ,
+                });
+                log_err_count = 0;
+                const index = try server.receiveBody_u32();
+                const test_fn = builtin.test_functions[index];
+
+                // Tells the build runner the clock for this test starts now, so a
+                // `--test-timeout` is not charged for process startup.
+                try server.serveStringMessage(.test_started, &.{});
+
+                const TestResults = std.zig.Server.Message.TestResults;
+                const status: TestResults.Status = if (test_fn.func()) |_|
+                    .pass
+                else |err| switch (err) {
+                    error.SkipZigTest => .skip,
+                    else => s: {
+                        if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
+                        break :s .fail;
+                    },
+                };
+                if (status == .skip) {
+                    skip_count += 1;
+                    if (!skipped_names_oom) {
+                        skipped_names.append(std.heap.page_allocator, test_fn.name) catch {
+                            skipped_names_oom = true;
+                        };
+                    }
+                }
+                testing.io_instance.deinit();
+                const leak_count = testing.allocator_instance.deinit();
+                try server.serveTestResults(.{
+                    .index = index,
+                    .flags = .{
+                        .status = status,
+                        // `--fuzz` drives fuzzing through a separate pass, which
+                        // needs the `.start_fuzzing` message below; a normal run
+                        // never marks a test as a fuzz target.
+                        .fuzz = false,
+                        .log_err_count = std.math.lossyCast(
+                            @FieldType(TestResults.Flags, "log_err_count"),
+                            log_err_count,
+                        ),
+                        .leak_count = std.math.lossyCast(
+                            @FieldType(TestResults.Flags, "leak_count"),
+                            leak_count,
+                        ),
+                    },
+                });
+            },
+            else => {
+                // `.start_fuzzing` lands here (and any protocol message this
+                // runner does not implement). Failing loudly beats a run that
+                // silently fuzzes nothing: build.zig only wires this runner when
+                // `-Dtest-skip-names=true` is passed, and `--fuzz` is meant to
+                // keep Zig's own runner.
+                std.debug.print(
+                    "zm-test-runner: unsupported build-system message 0x{x} — this runner does not implement fuzzing; drop -Dtest-skip-names when passing --fuzz\n",
+                    .{@backingInt(hdr.tag)},
+                );
+                std.process.exit(1);
+            },
+        }
+    }
+}
+
 /// Entry point the compiler-generated code references whenever the suite
 /// contains `std.testing.fuzz` blocks — without this export the filtered
 /// build fails to compile (`root ... has no member named 'fuzz'`). Actual
-/// fuzzing is not available here (`.simple` wiring); mirror the default
+/// fuzzing is not available here (`.simple`/server mode); mirror the default
 /// runner's non-fuzz contract instead: replay the declared corpus once per
 /// input, then one empty input as a smoke test.
 pub fn fuzz(

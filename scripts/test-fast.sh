@@ -56,6 +56,18 @@
 # output goes to the log), so a caller can capture it:
 #   n="$(bash scripts/test-fast.sh --count --db all)"
 #
+# ── naming the skipped tests ──────────────────────────────────────────────────
+#
+# `skipped=` is a count and nothing more: an unfiltered `zig build test` reports
+# it through the build summary, where a skip is a status bit and no name is ever
+# written. So every run here passes `-Dtest-skip-names=true`, which routes the
+# test artifacts through `scripts/test-runner.zig`'s server mode: the build
+# summary — and therefore every `zm-test-count:` line below, byte for byte — is
+# produced exactly as before, and the runner prints the skipped names on stderr,
+# which this script echoes at the end. A cached run (`run test cached`)
+# re-executes nothing and so names nothing, which is the same reason it has no
+# counts: `--force-run` is what gives you a run whose names you can quote.
+#
 # The convention — what to quote, what each label obliges you to do, and how this
 # relates to the benchmark reading convention — is `docs/dev/READING_NUMBERS.md`.
 #
@@ -75,7 +87,7 @@ COUNT_ONLY=""
 EXTRA=()
 
 usage() {
-  sed -n '2,67p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,79p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -107,7 +119,7 @@ export ZIG_GLOBAL_CACHE_DIR="$ZIG_CACHE"
 LOG="$(mktemp -t zm-test-fast.XXXXXX)"
 trap 'rm -f "$LOG"' EXIT
 
-ARGS=(build test "-Ddb=$DB" --summary all)
+ARGS=(build test "-Ddb=$DB" --summary all "-Dtest-skip-names=true")
 [[ -n "$FILTER" ]] && ARGS+=("-Dtest-filter=$FILTER")
 [[ -n "$FORCE_RUN" ]] && ARGS+=("-Dtest-force-run=true")
 [[ ${#EXTRA[@]} -gt 0 ]] && ARGS+=("${EXTRA[@]}")
@@ -154,8 +166,14 @@ BINARIES=0
 BINARY_ROWS=()
 
 RUNNER_LINES="$(grep -E '^zm-test-runner: ' "$LOG" || true)"
+# Only the per-binary *summary* lines are counts. The skipped-name block shares
+# the `zm-test-runner: ` prefix but says nothing about how many tests ran, and in
+# an unfiltered run it is the only runner line there is — so keying the source on
+# "any runner line" would relabel a build-summary run as a runner run and change
+# the aggregate line. Key it on the summary lines instead.
+RUNNER_SUMMARY_LINES="$(printf '%s\n' "$RUNNER_LINES" | grep -E '^zm-test-runner: selected ' || true)"
 
-if [[ -n "$RUNNER_LINES" ]]; then
+if [[ -n "$RUNNER_SUMMARY_LINES" ]]; then
   AGG_SOURCE="zm-test-runner"
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
@@ -176,7 +194,7 @@ if [[ -n "$RUNNER_LINES" ]]; then
     AGG_LEAKED=$((AGG_LEAKED + leaked))
     BINARIES=$((BINARIES + 1))
     BINARY_ROWS+=("$total $selected $passed $skipped")
-  done <<< "$RUNNER_LINES"
+  done <<< "$RUNNER_SUMMARY_LINES"
 else
   # Zig's own runner. The aggregate is the build summary's own total; the sum of
   # the per-binary rows is recomputed next to it and has to agree — a
@@ -288,5 +306,13 @@ while IFS= read -r row; do
 done < <(printf '%s\n' ${BINARY_ROWS[@]+"${BINARY_ROWS[@]}"} | sort -rn -k1,1)
 echo "test-fast: quote the aggregate line; the convention is docs/dev/READING_NUMBERS.md"
 if [[ -n "$RUNNER_LINES" ]]; then
-  printf '%s\n' "$RUNNER_LINES" | sed 's/^zm-test-runner: /test-fast:   /'
+  # Runner chatter, translated. The skipped names are deduplicated: the same name
+  # can legitimately appear twice (a binary restarted after a crash repeats its
+  # block, and the same suite is linked into more than one artifact), and what
+  # this block is read for is the *set* that drifted — not the tally. Summary
+  # lines are printed as-is: they are per binary, and collapsing two identical
+  # ones would hide a binary from the reader.
+  printf '%s\n' "$RUNNER_LINES" \
+    | awk '{ if ($0 ~ /^zm-test-runner: selected /) { print; next } if (!seen[$0]++) print }' \
+    | sed 's/^zm-test-runner: /test-fast:   /'
 fi

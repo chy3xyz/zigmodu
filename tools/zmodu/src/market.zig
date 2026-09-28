@@ -61,19 +61,47 @@ pub const Catalog = struct {
 const cache_path_const = cache_path;
 
 fn dupEntry(allocator: std.mem.Allocator, e: *const Entry) !Entry {
+    // Every field is a local until the struct literal hands the set over: a
+    // `return .{ … }` whose *k*th field fails to allocate drops the *k-1* fields
+    // already built on the floor, and the tags are additionally a slice plus its
+    // elements. The elements come first, so the loop needs a counted guard — an
+    // `errdefer` written inside the loop body would only cover its own iteration.
     const tags = try allocator.alloc([]const u8, e.tags.len);
     errdefer allocator.free(tags);
-    for (e.tags, 0..) |t, i| tags[i] = try allocator.dupe(u8, t);
+    var tags_owned: usize = 0;
+    errdefer for (tags[0..tags_owned]) |t| allocator.free(t);
+    for (e.tags, 0..) |t, i| {
+        tags[i] = try allocator.dupe(u8, t);
+        tags_owned += 1;
+    }
+
+    const id = try allocator.dupe(u8, e.id);
+    errdefer allocator.free(id);
+    const name = try allocator.dupe(u8, e.name);
+    errdefer allocator.free(name);
+    const kind = try allocator.dupe(u8, e.kind);
+    errdefer allocator.free(kind);
+    const path = if (e.path) |p| try allocator.dupe(u8, p) else null;
+    errdefer if (path) |p| allocator.free(p);
+    const summary = try allocator.dupe(u8, e.summary);
+    errdefer allocator.free(summary);
+    const min_version = try allocator.dupe(u8, e.min_version);
+    errdefer allocator.free(min_version);
+    const doc = if (e.doc) |d| try allocator.dupe(u8, d) else null;
+    errdefer if (doc) |d| allocator.free(d);
+    const status = if (e.status) |s| try allocator.dupe(u8, s) else null;
+    errdefer if (status) |s| allocator.free(s);
+
     return .{
-        .id = try allocator.dupe(u8, e.id),
-        .name = try allocator.dupe(u8, e.name),
-        .kind = try allocator.dupe(u8, e.kind),
-        .path = if (e.path) |p| try allocator.dupe(u8, p) else null,
-        .summary = try allocator.dupe(u8, e.summary),
+        .id = id,
+        .name = name,
+        .kind = kind,
+        .path = path,
+        .summary = summary,
         .tags = tags,
-        .min_version = try allocator.dupe(u8, e.min_version),
-        .doc = if (e.doc) |d| try allocator.dupe(u8, d) else null,
-        .status = if (e.status) |s| try allocator.dupe(u8, s) else null,
+        .min_version = min_version,
+        .doc = doc,
+        .status = status,
     };
 }
 
@@ -91,6 +119,15 @@ pub fn loadMergedCatalog(io: Io, allocator: std.mem.Allocator, external_path: ?[
         return base;
     };
     defer remote.deinit();
+    try appendMissingEntries(allocator, &base, &remote);
+    return base;
+}
+
+/// Append every remote entry whose id is not already in `base` (remote wins is
+/// the caller's business — this only adds the ones `base` lacks). Split out of
+/// `loadMergedCatalog` so the hand-over at the append site is reachable from a
+/// test: that function reads `.zmodu/market-index.json` out of the process CWD.
+fn appendMissingEntries(allocator: std.mem.Allocator, base: *Catalog, remote: *const Catalog) !void {
     for (remote.entries.items) |*re| {
         var found = false;
         for (base.entries.items) |*be| {
@@ -99,9 +136,16 @@ pub fn loadMergedCatalog(io: Io, allocator: std.mem.Allocator, external_path: ?[
                 break;
             }
         }
-        if (!found) try base.entries.append(allocator, try dupEntry(allocator, re));
+        if (found) continue;
+        // The copy is ours until the append takes it — `base.deinit()` only
+        // reaches what already made it into `base.entries`, so on OOM between
+        // the two this guard is the copy's only owner. It leaves scope with the
+        // iteration and the append is the iteration's last statement, so it can
+        // never outlive the hand-over and free the entry twice.
+        var copy = try dupEntry(allocator, re);
+        errdefer copy.deinit(allocator);
+        try base.entries.append(allocator, copy);
     }
-    return base;
 }
 
 /// Fetch a remote catalog JSON into `.zmodu/market-index.json`.
@@ -516,6 +560,75 @@ test "parseCatalog hands every entry to the catalog at every allocation point (O
     try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{json});
 }
 
+// `dupEntry` builds nine fields, two of them nested (the tags slice and each
+// element in it). A scan is what pins the hand-over: with the old struct literal
+// every allocation after the first one leaked, and the tags loop stranded
+// `tags[0..i]` on top of that.
+test "dupEntry hands over every field at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    // Literals on purpose: the source entry owns nothing, so every allocation
+    // the scan fails is the copy's, and the copy's guard has to be the thing
+    // that releases it.
+    const src = Entry{
+        .id = "module/crm",
+        .name = "crm",
+        .kind = "module",
+        .path = "modules/crm",
+        .summary = "CRM module",
+        .tags = &.{ "crm", "sales" },
+        .min_version = "0.15.4",
+        .doc = "docs/crm.md",
+        .status = "stable",
+    };
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, e: *const Entry) !void {
+            var copy = try dupEntry(a, e);
+            defer copy.deinit(a);
+            try std.testing.expectEqualStrings(e.id, copy.id);
+            try std.testing.expectEqualStrings(e.path.?, copy.path.?);
+            try std.testing.expectEqualStrings(e.status.?, copy.status.?);
+            try std.testing.expectEqual(e.tags.len, copy.tags.len);
+            try std.testing.expectEqualStrings(e.tags[1], copy.tags[1]);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{&src});
+}
+
+// The append site: `dupEntry` returns owned memory, and `base.deinit()` only
+// reaches what already made it into `base.entries`. An OOM between the two used
+// to strand the copy — and this is the only path that reaches it, since
+// `loadMergedCatalog` reads its index out of the process CWD.
+test "appendMissingEntries hands each copy over at every allocation point (OOM scan)" {
+    const allocator = std.testing.allocator;
+    const local_json =
+        \\{"entries":[{"id":"module/crm","name":"crm","kind":"module","summary":"local","tags":[],"min_version":"0.15.4"}]}
+    ;
+    const remote_json =
+        \\{"entries":[
+        \\  {"id":"module/crm","name":"crm","kind":"module","summary":"remote","tags":[],"min_version":"0.15.4"},
+        \\  {"id":"module/erp","name":"erp","kind":"module","path":"modules/erp","summary":"erp","tags":["erp"],"min_version":"0.15.4"}
+        \\]}
+    ;
+    const Scan = struct {
+        fn run(a: std.mem.Allocator, local: []const u8, remote: []const u8) !void {
+            var base = try parseCatalog(a, local);
+            defer base.deinit();
+            var rem = try parseCatalog(a, remote);
+            defer rem.deinit();
+            // The append has to be the allocation that fails, or the scan covers
+            // nothing: an ArrayList with spare capacity absorbs the entry without
+            // calling the allocator at all. `shrinkAndFree` is a shrink, which the
+            // harness never fails, so capacity ends up equal to the live length
+            // and every entry below has to grow the buffer.
+            base.entries.shrinkAndFree(a, base.entries.items.len);
+            try appendMissingEntries(a, &base, &rem);
+            try std.testing.expectEqual(@as(usize, 2), base.entries.items.len);
+            try std.testing.expectEqualStrings("module/erp", base.entries.items[1].id);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{ local_json, remote_json });
+}
+
 test "market parses embedded catalog" {
     const allocator = std.testing.allocator;
     var catalog = try parseCatalog(allocator, embedded_catalog);
@@ -571,16 +684,7 @@ test "market merges remote index into local catalog (dedupe by id)" {
     var remote = try parseCatalog(allocator, remote_json);
     defer remote.deinit();
 
-    for (remote.entries.items) |*re| {
-        var found = false;
-        for (base.entries.items) |*be| {
-            if (std.mem.eql(u8, be.id, re.id)) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) try base.entries.append(allocator, try dupEntry(allocator, re));
-    }
+    try appendMissingEntries(allocator, &base, &remote);
     try std.testing.expectEqual(@as(usize, 13), base.entries.items.len); // 12 local + 1 new remote
     var has_crm = false;
     for (base.entries.items) |e| {

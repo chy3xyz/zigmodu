@@ -87,6 +87,17 @@ pub fn build(b: *std.Build) void {
     // (`zig build test`, no options) keeps its cache behaviour untouched.
     const test_filter = b.option([]const u8, "test-filter", "Only run tests whose fully qualified name contains this substring (runtime filter via scripts/test-runner.zig; see scripts/test-fast.sh)");
     const test_force_run = b.option(bool, "test-force-run", "Re-execute test binaries even when Zig has a cached run result for them") orelse false;
+    // Unfiltered runs keep Zig's own runner, which reports *counts* over the
+    // build-system protocol and names nothing: a skip is only a status bit, so
+    // the `59 skipped` in the summary is a number with no way to see which test
+    // it is. `-Dtest-skip-names=true` swaps in `scripts/test-runner.zig`'s server
+    // mode for those artifacts: it speaks the same protocol (the counts, the
+    // build summary and therefore every `zm-test-count:` line are unchanged) and
+    // prints the skipped names to stderr, which is what `scripts/test-fast.sh`
+    // echoes at the end of a run. It is opt-in because fuzz mode needs runner
+    // features that file does not implement — `zig build test --fuzz=…` must keep
+    // Zig's runner.
+    const test_skip_names = b.option(bool, "test-skip-names", "Name the skipped tests in an unfiltered `test` run (server mode of scripts/test-runner.zig; keeps the build-summary counts; not compatible with --fuzz)") orelse false;
 
     // `--fuzz` needs the coverage sections `fuzzer_init` reads through the
     // linker-provided `__start___sancov_{cntrs,pcs1}` / `__stop_…` symbols. On
@@ -127,6 +138,7 @@ pub fn build(b: *std.Build) void {
             step: *std.Build.Step,
             artifact: *std.Build.Step.Compile,
             filter: ?[]const u8,
+            skip_names: bool,
             force_run: bool,
             use_llvm: bool,
         ) void {
@@ -134,6 +146,11 @@ pub fn build(b: *std.Build) void {
                 artifact.test_runner = .{
                     .path = b_.path("scripts/test-runner.zig"),
                     .mode = .simple,
+                };
+            } else if (skip_names) {
+                artifact.test_runner = .{
+                    .path = b_.path("scripts/test-runner.zig"),
+                    .mode = .server,
                 };
             }
             if (use_llvm) artifact.use_llvm = true;
@@ -156,7 +173,7 @@ pub fn build(b: *std.Build) void {
     const lib_tests = b.addTest(.{
         .root_module = lib_test_mod,
     });
-    addTest(b, test_step, lib_tests, test_filter, test_force_run, test_llvm_forced orelse llvm_for_fuzz);
+    addTest(b, test_step, lib_tests, test_filter, test_skip_names, test_force_run, test_llvm_forced orelse llvm_for_fuzz);
 
     // Test log_level.zig separately (needs build_options module)
     const log_level_test_mod = b.createModule(.{
@@ -168,7 +185,7 @@ pub fn build(b: *std.Build) void {
     const log_level_tests = b.addTest(.{
         .root_module = log_level_test_mod,
     });
-    addTest(b, test_step, log_level_tests, test_filter, test_force_run, test_llvm_forced orelse false);
+    addTest(b, test_step, log_level_tests, test_filter, test_skip_names, test_force_run, test_llvm_forced orelse false);
 
     // Benchmark step
     const benchmark_mod = b.createModule(.{
@@ -320,7 +337,7 @@ pub fn build(b: *std.Build) void {
     const zmodu_tests = b.addTest(.{
         .root_module = zmodu_cli_mod,
     });
-    addTest(b, test_step, zmodu_tests, test_filter, test_force_run, test_llvm_forced orelse false);
+    addTest(b, test_step, zmodu_tests, test_filter, test_skip_names, test_force_run, test_llvm_forced orelse false);
 
     // Dead-code analyzer unit tests live in the deadcode/ submodule; include
     // them explicitly so `zig build test` covers the analyzer itself.
@@ -330,14 +347,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const dc_analyze_tests = b.addTest(.{ .root_module = dc_analyze_mod });
-    addTest(b, test_step, dc_analyze_tests, test_filter, test_force_run, test_llvm_forced orelse false);
+    addTest(b, test_step, dc_analyze_tests, test_filter, test_skip_names, test_force_run, test_llvm_forced orelse false);
     const dc_scanner_mod = b.createModule(.{
         .root_source_file = b.path("tools/zmodu/src/deadcode/scanner.zig"),
         .target = target,
         .optimize = optimize,
     });
     const dc_scanner_tests = b.addTest(.{ .root_module = dc_scanner_mod });
-    addTest(b, test_step, dc_scanner_tests, test_filter, test_force_run, test_llvm_forced orelse false);
+    addTest(b, test_step, dc_scanner_tests, test_filter, test_skip_names, test_force_run, test_llvm_forced orelse false);
 
     // Concurrency soak (`zig build soak`) — real sockets, N clients x M
     // tenants, cross-tenant leak assertions. Kept out of `zig build test` so
@@ -492,7 +509,7 @@ pub fn build(b: *std.Build) void {
     db_link.link(stress_smoke_mod, b, features);
 
     const stress_smoke_tests = b.addTest(.{ .root_module = stress_smoke_mod });
-    addTest(b, test_step, stress_smoke_tests, test_filter, test_force_run, test_llvm_forced orelse false);
+    addTest(b, test_step, stress_smoke_tests, test_filter, test_skip_names, test_force_run, test_llvm_forced orelse false);
 
     // ── `soak-smoke`: the push-gate slice of the nightly soaks ─────────────
     //
