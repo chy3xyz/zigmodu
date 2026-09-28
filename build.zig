@@ -33,7 +33,7 @@ pub fn build(b: *std.Build) void {
     });
     zigmodu_mod.addImport("build_options", build_options_mod);
 
-    db_link.link(zigmodu_mod, b, features);
+    db_link.link(zigmodu_mod, b, target, features);
 
     // Create example executable
     const exe_mod = b.createModule(.{
@@ -169,7 +169,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     lib_test_mod.addImport("build_options", build_options_mod);
-    db_link.link(lib_test_mod, b, features);
+    db_link.link(lib_test_mod, b, target, features);
     const lib_tests = b.addTest(.{
         .root_module = lib_test_mod,
     });
@@ -372,7 +372,7 @@ pub fn build(b: *std.Build) void {
     });
     soak_mod.addImport("zigmodu", zigmodu_mod);
     soak_mod.addImport("build_options", soak_options_mod);
-    db_link.link(soak_mod, b, features);
+    db_link.link(soak_mod, b, target, features);
 
     const soak_tests = b.addTest(.{ .root_module = soak_mod });
     const run_soak = b.addRunArtifact(soak_tests);
@@ -402,7 +402,7 @@ pub fn build(b: *std.Build) void {
     });
     soak_cluster_mod.addImport("zigmodu", zigmodu_mod);
     soak_cluster_mod.addImport("build_options", soak_cluster_options_mod);
-    db_link.link(soak_cluster_mod, b, features);
+    db_link.link(soak_cluster_mod, b, target, features);
 
     const soak_cluster_tests = b.addTest(.{ .root_module = soak_cluster_mod });
     // The default test runner speaks the build runner's stdin protocol and
@@ -447,7 +447,7 @@ pub fn build(b: *std.Build) void {
     });
     stress_mod.addImport("zigmodu", zigmodu_mod);
     stress_mod.addImport("build_options", stress_options_mod);
-    db_link.link(stress_mod, b, features);
+    db_link.link(stress_mod, b, target, features);
 
     const stress_exe = b.addExecutable(.{
         .name = "runtime-stress",
@@ -506,7 +506,7 @@ pub fn build(b: *std.Build) void {
     });
     stress_smoke_mod.addImport("zigmodu", zigmodu_mod);
     stress_smoke_mod.addImport("build_options", stress_smoke_options_mod);
-    db_link.link(stress_smoke_mod, b, features);
+    db_link.link(stress_smoke_mod, b, target, features);
 
     const stress_smoke_tests = b.addTest(.{ .root_module = stress_smoke_mod });
     addTest(b, test_step, stress_smoke_tests, test_filter, test_skip_names, test_force_run, test_llvm_forced orelse false);
@@ -558,7 +558,7 @@ pub fn build(b: *std.Build) void {
     });
     soak_smoke_mod.addImport("zigmodu", zigmodu_mod);
     soak_smoke_mod.addImport("build_options", soak_smoke_options_mod);
-    db_link.link(soak_smoke_mod, b, features);
+    db_link.link(soak_smoke_mod, b, target, features);
 
     const soak_smoke_tests = b.addTest(.{ .root_module = soak_smoke_mod });
     // Same reason as `soak_cluster_tests` above: the default runner speaks the
@@ -590,7 +590,7 @@ pub fn build(b: *std.Build) void {
     });
     cluster_smoke_mod.addImport("zigmodu", zigmodu_mod);
     cluster_smoke_mod.addImport("build_options", cluster_smoke_options_mod);
-    db_link.link(cluster_smoke_mod, b, features);
+    db_link.link(cluster_smoke_mod, b, target, features);
 
     const cluster_smoke_tests = b.addTest(.{ .root_module = cluster_smoke_mod });
     cluster_smoke_tests.test_runner = .{

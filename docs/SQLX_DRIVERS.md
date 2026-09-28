@@ -4,7 +4,7 @@ ZigModu 默认链接 **sqlite + postgres + mysql**（`-Ddb=all`），保证旧�
 
 **实现**：`examples/_shared/db_link.zig` · `build_options.enable_*` · `src/sqlx/*_c_stub.zig` · `sqlx.DriverFeatures`  
 **相关**：[`data.sqlx`](../src/data.zig) · [PRODUCTION_ROADMAP.md](PRODUCTION_ROADMAP.md)（sqlx 维护边界）· [ZENT.md](ZENT.md)（正交 ORM，仍可能链 libsqlite3）  
-**跨平台编译**：见 §12（`-Ddb=none` 是默认唯一可行档；带驱动需要目标平台的库 + `SQLITE_*` / `PQ_*` / `MYSQL_*` 覆盖，附实测内存表）
+**跨平台编译**：见 §12（带驱动要提供**目标平台**的库：`XCOMPILE_ROOT`（或 `ZENT_XROOT`）指向 sysroot / 发行版 rootfs，或按驱动用 `SQLITE_*` / `PQ_*` / `MYSQL_*` 覆盖；主机路径只在目标就是构建机时才用，附实测内存表）
 
 ---
 
@@ -109,7 +109,7 @@ var client = try data.Client.open(allocator, io, .{ .driver = .postgres, .host =
 
 ## 7. 路径依赖示例与 `db_link.zig`
 
-仓库根与部分 example 共用 `examples/_shared/db_link.zig`（解析、探测 Homebrew 路径、`link` / `addToOptions`）。
+仓库根与部分 example 共用 `examples/_shared/db_link.zig`（解析、面向目标的驱动路径探测——主机路径只在目标就是构建机时才用，见 §12——以及 `link` / `linkDetected` / `addToOptions`）。
 
 Zig package 路径限制：example **不能** `@import("../_shared/db_link.zig")`。做法：
 
@@ -196,16 +196,35 @@ zent 使用自己的 SQLite / 驱动栈，与 `data.sqlx` **正交**（见 [ZENT
 
 ## 12. 跨平台编译（cross-compile）
 
-**一句话**：跨编译**默认只能用 `-Ddb=none`**；带驱动要自己提供**目标平台**的库并覆盖搜索路径，
-否则报 `unable to find dynamic system library 'sqlite3' using strategy 'paths_first'`。
+**一句话**：不带东西就跨编译时**只有 `-Ddb=none` 可行**；带驱动要自己提供**目标平台**的库——
+`XCOMPILE_ROOT` 指向 sysroot / 发行版 rootfs，或按驱动用 `PQ_*` / `MYSQL_*` / `SQLITE_*` 覆盖，
+否则报 `unable to find dynamic system library 'sqlite3' using strategy 'paths_first'`（构建脚本另有一条
+警告点名这些变量）。
 
 ### 12.1 为什么默认不行
 
-`examples/_shared/db_link.zig` 的 `detectPqPaths` / `detectMysqlPaths` 是**主机**启发式
-（macOS 探 Homebrew、Linux 探 `/usr/include/{postgresql,mariadb}`），`link()` 又无条件
-`linkSystemLibrary` —— 于是交叉编译时 Zig 去**目标**的默认路径找 `libpq` / `libmysqlclient` /
-`libsqlite3`，那里什么都没有。CI 的 `windows-cross` job 就是照这个约束写的：
-`zig build -Ddb=none -Dtarget=x86_64-windows`。
+`examples/_shared/db_link.zig` 的 `detectPqPaths` / `detectMysqlPaths` 早期按**主机**分支
+（macOS 探 Homebrew、Linux 探 `/usr/include/{postgresql,mariadb}`），`link()` 又把这些目录
+`addLibraryPath` + `linkSystemLibrary` 上去。所以交叉编译的失败**不是**"Zig 找不到库"这么
+简单：**主机的目录被真的交到了外来链接上**。Mac 上出 Linux 产物时 `ld` 拿到
+`/opt/homebrew/opt/mysql/lib/libmysqlclient.a`（Mach-O 归档；`opt/mysql` 只是指向
+`Cellar/mysql/9.3.0` 的软链），代价是**每个符号一条** `undefined symbol`（维护者环境实测 191 行）；
+`-lpq` / `-lmysqlclient` / `-lsqlite3` 反过来才轮到去找**目标**的默认路径，那里什么都没有。
+CI 的 `windows-cross` job 就是照这个约束写的：`zig build -Ddb=none -Dtarget=x86_64-windows`。
+
+现在这一层是**面向目标**的：
+
+- **只有 `target` 就是构建机时才探主机**——按 `b.graph.host` 的解析三元组比较，不是
+  `target.query.isNative()`：在 aarch64 Mac 上显式写 `-Dtarget=aarch64-macos` 仍算主机构建。
+- **主机探测也包含 pkg-config**。`linkSystemLibrary` 默认会跑
+  `pkg-config --cflags --libs mysqlclient`，而 Homebrew 的 `mysqlclient.pc` 写的正是
+  `/opt/homebrew/Cellar/mysql/9.3.0/{include,lib}`；它对**任何**目标都会跑，所以外来目标上
+  显式关掉（`use_pkg_config = .no`）。只关前一处没用——路径会从这个门进来。
+- **外来目标改从目标的根取路径**：`XCOMPILE_ROOT`，或 zent 侧的前缀拼法 `ZENT_XROOT`
+  （两个仓共用同一套语义，见 12.2）。
+- **根和逐驱动覆盖都没有、而 `-Ddb=` 确实要链驱动时，构建脚本只警告一次**：点名
+  `XCOMPILE_ROOT` 与各驱动的 `*_INCLUDE` / `*_LIB`。不说的话，失败仍以"外来归档的链接
+  噪音"出现，日志里没有一个字提到路径。`-Ddb=none` 不探驱动，因此不警告。
 
 两条常被忽略的相邻事实：
 
@@ -218,15 +237,33 @@ zent 使用自己的 SQLite / 驱动栈，与 `data.sqlx` **正交**（见 [ZENT
 
 ### 12.2 环境变量覆盖（目标平台库）
 
-| 驱动 | 变量 | 说明 |
+| 变量 | 驱动 | 说明 |
 |---|---|---|
-| postgres | `PQ_INCLUDE` / `PQ_LIB` | 已有；指向**目标**的 include / lib 目录 |
-| mysql | `MYSQL_INCLUDE` / `MYSQL_LIB` | 已有；同上 |
-| sqlite | `SQLITE_INCLUDE` / `SQLITE_LIB` | **新增**；至少给 `SQLITE_LIB`（sqlx 用 `extern` 绑定，头文件通常不需要） |
+| `XCOMPILE_ROOT` / `ZENT_XROOT` | 全部 | **新增**；目标平台的根（sysroot 或发行版 rootfs），见下方"根里怎么找" |
+| `PQ_INCLUDE` / `PQ_LIB` | postgres | 已有；指向**目标**的 include / lib 目录；任何目标都生效，并压过根 |
+| `MYSQL_INCLUDE` / `MYSQL_LIB` | mysql | 已有；同上 |
+| `SQLITE_INCLUDE` / `SQLITE_LIB` | sqlite | 已有；至少给 `SQLITE_LIB`（sqlx 用 `extern` 绑定，头文件通常不需要） |
 
 只给 lib 目录即可；给 include 会同时加 `addSystemIncludePath`。
 
+**根里怎么找**（`XCOMPILE_ROOT`）：头文件按各驱动自己的布局找——
+`{r}/usr/include/postgresql` → `{r}/usr/include/pgsql` → `{r}/usr/include`（libpq 的
+`libpq-fe.h`）；`{r}/usr/include/mariadb`（`mariadb/mysql.h`，include 目录取其父
+`{r}/usr/include`）→ `{r}/usr/include/mysql` → `{r}/usr/include`（`mysql.h`）；sqlite 是
+`{r}/usr/include`（`sqlite3.h`）。库目录只加**存在**的那些：`{r}/usr/lib/<multiarch>`、
+`{r}/lib/<multiarch>`、`{r}/usr/lib64`、`{r}/usr/lib`，`multiarch` 由目标架构推
+（`aarch64-linux-gnu` / `x86_64-linux-gnu` / `arm-linux-gnueabihf` / `riscv64-linux-gnu`，
+其余架构没有这一档）。不存在的目录不加——那只是每份 verbose 日志里的噪音。
+
+**MySQL 的库名是探出来的，不再写死 `mysqlclient`**：在解析出的库目录里查
+`libmysqlclient.{so,so.3,dylib,a}` 与 `libmariadb.{so,so.3,dylib,a}`；`libmysqlclient` 在就用
+它（主机上的既有行为不变），**只有** `libmariadb` 时才链 `-lmariadb`——Debian 的
+`libmariadb-dev` 只装 `libmariadb.so`，`libmysqlclient` 在另一个 `-dev-compat` 包里；两个都
+没查到就仍回落到 `mysqlclient`。
+
 ### 12.3 实测可用的配方（本机 aarch64-macOS，容器里的 aarch64 Debian 库）
+
+**A. 只给一个库目录（最省事；sqlite 够用）**
 
 ```bash
 # 1) 从目标平台（或容器/sysroot）取出真库
@@ -245,6 +282,22 @@ cd examples/tenant-mgmt && SQLITE_LIB=/tmp/sqlite-linux zig build \
 docker run --rm -v /tmp/out:/x <同样的目标镜像> ldd /x/bin/tenant-mgmt | grep sqlite
 # → libsqlite3.so.0 => /lib/aarch64-linux-gnu/libsqlite3.so.0
 ```
+
+**B. 给目标的根（sysroot / 发行版 rootfs），三条驱动共用一套**
+
+```bash
+# 根里要有 usr/include 与 usr/lib/<multiarch>；只加存在的目录
+sysroot=/tmp/debian-arm64
+XCOMPILE_ROOT=$sysroot zig build -Ddb=all -Dtarget=aarch64-linux-gnu.2.34 -p /tmp/out
+
+# 单个驱动仍可用 PQ_* / MYSQL_* / SQLITE_* 压过根
+PQ_INCLUDE=$sysroot/usr/include/postgresql PQ_LIB=$sysroot/usr/lib/aarch64-linux-gnu \
+  zig build -Ddb=postgres -Dtarget=aarch64-linux-gnu.2.34 -p /tmp/out
+```
+
+> 构建脚本读的是环境变量，而 Zig **不会**因为环境变量变了就重跑构建脚本：改完 `XCOMPILE_ROOT`
+> 或 `*_LIB` 之后若日志像是上一次的，先 `rm -rf .zig-cache`（与 `docs/ZENT.md` §14 的"改 pin
+> 先清缓存"同一条）。
 
 **踩过的坑**：只写 `-Dtarget=aarch64-linux-gnu`（不带版本）而库是 Debian bookworm 的，
 会得到一屏 `undefined reference: pthread_join@GLIBC_2.34`、`stat64@GLIBC_2.33` ——

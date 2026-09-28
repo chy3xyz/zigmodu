@@ -2,6 +2,64 @@
 
 ## [Unreleased]
 
+### 第 102 批：交叉编译把**主机**路径交给了外来链接（Mach-O 归档进 Linux 链接；实测 `homebrew` 16 → 0）——驱动探测改为面向目标 + `XCOMPILE_ROOT`（**破坏性：否**）
+
+1. **真缺陷（维护者报告核实）：`examples/_shared/db_link.zig` 的 `detectPqPaths` / `detectMysqlPaths`
+   按构建主机分支**（macOS 探 Homebrew、Linux 探 `/usr/include/{postgresql,mariadb}`），`link()` 又把
+   结果 `addLibraryPath` + `linkSystemLibrary` 上去，于是 `-Dtarget=aarch64-linux` 的链接线上出现
+   `-isystem /opt/homebrew/opt/libpq/include`、`-L /opt/homebrew/opt/mariadb-connector-c/lib`（本机
+   复现：`-Ddb=all -Dtarget=aarch64-linux --verbose` 的日志里 `homebrew` 出现 **16 次**，失败信息
+   `searched paths` 列出的全是主机目录）。维护者环境更远一步：Zig 在
+   `/opt/homebrew/Cellar/mysql/9.3.0/lib` 里选中 Mach-O 的 `libmysqlclient.a`（`opt/mysql` 只是软链），
+   换来**每个符号一条** `undefined symbol`，共 191 行。
+2. **文档 §12.1 的因果是反的**：原文写"交叉编译时 Zig 去**目标**的默认路径找库，那里什么都没有"——
+   实际是**主机路径确实被注入**（多走了一道 `linkSystemLibrary`），目标默认路径是之后才轮到。
+   §12.1 改写为"注入 + 选错归档"的因果，并保留"跨目标跑不了测试 / 未用到的库会被 `--as-needed` 丢掉"
+   两条相邻事实。
+3. **修复：探测面向目标。** `link` / `linkDetected` / 三个 `detect*Paths` 都收 `target`，16 个调用点
+   各传自己的 `b.standardTargetOptions` 结果；**只有 `target` 就是构建机时才探主机**——按
+   `b.graph.host` 的解析三元组比较，不是 `target.query.isNative()`（aarch64 Mac 上显式
+   `-Dtarget=aarch64-macos` 仍算主机构建）。外来目标从 **`XCOMPILE_ROOT`**（或 zent 侧的前缀拼法
+   `ZENT_XROOT`）指向的**目标根**取路径：头文件按各驱动的布局找
+   （`usr/include/postgresql` → `pgsql` → `usr/include`；`usr/include/mariadb`（`<mariadb/mysql.h>`
+   取其父）/ `usr/include/mysql` / `usr/include`；sqlite 的 `usr/include`），库目录**只加存在的**
+   （`usr/lib/<multiarch>`、`lib/<multiarch>`、`usr/lib64`、`usr/lib`，`multiarch` 由目标架构推）。
+   逐驱动的 `PQ_*` / `MYSQL_*` / `SQLITE_*` 对**任何**目标仍生效（§12.3 配方 A 靠它们）；根与覆盖都
+   没有、而 `-Ddb=` 确实要链驱动时，构建脚本**只警告一次**并点名这些变量（`-Ddb=none` 不探测也不警告）。
+4. **pkg-config 也是主机探测，外来目标上关掉。** `linkSystemLibrary` 默认会跑
+   `pkg-config --cflags --libs mysqlclient`，而 Homebrew 的 `mysqlclient.pc` 写的正是
+   `/opt/homebrew/Cellar/mysql/9.3.0/{include,lib}`——它对**任何**目标都会跑，只关前一处门路径会从
+   这里进来（实测：修完 `-Ddb=all -Dtarget=aarch64-linux --verbose` 的日志里 `homebrew` 出现 **0** 次，
+   失败信息变成 `searched paths: none`）。主机构建仍是 `.yes`，行为逐字不变。
+5. **MySQL 的库名改成探出来的**（不再写死 `mysqlclient`）：在解析出的库目录里查
+   `libmysqlclient.{so,so.3,dylib,a}` 与 `libmariadb.{...}`；只要 `libmysqlclient` 在就用它（本机
+   Homebrew 的 `mariadb-connector-c` 目录两者都有 → 仍链 `-lmysqlclient`，主机行为不变），**只有**
+   `libmariadb` 时才链 `-lmariadb`（Debian 的 `libmariadb-dev` 只装它，`libmysqlclient` 在另一个
+   `-dev-compat` 包），两个都没查到回落 `mysqlclient`。
+6. **`examples/zmsaas/backend/db_link.zig` 是**（不是 symlink 的）**一份 8 月旧副本**——`docs/SQLX_DRIVERS.md`
+   §7 的约定是"各 example 一律 symlink 到 `_shared`，只改 `_shared`"，这份副本已经落后（缺
+   `-Ddb=none` / `off`、缺 `linkDetected`），而它照样带着本批修的主机探测缺陷。改回
+   `symlink → ../../_shared/db_link.zig`，与另外五个 example 一致（Windows 无 symlink 权限时按 §7 表格
+   复制覆盖）。这是本批唯一一处的**文件类型变化**。
+7. **`examples/metaverse-creative` 的 zent 链接没有改写成 `zent.linkDrivers`**：该示例 pin 的是 zent
+   **v0.76.2**（`docs/ZENT.md` §4 与本文件的 zon 注释同口径），它没有 `linkDrivers`（v0.81.1 才有）；
+   `b.lazyImport(@This(), "zent")` 本身可用（依赖已声明），编译器报
+   `error: root source file struct 'build' has no member named 'linkDrivers'`。换过去要先动 pin 与配套
+   文档，不在本刀范围；调用点写明原因（`linkDetected` 现在面向目标，跨编译是安全的）。
+8. **文档**：`docs/SQLX_DRIVERS.md` §12.1–§12.3 改写（因果、`XCOMPILE_ROOT`/`ZENT_XROOT` 的取径规则、
+   MySQL 库名探测、配方 B"给目标的根"、"构建脚本不会因环境变量变化重跑、先清 `.zig-cache`"），§12.2 表
+   增 `XCOMPILE_ROOT` / `ZENT_XROOT` 行，头部小字与 `AGENTS.md` 的跨平台段同步。
+
+读数：`zig build test`（默认 `-Ddb=all`）绿，`-Dtest-force-run=true --summary all` 报
+**15/15 steps succeeded；2204/2264 tests passed（60 skipped）**；fmt 门（`zig fmt --check build.zig examples`
+与仓库 `zig build fmt-check` 的路径集）绿；
+`-Ddb=all -Dtarget=aarch64-linux --verbose` 的 `homebrew` 16 → **0**，
+`XCOMPILE_ROOT=/tmp/zmodu-root -Ddb=sqlite -Dtarget=aarch64-linux` 的链接线出现
+`-L /tmp/zmodu-root/usr/lib/aarch64-linux-gnu` 且无警告；主机构建（`examples/tenant-mgmt -Ddb=all`）
+的模块旗标与改动前逐条相同（`-isystem /opt/homebrew/opt/{libpq,mariadb-connector-c}/…` +
+`-lmysqlclient`），`examples/{tenant-mgmt,zmsaas/backend} -Ddb=sqlite` 均 exit 0，六个 example 的
+`zig build --list-steps` 全 0。
+
 ### 第 101 批：证据链基建——ARM64 Linux 进测试矩阵 + bench/nightly 结果沉淀为按 commit 寻址的 artifact 序列（**破坏性：否**）
 
 外部评估把"ARM64 Linux 无证据"与"commit→stress 结果没有沉淀为可比序列"列为 v1.0 前缺口。本批落地：

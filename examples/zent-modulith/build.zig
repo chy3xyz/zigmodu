@@ -38,7 +38,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     zigmodu_mod.addImport("build_options", build_options_mod);
-    db_link.link(zigmodu_mod, b, features);
+    db_link.link(zigmodu_mod, b, target, features);
 
     const helper_mod = b.createModule(.{
         .root_source_file = b.path("../_shared/zent_helpers.zig"),

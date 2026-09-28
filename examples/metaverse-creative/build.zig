@@ -27,9 +27,13 @@ pub fn build(b: *std.Build) void {
     });
     const zent_mod = zent_dep.module("zent");
     // src/db.zig references zent.sql_postgres; zent wires its pg_c binding
-    // when libpq headers are present but never links the library itself —
-    // link it here so PQ symbols resolve (no-op when libpq is absent).
-    db_link.linkDetected(zent_mod, b, .{ .postgres = true });
+    // when libpq headers are present but never links the library itself.
+    // zent's own build script exports this discovery as `linkDrivers`, but the
+    // pin below is v0.76.2, which predates it — switching over needs the pin
+    // bumped to v0.81.1 (and `docs/ZENT.md` §4 / this file's zon comment moved
+    // with it). Until then this is the one call site that mirrors zent's link
+    // logic; `linkDetected` is target-aware, so it is safe for a cross build.
+    db_link.linkDetected(zent_mod, b, target, .{ .postgres = true });
 
     const zigmodu_mod = b.addModule("zigmodu", .{
         .root_source_file = b.path("../../src/root.zig"),
@@ -38,7 +42,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     zigmodu_mod.addImport("build_options", build_options_mod);
-    db_link.link(zigmodu_mod, b, features);
+    db_link.link(zigmodu_mod, b, target, features);
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
