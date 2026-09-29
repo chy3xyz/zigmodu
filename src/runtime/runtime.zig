@@ -109,6 +109,10 @@ pub const Mailbox = mbox.Mailbox;
 pub const Scheduler = scheduler_mod.Scheduler;
 /// How the pool is declared: `Runtime.InitOptions.scheduler`.
 pub const SchedulerConfig = scheduler_mod.SchedulerConfig;
+/// Which ready ring a pooled worker's token lives in: strict order plus one
+/// reserved low-first turn in every `reservation_period`, so priority is a
+/// *bounded* difference, never a starvation licence (docs/RUNTIME.md §12.17).
+pub const Priority = scheduler_mod.Priority;
 /// One worker's delivery track, and the log all of them merge into (§13):
 /// `rt.deliveryLog().?.replayer(&manual)`.
 pub const DeliveryLog = recorder_mod.DeliveryLog;
@@ -214,6 +218,16 @@ pub const SpawnConfig = struct {
     /// field changes nothing at all, and a runtime that declares no blocking
     /// width cannot spawn a `.blocking` worker in the first place.
     execution_class: ExecutionClass = .cpu,
+    /// Which ready ring this worker's tokens wait in (docs/RUNTIME.md §12.17).
+    /// `.normal` (the default) is the class every worker had before the field
+    /// existed: an undeclared priority changes nothing at all.
+    ///
+    /// Like `execution_class`, this is only meaningful when a pool does the
+    /// scheduling — a `.dedicated` worker owns a thread, there is no ring for a
+    /// class to order — so declaring it on one is a compile error rather than a
+    /// silently ignored hint. It composes with `.execution_class = .blocking`:
+    /// the blocking pool runs the same class protocol on its own rings.
+    priority: Priority = .normal,
     /// How a stop for good treats the queue — see `StopPolicy`.
     ///
     /// `null` (the default) is **the mode's historical answer**, which is what
@@ -259,12 +273,13 @@ pub fn spawnConfig(comptime arg: anytype) SpawnConfig {
             for (@typeInfo(T).@"struct".field_names) |field_name| {
                 if (!@hasField(SpawnConfig, field_name)) @compileError(
                     "unknown field `." ++ field_name ++ "` in spawn's config for `" ++ @typeName(T) ++
-                        "`: the accepted fields are .capacity, .mode, .execution_class, .stop_policy and .record",
+                        "`: the accepted fields are .capacity, .mode, .execution_class, .priority, .stop_policy and .record",
                 );
             }
             var config: SpawnConfig = .{ .capacity = @field(arg, "capacity") };
             if (@hasField(T, "mode")) config.mode = @field(arg, "mode");
             if (@hasField(T, "execution_class")) config.execution_class = @field(arg, "execution_class");
+            if (@hasField(T, "priority")) config.priority = @field(arg, "priority");
             if (@hasField(T, "stop_policy")) config.stop_policy = @field(arg, "stop_policy");
             if (@hasField(T, "record")) {
                 // Field by field: the literal at the call site is an anonymous
@@ -1601,6 +1616,18 @@ pub const Runtime = struct {
                 "class at its default (`.cpu`).",
         );
 
+        // Same shape as the class above: a priority orders tokens in a pool's
+        // rings, and a dedicated worker's messages never enter one — there is
+        // nothing for the class to order. Refused, not ignored (§12.17).
+        const priority = comptime spawn_config.priority;
+        if (comptime (priority != .normal and !pooled)) @compileError(
+            @typeName(W) ++ " declares `.priority = ." ++ @tagName(priority) ++ "` but not `.mode = .pooled`: " ++
+                "a priority orders tokens waiting in a pool's ready rings, and a `.dedicated` " ++
+                "worker has a thread of its own (docs/RUNTIME.md §12.17). Write " ++
+                "`.{ .capacity = …, .mode = .pooled, .priority = ." ++ @tagName(priority) ++ " }`, or leave the " ++
+                "priority at its default (`.normal`).",
+        );
+
         // A delivery track is declared at the spawn site (§13.6 · 1) and its
         // capacity is comptime by construction: the ring is a fixed array of the
         // worker's own `Message`.
@@ -1693,6 +1720,7 @@ pub const Runtime = struct {
                 .queued = &handle.queued,
                 .dispatch = pooledDispatch(W, H),
                 .pending = pooledPending(H),
+                .priority = priority,
             };
         }
 
@@ -4947,6 +4975,63 @@ test "Runtime: a pooled worker receives every message, in order" {
     try std.testing.expectEqual(@as(usize, 0), s.ready_len);
     try std.testing.expect(!handle.claimed.load(.acquire));
     try std.testing.expect(!handle.queued.load(.acquire));
+}
+
+test "Runtime (§12.17): a pooled worker's declared priority reaches its ready token" {
+    const PrioCounting = struct {
+        pub const Message = u32;
+        count: usize = 0,
+        pub fn handle(self: *@This(), msg: u32, ctx: anytype) anyerror!void {
+            _ = msg;
+            _ = ctx;
+            self.count += 1;
+        }
+    };
+
+    var rt = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+        .scheduler = .{ .max_pooled_workers = 4 },
+    });
+    defer rt.deinit();
+
+    const h = try rt.spawn(PrioCounting, .{}, .{ .capacity = 8, .mode = .pooled, .priority = .high });
+    // The declaration lands on the token itself: every announce, hand-back
+    // re-push and claim-miss re-push of this worker routes by this value from
+    // here on. (The class *ordering* is pinned thread-free in scheduler.zig's
+    // §12.17 tests; here the plumbing is what is asserted.)
+    try std.testing.expectEqual(Priority.high, h.pool.?.priority);
+    try h.send(42);
+    try waitUntil(Drained(@TypeOf(h.*)){ .handle = h }, observation_budget_ms);
+    h.stop();
+    h.join();
+    try std.testing.expectEqual(@as(usize, 1), h.state.count);
+}
+
+test "Runtime (§12.17): a priority composes with the blocking pool" {
+    const BlockingPrioCounting = struct {
+        pub const Message = u32;
+        count: usize = 0,
+        pub fn handle(self: *@This(), msg: u32, ctx: anytype) anyerror!void {
+            _ = msg;
+            _ = ctx;
+            self.count += 1;
+        }
+    };
+
+    var rt = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+        .scheduler = .{ .max_pooled_workers = 2, .blocking_threads = 1 },
+    });
+    defer rt.deinit();
+
+    const hb = try rt.spawn(BlockingPrioCounting, .{}, .{ .capacity = 8, .mode = .pooled, .execution_class = .blocking, .priority = .low });
+    // Both halves of the declaration land: the class on the token, and the
+    // token on the *blocking* scheduler's rings.
+    try std.testing.expectEqual(Priority.low, hb.pool.?.priority);
+    try std.testing.expect(hb.pool.?.scheduler == rt.blocking_scheduler.?);
+    try hb.send(1);
+    try waitUntil(Drained(@TypeOf(hb.*)){ .handle = hb }, observation_budget_ms);
+    hb.stop();
+    hb.join();
+    try std.testing.expectEqual(@as(usize, 1), hb.state.count);
 }
 
 test "Runtime: a timer's delivery to a pooled worker arms its ready token" {

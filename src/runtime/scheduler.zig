@@ -165,6 +165,34 @@ pub const SchedulerConfig = struct {
 
 pub const default_batch: usize = 16;
 
+/// Which ready ring a pooled worker's token lives in (docs/RUNTIME.md §12.17).
+///
+/// Three classes, strict order, one reservation: turns try `high → normal →
+/// low`, except every `reservation_period`-th turn, which tries the classes in
+/// the *opposite* order. The reservation is what keeps priority from being a
+/// starvation licence: a low-class token queued behind a saturated high class
+/// is served within `reservation_period` scheduling turns (each turn runs at
+/// most `batch` messages), so the worst wait stays a function of the runtime's
+/// own bounds rather than of the busier class's traffic.
+///
+/// `.normal` is every worker that never declares the field: a runtime that
+/// uses no priorities pays two empty-ring `tryPop` reads per turn and nothing
+/// else — no extra atomics, no extra allocation, no second ring in use.
+pub const Priority = enum(u8) {
+    high = 0,
+    normal = 1,
+    low = 2,
+};
+
+/// How many ready rings a scheduler carries — one per `Priority`.
+pub const priority_classes: usize = 3;
+
+/// One turn in every `reservation_period` tries the classes low-first. The
+/// value is a constant rather than a knob on purpose (§12.9's discipline: a
+/// tuning parameter without a measurement behind it is a way to be wrong
+/// later, not a feature); §12.17's tests pin the bound it creates.
+pub const reservation_period: u64 = 8;
+
 /// Phase 1's pool width, and the default: a runtime that declares a pool but not
 /// a width runs exactly one pool thread (docs/RUNTIME.md §12.12).
 pub const default_pool_threads: usize = 1;
@@ -220,6 +248,11 @@ pub const Ready = struct {
     /// Messages waiting in the mailbox right now. Read exactly once per
     /// hand-back, as step 3 above.
     pending: *const fn (ctx: *anyopaque) usize,
+    /// Which ring this worker's token lives in (§12.17). Fixed at `spawn`; the
+    /// hand-back's re-push and a claim-miss's re-push both route through it, so
+    /// a worker can never drift into another class's queue. `.normal` is the
+    /// class every worker had before the field existed.
+    priority: Priority = .normal,
 };
 
 /// Producer side of the ready hand-off: called after a successful
@@ -366,8 +399,17 @@ pub const Scheduler = struct {
 
     allocator: std.mem.Allocator,
     io: std.Io,
-    ready: ReadyRing,
-    /// The declared bound the ring's capacity was derived from.
+    /// One ring per `Priority` (§12.17). All three are sized from the same
+    /// declared bound — the admission limit is on workers *in total*, and every
+    /// worker may legally be `.high`, so each class ring must independently
+    /// satisfy the capacity invariant (one token per worker of that class, plus
+    /// one per consumer inside `tryPop`).
+    ready: [priority_classes]ReadyRing,
+    /// Scheduling turns taken, monotonically. The only consumer is the
+    /// reservation slot in `turn` (`n % reservation_period`); it is not a
+    /// statistic and is never reported.
+    turns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// The declared bound the rings' capacity was derived from.
     max_pooled_workers: usize,
     /// How many pool threads this scheduler runs, and how many of them consume
     /// the ready ring concurrently. Fixed at construction (§12.12).
@@ -441,10 +483,17 @@ pub const Scheduler = struct {
         errdefer allocator.destroy(self);
         const threads = try allocator.alloc(std.Thread, threads_n);
         errdefer allocator.free(threads);
+        var rings: [priority_classes]ReadyRing = undefined;
+        var rings_up: usize = 0;
+        errdefer for (rings[0..rings_up]) |*r| r.deinit(allocator);
+        for (&rings) |*r| {
+            r.* = try ReadyRing.init(allocator, capacity);
+            rings_up += 1;
+        }
         self.* = .{
             .allocator = allocator,
             .io = io,
-            .ready = try ReadyRing.init(allocator, capacity),
+            .ready = rings,
             .max_pooled_workers = config.max_pooled_workers,
             .pool_threads = threads_n,
             .batch = config.batch,
@@ -493,7 +542,7 @@ pub const Scheduler = struct {
 
     pub fn deinit(self: *Self) void {
         self.shutdown();
-        self.ready.deinit(self.allocator);
+        for (&self.ready) |*r| r.deinit(self.allocator);
         self.allocator.free(self.threads);
         self.allocator.destroy(self);
     }
@@ -606,8 +655,13 @@ pub const Scheduler = struct {
         const live = self.started.load(.monotonic);
         return .{
             .max_pooled_workers = self.max_pooled_workers,
-            .ready_capacity = self.ready.capacity(),
-            .ready_len = self.ready.len(),
+            // Per-class ring capacity (all three are sized identically, from the
+            // declared bound — see `init`). `ready_len` is the sum across the
+            // class rings: "a token is waiting somewhere" must not depend on the
+            // class layout, and `ready_len == 0` remains the settled condition
+            // (`PoolSettled`, runtime.zig).
+            .ready_capacity = self.ready[0].capacity(),
+            .ready_len = self.readyLen(),
             .spawned = self.spawned.load(.monotonic),
             .running = live != 0,
             .pool_threads = live,
@@ -616,14 +670,23 @@ pub const Scheduler = struct {
             .claim_misses = self.claim_misses.load(.monotonic),
             .ready_push_failures = self.ready_push_failures.load(.monotonic),
             .idle_waits = self.idle_waits.load(.monotonic),
-            .ready_high_water = self.ready.high_water.load(.monotonic),
+            // The peak over the class rings, not their sum: the reading guards
+            // "a ring came nowhere near its capacity", and summing three disjoint
+            // rings could exceed it legitimately.
+            .ready_high_water = @max(self.ready[0].high_water.load(.monotonic), @max(self.ready[1].high_water.load(.monotonic), self.ready[2].high_water.load(.monotonic))),
         };
     }
 
-    /// How many tokens are in the ring. For tests and stats: a dedicated worker
-    /// never puts one there.
+    /// How many tokens wait in the rings, across all priority classes. For tests
+    /// and stats: a dedicated worker never puts one there.
     pub fn readyLen(self: *Self) usize {
-        return self.ready.len();
+        return self.ready[0].len() + self.ready[1].len() + self.ready[2].len();
+    }
+
+    /// The ring one priority class owns. Tests reach rings through here, so the
+    /// array's layout has exactly one name.
+    fn ring(self: *Self, p: Priority) *ReadyRing {
+        return &self.ready[@backingInt(p)];
     }
 
     /// Push a token. Infallible — see the capacity invariant at the top of this
@@ -638,9 +701,10 @@ pub const Scheduler = struct {
     /// and the second one clears itself — so waiting is exactly what the first
     /// one cannot do, and treating them alike is what eats the token.
     fn push(self: *Self, item: Ready) void {
+        const target = self.ring(item.priority);
         var round: usize = 0;
         while (true) {
-            if (self.ready.tryPush(item)) {
+            if (target.tryPush(item)) {
                 // Published *after* the token is in the ring, so a pool thread
                 // that read a different value is looking at a ring that changed
                 // (`poolMain`'s park guard). Only a successful push counts:
@@ -686,23 +750,44 @@ pub const Scheduler = struct {
     }
 
     fn turn(self: *Self) Turn {
-        const item = self.ready.tryPop() orelse return .empty;
-        if (item.claimed.swap(true, .acq_rel)) {
-            // Another pool thread is running this worker right now, so this
-            // token is redundant — its hand-back owns the `queued` bit and
-            // re-checks the mailbox before it lets go (see `runOne`). What it
-            // must not do is *disappear*: a dropped token is a worker that stops
-            // being scheduled while its mailbox keeps accepting messages, and
-            // `queued` staying true would keep every producer from pushing
-            // another. Putting it back turns the skip into a retry.
-            _ = self.claim_misses.fetchAdd(1, .monotonic);
-            self.push(item);
-            return .skipped;
+        // §12.17: classes are tried strict (`high → normal → low`), except every
+        // `reservation_period`-th turn, which tries them low-first. The reserved
+        // turn is what makes "a saturated high class starves nobody" a bound
+        // (`reservation_period` turns) rather than a hope — and when only one
+        // class carries traffic the two orders are the same set, so the plain
+        // shape pays nothing. Empty turns count too: under contention no turn is
+        // empty, so the cadence is exact exactly when it matters.
+        const reserved = self.turns.fetchAdd(1, .monotonic) % reservation_period == reservation_period - 1;
+        var c: usize = if (reserved) priority_classes - 1 else 0;
+        while (true) {
+            const item = self.ready[c].tryPop() orelse {
+                if (reserved) {
+                    if (c == 0) return .empty;
+                    c -= 1;
+                } else {
+                    c += 1;
+                    if (c == priority_classes) return .empty;
+                }
+                continue;
+            };
+            if (item.claimed.swap(true, .acq_rel)) {
+                // Another pool thread is running this worker right now, so this
+                // token is redundant — its hand-back owns the `queued` bit and
+                // re-checks the mailbox before it lets go (see `runOne`). What it
+                // must not do is *disappear*: a dropped token is a worker that stops
+                // being scheduled while its mailbox keeps accepting messages, and
+                // `queued` staying true would keep every producer from pushing
+                // another. Putting it back turns the skip into a retry — into the
+                // worker's *own* class ring, so a skip can never reroute it.
+                _ = self.claim_misses.fetchAdd(1, .monotonic);
+                self.push(item);
+                return .skipped;
+            }
+            _ = self.dispatches.fetchAdd(1, .monotonic);
+            _ = self.claimed.fetchAdd(1, .monotonic);
+            self.runOne(item);
+            return .ran;
         }
-        _ = self.dispatches.fetchAdd(1, .monotonic);
-        _ = self.claimed.fetchAdd(1, .monotonic);
-        self.runOne(item);
-        return .ran;
     }
 
     /// Run one claimed batch and hand the worker back.
@@ -815,6 +900,10 @@ const FakeWorker = struct {
     /// runner has observed the mailbox empty and before it hands the worker
     /// back.
     inject: ?u32 = null,
+    /// The class this worker's tokens live in. `produce` announces through the
+    /// same `ready()` a test overrides by hand, so the field — not the call
+    /// site — decides where every token of this worker lands (§12.17).
+    priority: Priority = .normal,
 
     fn ready(self: *@This()) Ready {
         return .{
@@ -824,6 +913,7 @@ const FakeWorker = struct {
             .queued = &self.queued,
             .dispatch = dispatch,
             .pending = pending,
+            .priority = self.priority,
         };
     }
 
@@ -1045,7 +1135,7 @@ const release_delay_rounds: usize = 1 << 14;
 test "scheduler: a producer waits out the slot its consumer is mid-release on" {
     var sched = try testScheduler(.{ .max_pooled_workers = 1 }); // ring capacity 2
     defer sched.deinit();
-    const ring = &sched.ready;
+    const ring = sched.ring(.normal);
 
     var a = FakeWorker{ .scheduler = sched };
     var b = FakeWorker{ .scheduler = sched };
@@ -1106,7 +1196,7 @@ test "scheduler: a hammered ring never eats a token" {
     const Drain = struct {
         fn run(s: *Scheduler, done: *std.atomic.Value(bool)) void {
             while (!done.load(.acquire)) {
-                if (s.ready.tryPop() == null) std.atomic.spinLoopHint();
+                if (s.ring(.normal).tryPop() == null) std.atomic.spinLoopHint();
             }
         }
     };
@@ -1124,6 +1214,119 @@ test "scheduler: a hammered ring never eats a token" {
     drain.join();
 
     try std.testing.expectEqual(@as(u64, 0), sched.stats().ready_push_failures);
+}
+
+// ── §12.17: priority classes ────────────────────────────────────────────────
+//
+// Driven through `step` like the protocol tests above: what is asserted is the
+// *order* the rings are drained and the reservation cadence — not "it happened
+// to schedule this way with threads".
+
+test "scheduler (§12.17): a turn takes the highest-priority token waiting" {
+    var sched = try testScheduler(.{ .max_pooled_workers = 3 });
+    defer sched.deinit();
+
+    var low = FakeWorker{};
+    low.scheduler = sched;
+    var normal = FakeWorker{};
+    normal.scheduler = sched;
+    var high = FakeWorker{};
+    high.scheduler = sched;
+
+    // Push in the *opposite* of serving order, so plain FIFO would serve low
+    // first. (Turn 0 is a strict-order turn; the reservation is at slot 7.)
+    var lr = low.ready();
+    lr.priority = .low;
+    var nr = normal.ready();
+    nr.priority = .normal;
+    var hr = high.ready();
+    hr.priority = .high;
+    sched.push(lr);
+    sched.push(nr);
+    sched.push(hr);
+
+    // Empty mailboxes: every dispatch returns "nothing left", so no token
+    // re-arms and each step serves exactly one worker.
+    try std.testing.expect(sched.step());
+    try std.testing.expectEqual(@as(usize, 1), high.dispatches);
+    try std.testing.expectEqual(@as(usize, 0), normal.dispatches);
+    try std.testing.expectEqual(@as(usize, 0), low.dispatches);
+    try std.testing.expect(sched.step());
+    try std.testing.expectEqual(@as(usize, 1), normal.dispatches);
+    try std.testing.expectEqual(@as(usize, 0), low.dispatches);
+    try std.testing.expect(sched.step());
+    try std.testing.expectEqual(@as(usize, 1), low.dispatches);
+    try std.testing.expectEqual(@as(usize, 0), sched.readyLen());
+}
+
+test "scheduler (§12.17): the reservation slot bounds a low token's wait behind a saturated high class" {
+    // batch = 1 keeps the high worker queued on every turn: one message per
+    // claim, and the hand-back re-arms while the mailbox holds more. With a
+    // strict order the low token would wait for the high mailbox to drain
+    // (turn 8); the reservation slot serves it on turn 7 — that difference is
+    // the whole guarantee, and the mutation target.
+    var sched = try testScheduler(.{ .max_pooled_workers = 2, .batch = 1 });
+    defer sched.deinit();
+
+    var high = FakeWorker{};
+    high.scheduler = sched;
+    high.priority = .high;
+    var low = FakeWorker{};
+    low.scheduler = sched;
+    // Announced by `produce` into the high ring (the fake's own priority).
+    for (0..FakeWorker.cap) |i| high.produce(@intCast(i));
+
+    var lr = low.ready();
+    lr.priority = .low;
+    sched.push(lr);
+
+    // Seven strict turns: the high worker re-arms each time, and the low token
+    // never becomes eligible.
+    for (0..7) |_| {
+        try std.testing.expect(sched.step());
+        try std.testing.expectEqual(@as(usize, 0), low.dispatches);
+    }
+    try std.testing.expectEqual(@as(usize, 7), high.dispatches);
+
+    // Turn 7 is the reservation slot: low-first order, so the low token is
+    // served even though the high ring still holds the token re-armed by
+    // turn 6's hand-back (the high mailbox is not empty yet).
+    try std.testing.expect(sched.step());
+    try std.testing.expectEqual(@as(usize, 1), low.dispatches);
+    try std.testing.expect(sched.ring(.high).len() != 0);
+
+    // Sanity: once the high mailbox drains, the rings settle empty — the
+    // reservation costs the plain shape nothing when nothing is waiting.
+    try std.testing.expect(sched.step());
+    try std.testing.expectEqual(@as(usize, 8), high.dispatches);
+    try std.testing.expectEqual(@as(usize, 0), sched.readyLen());
+}
+
+test "scheduler (§12.17): a claim-miss re-push keeps the token in its own class" {
+    var sched = try testScheduler(.{ .max_pooled_workers = 2 });
+    defer sched.deinit();
+
+    var high = FakeWorker{};
+    high.scheduler = sched;
+    var hr = high.ready();
+    hr.priority = .high;
+
+    // Someone else "holds" the claim: the token must be skipped and re-pushed,
+    // not run — and the re-push must land in the high ring, not wherever the
+    // turn happened to look first.
+    high.claimed.store(true, .release);
+    sched.push(hr);
+    try std.testing.expect(sched.step()); // .skipped is still a non-empty turn
+    try std.testing.expectEqual(@as(usize, 0), high.dispatches);
+    try std.testing.expectEqual(@as(usize, 1), sched.ring(.high).len());
+    try std.testing.expectEqual(@as(usize, 0), sched.ring(.normal).len());
+    try std.testing.expectEqual(@as(usize, 1), sched.stats().claim_misses);
+
+    // The claim released: the same token runs, from the same class.
+    high.claimed.store(false, .release);
+    try std.testing.expect(sched.step());
+    try std.testing.expectEqual(@as(usize, 1), high.dispatches);
+    try std.testing.expectEqual(@as(usize, 0), sched.readyLen());
 }
 
 // ─────────────────────────────────────────────────
@@ -1191,7 +1394,7 @@ test "scheduler: two consumers race one token and exactly one of them gets it" {
     const rounds = 50_000;
     var sched = try testScheduler(.{ .max_pooled_workers = 1, .pool_threads = 2 });
     defer sched.deinit();
-    const ring = &sched.ready;
+    const ring = sched.ring(.normal);
 
     const stop_marker = std.math.maxInt(u32);
     // The gate counts *releases*, not rounds: it starts at 0, which has to mean
@@ -1254,7 +1457,7 @@ test "scheduler: a hammered ring hands every token to exactly one consumer" {
         .pool_threads = consumers,
     });
     defer sched.deinit();
-    const ring = &sched.ready;
+    const ring = sched.ring(.normal);
 
     const seen = try std.testing.allocator.alloc(std.atomic.Value(u32), total);
     defer std.testing.allocator.free(seen);
@@ -1361,7 +1564,7 @@ test "scheduler: four consumers released together still hand one token out once"
     const rounds = 20_000;
     var sched = try testScheduler(.{ .max_pooled_workers = 1, .pool_threads = consumers });
     defer sched.deinit();
-    const ring = &sched.ready;
+    const ring = sched.ring(.normal);
 
     const stop_marker = std.math.maxInt(u32);
     var gate = std.atomic.Value(u32).init(0);
@@ -1422,7 +1625,7 @@ test "scheduler: the declared occupancy pushes cleanly, round after round" {
 
     var sched = try testScheduler(.{ .max_pooled_workers = bound, .pool_threads = width });
     defer sched.deinit();
-    const ring = &sched.ready;
+    const ring = sched.ring(.normal);
     // The Scheduler's ring is the one the declared width pays for, not a ring
     // built by hand in the test.
     try std.testing.expectEqual(consumer_capacity, ring.capacity());

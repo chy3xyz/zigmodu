@@ -200,6 +200,63 @@ loopback）；跨域、跨云、过公网的集群面流量必须走**边车或�
 但"过了门" ≠ "已加密"。机密性只有上面两种拓扑答案，监控/审计/合规口径不要把
 "集群认证已开"读成"集群流量已加密"。
 
+## 并发额度耗尽分支（A-8 定界）
+
+**现状一句话**：框架处理 `std.Io.ConcurrentError`（= `error{ConcurrencyUnavailable}`，
+`std/Io.zig:2546-2551`，std 自述"可能因资源耗尽等暂时状况，或 Io 实现不支持并发"）
+的分支共 7 处、分两种形状。`std.testing.io` 永远造不出这个分支（工具链事实），但
+"树内不可测"已不成立 —— 启动期 3 处自第 39/42 批（`CHANGELOG.md`）起各有专测，
+用例自带**有界** `Io.Threaded`。本节是这个家族的权威边界。
+
+**机制**：`Io.Threaded` 在 `busy_count >= concurrent_limit` 时返回
+`error.ConcurrencyUnavailable`（`std/Io/Threaded.zig:2144`、`:2252`；OOM 也映射成它），
+`concurrent_limit` 默认 `.unlimited`（`:40`）。这些循环用 `Group.concurrent` 而不用
+`Group.async` 是 load-bearing 的：`async` 到限走 eager 回落、把任务体征用到**调用者
+线程**，而 `busy_count` 只在任务体**返回**后递减 —— 一个永不返回的循环借此把
+`start()`/accept 线程永久占住（2 核 CI runner 上真实挂过，CHANGELOG 第 38/39 批）；
+`concurrent` 无 eager 路径，超限即报错。
+
+**两种处理形状**：
+
+| 形状 | 位置 | 语义 |
+|---|---|---|
+| 启动期：派发失败 = `start()` 失败 | `core/DistributedEventBus.zig:566`（accept/heartbeat/dlq 三路，`:548`/`:550`/`:555` 接入）、`extensions/WebSocket.zig:244`（`WebSocketServer.acceptLoop`，`:237` 接入）、`extensions/WebSocket.zig:1182`（`WebSocketMonitor.updateLoop`，`:1175` 接入） | `abortStart` 回滚（复位标志、关 listener、排空 group、warn 日志），错误原样传播给 `start()` 的调用方 |
+| 连接期：派发失败 = 拒这一条连接 | `api/Server.zig:3099-3104`、`core/DistributedEventBus.zig:720-724`、`extensions/WebSocket.zig:440-444`、`core/cluster/NetworkTransport.zig:142-147` | warn + 关连接 + `continue`，accept 循环不受影响 |
+
+**测试边界**（A-8 的原始判定来源，以及它过时的部分）：
+
+- `std.testing.io` 是默认配置的 `Io.Threaded`（`std/testing.zig:23-24`）：仓库自带
+  runner 初始化它时只设 `argv0`/`environ`（`scripts/test-runner.zig:198-201`、
+  `:362-365`），std 默认 simple runner 同样 `.init(allocator, .{})`
+  （`lib/compiler/test_runner.zig:380`）—— `concurrent_limit` 保持 `.unlimited`。
+  所以**跑在 testing.io 上的用例永远到不了这个分支**；这不是覆盖缺口，是测试 io 的
+  固定形状。
+- 启动期 3 处**已有专测**：用例自带 `Io.Threaded`（`.concurrent_limit = .nothing` /
+  `.limited(1)`）把失败钉成确定性 —— `DistributedEventBus.zig:4231`、
+  `WebSocket.zig:1951`、`:1977`（断言 `error.ConcurrencyUnavailable` + 回滚干净 +
+  端口可立刻重新 bind）。2026-09-29 本机 macOS 实测三条全绿
+  （`bash scripts/test-fast.sh --db all --filter dispatch`，29/2325 命中全过，
+  日志可见三处的 warn 行）。
+- 连接期 4 处：`WebSocket.zig:441` 被 WebSocketMonitor 那条测试**顺带执行**
+  （`abortStart → stop()` 的自拨号唤醒 `core/sockread.zig:100-112` 在额度耗尽时走进
+  acceptLoop 的拒绝分支，运行日志可见），但没有断言锁它；`Server` /
+  `DistributedEventBus` / `NetworkTransport` 三处**无用例**。注意这三处是"没人写"
+  而不是"写不出" —— 有界 io + 真客户端即可构造（`Server` 的 accept 是裸线程，连接
+  派发走 `conn_group.concurrent`，`.limited(1)` 下第二个连接必被拒），与环境限制无关。
+- 仍未覆盖的形状：生产 io（`.unlimited` 或大额 `.limited`）下**瞬时**打满再恢复 ——
+  测试把额度钉死在 0/1，覆盖不了 std 自述的"暂时性资源耗尽"语义。
+
+**为什么目前的处理足够**：启动期失败传播给调用方（部署期显性失败，不是运行期暗坑）；
+连接期拒绝只杀单条连接、accept 循环存活（额度耗尽按 std 自述可以是暂时的，下一条
+连接可能就能派发）。两种形状都有 warn 日志可观测。这是防御性兜底 —— `Io.Threaded`
+默认 `.unlimited`，生产真撞上说明宿主线程资源已枯竭，此时"响亮失败 + 日志"是正确的
+终点。
+
+**结论改变的条件**：testing.io 或仓库 runner 给 `io_instance` 设非默认
+`concurrent_limit`（则"testing.io 打不到"失效，机制测试需重核）；连接期 3 处补上
+专测（缺口从"未测"消失，与环境无关）；std 改 `ConcurrentError` 语义（7 处的错误集
+与注释需重核）。
+
 ## 读侧怎么被喂（membership → view → 请求路径）
 
 `ClusterView` 是**读侧**：引用计数快照 + rendezvous 选点，请求路径读它、不读 membership 的哈希表。

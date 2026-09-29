@@ -12,6 +12,11 @@
 #                                                       `.dedicated` and `handle`
 #   green  the same worker left `.dedicated`          -> must PASS
 #   green  a message-driven worker, pooled            -> must PASS
+#   deny   `.priority = .high` on `.dedicated`        -> must FAIL, and name
+#                                                       `.pooled` (§12.17: a class
+#                                                       orders pool rings; a
+#                                                       dedicated worker has none)
+#   green  `.priority = .high` on `.pooled`           -> must PASS
 #
 # The fixtures are written at the repository root because a Zig module's root
 # directory is the directory of its root source file: a fixture in a temporary
@@ -26,7 +31,9 @@ FIXTURE_PREFIX="$ROOT/.pool-guard-fixture"
 DENY="$FIXTURE_PREFIX-deny.zig"
 DEDICATED="$FIXTURE_PREFIX-dedicated.zig"
 POOLED="$FIXTURE_PREFIX-pooled.zig"
-trap 'rm -f "$DENY" "$DEDICATED" "$POOLED"' EXIT
+PRIORITY_DENY="$FIXTURE_PREFIX-priority-deny.zig"
+PRIORITY_POOLED="$FIXTURE_PREFIX-priority-pooled.zig"
+trap 'rm -f "$DENY" "$DEDICATED" "$POOLED" "$PRIORITY_DENY" "$PRIORITY_POOLED"' EXIT
 
 cat > "$DENY" <<'ZIG'
 //! Must not compile: a `run`-owned worker cannot be pooled (§12.5).
@@ -78,6 +85,43 @@ export fn probe(runtime: *rt.Runtime) void {
 }
 ZIG
 
+cat > "$PRIORITY_DENY" <<'ZIG'
+//! Must not compile: a priority orders pool rings; a dedicated worker's
+//! messages never enter one (§12.17).
+const rt = @import("src/runtime/runtime.zig");
+
+const MsgWorker = struct {
+    pub const Message = u32;
+    pub fn handle(self: *@This(), msg: u32, ctx: anytype) anyerror!void {
+        _ = self;
+        _ = msg;
+        _ = ctx;
+    }
+};
+
+export fn probe(runtime: *rt.Runtime) void {
+    _ = runtime.spawn(MsgWorker, .{}, .{ .capacity = 8, .priority = .high }) catch {};
+}
+ZIG
+
+cat > "$PRIORITY_POOLED" <<'ZIG'
+//! The same declaration on a pooled worker is exactly what §12.17 is for.
+const rt = @import("src/runtime/runtime.zig");
+
+const MsgWorker = struct {
+    pub const Message = u32;
+    pub fn handle(self: *@This(), msg: u32, ctx: anytype) anyerror!void {
+        _ = self;
+        _ = msg;
+        _ = ctx;
+    }
+};
+
+export fn probe(runtime: *rt.Runtime) void {
+    _ = runtime.spawn(MsgWorker, .{}, .{ .capacity = 8, .mode = .pooled, .priority = .high }) catch {};
+}
+ZIG
+
 compile() {
   # Prints combined stdout+stderr; returns the compiler's exit code.
   # `-fno-emit-bin` type-checks without linking (the fixtures never run).
@@ -126,6 +170,34 @@ if out="$(compile "$POOLED")"; then
   note 'OK(green): a message-driven worker compiles `.pooled`'
 else
   err "FAIL(green): a message-driven `.pooled` worker does not compile:"
+  printf '%s\n' "$out" >&2
+  fail=1
+fi
+
+# 4. deny: `.priority` on a dedicated worker must fail, and the failure must
+#    say where the declaration belongs.
+if out="$(compile "$PRIORITY_DENY")"; then
+  err "FAIL(deny): `.priority = .high` on a `.dedicated` worker COMPILED — the guard is not firing"
+  fail=1
+else
+  missing=""
+  for needle in ".priority" ".pooled"; do
+    grep -q -- "$needle" <<<"$out" || missing="$missing '$needle'"
+  done
+  if [[ -n "$missing" ]]; then
+    err "FAIL(deny): compile error is missing actionable text:$missing"
+    printf '%s\n' "$out" >&2
+    fail=1
+  else
+    note 'OK(deny): `.priority` on a `.dedicated` worker is a compile error, and the error says what to do'
+  fi
+fi
+
+# 5. green: the same declaration on a pooled worker.
+if out="$(compile "$PRIORITY_POOLED")"; then
+  note 'OK(green): a pooled worker compiles `.priority = .high`'
+else
+  err "FAIL(green): a pooled worker with `.priority = .high` does not compile:"
   printf '%s\n' "$out" >&2
   fail=1
 fi

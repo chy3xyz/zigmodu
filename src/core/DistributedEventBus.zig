@@ -506,6 +506,11 @@ pub const DistributedEventBus = struct {
     /// owns these loops via `fiber_group.await`, and the loops themselves are io
     /// calls (`accept`, `std.Io.sleep`): `concurrent` keeps one teardown
     /// mechanism instead of two.
+    ///
+    /// Where the `ConcurrencyUnavailable` branch is and is not tested
+    /// (`std.testing.io` can never produce it — the pinned-limit tests bring
+    /// their own bounded `Io.Threaded`) is written down in
+    /// `docs/DISTRIBUTED.md` 「并发额度耗尽分支（A-8 定界）」.
     pub fn start(self: *Self, port: u16) !void {
         if (self.is_running) return;
 

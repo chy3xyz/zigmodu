@@ -1,5 +1,56 @@
 # Changelog
 
+## [Unreleased]
+
+### 第 115 批：Scheduler 三级优先级 + 保留槽（§12.17）+ A-7/A-8 环境边界定界写档（**破坏性：否**）
+
+1. **缘起**：v1.0-gap A 组收尾 —— A-6 是评估矩阵 §15 的 Priority 项（调度优先级，原列 P1/P2）；
+   A-7/A-8 是 v1.0-readiness 复核里两条"环境边界"（ws_uring 只在 Linux 可验、
+   `ConcurrentError` 在 `std.testing.io` 下不可达）的**定界写档**——不写功能代码，
+   把边界、证据与"结论改变的条件"写成权威文档节。
+2. **Scheduler 形状（`src/runtime/scheduler.zig`）**：ready 环从一个变三个 ——
+   `Priority = enum(u8) { high, normal, low }` 每类一条，各环独立满足 §12.12 的容量不变量
+   （`ceilPowerOfTwo(max_pooled_workers + pool_threads)`，三环同容量、初始化带 errdefer 回卷）。
+   `push` 按 token 上的 `priority` 路由；常规轮严格序 `high → normal → low`；每第 8 轮
+   （`turns % 8 == 7`）是**保留轮**，顺序反向 `low → normal → high` —— `low`（及面对持续
+   `high` 的 `normal`）的饿死上界 = 一个保留周期（8 轮 × 每轮至多 `batch` 条，默认 128 条），
+   与 §12.16 同一条"用消息数计量、与宿主无关"的口径。claim-miss 的重推**回本类环**
+   （降级会让 high token 在竞争下漂进 normal，声明就失去意义）。`RuntimeStats` 口径：
+   `ready_len` = 三环之和（`PoolSettled` 等既有断言零改动）、`ready_high_water` = 三环 max、
+   `ready_capacity` = 单环容量。
+3. **`SpawnConfig.priority` 接线（`runtime.zig`）**：默认 `.normal`，只认 `.pooled` ——
+   `.dedicated` 声明它是**编译错误**（与 `.execution_class` 的门同形，fail loud：
+   dedicated 有自己的线程，没有"排队等调度"这个事件，声明了也影响不了任何东西）；
+   `.blocking` 池共用同一协议零特判。`scripts/check-pool-guard.sh` 加 fixture 4/5
+   （dedicated+`.high` 必须编译失败且报错含 `.priority`/`.pooled`；pooled+`.high` 必须过）。
+4. **测试证据**：5 条 §12.17 新测试全绿 —— scheduler 侧 3 条无线程环驱动（严格序 /
+   保留槽上界 / claim-miss 保级），runtime 侧 2 条接线（pooled+`.high` 的声明落在 token 上
+   且收发守恒；`.blocking`+`.low` 组合落在阻塞池自己的调度器上）。**3 条变异验红后还原**：
+   关掉保留轮 → 保留槽测试红（`expected 1, found 0`）；claim-miss 重推改降级 → 保级测试红；
+   排序固定永远 low 优先 → 严格序测试红。既有 38 条 scheduler 测试零改动全绿。
+5. **刻意不做**（§12.9 纪律：无测量不加旋钮）：类别数固定 3、保留周期固定 8，不做可配
+   权重/类别数；per-worker `batch` 覆盖仍不做；MetricsBridge 每类拆分 gauge 仍开；
+   优先级对吞吐/延迟尾巴的影响**未实测**（三类混合形状的 bench 是下一步，也是"要不要
+   可配权重"的唯一正当输入）。
+6. **A-7 定界**（`docs/API.md` 新节 + `src/im/ws_uring.zig` 文档注释）：非 Linux 是
+   **编译期拒绝**（`ws_uring.zig:91` 的 `@compileError` + 文件头 stub `:9-41`），不是运行时
+   回落；9 条测试全平台真跑（本机 macOS 实测 9/9 绿），但**没有任何用例构造真 ring**
+   （`WsUring.init` 树内无调用方，函数体不进任何平台的分析图）；CI 三腿跑同一条
+   `zig build test`，无 ws_uring 专属步骤；macOS 上的帧解析保证来自第 54 批共享校验器并轨。
+7. **A-8 定界**（`docs/DISTRIBUTED.md` 新节 + `docs/API.md` 指针段 +
+   `core/DistributedEventBus.zig` 注释）：7 处 `ConcurrentError` 分支分两种形状 ——
+   启动期 3 处 `abortStart` 响亮失败（自第 39/42 批起各有专测，用例自带有界 `Io.Threaded`
+   钉成确定性）；连接期 4 处 warn+close+continue（1 处被顺带执行无断言、3 处树内可构造
+   但无人写）。**事实修正**：原判定"树内不可测"已过时，仍然成立的只有更窄的一条 ——
+   `std.testing.io` 本身（默认 `concurrent_limit = .unlimited`）永远到不了该分支，这是
+   工具链事实不是覆盖缺口。`docs/dev/v1.0-readiness-v0.35.md` §七 追加 A-7/A-8 跟进注
+   （§二/§六 正文按惯例不回改）。
+8. **门禁读数**：`zig build test -Dtest-filter="12.17" -Dtest-force-run=true` —
+   **selected 5 of 2138，5 passed / 0 failed / 0 leaked**；`bash scripts/check-pool-guard.sh`
+   5 行全 OK；`zig fmt --check`（改动文件）✓；`bash scripts/check-production.sh` ✓；
+   全量 `zig build test` —— **19/19 steps，2230/2290 passed（60 skipped，环境依赖项），
+   大二进制 2080 pass + 58 skip / 2138**。
+
 ## [0.39.0] - 2026-09-29
 
 ### 第 114 批：CI 墙钟提速（gate 过滤执行 + 第二波并行化）+ §12.16 batch sweep 快照竞态修复（**破坏性：否**）

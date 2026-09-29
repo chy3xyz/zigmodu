@@ -961,6 +961,8 @@ B 仍然被服务，只是要等 A 那一批跑干。所以小 batch 换吞吐�
     而它若要"失败必须响亮"，就需要 dedicated 路径目前**没有**的父子启动握手：`spawn` 在线程跑起来
     之前就返回（`runtime.zig:1719-1723`），线程体的 init 结果"刻意不读"（`runtime.zig:2305-2308`）。
     先加字段只能买到"静默失败的 pin"或"上报成功却没拿到核的 worker"。详见 `affinity.zig` 的模块 doc。
+  * **优先级已落地（§12.17）**：三级类别 + 每 8 轮一个低优先保留槽，只认 `.pooled`
+    （`.dedicated` 声明它是编译错误）。本条现在排除的是 **affinity/NUMA 与可配权重**。
 - **不做 μs 级 timer**：那是独立的 `LowLatencyClock/Timer`（评估 §7 的建议），与调度器正交。
   **后续（§12.15）**：µs 级**定时器**已由 `PrecisionTimer` 落地（min-heap + spin window，实测
   p50 0 ns / p99 1 µs）；仍**没有**独立的 `LowLatencyClock` 类型 —— 它直接读
@@ -1116,7 +1118,8 @@ dedicated 加"抽干后再停"，两者都是会动到 D5 那条回执出口的�
 * ~~多池线程~~ —— **Phase 2 已做，见 §12.12**（协议里的 two-bit 与回执出口在任意 N 下都成立，
   §12.10 这两条不用改；改的是协议外围：环的多消费者出队、宽度声明、以及拿不到 token 时的退避）；
 * `batch` 的实测调优（默认 16，D3 的起点；per-worker 覆盖也没做）；
-* 公平性加权、优先级、CPU affinity/NUMA（§12.7 本来就排除）。
+* 公平性加权、CPU affinity/NUMA（§12.7 本来就排除）；优先级**已由 §12.17 落地**
+  （三级类别 + 保留槽，只认 `.pooled`）。
 
 **Phase 1 落地后补的三件（原"没做"清单里已划掉）**：
 
@@ -1363,9 +1366,11 @@ dedicated 加"抽干后再停"，两者都是会动到 D5 那条回执出口的�
 `Runtime: ...pooled...` 用例、`Actor:` 的两条停机语义用例、`zigmodu_runtime_pool_*` 的取值断言）
 一行未改、读数未变；宽度是新增的声明，不是既有声明的语义变化。
 
-**Phase 2 仍未做（§12.16 之后重述）**：公平性加权、优先级、affinity/NUMA（§12.7 本来就排除）、
-以及"池线程数随负载自适应"。**`batch` 的实测调优已不在这一行** —— §12.16 用 6 个点 × 3 种形状实测过，
-结论是**保持 16**（per-worker 覆盖仍然没有，那需要 per-worker 声明，属于加权/优先级那一档）。
+**Phase 2 仍未做（§12.16 之后重述）**：公平性加权、affinity/NUMA（§12.7 本来就排除）、
+以及"池线程数随负载自适应"。**优先级已不在这一行** —— §12.17 落地了三级类别 + 每 8 轮一个
+低优先保留槽（加权仍不做：那需要 per-worker 声明与可配权重，属于"有测量才开"的那一档）。
+**`batch` 的实测调优也已不在这一行** —— §12.16 用 6 个点 × 3 种形状实测过，
+结论是**保持 16**（per-worker 覆盖仍然没有，理由同上）。
 另外一条已知的**取舍**（不是缺陷）：上面第 4 点的 1 ms 偷取延迟。
 
 ### 12.15 `PrecisionTimer` 的界是**宿主的**，不是机制的（v0.33.6；CI 红过一次）
@@ -1569,6 +1574,60 @@ p99 ≈ 1 ms 上（`mixed-x2` 正好是 `p99 = 947 µs` 而 `p50 = 10 µs` 的�
   的形状（生产者睡着）会同时改变吞吐与 park 频率，那是另一组读数。
 * 没有动公平性机制：`queued`/`claimed`、FIFO 环、一个 worker 一个 token 一条未改，也没有加
   加权或优先级（§12.7 本来就排除）。这一节只回答"会不会饿死"和"`batch` 该取多少"。
+
+### 12.17 优先级：三级类别 + 每 8 轮一个保留槽（§12.7 排除项的第一条落地）
+
+> 状态：**已落地并断言**。`SpawnConfig.priority`（`.high` / `.normal` / `.low`，默认 `.normal`）
+> 只对 `.pooled` 有意义；给 `.dedicated` 声明它是**编译错误**（与 `.execution_class` 的门同形，
+> fail loud 而不是静默忽略；`scripts/check-pool-guard.sh` 有这条门的 fixture）。
+> 测试：`src/runtime/scheduler.zig` 三条（无线程，直接驱动环）+ `src/runtime/runtime.zig`
+> 两条接线用例，名字里都带 `§12.17`。
+
+**形状**：ready 环从一个变三个 —— 每类一条，各自独立满足 §12.12 的容量不变量
+（`ceilPowerOfTwo(max_pooled_workers + pool_threads)`，三环同容量）。`push` 按 token 上的
+`priority` 路由；claim-miss 的重推**回本类环** —— 降进 normal 环能省一行代码，但那样 high 的
+token 在竞争下会慢慢漂进 normal，优先级声明就失去了意义（测试 3 钉的就是这个）。
+
+**排序**：常规轮严格序 `high → normal → low`；每第 8 轮（`turns % 8 == 7`）是**保留轮**，
+顺序反过来 `low → normal → high`。于是：
+
+* **同类内**：FIFO、一个 worker 一个 token、`batch` 不变 —— §12.16 的"等待 = 一个 batch"
+  在同类内一字不改；
+* **跨类**：`low`（以及面对持续 `high` 的 `normal`）的饿死上界是**一个保留周期** ——
+  最坏等 8 轮 × 每轮至多 `batch` 条消息（默认 128 条）。与 §12.16 同一条口径：
+  用消息数计量、与宿主无关；
+* `high` 永远不被跨类耽误：保留轮里它排最后，但其余 7/8 的轮里它都在最前。
+
+**刻意不做**（§12.9 纪律：没有测量就不加旋钮）：类别数固定 3、保留周期固定 8，
+**不做**可配权重与类别数 —— 那两个旋钮的正当形状必须由 bench 反推，而不是先开出来再说。
+per-worker 的 `batch` 覆盖同理仍不做（§12.16 末尾已记）。
+
+**`dedicated` 为什么是编译错误**：dedicated worker 有自己的线程，没有"排队等调度"这个事件，
+给它一个优先级是语义噪音 —— 它影响不了任何东西，只会让读代码的人以为它能。这正是 §12.7 对
+`.affinity` 的论证的另一半：affinity 只对 dedicated 有意义、priority 只对 pooled 有意义，
+两边都不许"声明了却不生效"。
+
+**`RuntimeStats` 口径**：`ready_len` = 三环之和（`PoolSettled` 等既有断言零改动）、
+`ready_high_water` = 三环各自 high-water 的 max、`ready_capacity` = 单环容量（三环同值）。
+MetricsBridge 的**每类拆分 gauge 仍没做** —— 现有 `zigmodu_runtime_pool_*` 读数语义不变，
+按类拆开是已知的下一步。
+
+**测试证据**（三条 scheduler 测试都是无线程的环驱动，断言的是顺序本身，与宿主速度无关）：
+
+| 测试 | 钉住的行为 |
+|------|-----------|
+| 严格序 | high/normal/low 各一个 token 同时在环时，出环顺序必须恰好 high→normal→low |
+| 保留槽 | low 的 token 在 high 持续占用下，最迟在保留轮（`turns % 8 == 7`）被服务 |
+| claim-miss 保级 | 一个 high token claim-miss 后重推，下一轮仍按 high 服务（不漂移） |
+
+三条变异都验过红再还原：把保留轮关掉 → 保留槽测试红（`expected 1, found 0`）；把 claim-miss
+重推改成降进 normal 环 → 保级测试红；把排序固定成永远 low 优先 → 严格序测试红。
+两条 runtime 接线用例：pooled + `.high` 的声明落在 token 上（`h.pool.?.priority`）且收发守恒；
+`.blocking` + `.low` 组合落在**阻塞池自己的调度器**上（同一协议，零特判）。
+
+**没说明什么 / 仍开**：优先级对吞吐与延迟尾巴的影响**没有实测**（§12.16 的扫描是单类形状；
+三类混合的 bench 是下一步，也是"要不要可配权重"的唯一正当输入）；保留周期 8 是设计值、
+不是实测值；§12.7 对 affinity/NUMA 的立场不变。
 
 ## 13. Runtime Replay —— v1 已实现（见 §13.7）
 

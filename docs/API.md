@@ -1217,6 +1217,48 @@ a handoff that is *refused* leaves the fd to the fiber, which closes it as it
 always did. You do not have to do anything for either half; a rejected connection
 gets a close frame and its `on_close` call, the same as any other refusal.
 
+**ws_uring 环境边界（A-7 定界）。** 本节是 `setWsUring` 背后那条 io_uring 路径
+（`src/im/ws_uring.zig`）的权威验证边界：哪里测过、哪里没测过、为什么、什么情况下
+结论会改变。
+
+*非 Linux 的实际行为（以代码为准）*：不是运行时回落，也不是 `error.Unsupported` ——
+`WsUring.init` 函数体的第一个语句是 `if (builtin.os.tag != .linux) @compileError(...)`
+（`ws_uring.zig:91`），**编译期拒绝**。文件头的 `linux` / `IoUring` 两个别名在非 Linux
+换成 stub（`ws_uring.zig:9-41`），作用只是让文件其余部分（帧解析器、准入/排空记账）
+在所有平台保持可分析、可测。
+
+*各平台真正执行什么（以测试与 CI 为准）*：9 条测试全平台真跑 —— 解析器 4 条
+（`parseFrame:` 系列，`ws_uring.zig:607`/`:617`/`:647`/`:674`）、`writeControl` 超限拒绝
+1 条（`:689`）、`user_data` 编解码 1 条（`:568`）、准入/排空契约 2 条（`WsUring.adopt` /
+`WsUring.teardown`，`:765`/`:822`，用手工实例 `testInstance`（`:724`，`ring` 置
+`undefined`）+ socketpair）、强制分析 1 条（`:549`，把 `start`/`stop`/`adopt`/
+`processData` 的函数体钉进每个平台的分析图）。Linux 腿只多一条：teardown 测试里
+"fd 真被 `close(2)` 关掉"的断言（`:858-866`；非 Linux 的 `linux.close` 是空 stub，
+断言无意义故编译期跳过）。**任何平台都没有执行过的**：真 ring 的
+`runLoop`/`submitRead`/`copy_cqes` 与内核的交互 —— 树内没有任何用例构造 `WsUring`
+（`init` 唯一的"调用方"是 `tools/zmodu` 脚手架的模板字符串，
+`tools/zmodu/src/main.zig:7953`），`init` 的函数体因此在任何平台都**不进分析图**
+（测试只取它的类型，`:563`）；那句 `@compileError` 是给下游应用调用方的护栏，
+不是树内会触发的检查。CI 侧：`build-and-test` 矩阵（`.github/workflows/ci.yml:64-84`）
+在 ubuntu-latest / macos-latest / ubuntu-24.04-arm 三腿跑同一条
+`zig build test --test-timeout 300s`（`ci.yml:164`），没有 ws_uring 专属步骤
+（workflow 全文零命中），测试里也没有 io_uring 可用性探测或跳过逻辑 —— 因为根本
+没有用例碰真 ring。2026-09-29 本机 macOS 实测：`bash scripts/test-fast.sh --db all
+--filter ws_uring` 命中 9/2325 全绿。
+
+*macOS 上的保证从哪来*：帧解析的正确性不是这份文件自己的，而是**共享校验器**的 ——
+`parseFrame` 调 `WsFramer.validateFrameHeader`（`ws_uring.zig:494`）、
+`WsFramer.Assembler`（`:400`/`:709`）、`closeCodeFor`（`:519`），与 fiber 路径同一份
+规则（`WsFramer.zig:39-46`、`:298-303`），两条路径由构造保证不漂移。第 54 批
+（`CHANGELOG.md` 「第 54 批」）并轨时修掉两个真缺陷（升级后 fd 双重关闭、
+`adopt`/`runLoop` 跨线程元数据撕裂），并补了准入/排空与强制分析测试；该批自述同样
+写明：ring 线程的锁序与真 io_uring 行为"只能评审"。
+
+*结论改变的条件*：① 树内长出真跑 `WsUring.init`/`setWsUring` 的用例或示例 —— 两条
+Linux CI 腿将第一次执行真 ring（runner 内核的 io_uring 可用性是仓库外事实，未验证，
+届时需先在腿上落实）；② Zig std 的 Io 长出等价跨平台能力、该文件被替换；③ CI 增加
+新平台腿。本节随其中任何一条重核。
+
 
 
 **Server Options:**
@@ -1773,6 +1815,13 @@ later is reported at `err` level with the live connection count
 return holds shutdown …`): the log is the diagnosis, and the wait continues — a
 `stop()` that returned with a fiber still alive would hand it a server its caller
 is about to `deinit`.
+
+**Dispatch boundary (A-8).** `start()` 派发永循环走 `Group.concurrent`，并发额度耗尽时
+以 `error.ConcurrencyUnavailable` **响亮失败并回滚**（`abortStart`），而不是把调用线程
+征用作循环体。该分支在 `std.testing.io` 下不可达（额度 `.unlimited`），由自带有界
+`Io.Threaded` 的专测锁定（`src/extensions/WebSocket.zig:1951`/`:1977`）——
+权威边界（机制、两种处理形状、各 site 的覆盖状态）见
+[`DISTRIBUTED.md`](DISTRIBUTED.md)「并发额度耗尽分支（A-8 定界）」。
 
 ### Cache
 

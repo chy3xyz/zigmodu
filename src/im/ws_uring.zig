@@ -52,6 +52,14 @@ const WsFramer = ws_framer.WsFramer;
 
 /// io_uring-based WebSocket event loop — Linux 5.1+ only.
 /// Eliminates per-connection fiber stacks: each connection is a 4KB buffer + 120B state.
+///
+/// Platform boundary: `init`'s first statement is a `@compileError` off Linux
+/// (below), and the `linux` / `IoUring` aliases at the top of this file degrade
+/// to stubs there, so the frame parser and the admission/teardown bookkeeping
+/// stay analyzable and testable on every platform. What is verified where — and
+/// what no test executes anywhere (the real ring; nothing in-tree calls
+/// `WsUring.init`) — is written down as the authoritative boundary note in
+/// `docs/API.md` 「ws_uring 环境边界（A-7 定界）」.
 pub const WsUring = struct {
     const Self = @This();
 
