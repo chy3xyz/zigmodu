@@ -2,6 +2,64 @@
 
 ## [Unreleased]
 
+### 第 110 批：A-3 落地 —— 集群两面运行时密钥轮换/撤销 + 双 key 无分区轮换窗（**破坏性：否**）
+
+1. **范围与威胁模型**：per-node 凭证（A-1，第 109 批）落地后的运维面 —— key 泄露要撤、定期要换，
+   且轮换过程**不许分区**（两端不可能同一瞬时换 key）。源真相仍是 SecretsManager/启动配置
+   （框架不替你读 key，同 `cluster_secret` 约定）；本批给的是把它落到**运行中**集群的调用。
+   线格式不变：没有 kid，轮换窗只改"哪把 key 能验"，不改帧形状。
+2. **API（两面同形，`ClusterBootstrap` 一次打两面，缺的面跳过）**：`rotateOwnKey(new)`（改签，
+   立即生效）/ `rotatePeerKey(id, new)`（开窗：current←new、previous←旧 current；未知 id =
+   无窗 upsert）/ `setPeerKey(id, key)`（覆盖写并关窗）/ `dropPreviousPeerKey(id) bool`
+   （显式关窗，不动 current）/ 撤销：总线 `removePeerKey(id) bool`、Raft `revokePeerKey(id) !bool`
+   （`error{OutOfMemory}` 时什么都不改）。验签一律先 current 后 previous（常数时间逐候选），
+   签名永远只用 current；窗口内每帧最多两次 HMAC。**无分区轮换 B 的 key（K1→K2）三阶段**：
+   各节点 `rotatePeerKey(B, K2)` 开窗 → B `rotateOwnKey(K2)` 改签 → 各节点 `setPeerKey(B, K2)`
+   或 `dropPreviousPeerKey(B)` 关窗。
+3. **撤销语义（不是删一行表）**：总线 `removePeerKey` 删表项 **并 `disconnectNode(id)`** 关注册表
+   连接（在途拨号由 `settleConnect` 收尾关掉）；入站长连接（不在注册表）由**逐帧查表**兜住 ——
+   撤销后下一帧查不到 key 即断连，重握手在 `bindInbound` 被拒；`credentials_configured` 保持
+   粘性，删掉最后一把 peer key **不会**把端口降回裸帧。Raft 侧无长连接可关：撤销后入站帧在 key
+   查找处拒、出站 RPC 在 dial 前丢（既有 fail-closed 路径免费得到）。
+4. **同步纪律（为什么多一把锁）**：Raft 入站读侧（`RaftTransport.handleConnection`，accept 线程）
+   在 dispatch 前验签，**有意不持 `RaftLock`**；出站由 `tick()` 在 `RaftLock` 内查 key —— 所以
+   变更不能只靠 RaftLock。`RaftElection` 新增叶子锁 `key_lock`：读侧锁内按值拷出 `[32]u8`
+   （HMAC 在锁外），变更侧整个重建在锁内（alloc + swap + free 旧 slice），读者从不持有 slice
+   指针 → 无 UAF、无 RCU。锁序 `RaftLock → key_lock`；`key_lock` 内不取主锁、不 IO。总线沿用
+   既有 `peer_keys_lock`（现同护 `own_key`）；入站事件帧从"握手时缓存进 `Binding`"改为逐帧查表，
+   撤销才能打到存活连接。
+5. **测试**（+7，全真 loopback，端口 20200–20290 段）：`RaftElection.zig` +1（key 表运维单测：
+   rotate 开窗 / close / revoke 的结算形状，OOM 不改状态）；`RaftTransport.zig` +2 —— 撤销
+   （被撤 peer 入站被拒且永不被拨，有 key peer 不受影响）与轮换窗（窗内旧新皆验、关窗后旧签拒、
+   `rotateOwnKey` 改签后旧签拒）；`DistributedEventBus.zig` +3 —— 线上帧轮换窗（旧新皆收 →
+   关窗 → 覆盖写关窗 → `rotateOwnKey` 改签）、拨号方对接收方 previous 的验收与关窗/覆盖后拒绝、
+   撤销断开现存连接且重握手被拒；`ClusterBootstrap.zig` +1（五个透传两面落地、缺面跳过）。
+   总数 2307 → 2314（2247 → 2254 通过，skip 60 不变）。
+6. **变异验红证据**：① `verifyFrameMacWindowed` 只验 current → Raft 轮换窗测试红
+   （`TestUnexpectedResult` @ `RaftTransport.zig:3597`：旧 key 的 vote 交换在窗内被拒），
+   还原复绿；② `removePeerKey` 去掉 `disconnectNode` → 撤销测试红（`expected 0, found 1`：
+   注册表连接在撤销后存活），还原复绿；③ `openEventFrameWindowed` 只验 current → 线上轮换窗
+   测试红（`expected 3, found 2`：previous 签的帧被丢），还原复绿。
+7. **顺手修的测试基建 bug（本批验收抓到）**：`peerServeAsReceiver` 在 claim 校验失败时只
+   `return error` **不关 socket** —— dialer 的应答读永久阻塞（本批新测试最后一个负例踩中：
+   诊断打完后整跑挂到超时 kill）。改为与 `bindInbound` 同形：拒签即挂断（`sock.close` +
+   `error.HandshakeRefused`），dialer 读到 EOF → `HandshakeRejected`。既有调用只走成功路径，
+   行为不变。
+8. **门禁读数**：`zig build fmt-check` ✓ · `zig build check`（check-production）✓ ·
+   `bash scripts/check-version.sh` ✓ · 全量 `bash scripts/test-fast.sh --db all --force-run`
+   **2254/2314 通过、60 skip、0 fail**（较基线 +7：RaftElection 1、RaftTransport 2、
+   DistributedEventBus 3、ClusterBootstrap 1）· `zig build soak-cluster` ✓（18 条 delivery 对
+   全部 2400/2400）· `bash scripts/ci-mixed-version.sh` ✓（同版本三节点唯一选主；混合对跑
+   旧节点帧被拒 4 行、应答拒绝 74 行、总线拒绝 1 行，新侧两节点照常选主复制、干净退出）·
+   `zig build -Ddb=none -Dtarget=x86_64-windows` ✓。
+9. **文档**：`docs/DISTRIBUTED.md` 新增「密钥轮换与撤销（A-3，两面同 API）」节（API 表、三阶段
+   序列、撤销语义、fail-closed 不变、同步纪律、不在范围）；`docs/dev/cluster-identity-design.md`
+   两处"不做密钥轮换/撤销"改"已由第 110 批实现"；`docs/dev/cluster-auth-design.md` 头部状态行
+   补 A-3；`docs/dev/README.md` 状态表两行 + 落地行；`docs/dev/v1.0-readiness-v0.35.md` §七
+   加 A-3 跟进注（判定表不回改）。
+10. **不在范围**：kid 帧内协商、控制面自动下发、轮换状态持久化（进程重启后 key 表以来源
+    SecretsManager/启动配置为准）—— 都不做。
+
 ### 第 109 批：A-1 落地 —— Raft 端口 per-node 身份绑定（帧内自述 id + `peer_keys[自述id]` 验签；**破坏性：否**）
 
 1. **威胁模型与设计**：对齐总线（`DistributedEventBus`）已落地的身份绑定语义 —— 持有节点 B 合法

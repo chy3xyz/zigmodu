@@ -274,6 +274,10 @@ pub const ElectionConfig = struct {
     /// every frame, and inside the MAC's coverage), so only the holder of
     /// node-X's key can appear as X. The mode is fail-closed: a peer with no key
     /// on record is never dialled and its inbound frames are refused.
+    ///
+    /// A-3: after `init` this field is guarded by `RaftElection.key_lock` —
+    /// change it only through `RaftElection.rotateOwnKey`, never by poking the
+    /// config directly (the accept thread reads it under that lock).
     own_key: ?[32]u8 = null,
 
     /// A-1: the peers' credentials — `key` is the key **that node** signs with
@@ -285,6 +289,10 @@ pub const ElectionConfig = struct {
     /// reply against the key of the peer they dialled, which is why a missing
     /// entry here means "cannot talk to that peer at all", not "talk less
     /// safely".
+    ///
+    /// A-3: same `key_lock` rule as `own_key` — runtime changes go through
+    /// `rotatePeerKey` / `setPeerKey` / `dropPreviousPeerKey` / `revokePeerKey`.
+    /// `PeerKey.previous` is the rotation window those calls manage.
     peer_keys: []const PeerKey = &.{},
 
     /// §7 log compaction, leader-side automatic trigger: once the **live** log
@@ -342,9 +350,15 @@ pub const Peer = struct {
 /// `id` is the same namespace as `Peer.id` / `node_id`; `key` is the key that
 /// node signs its frames with (its own `own_key`). See `ElectionConfig.own_key`
 /// for the mode this enables.
+///
+/// A-3 (`RaftElection.rotatePeerKey`): `previous` is the rotation window — while
+/// it is set, frames signed with **either** `key` or `previous` verify (signing
+/// never uses `previous`). It is cleared by `setPeerKey` / `dropPreviousPeerKey`,
+/// and stays null for every entry that was never rotated.
 pub const PeerKey = struct {
     id: []const u8,
     key: [32]u8,
+    previous: ?[32]u8 = null,
 };
 
 /// Vote request sent to peers
@@ -423,6 +437,34 @@ pub const RaftElection = struct {
     /// `compactLog` and by the state accessors; the private helpers they call
     /// (`startElection`, `sendHeartbeats`, …) assume it is already held.
     lock: RaftLock = .{},
+
+    /// A-3: guards **only** the key material — `config.own_key` and
+    /// `config.peer_keys` (the slice header included) — against the runtime
+    /// rotation/revocation API below. It exists because the inbound read side
+    /// is *not* under `lock`: `RaftTransport.handleConnection` deliberately
+    /// resolves and verifies a frame's key before the dispatch that would take
+    /// `lock` (see its own comment), so a `peer_keys` rebuild holding only
+    /// `lock` would free the slice out from under an accept-thread reader.
+    ///
+    /// Discipline: a reader acquires this lock, resolves the key(s) it needs
+    /// **by value** (`[32]u8` copies — `authMode` / `signAuth` / `nodeKeys`),
+    /// and releases before any IO; a mutation does its whole rebuild inside the
+    /// lock, so no reader can be mid-iteration when an old slice is freed. The
+    /// critical sections are a short scan plus value copies (a mutation adds
+    /// one allocator call — an operational rarity, not a per-frame path).
+    ///
+    /// Lock order: `lock` → `key_lock` (`tick`'s outbound round resolves keys
+    /// while holding `lock`); `key_lock` is otherwise taken alone, and nothing
+    /// holding it ever acquires `lock` or blocks on IO.
+    key_lock: RaftLock = .{},
+
+    /// The mutable view of the peer-key table — the **same allocation** as
+    /// `config.peer_keys`, owned by this raft since `init`. `ElectionConfig`'s
+    /// public shape is `[]const PeerKey` (so callers can pass comptime
+    /// literals), but the A-3 rotation/revocation calls mutate entries in
+    /// place; every such mutation goes through this view under `key_lock` and
+    /// re-publishes **both** views when the slice is rebuilt.
+    peer_keys_mut: []PeerKey,
 
     // Persistent state (would be persisted to disk in full Raft)
     current_term: u64 = 0,
@@ -506,7 +548,7 @@ pub const RaftElection = struct {
             allocator.free(peer_keys_copy);
         }
         for (config.peer_keys, 0..) |pk, i| {
-            peer_keys_copy[i] = .{ .id = try allocator.dupe(u8, pk.id), .key = pk.key };
+            peer_keys_copy[i] = .{ .id = try allocator.dupe(u8, pk.id), .key = pk.key, .previous = pk.previous };
             peer_keys_init = i + 1;
         }
         var config_kept = config;
@@ -517,6 +559,7 @@ pub const RaftElection = struct {
         return .{
             .allocator = allocator,
             .config = config_kept,
+            .peer_keys_mut = peer_keys_copy,
             .log = std.ArrayList(LogEntry).empty,
             .pending_snapshot = std.ArrayList(u8).empty,
             .next_index = std.StringHashMap(u64).init(allocator),
@@ -557,8 +600,10 @@ pub const RaftElection = struct {
         }
         self.peers.deinit(self.allocator);
         // The A-1 peer-key table: owned by this raft since `init` (see there).
-        for (self.config.peer_keys) |pk| self.allocator.free(pk.id);
-        self.allocator.free(self.config.peer_keys);
+        // `config.peer_keys` is the same allocation as `peer_keys_mut` — free
+        // it exactly once, through the mutable view.
+        for (self.peer_keys_mut) |pk| self.allocator.free(pk.id);
+        self.allocator.free(self.peer_keys_mut);
         if (self.voted_for) |v| self.allocator.free(v);
         if (self.snapshot_data) |s| self.allocator.free(s);
         // leader_id may alias local_id (from becomeLeader); only free when they differ
@@ -1441,6 +1486,146 @@ pub const RaftElection = struct {
         const id_copy = try self.allocator.dupe(u8, id);
         errdefer self.allocator.free(id_copy);
         try self.peers.append(self.allocator, .{ .id = id_copy, .address = "" });
+    }
+
+    // ── A-3: runtime key rotation & revocation ──────────────────────────────
+    //
+    // The operational half of per-node identity (the read half is in
+    // `RaftTransport`): `SecretsManager` stays the source of truth — these are
+    // the hooks an operator (or a secrets watcher) calls when a key changes.
+    // Every one of them holds `key_lock` for its whole rebuild, so a reader on
+    // the accept thread or in `tick`'s outbound round always sees a whole
+    // table; see the `key_lock` field for the discipline. None of them touches
+    // the wire format: a frame is still `[len][tag][payload][mac]`, and the
+    // rotation window lives entirely in *which key verifies*.
+    //
+    // The three-phase, no-partition rotation sequence for node B's key
+    // (K1 → K2), spelled out in `docs/DISTRIBUTED.md` §"密钥轮换与撤销":
+    //   1. every peer: `rotatePeerKey(B, K2)` — K2 is current, K1 still verifies;
+    //   2. B: `rotateOwnKey(K2)` — B's frames now sign with K2 and verify
+    //      everywhere as current; in-flight K1 frames verify as previous;
+    //   3. every peer: `setPeerKey(B, K2)` or `dropPreviousPeerKey(B)` — the
+    //      window closes, K1 stops verifying.
+
+    /// Replace this node's own signing key. Frames signed after the swap carry
+    /// `new_key`; a receiver whose window still covers the old key
+    /// (`PeerKey.previous`) keeps verifying the in-flight old-signed frames.
+    pub fn rotateOwnKey(self: *Self, new_key: [32]u8) void {
+        self.key_lock.acquire();
+        defer self.key_lock.release();
+        self.config.own_key = new_key;
+    }
+
+    /// Set (or overwrite) `peer_id`'s credential, closing any open rotation
+    /// window (`previous` cleared). For a rotation that keeps the old key
+    /// acceptable while peers catch up, use `rotatePeerKey` instead.
+    pub fn setPeerKey(self: *Self, peer_id: []const u8, key: [32]u8) !void {
+        self.key_lock.acquire();
+        defer self.key_lock.release();
+        if (self.peerKeyEntry(peer_id)) |pk| {
+            pk.key = key;
+            pk.previous = null;
+            return;
+        }
+        try self.appendPeerKeyLocked(peer_id, key);
+    }
+
+    /// Rotate `peer_id`'s credential: `new_key` becomes the current key and the
+    /// old current moves to `previous`, so frames signed with either verify
+    /// until the window is closed (`setPeerKey` / `dropPreviousPeerKey`). An
+    /// unknown id is upserted with no window (there is no old key to keep).
+    pub fn rotatePeerKey(self: *Self, peer_id: []const u8, new_key: [32]u8) !void {
+        self.key_lock.acquire();
+        defer self.key_lock.release();
+        if (self.peerKeyEntry(peer_id)) |pk| {
+            pk.previous = pk.key;
+            pk.key = new_key;
+            return;
+        }
+        try self.appendPeerKeyLocked(peer_id, new_key);
+    }
+
+    /// Close `peer_id`'s rotation window: frames signed with the previous key
+    /// stop verifying. True when the entry exists (the post-state is "no
+    /// previous" either way); false for an unknown id.
+    pub fn dropPreviousPeerKey(self: *Self, peer_id: []const u8) bool {
+        self.key_lock.acquire();
+        defer self.key_lock.release();
+        const pk = self.peerKeyEntry(peer_id) orelse return false;
+        pk.previous = null;
+        return true;
+    }
+
+    /// Revoke `peer_id`'s credential outright: the entry leaves the table, so
+    /// an inbound frame claiming that id fails the key lookup in
+    /// `RaftTransport.handleConnection`, and an outbound RPC to it is lost in
+    /// `outboundKeys` before the dial — both already fail-closed paths. True
+    /// when the entry existed. There is no live connection to close: Raft RPCs
+    /// are one short connection per call, so the next frame from the revoked
+    /// peer is refused at the verify step and nothing lingers (the bus's
+    /// long-lived connections are why `DistributedEventBus.removePeerKey` has a
+    /// `disconnectNode` half instead).
+    ///
+    /// `error.OutOfMemory` means the rebuild failed and **nothing changed** —
+    /// the entry is still in place and the call may be retried; refusing to
+    /// report it would leave an operator believing a revoked key is dead.
+    pub fn revokePeerKey(self: *Self, peer_id: []const u8) error{OutOfMemory}!bool {
+        self.key_lock.acquire();
+        defer self.key_lock.release();
+        const old = self.peer_keys_mut;
+        var index: ?usize = null;
+        for (old, 0..) |pk, i| {
+            if (std.mem.eql(u8, pk.id, peer_id)) {
+                index = i;
+                break;
+            }
+        }
+        const i = index orelse return false;
+
+        const shrunk = try self.allocator.alloc(PeerKey, old.len - 1);
+        var out: usize = 0;
+        for (old, 0..) |pk, j| {
+            if (j == i) continue;
+            shrunk[out] = pk;
+            out += 1;
+        }
+        self.allocator.free(old[i].id);
+        self.allocator.free(old);
+        self.publishPeerKeysLocked(shrunk);
+        return true;
+    }
+
+    /// The mutable entry for `peer_id`, or null. `key_lock` must be held — the
+    /// table is rebuilt by the rotation/revocation calls above.
+    fn peerKeyEntry(self: *Self, peer_id: []const u8) ?*PeerKey {
+        for (self.peer_keys_mut) |*pk| {
+            if (std.mem.eql(u8, pk.id, peer_id)) return pk;
+        }
+        return null;
+    }
+
+    /// Swap the table for a rebuilt slice. `key_lock` held by the caller; the
+    /// old slice is already freed (its ids' ownership moved with the entries).
+    /// Both views are re-published together — readers only ever hold one of
+    /// them for the length of a `key_lock` critical section.
+    fn publishPeerKeysLocked(self: *Self, new_table: []PeerKey) void {
+        self.peer_keys_mut = new_table;
+        self.config.peer_keys = new_table;
+    }
+
+    /// Grow the table by one entry. `key_lock` held by the caller; the id copy
+    /// and the wider slice are owned by the table from here on, replacing the
+    /// old slice (freed here — no reader can hold it: every reader runs inside
+    /// this same lock and takes its keys by value).
+    fn appendPeerKeyLocked(self: *Self, peer_id: []const u8, key: [32]u8) !void {
+        const id_copy = try self.allocator.dupe(u8, peer_id);
+        errdefer self.allocator.free(id_copy);
+        const old = self.peer_keys_mut;
+        const grown = try self.allocator.alloc(PeerKey, old.len + 1);
+        @memcpy(grown[0..old.len], old);
+        grown[old.len] = .{ .id = id_copy, .key = key, .previous = null };
+        self.allocator.free(old);
+        self.publishPeerKeysLocked(grown);
     }
 
     /// Get current state
@@ -4294,4 +4479,65 @@ test "a member leader's AppendEntries is still accepted and appended" {
     try testing.expectEqualStrings("from-member", election.getLogEntry(1).?.command);
     try testing.expectEqualStrings("node-leader", election.getLeader().?);
     try testing.expectEqual(@as(u64, 1), election.getCommitIndex());
+}
+
+// ── A-3: runtime key rotation & revocation ──────────────────────────────────
+
+test "runtime key table ops: rotate opens a window, close/revoke settle it" {
+    const allocator = testing.allocator;
+
+    const k_own1: [32]u8 = @splat(0xa0);
+    const k_own2: [32]u8 = @splat(0xa9);
+    const k_b1: [32]u8 = @splat(0xb1);
+    const k_b2: [32]u8 = @splat(0xb2);
+    const k_c1: [32]u8 = @splat(0xc1);
+    const k_d1: [32]u8 = @splat(0xd1);
+
+    var peers = [_]Peer{ .{ .id = "node-b", .address = "" }, .{ .id = "node-c", .address = "" } };
+    const keys = [_]PeerKey{ .{ .id = "node-b", .key = k_b1 }, .{ .id = "node-c", .key = k_c1 } };
+    var election = try RaftElection.init(allocator, "node-a", &peers, .{ .own_key = k_own1, .peer_keys = &keys }, &MembershipTestTransport.vtable);
+    defer election.deinit();
+
+    // rotateOwnKey: the signing key swaps, no window on this side.
+    election.rotateOwnKey(k_own2);
+    try testing.expectEqual(@as(?[32]u8, k_own2), election.config.own_key);
+
+    // rotatePeerKey on a known id: new current, old current kept as previous.
+    try election.rotatePeerKey("node-b", k_b2);
+    try testing.expectEqual(k_b2, election.peerKeyEntry("node-b").?.key);
+    try testing.expectEqual(@as(?[32]u8, k_b1), election.peerKeyEntry("node-b").?.previous);
+
+    // An unknown id is upserted with no window (nothing old to keep).
+    try election.rotatePeerKey("node-d", k_d1);
+    try testing.expectEqual(k_d1, election.peerKeyEntry("node-d").?.key);
+    try testing.expectEqual(@as(?[32]u8, null), election.peerKeyEntry("node-d").?.previous);
+    try testing.expectEqual(@as(usize, 3), election.config.peer_keys.len);
+
+    // setPeerKey overwrites and closes the window.
+    try election.setPeerKey("node-b", k_b1);
+    try testing.expectEqual(k_b1, election.peerKeyEntry("node-b").?.key);
+    try testing.expectEqual(@as(?[32]u8, null), election.peerKeyEntry("node-b").?.previous);
+    // …and upserts an unknown id the same way.
+    try election.setPeerKey("node-e", k_d1);
+    try testing.expectEqual(@as(usize, 4), election.config.peer_keys.len);
+
+    // dropPreviousPeerKey closes an open window; both miss shapes are false.
+    try election.rotatePeerKey("node-b", k_b2);
+    try testing.expect(election.dropPreviousPeerKey("node-b"));
+    try testing.expectEqual(@as(?[32]u8, null), election.peerKeyEntry("node-b").?.previous);
+    try testing.expect(!election.dropPreviousPeerKey("node-zz"));
+
+    // revokePeerKey: the entry is gone, the table rebuilt without it; a second
+    // revoke and an unknown id are false. (The on-wire halves — inbound refuse,
+    // outbound fail-closed — are the RaftTransport tests.)
+    try testing.expect(try election.revokePeerKey("node-b"));
+    try testing.expect(election.peerKeyEntry("node-b") == null);
+    try testing.expectEqual(@as(usize, 3), election.config.peer_keys.len);
+    try testing.expect(!try election.revokePeerKey("node-b"));
+
+    // Revoking down to an empty table stays consistent (deinit frees it).
+    try testing.expect(try election.revokePeerKey("node-c"));
+    try testing.expect(try election.revokePeerKey("node-d"));
+    try testing.expect(try election.revokePeerKey("node-e"));
+    try testing.expectEqual(@as(usize, 0), election.config.peer_keys.len);
 }

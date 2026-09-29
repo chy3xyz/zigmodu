@@ -164,7 +164,10 @@ pub fn setPeerKey(self: *Self, peer_id: []const u8, key: [32]u8) void; // 我怎
 
 - **不做加密**：帧仍是明文。握手给的是**身份**，不是**机密性**。要机密性走 TLS/边车
   （与 `cluster-auth-design.md` §5 同一条）。
-- **不做密钥轮换 / 撤销**：静态成员表 + 静态 key，与集群既有的静态 `peers` 一致。要轮换是另一件事。
+- ~~**不做密钥轮换 / 撤销**~~：**已由第 110 批（A-3）实现** —— 运行时 `rotateOwnKey` /
+  `rotatePeerKey`（双 key 验收窗）/ `setPeerKey` / `dropPreviousPeerKey` / `removePeerKey`
+  （撤销并断开现存连接），Raft 侧同形（`revokePeerKey`）。见 `docs/DISTRIBUTED.md`
+  §"密钥轮换与撤销"。本轮当时不做：静态成员表 + 静态 key，与集群既有的静态 `peers` 一致。
 - **不动 Raft 侧** —— 但要说清楚：**Raft 的 L1 有同一个性质**（共享 PSK 的 `ClusterAuth` 不绑定身份），
   Raft 靠 **L2 的成员校验**兜住"自述 id 必须是成员"，而**那个 id 的可信度同样只有"持有 secret 的主机"**。
   所以本设计只是总线那一半；Raft 那一半是**同形的一件事**，另开一轮。
@@ -315,13 +318,18 @@ L1 的 HMAC helper、`serializeEvent` 的转义与漂移守卫、`seq` 重放防
 ### 11.8 仍未做（**明写**）
 
 - **不做加密**：帧仍是明文（§9 未变）。
-- **不做密钥轮换 / 撤销**：静态成员表 + 静态 key；`peer_keys` 可以被 `setPeerKey` 覆盖（最后一个
-  写入者赢），但**没有撤销入口**，也没有按 kid 的双验。
+- ~~**不做密钥轮换 / 撤销**~~：**已由第 110 批（A-3）实现** —— `rotateOwnKey` / `rotatePeerKey`
+  （开窗：current 验签、旧 key 进 previous 双验，不是按 kid）/ `setPeerKey`（覆盖并关窗）/
+  `dropPreviousPeerKey` / `removePeerKey`（撤销入口：删表项 + `disconnectNode` 关现存连接，入站侧由
+  逐帧查表兜住）；Raft 侧同形。见 `docs/DISTRIBUTED.md` §"密钥轮换与撤销"。kid 协商 / 自动下发 /
+  轮换状态持久化仍不做。
 - **混合版本集群未实测对跑**：硬切更硬了 —— 新侧对旧节点发的第一帧期望的是 challenge，收到的是
   事件帧；旧侧对新节点的 challenge 会当事件去解析（§14 记过：旧侧的解析器是子串匹配）。**失败形态是
   "总线连不上"，不是"看起来正常但不设防"**，但确实没有实测过混合版本。
-- **Raft 那一半没动**：L1 的 `ClusterAuth` 仍是共享 PSK，`leader_id` 的可信度仍只是"持有 secret 的
-  主机"（§9 已记，属于另一轮）。
+- ~~**Raft 那一半没动**~~：**已由第 109 批（A-1）+ 第 110 批（A-3）改变** —— Raft 端口
+  可选 per-node 凭证（帧内自述 id + `peer_keys[自述id]` 验签，优先于 `cluster_secret`；共享 PSK
+  仅是未配 per-node 时的兼容路径），轮换/撤销 API 两面同形。见 `docs/DISTRIBUTED.md`
+  「Raft 端口：per-node 身份」与「密钥轮换与撤销」。
 - **入站连接不登记回 `self.nodes`**：绑定给了 id，但没有地址可用（入站对端是
   `dialer_ip:临时端口`），所以"反向投递仍走对端自己拨的那条连接"。这是既有形状，未改。
 - **`peer_keys` 没有上界 / TTL**：只有应用写它，不是对端可控的表（与 `peer_seqs` 的区别写在这里）。

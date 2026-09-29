@@ -479,6 +479,61 @@ pub const ClusterBootstrap = struct {
         return self.raft;
     }
 
+    // ── A-3: runtime key rotation & revocation ──────────────────────────────
+    //
+    // One call reaches **both** cluster planes: the event bus
+    // (`DistributedEventBus`, long-lived connections) and the raft
+    // (`RaftElection`, one short connection per RPC). A plane that does not
+    // exist (node not started, or no raft) is skipped. `SecretsManager` stays
+    // the source of truth — these are the operational hooks a secrets watcher
+    // calls when a key changes; the three-phase rotation sequence is in
+    // `docs/DISTRIBUTED.md` §"密钥轮换与撤销". None of them changes the wire
+    // format.
+
+    /// Swap this node's own signing key on both planes. Frames signed after
+    /// the call use `new_key`; peers accept it once their window for this node
+    /// covers it (their `rotatePeerKey(this, new_key)` came first).
+    pub fn rotateOwnKey(self: *Self, new_key: [32]u8) void {
+        if (self.bus) |bus| bus.rotateOwnKey(new_key);
+        if (self.raft) |raft| raft.rotateOwnKey(new_key);
+    }
+
+    /// Rotate a peer's credential on both planes: `new_key` is current, the old
+    /// current stays acceptable as the window's `previous` until
+    /// `setPeerKey` / `dropPreviousPeerKey` closes it.
+    pub fn rotatePeerKey(self: *Self, peer_id: []const u8, new_key: [32]u8) !void {
+        if (self.bus) |bus| try bus.rotatePeerKey(peer_id, new_key);
+        if (self.raft) |raft| try raft.rotatePeerKey(peer_id, new_key);
+    }
+
+    /// Overwrite a peer's credential on both planes and close any open
+    /// rotation window — phase ③ of the rotation sequence.
+    pub fn setPeerKey(self: *Self, peer_id: []const u8, key: [32]u8) !void {
+        if (self.bus) |bus| try bus.setPeerKey(peer_id, key);
+        if (self.raft) |raft| try raft.setPeerKey(peer_id, key);
+    }
+
+    /// Close a peer's rotation window on both planes without touching the
+    /// current key. True when the entry existed on at least one plane.
+    pub fn dropPreviousPeerKey(self: *Self, peer_id: []const u8) bool {
+        var found = false;
+        if (self.bus) |bus| found = bus.dropPreviousPeerKey(peer_id) or found;
+        if (self.raft) |raft| found = raft.dropPreviousPeerKey(peer_id) or found;
+        return found;
+    }
+
+    /// Revoke a peer's credential on both planes. The bus half
+    /// (`DistributedEventBus.removePeerKey`) also closes every connection bound
+    /// to that id; the raft half (`RaftElection.revokePeerKey`) makes its
+    /// frames and RPCs fail closed from the next one on. True when the entry
+    /// existed on at least one plane.
+    pub fn revokePeerKey(self: *Self, peer_id: []const u8) error{OutOfMemory}!bool {
+        var found = false;
+        if (self.bus) |bus| found = bus.removePeerKey(peer_id) or found;
+        if (self.raft) |raft| found = (try raft.revokePeerKey(peer_id)) or found;
+        return found;
+    }
+
     /// The read side: refcounted membership snapshots + rendezvous routing.
     /// Request paths use `getView().acquire()/.release()` (or `.pick(key)`);
     /// they must not read the membership map.
@@ -1036,4 +1091,61 @@ test "a ClusterBootstrap-configured cluster elects a leader (peers credited by i
     try raft.handleVoteResponse(.{ .term = raft.getTerm(), .vote_granted = true }, "node-b");
     try std.testing.expect(raft.isLeader());
     try std.testing.expectEqualStrings("node-a", raft.getLeader().?);
+}
+
+test "ClusterBootstrap forwards key rotation and revocation to both planes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Single node: nothing to elect, the stub transport is fine — this test is
+    // about the A-3 facade, not about elections.
+    var cluster = try ClusterBootstrap.init(allocator, io, .{
+        .node_id = "a3-node",
+        .port = 20290,
+        .peers = &.{},
+        .raft_cluster_size = 1,
+    });
+    defer cluster.deinit();
+    try cluster.start();
+
+    const k1: [32]u8 = @splat(0x11);
+    const k2: [32]u8 = @splat(0x22);
+
+    // Before anything is set: nothing to close or revoke, on either plane.
+    try std.testing.expect(!cluster.dropPreviousPeerKey("peer-x"));
+    try std.testing.expect(!(try cluster.revokePeerKey("peer-x")));
+
+    // rotatePeerKey upserts on both planes; the raft half is directly
+    // observable, the bus half answers through the same facade below.
+    try cluster.rotatePeerKey("peer-x", k1);
+    const raft = cluster.getRaft().?;
+    raft.key_lock.acquire();
+    try std.testing.expectEqual(@as(usize, 1), raft.config.peer_keys.len);
+    try std.testing.expectEqualStrings("peer-x", raft.config.peer_keys[0].id);
+    raft.key_lock.release();
+
+    try cluster.rotatePeerKey("peer-x", k2);
+    raft.key_lock.acquire();
+    try std.testing.expectEqual(k2, raft.config.peer_keys[0].key);
+    try std.testing.expectEqual(@as(?[32]u8, k1), raft.config.peer_keys[0].previous);
+    raft.key_lock.release();
+
+    try std.testing.expect(cluster.dropPreviousPeerKey("peer-x"));
+    raft.key_lock.acquire();
+    try std.testing.expectEqual(@as(?[32]u8, null), raft.config.peer_keys[0].previous);
+    raft.key_lock.release();
+
+    cluster.rotateOwnKey(k2);
+    raft.key_lock.acquire();
+    try std.testing.expectEqual(@as(?[32]u8, k2), raft.config.own_key);
+    raft.key_lock.release();
+
+    // Revocation reaches both planes: true once, false once the entry is gone
+    // (the bus half's `removePeerKey` is what makes the second call false even
+    // with the raft already clean).
+    try std.testing.expect(try cluster.revokePeerKey("peer-x"));
+    raft.key_lock.acquire();
+    try std.testing.expectEqual(@as(usize, 0), raft.config.peer_keys.len);
+    raft.key_lock.release();
+    try std.testing.expect(!(try cluster.revokePeerKey("peer-x")));
 }

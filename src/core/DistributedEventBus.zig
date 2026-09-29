@@ -140,6 +140,17 @@ const default_outbound_send_timeout_ms: u32 = 5_000;
 /// cannot make this node allocate without bound.
 const max_frame_size = NetworkTransport.MAX_MESSAGE_SIZE;
 
+/// A-3: a peer's credential as a rotation window. `current` is the only key
+/// ever signed with; while `previous` is set, inbound material signed with
+/// **either** verifies — that is what makes rotating a live peer's key a
+/// no-partition sequence (`docs/DISTRIBUTED.md` §"密钥轮换与撤销"). The window
+/// is explicit: `rotatePeerKey` opens it, `setPeerKey` / `dropPreviousPeerKey`
+/// close it, `removePeerKey` drops the entry altogether.
+pub const PeerKeyWindow = struct {
+    current: [32]u8,
+    previous: ?[32]u8 = null,
+};
+
 /// Distributed Event Bus for cross-node communication
 /// Allows events to be published and subscribed across multiple processes/machines
 pub const DistributedEventBus = struct {
@@ -215,6 +226,10 @@ pub const DistributedEventBus = struct {
     /// framework does not read keys for you. `null` means this node cannot
     /// complete a handshake at all, so with credentials configured every
     /// connection is closed (`start()` says so, loudly).
+    ///
+    /// A-3: guarded by `peer_keys_lock` once the bus is running —
+    /// `rotateOwnKey` swaps it at runtime while accept fibers and the publish
+    /// path read it; both sides take the lock and copy the value out.
     own_key: ?[32]u8 = null,
 
     /// `peer_id → that node's own key`: how the claim of `peer_id` is verified,
@@ -223,11 +238,23 @@ pub const DistributedEventBus = struct {
     /// its own), so this table is application configuration rather than
     /// peer-controlled state — unlike `peer_seqs`, which only a verified peer can
     /// grow.
-    peer_keys: std.StringHashMap([32]u8),
+    ///
+    /// A-3: the value is a rotation window — `current` verifies and signs,
+    /// `previous` only verifies, and only while the window is open
+    /// (`rotatePeerKey` opens it, `setPeerKey` / `dropPreviousPeerKey` close it,
+    /// `removePeerKey` revokes outright). Lookups copy the value out under
+    /// `peer_keys_lock`; the per-frame verify reads the table **per frame**
+    /// rather than caching at the handshake, so a rotation reaches a live
+    /// connection and a revocation closes it (see `handleConnection`).
+    peer_keys: std.StringHashMap(PeerKeyWindow),
 
-    /// Guards `peer_keys`: `setPeerKey`/`setOwnKey` are wiring-time calls but the
-    /// bus is normally already started when an app reaches it through
-    /// `ClusterBootstrap.getEventBus()`, while accept fibers read the same table.
+    /// Guards `peer_keys` **and** `own_key`: `setPeerKey`/`setOwnKey` are
+    /// wiring-time calls but the bus is normally already started when an app
+    /// reaches it through `ClusterBootstrap.getEventBus()`, while accept fibers
+    /// read the same table — and the A-3 rotation/revocation calls are runtime
+    /// by definition. Leaf lock: nothing holding it touches `nodes_lock`,
+    /// `write_lock` or IO (`removePeerKey` releases it *before* its
+    /// `disconnectNode` half).
     peer_keys_lock: std.Io.Mutex = .init,
 
     /// Sticky "some credential exists" flag, set by any of the three setters.
@@ -365,7 +392,7 @@ pub const DistributedEventBus = struct {
             .heartbeat_thread = null,
             .fiber_group = .init,
             .peer_seqs = std.StringHashMap(u64).init(allocator),
-            .peer_keys = std.StringHashMap([32]u8).init(allocator),
+            .peer_keys = std.StringHashMap(PeerKeyWindow).init(allocator),
             // Milliseconds since the host booted, in the low bits: a *process*
             // restart on a host that did not reboot therefore resumes ahead of
             // the counter it had reached, so peers keep accepting it. A reboot
@@ -1050,7 +1077,7 @@ pub const DistributedEventBus = struct {
         defer self.allocator.free(frame);
         std.mem.writeInt(u32, frame[0..4], @intCast(body_len), .big);
         if (mac_len != 0) {
-            const key = self.own_key orelse return error.PeerKeyMissing;
+            const key = self.ownKey() orelse return error.PeerKeyMissing;
             std.crypto.auth.hmac.sha2.HmacSha256.create(frame[4..][0..auth_mac_bytes], json, &key);
         }
         @memcpy(frame[4 + mac_len ..], json);
@@ -1073,9 +1100,11 @@ pub const DistributedEventBus = struct {
     /// connection — the stream cannot be resynchronised past an unauthenticated
     /// frame — which is exactly how `RaftTransport.handleConnection` treats one.
     ///
-    /// `sender_key` is the credential of the node this connection is **bound** to
-    /// (see the handshake comment at the top of this file). Nothing here reads
-    /// the frame before its MAC verifies: the key no longer comes from a
+    /// `sender_key` is the credential of the node this connection is **bound**
+    /// to, resolved per frame by the caller (the handshake pins the *id*; the
+    /// key table says what verifies — see `openEventFrameWindowed` for the A-3
+    /// rotation window). Nothing here reads the frame before its MAC verifies:
+    /// the key no longer comes from a
     /// self-description, so this is a straight verify-then-return and the json it
     /// hands back is the first and only parse of those bytes. A null key means
     /// the bare path, where there is nothing to verify against.
@@ -1101,11 +1130,22 @@ pub const DistributedEventBus = struct {
         return json;
     }
 
-    /// A connection's identity, settled by the handshake: who the peer proved it
-    /// is, and the credential its event frames have to be signed with.
+    /// A-3: `openEventFrame` under a rotation window — `current` first, then
+    /// `previous` while the window is open. Signing never uses `previous`. At
+    /// most two HMACs per frame, and only during a rotation.
+    fn openEventFrameWindowed(keys: PeerKeyWindow, body: []const u8) ?[]const u8 {
+        if (openEventFrame(keys.current, body)) |json| return json;
+        const prev = keys.previous orelse return null;
+        return openEventFrame(prev, body);
+    }
+
+    /// A connection's identity, settled by the handshake: who the peer proved
+    /// it is. The key its frames verify against is **not** cached here — it is
+    /// looked up per frame (`handleConnection`), so a rotation window opened by
+    /// `rotatePeerKey` reaches a live connection, and a revocation
+    /// (`removePeerKey`) closes one.
     const Binding = struct {
         id: []const u8,
-        key: [32]u8,
     };
 
     /// ② of the handshake protocol: `[dc: 16][claim_id][mac: 32]`, split into
@@ -1200,7 +1240,7 @@ pub const DistributedEventBus = struct {
     /// no path out of this function ends in an accepted unauthenticated
     /// connection.
     fn bindInbound(self: *Self, conn: std.Io.net.Stream) ?Binding {
-        const own = self.own_key orelse {
+        const own = self.ownKey() orelse {
             std.log.debug("[DEB] dropping connection: this node has no own_key to bind with", .{});
             return null;
         };
@@ -1226,20 +1266,14 @@ pub const DistributedEventBus = struct {
         const mac = &parts.mac;
 
         // The claim is what selects the key; a claim we hold no key for is an
-        // unknown peer, not a peer to fall back on.
-        const claim_key = self.peerKey(claim) orelse {
+        // unknown peer, not a peer to fall back on. The window (A-3): while the
+        // peer's rotation is open, a claim signed with its *previous* key still
+        // verifies — that is phase ② of the sequence, the peer mid-swap.
+        const claim_keys = self.peerKey(claim) orelse {
             std.log.debug("[DEB] dropping connection: no peer key for handshake claim '{s}'", .{claim});
             return null;
         };
-        var expected: [auth_mac_bytes]u8 = undefined;
-        var claim_hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&claim_key);
-        claim_hmac.update(claim);
-        claim_hmac.update(&challenge);
-        claim_hmac.update(dc);
-        claim_hmac.final(&expected);
-        // Constant-time, for the same reason `RaftTransport.verifiedRecv` is: a
-        // byte-wise early exit leaks the tag.
-        if (!ClusterAuth.timingSafeEql(&expected, mac)) {
+        if (!claimMacVerified(claim_keys, claim, &challenge, dc, mac)) {
             std.log.debug("[DEB] dropping connection: handshake MAC does not verify for claim '{s}'", .{claim});
             return null;
         }
@@ -1263,7 +1297,56 @@ pub const DistributedEventBus = struct {
             std.log.debug("[DEB] dropping connection: bound id not stored ({})", .{err});
             return null;
         };
-        return .{ .id = id_copy, .key = claim_key };
+        return .{ .id = id_copy };
+    }
+
+    /// One handshake claim MAC (`HMAC(key, claim ++ challenge ++ dc)`) checked
+    /// against a key window: current first, then `previous` while the rotation
+    /// window is open. Constant-time per candidate, for the same reason
+    /// `RaftTransport.verifiedRecv` is: a byte-wise early exit leaks the tag.
+    fn claimMacVerified(
+        keys: PeerKeyWindow,
+        claim: []const u8,
+        challenge: *const [handshake_nonce_bytes]u8,
+        dc: *const [handshake_nonce_bytes]u8,
+        mac: *const [auth_mac_bytes]u8,
+    ) bool {
+        if (claimMacWith(keys.current, claim, challenge, dc, mac)) return true;
+        const prev = keys.previous orelse return false;
+        return claimMacWith(prev, claim, challenge, dc, mac);
+    }
+
+    fn claimMacWith(
+        key: [32]u8,
+        claim: []const u8,
+        challenge: *const [handshake_nonce_bytes]u8,
+        dc: *const [handshake_nonce_bytes]u8,
+        mac: *const [auth_mac_bytes]u8,
+    ) bool {
+        var expected: [auth_mac_bytes]u8 = undefined;
+        var h = std.crypto.auth.hmac.sha2.HmacSha256.init(&key);
+        h.update(claim);
+        h.update(challenge);
+        h.update(dc);
+        h.final(&expected);
+        return ClusterAuth.timingSafeEql(&expected, mac);
+    }
+
+    /// The dialer half of the same window check, for the receiver's proof
+    /// (`HMAC(key, receiver_id ++ dc)`).
+    fn replyMacVerified(keys: PeerKeyWindow, receiver_id: []const u8, dc: *const [handshake_nonce_bytes]u8, mac: *const [auth_mac_bytes]u8) bool {
+        if (replyMacWith(keys.current, receiver_id, dc, mac)) return true;
+        const prev = keys.previous orelse return false;
+        return replyMacWith(prev, receiver_id, dc, mac);
+    }
+
+    fn replyMacWith(key: [32]u8, receiver_id: []const u8, dc: *const [handshake_nonce_bytes]u8, mac: *const [auth_mac_bytes]u8) bool {
+        var expected: [auth_mac_bytes]u8 = undefined;
+        var h = std.crypto.auth.hmac.sha2.HmacSha256.init(&key);
+        h.update(receiver_id);
+        h.update(dc);
+        h.final(&expected);
+        return ClusterAuth.timingSafeEql(&expected, mac);
     }
 
     /// The dialing half of the handshake: read the receiver's challenge, prove
@@ -1284,8 +1367,8 @@ pub const DistributedEventBus = struct {
         // Both lookups happen **before** a byte is written: there is no point
         // opening an exchange we cannot finish, and no path where a missing key
         // degrades into an unverified connection.
-        const own = self.own_key orelse return error.PeerKeyMissing;
-        const peer_key = self.peerKey(peer_id) orelse return error.PeerKeyMissing;
+        const own = self.ownKey() orelse return error.PeerKeyMissing;
+        const peer_keys = self.peerKey(peer_id) orelse return error.PeerKeyMissing;
 
         const challenge = readHandshake(conn, self.allocator) orelse return error.HandshakeRejected;
         defer self.allocator.free(challenge);
@@ -1318,12 +1401,9 @@ pub const DistributedEventBus = struct {
             std.log.debug("[DEB] handshake refused: dialled '{s}', answered by '{s}'", .{ peer_id, receiver_id });
             return error.HandshakeRejected;
         }
-        var expected: [auth_mac_bytes]u8 = undefined;
-        var reply_hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&peer_key);
-        reply_hmac.update(receiver_id);
-        reply_hmac.update(&dc);
-        reply_hmac.final(&expected);
-        if (!ClusterAuth.timingSafeEql(&expected, &proof.mac)) {
+        // The receiver proves itself with its own key; inside its rotation
+        // window a proof signed with the *previous* key still verifies (A-3).
+        if (!replyMacVerified(peer_keys, receiver_id, &dc, &proof.mac)) {
             std.log.debug("[DEB] handshake refused: '{s}' did not prove it holds its own key", .{peer_id});
             return error.HandshakeRejected;
         }
@@ -1409,8 +1489,22 @@ pub const DistributedEventBus = struct {
             // below is the only parse of these bytes. An unauthenticated frame
             // never becomes an event, and it is not a *parse* failure either, so
             // it does not go to the DLQ: the connection is dropped.
-            const sender_key: ?[32]u8 = if (binding) |b| b.key else null;
-            const data = openEventFrame(sender_key, body.items) orelse break;
+            //
+            // A-3: the key is looked up **per frame**, not cached at the
+            // handshake — a rotation window (`rotatePeerKey`) has to reach a live
+            // connection, and a revocation (`removePeerKey`) has to close one.
+            // A missing entry on a bound connection is the revoked peer, so the
+            // connection is dropped, never read bare.
+            const data = blk: {
+                if (binding) |b| {
+                    const keys = self.peerKey(b.id) orelse {
+                        std.log.debug("[DEB] dropping connection: bound peer '{s}' has no key on record (revoked?)", .{b.id});
+                        break;
+                    };
+                    break :blk openEventFrameWindowed(keys, body.items) orelse break;
+                }
+                break :blk openEventFrame(null, body.items) orelse break;
+            };
 
             // Parse using our arena to avoid multiple tiny heap allocations
             const maybe_event = parseEvent(ma, data) catch |err| switch (err) {
@@ -2108,9 +2202,27 @@ pub const DistributedEventBus = struct {
     /// its frames with. Source it from `secrets.SecretsManager`; the framework
     /// deliberately does not read keys for you (the same convention as
     /// `cluster_secret`).
+    ///
+    /// Runtime-safe (A-3): the write goes through `peer_keys_lock`, as do the
+    /// readers, so calling this on a started bus is sound. `rotateOwnKey` is
+    /// the same call named for the rotation sequence.
     pub fn setOwnKey(self: *Self, key: [32]u8) void {
+        self.peer_keys_lock.lock(self.io) catch {
+            std.log.err("[DistributedEventBus] own key NOT set: key table lock unavailable", .{});
+            return;
+        };
+        defer self.peer_keys_lock.unlock(self.io);
         self.own_key = key;
         self.credentials_configured.store(true, .release);
+    }
+
+    /// A-3: swap this node's signing key on a **running** bus. Every frame and
+    /// handshake signed after the swap uses `new_key`; peers whose window for
+    /// this node still covers the old key (`PeerKeyWindow.previous`, opened by
+    /// their `rotatePeerKey`) keep verifying the in-flight old-signed material.
+    /// The full no-partition sequence is in `docs/DISTRIBUTED.md` §"密钥轮换与撤销".
+    pub fn rotateOwnKey(self: *Self, new_key: [32]u8) void {
+        self.setOwnKey(new_key);
     }
 
     /// How this node verifies `peer_id`: that node's **own** key. Set one per
@@ -2118,6 +2230,10 @@ pub const DistributedEventBus = struct {
     /// (`connectToNode` returns `error.PeerKeyMissing`) and cannot connect to us
     /// (its claim is closed at the handshake), which is the fail-closed shape
     /// `docs/dev/cluster-identity-design.md` §5 asks for.
+    ///
+    /// An overwrite **closes** the rotation window (`previous` cleared) — this
+    /// is phase ③ of the rotation sequence. To keep the old key acceptable
+    /// while the peer catches up, use `rotatePeerKey` instead.
     pub fn setPeerKey(self: *Self, peer_id: []const u8, key: [32]u8) !void {
         const id_copy = try self.allocator.dupe(u8, peer_id);
         errdefer self.allocator.free(id_copy);
@@ -2131,16 +2247,85 @@ pub const DistributedEventBus = struct {
         } else {
             self.allocator.free(id_copy);
         }
-        gop.value_ptr.* = key;
+        gop.value_ptr.* = .{ .current = key, .previous = null };
         self.credentials_configured.store(true, .release);
     }
 
-    /// The key recorded for `peer_id`, or null. Locked: the table is read from
-    /// accept/handle fibers while an app may still be filling it in.
-    fn peerKey(self: *Self, peer_id: []const u8) ?[32]u8 {
+    /// A-3: rotate `peer_id`'s credential — `new_key` becomes the key its
+    /// material must verify against, and the old key stays acceptable as
+    /// `previous` until the window is closed (`setPeerKey` /
+    /// `dropPreviousPeerKey`). An unknown id is upserted with no window: there
+    /// is no old key to keep, and refusing the upsert would only invent a
+    /// second way to say `setPeerKey`.
+    pub fn rotatePeerKey(self: *Self, peer_id: []const u8, new_key: [32]u8) !void {
+        self.peer_keys_lock.lock(self.io) catch return error.KeyTableLocked;
+        defer self.peer_keys_lock.unlock(self.io);
+
+        if (self.peer_keys.getPtr(peer_id)) |entry| {
+            entry.previous = entry.current;
+            entry.current = new_key;
+            self.credentials_configured.store(true, .release);
+            return;
+        }
+        const id_copy = try self.allocator.dupe(u8, peer_id);
+        errdefer self.allocator.free(id_copy);
+        try self.peer_keys.put(id_copy, .{ .current = new_key, .previous = null });
+        self.credentials_configured.store(true, .release);
+    }
+
+    /// A-3: close `peer_id`'s rotation window — material signed with the
+    /// previous key stops verifying on the next frame/handshake. True when the
+    /// entry exists (the post-state is "no previous" either way), false for an
+    /// unknown id.
+    pub fn dropPreviousPeerKey(self: *Self, peer_id: []const u8) bool {
+        self.peer_keys_lock.lock(self.io) catch return false;
+        defer self.peer_keys_lock.unlock(self.io);
+        const entry = self.peer_keys.getPtr(peer_id) orelse return false;
+        entry.previous = null;
+        return true;
+    }
+
+    /// A-3: revoke `peer_id` outright. The entry leaves the table **and every
+    /// connection bound to that id is closed** — a revocation that leaves the
+    /// firewiring up is decorative: the registry half (`disconnectNode`, which
+    /// also wins against a dial still in flight) plus the per-frame key lookup
+    /// in `handleConnection`, which drops any surviving inbound connection at
+    /// its next frame now that the lookup misses. A re-handshake is refused at
+    /// `bindInbound` for the same reason. False when the id had no entry.
+    ///
+    /// `credentials_configured` deliberately stays set: removing the last peer
+    /// key must never flip the bus back to the bare wire format.
+    pub fn removePeerKey(self: *Self, peer_id: []const u8) bool {
+        const removed = blk: {
+            self.peer_keys_lock.lock(self.io) catch return false;
+            defer self.peer_keys_lock.unlock(self.io);
+            const kv = self.peer_keys.fetchRemove(peer_id) orelse break :blk false;
+            self.allocator.free(kv.key);
+            break :blk true;
+        };
+        if (!removed) return false;
+        // Outside `peer_keys_lock` (the leaf): `disconnectNode` walks the
+        // registry under `nodes_lock` and waits on the node's `write_lock`.
+        self.disconnectNode(peer_id);
+        return true;
+    }
+
+    /// The window recorded for `peer_id`, or null — a **value copy**, locked:
+    /// the table is read from accept/handle fibers while an app may still be
+    /// filling it in, and the A-3 calls above mutate it at runtime.
+    fn peerKey(self: *Self, peer_id: []const u8) ?PeerKeyWindow {
         self.peer_keys_lock.lock(self.io) catch return null;
         defer self.peer_keys_lock.unlock(self.io);
         return self.peer_keys.get(peer_id);
+    }
+
+    /// This node's own key, copied out under `peer_keys_lock` — the runtime
+    /// readers (`sendEventFrame`, both handshake halves) must not race
+    /// `rotateOwnKey` on a 32-byte read.
+    fn ownKey(self: *Self) ?[32]u8 {
+        self.peer_keys_lock.lock(self.io) catch return null;
+        defer self.peer_keys_lock.unlock(self.io);
+        return self.own_key;
     }
 
     /// True once **any** credential is configured: a `cluster_secret`
@@ -3127,14 +3312,19 @@ fn peerServeAsReceiver(
     const dc = response[0..handshake_nonce_bytes];
     const claim = response[handshake_nonce_bytes .. response.len - auth_mac_bytes];
     // The claim is checked before the reply goes out, exactly like the real
-    // receiver: an unproven dialer gets nothing back.
+    // receiver: an unproven dialer gets nothing back. And like `bindInbound`
+    // it *hangs up* — a refusal without the close leaves the dialer's reply
+    // read blocked on a socket nobody will ever write to again.
     var expected: [auth_mac_bytes]u8 = undefined;
     var claim_hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&claim_key);
     claim_hmac.update(claim);
     claim_hmac.update(&challenge);
     claim_hmac.update(dc);
     claim_hmac.final(&expected);
-    try std.testing.expectEqualSlices(u8, &expected, response[response.len - auth_mac_bytes ..]);
+    if (!ClusterAuth.timingSafeEql(&expected, response[response.len - auth_mac_bytes ..][0..auth_mac_bytes])) {
+        sock.close(std.testing.io);
+        return error.HandshakeRefused;
+    }
 
     const reply = try allocator.alloc(u8, receiver_id.len + auth_mac_bytes);
     defer allocator.free(reply);
@@ -5471,4 +5661,243 @@ test "a bus with credentials still fails closed when the handshake cannot comple
     // answered, so the socket was closed rather than used bare.
     try std.testing.expectEqual(@as(usize, 1), bus.getNodeCount());
     try std.testing.expect(bus.nodes.items[0].socket == null);
+}
+
+// ── A-3: rotation window & revocation on the wire ───────────────────────────
+//
+// The window semantics are per-frame (`handleConnection` resolves the key table
+// on every frame, never caching it from the handshake), so these tests drive
+// live connections through a rotation without reconnecting.
+
+/// An event frame body for the window tests: strictly increasing `seq` per
+/// source, because the replay gate (`acceptSeq`) keeps a per-claim high-water
+/// mark that outlives connections — two feeds with the same seq would be
+/// dropped as replays rather than judged by their keys.
+fn windowEventJson(buf: []u8, topic: []const u8, source: []const u8, seq: u64) []const u8 {
+    return DistributedEventBus.serializeEvent(.{
+        .topic = topic,
+        .payload = "x",
+        .source_node = source,
+        .timestamp = 1,
+        .seq = seq,
+    }, buf);
+}
+
+test "rotation window on the wire: old and new keys verify until the window closes" {
+    const allocator = std.testing.allocator;
+    const key_a1: [32]u8 = @splat(0xa1); // this node's own, rotated to a2 mid-test
+    const key_a2: [32]u8 = @splat(0xa2);
+    const key_b1: [32]u8 = @splat(0xb1); // the peer's old key
+    const key_b2: [32]u8 = @splat(0xb2); // the peer's new key
+    const key_b3: [32]u8 = @splat(0xb3); // overwrite target
+    const topic = "a3.window";
+    const peer = "node-b";
+
+    var received: usize = 0;
+    var bus = try framedBus(allocator, "node-a", topic, &received);
+    defer bus.deinit();
+    bus.setOwnKey(key_a1);
+    try bus.setPeerKey(peer, key_b1);
+
+    var j1: [160]u8 = undefined;
+    var j2: [160]u8 = undefined;
+    var j3: [160]u8 = undefined;
+    var j4: [160]u8 = undefined;
+    var j5: [160]u8 = undefined;
+    var j6: [160]u8 = undefined;
+    const f1 = windowEventJson(&j1, topic, peer, 1);
+    const f2 = windowEventJson(&j2, topic, peer, 2);
+    const f3 = windowEventJson(&j3, topic, peer, 3);
+    const f4 = windowEventJson(&j4, topic, peer, 4);
+    const f5 = windowEventJson(&j5, topic, peer, 5);
+    const f6 = windowEventJson(&j6, topic, peer, 6);
+
+    // Baseline: the only key on record verifies.
+    feedAuthed(&bus, peer, key_b1, key_b1, &.{f1});
+    try std.testing.expectEqual(@as(usize, 1), received);
+
+    // ① Open the window: rotate the record to key_b2, key_b1 kept as previous.
+    //    Both signs verify — the peer mid-swap (still signing with the old key)
+    //    and the peer already swapped. A verifier that looks at `current` only
+    //    fails the key_b1 feed here (mutation-tested).
+    try bus.rotatePeerKey(peer, key_b2);
+    feedAuthed(&bus, peer, key_b2, key_b2, &.{f2});
+    try std.testing.expectEqual(@as(usize, 2), received);
+    feedAuthed(&bus, peer, key_b1, key_b1, &.{f3});
+    try std.testing.expectEqual(@as(usize, 3), received);
+
+    // ③ Close the window: the old key stops verifying (handshake and frame
+    //    alike), the new key is untouched.
+    try std.testing.expect(bus.dropPreviousPeerKey(peer));
+    feedAuthed(&bus, peer, key_b1, key_b1, &.{f4});
+    try std.testing.expectEqual(@as(usize, 3), received);
+    feedAuthed(&bus, peer, key_b2, key_b2, &.{f4});
+    try std.testing.expectEqual(@as(usize, 4), received);
+
+    // `setPeerKey` is the other window closer: an overwrite clears `previous`.
+    try bus.rotatePeerKey(peer, key_b3);
+    try bus.setPeerKey(peer, key_b3);
+    feedAuthed(&bus, peer, key_b2, key_b2, &.{f5});
+    try std.testing.expectEqual(@as(usize, 4), received);
+    feedAuthed(&bus, peer, key_b3, key_b3, &.{f6});
+    try std.testing.expectEqual(@as(usize, 5), received);
+
+    // rotateOwnKey: the receiver's proof (handshake ③) is signed with the new
+    // own key from the swap on — checked against both candidates on the raw
+    // reply, because a feed's internal check can only prove the positive.
+    bus.rotateOwnKey(key_a2);
+    const pair = try openSocketPair();
+    bus.is_running = true;
+    const reader = try std.Thread.spawn(.{}, DistributedEventBus.handleConnection, .{ &bus, pair.conn });
+    defer {
+        pair.peer.close(std.testing.io);
+        reader.join();
+        bus.is_running = false;
+    }
+    const challenge = peerReadMessage(allocator, pair.peer) orelse return error.TestUnexpectedResult;
+    defer allocator.free(challenge);
+    try std.testing.expectEqual(@as(usize, handshake_nonce_bytes), challenge.len);
+    var dc: [handshake_nonce_bytes]u8 = undefined;
+    std.Io.randomSecure(std.testing.io, &dc) catch return error.EntropyUnavailable;
+    const response = try allocator.alloc(u8, handshake_nonce_bytes + peer.len + auth_mac_bytes);
+    defer allocator.free(response);
+    @memcpy(response[0..handshake_nonce_bytes], &dc);
+    @memcpy(response[handshake_nonce_bytes..][0..peer.len], peer);
+    var claim_hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&key_b3);
+    claim_hmac.update(peer);
+    claim_hmac.update(challenge);
+    claim_hmac.update(&dc);
+    claim_hmac.final(response[handshake_nonce_bytes + peer.len ..][0..auth_mac_bytes]);
+    try peerWriteMessage(pair.peer, response);
+
+    const reply = peerReadMessage(allocator, pair.peer) orelse return error.TestUnexpectedResult;
+    defer allocator.free(reply);
+    const proof = DistributedEventBus.parseHandshakeReply(reply) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("node-a", proof.id);
+    try std.testing.expect(DistributedEventBus.replyMacVerified(.{ .current = key_a2 }, proof.id, &dc, &proof.mac));
+    try std.testing.expect(!DistributedEventBus.replyMacVerified(.{ .current = key_a1 }, proof.id, &dc, &proof.mac));
+}
+
+/// One `bindOutbound` against a scripted receiver (`ReceiverFixture`); the
+/// dialer's verdict is the returned error, the fixture's own claim check rides
+/// along — a fixture failure on an *accepted* bind is a test bug, not a verdict.
+fn dialOnce(bus: *DistributedEventBus, reply_key: [32]u8, claim_key: [32]u8) !void {
+    const allocator = std.testing.allocator;
+    const pair = try openSocketPair();
+    var fixture = ReceiverFixture{
+        .allocator = allocator,
+        .sock = pair.peer,
+        .id = "node-a",
+        .reply_key = reply_key,
+        .claim_key = claim_key,
+    };
+    const receiver = try std.Thread.spawn(.{}, ReceiverFixture.run, .{&fixture});
+    const bind_result = bus.bindOutbound(pair.conn, "node-a");
+    pair.conn.close(std.testing.io);
+    receiver.join();
+    try bind_result;
+    if (fixture.err) |e| return e;
+}
+
+test "the dialer accepts the receiver's previous key inside the window and refuses it after" {
+    const allocator = std.testing.allocator;
+    const key_b1: [32]u8 = @splat(0xb1); // dialer's own, rotated to b2 at the end
+    const key_b2: [32]u8 = @splat(0xb2);
+    const key_a1: [32]u8 = @splat(0xa1); // receiver's old own key
+    const key_a2: [32]u8 = @splat(0xa2); // receiver's new own key
+
+    var dialer = try DistributedEventBus.init(allocator, std.testing.io, "node-b");
+    defer dialer.deinit();
+    dialer.setOwnKey(key_b1);
+    try dialer.setPeerKey("node-a", key_a1);
+
+    // Baseline: the receiver proves with the only key on record.
+    try dialOnce(&dialer, key_a1, key_b1);
+
+    // Window open: the receiver proving with its new key (current) and with its
+    // old key (previous) are both accepted — the window is what lets the two
+    // sides rotate without agreeing on the instant.
+    try dialer.rotatePeerKey("node-a", key_a2);
+    try dialOnce(&dialer, key_a2, key_b1);
+    try dialOnce(&dialer, key_a1, key_b1);
+
+    // Window closed: the old proof is refused, the new one still passes.
+    try std.testing.expect(dialer.dropPreviousPeerKey("node-a"));
+    try std.testing.expectError(error.HandshakeRejected, dialOnce(&dialer, key_a1, key_b1));
+    try dialOnce(&dialer, key_a2, key_b1);
+
+    // An overwrite (`setPeerKey`) closes the window too.
+    try dialer.rotatePeerKey("node-a", key_a1);
+    try dialer.setPeerKey("node-a", key_a2);
+    try std.testing.expectError(error.HandshakeRejected, dialOnce(&dialer, key_a1, key_b1));
+    try dialOnce(&dialer, key_a2, key_b1);
+
+    // rotateOwnKey changes what the dialer proves with: the receiver checking
+    // claims against the new own key accepts, against the old one refuses.
+    dialer.rotateOwnKey(key_b2);
+    try dialOnce(&dialer, key_a2, key_b2);
+    try std.testing.expectError(error.HandshakeRejected, dialOnce(&dialer, key_a2, key_b1));
+}
+
+test "peer key revocation closes the live connection and refuses the re-handshake" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    const key_a: [32]u8 = @splat(0xa1);
+    const key_b: [32]u8 = @splat(0xb2);
+    const topic = "a3.revoke";
+
+    var received: usize = 0;
+    var bus_a = try framedBus(allocator, "node-a", topic, &received);
+    defer bus_a.deinit();
+    bus_a.setOwnKey(key_a);
+    try bus_a.setPeerKey("node-b", key_b);
+    try bus_a.start(20250);
+    defer bus_a.stop();
+
+    var bus_b = try DistributedEventBus.init(allocator, io, "node-b");
+    defer bus_b.deinit();
+    bus_b.setOwnKey(key_b);
+    try bus_b.setPeerKey("node-a", key_a);
+    try bus_b.start(20251);
+    defer bus_b.stop();
+
+    // Both directions bound: b dials a (a's inbound fiber binds "node-b"), and
+    // a dials b, so a's *registry* holds a live connection to node-b too.
+    try bus_b.connectToNode("node-a", try std.Io.net.IpAddress.parseIp4("127.0.0.1", 20250));
+    try bus_a.connectToNode("node-b", try std.Io.net.IpAddress.parseIp4("127.0.0.1", 20251));
+    try std.testing.expectEqual(@as(usize, 1), bus_a.getNodeCount());
+    try std.testing.expect(bus_a.nodes.items[0].socket != null);
+
+    // Positive control: an event from b lands on a.
+    try bus_b.publish(topic, "before-revoke");
+    var waited: usize = 0;
+    while (received == 0 and waited < 200) : (waited += 1) {
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch break;
+    }
+    try std.testing.expectEqual(@as(usize, 1), received);
+
+    // Revoke. The registry half is closed and removed *by the call itself* —
+    // without the `disconnectNode` half this count stays 1 (mutation-tested).
+    try std.testing.expect(bus_a.removePeerKey("node-b"));
+    try std.testing.expect(!bus_a.removePeerKey("node-b"));
+    try std.testing.expectEqual(@as(usize, 0), bus_a.getNodeCount());
+
+    // The inbound half (b's connection into a, not a registry entry) dies at
+    // its next frame: the per-frame key lookup misses and the connection is
+    // dropped — the event is never delivered.
+    try bus_b.publish(topic, "after-revoke");
+    waited = 0;
+    while (waited < 40) : (waited += 1) {
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch break;
+    }
+    try std.testing.expectEqual(@as(usize, 1), received);
+
+    // A re-handshake is refused at bindInbound for the same reason (no key on
+    // record): the fresh dial is registered for routing but never connected.
+    bus_b.disconnectNode("node-a");
+    try bus_b.connectToNode("node-a", try std.Io.net.IpAddress.parseIp4("127.0.0.1", 20250));
+    try std.testing.expectEqual(@as(usize, 1), bus_b.getNodeCount());
+    try std.testing.expect(bus_b.nodes.items[0].socket == null);
 }

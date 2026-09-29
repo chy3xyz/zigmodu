@@ -3,7 +3,9 @@
 > 状态：**§3（L1 逐帧 HMAC 认证）与 §3.5（fail-closed 门禁）已实现并验证；
 > §4（L2 成员校验）已实现 —— 它当初被 §10 的缺陷阻断，§10 修完后随之解锁；
 > A-1（Raft 侧 per-node 身份绑定）已实现：帧内自述 id + `peer_keys[自述id]` 验签，
-> 见 `RaftTransport.zig` 文件头 §A-1 与 `docs/DISTRIBUTED.md`「Raft 端口：per-node 身份」。**
+> 见 `RaftTransport.zig` 文件头 §A-1 与 `docs/DISTRIBUTED.md`「Raft 端口：per-node 身份」；
+> A-3（密钥轮换/撤销）已由第 110 批实现：两面运行时 API + 双 key 验收窗，
+> 见 `docs/DISTRIBUTED.md`「密钥轮换与撤销」。**
 > 来源是 `docs/dev/security-audit-cluster.md` 的第 3 条高危，
 > 以及本次评估中对 `handleVoteRequest` / `handleAppendEntries` 的复核。
 > 所有事实都带 `文件:行`；推测的地方显式标注"未验证"。

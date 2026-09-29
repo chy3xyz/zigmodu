@@ -109,6 +109,50 @@ var cluster = try ClusterBootstrap.init(allocator, io, .{
   `setOwnKey` / `setPeerKey`（`ClusterBootstrap` 只把 `cluster_secret` 传给总线，per-node key 不进
   总线）。
 
+## 密钥轮换与撤销（A-3，两面同 API）
+
+per-node key 的运行时运维钩子。**源真相仍是 SecretsManager**（框架不替你读 key，同 `cluster_secret`
+的约定）；下面是 key 变更/泄露时把它落到运行中集群的调用。线格式不变：`[len][tag][payload][mac]`，
+没有 kid，轮换窗**只改"哪把 key 能验"**，不改帧形状。
+
+两面（总线 `DistributedEventBus`、Raft 端口 `RaftElection`）各有同名 API，`ClusterBootstrap` 一次
+打到两面（缺的面跳过）：
+
+| 操作 | 总线 | Raft | Bootstrap |
+|------|------|------|-----------|
+| 换自己签名 key | `rotateOwnKey(new)` | 同名 | 同名（两面） |
+| 轮换 peer key（开窗） | `rotatePeerKey(id, new)` | 同名 | 同名（两面） |
+| 覆盖写并**关窗** | `setPeerKey(id, key)` | 同名 | 同名（两面） |
+| 显式关窗 | `dropPreviousPeerKey(id) bool` | 同名 | 同名（存在任一面即 true） |
+| 撤销 | `removePeerKey(id) bool`（**并断开该 id 的现存连接**） | `revokePeerKey(id) !bool`（帧/RPC fail-closed，无长连接可关） | `revokePeerKey(id) !bool`（两面，任一存在即 true） |
+
+**轮换窗（双 key 验收）**：验签先试 `current`、失败再试 `previous`；签名永远只用 `current`。
+窗口内每帧最多两次 HMAC。`rotatePeerKey(id, new)` = current←new、previous←旧 current；
+`setPeerKey` 覆盖写且清空 previous；`dropPreviousPeerKey` 不动 current 只关窗。
+**无分区轮换 B 的 key（K1→K2）三阶段**：
+
+1. 各节点 `rotatePeerKey(B, K2)` —— B 的旧签（K1）仍被 previous 收，新签（K2）已是 current；
+2. B `rotateOwnKey(K2)` —— B 改签 K2，对端按 current=K2 收（在途 K1 帧按 previous 收）；
+3. 各节点 `setPeerKey(B, K2)` 或 `dropPreviousPeerKey(B)` 关窗 —— K1 停止验收。
+
+**撤销**：总线侧 `removePeerKey` 在 `peer_keys_lock` 下删表项，然后 `disconnectNode(id)` 关掉注册表里
+该 id 的连接（正在拨号的也由 `settleConnect` 收尾关掉）；入站长连接（不在注册表）由**逐帧查表**兜住
+——撤销后下一帧查不到 key 即断连，重握手在 `bindInbound` 被拒。Raft 侧没有长连接要关：RPC 一次一短
+连接，撤销后该 id 的入站帧在 key 查找处被拒、出站 RPC 在 dial 前丢（既有 fail-closed 路径免费得到）。
+
+**fail-closed 不变**：无 key 对端仍 dial 前丢（`error.PeerKeyMissing`）；无 `own_key` 仍拒发拒答；
+删掉最后一把 peer key **不会**把端口降回裸帧（`credentials_configured` 是粘性的）。
+
+**同步纪律**（为什么要一把新锁）：Raft 入站读侧（`RaftTransport.handleConnection`，accept 线程）
+在 dispatch 之前验签，**有意不持 `RaftLock`**；出站由 `tick()` 在 `RaftLock` 内查 key。所以轮换/撤销
+不走 `RaftLock`，而是专用的叶子锁 `RaftElection.key_lock`：读侧锁内按值拷出 key（[32]u8），变更侧整个
+重建在锁内完成（alloc + 换 + 释放旧 slice），读者从不持有 slice 指针，因此无 UAF、无 RCU。锁序：
+`RaftLock` → `key_lock`；`key_lock` 内不取主锁、不分配热路径、不 IO。总线侧沿用既有
+`peer_keys_lock`（现在同时护 `own_key`），逐帧查表的开销是一次哈希查找 + 锁内 32–64 字节拷贝。
+
+**不在范围**：kid 帧内协商、控制面自动下发、轮换状态持久化（进程重启后 key 表以来源
+SecretsManager/启动配置为准）——都不做，见 `docs/dev/v1.0-readiness-v0.35.md` §七 A-3 注记。
+
 ## 读侧怎么被喂（membership → view → 请求路径）
 
 `ClusterView` 是**读侧**：引用计数快照 + rendezvous 选点，请求路径读它、不读 membership 的哈希表。

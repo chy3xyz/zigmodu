@@ -406,6 +406,20 @@ fn verifyFrameMac(key: [32]u8, frame: []const u8) ![]const u8 {
     return frame[0..signed_len];
 }
 
+/// A-3: `verifyFrameMac` under a rotation window — `current` first, then
+/// `previous` while the window is open. At most two HMACs per frame, only
+/// during a rotation; signing never uses `previous`.
+fn verifyFrameMacWindowed(keys: NodeKeys, frame: []const u8) ![]const u8 {
+    if (verifyFrameMac(keys.current, frame)) |payload| return payload else |_| {}
+    const prev = keys.previous orelse return error.ClusterAuthFailed;
+    return verifyFrameMac(prev, frame);
+}
+
+/// `verifiedRecv` under a rotation window — see `verifyFrameMacWindowed`.
+fn verifiedRecvWindowed(keys: NodeKeys, conn: *NetworkTransport.ClusterConnection, buf: *std.ArrayList(u8)) ![]const u8 {
+    return verifyFrameMacWindowed(keys, try conn.recv(buf));
+}
+
 // ── A-1: per-node identity (which key a frame is keyed with) ────────────────
 //
 // `docs/dev/cluster-identity-design.md`'s threat model applied to the Raft
@@ -442,10 +456,31 @@ fn authMode(config: *const ElectionConfig) AuthMode {
 /// The key a frame **from** `id` must verify against: that node's own key.
 /// `id == local_id` maps to our own `own_key` (null when unset — i.e. refused,
 /// which is also the right answer for the nonsense claim "I am you").
+///
+/// Callers resolving a *verification* key want `nodeKeys` (the rotation window
+/// travels with it); this current-only form remains for "does a key exist for
+/// this id at all" questions (the vote-relay gate, the fail-closed tests).
 fn nodeKey(config: *const ElectionConfig, local_id: []const u8, id: []const u8) ?[32]u8 {
-    if (std.mem.eql(u8, id, local_id)) return config.own_key;
+    const keys = nodeKeys(config, local_id, id) orelse return null;
+    return keys.current;
+}
+
+/// What a frame from `id` may verify against: the current key, and — inside a
+/// rotation window (A-3, `RaftElection.rotatePeerKey`) — the key it replaced.
+/// Signing never uses `previous`; the window exists so a peer mid-rotation
+/// (its own key already swapped, our record not yet closed) still verifies.
+/// All value copies: a caller holding `key_lock` releases it before the HMAC.
+const NodeKeys = struct { current: [32]u8, previous: ?[32]u8 };
+
+fn nodeKeys(config: *const ElectionConfig, local_id: []const u8, id: []const u8) ?NodeKeys {
+    if (std.mem.eql(u8, id, local_id)) {
+        // Our own key signs and has no window on the verify side: the window
+        // for *our* rotation lives in the peers' `previous` slot for us.
+        const own = config.own_key orelse return null;
+        return .{ .current = own, .previous = null };
+    }
     for (config.peer_keys) |pk| {
-        if (std.mem.eql(u8, pk.id, id)) return pk.key;
+        if (std.mem.eql(u8, pk.id, id)) return .{ .current = pk.key, .previous = pk.previous };
     }
     return null;
 }
@@ -504,9 +539,11 @@ fn writeFrameSigned(auth: SignAuth, conn: *NetworkTransport.ClusterConnection, f
 /// key, so the reply read has to verify against the key of whoever answered
 /// (the dialled peer, resolved by the caller) — and a decoder that ignores
 /// trailing bytes would otherwise accept a frame it never authenticated.
-/// `null` is the bare path.
-fn readFrameAuth(key: ?[32]u8, conn: *NetworkTransport.ClusterConnection, buf: *std.ArrayList(u8)) ![]const u8 {
-    if (key) |k| return verifiedRecv(k, conn, buf);
+/// `null` is the bare path. The windowed keys accept a reply signed with the
+/// peer's *previous* key too, for the same mid-rotation reason as the inbound
+/// verifier (`verifyFrameMacWindowed`).
+fn readFrameAuth(keys: ?NodeKeys, conn: *NetworkTransport.ClusterConnection, buf: *std.ArrayList(u8)) ![]const u8 {
+    if (keys) |ks| return verifiedRecvWindowed(ks, conn, buf);
     return conn.recv(buf);
 }
 
@@ -838,24 +875,33 @@ pub fn TransportImpl(comptime slot: usize) type {
         /// The two keys one outbound RPC needs, resolved before the dial.
         /// `sign` is always this node's own key (`signAuth`); `verify` is the
         /// key the *answering* peer signs its reply with — under per-node that
-        /// is the peer's own key, resolved by the dial target's id.
-        const OutboundKeys = struct { sign: SignAuth, verify: ?[32]u8 };
+        /// is the peer's own key, resolved by the dial target's id, with its
+        /// rotation window (`NodeKeys.previous`, A-3) riding along.
+        const OutboundKeys = struct { sign: SignAuth, verify: ?NodeKeys };
 
         /// Resolve both halves of one outbound RPC, or fail closed: per-node
         /// mode with a keyless target (or no `own_key`) returns null, and the
         /// caller loses the message instead of dialling. The dial target is
         /// the identity the reply has to verify against, so a null `peer_id`
         /// there is unverifiable and refused for the same reason.
+        ///
+        /// Holds the raft's `key_lock` for the lookup: the callers run inside
+        /// `RaftLock` (`tick`'s round) or on an app thread, while
+        /// `revokePeerKey` may be rebuilding the table on a third. Everything
+        /// returned is a value copy, so the lock never spans the dial.
         fn outboundKeys(self: *Self, peer_id: ?[]const u8) ?OutboundKeys {
-            const config = &self.raft.config;
+            const raft = self.raft;
+            const config = &raft.config;
+            raft.key_lock.acquire();
+            defer raft.key_lock.release();
             switch (authMode(config)) {
                 .bare => return .{ .sign = .bare, .verify = null },
-                .shared => return .{ .sign = .{ .key = config.cluster_secret.? }, .verify = config.cluster_secret },
+                .shared => return .{ .sign = .{ .key = config.cluster_secret.? }, .verify = .{ .current = config.cluster_secret.?, .previous = null } },
                 .per_node => {
                     const sign = signAuth(config);
                     if (sign == .drop) return null;
                     const id = peer_id orelse return null;
-                    const verify = nodeKey(config, self.raft.local_id, id) orelse return null;
+                    const verify = nodeKeys(config, raft.local_id, id) orelse return null;
                     return .{ .sign = sign, .verify = verify };
                 },
             }
@@ -1009,7 +1055,8 @@ pub const ElectionTransportImpl = TransportImpl(0);
 /// `addresses` is optional and used only to push a vote response back to the
 /// candidate (whose own socket is closed by then).
 ///
-/// **Nothing here takes a lock, and that is deliberate.** The raft-state window
+/// **Nothing here takes the raft's `lock`, and that is deliberate.** The
+/// raft-state window
 /// of a frame is `decode → dispatch → encode`, and it is serialized by
 /// `RaftElection`'s own `lock` ([`RaftElection.RaftLock`]) — every `handle*` the
 /// dispatch calls takes it for its whole body, which is what keeps this file's
@@ -1020,6 +1067,13 @@ pub const ElectionTransportImpl = TransportImpl(0);
 /// guarantee depend on every path into a `RaftElection` remembering to
 /// serialize — an `InboundServer` started directly, or an app driving `tick()`
 /// itself, is exactly the case that was left open.
+///
+/// The exception is `key_lock` (A-3): the frame's verification key is resolved
+/// *before* the dispatch above, so it is outside the raft-state window, and the
+/// A-3 rotation/revocation API mutates that table at runtime. `key_lock` is a
+/// leaf taken for the lookup only — value copies out, HMAC after release — and
+/// never held across IO, so it cannot reintroduce the deadlock this comment is
+/// about.
 ///
 /// The two ends of the function stay outside any lock: a `recv`, the reply, and
 /// the relay dial are IO, and a `tick()` that waits on a peer's connect timeout
@@ -1058,8 +1112,17 @@ pub fn handleConnection(raft: *RaftElection, addresses: ?*const AddressBook, con
     // heartbeat — dropping a vote because a 6-byte `dupe` failed is not a failure
     // mode this path should have. Per-node mode picks the key off the frame's
     // claimed sender id (A-1, see the section at the top of this file).
+    //
+    // The reads run under the raft's `key_lock` (A-3): this thread holds no
+    // raft lock, and `rotateOwnKey` / `rotatePeerKey` / `revokePeerKey` may be
+    // rebuilding the key table on an operator thread right now. The critical
+    // sections below only resolve the mode and copy key bytes out; the HMAC
+    // itself runs after the release.
     const config = &raft.config;
+    raft.key_lock.acquire();
+    const mode = authMode(config);
     const sign = signAuth(config);
+    raft.key_lock.release();
     switch (sign) {
         // Per-node mode without an `own_key` cannot even answer: the reply
         // would have to go out bare, which the caller refuses to read. Refuse
@@ -1077,7 +1140,7 @@ pub fn handleConnection(raft: *RaftElection, addresses: ?*const AddressBook, con
     // *before* any decoder sees it; a bad tag is the same shape of failure as an
     // unreadable frame — drop the connection and keep serving.
     const frame = blk: {
-        switch (authMode(config)) {
+        switch (mode) {
             .bare => break :blk conn.recv(&in) catch |err| {
                 log.debug("[raft] inbound frame not readable ({})", .{err});
                 return;
@@ -1098,11 +1161,16 @@ pub fn handleConnection(raft: *RaftElection, addresses: ?*const AddressBook, con
                     log.debug("[raft] inbound frame carries no sender id, dropped", .{});
                     return;
                 };
-                const key = nodeKey(config, raft.local_id, claimed) orelse {
+                raft.key_lock.acquire();
+                const keys = nodeKeys(config, raft.local_id, claimed);
+                raft.key_lock.release();
+                const ks = keys orelse {
                     log.debug("[raft] inbound frame from unkeyed node {s}, dropped", .{claimed});
                     return;
                 };
-                break :blk verifyFrameMac(key, raw) catch |err| {
+                // A-3: current first, then the previous key while the peer's
+                // rotation window is open — signing never uses `previous`.
+                break :blk verifyFrameMacWindowed(ks, raw) catch |err| {
                     log.debug("[raft] inbound frame not authenticated as {s} ({})", .{ claimed, err });
                     return;
                 };
@@ -1165,7 +1233,10 @@ pub fn handleConnection(raft: *RaftElection, addresses: ?*const AddressBook, con
     if (relay_candidate) |candidate| {
         const ep = if (addresses) |book| book.lookup(candidate) else null;
         if (ep) |endpoint| {
-            if (authMode(config) == .per_node and nodeKey(config, raft.local_id, candidate) == null) {
+            raft.key_lock.acquire();
+            const candidate_unkeyed = mode == .per_node and nodeKey(config, raft.local_id, candidate) == null;
+            raft.key_lock.release();
+            if (candidate_unkeyed) {
                 log.debug("[raft] candidate {s} has no configured key, vote response not relayed", .{candidate});
                 return;
             }
@@ -3345,4 +3416,215 @@ test "connectTimeout hands back a blocking stream the sockread helpers can use" 
     const gone_port = gone.socket.address.getPort();
     gone.deinit(io);
     try testing.expectError(error.ConnectionRefused, connectTimeout(io, try std.Io.net.IpAddress.parse("127.0.0.1", gone_port), test_dial_timeout_ms));
+}
+
+// ── A-3: rotation window & revocation on the wire ───────────────────────────
+//
+// The runtime half of per-node identity (`RaftElection.rotateOwnKey` /
+// `rotatePeerKey` / `setPeerKey` / `dropPreviousPeerKey` / `revokePeerKey`).
+// Wire format untouched: the window changes *which key verifies*, never the
+// frame shape.
+
+/// Rotated credentials for the A-3 tests (distinct from the `pernode_key_*`
+/// constants the A-1 tests run on).
+const rotated_key_a: [32]u8 = @splat(0xa2);
+const rotated_key_b: [32]u8 = @splat(0xb5);
+
+/// One vote_request round trip: dial `port`, send the request signed with
+/// `sign_key`, and hand back the **raw** reply bytes (MAC still attached, so
+/// the caller decides which key must verify them — and which must not). Null
+/// is the fail-closed answer: the peer dropped the connection without
+/// answering.
+fn voteExchangeRaw(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    port: u16,
+    term: u64,
+    candidate_id: []const u8,
+    sign_key: [32]u8,
+) !?[]u8 {
+    var conn = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = port }, test_dial_timeout_ms);
+    defer conn.deinit();
+    sockread.setRecvTimeout(conn.stream, stalled_peer_patience_ms);
+    var frame = std.ArrayList(u8).empty;
+    defer frame.deinit(allocator);
+    try encodeVoteRequest(&frame, allocator, .{ .term = term, .candidate_id = candidate_id, .last_log_index = 0, .last_log_term = 0 });
+    try sendSigned(sign_key, &conn, frame.items);
+    var reply = std.ArrayList(u8).empty;
+    defer reply.deinit(allocator);
+    _ = conn.recv(&reply) catch return null;
+    return try allocator.dupe(u8, reply.items);
+}
+
+test "per-node key revocation: a revoked peer is refused inbound and never dialled, keyed peers unaffected" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    if (!@import("../../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    // node-b inbound, keyed for node-a and node-c.
+    var b_impl: TransportImpl(1) = undefined;
+    var b_raft: RaftElection = undefined;
+    var b_inbound: InboundServer = undefined;
+    var b_thread: std.Thread = undefined;
+
+    var impl_up = false;
+    var raft_up = false;
+    var server_up = false;
+    defer if (impl_up) b_impl.deinit();
+    defer if (raft_up) b_raft.deinit();
+    defer if (server_up) stopInbound(io, &b_inbound, &b_thread);
+
+    b_impl.init(allocator, io, &b_raft);
+    impl_up = true;
+    const b_port = try startInbound(allocator, io, &b_raft, &b_impl.addresses, 20200, &b_inbound, &b_thread);
+    server_up = true;
+
+    const b_keys = [_]PeerKey{ .{ .id = "node-a", .key = pernode_key_a }, .{ .id = "node-c", .key = pernode_key_c } };
+    var b_peers = [_]Peer{ .{ .id = "node-a", .address = "" }, .{ .id = "node-c", .address = "" } };
+    b_raft = try RaftElection.init(allocator, "node-b", &b_peers, .{ .own_key = pernode_key_b, .peer_keys = &b_keys }, &b_impl.transport());
+    raft_up = true;
+
+    // Positive control: node-c is answered before the revocation.
+    const before = (try voteExchangeRaw(allocator, io, b_port, 7, "node-c", pernode_key_c)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(before);
+    _ = try verifyFrameMac(pernode_key_b, before);
+    try testing.expectEqual(@as(u64, 7), b_raft.getTerm());
+
+    // Revoke. Second call and an unknown id both report "nothing was there".
+    try testing.expect(try b_raft.revokePeerKey("node-c"));
+    try testing.expect(!try b_raft.revokePeerKey("node-c"));
+    try testing.expect(!try b_raft.revokePeerKey("node-zz"));
+
+    // Inbound frames from node-c — even signed with its erstwhile *legitimate*
+    // key — fail the key lookup now, and the raft never sees them.
+    try testing.expect((try voteExchangeRaw(allocator, io, b_port, 8, "node-c", pernode_key_c)) == null);
+    try testing.expect((try voteExchangeRaw(allocator, io, b_port, 8, "node-c", @splat(0x99))) == null);
+    try testing.expectEqual(@as(u64, 7), b_raft.getTerm());
+
+    // Positive control after: node-a is still answered, so the refusal above
+    // is the revocation and not a dead listener.
+    const after = (try voteExchangeRaw(allocator, io, b_port, 9, "node-a", pernode_key_a)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(after);
+    _ = try verifyFrameMac(pernode_key_b, after);
+    try testing.expectEqual(@as(u64, 9), b_raft.getTerm());
+
+    // Outbound: a revoked peer is never dialled (the fail-closed `outboundKeys`
+    // gate now misses on the removed entry). The listener only counts accepts.
+    failclosed_accepts.store(0, .monotonic);
+    var listener = NetworkTransport.ClusterServer.init(allocator, io, 20210);
+    var listener_up = false;
+    defer if (listener_up) listener.stop();
+    const listener_thread = try std.Thread.spawn(.{}, NetworkTransport.ClusterServer.start, .{ &listener, failClosedHandler, null });
+    listener_up = true;
+    var spins: usize = 0;
+    while (!listener.running.load(.monotonic) and spins < 2000) : (spins += 1) {
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    try testing.expect(listener.running.load(.monotonic));
+
+    var a_impl: ElectionTransportImpl = undefined;
+    var a_raft: RaftElection = undefined;
+    var a_impl_up = false;
+    var a_raft_up = false;
+    defer if (a_impl_up) a_impl.deinit();
+    defer if (a_raft_up) a_raft.deinit();
+    a_impl.init(allocator, io, &a_raft);
+    a_impl_up = true;
+    const a_keys = [_]PeerKey{ .{ .id = "node-b", .key = pernode_key_b }, .{ .id = "node-c", .key = pernode_key_c } };
+    var a_peers = [_]Peer{ .{ .id = "node-b", .address = "" }, .{ .id = "node-c", .address = "" } };
+    a_raft = try RaftElection.init(allocator, "node-a", &a_peers, .{ .own_key = pernode_key_a, .peer_keys = &a_keys }, &a_impl.transport());
+    a_raft_up = true;
+    try a_impl.addresses.addEndpoint("node-c", "127.0.0.1:20210");
+    try a_impl.addresses.addEndpoint("node-b", "127.0.0.1:20210");
+
+    try testing.expect(try a_raft.revokePeerKey("node-c"));
+    const lost = a_impl.sendAppendEntries("node-c", "", .{ .term = 1, .leader_id = "node-a", .prev_log_index = 0, .prev_log_term = 0, .entries = &.{}, .leader_commit = 0 });
+    try testing.expect(!lost.success);
+    try testing.expectEqual(@as(u64, 0), failclosed_accepts.load(.monotonic));
+
+    // Control: the keyed peer at the same address *is* dialled.
+    _ = a_impl.sendAppendEntries("node-b", "", .{ .term = 1, .leader_id = "node-a", .prev_log_index = 0, .prev_log_term = 0, .entries = &.{}, .leader_commit = 0 });
+    try testing.expectEqual(@as(u64, 1), failclosed_accepts.load(.monotonic));
+
+    listener.stop();
+    if (dialTo(allocator, io, .{ .host = "127.0.0.1", .port = 20210 }, test_dial_timeout_ms)) |wake| {
+        var c = wake;
+        c.deinit();
+    } else |err| {
+        std.log.debug("[raft test] wake connection not needed ({s})", .{@errorName(err)});
+    }
+    listener_thread.join();
+    listener_up = false;
+}
+
+test "per-node rotation window: old and new verify until the window closes, and rotateOwnKey re-signs" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    if (!@import("../../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    // node-b inbound, keyed for node-a.
+    var b_impl: TransportImpl(1) = undefined;
+    var b_raft: RaftElection = undefined;
+    var b_inbound: InboundServer = undefined;
+    var b_thread: std.Thread = undefined;
+
+    var impl_up = false;
+    var raft_up = false;
+    var server_up = false;
+    defer if (impl_up) b_impl.deinit();
+    defer if (raft_up) b_raft.deinit();
+    defer if (server_up) stopInbound(io, &b_inbound, &b_thread);
+
+    b_impl.init(allocator, io, &b_raft);
+    impl_up = true;
+    const b_port = try startInbound(allocator, io, &b_raft, &b_impl.addresses, 20220, &b_inbound, &b_thread);
+    server_up = true;
+
+    const b_keys = [_]PeerKey{.{ .id = "node-a", .key = pernode_key_a }};
+    var b_peers = [_]Peer{.{ .id = "node-a", .address = "" }};
+    b_raft = try RaftElection.init(allocator, "node-b", &b_peers, .{ .own_key = pernode_key_b, .peer_keys = &b_keys }, &b_impl.transport());
+    raft_up = true;
+
+    // Baseline: the only key on record verifies; the reply is signed with
+    // node-b's own key.
+    const r0 = (try voteExchangeRaw(allocator, io, b_port, 7, "node-a", pernode_key_a)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(r0);
+    _ = try verifyFrameMac(pernode_key_b, r0);
+
+    // ① Open the window: our record for node-a rotates a1 → a2, keeping a1 as
+    //    previous. Both signs verify — a verifier that only tries `current`
+    //    refuses the a1 frame here (mutation-tested).
+    try b_raft.rotatePeerKey("node-a", rotated_key_a);
+    const r1 = (try voteExchangeRaw(allocator, io, b_port, 8, "node-a", pernode_key_a)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(r1);
+    _ = try verifyFrameMac(pernode_key_b, r1);
+    const r2 = (try voteExchangeRaw(allocator, io, b_port, 9, "node-a", rotated_key_a)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(r2);
+    _ = try verifyFrameMac(pernode_key_b, r2);
+
+    // ② Our own key swaps: replies are signed with the new own key from here
+    //    on — verified against both candidates on the same raw reply.
+    b_raft.rotateOwnKey(rotated_key_b);
+    const r3 = (try voteExchangeRaw(allocator, io, b_port, 10, "node-a", rotated_key_a)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(r3);
+    _ = try verifyFrameMac(rotated_key_b, r3);
+    try testing.expectError(error.ClusterAuthFailed, verifyFrameMac(pernode_key_b, r3));
+
+    // ③ Close the window: the old key stops verifying, the new one is
+    //    untouched, and the raft still answers.
+    try testing.expect(b_raft.dropPreviousPeerKey("node-a"));
+    try testing.expect((try voteExchangeRaw(allocator, io, b_port, 11, "node-a", pernode_key_a)) == null);
+    try testing.expectEqual(@as(u64, 10), b_raft.getTerm());
+    const r4 = (try voteExchangeRaw(allocator, io, b_port, 12, "node-a", rotated_key_a)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(r4);
+    _ = try verifyFrameMac(rotated_key_b, r4);
+
+    // `setPeerKey` is the other window closer: an overwrite clears `previous`.
+    try b_raft.rotatePeerKey("node-a", pernode_key_a); // current=a1, previous=rotated_key_a
+    try b_raft.setPeerKey("node-a", pernode_key_a); // window closed
+    try testing.expect((try voteExchangeRaw(allocator, io, b_port, 13, "node-a", rotated_key_a)) == null);
+    const r5 = (try voteExchangeRaw(allocator, io, b_port, 14, "node-a", pernode_key_a)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(r5);
+    _ = try verifyFrameMac(rotated_key_b, r5);
+    try testing.expectEqual(@as(u64, 14), b_raft.getTerm());
 }
