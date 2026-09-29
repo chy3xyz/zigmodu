@@ -161,8 +161,8 @@ defer allocator.free(json);               // 挂到 /cluster/health 或 metrics 
 | 方向 | 用什么 | 要做的事 |
 |------|--------|---------|
 | 出站 · 投票 | `NetworkTransport.connect(host, port)` → `ClusterConnection.send(payload)` | `sendVoteRequest` 返回 `void`（fire-and-forget）：把 `VoteRequest` 编码后发给每个 peer 即可，**应答走入站** |
-| 出站 · 日志复制 | 同上 | `sendAppendEntries` 是**同步**的：发出去、读回 `AppendEntriesResponse`（同一条连接 `recv`） |
-| 入站 · 分发 | **`ClusterBootstrap.start()` 已经替你挂好**（给了 `.transport` 就在 `port` 上监听，走 `RaftTransport.handleConnection`）；不用 `ClusterBootstrap` 时才需要自己用 `ClusterServer.start(handler, context)` / `RaftTransport.InboundServer` | 解码后分别调 `RaftElection.handleVoteRequest` / `handleAppendEntries` / `handleVoteResponse` / `handleInstallSnapshot`，把返回值编码后**在同一连接上回包** |
+| 出站 · 日志复制 | 同上 | `sendAppendEntries` 是**同步**的：发出去、读回 `AppendEntriesResponse`（同一条连接 `recv`）；`sendInstallSnapshot`（§7，见下「日志压缩」）同模型 |
+| 入站 · 分发 | **`ClusterBootstrap.start()` 已经替你挂好**（给了 `.transport` 就在 `port` 上监听，走 `RaftTransport.handleConnection`）；不用 `ClusterBootstrap` 时才需要自己用 `ClusterServer.start(handler, context)` / `RaftTransport.InboundServer` | 解码后分别调 `RaftElection.handleVoteRequest` / `handleAppendEntries` / `handleVoteResponse` / `handleInstallSnapshot`，把返回值编码后**在同一连接上回包**。`append_entries_response` / `install_snapshot_response` 两个 tag **入站不消费**（发送方已同步读过），直接丢 |
 | 地址簿 | **`ClusterBootstrap` 从 `config.peers` 建**（`RaftTransport.AddressBook`，键 = `peers` 里 `@` 前的 id，与 `raft.addPeer(p.id)` 同口径） | peer id → `host:port` 的映射（今天 `BootstrapConfig.peers` 是唯一来源；`ClusterMembership` 的 `nodes` 只有 loopback + 端口） |
 | 失败语义 | 你自己 | Raft 能容忍丢包与重发：`AppendEntriesResponse{ .success = false }` 是**正常应答**而不是错误；连接失败按"这条消息丢了"处理即可，别把节点判死（那是 `AccrualFailureDetector` 的活） |
 
@@ -199,7 +199,7 @@ defer allocator.free(json);               // 挂到 /cluster/health 或 metrics 
   `handleAppendEntries` —— 两边都会 free/dupe `voted_for`、推 `log`、改 `next_index`/`match_index`。
   所以这把锁**在 `RaftElection` 自己身上**（`RaftElection.RaftLock`，快路径 `cmpxchgWeak` +
   有界自旋 + `poll` 睡眠的三档，与 `scheduler.zig` 协调池线程同口径）：每个碰共享状态的公开入口（`tick` / `handleVoteRequest` / `handleAppendEntries` /
-  `handleVoteResponse` / `handleInstallSnapshot` / `appendEntry` / `addPeer` / `compactLog` 以及状态
+  `handleVoteResponse` / `handleInstallSnapshot` / `handleInstallSnapshotResponse` / `appendEntry` / `addPeer` / `compactLog` 以及状态
   访问器）自己取放一次，私有的步骤函数（`startElection` / `sendHeartbeats` / `becomeLeader` / …）
   假设锁已在手。**门面不再持锁**（`ClusterBootstrap.raft_lock` 已删）：`ClusterBootstrap` 直接驱动、
   `RaftTransport.InboundServer` 单独用、或应用自己调 `raft.tick()` / 在其它线程读它，都被同一把锁串起来，
@@ -310,6 +310,49 @@ defer allocator.free(json);               // 挂到 /cluster/health 或 metrics 
 撞不出"锁放开期间日志被截断"和"响应过期"。所以落地时必须**另配两条红测试**：一条让
 `sendAppendEntries` 阻塞住、另一个线程同时截断日志，断言发出去的请求仍读到有效字节；
 一条让响应在"任期已变"之后才回，断言它被丢弃而不是写进 `next_index`。没有这两条就不要动这段代码。
+
+### 日志压缩（§7 InstallSnapshot，Unreleased 起为可用闭环）
+
+`compactLog` / `handleInstallSnapshot` 的类型与桩存在已久，但生产路径上没人调用（阈值、hook、
+leader 侧发送都是缺的），且压缩后全文件把 `log.items.len` / `log.items[i]` 当绝对 index 用的换算
+是错的。现在闭环了，约定如下。
+
+**坐标约定**：`log` 只存快照边界之后的**活条目**——绝对 index `i` 位于
+`log.items[i - last_included_index - 1]`，`log.items.len` 是**条数**而不是末 index。所有换算集中在
+`RaftElection.zig` 的三个私有 helper（`lastLogIndex` / `lastLogTerm` / `termAt`）；append、prev 检查、
+冲突截断、commit 推进、投票完整性、复制批次构造全部在绝对坐标上做。follower 侧的 prev 检查分三支：
+prev 在边界**上**→ 对 `last_included_term`（不符则拒绝但**不截断**——快照是已提交历史）；prev 在边界
+**内**→ 隐式匹配（该区域已提交，由 leader completeness 保证一致），批次里被快照覆盖的条目跳过；
+prev 在边界**外**→ 活条目比对，冲突照常截断（截不到快照里）。
+
+- **手动**：`raft.compactLog(up_to_index, snapshot_bytes)`。边界**必须已提交**：
+  `up_to_index > commit_index` 返 `error.NotCommitted`——把未提交条目折进快照会让少数派的未提交
+  状态变得可存活，正是 §7 禁止的。`up_to_index <= last_included_index` 是 no-op。
+- **自动**：`ElectionConfig.snapshot_threshold_entries`（**默认 0 = 关**，存量集群行为不变）。leader 的
+  每次 `tick()` 在心跳之后检查 `log.items.len > threshold`，触发时压缩到 `commit_index` 为止
+  （`maybeCompactLog`；hook/OOM 错误只记 `std.log.err`，不打断心跳循环）。`BootstrapConfig` 同名透传
+  （`snapshot_threshold_entries` / `snapshotter` / `snapshotter_ctx` / `snapshot_chunk_bytes`）。
+- **快照字节从哪来**：`ElectionConfig.snapshotter`
+  （`Snapshotter = *const fn (ctx: ?*anyopaque, up_to_index: u64, allocator) anyerror![]u8`；在**锁内**
+  调用，保持轻量；返回切片用传入 allocator 分配，归 raft 释放）。**不给 hook 时存的是占位摘要**
+  （`zigmodu-raft-snapshot:v1:last_included_index=…:last_included_term=…:compacted_entries=…`）——框架
+  没有应用状态机，这些字节**恢复不了应用状态**；要真快照的应用自己供 hook 产字节，并在 follower 侧
+  从 `snapshot_data` 消费它们。
+- **leader → 落后的 follower**：`next_index[peer] <= last_included_index` 时这一轮改发 InstallSnapshot，
+  按 `snapshot_chunk_bytes` 分帧（默认 16 KiB；wire 是 u16 长度前缀，clamp 到 65535）。应答**同步**
+  消费（与 `sendAppendEntries` 同连接同模型）：成功后 `match_index[peer] = last_included_index`、
+  `next_index[peer] = last_included_index + 1`，下一轮回到 AppendEntries；term 更大的应答让节点当场
+  退成 follower。走异步传输的应答用公共入口
+  `handleInstallSnapshotResponse(resp, from_peer, last_included_index)`——boundary 与当前不符的是
+  陈旧应答，只有 term 半步生效（可能退位），`next_index` 不动。
+- **follower 侧组装**：分帧按 `(last_included_index, last_included_term)` 归属同一次传输，`offset` 必须
+  恰好落在已组装长度上，错位即丢弃等 leader 重传（幂等）；`done` 帧才应用。应用时**保留延续快照的
+  日志后缀**（§7 原文语义：边界条目在日志里存在且 term 一致 → 只丢被覆盖的前缀；否则全清）。
+  `commit_index` / `last_applied` 取 `@max` 推进。
+- **已知坑**：快照发送沿用上节记录的既有模型——出站 IO（含逐帧 chunk）在 `RaftLock` 内同步跑，
+  受 `rpc_timeout_ms` 界定但**没有收窄锁范围**；大快照 × 多落后 follower 时这一债会被放大，
+  「出站 IO 与锁」一节落地前，巨型快照应调大 `snapshot_chunk_bytes`（少几帧）而不是调小。
+  follower 侧主动压缩（非 leader 触发）不在当前闭环内。
 
 ## Production Deployment Checklist
 

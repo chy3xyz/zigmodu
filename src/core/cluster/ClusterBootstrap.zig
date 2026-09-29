@@ -36,6 +36,10 @@ const ElectionConfig = @import("RaftElection.zig").ElectionConfig;
 const VoteRequest = @import("RaftElection.zig").VoteRequest;
 const AppendEntriesRequest = @import("RaftElection.zig").AppendEntriesRequest;
 const AppendEntriesResponse = @import("RaftElection.zig").AppendEntriesResponse;
+const InstallSnapshotRequest = @import("RaftElection.zig").InstallSnapshotRequest;
+const InstallSnapshotResponse = @import("RaftElection.zig").InstallSnapshotResponse;
+const Snapshotter = @import("RaftElection.zig").Snapshotter;
+const default_snapshot_chunk_bytes = @import("RaftElection.zig").default_snapshot_chunk_bytes;
 const ClusterMetrics = @import("ClusterMetrics.zig").ClusterMetrics;
 const ClusterHealth = @import("ClusterHealth.zig");
 const MembershipView = @import("../../cluster/MembershipView.zig").MembershipView;
@@ -88,6 +92,22 @@ pub const BootstrapConfig = struct {
     /// Loud acknowledgement that a multi-node cluster runs **unauthenticated**.
     /// Same idiom as `allow_stub_raft_transport`: refuse unless set.
     allow_unauthenticated_cluster: bool = false,
+    /// §7 log compaction, leader-side automatic trigger — forwarded to
+    /// `ElectionConfig.snapshot_threshold_entries`. `0` (the default) keeps the
+    /// pre-feature behaviour: the log grows until the app calls
+    /// `getRaft().?.compactLog(...)` itself.
+    snapshot_threshold_entries: usize = 0,
+    /// Where snapshot bytes come from when the threshold fires — forwarded to
+    /// `ElectionConfig.snapshotter`. When null the framework stores a
+    /// **placeholder** (a parseable debug summary of the compacted range); the
+    /// application state machine is the app's, so restoring application state
+    /// from a snapshot is the app's job (`raft.snapshot_data` is the store
+    /// either way).
+    snapshotter: ?Snapshotter = null,
+    snapshotter_ctx: ?*anyopaque = null,
+    /// Per-frame payload cap for InstallSnapshot chunks — forwarded to
+    /// `ElectionConfig.snapshot_chunk_bytes`.
+    snapshot_chunk_bytes: usize = default_snapshot_chunk_bytes,
 };
 
 pub const ClusterBootstrap = struct {
@@ -238,11 +258,18 @@ pub const ClusterBootstrap = struct {
                 return error.PeerIdRequired;
             }
         }
-        const election_cfg = ElectionConfig{ .cluster_secret = self.config.cluster_secret };
+        const election_cfg = ElectionConfig{
+            .cluster_secret = self.config.cluster_secret,
+            .snapshot_threshold_entries = self.config.snapshot_threshold_entries,
+            .snapshot_chunk_bytes = self.config.snapshot_chunk_bytes,
+            .snapshotter = self.config.snapshotter,
+            .snapshotter_ctx = self.config.snapshotter_ctx,
+        };
         const S = struct {
             var transport_impl: ?struct {
                 sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
                 sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse,
+                sendInstallSnapshot: *const fn (?[]const u8, []const u8, InstallSnapshotRequest) InstallSnapshotResponse,
             } = null;
         };
         if (S.transport_impl == null) {
@@ -253,6 +280,13 @@ pub const ClusterBootstrap = struct {
                 .sendAppendEntries = struct {
                     fn f(_: ?[]const u8, _: []const u8, _: AppendEntriesRequest) AppendEntriesResponse {
                         return AppendEntriesResponse{ .term = 0, .success = false, .match_index = 0 };
+                    }
+                }.f,
+                // The stub's snapshot half, same "lost message" answer as the
+                // AppendEntries stub's `success = false`.
+                .sendInstallSnapshot = struct {
+                    fn f(_: ?[]const u8, _: []const u8, _: InstallSnapshotRequest) InstallSnapshotResponse {
+                        return InstallSnapshotResponse{ .term = 0 };
                     }
                 }.f,
             };
@@ -526,10 +560,14 @@ test "ClusterBootstrap accepts an app-supplied Raft transport" {
         fn sendAppend(_: ?[]const u8, _: []const u8, _: AppendEntriesRequest) AppendEntriesResponse {
             return .{ .term = 7, .success = true, .match_index = 1 };
         }
+        fn sendSnapshot(_: ?[]const u8, _: []const u8, _: InstallSnapshotRequest) InstallSnapshotResponse {
+            return .{ .term = 0 };
+        }
     };
     var vtable = struct {
         sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void = Impl.sendVote,
         sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse = Impl.sendAppend,
+        sendInstallSnapshot: *const fn (?[]const u8, []const u8, InstallSnapshotRequest) InstallSnapshotResponse = Impl.sendSnapshot,
     }{};
     const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(&vtable));
 
@@ -595,6 +633,9 @@ const GateTransport = struct {
     fn sendAppend(_: ?[]const u8, _: []const u8, _: AppendEntriesRequest) AppendEntriesResponse {
         return .{ .term = 0, .success = false, .match_index = 0 };
     }
+    fn sendSnapshot(_: ?[]const u8, _: []const u8, _: InstallSnapshotRequest) InstallSnapshotResponse {
+        return .{ .term = 0 };
+    }
 };
 
 fn gateTransport() RaftElection.ElectionTransport {
@@ -602,6 +643,7 @@ fn gateTransport() RaftElection.ElectionTransport {
         var vtable = struct {
             sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void = GateTransport.sendVote,
             sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse = GateTransport.sendAppend,
+            sendInstallSnapshot: *const fn (?[]const u8, []const u8, InstallSnapshotRequest) InstallSnapshotResponse = GateTransport.sendSnapshot,
         }{};
     };
     return @ptrCast(@alignCast(&S.vtable));
@@ -792,10 +834,14 @@ test "ClusterBootstrap drives raft.tick and serves inbound Raft RPCs" {
         fn sendAppend(_: ?[]const u8, _: []const u8, _: AppendEntriesRequest) AppendEntriesResponse {
             return .{ .term = 0, .success = false, .match_index = 0 };
         }
+        fn sendSnapshot(_: ?[]const u8, _: []const u8, _: InstallSnapshotRequest) InstallSnapshotResponse {
+            return .{ .term = 0 };
+        }
     };
     var vtable = struct {
         sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void = Counting.sendVote,
         sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse = Counting.sendAppend,
+        sendInstallSnapshot: *const fn (?[]const u8, []const u8, InstallSnapshotRequest) InstallSnapshotResponse = Counting.sendSnapshot,
     }{};
     const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(&vtable));
 

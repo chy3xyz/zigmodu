@@ -253,7 +253,45 @@ pub const ElectionConfig = struct {
     /// every outbound one is signed. When null the frames are bare — which is why
     /// `ClusterBootstrap.start()` refuses a multi-node cluster without one.
     cluster_secret: ?[32]u8 = null,
+
+    /// §7 log compaction, leader-side automatic trigger: once the **live** log
+    /// (`log.items.len`, i.e. entries past the snapshot boundary) exceeds this
+    /// many entries, the leader's `tick()` compacts the committed prefix into a
+    /// snapshot. `0` disables it — the default, so an existing cluster's
+    /// behaviour does not change. Compaction never crosses `commit_index`: an
+    /// uncommitted entry is never folded into a snapshot.
+    snapshot_threshold_entries: usize = 0,
+
+    /// One InstallSnapshot frame carries at most this many bytes of snapshot
+    /// payload; a bigger snapshot is sent as `offset`/`done` chunks of this size
+    /// (the follower reassembles them in `handleInstallSnapshot`). The wire
+    /// length-prefixes payload with a u16, so the effective chunk is clamped to
+    /// 65535.
+    snapshot_chunk_bytes: usize = default_snapshot_chunk_bytes,
+
+    /// §7: where snapshot bytes come from when `snapshot_threshold_entries`
+    /// fires (or when an app drives `compactLog` itself it passes the bytes
+    /// directly). Called on the leader with the lock held — keep it cheap. The
+    /// returned slice must be allocated with the passed allocator and becomes
+    /// the raft's to free (it is released right after `compactLog` copies it).
+    ///
+    /// When null, a **placeholder** is stored: a parseable debug summary
+    /// (`zigmodu-raft-snapshot:v1:last_included_index=…:last_included_term=…:
+    /// compacted_entries=…`). The framework has no application state machine, so
+    /// restoring application state from a snapshot is the *application's* job —
+    /// it supplies this hook (and consumes `snapshot_data`, which has a store
+    /// either way).
+    snapshotter: ?Snapshotter = null,
+    /// Opaque context handed to `snapshotter`.
+    snapshotter_ctx: ?*anyopaque = null,
 };
+
+/// Default for `ElectionConfig.snapshot_chunk_bytes`, named so
+/// `BootstrapConfig` can share it instead of restating the number.
+pub const default_snapshot_chunk_bytes: usize = 16 * 1024;
+
+/// See `ElectionConfig.snapshotter`.
+pub const Snapshotter = *const fn (ctx: ?*anyopaque, up_to_index: u64, allocator: std.mem.Allocator) anyerror![]u8;
 
 /// Raft server state
 pub const RaftState = enum {
@@ -261,7 +299,6 @@ pub const RaftState = enum {
     candidate,
     leader,
 };
-
 /// A peer in the Raft cluster
 pub const Peer = struct {
     id: []const u8,
@@ -322,6 +359,13 @@ pub const InstallSnapshotResponse = struct {
     term: u64,
 };
 
+/// The default `ElectionTransport.sendInstallSnapshot`: the "lost message"
+/// answer (`term = 0` is below any live term, so the leader treats it as a
+/// dropped frame and retries next round). See the field's own doc.
+fn lostInstallSnapshot(_: ?[]const u8, _: []const u8, _: InstallSnapshotRequest) InstallSnapshotResponse {
+    return .{ .term = 0 };
+}
+
 /// Raft
 ///
 /// Handles leader election and log replication within a Raft cluster.
@@ -345,6 +389,13 @@ pub const RaftElection = struct {
     last_included_index: u64 = 0,
     last_included_term: u64 = 0,
     snapshot_data: ?[]const u8 = null,
+    /// Chunk assembly for an inbound InstallSnapshot that arrives in pieces
+    /// (`offset`/`done`): `offset == 0` starts it, continuations must name the
+    /// same `(pending_snapshot_index, pending_snapshot_term)` and land at
+    /// exactly `pending_snapshot.items.len`, and `done` applies it.
+    pending_snapshot: std.ArrayList(u8),
+    pending_snapshot_index: u64 = 0,
+    pending_snapshot_term: u64 = 0,
 
     // Volatile state (all servers)
     state: RaftState = .follower,
@@ -375,6 +426,14 @@ pub const RaftElection = struct {
     pub const ElectionTransport = *const struct {
         sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
         sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse,
+        /// §7: synchronous, like `sendAppendEntries` — the follower replies on
+        /// the same connection. Defaults to the "lost message" answer so a
+        /// two-field transport literal still compiles: with it a compacted
+        /// leader simply never catches a boundary-lagged follower up (the
+        /// snapshot send goes nowhere, retried each round) until a real
+        /// transport is supplied. **Note for `@ptrCast` vtables**: a hand-rolled
+        /// struct must declare this field too — the cast shares the layout.
+        sendInstallSnapshot: *const fn (?[]const u8, []const u8, InstallSnapshotRequest) InstallSnapshotResponse = &lostInstallSnapshot,
     };
 
     /// Initialize Raft module
@@ -401,6 +460,7 @@ pub const RaftElection = struct {
             .allocator = allocator,
             .config = config,
             .log = std.ArrayList(LogEntry).empty,
+            .pending_snapshot = std.ArrayList(u8).empty,
             .next_index = std.StringHashMap(u64).init(allocator),
             .match_index = std.StringHashMap(u64).init(allocator),
             .votes_received = std.StringHashMap(void).init(allocator),
@@ -425,6 +485,7 @@ pub const RaftElection = struct {
             self.allocator.free(entry.command);
         }
         self.log.deinit(self.allocator);
+        self.pending_snapshot.deinit(self.allocator);
 
         // Free leader state hashmaps (keys are borrowed from peers)
         self.next_index.deinit();
@@ -474,6 +535,13 @@ pub const RaftElection = struct {
                     try self.sendHeartbeats();
                     self.last_heartbeat_ms = now_ms;
                 }
+                // §7 housekeeping on the leader: bounded log growth. Off by
+                // default (`snapshot_threshold_entries = 0`); when on, a skipped
+                // compaction (e.g. an OOM in the snapshotter) must not stop the
+                // heartbeat loop, so the error is logged instead of propagated.
+                self.maybeCompactLog() catch |err| {
+                    std.log.err("[RaftElection] auto-compaction skipped this tick: {}", .{err});
+                };
             },
         }
     }
@@ -492,7 +560,10 @@ pub const RaftElection = struct {
         const cmd_copy = try self.allocator.dupe(u8, command);
         errdefer self.allocator.free(cmd_copy);
 
-        const index: u64 = @intCast(self.log.items.len + 1);
+        // Absolute index: after a compaction the first live entry is
+        // `last_included_index + 1`, so the tail is `lastLogIndex()`, not
+        // `log.items.len`.
+        const index: u64 = self.lastLogIndex() + 1;
         try self.log.append(self.allocator, LogEntry{
             .term = self.current_term,
             .index = index,
@@ -537,9 +608,12 @@ pub const RaftElection = struct {
 
         if (req.term >= self.current_term) {
             if (self.voted_for == null or std.mem.eql(u8, self.voted_for.?, req.candidate_id)) {
-                // Check log completeness: candidate's log must be at least as up-to-date
-                const last_idx: u64 = @intCast(self.log.items.len);
-                const last_term = if (last_idx > 0) self.log.items[last_idx - 1].term else 0;
+                // Check log completeness: candidate's log must be at least as
+                // up-to-date. Absolute coordinates: with a snapshot installed the
+                // tail is `lastLogIndex()`, and an empty live log's last term is
+                // the snapshot's `last_included_term` (§7).
+                const last_idx = self.lastLogIndex();
+                const last_term = self.lastLogTerm();
 
                 if (req.last_log_term > last_term or
                     (req.last_log_term == last_term and req.last_log_index >= last_idx))
@@ -577,7 +651,7 @@ pub const RaftElection = struct {
             return AppendEntriesResponse{
                 .term = self.current_term,
                 .success = false,
-                .match_index = @intCast(self.log.items.len),
+                .match_index = self.lastLogIndex(),
             };
         }
 
@@ -590,7 +664,7 @@ pub const RaftElection = struct {
             return AppendEntriesResponse{
                 .term = self.current_term,
                 .success = false,
-                .match_index = @intCast(self.log.items.len),
+                .match_index = self.lastLogIndex(),
             };
         }
 
@@ -608,28 +682,57 @@ pub const RaftElection = struct {
         // Update leader info. Allocate before freeing — same reason as
         // `handleVoteRequest`'s `voted_for`: freeing first leaves a dangling
         // `leader_id` on allocation failure, and `deinit` frees it again (and
-        // `getLeader()` hands it out).
+        // `getLeader()` hands it out). The alias guard mirrors `becomeLeader`:
+        // after its allocation-failure fallback `leader_id` **is** `local_id`,
+        // and freeing it here would dangle `local_id` itself.
         const leader_copy = try self.allocator.dupe(u8, req.leader_id);
-        if (self.leader_id) |l| self.allocator.free(l);
+        if (self.leader_id) |l| {
+            if (l.ptr != self.local_id.ptr) self.allocator.free(l);
+        }
         self.leader_id = leader_copy;
 
-        // Reply false if log doesn't contain entry at prev_log_index with matching term (§5.3)
+        // Reply false if the log doesn't contain prev_log_index with a matching
+        // term (§5.3) — with the §7 wrinkle that the log no longer starts at
+        // index 1 once a snapshot is installed:
+        //
+        //   * prev **above** the boundary is a live entry: position
+        //     `prev - last_included_index`, term compared as before, and a
+        //     conflict still truncates from there (never into the snapshot).
+        //   * prev **at** the boundary matches against `last_included_term`
+        //     (Raft §7's standard rule). A mismatch rejects *without*
+        //     truncating — the snapshot is committed history, not ours to cut.
+        //   * prev **below** the boundary is implicitly matched: that region is
+        //     committed (`compactLog` refuses an uncommitted boundary), so by
+        //     leader completeness (§5.4.3) the leader's history there is
+        //     identical to ours. The entry loop then skips everything the
+        //     snapshot already covers.
         if (req.prev_log_index > 0) {
-            if (req.prev_log_index > self.log.items.len) {
+            if (req.prev_log_index > self.lastLogIndex()) {
                 return AppendEntriesResponse{
                     .term = self.current_term,
                     .success = false,
-                    .match_index = @intCast(self.log.items.len),
+                    .match_index = self.lastLogIndex(),
                 };
             }
-            const prev_entry = self.log.items[req.prev_log_index - 1];
-            if (prev_entry.term != req.prev_log_term) {
-                // Conflict: delete conflicting entry and everything after it
-                self.truncateLog(req.prev_log_index - 1);
+            if (req.prev_log_index > self.last_included_index) {
+                const prev_pos: usize = @intCast(req.prev_log_index - self.last_included_index);
+                const prev_entry = self.log.items[prev_pos - 1];
+                if (prev_entry.term != req.prev_log_term) {
+                    // Conflict: delete conflicting entry and everything after it
+                    self.truncateLog(prev_pos - 1);
+                    return AppendEntriesResponse{
+                        .term = self.current_term,
+                        .success = false,
+                        .match_index = self.lastLogIndex(),
+                    };
+                }
+            } else if (req.prev_log_index == self.last_included_index and
+                req.prev_log_term != self.last_included_term)
+            {
                 return AppendEntriesResponse{
                     .term = self.current_term,
                     .success = false,
-                    .match_index = @intCast(self.log.items.len),
+                    .match_index = self.lastLogIndex(),
                 };
             }
         }
@@ -692,17 +795,31 @@ pub const RaftElection = struct {
         // `leader_id` — have already happened by this point; that is the same
         // window every AppendEntries request gets, and losing an election round
         // is the recoverable outcome there.)
-        for (entries) |entry| {
+        //
+        // Contiguity is validated here too: entries must run
+        // `prev_log_index + 1, +2, …` with no gaps. A gapped batch would
+        // otherwise append past the tail and misalign absolute index and
+        // position — the invariant every position computation in this file
+        // stands on. Rejected alongside the zero-index guard, before any
+        // mutation, for the same reason.
+        for (entries, 0..) |entry, i| {
             if (entry.index == 0) return error.InvalidLogIndex;
+            if (entry.index != req.prev_log_index + 1 + @as(u64, @intCast(i))) return error.InvalidLogIndex;
         }
 
-        // Process incoming entries: skip already-matched, overwrite conflicts
+        // Process incoming entries: skip already-matched, overwrite conflicts.
+        // Absolute index → position: the live log starts at
+        // `last_included_index + 1`, and anything at or below the boundary is
+        // the snapshot's — already committed, already identical (see the prev
+        // check), so it is skipped rather than re-appended.
         for (entries) |entry| {
-            if (entry.index <= self.log.items.len) {
-                const existing = self.log.items[entry.index - 1];
+            if (entry.index <= self.last_included_index) continue;
+            const pos: u64 = entry.index - self.last_included_index; // 1-based position
+            if (pos <= self.log.items.len) {
+                const existing = self.log.items[pos - 1];
                 if (existing.term != entry.term) {
                     // Conflict at this index: delete it and everything after
-                    self.truncateLog(entry.index - 1);
+                    self.truncateLog(pos - 1);
                     // Fall through to append below
                 } else {
                     continue; // Already have this matching entry, skip
@@ -720,14 +837,13 @@ pub const RaftElection = struct {
 
         // Update commit index (§5.3, §5.4)
         if (req.leader_commit > self.commit_index) {
-            const last_idx: u64 = @intCast(self.log.items.len);
-            self.commit_index = @min(req.leader_commit, last_idx);
+            self.commit_index = @min(req.leader_commit, self.lastLogIndex());
         }
 
         return AppendEntriesResponse{
             .term = self.current_term,
             .success = true,
-            .match_index = @intCast(self.log.items.len),
+            .match_index = self.lastLogIndex(),
         };
     }
 
@@ -735,28 +851,77 @@ pub const RaftElection = struct {
     //
     // Everything from here down (`sendAppendEntries`, `advanceCommitIndex`,
     // `truncateLog`, `startElection`, `becomeLeader`, `sendHeartbeats`,
-    // `randomElectionTimeout`) is reachable only from the locked entry points
-    // above and assumes `lock` is already held: they are steps *within* one
-    // state transition, so taking it here would self-deadlock the lock rather
-    // than add a safety margin.
+    // `randomElectionTimeout`, the index helpers, the snapshot send/apply
+    // halves) is reachable only from the locked entry points above and assumes
+    // `lock` is already held: they are steps *within* one state transition, so
+    // taking it here would self-deadlock the lock rather than add a safety
+    // margin.
+    //
+    // ── Absolute index ⇄ position ───────────────────────────────────────────
+    //
+    // `log` holds only the entries **after** the snapshot: the entry with
+    // absolute index `i` sits at `log.items[i - last_included_index - 1]`, and
+    // `log.items.len` is a *count*, not the last index. Every position
+    // computation in this file goes through the three helpers below — an
+    // off-by-one here is what made `compactLog` unusable in production (the
+    // send path read `log.items[next-1]` as if the log still started at 1).
+
+    /// Absolute index of the newest entry, compacted or live. `0` when the
+    /// node holds nothing at all.
+    fn lastLogIndex(self: *const Self) u64 {
+        return self.last_included_index + @as(u64, @intCast(self.log.items.len));
+    }
+
+    /// Term of the newest entry; the snapshot's term when the live log is
+    /// empty, `0` when the node holds nothing at all.
+    fn lastLogTerm(self: *const Self) u64 {
+        if (self.log.items.len > 0) return self.log.items[self.log.items.len - 1].term;
+        return self.last_included_term;
+    }
+
+    /// Term of absolute index `index`, or null when it is unavailable: `0`
+    /// reads as the conventional pre-log term, the boundary reads as
+    /// `last_included_term`, and anything below the boundary or past the tail
+    /// is unknown (compacted away / not yet replicated).
+    fn termAt(self: *const Self, index: u64) ?u64 {
+        if (index == 0) return 0;
+        if (index == self.last_included_index) return self.last_included_term;
+        if (index < self.last_included_index) return null;
+        const pos = index - self.last_included_index; // 1-based position
+        if (pos > self.log.items.len) return null;
+        return self.log.items[pos - 1].term;
+    }
 
     /// Leader sends AppendEntries to all peers with new log entries.
     fn sendAppendEntries(self: *Self) !void {
         for (self.peers.items) |peer| {
             const next_idx = self.next_index.get(peer.id) orelse blk: {
                 // Initialize if missing
-                const idx: u64 = @intCast(self.log.items.len + 1);
+                const idx: u64 = self.lastLogIndex() + 1;
                 self.next_index.put(peer.id, idx) catch continue;
                 break :blk idx;
             };
 
-            // Build entries slice: from (next_idx - 1) to end of log, capped so
-            // a lagging follower is fed the log in `max_append_entries` chunks
-            // instead of one RPC carrying everything. The following round picks
-            // up where this one stopped (`next_index` = last entry sent + 1).
-            const start: usize = if (next_idx > 0) @intCast(next_idx - 1) else 0;
-            const pending: []const LogEntry = if (start < self.log.items.len)
-                self.log.items[start..]
+            // §7: what this follower needs next has already been compacted into
+            // the snapshot — no AppendEntries can match below the boundary
+            // (the entries are gone), so the snapshot itself goes instead, and
+            // the next round resumes AppendEntries at `last_included_index + 1`
+            // once the follower has installed it.
+            if (next_idx <= self.last_included_index) {
+                self.sendSnapshotToPeer(peer);
+                // A higher term in the reply stepped us down mid-round: stop.
+                if (self.state != .leader) return;
+                continue;
+            }
+
+            // Build entries slice: from the first live entry the follower is
+            // missing to the end of the log, capped so a lagging follower is
+            // fed in `max_append_entries` chunks instead of one RPC carrying
+            // everything. The following round picks up where this one stopped
+            // (`next_index` = last entry sent + 1).
+            const start: usize = @intCast(next_idx - self.last_included_index); // 1-based position of the first entry to send
+            const pending: []const LogEntry = if (start <= self.log.items.len)
+                self.log.items[start - 1 ..]
             else
                 &.{};
             // A cap of 0 would ship empty rounds forever and never advance
@@ -769,9 +934,15 @@ pub const RaftElection = struct {
 
             var prev_log_idx: u64 = 0;
             var prev_log_term: u64 = 0;
-            if (start > 0 and start <= self.log.items.len) {
-                prev_log_idx = self.log.items[start - 1].index;
-                prev_log_term = self.log.items[start - 1].term;
+            if (next_idx > 1) {
+                prev_log_idx = next_idx - 1;
+                // Boundary hit → the snapshot's `last_included_term` (the
+                // follower's §5.3 check matches it against its own boundary); a
+                // live entry → its own term. `next_idx > last_included_index`
+                // in this branch, so `termAt` misses only when `next_index`
+                // outran the tail — the follower then rejects and the
+                // backtracking below repairs the map.
+                prev_log_term = self.termAt(prev_log_idx) orelse 0;
             }
 
             const req = AppendEntriesRequest{
@@ -809,13 +980,16 @@ pub const RaftElection = struct {
                 self.next_index.put(peer.id, matched + 1) catch |err| std.log.err("[RaftElection] next_index update failed: {}", .{err});
                 self.match_index.put(peer.id, matched) catch |err| std.log.err("[RaftElection] match_index update failed: {}", .{err});
             } else {
-                // Decrement next_index for fast backtracking
+                // Decrement next_index for fast backtracking, with the
+                // follower's `match_index` as a hint. Floor is 1: a next_index
+                // that lands at/below the snapshot boundary is the snapshot
+                // branch above, not a wedge.
                 if (next_idx > 1) {
-                    self.next_index.put(peer.id, next_idx - 1) catch |err| std.log.err("[RaftElection] next_index backtrack failed: {}", .{err});
-                }
-                if (resp.match_index > 0) {
-                    // Use follower's match_index hint for faster convergence
-                    self.next_index.put(peer.id, @min(next_idx - 1, resp.match_index + 1)) catch |err| std.log.err("[RaftElection] next_index hint update failed: {}", .{err});
+                    const back = if (resp.match_index > 0)
+                        @min(next_idx - 1, resp.match_index + 1)
+                    else
+                        next_idx - 1;
+                    self.next_index.put(peer.id, back) catch |err| std.log.err("[RaftElection] next_index backtrack failed: {}", .{err});
                 }
             }
         }
@@ -826,12 +1000,14 @@ pub const RaftElection = struct {
     }
 
     /// Advance commit_index if a majority of peers have replicated an entry
-    /// from the current term (§5.3, §5.4).
+    /// from the current term (§5.3, §5.4). Absolute coordinates: entries at or
+    /// below the snapshot boundary are committed by construction, so the scan
+    /// starts past both.
     fn advanceCommitIndex(self: *Self) void {
-        var n: u64 = self.commit_index + 1;
-        while (n <= self.log.items.len) : (n += 1) {
+        var n: u64 = @max(self.commit_index, self.last_included_index) + 1;
+        while (n <= self.lastLogIndex()) : (n += 1) {
             // Only commit entries from the current term (§5.4.2)
-            if (self.log.items[@intCast(n - 1)].term != self.current_term) continue;
+            if ((self.termAt(n) orelse continue) != self.current_term) continue;
 
             var count: usize = 1; // count self
             var it = self.match_index.iterator();
@@ -849,7 +1025,9 @@ pub const RaftElection = struct {
         }
     }
 
-    /// Truncate the log to keep only the first `keep_count` entries.
+    /// Truncate the log to keep only the first `keep_count` **live** entries
+    /// (a position count, not an absolute index — the snapshot below
+    /// `last_included_index` is never touched).
     fn truncateLog(self: *Self, keep_count: u64) void {
         while (self.log.items.len > keep_count) {
             if (self.log.pop()) |entry| {
@@ -891,8 +1069,8 @@ pub const RaftElection = struct {
             return;
         }
 
-        const last_idx: u64 = @intCast(self.log.items.len);
-        const last_term = if (last_idx > 0) self.log.items[last_idx - 1].term else 0;
+        const last_idx: u64 = self.lastLogIndex();
+        const last_term = self.lastLogTerm();
 
         const vote_req = VoteRequest{
             .term = self.current_term,
@@ -923,7 +1101,7 @@ pub const RaftElection = struct {
         self.leader_id = leader_copy;
 
         // Initialize next_index and match_index for all peers
-        const last_log_idx: u64 = @intCast(self.log.items.len);
+        const last_log_idx: u64 = self.lastLogIndex();
         self.next_index.clearRetainingCapacity();
         self.match_index.clearRetainingCapacity();
 
@@ -952,6 +1130,93 @@ pub const RaftElection = struct {
     /// `config.max_append_entries` of them per round.
     fn sendHeartbeats(self: *Self) !void {
         try self.sendAppendEntries();
+    }
+
+    /// §7 leader side: send the snapshot to a follower whose `next_index` has
+    /// fallen to or below `last_included_index` (the entries it needs are gone
+    /// from the log). Payload goes in `snapshot_chunk_bytes` frames — a small
+    /// snapshot is one frame (`offset = 0, done = true`) — and each reply is
+    /// processed inline, like `sendAppendEntries` does.
+    ///
+    /// Assumes `lock` is held (called from `sendAppendEntries`' round), which
+    /// is also what keeps `last_included_*` stable between chunks: compaction
+    /// runs on this same locked path.
+    fn sendSnapshotToPeer(self: *Self, peer: Peer) void {
+        const snap = self.snapshot_data orelse "";
+        // u16 length prefix on the wire (`RaftTransport.putStr`) — the clamp is
+        // the wire format's, not a tuning choice.
+        const chunk = @min(@max(@as(usize, 1), self.config.snapshot_chunk_bytes), std.math.maxInt(u16));
+        var offset: usize = 0;
+        while (true) {
+            const end = @min(snap.len, offset + chunk);
+            const done = end == snap.len;
+            const resp = self.transport.*.sendInstallSnapshot(peer.id, peer.address, .{
+                .term = self.current_term,
+                .leader_id = self.local_id,
+                .last_included_index = self.last_included_index,
+                .last_included_term = self.last_included_term,
+                .offset = @intCast(offset),
+                .data = snap[offset..end],
+                .done = done,
+            });
+            self.processInstallSnapshotResponse(resp, peer.id);
+            // Stepped down (higher term): the round is over. A stale answer
+            // (below our term — e.g. the "lost message" `term = 0`) leaves
+            // `next_index` at the boundary and the next round retries.
+            if (self.state != .leader or resp.term != self.current_term) return;
+            if (done) return;
+            offset = end;
+        }
+    }
+
+    /// The bookkeeping half of an InstallSnapshot reply. Assumes `lock` held;
+    /// the public `handleInstallSnapshotResponse` is the locking entry point.
+    fn processInstallSnapshotResponse(self: *Self, resp: InstallSnapshotResponse, from_peer: []const u8) void {
+        if (resp.term > self.current_term) {
+            self.current_term = resp.term;
+            self.state = .follower;
+            return;
+        }
+        if (self.state != .leader) return;
+        if (resp.term != self.current_term) return; // a reply to an older term's snapshot
+        const peer_id = self.peerId(from_peer) orelse return;
+        // The reply carries only a term, so "what was installed" is what we
+        // sent: the snapshot boundary this node currently holds (stable under
+        // the lock across the send).
+        self.match_index.put(peer_id, self.last_included_index) catch |err| std.log.err("[RaftElection] match_index update after snapshot failed: {}", .{err});
+        self.next_index.put(peer_id, self.last_included_index + 1) catch |err| std.log.err("[RaftElection] next_index update after snapshot failed: {}", .{err});
+    }
+
+    /// §7: compact the committed prefix once the live log outgrows
+    /// `snapshot_threshold_entries`. Called from `tick()` on the leader with
+    /// `lock` held. Never crosses `commit_index`.
+    fn maybeCompactLog(self: *Self) !void {
+        const threshold = self.config.snapshot_threshold_entries;
+        if (threshold == 0) return;
+        if (self.log.items.len <= threshold) return;
+        // Nothing new to fold in: the committed prefix is already snapshotted.
+        if (self.commit_index <= self.last_included_index) return;
+
+        const up_to = self.commit_index;
+        const bytes = if (self.config.snapshotter) |snapshotter|
+            try snapshotter(self.config.snapshotter_ctx, up_to, self.allocator)
+        else
+            try self.defaultSnapshotBytes(up_to);
+        defer self.allocator.free(bytes);
+        try self.compactLogLocked(up_to, bytes);
+    }
+
+    /// The no-`snapshotter` snapshot: a parseable debug summary of what was
+    /// folded in. **Placeholder semantics** — the framework has no application
+    /// state machine, so restoring application state from these bytes is not a
+    /// thing; apps that need real snapshots supply `ElectionConfig.snapshotter`.
+    fn defaultSnapshotBytes(self: *const Self, up_to_index: u64) ![]u8 {
+        const term = self.termAt(up_to_index) orelse 0;
+        return std.fmt.allocPrint(self.allocator, "zigmodu-raft-snapshot:v1:last_included_index={d}:last_included_term={d}:compacted_entries={d}", .{
+            up_to_index,
+            term,
+            up_to_index - self.last_included_index,
+        });
     }
 
     /// Handle a vote response from a peer. Granted votes are tallied per term
@@ -993,6 +1258,31 @@ pub const RaftElection = struct {
         if (@as(usize, self.votes_received.count()) + 1 >= self.quorumSize()) {
             self.becomeLeader();
         }
+    }
+
+    /// Leader consumes an InstallSnapshot reply (§7). The synchronous send path
+    /// (`sendSnapshotToPeer`) feeds replies through `processInstallSnapshotResponse`
+    /// directly; this is the entry point for a reply that arrives out of band
+    /// (e.g. an async transport). The reply itself carries only a term, so the
+    /// caller names the snapshot it belongs to: `last_included_index` that does
+    /// not match the snapshot this node currently holds is a stale answer — only
+    /// the term half of it still applies.
+    ///
+    /// Holds `lock`: on success it rewrites `next_index` / `match_index`, and a
+    /// higher term steps the node down — both are the same writes the ticker
+    /// makes.
+    pub fn handleInstallSnapshotResponse(self: *Self, resp: InstallSnapshotResponse, from_peer: []const u8, last_included_index: u64) !void {
+        self.lock.acquire();
+        defer self.lock.release();
+
+        if (last_included_index != self.last_included_index) {
+            if (resp.term > self.current_term) {
+                self.current_term = resp.term;
+                self.state = .follower;
+            }
+            return;
+        }
+        self.processInstallSnapshotResponse(resp, from_peer);
     }
 
     /// The stored id of the peer named `id`, or null when it is not a member.
@@ -1066,15 +1356,19 @@ pub const RaftElection = struct {
         return self.commit_index;
     }
 
-    /// Get log entry at the given 1-based index, or null if out of range.
+    /// Get log entry by **absolute** 1-based index, or null when out of range —
+    /// which includes indices folded into the snapshot (`<= last_included_index`):
+    /// those entries no longer exist individually.
     ///
     /// The lock makes the lookup whole, but the returned entry's `command`
     /// borrows the log: it is valid only until the next call into this raft.
     pub fn getLogEntry(self: *Self, index: u64) ?LogEntry {
         self.lock.acquire();
         defer self.lock.release();
-        if (index == 0 or index > self.log.items.len) return null;
-        return self.log.items[index - 1];
+        if (index == 0 or index <= self.last_included_index) return null;
+        const pos = index - self.last_included_index;
+        if (pos > self.log.items.len) return null;
+        return self.log.items[pos - 1];
     }
 
     /// Add a peer to the cluster dynamically. Holds `lock`: `peers` is what
@@ -1089,15 +1383,25 @@ pub const RaftElection = struct {
     }
 
     /// Get current state
-    /// Log compaction: Discard entries up to `up_to_index` and retain `snapshot_data`.
+    /// Log compaction: discard entries up to `up_to_index` (absolute) and
+    /// retain `snapshot_data`. The boundary must be **committed** — folding an
+    /// uncommitted entry into a snapshot is what makes a minority's uncommitted
+    /// state survivable, which Raft forbids — so `up_to_index > commit_index`
+    /// is refused rather than clipped.
     ///
     /// Holds `lock`: it frees the entries it discards and compacts `log` under
     /// the readers of both.
     pub fn compactLog(self: *Self, up_to_index: u64, snapshot_bytes: []const u8) !void {
         self.lock.acquire();
         defer self.lock.release();
+        try self.compactLogLocked(up_to_index, snapshot_bytes);
+    }
 
+    /// The lock-held body of `compactLog` (also what `maybeCompactLog` calls
+    /// from inside `tick`).
+    fn compactLogLocked(self: *Self, up_to_index: u64, snapshot_bytes: []const u8) !void {
         if (up_to_index <= self.last_included_index) return;
+        if (up_to_index > self.commit_index) return error.NotCommitted;
         if (self.log.items.len == 0) return;
 
         var target_idx: ?usize = null;
@@ -1139,6 +1443,15 @@ pub const RaftElection = struct {
     }
 
     /// Follower handles InstallSnapshot RPC from leader (§7 Log Compaction).
+    ///
+    /// Chunks: `offset == 0` starts a transfer, a continuation must name the
+    /// same `(last_included_index, last_included_term)` and land at exactly the
+    /// assembled length (anything else drops the partial buffer and the
+    /// leader's next round restarts it), and `done` applies. Applying **retains
+    /// the log suffix** when it continues the snapshot — the entry at
+    /// `last_included_index` exists with the same term (§7: "If existing log
+    /// entry has same index and term as snapshot's last included entry, retain
+    /// log entries following it and reply") — and wipes the log otherwise.
     pub fn handleInstallSnapshot(self: *Self, req: InstallSnapshotRequest) !InstallSnapshotResponse {
         self.lock.acquire();
         defer self.lock.release();
@@ -1147,9 +1460,9 @@ pub const RaftElection = struct {
             return InstallSnapshotResponse{ .term = self.current_term };
         }
 
-        // Same check as `handleAppendEntries`, and this is the path that wipes the
-        // whole log, so an unknown sender must be refused before anything moves —
-        // term, state and (below) `log` are all reachable from here.
+        // Same check as `handleAppendEntries`, and this is the path that can wipe
+        // the whole log, so an unknown sender must be refused before anything
+        // moves — term, state and (below) `log` are all reachable from here.
         if (!std.mem.eql(u8, req.leader_id, self.local_id) and self.peerId(req.leader_id) == null) {
             return InstallSnapshotResponse{ .term = self.current_term };
         }
@@ -1159,18 +1472,65 @@ pub const RaftElection = struct {
         }
         self.state = .follower;
 
+        // A snapshot from the leader is leader contact, same as an
+        // AppendEntries: reset the election clock and record who leads. Both
+        // were missing here — the handler moved the term and wiped the log but
+        // left the deadline (and `getLeader()`) stale.
+        const now_ms = Time.monotonicNowMilliseconds();
+        self.last_heartbeat_ms = now_ms;
+        self.election_deadline_ms = now_ms + @as(i64, @intCast(self.randomElectionTimeout()));
+        const leader_copy = try self.allocator.dupe(u8, req.leader_id);
+        if (self.leader_id) |l| {
+            if (l.ptr != self.local_id.ptr) self.allocator.free(l);
+        }
+        self.leader_id = leader_copy;
+
+        // Chunk assembly. A mismatching continuation is dropped, not applied:
+        // the sender restarts at `offset = 0` on its next attempt.
+        if (req.offset == 0) {
+            self.pending_snapshot.clearRetainingCapacity();
+            self.pending_snapshot_index = req.last_included_index;
+            self.pending_snapshot_term = req.last_included_term;
+        } else {
+            if (req.last_included_index != self.pending_snapshot_index or
+                req.last_included_term != self.pending_snapshot_term or
+                req.offset != self.pending_snapshot.items.len)
+            {
+                self.pending_snapshot.clearRetainingCapacity();
+                return InstallSnapshotResponse{ .term = self.current_term };
+            }
+        }
+        try self.pending_snapshot.appendSlice(self.allocator, req.data);
+        if (!req.done) return InstallSnapshotResponse{ .term = self.current_term };
+        defer self.pending_snapshot.clearRetainingCapacity();
+
         if (req.last_included_index > self.last_included_index) {
             // Allocate the snapshot **first**: everything below this line is
-            // destructive (it frees every log entry and clears the log), so the old
-            // order left a dangling `snapshot_data` *and* a wiped log when the dupe
-            // failed — the node came back with no snapshot and no log.
-            const snap_copy = try self.allocator.dupe(u8, req.data);
+            // destructive (it frees log entries), so the old order left a
+            // dangling `snapshot_data` *and* a wiped log when the dupe failed —
+            // the node came back with no snapshot and no log.
+            const snap_copy = try self.allocator.dupe(u8, self.pending_snapshot.items);
 
-            // Free current log entries
-            for (self.log.items) |entry| {
-                self.allocator.free(entry.command);
+            // §7 suffix retention: the entry at the snapshot boundary exists and
+            // matches `last_included_term` → the log *continues* the snapshot,
+            // so only the covered prefix is dropped. Otherwise (gap, or a term
+            // that disagrees) the log cannot be trusted to follow the snapshot
+            // and is wiped wholesale.
+            const covered: usize = @intCast(req.last_included_index - self.last_included_index);
+            const drop_count: usize = if (covered <= self.log.items.len and
+                self.termAt(req.last_included_index) == req.last_included_term)
+                covered
+            else
+                self.log.items.len;
+
+            for (0..drop_count) |i| {
+                self.allocator.free(self.log.items[i].command);
             }
-            self.log.clearRetainingCapacity();
+            const remaining = self.log.items.len - drop_count;
+            if (remaining > 0) {
+                std.mem.copyForwards(LogEntry, self.log.items[0..remaining], self.log.items[drop_count..]);
+            }
+            self.log.items.len = remaining;
 
             self.last_included_index = req.last_included_index;
             self.last_included_term = req.last_included_term;
@@ -1245,6 +1605,7 @@ const TestCluster = struct {
     const TestTransport = struct {
         sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
         sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse,
+        sendInstallSnapshot: *const fn (?[]const u8, []const u8, InstallSnapshotRequest) InstallSnapshotResponse,
     };
 
     fn init(allocator: std.mem.Allocator, count: usize) !TestCluster {
@@ -1285,6 +1646,7 @@ const TestCluster = struct {
             transports.appendAssumeCapacity(.{
                 .sendVoteRequest = sendVoteRequestFn,
                 .sendAppendEntries = sendAppendEntriesFn,
+                .sendInstallSnapshot = noopInstallSnapshot,
             });
             transport_refs.appendAssumeCapacity(@ptrCast(@alignCast(@constCast(&transports.items[i]))));
 
@@ -1571,6 +1933,7 @@ test "RaftElection initialization" {
     const TransportImpl = struct {
         sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
         sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse,
+        sendInstallSnapshot: *const fn (?[]const u8, []const u8, InstallSnapshotRequest) InstallSnapshotResponse,
     };
     var transport_impl = TransportImpl{
         .sendVoteRequest = (struct {
@@ -1581,6 +1944,7 @@ test "RaftElection initialization" {
                 return AppendEntriesResponse{ .term = 0, .success = false, .match_index = 0 };
             }
         }).f,
+        .sendInstallSnapshot = noopInstallSnapshot,
     };
     const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transport_impl)));
 
@@ -1604,6 +1968,7 @@ test "RaftElection heartbeat resets leader info" {
     const TransportImpl = struct {
         sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
         sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse,
+        sendInstallSnapshot: *const fn (?[]const u8, []const u8, InstallSnapshotRequest) InstallSnapshotResponse,
     };
     var transport_impl = TransportImpl{
         .sendVoteRequest = (struct {
@@ -1614,6 +1979,7 @@ test "RaftElection heartbeat resets leader info" {
                 return AppendEntriesResponse{ .term = 0, .success = true, .match_index = 0 };
             }
         }).f,
+        .sendInstallSnapshot = noopInstallSnapshot,
     };
     const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transport_impl)));
 
@@ -1660,6 +2026,7 @@ test "an AppendEntries entry with index 0 is refused before the log is touched" 
     const TransportImpl = struct {
         sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
         sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse,
+        sendInstallSnapshot: *const fn (?[]const u8, []const u8, InstallSnapshotRequest) InstallSnapshotResponse,
     };
     var transport_impl = TransportImpl{
         .sendVoteRequest = (struct {
@@ -1670,6 +2037,7 @@ test "an AppendEntries entry with index 0 is refused before the log is touched" 
                 return AppendEntriesResponse{ .term = 0, .success = true, .match_index = 0 };
             }
         }).f,
+        .sendInstallSnapshot = noopInstallSnapshot,
     };
     const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transport_impl)));
 
@@ -1722,6 +2090,7 @@ test "a failed voted_for re-allocation leaves the old vote intact" {
     const TransportImpl = struct {
         sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
         sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse,
+        sendInstallSnapshot: *const fn (?[]const u8, []const u8, InstallSnapshotRequest) InstallSnapshotResponse,
     };
     var transport_impl = TransportImpl{
         .sendVoteRequest = (struct {
@@ -1732,6 +2101,7 @@ test "a failed voted_for re-allocation leaves the old vote intact" {
                 return AppendEntriesResponse{ .term = 0, .success = true, .match_index = 0 };
             }
         }).f,
+        .sendInstallSnapshot = noopInstallSnapshot,
     };
     const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transport_impl)));
 
@@ -1781,6 +2151,7 @@ test "a leader_id aliased onto local_id is not freed on the next election win" {
     const TransportImpl = struct {
         sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
         sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse,
+        sendInstallSnapshot: *const fn (?[]const u8, []const u8, InstallSnapshotRequest) InstallSnapshotResponse,
     };
     var transport_impl = TransportImpl{
         .sendVoteRequest = (struct {
@@ -1791,6 +2162,7 @@ test "a leader_id aliased onto local_id is not freed on the next election win" {
                 return AppendEntriesResponse{ .term = 0, .success = true, .match_index = 0 };
             }
         }).f,
+        .sendInstallSnapshot = noopInstallSnapshot,
     };
     const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transport_impl)));
 
@@ -1822,6 +2194,7 @@ test "RaftElection vote request validation" {
     const TransportImpl = struct {
         sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
         sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse,
+        sendInstallSnapshot: *const fn (?[]const u8, []const u8, InstallSnapshotRequest) InstallSnapshotResponse,
     };
     var transport_impl = TransportImpl{
         .sendVoteRequest = (struct {
@@ -1832,6 +2205,7 @@ test "RaftElection vote request validation" {
                 return AppendEntriesResponse{ .term = 0, .success = false, .match_index = 0 };
             }
         }).f,
+        .sendInstallSnapshot = noopInstallSnapshot,
     };
     const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transport_impl)));
 
@@ -1865,6 +2239,7 @@ test "RaftElection rejects stale term vote" {
     const TransportImpl = struct {
         sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
         sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse,
+        sendInstallSnapshot: *const fn (?[]const u8, []const u8, InstallSnapshotRequest) InstallSnapshotResponse,
     };
     var transport_impl = TransportImpl{
         .sendVoteRequest = (struct {
@@ -1875,6 +2250,7 @@ test "RaftElection rejects stale term vote" {
                 return AppendEntriesResponse{ .term = 0, .success = false, .match_index = 0 };
             }
         }).f,
+        .sendInstallSnapshot = noopInstallSnapshot,
     };
     const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transport_impl)));
 
@@ -1911,6 +2287,7 @@ test "RaftElection split vote across three candidates" {
     const TransportImpl = struct {
         sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
         sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse,
+        sendInstallSnapshot: *const fn (?[]const u8, []const u8, InstallSnapshotRequest) InstallSnapshotResponse,
     };
     var transport_impl = TransportImpl{
         .sendVoteRequest = (struct {
@@ -1921,6 +2298,7 @@ test "RaftElection split vote across three candidates" {
                 return AppendEntriesResponse{ .term = 0, .success = false, .match_index = 0 };
             }
         }).f,
+        .sendInstallSnapshot = noopInstallSnapshot,
     };
     const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transport_impl)));
 
@@ -1963,6 +2341,7 @@ test "RaftElection quorum calculation" {
     const TransportImpl = struct {
         sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
         sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse,
+        sendInstallSnapshot: *const fn (?[]const u8, []const u8, InstallSnapshotRequest) InstallSnapshotResponse,
     };
     var transport_impl = TransportImpl{
         .sendVoteRequest = (struct {
@@ -1973,6 +2352,7 @@ test "RaftElection quorum calculation" {
                 return AppendEntriesResponse{ .term = 0, .success = false, .match_index = 0 };
             }
         }).f,
+        .sendInstallSnapshot = noopInstallSnapshot,
     };
     const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transport_impl)));
 
@@ -2035,6 +2415,7 @@ test "a 2-node cluster elects a leader with its single peer's grant" {
     const TransportImpl = struct {
         sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
         sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse,
+        sendInstallSnapshot: *const fn (?[]const u8, []const u8, InstallSnapshotRequest) InstallSnapshotResponse,
     };
     var transport_impl = TransportImpl{
         .sendVoteRequest = (struct {
@@ -2045,6 +2426,7 @@ test "a 2-node cluster elects a leader with its single peer's grant" {
                 return AppendEntriesResponse{ .term = 0, .success = true, .match_index = 0 };
             }
         }).f,
+        .sendInstallSnapshot = noopInstallSnapshot,
     };
     const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transport_impl)));
 
@@ -2075,6 +2457,7 @@ test "a raft whose peers were added by id elects a leader (the ClusterBootstrap 
     const TransportImpl = struct {
         sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
         sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse,
+        sendInstallSnapshot: *const fn (?[]const u8, []const u8, InstallSnapshotRequest) InstallSnapshotResponse,
     };
     var transport_impl = TransportImpl{
         .sendVoteRequest = (struct {
@@ -2085,6 +2468,7 @@ test "a raft whose peers were added by id elects a leader (the ClusterBootstrap 
                 return AppendEntriesResponse{ .term = 0, .success = false, .match_index = 0 };
             }
         }).f,
+        .sendInstallSnapshot = noopInstallSnapshot,
     };
     const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transport_impl)));
 
@@ -2167,6 +2551,7 @@ test "RaftElection log compaction and InstallSnapshot" {
     const TransportImpl = struct {
         sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
         sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse,
+        sendInstallSnapshot: *const fn (?[]const u8, []const u8, InstallSnapshotRequest) InstallSnapshotResponse,
     };
     var transport_impl = TransportImpl{
         .sendVoteRequest = (struct {
@@ -2177,6 +2562,7 @@ test "RaftElection log compaction and InstallSnapshot" {
                 return AppendEntriesResponse{ .term = 0, .success = false, .match_index = 0 };
             }
         }).f,
+        .sendInstallSnapshot = noopInstallSnapshot,
     };
     const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transport_impl)));
 
@@ -2221,14 +2607,669 @@ test "RaftElection log compaction and InstallSnapshot" {
     try testing.expectEqualStrings("follower-snapshot-data", follower.snapshot_data.?);
 }
 
+// ── §7 production-loop tests ────────────────────────────────────────────────
+//
+// The tests below pin the absolute-index ⇄ position convention the compaction
+// rework stands on (`log` holds only the entries after `last_included_index`),
+// the leader's snapshot-send path, chunk assembly with suffix retention, and
+// threshold-driven auto-compaction in `tick`. The offset arithmetic they guard
+// is off-by-one fragile, so each test asserts *absolute* indices on both sides
+// of a compaction boundary.
+
+/// Captures the coordinates of each AppendEntries round (prev + batch range).
+const AppendCoords = struct {
+    var calls: usize = 0;
+    var prev_index: u64 = 0;
+    var prev_term: u64 = 0;
+    var entries_len: usize = 0;
+    var first_index: u64 = 0;
+    var last_index: u64 = 0;
+
+    fn reset() void {
+        calls = 0;
+        prev_index = 0;
+        prev_term = 0;
+        entries_len = 0;
+        first_index = 0;
+        last_index = 0;
+    }
+
+    fn accept(_: ?[]const u8, _: []const u8, req: AppendEntriesRequest) AppendEntriesResponse {
+        calls += 1;
+        prev_index = req.prev_log_index;
+        prev_term = req.prev_log_term;
+        entries_len = req.entries.len;
+        first_index = if (req.entries.len > 0) req.entries[0].index else 0;
+        last_index = if (req.entries.len > 0) req.entries[req.entries.len - 1].index else req.prev_log_index;
+        return .{ .term = req.term, .success = true, .match_index = last_index };
+    }
+};
+
+/// An AppendEntries rejection with no backtracking hint — the shape a test
+/// wants when the peer must never advance the leader's `match_index`.
+fn rejectAppendEntries(_: ?[]const u8, _: []const u8, req: AppendEntriesRequest) AppendEntriesResponse {
+    return .{ .term = req.term, .success = false, .match_index = 0 };
+}
+
+/// Captures InstallSnapshot frames (offsets + reassembled payload) and answers
+/// with the sender's own term, so a leader round completes inline.
+const SnapshotCapture = struct {
+    var calls: usize = 0;
+    var done_calls: usize = 0;
+    var offsets: [8]u64 = undefined;
+    var last_included_index: u64 = 0;
+    var last_included_term: u64 = 0;
+    var buf: [4096]u8 = undefined;
+    var len: usize = 0;
+
+    fn reset() void {
+        calls = 0;
+        done_calls = 0;
+        last_included_index = 0;
+        last_included_term = 0;
+        len = 0;
+    }
+
+    fn accept(_: ?[]const u8, _: []const u8, req: InstallSnapshotRequest) InstallSnapshotResponse {
+        if (calls < offsets.len) offsets[calls] = req.offset;
+        calls += 1;
+        last_included_index = req.last_included_index;
+        last_included_term = req.last_included_term;
+        if (len + req.data.len <= buf.len) {
+            @memcpy(buf[len..][0..req.data.len], req.data);
+            len += req.data.len;
+        }
+        if (req.done) done_calls += 1;
+        return .{ .term = req.term };
+    }
+
+    fn assembled() []const u8 {
+        return buf[0..len];
+    }
+};
+
+/// A `Snapshotter` that records its invocation and hands back named bytes.
+const SnapshotterProbe = struct {
+    var calls: usize = 0;
+    var seen_ctx: ?*anyopaque = null;
+    var seen_up_to: u64 = 0;
+
+    fn reset() void {
+        calls = 0;
+        seen_ctx = null;
+        seen_up_to = 0;
+    }
+
+    fn snapshot(ctx: ?*anyopaque, up_to_index: u64, allocator: std.mem.Allocator) anyerror![]u8 {
+        calls += 1;
+        seen_ctx = ctx;
+        seen_up_to = up_to_index;
+        return std.fmt.allocPrint(allocator, "app-snapshot@{d}", .{up_to_index});
+    }
+};
+
+test "RaftElection compaction rebases the log: append and replication continue at absolute indices" {
+    const allocator = testing.allocator;
+    AppendCoords.reset();
+
+    var impl = TestTransportVTable{
+        .sendVoteRequest = noopVoteRequest,
+        .sendAppendEntries = AppendCoords.accept,
+        .sendInstallSnapshot = noopInstallSnapshot,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
+
+    // No peers yet: a one-node leader self-commits every append.
+    var raft = try RaftElection.init(allocator, "n1", &.{}, .{}, &transport);
+    defer raft.deinit();
+    raft.state = .leader;
+    raft.current_term = 1;
+
+    for (0..6) |i| {
+        var buf: [16]u8 = undefined;
+        const cmd = try std.fmt.bufPrint(&buf, "cmd-{d}", .{i});
+        try testing.expectEqual(@as(u64, i + 1), try raft.appendEntry(cmd));
+    }
+    try testing.expectEqual(@as(u64, 6), raft.getCommitIndex());
+
+    try raft.compactLog(3, "snap@3");
+    try testing.expectEqual(@as(u64, 3), raft.last_included_index);
+    try testing.expectEqual(@as(u64, 1), raft.last_included_term);
+    try testing.expectEqual(@as(usize, 3), raft.logLen());
+
+    // The tail is boundary + live count: the next append is index 7, not 4.
+    try testing.expectEqual(@as(u64, 7), try raft.appendEntry("cmd-6"));
+    try testing.expect(raft.getLogEntry(3) == null);
+    try testing.expectEqualStrings("cmd-3", raft.getLogEntry(4).?.command);
+    try testing.expectEqualStrings("cmd-6", raft.getLogEntry(7).?.command);
+
+    // A follower joining at the boundary gets prev = (boundary, snapshot term)
+    // and the whole live suffix.
+    try raft.addPeer("n2");
+    const peer_key = raft.peers.items[0].id;
+    try raft.next_index.put(peer_key, 4);
+    try raft.match_index.put(peer_key, 3);
+
+    try raft.sendAppendEntries();
+    try testing.expectEqual(@as(usize, 1), AppendCoords.calls);
+    try testing.expectEqual(@as(u64, 3), AppendCoords.prev_index);
+    try testing.expectEqual(@as(u64, 1), AppendCoords.prev_term);
+    try testing.expectEqual(@as(usize, 4), AppendCoords.entries_len);
+    try testing.expectEqual(@as(u64, 4), AppendCoords.first_index);
+    try testing.expectEqual(@as(u64, 7), AppendCoords.last_index);
+    try testing.expectEqual(@as(u64, 8), raft.next_index.get(peer_key).?);
+
+    // Caught up: the next round is an empty probe whose prev is the live tail.
+    try raft.sendAppendEntries();
+    try testing.expectEqual(@as(usize, 2), AppendCoords.calls);
+    try testing.expectEqual(@as(u64, 7), AppendCoords.prev_index);
+    try testing.expectEqual(@as(usize, 0), AppendCoords.entries_len);
+    try testing.expectEqual(@as(u64, 8), raft.next_index.get(peer_key).?);
+}
+
+test "RaftElection AppendEntries whose prev_log sits on the snapshot boundary matches last_included_term" {
+    const allocator = testing.allocator;
+
+    var impl = TestTransportVTable{
+        .sendVoteRequest = noopVoteRequest,
+        .sendAppendEntries = rejectAppendEntries,
+        .sendInstallSnapshot = noopInstallSnapshot,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
+
+    var peers = [_]Peer{.{ .id = "leader", .address = "" }};
+    var raft = try RaftElection.init(allocator, "f1", &peers, .{}, &transport);
+    defer raft.deinit();
+
+    const seed_entries = [_]LogEntry{
+        .{ .term = 1, .index = 1, .command = "e1" },
+        .{ .term = 1, .index = 2, .command = "e2" },
+        .{ .term = 1, .index = 3, .command = "e3" },
+        .{ .term = 1, .index = 4, .command = "e4" },
+    };
+    const seed = try raft.handleAppendEntries(.{
+        .term = 1,
+        .leader_id = "leader",
+        .prev_log_index = 0,
+        .prev_log_term = 0,
+        .entries = &seed_entries,
+        .leader_commit = 4,
+    });
+    try testing.expect(seed.success);
+
+    try raft.compactLog(3, "snap@3");
+    try testing.expectEqual(@as(usize, 1), raft.logLen());
+
+    // The boundary prev names the snapshot's term; a wrong term rejects and —
+    // unlike a live-entry conflict — truncates nothing.
+    const wrong_term = try raft.handleAppendEntries(.{
+        .term = 1,
+        .leader_id = "leader",
+        .prev_log_index = 3,
+        .prev_log_term = 9,
+        .entries = &.{},
+        .leader_commit = 4,
+    });
+    try testing.expect(!wrong_term.success);
+    try testing.expectEqual(@as(usize, 1), raft.logLen());
+    try testing.expectEqual(@as(u64, 3), raft.last_included_index);
+
+    // The matching boundary term accepts; the batch replays the live entry
+    // (skipped — term matches) and continues the log in absolute coordinates.
+    const tail_entries = [_]LogEntry{
+        .{ .term = 1, .index = 4, .command = "DIFFERENT" },
+        .{ .term = 1, .index = 5, .command = "e5" },
+    };
+    const ok = try raft.handleAppendEntries(.{
+        .term = 1,
+        .leader_id = "leader",
+        .prev_log_index = 3,
+        .prev_log_term = 1,
+        .entries = &tail_entries,
+        .leader_commit = 5,
+    });
+    try testing.expect(ok.success);
+    try testing.expectEqual(@as(u64, 5), ok.match_index);
+    try testing.expectEqual(@as(usize, 2), raft.logLen());
+    try testing.expectEqualStrings("e4", raft.getLogEntry(4).?.command);
+    try testing.expectEqualStrings("e5", raft.getLogEntry(5).?.command);
+    try testing.expectEqual(@as(u64, 5), raft.getCommitIndex());
+}
+
+test "RaftElection AppendEntries below the snapshot boundary skips covered entries and appends the tail" {
+    const allocator = testing.allocator;
+
+    var impl = TestTransportVTable{
+        .sendVoteRequest = noopVoteRequest,
+        .sendAppendEntries = rejectAppendEntries,
+        .sendInstallSnapshot = noopInstallSnapshot,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
+
+    var peers = [_]Peer{.{ .id = "leader", .address = "" }};
+    var raft = try RaftElection.init(allocator, "f1", &peers, .{}, &transport);
+    defer raft.deinit();
+
+    const seed_entries = [_]LogEntry{
+        .{ .term = 1, .index = 1, .command = "e1" },
+        .{ .term = 1, .index = 2, .command = "e2" },
+        .{ .term = 1, .index = 3, .command = "e3" },
+        .{ .term = 1, .index = 4, .command = "e4" },
+    };
+    const seed = try raft.handleAppendEntries(.{
+        .term = 1,
+        .leader_id = "leader",
+        .prev_log_index = 0,
+        .prev_log_term = 0,
+        .entries = &seed_entries,
+        .leader_commit = 4,
+    });
+    try testing.expect(seed.success);
+
+    try raft.compactLog(3, "snap@3");
+    try testing.expectEqual(@as(usize, 1), raft.logLen());
+
+    // prev is INSIDE the snapshot: implicitly matched (that region is
+    // committed on both sides), covered entries are skipped, the matching live
+    // entry is left untouched, and only the genuine tail is appended.
+    const covered = [_]LogEntry{
+        .{ .term = 1, .index = 2, .command = "x2" },
+        .{ .term = 1, .index = 3, .command = "x3" },
+        .{ .term = 1, .index = 4, .command = "DIFFERENT" },
+        .{ .term = 1, .index = 5, .command = "e5" },
+    };
+    const resp = try raft.handleAppendEntries(.{
+        .term = 1,
+        .leader_id = "leader",
+        .prev_log_index = 1,
+        .prev_log_term = 1,
+        .entries = &covered,
+        .leader_commit = 5,
+    });
+    try testing.expect(resp.success);
+    try testing.expectEqual(@as(u64, 5), resp.match_index);
+    try testing.expectEqual(@as(usize, 2), raft.logLen());
+    // Index 4 matched by term, so it was skipped — not overwritten.
+    try testing.expectEqualStrings("e4", raft.getLogEntry(4).?.command);
+    try testing.expectEqualStrings("e5", raft.getLogEntry(5).?.command);
+
+    // A batch with a hole is malformed: rejected before any mutation, even
+    // though the hole sits inside the snapshotted region.
+    const gapped = [_]LogEntry{
+        .{ .term = 1, .index = 2, .command = "x2" },
+        .{ .term = 1, .index = 4, .command = "x4" },
+    };
+    try testing.expectError(error.InvalidLogIndex, raft.handleAppendEntries(.{
+        .term = 1,
+        .leader_id = "leader",
+        .prev_log_index = 1,
+        .prev_log_term = 1,
+        .entries = &gapped,
+        .leader_commit = 5,
+    }));
+    try testing.expectEqual(@as(usize, 2), raft.logLen());
+    try testing.expectEqualStrings("e5", raft.getLogEntry(5).?.command);
+}
+
+test "RaftElection sends InstallSnapshot to a follower lagging into the snapshot, then resumes AppendEntries at the boundary" {
+    const allocator = testing.allocator;
+    AppendCoords.reset();
+    SnapshotCapture.reset();
+
+    var impl = TestTransportVTable{
+        .sendVoteRequest = noopVoteRequest,
+        .sendAppendEntries = AppendCoords.accept,
+        .sendInstallSnapshot = SnapshotCapture.accept,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
+
+    var peers = [_]Peer{.{ .id = "n2", .address = "" }};
+    var raft = try RaftElection.init(allocator, "n1", &peers, .{}, &transport);
+    defer raft.deinit();
+    raft.state = .leader;
+    raft.current_term = 2;
+
+    for (0..7) |i| {
+        var buf: [16]u8 = undefined;
+        _ = try raft.appendEntry(try std.fmt.bufPrint(&buf, "cmd-{d}", .{i}));
+    }
+    // Commit through 7 so a boundary at 3 is legal.
+    const peer_key = raft.peers.items[0].id;
+    try raft.match_index.put(peer_key, 7);
+    raft.advanceCommitIndex();
+    try testing.expectEqual(@as(u64, 7), raft.getCommitIndex());
+
+    try raft.compactLog(3, "snap@3");
+    try testing.expectEqualStrings("snap@3", raft.snapshot_data.?);
+
+    // The follower fell behind into the compacted region: no AppendEntries can
+    // match below the boundary, so the round ships the snapshot instead.
+    try raft.next_index.put(peer_key, 2);
+    try raft.match_index.put(peer_key, 1);
+
+    try raft.sendAppendEntries();
+    try testing.expectEqual(@as(usize, 0), AppendCoords.calls);
+    try testing.expectEqual(@as(usize, 1), SnapshotCapture.calls);
+    try testing.expectEqual(@as(usize, 1), SnapshotCapture.done_calls);
+    try testing.expectEqual(@as(u64, 0), SnapshotCapture.offsets[0]);
+    try testing.expectEqual(@as(u64, 3), SnapshotCapture.last_included_index);
+    try testing.expectEqual(@as(u64, 2), SnapshotCapture.last_included_term);
+    try testing.expectEqualStrings("snap@3", SnapshotCapture.assembled());
+    // The reply advanced the follower to just past the boundary.
+    try testing.expectEqual(@as(u64, 3), raft.match_index.get(peer_key).?);
+    try testing.expectEqual(@as(u64, 4), raft.next_index.get(peer_key).?);
+
+    // The next round is AppendEntries again, anchored on the snapshot boundary.
+    try raft.sendAppendEntries();
+    try testing.expectEqual(@as(usize, 1), AppendCoords.calls);
+    try testing.expectEqual(@as(u64, 3), AppendCoords.prev_index);
+    try testing.expectEqual(@as(u64, 2), AppendCoords.prev_term);
+    try testing.expectEqual(@as(usize, 4), AppendCoords.entries_len);
+    try testing.expectEqual(@as(u64, 4), AppendCoords.first_index);
+    try testing.expectEqual(@as(u64, 7), AppendCoords.last_index);
+}
+
+test "RaftElection InstallSnapshot response: matching index advances the peer, higher term steps down, stale is ignored" {
+    const allocator = testing.allocator;
+
+    var impl = TestTransportVTable{
+        .sendVoteRequest = noopVoteRequest,
+        .sendAppendEntries = rejectAppendEntries,
+        .sendInstallSnapshot = noopInstallSnapshot,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
+
+    var peers = [_]Peer{.{ .id = "n2", .address = "" }};
+    var raft = try RaftElection.init(allocator, "n1", &peers, .{}, &transport);
+    defer raft.deinit();
+    raft.state = .leader;
+    raft.current_term = 2;
+
+    for (0..4) |i| {
+        var buf: [16]u8 = undefined;
+        _ = try raft.appendEntry(try std.fmt.bufPrint(&buf, "cmd-{d}", .{i}));
+    }
+    const peer_key = raft.peers.items[0].id;
+    try raft.match_index.put(peer_key, 4);
+    raft.advanceCommitIndex();
+    try raft.compactLog(3, "snap@3");
+
+    // A snapshot round is in flight: next_index sits at/below the boundary.
+    try raft.next_index.put(peer_key, 2);
+    try raft.match_index.put(peer_key, 1);
+
+    // The matching reply resumes the peer just past the snapshot.
+    try raft.handleInstallSnapshotResponse(.{ .term = 2 }, "n2", 3);
+    try testing.expectEqual(@as(u64, 3), raft.match_index.get(peer_key).?);
+    try testing.expectEqual(@as(u64, 4), raft.next_index.get(peer_key).?);
+    try testing.expectEqual(RaftState.leader, raft.getState());
+
+    // A reply naming a different boundary is stale: nothing moves.
+    try raft.handleInstallSnapshotResponse(.{ .term = 2 }, "n2", 99);
+    try testing.expectEqual(@as(u64, 4), raft.next_index.get(peer_key).?);
+    try testing.expectEqual(RaftState.leader, raft.getState());
+
+    // A reply from an older term moves nothing either.
+    try raft.handleInstallSnapshotResponse(.{ .term = 1 }, "n2", 3);
+    try testing.expectEqual(@as(u64, 4), raft.next_index.get(peer_key).?);
+
+    // Unknown peer: no-op.
+    try raft.handleInstallSnapshotResponse(.{ .term = 2 }, "ghost", 3);
+    try testing.expectEqual(RaftState.leader, raft.getState());
+
+    // Higher term steps the node down — even when the boundary it names is
+    // stale (the term half of a stale answer still applies).
+    try raft.handleInstallSnapshotResponse(.{ .term = 5 }, "n2", 99);
+    try testing.expectEqual(RaftState.follower, raft.getState());
+    try testing.expectEqual(@as(u64, 5), raft.current_term);
+
+    try raft.handleInstallSnapshotResponse(.{ .term = 7 }, "n2", 3);
+    try testing.expectEqual(@as(u64, 7), raft.current_term);
+    try testing.expectEqual(RaftState.follower, raft.getState());
+}
+
+test "RaftElection assembles a chunked InstallSnapshot, retains a continuing suffix, wipes a disagreeing one" {
+    const allocator = testing.allocator;
+
+    var impl = TestTransportVTable{
+        .sendVoteRequest = noopVoteRequest,
+        .sendAppendEntries = rejectAppendEntries,
+        .sendInstallSnapshot = noopInstallSnapshot,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
+
+    var peers = [_]Peer{.{ .id = "leader", .address = "" }};
+    var raft = try RaftElection.init(allocator, "f1", &peers, .{}, &transport);
+    defer raft.deinit();
+
+    const cmds = [_][]const u8{ "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8" };
+    var seed_entries: [8]LogEntry = undefined;
+    for (0..8) |i| seed_entries[i] = .{ .term = 1, .index = @intCast(i + 1), .command = cmds[i] };
+    const seed = try raft.handleAppendEntries(.{
+        .term = 1,
+        .leader_id = "leader",
+        .prev_log_index = 0,
+        .prev_log_term = 0,
+        .entries = &seed_entries,
+        .leader_commit = 8,
+    });
+    try testing.expect(seed.success);
+    try testing.expectEqual(@as(u64, 8), raft.getCommitIndex());
+
+    const payload = "0123456789abcdefghij0123456";
+    try testing.expectEqual(@as(usize, 27), payload.len);
+
+    // Frames 1–2 assemble but do not apply.
+    _ = try raft.handleInstallSnapshot(.{ .term = 1, .leader_id = "leader", .last_included_index = 6, .last_included_term = 1, .offset = 0, .data = payload[0..10], .done = false });
+    try testing.expect(raft.snapshot_data == null);
+    try testing.expectEqual(@as(usize, 8), raft.logLen());
+    _ = try raft.handleInstallSnapshot(.{ .term = 1, .leader_id = "leader", .last_included_index = 6, .last_included_term = 1, .offset = 10, .data = payload[10..20], .done = false });
+    try testing.expect(raft.snapshot_data == null);
+
+    // Frame 3 completes the transfer: the entry at the boundary exists with
+    // the snapshot's term, so the suffix (7, 8) is retained (§7).
+    _ = try raft.handleInstallSnapshot(.{ .term = 1, .leader_id = "leader", .last_included_index = 6, .last_included_term = 1, .offset = 20, .data = payload[20..27], .done = true });
+    try testing.expectEqualStrings(payload, raft.snapshot_data.?);
+    try testing.expectEqual(@as(u64, 6), raft.last_included_index);
+    try testing.expectEqual(@as(usize, 2), raft.logLen());
+    try testing.expectEqualStrings("s7", raft.getLogEntry(7).?.command);
+    try testing.expectEqualStrings("s8", raft.getLogEntry(8).?.command);
+    try testing.expectEqual(@as(u64, 8), raft.getCommitIndex());
+
+    // A continuation that does not land at the assembled length is dropped,
+    // not applied.
+    _ = try raft.handleInstallSnapshot(.{ .term = 1, .leader_id = "leader", .last_included_index = 6, .last_included_term = 1, .offset = 5, .data = "xx", .done = false });
+    try testing.expectEqualStrings(payload, raft.snapshot_data.?);
+    try testing.expectEqual(@as(usize, 2), raft.logLen());
+
+    // Replication continues from the retained live tail.
+    const tail = [_]LogEntry{.{ .term = 1, .index = 9, .command = "s9" }};
+    const ok = try raft.handleAppendEntries(.{
+        .term = 1,
+        .leader_id = "leader",
+        .prev_log_index = 8,
+        .prev_log_term = 1,
+        .entries = &tail,
+        .leader_commit = 8,
+    });
+    try testing.expect(ok.success);
+    try testing.expectEqualStrings("s9", raft.getLogEntry(9).?.command);
+
+    // A snapshot whose boundary term disagrees with the log wipes it wholesale.
+    _ = try raft.handleInstallSnapshot(.{ .term = 1, .leader_id = "leader", .last_included_index = 7, .last_included_term = 9, .offset = 0, .data = "w", .done = true });
+    try testing.expectEqual(@as(u64, 7), raft.last_included_index);
+    try testing.expectEqual(@as(u64, 9), raft.last_included_term);
+    try testing.expectEqual(@as(usize, 0), raft.logLen());
+    try testing.expectEqualStrings("w", raft.snapshot_data.?);
+
+    // The log continues after the wipe, anchored on the new boundary term.
+    const rebuild = [_]LogEntry{.{ .term = 1, .index = 8, .command = "n8" }};
+    const ok2 = try raft.handleAppendEntries(.{
+        .term = 1,
+        .leader_id = "leader",
+        .prev_log_index = 7,
+        .prev_log_term = 9,
+        .entries = &rebuild,
+        .leader_commit = 8,
+    });
+    try testing.expect(ok2.success);
+    try testing.expectEqualStrings("n8", raft.getLogEntry(8).?.command);
+}
+
+test "RaftElection leader tick compacts the committed prefix once the log outgrows snapshot_threshold_entries" {
+    const allocator = testing.allocator;
+
+    var impl = TestTransportVTable{
+        .sendVoteRequest = noopVoteRequest,
+        .sendAppendEntries = rejectAppendEntries,
+        .sendInstallSnapshot = noopInstallSnapshot,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
+
+    var raft = try RaftElection.init(allocator, "n1", &.{}, .{ .snapshot_threshold_entries = 3 }, &transport);
+    defer raft.deinit();
+    raft.state = .leader;
+    raft.current_term = 1;
+
+    for (0..5) |i| {
+        var buf: [16]u8 = undefined;
+        _ = try raft.appendEntry(try std.fmt.bufPrint(&buf, "cmd-{d}", .{i}));
+    }
+    try testing.expectEqual(@as(u64, 5), raft.getCommitIndex());
+    try testing.expectEqual(@as(usize, 5), raft.logLen());
+
+    try raft.tick();
+    try testing.expectEqual(@as(u64, 5), raft.last_included_index);
+    try testing.expectEqual(@as(u64, 1), raft.last_included_term);
+    try testing.expectEqual(@as(usize, 0), raft.logLen());
+    // No snapshotter hook: the stored bytes are the placeholder summary — a
+    // debug artifact, not application state.
+    const snap = raft.snapshot_data.?;
+    try testing.expect(std.mem.indexOf(u8, snap, "zigmodu-raft-snapshot:v1:") != null);
+    try testing.expect(std.mem.indexOf(u8, snap, "last_included_index=5") != null);
+    try testing.expect(std.mem.indexOf(u8, snap, "compacted_entries=5") != null);
+
+    // Appends continue in absolute coordinates across the auto-compaction.
+    try testing.expectEqual(@as(u64, 6), try raft.appendEntry("cmd-5"));
+}
+
+test "RaftElection snapshotter hook supplies the bytes, and the uncommitted tail is never compacted" {
+    const allocator = testing.allocator;
+    SnapshotterProbe.reset();
+
+    var impl = TestTransportVTable{
+        .sendVoteRequest = noopVoteRequest,
+        .sendAppendEntries = rejectAppendEntries,
+        .sendInstallSnapshot = noopInstallSnapshot,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
+
+    var marker: u8 = 0;
+    var peers = [_]Peer{.{ .id = "n2", .address = "" }};
+    var raft = try RaftElection.init(allocator, "n1", &peers, .{
+        .snapshot_threshold_entries = 3,
+        .snapshotter = SnapshotterProbe.snapshot,
+        .snapshotter_ctx = &marker,
+    }, &transport);
+    defer raft.deinit();
+    raft.state = .leader;
+    raft.current_term = 1;
+
+    for (0..6) |i| {
+        var buf: [16]u8 = undefined;
+        _ = try raft.appendEntry(try std.fmt.bufPrint(&buf, "cmd-{d}", .{i}));
+    }
+    // Nothing committed (the peer rejects everything): the tick must not fold
+    // uncommitted entries into a snapshot.
+    try testing.expectEqual(@as(u64, 0), raft.getCommitIndex());
+    try raft.tick();
+    try testing.expectEqual(@as(u64, 0), raft.last_included_index);
+    try testing.expectEqual(@as(usize, 6), raft.logLen());
+    try testing.expect(raft.snapshot_data == null);
+    try testing.expectEqual(@as(usize, 0), SnapshotterProbe.calls);
+
+    // Commit through 4: the next tick snapshots exactly the committed prefix.
+    const peer_key = raft.peers.items[0].id;
+    try raft.match_index.put(peer_key, 4);
+    raft.advanceCommitIndex();
+    try testing.expectEqual(@as(u64, 4), raft.getCommitIndex());
+
+    try raft.tick();
+    try testing.expectEqual(@as(usize, 1), SnapshotterProbe.calls);
+    try testing.expectEqual(@as(u64, 4), SnapshotterProbe.seen_up_to);
+    try testing.expect(SnapshotterProbe.seen_ctx == @as(?*anyopaque, &marker));
+    try testing.expectEqual(@as(u64, 4), raft.last_included_index);
+    try testing.expectEqual(@as(usize, 2), raft.logLen());
+    try testing.expectEqualStrings("app-snapshot@4", raft.snapshot_data.?);
+    try testing.expectEqualStrings("cmd-4", raft.getLogEntry(5).?.command);
+}
+
+test "RaftElection compactLog refuses an uncommitted or out-of-range boundary" {
+    const allocator = testing.allocator;
+
+    var impl = TestTransportVTable{
+        .sendVoteRequest = noopVoteRequest,
+        .sendAppendEntries = rejectAppendEntries,
+        .sendInstallSnapshot = noopInstallSnapshot,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
+
+    // Two nodes, the peer never acks: commit_index stays 0, so compaction must
+    // refuse — folding uncommitted entries into a snapshot is exactly what
+    // Raft §7 forbids.
+    var peers = [_]Peer{.{ .id = "n2", .address = "" }};
+    var raft = try RaftElection.init(allocator, "n1", &peers, .{}, &transport);
+    defer raft.deinit();
+    raft.state = .leader;
+    raft.current_term = 1;
+    for (0..4) |i| {
+        var buf: [16]u8 = undefined;
+        _ = try raft.appendEntry(try std.fmt.bufPrint(&buf, "cmd-{d}", .{i}));
+    }
+    try testing.expectEqual(@as(u64, 0), raft.getCommitIndex());
+    try testing.expectError(error.NotCommitted, raft.compactLog(3, "x"));
+    try testing.expectEqual(@as(usize, 4), raft.logLen());
+    try testing.expectEqual(@as(u64, 0), raft.last_included_index);
+    try testing.expect(raft.snapshot_data == null);
+
+    // One node: everything commits, so a boundary *inside* the log compacts…
+    var solo = try RaftElection.init(allocator, "solo", &.{}, .{}, &transport);
+    defer solo.deinit();
+    solo.state = .leader;
+    solo.current_term = 1;
+    _ = try solo.appendEntry("a");
+    _ = try solo.appendEntry("b");
+    _ = try solo.appendEntry("c");
+    try testing.expectEqual(@as(u64, 3), solo.getCommitIndex());
+    // …but a boundary past the committed tail is still an uncommitted boundary
+    // (commit_index ≤ the tail always, so "past the tail" and "past the
+    // committed prefix" are the same refusal here).
+    try testing.expectError(error.NotCommitted, solo.compactLog(9, "x"));
+    try testing.expectEqual(@as(usize, 3), solo.logLen());
+    try solo.compactLog(2, "ok");
+    try testing.expectEqual(@as(u64, 2), solo.last_included_index);
+    try testing.expectEqual(@as(usize, 1), solo.logLen());
+    // Re-compacting at or below the boundary is a no-op, not an error.
+    try solo.compactLog(2, "ignored");
+    try testing.expectEqualStrings("ok", solo.snapshot_data.?);
+}
+
 /// Shape of `RaftElection.ElectionTransport`, restated at file scope so the
 /// tests below can build transports out of named helper functions.
 const TestTransportVTable = struct {
     sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
     sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse,
+    sendInstallSnapshot: *const fn (?[]const u8, []const u8, InstallSnapshotRequest) InstallSnapshotResponse,
 };
 
 fn noopVoteRequest(_: ?[]const u8, _: []const u8, _: VoteRequest) void {}
+
+/// The snapshot half of the test transports below: records nothing, answers
+/// "lost message" (`term = 0` reads as a dropped frame to the leader's
+/// bookkeeping). Tests that exercise the §7 sender use their own capture.
+fn noopInstallSnapshot(_: ?[]const u8, _: []const u8, _: InstallSnapshotRequest) InstallSnapshotResponse {
+    return .{ .term = 0 };
+}
 
 /// Records what a peer was handed, and accepts it.
 const AppendEntriesCapture = struct {
@@ -2267,6 +3308,7 @@ test "RaftElection single-node cluster elects itself on the first tick" {
     var impl = TestTransportVTable{
         .sendVoteRequest = noopVoteRequest,
         .sendAppendEntries = AppendEntriesCapture.accept,
+        .sendInstallSnapshot = noopInstallSnapshot,
     };
     const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
 
@@ -2334,6 +3376,7 @@ test "RaftElection caps each replication round at max_append_entries" {
     var impl = TestTransportVTable{
         .sendVoteRequest = noopVoteRequest,
         .sendAppendEntries = AppendEntriesCapture.accept,
+        .sendInstallSnapshot = noopInstallSnapshot,
     };
     const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
 
@@ -2486,6 +3529,7 @@ test "a follower that acknowledged only part of a batch rewinds the leader to wh
     var impl = TestTransportVTable{
         .sendVoteRequest = noopVoteRequest,
         .sendAppendEntries = PartialAppendAck.accept,
+        .sendInstallSnapshot = noopInstallSnapshot,
     };
     const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
 
@@ -2526,6 +3570,7 @@ test "RaftElection becomeLeader reinitializes per-peer next_index and match_inde
     var impl = TestTransportVTable{
         .sendVoteRequest = noopVoteRequest,
         .sendAppendEntries = higherTermAppendEntries,
+        .sendInstallSnapshot = noopInstallSnapshot,
     };
     const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
 
@@ -2586,6 +3631,7 @@ test "RaftElection degenerate election timeout window still schedules an electio
     var impl = TestTransportVTable{
         .sendVoteRequest = noopVoteRequest,
         .sendAppendEntries = AppendEntriesCapture.accept,
+        .sendInstallSnapshot = noopInstallSnapshot,
     };
     const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
 
@@ -2781,6 +3827,7 @@ test "RaftElection: a tick and an inbound RPC cannot both free voted_for" {
     var impl = TestTransportVTable{
         .sendVoteRequest = noopVoteRequest,
         .sendAppendEntries = AppendEntriesCapture.accept,
+        .sendInstallSnapshot = noopInstallSnapshot,
     };
     const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
 
@@ -3045,6 +4092,7 @@ const MembershipTestTransport = struct {
     const vtable: RaftElection.ElectionTransport = &.{
         .sendVoteRequest = vote,
         .sendAppendEntries = append,
+        .sendInstallSnapshot = noopInstallSnapshot,
     };
 };
 

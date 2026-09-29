@@ -278,6 +278,10 @@ const mac_bytes = 32;
 const VoteRequest = @typeInfo(@TypeOf(RaftWire.encodeVoteRequest)).@"fn".param_types[2].?;
 const AppendEntriesRequest = @typeInfo(@TypeOf(RaftWire.encodeAppendEntries)).@"fn".param_types[2].?;
 const AppendEntriesResponse = @typeInfo(@typeInfo(@TypeOf(RaftWire.decodeAppendEntriesResponse)).@"fn".return_type.?).error_union.payload;
+// §7 frames exist on both sides of the mixed-version gate (v0.32.0 already
+// shipped the codec — what it lacked was the leader-side *sender*).
+const InstallSnapshotRequest = @typeInfo(@TypeOf(RaftWire.encodeInstallSnapshot)).@"fn".param_types[2].?;
+const InstallSnapshotResponse = @typeInfo(@typeInfo(@TypeOf(RaftWire.decodeInstallSnapshotResponse)).@"fn".return_type.?).error_union.payload;
 
 fn sendAllNoSig(io: std.Io, stream: std.Io.net.Stream, bytes: []const u8) !void {
     // `send(MSG_NOSIGNAL)`, not `writev`: answering a peer that already closed
@@ -373,11 +377,17 @@ const HarnessTransport = struct {
     vtable: VTable = .{
         .sendVoteRequest = thunkVoteRequest,
         .sendAppendEntries = thunkSendAppendEntries,
+        .sendInstallSnapshot = thunkSendInstallSnapshot,
     },
 
     const VTable = struct {
         sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
         sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse,
+        /// Read only by new builds: an old build's `ElectionTransport` is the
+        /// two-field shape and never calls it (and never compacts — the
+        /// threshold defaults to 0 on both sides), so the trailing field is
+        /// inert on the v0.32.0 side of the gate.
+        sendInstallSnapshot: *const fn (?[]const u8, []const u8, InstallSnapshotRequest) InstallSnapshotResponse,
     };
 
     var bound: ?*HarnessTransport = null;
@@ -470,6 +480,39 @@ const HarnessTransport = struct {
     fn thunkSendAppendEntries(peer_id: ?[]const u8, address: []const u8, req: AppendEntriesRequest) AppendEntriesResponse {
         const self = bound orelse return .{ .term = 0, .success = false, .match_index = 0 };
         return self.sendAppendEntries(peer_id, address, req);
+    }
+
+    /// The §7 mirror of `sendAppendEntries`: synchronous, same-connection reply,
+    /// every failure mode the "lost message" answer (`term = 0`). The harness
+    /// never compacts (threshold 0 on both builds), so this is the contract
+    /// shape, not a path a run is expected to take.
+    fn sendInstallSnapshot(self: *HarnessTransport, peer_id: ?[]const u8, address: []const u8, req: InstallSnapshotRequest) InstallSnapshotResponse {
+        const lost: InstallSnapshotResponse = .{ .term = 0 };
+        const ep = self.resolve(peer_id, address) orelse return lost;
+
+        var frame = std.ArrayList(u8).empty;
+        defer frame.deinit(self.allocator);
+        RaftWire.encodeInstallSnapshot(&frame, self.allocator, req) catch return lost;
+
+        const addr = std.Io.net.IpAddress.parse(ep.host, ep.port) catch return lost;
+        const stream = addr.connect(self.io, .{ .mode = .stream }) catch return lost;
+        defer stream.close(self.io);
+        setSockTimeoutMs(stream.socket.handle, std.posix.SO.SNDTIMEO, self.rpc_timeout_ms);
+        setSockTimeoutMs(stream.socket.handle, std.posix.SO.RCVTIMEO, self.rpc_timeout_ms);
+        writeFrameAuth(self.io, stream, self.secret, frame.items) catch return lost;
+
+        const reply = recvFrameAlloc(self.allocator, stream) catch return lost;
+        defer self.allocator.free(reply);
+        const body = if (self.secret) |key| verifyFrameMac(key, reply) orelse {
+            note("PEER_REPLY_REFUSED peer={s}", .{peer_id orelse ep.host});
+            return lost;
+        } else reply;
+        return RaftWire.decodeInstallSnapshotResponse(body) catch lost;
+    }
+
+    fn thunkSendInstallSnapshot(peer_id: ?[]const u8, address: []const u8, req: InstallSnapshotRequest) InstallSnapshotResponse {
+        const self = bound orelse return .{ .term = 0 };
+        return self.sendInstallSnapshot(peer_id, address, req);
     }
 };
 

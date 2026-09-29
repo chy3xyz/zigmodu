@@ -1,14 +1,15 @@
 //! Real Raft transport — the layer `docs/DISTRIBUTED.md`「真选主要什么」describes.
 //!
 //! `RaftElection` owns the algorithm and only calls out through
-//! `ElectionTransport` (two bare function pointers). This file is the
+//! `ElectionTransport` (three bare function pointers). This file is the
 //! implementation the framework used to leave to the app:
 //!
 //! - **outbound** — `TransportImpl(N).send*` encodes an RPC, dials the peer and
 //!   writes one frame. `sendVoteRequest` is fire-and-forget (a failed dial is a
-//!   *dropped message* — Raft re-sends); `sendAppendEntries` is synchronous and
-//!   reads the reply from the same connection, answering
-//!   `AppendEntriesResponse{ .success = false }` when the message is lost.
+//!   *dropped message* — Raft re-sends); `sendAppendEntries` and
+//!   `sendInstallSnapshot` are synchronous and read the reply from the same
+//!   connection, answering `AppendEntriesResponse{ .success = false }` /
+//!   `InstallSnapshotResponse{ .term = 0 }` when the message is lost.
 //! - **inbound** — `handleConnection` reads one frame, dispatches it into
 //!   `RaftElection.handleVoteRequest` / `handleAppendEntries` /
 //!   `handleVoteResponse` / `handleInstallSnapshot`, and writes the reply back
@@ -674,7 +675,7 @@ pub fn TransportImpl(comptime slot: usize) type {
         /// The local node: responses arriving inbound are fed into it.
         raft: *RaftElection,
         addresses: AddressBook,
-        vtable: VTable = .{ .sendVoteRequest = thunkVoteRequest, .sendAppendEntries = thunkAppendEntries },
+        vtable: VTable = .{ .sendVoteRequest = thunkVoteRequest, .sendAppendEntries = thunkAppendEntries, .sendInstallSnapshot = thunkInstallSnapshot },
 
         /// `ElectionConfig.rpc_timeout_ms`, read from the raft at send time.
         ///
@@ -693,6 +694,7 @@ pub fn TransportImpl(comptime slot: usize) type {
         pub const VTable = struct {
             sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
             sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse,
+            sendInstallSnapshot: *const fn (?[]const u8, []const u8, InstallSnapshotRequest) InstallSnapshotResponse,
         };
 
         /// The impl the thunks dispatch to.
@@ -809,6 +811,46 @@ pub fn TransportImpl(comptime slot: usize) type {
         fn thunkAppendEntries(peer_id: ?[]const u8, address: []const u8, req: AppendEntriesRequest) AppendEntriesResponse {
             const self = bound orelse return .{ .term = 0, .success = false, .match_index = 0 };
             return self.sendAppendEntries(peer_id, address, req);
+        }
+
+        /// Synchronous, the §7 mirror of `sendAppendEntries`: the follower
+        /// answers on the same connection, and every failure mode (no address,
+        /// dial, write, read, decode) is the same "lost message" answer —
+        /// `term = 0` is below any live term, so the leader treats it as a
+        /// dropped frame and retries next round. Never a panic.
+        pub fn sendInstallSnapshot(self: *Self, peer_id: ?[]const u8, address: []const u8, req: InstallSnapshotRequest) InstallSnapshotResponse {
+            const lost = InstallSnapshotResponse{ .term = 0 };
+            const ep = self.resolve(peer_id, address) orelse return lost;
+
+            var frame = std.ArrayList(u8).empty;
+            defer frame.deinit(self.allocator);
+            encodeInstallSnapshot(&frame, self.allocator, req) catch |err| {
+                log.debug("[raft] encoding InstallSnapshot failed ({})", .{err});
+                return lost;
+            };
+
+            var conn = dialTo(self.allocator, self.io, ep, self.rpcTimeoutMs()) catch return lost;
+            defer conn.deinit();
+            sockread.setSendTimeout(conn.stream, self.rpcTimeoutMs());
+            writeFrameAuth(self.raft.config.cluster_secret, &conn, frame.items) catch return lost;
+
+            // Same bounded reply wait as `sendAppendEntries` — a snapshot can be
+            // the largest frame a peer ever gets, so a WAN should raise
+            // `rpc_timeout_ms` for both ends rather than rely on the default.
+            sockread.setRecvTimeout(conn.stream, self.rpcTimeoutMs());
+
+            var reply = std.ArrayList(u8).empty;
+            defer reply.deinit(self.allocator);
+            const bytes = readFrameAuth(self.raft.config.cluster_secret, &conn, &reply) catch |err| {
+                log.debug("[raft] no snapshot reply from {s}:{d} within {d}ms, or the peer closed ({}) — message dropped", .{ ep.host, ep.port, self.rpcTimeoutMs(), err });
+                return lost;
+            };
+            return decodeInstallSnapshotResponse(bytes) catch lost;
+        }
+
+        fn thunkInstallSnapshot(peer_id: ?[]const u8, address: []const u8, req: InstallSnapshotRequest) InstallSnapshotResponse {
+            const self = bound orelse return .{ .term = 0 };
+            return self.sendInstallSnapshot(peer_id, address, req);
         }
     };
 }
@@ -933,8 +975,10 @@ pub fn handleConnection(raft: *RaftElection, addresses: ?*const AddressBook, con
             raft.handleVoteResponse(decoded.resp, decoded.responder_id) catch |err| return logDrop(err);
             return; // no reply: the candidate asked, this is the answer
         },
-        // Nothing in `RaftElection` consumes these yet (the leader reads its
-        // AppendEntries reply on the synchronous path).
+        // Nothing consumes these **inbound**: the leader reads its AppendEntries
+        // / InstallSnapshot reply synchronously on the connection it opened
+        // (`TransportImpl.sendAppendEntries` / `sendInstallSnapshot`), so a
+        // response frame arriving here would be a stray — drop it, keep serving.
         .append_entries_response, .install_snapshot_response => return,
     }
 
@@ -1883,6 +1927,133 @@ test "real loopback catch-up: empty-log follower converges via per-peer nextInde
     const before = a_raft.next_index.get("node-b").?;
     try a_raft.tick();
     try testing.expectEqual(before, a_raft.next_index.get("node-b").?);
+}
+
+test "real loopback snapshot catch-up: a follower that fell into the snapshot converges via InstallSnapshot" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    if (!@import("../../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var a_impl: ElectionTransportImpl = undefined;
+    var b_impl: TransportImpl(1) = undefined;
+    var c_impl: TransportImpl(2) = undefined;
+    var a_raft: RaftElection = undefined;
+    var b_raft: RaftElection = undefined;
+    var c_raft: RaftElection = undefined;
+    var b_inbound: InboundServer = undefined;
+    var b_thread: std.Thread = undefined;
+    var c_inbound: InboundServer = undefined;
+    var c_thread: std.Thread = undefined;
+
+    var impls_up: u8 = 0;
+    var rafts_up: u8 = 0;
+    var servers_up: u8 = 0;
+    defer {
+        if (impls_up >= 3) c_impl.deinit();
+        if (impls_up >= 2) a_impl.deinit();
+        if (impls_up >= 1) b_impl.deinit();
+    }
+    defer {
+        if (rafts_up >= 3) c_raft.deinit();
+        if (rafts_up >= 2) a_raft.deinit();
+        if (rafts_up >= 1) b_raft.deinit();
+    }
+    defer if (servers_up >= 2) stopInbound(io, &c_inbound, &c_thread);
+    defer if (servers_up >= 1) stopInbound(io, &b_inbound, &b_thread);
+
+    // b serves from the start; c stays unreachable until after the compaction,
+    // which is what strands it behind the snapshot boundary.
+    b_impl.init(allocator, io, &b_raft);
+    impls_up = 1;
+    const b_port = try startInbound(allocator, io, &b_raft, &b_impl.addresses, 19720, &b_inbound, &b_thread);
+    servers_up = 1;
+    const b_endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{b_port});
+    defer allocator.free(b_endpoint);
+
+    a_impl.init(allocator, io, &a_raft);
+    impls_up = 2;
+    try a_impl.addresses.addEndpoint("node-b", b_endpoint);
+
+    c_impl.init(allocator, io, &c_raft);
+    impls_up = 3;
+
+    // Every node names every member: the follower-side check refuses RPCs from
+    // unknown senders (docs/dev/cluster-auth-design.md §4.1).
+    var b_peers = [_]Peer{ .{ .id = "node-a", .address = "" }, .{ .id = "node-c", .address = "" } };
+    b_raft = try RaftElection.init(allocator, "node-b", &b_peers, .{}, &b_impl.transport());
+    rafts_up = 1;
+    var c_peers = [_]Peer{ .{ .id = "node-a", .address = "" }, .{ .id = "node-b", .address = "" } };
+    c_raft = try RaftElection.init(allocator, "node-c", &c_peers, .{}, &c_impl.transport());
+    rafts_up = 2;
+    var a_peers = [_]Peer{ .{ .id = "node-b", .address = "" }, .{ .id = "node-c", .address = "" } };
+    a_raft = try RaftElection.init(allocator, "node-a", &a_peers, .{}, &a_impl.transport());
+    rafts_up = 3;
+
+    // node-a leads term 1 with four entries; node-c's endpoint is not in the
+    // address book yet, so the early rounds drop its frames as lost messages
+    // and back its next_index down to 1.
+    a_raft.state = .leader;
+    a_raft.current_term = 1;
+    a_raft.config.heartbeat_interval_ms = 0;
+    for (0..4) |i| {
+        var buf: [16]u8 = undefined;
+        _ = try a_raft.appendEntry(try std.fmt.bufPrint(&buf, "cmd-{d}", .{i}));
+    }
+    var ticks: usize = 0;
+    while (ticks < 12 and (b_raft.logLen() < 4 or a_raft.getCommitIndex() < 4)) : (ticks += 1) {
+        try a_raft.tick();
+    }
+    try testing.expectEqual(@as(usize, 4), b_raft.logLen());
+    try testing.expectEqual(@as(u64, 4), a_raft.getCommitIndex()); // quorum: a + b
+
+    // Compact the committed prefix, then grow past it. A follower whose
+    // next_index is at/below 3 can no longer be fed AppendEntries — §7.
+    try a_raft.compactLog(3, "snap-payload");
+    _ = try a_raft.appendEntry("cmd-4");
+    _ = try a_raft.appendEntry("cmd-5");
+    try testing.expectEqual(@as(usize, 3), a_raft.logLen()); // live: 4, 5, 6
+
+    // node-c joins the network now, one snapshot and three entries behind.
+    const c_port = try startInbound(allocator, io, &c_raft, &c_impl.addresses, 19760, &c_inbound, &c_thread);
+    servers_up = 2;
+    const c_endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{c_port});
+    defer allocator.free(c_endpoint);
+    try a_impl.addresses.addEndpoint("node-c", c_endpoint);
+
+    // Bounded rounds: the snapshot branch fires for c (next_index 1 <= the
+    // boundary 3), then AppendEntries resumes at boundary + 1 until c holds
+    // the live tail and the commit that covers it. Each round is synchronous,
+    // so this converges deterministically. The loop condition reads only
+    // locked accessors; the fields below are read after the last synchronous
+    // round-trip, which orders them after the inbound thread's writes.
+    ticks = 0;
+    while (ticks < 40 and
+        (c_raft.logLen() < 3 or c_raft.getCommitIndex() < 6)) : (ticks += 1)
+    {
+        try a_raft.tick();
+    }
+
+    // The snapshot landed verbatim…
+    try testing.expectEqual(@as(u64, 3), c_raft.last_included_index);
+    try testing.expectEqual(@as(u64, 1), c_raft.last_included_term);
+    try testing.expectEqualStrings("snap-payload", c_raft.snapshot_data.?);
+
+    // …and the live tail replicated on top of it, in absolute coordinates.
+    try testing.expectEqual(@as(usize, 3), c_raft.logLen());
+    var i: u64 = 4;
+    while (i <= 6) : (i += 1) {
+        const ldr = a_raft.getLogEntry(i).?;
+        const fwr = c_raft.getLogEntry(i).?;
+        try testing.expectEqual(ldr.term, fwr.term);
+        try testing.expectEqual(ldr.index, fwr.index);
+        try testing.expectEqualStrings(ldr.command, fwr.command);
+    }
+    try testing.expectEqual(@as(u64, 6), a_raft.getCommitIndex());
+    try testing.expectEqual(@as(u64, 6), c_raft.getCommitIndex());
+
+    // Leader bookkeeping: c resumed just past the snapshot and ended caught up.
+    try testing.expectEqual(@as(?u64, 7), a_raft.next_index.get("node-c"));
+    try testing.expectEqual(@as(?u64, 6), a_raft.match_index.get("node-c"));
 }
 
 /// Frames the black-hole peer below actually read. The handler now gets its

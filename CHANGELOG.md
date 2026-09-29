@@ -1,5 +1,65 @@
 # Changelog
 
+## [Unreleased]
+
+### 第 107 批：Raft 日志压缩（§7 InstallSnapshot）从"类型在、生产零调用"补成可用闭环（**破坏性：否**）
+
+1. **offset 修正（本批的地基）**：压缩后 `log` 只存 `last_included_index` 之后的活条目，绝对 index
+   `i` 位于 `log.items[i - last_included_index - 1]`，`log.items.len` 是条数不是末 index。全文件踩点
+   （`appendEntry` / `handleVoteRequest` 日志完整性 / `handleAppendEntries` 的 prev 检查·冲突截断·
+   追加·commit 更新 / `advanceCommitIndex` / `startElection` / `becomeLeader` / `sendAppendEntries`
+   的 start·prev_log·next_index 回退 / `getLogEntry`）统一收进三个私有 helper（`lastLogIndex` /
+   `lastLogTerm` / `termAt`）。`handleAppendEntries` 的 prev 检查按 §7 分三支：prev 在边界**上** →
+   对 `last_included_term`（不符拒绝但**不截断**——快照是已提交历史）；边界**内** → 隐式匹配
+   （该区域已提交，leader completeness 保证一致），批次内被覆盖条目跳过；边界**外** → 活条目比对、
+   冲突照常截断（截不到快照里）。批次新增连续性校验（`entry.index == prev_log_index + 1 + i`，
+   违反即 `error.InvalidLogIndex`，在任何日志变异之前拒绝）。
+2. **leader 侧发快照**：`ElectionTransport` 新增第三个方法 `sendInstallSnapshot`（**带默认值**
+   `lostInstallSnapshot`——`{ .term = 0 }` 的"丢消息"语义，匿名字面量初始化源码兼容）。复制轮次里
+   `next_index[peer] <= last_included_index` 时改走 `sendSnapshotToPeer`：按 `snapshot_chunk_bytes`
+   （默认 16 KiB；wire 是 u16 长度前缀，clamp 65535）分帧、应答同步消费（与 `sendAppendEntries`
+   同连接同模型）；成功后 `match_index[peer] = boundary`、`next_index[peer] = boundary + 1`，
+   下一轮回到 AppendEntries；term 更大的应答当场退 follower。异步传输的应答走公共入口
+   `handleInstallSnapshotResponse(resp, from_peer, last_included_index)`——boundary 与当前不符的是
+   陈旧应答，只有 term 半步生效。`RaftTransport` 的 VTable / 出站（同步 dial+收发）/ 入站分发同步
+   接线（`install_snapshot_response` 入站保持丢弃：发送方已同步读过）。
+3. **自动阈值 + snapshotter hook**：`ElectionConfig.snapshot_threshold_entries`（**默认 0 = 关**，
+   存量集群行为不变），leader `tick()` 心跳之后检查、触发时压缩到 `commit_index` 为止——
+   **永不折叠未提交条目**（`compactLog` 对 `up_to_index > commit_index` 返 `error.NotCommitted`）；
+   hook/OOM 错误只记 `std.log.err`，不打断心跳循环。`ElectionConfig.snapshotter`
+   （`Snapshotter = *const fn (ctx, up_to_index, allocator) anyerror![]u8`，锁内调用、保持轻量，
+   返回切片归 raft 释放）缺省时存**占位摘要**字节
+   （`zigmodu-raft-snapshot:v1:last_included_index=…:last_included_term=…:compacted_entries=…`）——
+   框架没有应用状态机，从这些字节恢复不了应用状态；要真快照的应用供 hook 产字节、在 follower 侧
+   消费 `snapshot_data`。`BootstrapConfig` 同名四项透传。
+4. **follower 侧组装**：分帧按 `(last_included_index, last_included_term)` 归属同一次传输，`offset`
+   必须落在已组装长度上（错位丢弃等重传，幂等），`done` 帧才应用；应用时按 §7 原文**保留延续快照的
+   日志后缀**（边界条目存在且 term 一致 → 只丢被覆盖的前缀；否则全清）；`commit_index` /
+   `last_applied` 取 `@max` 推进；收到快照即 leader 联系（重置选举 deadline + 更新 `leader_id`，
+   原来只搬 term 就清日志、选举时钟与 `getLeader()` 全留旧值）。
+5. **顺手修掉的真 bug**：`handleAppendEntries` 的 `leader_id` 更新原来**无别名守卫**地 free——
+   `becomeLeader` 分配失败回落会让 `leader_id` 别名 `local_id`，free 后 `local_id` 悬垂、`deinit`
+   双 free；已加与 `deinit` / `becomeLeader` 同款的 `l.ptr != self.local_id.ptr` 守卫。
+6. **测试**（`RaftElection.zig` 新增 9 条 + `RaftTransport.zig` 新增 1 条真 loopback）：压缩后
+   append/复制在绝对坐标上继续；边界 prev 三分支（错 term 拒绝不截断）；落后进快照的 follower 先收
+   InstallSnapshot 再在边界续 AppendEntries；快照应答的推进/陈旧/退位/未知 peer；chunk 分帧组装 +
+   后缀保留 + 错位丢弃 + term 不符全清；阈值自动触发且 commit 前不压；hook 供字节并见到
+   ctx/up_to；`compactLog` 拒绝未提交/越界边界。loopback 用例三节点真 TCP：c 缺席期间 a 压缩 +
+   追加，c 起网后经快照收敛到绝对坐标（`snapshot_data` 逐字节一致、日志 [4,5,6] 对齐、commit 6、
+   `next_index[c] = 7`）。**两条 off-by-one 变异验过红**：send 侧 `start - 1` → `start`（
+   "compaction rebases" 红：expected 4, found 3）；follower 侧 entry 循环 `pos` 换算 +1（
+   "skips covered entries" 红：expected 5, found 6）。
+7. **验证**：`zig build fmt-check` / `zig build check`（含 check-production）/ `check-version.sh` 绿；
+   全量 `zig build test`（force-run，真跑非缓存）：`-Ddb=sqlite` 2238/2299（61 skip 均为 live-DB
+   门控）、`-Ddb=all` 2239/2299（60 skip）；`zig build soak-cluster`（18 条链路 2400/2400）与
+   `scripts/ci-mixed-version.sh`（同版本选主 + v0.32.0 混合对跑）不回归。
+8. **文档**：`docs/DISTRIBUTED.md` 新增「日志压缩（§7 InstallSnapshot）」小节（坐标约定 / 阈值 /
+   hook 与占位语义 / chunk 分帧 / 应答口径 / 已知坑——出站 IO 在 `RaftLock` 内的既有债不扩大也不
+   收窄），传输契约表与锁入口清单同步；`docs/dev/v1.0-readiness-v0.35.md` §七 加 A-4 跟进注记
+   （判定保留复核时点原样）。
+9. **不在本批范围**：follower 侧主动压缩（非 leader 触发）；「出站 IO 与锁」收窄（DISTRIBUTED.md
+   已载的既定设计，未落地）。
+
 ## [0.37.1] - 2026-09-29
 
 ### 第 106 批：`-Ddb=none` 下全套件挂死的隐患 —— `notify.zig` 的 webhook 测试（**破坏性：否**）

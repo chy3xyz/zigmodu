@@ -223,6 +223,8 @@ const bus_keys = [node_count][32]u8{
 const VoteRequest = @typeInfo(@TypeOf(RaftWire.encodeVoteRequest)).@"fn".param_types[2].?;
 const AppendEntriesRequest = @typeInfo(@TypeOf(RaftWire.encodeAppendEntries)).@"fn".param_types[2].?;
 const AppendEntriesResponse = @typeInfo(@typeInfo(@TypeOf(RaftWire.decodeAppendEntriesResponse)).@"fn".return_type.?).error_union.payload;
+const InstallSnapshotRequest = @typeInfo(@TypeOf(RaftWire.encodeInstallSnapshot)).@"fn".param_types[2].?;
+const InstallSnapshotResponse = @typeInfo(@typeInfo(@TypeOf(RaftWire.decodeInstallSnapshotResponse)).@"fn".return_type.?).error_union.payload;
 
 // ── thresholds (environment overrides) ──────────────────────────────────────
 
@@ -489,11 +491,13 @@ fn SoakTransport(comptime slot: usize) type {
         vtable: VTable = .{
             .sendVoteRequest = thunkVoteRequest,
             .sendAppendEntries = thunkSendAppendEntries,
+            .sendInstallSnapshot = thunkSendInstallSnapshot,
         },
 
         const VTable = struct {
             sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
             sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse,
+            sendInstallSnapshot: *const fn (?[]const u8, []const u8, InstallSnapshotRequest) InstallSnapshotResponse,
         };
 
         fn init(
@@ -596,6 +600,37 @@ fn SoakTransport(comptime slot: usize) type {
         fn thunkSendAppendEntries(peer_id: ?[]const u8, address: []const u8, req: AppendEntriesRequest) AppendEntriesResponse {
             const self: *Self = @ptrCast(@alignCast(bound orelse return .{ .term = 0, .success = false, .match_index = 0 }));
             return self.sendAppendEntries(peer_id, address, req);
+        }
+
+        /// The §7 mirror of `sendAppendEntries` — synchronous, same-connection
+        /// reply, every failure mode the same "lost message" answer
+        /// (`term = 0`). The soak never compacts (threshold is 0 by default), so
+        /// this exists for the vtable contract, not because a snapshot is
+        /// expected.
+        fn sendInstallSnapshot(self: *Self, peer_id: ?[]const u8, address: []const u8, req: InstallSnapshotRequest) InstallSnapshotResponse {
+            const lost: InstallSnapshotResponse = .{ .term = 0 };
+            const ep = self.resolve(peer_id, address) orelse return lost;
+
+            var frame = std.ArrayList(u8).empty;
+            defer frame.deinit(self.allocator);
+            RaftWire.encodeInstallSnapshot(&frame, self.allocator, req) catch return lost;
+
+            const addr = std.Io.net.IpAddress.parse(ep.host, ep.port) catch return lost;
+            const stream = addr.connect(io, .{ .mode = .stream }) catch return lost;
+            defer stream.close(io);
+            setSockTimeoutMs(stream.socket.handle, std.posix.SO.SNDTIMEO, self.rpc_timeout_ms);
+            setSockTimeoutMs(stream.socket.handle, std.posix.SO.RCVTIMEO, self.rpc_timeout_ms);
+            writeSignedFrame(stream, self.secret, frame.items) catch return lost;
+
+            const reply = recvFrameAlloc(self.allocator, stream) catch return lost;
+            defer self.allocator.free(reply);
+            const body = verifyFrameMac(self.secret, reply) orelse return lost;
+            return RaftWire.decodeInstallSnapshotResponse(body) catch lost;
+        }
+
+        fn thunkSendInstallSnapshot(peer_id: ?[]const u8, address: []const u8, req: InstallSnapshotRequest) InstallSnapshotResponse {
+            const self: *Self = @ptrCast(@alignCast(bound orelse return .{ .term = 0 }));
+            return self.sendInstallSnapshot(peer_id, address, req);
         }
     };
 }
