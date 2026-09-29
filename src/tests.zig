@@ -71,7 +71,7 @@ test "compile all source files" {
     _ = @import("core/cluster/RaftTransport.zig");
     _ = @import("core/cluster/PeerDiscovery.zig");
     _ = @import("core/cluster/ClusterMessage.zig");
-    _ = @import("core/cluster/TlsTransport.zig");
+    _ = @import("core/cluster/ClusterAuth.zig");
     _ = @import("core/cluster/ClusterMetrics.zig");
     _ = @import("core/cluster/ClusterBootstrap.zig");
     _ = @import("core/cluster/ClusterHealth.zig");

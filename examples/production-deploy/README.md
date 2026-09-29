@@ -64,5 +64,10 @@ curl -sk  https://localhost:8443/metrics | head  # Prometheus 文本
 - 证书轮换、CRL/OCSP、H2 ALPN 协商、加密套件策略属于运维面，边车有成熟实现。
 - sidecar 拓扑可整体替换（nginx/envoy/云 LB），不影响应用代码。
 
+**集群面（Raft / 事件总线端口）同理**：集群帧是明文 + 逐帧 HMAC-SHA256（认证/完整性，
+**不是加密**）。集群端口只放受信二层（VPC/专线/localhost）；跨域/公网用边车或网格
+终结 mTLS，边车与节点同主机/同 Pod。权威定界见 `docs/DISTRIBUTED.md`「传输加密边界
+（A-2 定界）」。
+
 后续若确实需要"单二进制自带 TLS"，属于路线图级别的新增（见
 `docs/PRODUCTION_ROADMAP.md`「单进程单点与原位隔离」同类决策记录）。

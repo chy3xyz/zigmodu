@@ -23,7 +23,7 @@ grep -rn 'docs/dev/' --include='*.zig' --include='*.sh' --include='*.md' . | gre
 | 文件 | 首次入库 | 什么 | 引用者 |
 |------|----------|------|--------|
 | `cluster-identity-design.md` | 09-21 | 总线节点身份绑定 —— **已实现**；密钥轮换/撤销（A-3）**已实现**（第 110 批） | `src/core/DistributedEventBus.zig`、`docs/DISTRIBUTED.md` |
-| `cluster-auth-design.md` | 09-20 | 集群入站认证 —— **L1/L2 已实现**；Raft 侧身份绑定（A-1）**已实现**（第 109 批）；密钥轮换/撤销（A-3）**已实现**（第 110 批） | `src/core/cluster/{RaftElection,RaftTransport,ClusterBootstrap,DistributedIntegrationTest}.zig`、`src/core/DistributedEventBus.zig`、`docs/DISTRIBUTED.md`、`docs/UPGRADING.md` |
+| `cluster-auth-design.md` | 09-20 | 集群入站认证 —— **L1/L2 已实现**；Raft 侧身份绑定（A-1）**已实现**（第 109 批）；密钥轮换/撤销（A-3）**已实现**（第 110 批）；传输加密（A-2）**已定界**（第 111 批：明文+HMAC 是显式决策，框架不内嵌 TLS，机密性交部署拓扑） | `src/core/cluster/{RaftElection,RaftTransport,ClusterAuth,ClusterBootstrap,DistributedIntegrationTest}.zig`、`src/core/DistributedEventBus.zig`、`docs/DISTRIBUTED.md`、`docs/UPGRADING.md` |
 | `alpha-engine-spec.md` | 09-17 | alpha-engine 规格（todo3 §十六 的参考实现） | `examples/alpha-engine/**`（7 处）、`CHANGELOG.md` |
 | `READING_NUMBERS.md` | 09-20 | 读数约定：一个事实一个名字 | `scripts/test-fast.sh`、`scripts/check-bench.sh`、`docs/UPGRADING.md`、`CHANGELOG.md` |
 | `todo3.md` | 09-17 | 运行时**方向** | `docs/RUNTIME.md`（:5 与 :531） |
@@ -74,7 +74,9 @@ v0.31.0 通用 / 集群·Raft 帧解码 / WebSocket 帧解析·握手。
 
 **设计文档两份并列**（状态不同，互不取代）：
 `cluster-identity-design.md` 已实现 · `cluster-auth-design.md` L1/L2 + A-1 均已实现；
-A-3（密钥轮换/撤销）第 110 批在两者之上落地，见 `docs/DISTRIBUTED.md`「密钥轮换与撤销」。
+A-3（密钥轮换/撤销）第 110 批在两者之上落地，见 `docs/DISTRIBUTED.md`「密钥轮换与撤销」；
+A-2（传输加密）第 111 批**定界**（不内嵌 TLS，机密性交受信二层/边车/网格），见
+`docs/DISTRIBUTED.md`「传输加密边界（A-2 定界）」。
 
 ## 4. 建议动作
 

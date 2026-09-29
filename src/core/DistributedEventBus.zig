@@ -11,7 +11,7 @@ const DLQConfig = @import("eventbus/DLQ.zig").DLQConfig;
 const RequeuedMessage = @import("eventbus/DLQ.zig").RequeuedMessage;
 const Partitioner = @import("eventbus/Partitioner.zig").ConsistentHashPartitioner;
 const NetworkTransport = @import("cluster/NetworkTransport.zig");
-const ClusterAuth = @import("cluster/TlsTransport.zig").ClusterAuth;
+const ClusterAuth = @import("cluster/ClusterAuth.zig").ClusterAuth;
 
 // ── Wire format for peer traffic (both directions) ──────────────────────────
 //

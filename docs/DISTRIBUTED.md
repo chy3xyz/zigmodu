@@ -153,6 +153,53 @@ per-node key 的运行时运维钩子。**源真相仍是 SecretsManager**（框
 **不在范围**：kid 帧内协商、控制面自动下发、轮换状态持久化（进程重启后 key 表以来源
 SecretsManager/启动配置为准）——都不做，见 `docs/dev/v1.0-readiness-v0.35.md` §七 A-3 注记。
 
+## 传输加密边界（A-2 定界）
+
+**现状一句话**：集群两面（Raft 端口、分布式事件总线）都是**明文 TCP + 逐帧
+HMAC-SHA256**。HMAC 给的是**认证 + 完整性**，不是机密性。本节把这个边界写成权威决策
+——认证 helpers 所在文件曾以 TLS 命名（里面没有任何 TLS transport），第 111 批已改名
+`core/cluster/ClusterAuth.zig` 并删除全仓零消费者的 `TlsConfig`，免得"框架有加密"的误读
+再从文件名里长出来。
+
+**这套认证挡什么、不挡什么**：
+
+| 挡（已关闭的攻击面） | 机制 |
+|---|---|
+| 注入 / 伪造帧 | 逐帧 HMAC-SHA256，无 key 者签名不过 |
+| 冒充节点（A-1） | 总线挑战-应答握手绑定身份；Raft 身份钉在每帧自述 id（MAC 覆盖内） |
+| 重放 | 总线 seq 窗口；Raft term/index 单调 + 幂等拒旧 |
+| key 泄露后的处置（A-3） | 运行时轮换（双 key 窗）/ 撤销（总线断连、Raft fail-closed） |
+
+**不挡：能读流量的人。** 被动嗅探者看到的是 Raft 日志条目与事件载荷的**明文**。
+HMAC 不改变载荷的可读性 —— 这是设计如此，不是疏漏。
+
+**为什么不内嵌 TLS**：① 零依赖铁律 —— 加密只用 `std.crypto`，引入 TLS 库即破；
+② Zig std 至今没有 server-side TLS（`std.crypto.tls` 只有 client 侧）；③ 自研 TLS
+栈是安全禁区，不做。**std 若日后长出 server-side TLS，本条可重开**（届时也只走
+std，不引第三方）。
+
+**生产拓扑答案**：集群端口只允许出现在**受信二层**（VPC 内网 / 专线 / localhost
+loopback）；跨域、跨云、过公网的集群面流量必须走**边车或服务网格终结 mTLS**：
+
+```
+【同 VPC / 专线 / 同主机】—— 允许直连
+  node A ──────── 明文+HMAC ──────── node B
+
+【跨域 / 公网】—— 必须边车/网格
+  node A ──localhost── sidecar A ═══ mTLS ═══ sidecar B ──localhost── node B
+        └ 明文+HMAC 只存在于节点与同机边车之间；线上走的每一段都是 mTLS ┘
+```
+
+最后一跳（边车 → 节点本体）仍是明文+HMAC，所以边车必须与节点**同主机/同 Pod**
+（localhost 或 Pod 内网），那一段不在任何网络上。同一哲学在 HTTP 入口面的决策记录与
+拓扑参考见 `examples/production-deploy/`（TLS 一律边车终结，后端明文/h2c）。
+
+**fail-closed 门的准确含义**：`ClusterBootstrap.start()` 的 `ClusterAuthRequired` 门
+保证的是**认证**（多节点无凭证拒绝启动），**不保证机密性** —— 过了门，帧照样明文。
+`.allow_unauthenticated_cluster = true` 是显式承认裸奔（既无认证也无机密性，仅限 dev）；
+但"过了门" ≠ "已加密"。机密性只有上面两种拓扑答案，监控/审计/合规口径不要把
+"集群认证已开"读成"集群流量已加密"。
+
 ## 读侧怎么被喂（membership → view → 请求路径）
 
 `ClusterView` 是**读侧**：引用计数快照 + rendezvous 选点，请求路径读它、不读 membership 的哈希表。

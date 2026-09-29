@@ -1,27 +1,19 @@
-//! TLS-secured transport wrapper for cluster communication.
+//! PSK authentication helpers for cluster ports — the `ClusterAuth` used by
+//! `RaftTransport.zig` and `DistributedEventBus.zig`.
 //!
-//! Provides encryption and optional mutual TLS for node-to-node messaging.
-//! Uses Zig 0.16 std.crypto.tls.Client for TLS 1.3 connections.
+//! 集群两面（Raft 端口 / 分布式事件总线）的帧认证原语：HMAC-SHA256 签名（hex 与 raw
+//! 两种形态）、常数时间比较。线格式 `[len][tag][payload][mac]` 的 mac 由这里的
+//! 原语产生与核验（帧形状的拼装/剥离归 `RaftTransport.zig` 与总线各自所有）。
 //!
-//! NOTE: Full mTLS requires server-side TLS which is not yet in Zig 0.16 stdlib.
-//! For production, use a sidecar TLS proxy (nginx/envoy) or the Zig TLS client
-//! with pre-shared keys for node authentication.
+//! 机密性边界（A-2 定界，第 111 批）：本文件给的是**认证 + 完整性**，不是加密 ——
+//! 帧体仍是明文，被动嗅探者能读到 Raft 日志条目与事件载荷。框架**不内嵌 TLS**：
+//! 零依赖铁律（加密只用 `std.crypto`）加上 Zig std 没有 server-side TLS，而自研
+//! TLS 栈是安全禁区。生产部署把集群端口限制在受信二层（VPC/专线/localhost），
+//! 跨域/公网用边车或服务网格终结 mTLS —— 权威说明与最小拓扑见
+//! `docs/DISTRIBUTED.md`「传输加密边界（A-2 定界）」。std 若日后长出 server-side
+//! TLS，该节写明了重开条件。
 
 const std = @import("std");
-
-/// TLS configuration for cluster transport.
-pub const TlsConfig = struct {
-    /// Path to CA certificate for server verification
-    ca_cert_path: ?[]const u8 = null,
-    /// Path to client certificate for mTLS
-    client_cert_path: ?[]const u8 = null,
-    /// Path to client private key
-    client_key_path: ?[]const u8 = null,
-    /// Expected server hostname (SNI)
-    server_name: ?[]const u8 = null,
-    /// Skip certificate verification (DEV ONLY)
-    insecure_skip_verify: bool = false,
-};
 
 /// Wraps cluster messages with PSK-based node authentication.
 /// Each node has a pre-shared key that's included in message headers.

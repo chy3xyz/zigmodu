@@ -5,7 +5,10 @@
 > A-1（Raft 侧 per-node 身份绑定）已实现：帧内自述 id + `peer_keys[自述id]` 验签，
 > 见 `RaftTransport.zig` 文件头 §A-1 与 `docs/DISTRIBUTED.md`「Raft 端口：per-node 身份」；
 > A-3（密钥轮换/撤销）已由第 110 批实现：两面运行时 API + 双 key 验收窗，
-> 见 `docs/DISTRIBUTED.md`「密钥轮换与撤销」。**
+> 见 `docs/DISTRIBUTED.md`「密钥轮换与撤销」；
+> A-2（传输加密）已由第 111 批**定界**：明文 + HMAC 是显式决策，框架不内嵌 TLS
+> （零依赖 + std 无 server-side TLS），机密性交部署拓扑（受信二层/边车/网格），
+> 见 `docs/DISTRIBUTED.md`「传输加密边界（A-2 定界）」。**
 > 来源是 `docs/dev/security-audit-cluster.md` 的第 3 条高危，
 > 以及本次评估中对 `handleVoteRequest` / `handleAppendEntries` 的复核。
 > 所有事实都带 `文件:行`；推测的地方显式标注"未验证"。
@@ -18,7 +21,7 @@
 > **A-1 已由第 109 批关闭**：Raft 是短连接请求-响应，握手+长连接的模板不适用，身份改为钉在
 > 每一帧上（自述 id 在 MAC 覆盖内，验签用 `peer_keys[自述id]`）。
 
-当时：**TCP 可达即集群成员**：`TlsTransport.ClusterAuth`（HMAC-PSK）定义在案、有单测，
+当时：**TCP 可达即集群成员**：`ClusterAuth`（HMAC-PSK）定义在案、有单测，
 但**全仓库零调用点**，连"打开它"的入口都不存在。要用 HS256 把每个入站帧按
 `[len][tag][payload][mac32]` 验一遍，并在 `ClusterBootstrap.start()` 上按既有
 `allow_stub_raft_transport` 的同一种"拒绝 + 显式承认"惯用法做 fail-closed。
@@ -82,7 +85,7 @@
 
 ### 3.2 `ClusterAuth` 需要补什么
 
-现有 `ClusterAuth`（`TlsTransport.zig:28-75`）够用但缺两件：
+现有 `ClusterAuth`（`core/cluster/ClusterAuth.zig`，行号是当时快照）够用但缺两件：
 
 1. **`sign` 返回的是 hex（64 字节，`:48-59`）**，帧里要的是 **raw 32 字节**。
    加一个 `mac(self, payload) ![32]u8`（直接 `HmacSha256.create` 到 `[32]u8`），
@@ -203,7 +206,8 @@ if (self.config.transport != null and self.config.raft_cluster_size > 1
 **未验证**：`DistributedEventBus` 与新节点混跑时，总线侧是否也需要独立处理跨版本 —— 实现时确认。
 
 **不做加密**：MAC 给的是**完整性 + 身份**，不是**机密性**。帧仍然明文。要机密性得走
-TLS/边车（`TlsTransport.zig:1-8` 的文件头已经写明 mTLS 目前要边车）。这是另一件事，本设计**不声称**覆盖它。
+TLS/边车（当时该文件头已写明 mTLS 目前要边车；**A-2 已由第 111 批定界**，权威说明见
+`docs/DISTRIBUTED.md`「传输加密边界（A-2 定界）」）。这是另一件事，本设计**不声称**覆盖它。
 
 ---
 
@@ -230,7 +234,7 @@ TLS/边车（`TlsTransport.zig:1-8` 的文件头已经写明 mTLS 目前要边�
 | 7 | 单节点（`raft_cluster_size = 1`）无 secret | 正常启动 | — |
 
 > #5 是**当前就会红**的一条：它在改之前先失败，正是 L2 的存在理由。
-> 另：`ClusterAuth` 的两个既有单测（`TlsTransport.zig:77-108`）用
+> 另：`ClusterAuth` 的两个既有单测（`core/cluster/ClusterAuth.zig`，行号是当时快照）用
 > `@intFromPtr` 种 `DefaultCsprng`（`:80-86`）—— 那是**测试种子、不是安全边界**，
 > 但既然 `AGENTS.md` 刚把"`@intFromPtr` 不是熵源"写进 DO/DON'T，顺手改成固定字面量更干净。
 
@@ -335,7 +339,7 @@ TLS/边车（`TlsTransport.zig:1-8` 的文件头已经写明 mTLS 目前要边�
 
 | 文件 | 改动 |
 |---|---|
-| `TlsTransport.zig` | 新增 `ClusterAuth.mac()` —— 返回**原始 32 字节** HMAC（`sign` 返回的 64 字节 hex 是给人和 JSON 用的，不能直接上线）；`timingSafeEql` 改为 `pub` 以便复用 |
+| `core/cluster/ClusterAuth.zig`（当时文件名不同，第 111 批改名） | 新增 `ClusterAuth.mac()` —— 返回**原始 32 字节** HMAC（`sign` 返回的 64 字节 hex 是给人和 JSON 用的，不能直接上线）；`timingSafeEql` 改为 `pub` 以便复用 |
 | `RaftTransport.zig` | 帧形状 `[len][tag][payload][mac32]`；`sendSigned` / `verifiedRecv` / `writeFrameAuth` / `readFrameAuth`；入站验签在**任何 decoder 之前**完成并剥离，所以 6 个 `decode*` 一字未改 |
 | `RaftElection.zig` | `ElectionConfig.cluster_secret: ?[32]u8 = null` |
 | `ClusterBootstrap.zig` | `BootstrapConfig.cluster_secret` + `allow_unauthenticated_cluster`；门禁紧邻 `allow_stub_raft_transport` 那块，返回 `error.ClusterAuthRequired` |

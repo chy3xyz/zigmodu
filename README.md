@@ -201,14 +201,21 @@ A feature list is the least useful half of a README. These boundaries decide dep
 
 - **Cluster upgrades are a hard cut.** The Raft frame format and the bus handshake changed, and an old
   and a new binary do not understand each other in either direction — deliberately, so that there is no
-  "degrade to unauthenticated" path. A mixed-version rolling upgrade has **never been run**; it is the
-  first item in the [readiness assessment](docs/dev/v1.0-readiness-v0.35.md).
-- **No encryption on the wire.** Cluster frames are plaintext today; production uses a TLS-terminating
-  sidecar ([examples/production-deploy](examples/production-deploy/)). `src/core/cluster/TlsTransport.zig`
-  exists and has no callers.
-- **Cluster identity: per-node on the bus, shared-PSK on Raft.** Holding the Raft `cluster_secret` lets
-  one node impersonate another; the bus got per-node credentials and a challenge-response handshake,
-  Raft did not (yet). No rotation, no revocation.
+  "degrade to unauthenticated" path. Mixed-version interop is still unsupported, but the refusal is now
+  gated: `scripts/ci-mixed-version.sh` (nightly CI) runs a v0.32.0 node against the current tree and
+  asserts the new side rejects its bare frames and keeps a working quorum.
+- **No encryption on the wire.** Cluster frames are plaintext + per-frame HMAC-SHA256
+  (authentication and integrity, **not confidentiality**). Keep cluster ports on trusted L2
+  (VPC / leased line / localhost); across trust boundaries terminate mTLS in a sidecar or
+  service mesh — the boundary is defined in the "Transport encryption boundary (A-2)" section
+  of [docs/DISTRIBUTED.md](docs/DISTRIBUTED.md), with topology references in
+  [examples/production-deploy](examples/production-deploy/). The PSK auth helpers live in
+  `src/core/cluster/ClusterAuth.zig`.
+- **Cluster identity is opt-in per-node, not the default.** With `own_key`/`peer_keys` configured,
+  only the holder of node X's key can appear as X — on the bus via the challenge-response handshake,
+  on the Raft port via the self-declared id inside every frame's MAC coverage — and both planes take
+  runtime rotation (dual-key windows) and revocation. A `cluster_secret`-only setup keeps the legacy
+  behavior byte-for-byte: frames are authenticated, but any holder of the PSK can claim any node id.
 - **`ws_uring` is Linux-only** (io_uring); other platforms take the portable path.
 - **⚠️ marks experimental modules** — Saga, SecurityScanner, DistributedEventBus, ClusterMembership,
   2PC, Plugin, WebMonitor, HotReloader. They have tests; they do not have a production track record here.

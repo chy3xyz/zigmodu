@@ -5,11 +5,15 @@
 >
 > **本文写于审计当时。第 1、2 条已在 v0.32.0 修复，并且"实际爆炸形状"已由编译+运行实测取代推测 ——
 > 第 5 节是唯一的现状口径，下面 1.1 / 1.2 的推测部分按第 5 节读。**
+>
+> 修订注（第 111 批）：本文引用的 `ClusterAuth` 所在文件已改名 `src/core/cluster/ClusterAuth.zig`；
+> 正文残留的旧路径与行号均为审计时点快照，结论不受影响（第 3 条"零认证"此后已由
+> L1/L2 + A-1 关闭，见 `cluster-auth-design.md` 头部状态行）。
 
 
 1. **高危、可远程单人触发**：`RaftElection.handleAppendEntries` 用对端给的 `entry.index` 直接算 `items[entry.index - 1]`，**`entry.index == 0` 时 `-1` 无符号下溢** —— 一个 56 字节、无需认证的 TCP 帧就能打死/越界读节点(`RaftElection.zig:442-443`)。**【v0.32.0 已修，实测形状见第 5 节】**
 2. **高危可用性**：入站 accept 环在同一条线程上**内联**处理连接(`NetworkTransport.zig:88`)，而 `handleConnection` 的 `recv` **没有 `setRecvTimeout`**（全仓库只有出站侧设了）——一个只发 4 字节长度前缀就挂住的连接，能停掉整个节点的 Raft 入站；连 `ClusterBootstrap.stop()` 都会卡死在 `thread.join()`。**【v0.32.0 已修；吞吐那一半仍未改】**
-3. **高危结构**：这条线上**零认证**——`TlsTransport.ClusterAuth`(HMAC-PSK) 全仓库无任何调用点；于是 TCP 可达即"是集群成员"，可代任意（非成员的）候选人投票、冒充 leader 灌日志。**【未修】**
+3. **高危结构**：这条线上**零认证**——`ClusterAuth`(HMAC-PSK) 全仓库无任何调用点；于是 TCP 可达即"是集群成员"，可代任意（非成员的）候选人投票、冒充 leader 灌日志。**【未修】**
 
 ---
 
@@ -61,9 +65,9 @@ try sockread.readFull(self.stream, buf.items[0..msg_len]);      // 无超时：�
 - **冒充 leader 灌日志**：`handleAppendEntries`(391-473) 不校验 `leader_id`。任意对端可 append 任意 command，并把 `leader_commit` 推到日志尾 → 本节点把这些当成已提交。
 - **抹掉本节点日志**：`prev_log_index=0`（跳检）+ 一条 `index=1, term=≠现term` 的 entry → 走 `truncateLog(0)`(431/446) → **整份日志被清空**（含已提交项）。
 
-证据：`ClusterAuth`（HMAC-PSK 验证器，`TlsTransport.zig:28-75`）**没有任何调用点**：
+证据：`ClusterAuth`（HMAC-PSK 验证器，文件第 111 批改名 `core/cluster/ClusterAuth.zig`，行号为审计时点快照）**没有任何调用点**：
 ```
-$ grep -rn "ClusterAuth|pre_shared" src/ examples/   → 只命中 TlsTransport.zig 自身与其测试、以及 src/tests.zig:73 的 _ = @import
+$ grep -rn "ClusterAuth|pre_shared" src/ examples/   → 只命中该文件自身与其测试、以及 src/tests.zig 的 _ = @import（路径为审计时点快照）
 ```
 框架自己的测试就是证据：`ClusterBootstrap.zig:549` 的用例用一条裸 TCP 连接、`candidate_id="peer-node"`（不在 peers 里）换到了 `vote_granted == true`。
 **前置条件**：TCP 可达集群端口。**这是网络暴露问题**：端口绑 `0.0.0.0`，文档（`docs/DISTRIBUTED.md`）只说"对端发来的投票/复制消息"，没有写任何信任边界或"必须放内网/防火墙"的运维前提。
@@ -104,7 +108,7 @@ self.leader_id = try self.allocator.dupe(u8, req.leader_id);  // dupe 失败 →
 
 ## 4. 我读了什么 / 我没读什么
 
-**逐行读了**：`sockread.zig`(全) · `NetworkTransport.zig`(全) · `RaftTransport.zig`(全 1281 行，含测试) · `ClusterMessage.zig`(全) · `TlsTransport.zig`(全) · `RaftElection.zig` 第 80-920 行（全部 `handle*` + 状态访问器 + 私有 helper）与 1600-1640 · `ClusterBootstrap.zig` 40-320、380-620 · `ClusterMembership.zig` 200-320（gossip 解析）· `DistributedEventBus.zig` 120-270、434-441。
+**逐行读了**：`sockread.zig`(全) · `NetworkTransport.zig`(全) · `RaftTransport.zig`(全 1281 行，含测试) · `ClusterMessage.zig`(全) · `ClusterAuth.zig`(全；审计时点文件名不同，第 111 批改名) · `RaftElection.zig` 第 80-920 行（全部 `handle*` + 状态访问器 + 私有 helper）与 1600-1640 · `ClusterBootstrap.zig` 40-320、380-620 · `ClusterMembership.zig` 200-320（gossip 解析）· `DistributedEventBus.zig` 120-270、434-441。
 
 **只做了 grep 级检查（未逐行读，因此"没找到"≠"安全"）**：`LoadBalancer.zig`、`PeerDiscovery.zig`、`FailureDetector.zig` —— 在它们里 grep `recv|readFull|readSome|readInt|@intCast|@truncate|fromJson|resize|alloc(` 只命中 `LoadBalancer.zig:52` 一行本地时间取模（无对端字节解码）；`PeerDiscovery.zig:57` 只解析**本进程配置**里的 `host:port`。**结论：这三个文件不接触对端字节，但我没有通读它们的逻辑。**
 

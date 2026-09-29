@@ -2,6 +2,56 @@
 
 ## [Unreleased]
 
+### 第 111 批：A-2 定界 —— 集群面明文/TLS 边界收口（删死代码 + 认证 helpers 文件改名归位；**破坏性：否**）
+
+1. **批次性质**：这是**定界批**，不是加密实现批。v0.35 判定表 A-2 行（"无加密（帧明文）"）
+   的收口方式是把"集群面明文"从缺陷改写为**显式决策 + 权威文档**，并消灭冒充安全特性的
+   死代码与误导性文件名。框架内嵌 TLS / mTLS **不做**（不在范围，见第 6 条）。
+2. **删死代码**：`TlsConfig`（CA/client 证书路径、SNI、`insecure_skip_verify`）全仓
+   **零消费者**（复核：`grep TlsConfig` 只命中定义处与 v0.35 判定表对它的点名）—— 连
+   struct 带注释删除。类型留在原地只会让读者以为"集群有 TLS 开关"。
+3. **文件改名归位**：`src/core/cluster/TlsTransport.zig` → `src/core/cluster/ClusterAuth.zig`
+   （`git mv`，历史保留）。一个叫 TLS transport 的文件里没有任何 TLS transport，正是误导
+   本身；活物只有 `ClusterAuth`（HMAC-SHA256 helpers，消费者是 `RaftTransport.zig` 与
+   `DistributedEventBus.zig`，外加 `src/tests.zig` 的编译注册与文件内 3 条单测）。机械替换
+   3 处 import；文件头重写为"集群端口 PSK 认证 helpers + 机密性边界一句话 + 为什么不内嵌
+   TLS"，指向 `docs/DISTRIBUTED.md` 新节。改名只动仓库内部路径（该文件不经 `root.zig`
+   导出），对下游**无破坏性**；行为零变化。
+4. **权威文档**：`docs/DISTRIBUTED.md` 新增「传输加密边界（A-2 定界）」节（置于「密钥轮换
+   与撤销」之后）：现状（明文 TCP + 逐帧 HMAC-SHA256；总线挑战-应答握手绑身份 + seq 防重放；
+   Raft term/index 单调 + 幂等拒旧）、威胁定界表（HMAC 挡注入/伪造/冒充/重放，**不挡被动
+   嗅探** —— 帧体明文可读）、不内嵌 TLS 的三条理由（零依赖铁律 / Zig std 无 server-side TLS /
+   自研 TLS 禁区；std 长出后可重开）、生产拓扑答案（集群端口只放受信二层 VPC/专线/localhost；
+   跨域/公网必须边车或服务网格终结 mTLS，边车与节点同主机/同 Pod；含最小拓扑图）、
+   `ClusterAuthRequired` 门的准确含义（**保证认证、不保证机密性**；
+   `.allow_unauthenticated_cluster = true` 是显式承认裸奔）。
+5. **文档同步**：`docs/dev/v1.0-readiness-v0.35.md` §七 加 A-2 跟进注（判定表不回改，仅把
+   A-2 行里已死的路径引用改为改名注记）；`docs/dev/cluster-auth-design.md` 头部状态行补 A-2 +
+   5 处旧文件名提法修订；`docs/dev/README.md` 状态表与落地行补 A-2；`README.md` /
+   `README.zh.md`「线上不加密」条改写为新口径（顺带修掉"`src/core/cluster/TlsTransport.zig`
+   存在但没有调用方"这条双失真陈述：文件已改名，且 `ClusterAuth` 早有调用方）；`examples/production-deploy/README.md` 补集群面一段（与 HTTP 入口面同一边车
+   哲学）。历史快照文档（`security-audit-cluster.md` / `todo3.md` / `v1.0-readiness-v0.32.md`）
+   只修订旧文件名引用并加修订注，结论不动。收尾 `grep -rn TlsTransport`：受跟踪内容只剩
+   CHANGELOG 历史条目（3 行）。
+6. **不在范围**：内嵌 TLS / mTLS **不做** —— 零依赖铁律（加密只用 `std.crypto`）+ Zig std
+   无 server-side TLS + 自研 TLS 栈是安全禁区；std 若日后长出 server-side TLS，新节写明了
+   重开条件。机密性本身仍是部署拓扑的责任（受信二层或边车/网格）。
+7. **测试**：无新增、无删除（删的是零消费者死代码，改名是纯机械替换；`ClusterAuth` 既有
+   3 条单测原位保留并全部通过）。门禁读数：`zig build fmt-check` ✓ · `zig build check`
+   （check-production）✓ · `scripts/check-deadcode.sh` ✓（27 在 baseline 内）·
+   `bash scripts/check-version.sh` ✓ · 全量 `zig build test`（`-Ddb=all`）✓ +
+   `bash scripts/test-fast.sh --db all --force-run` **2253/2314 通过、61 skip、0 fail**
+   （与第 110 批 2254/60 相比：通过 -1、skip +1，差额是黑洞拨号测试的 ARP 负缓存环境门控
+   跳过 —— 第 109 批记录的既有 flake 守卫，非本批回归）· `zig build soak-cluster` ✓
+   （18 条 delivery 全部 2400/2400）· `bash scripts/ci-mixed-version.sh` ✓（同版本三节点
+   唯一选主；混合对跑新侧拒旧节点、两节点照常选主）·
+   `zig build -Ddb=none -Dtarget=x86_64-windows` ✓。
+8. **顺手收掉的 README 双 stale（本批验收抓到）**：README.md / README.zh.md 的「集群身份」条
+   仍写"Raft 是共享 PSK、无轮换无撤销"（与 A-1/A-3 现状矛盾），「集群升级」条仍写"混合版本
+   从未跑过"（与 B-11 的 `ci-mixed-version.sh` + 夜间 CI 矛盾）—— 两条均改写为现状口径
+   （混合版本仍不支持但拒绝行为已门禁化；per-node 身份是可选配置而非默认，只配
+   `cluster_secret` 逐字节保持旧行为）。英文版遵守 DocSnippets 英文守卫（不引用中文节名）。
+
 ### 第 110 批：A-3 落地 —— 集群两面运行时密钥轮换/撤销 + 双 key 无分区轮换窗（**破坏性：否**）
 
 1. **范围与威胁模型**：per-node 凭证（A-1，第 109 批）落地后的运维面 —— key 泄露要撤、定期要换，

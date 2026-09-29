@@ -80,9 +80,9 @@ comptime 轨道类型、手写队列、热路径上的分配是被**测试钉住
 
 ## 🚧 它不是什么（采用前先定价）
 
-- **集群升级是硬切**：Raft 帧格式与总线握手都变过，新旧二进制**两个方向都听不懂**（刻意如此，不留"降级到不认证"的路）。混合版本滚动升级**从未跑过** —— 这是[就绪度评估](docs/dev/v1.0-readiness-v0.35.md)里排在第一位的那条。
-- **线上不加密**：集群帧目前是明文，生产用边车终结 TLS（[examples/production-deploy](examples/production-deploy/)）；`src/core/cluster/TlsTransport.zig` 存在但**没有调用方**。
-- **集群身份：总线是按节点，Raft 是共享 PSK**：拿到 Raft 的 `cluster_secret` 就能冒充任意节点；总线已经换成每节点凭证 + 挑战应答。没有轮换、没有撤销。
+- **集群升级是硬切**：Raft 帧格式与总线握手都变过，新旧二进制**两个方向都听不懂**（刻意如此，不留"降级到不认证"的路）。混合版本互联仍不支持，但拒绝行为已门禁化：`scripts/ci-mixed-version.sh`（夜间 CI）拿 v0.32.0 节点对跑当前树，断言新侧拒掉旧节点的裸帧且保住可用 quorum。
+- **线上不加密**：集群帧是明文 + 逐帧 HMAC-SHA256（认证/完整性，**不是机密性**）；集群端口只放受信二层（VPC/专线/localhost），跨域走边车/网格终结 mTLS —— 定界见 [docs/DISTRIBUTED.md](docs/DISTRIBUTED.md)「传输加密边界（A-2 定界）」，拓扑参考 [examples/production-deploy](examples/production-deploy/)；PSK 认证 helpers 在 `src/core/cluster/ClusterAuth.zig`。
+- **集群身份是可选配置，不是默认**：配上 `own_key`/`peer_keys` 后，只有持有节点 X 的 key 才能以 X 的身份出现 —— 总线靠挑战-应答握手绑定，Raft 端口靠每帧自述 id 落在 MAC 覆盖内 —— 且两面都支持运行时轮换（双 key 窗口）与撤销。只配 `cluster_secret` 则逐字节保持旧行为：帧有认证，但任何持 PSK 者都能自称任何节点。
 - **`ws_uring` 只在 Linux 生效**（io_uring）；其它平台走可移植路径。
 - **⚠️ 标的是 experimental 模块**：Saga、SecurityScanner、DistributedEventBus、ClusterMembership、2PC、Plugin、WebMonitor、HotReloader。有测试，但在这里没有生产记录。
 - **AI 是可选的领域，不是核心**：`src/ai` 只占一小部分，HTTP / 数据 / 安全 / 可观测核心不依赖它；Agent 默认不能动作（[AGENT_RUNTIME.md](docs/AGENT_RUNTIME.md)）。
