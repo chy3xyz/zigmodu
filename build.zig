@@ -444,9 +444,25 @@ pub fn build(b: *std.Build) void {
     // The mixed-version script runs the *installed* binary: the pinned
     // toolchain's build runner drops args after `--`, and three nodes of a
     // cluster must be launched as independent processes anyway.
-    b.installArtifact(cluster_node_exe);
-    const cluster_node_step = b.step("cluster-node", "Build the single-node cluster harness used by scripts/ci-mixed-version.sh (installed as zig-out/bin/cluster-node)");
-    cluster_node_step.dependOn(&b.addInstallArtifact(cluster_node_exe, .{}).step);
+    //
+    // The harness (and the cluster transport beneath it — `src/core/sockread.zig`,
+    // `RaftTransport`'s framed writer) is **POSIX-only by design**: raw
+    // `posix.read` / `send(MSG_NOSIGNAL)` / `sendmsg`, none of which exist in
+    // the Windows compile branches (that code predates the harness and was
+    // never reachable — hence never compiled — on Windows before this artifact
+    // existed; Zig's lazy analysis kept the windows-cross job green). Shipping
+    // the binary in the default install set made the Windows cross-compile job
+    // analyze it and go red, so on Windows the artifact is neither installed
+    // nor given a step: the gate keeps covering exactly what it covered before
+    // batch 105, and a Windows build is not asked to compile code that could
+    // never run there. Making the cluster transport itself Windows-portable is
+    // a separate, larger piece of work — tracked as a documented limitation in
+    // `docs/DISTRIBUTED.md`, not folded into a harness fix.
+    if (target.result.os.tag != .windows) {
+        b.installArtifact(cluster_node_exe);
+        const cluster_node_step = b.step("cluster-node", "Build the single-node cluster harness used by scripts/ci-mixed-version.sh (installed as zig-out/bin/cluster-node; POSIX-only, like the cluster transport it drives)");
+        cluster_node_step.dependOn(&b.addInstallArtifact(cluster_node_exe, .{}).step);
+    }
 
     // Long-horizon runtime harness (`zig build runtime-stress`). Sibling of
     // `soak`, and deliberately not a second one of it: `soak` is HTTP + tenant
@@ -503,7 +519,9 @@ pub fn build(b: *std.Build) void {
     soak_compile_step.dependOn(&soak_tests.step);
     soak_compile_step.dependOn(&soak_cluster_tests.step);
     soak_compile_step.dependOn(&stress_exe.step);
-    soak_compile_step.dependOn(&cluster_node_exe.step);
+    // POSIX-only, same as its install rule above: a Windows-targeted
+    // `soak-compile` must not be asked to analyze it either.
+    if (target.result.os.tag != .windows) soak_compile_step.dependOn(&cluster_node_exe.step);
 
     // The same file, compiled into `zig build test` with a *smoke* budget, so
     // the default suite covers the harness's code path and every check while the

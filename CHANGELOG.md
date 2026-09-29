@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### 第 108 批：Windows 交叉编译腿被 cluster-node 打红 —— harness 按 POSIX-only 边界从该目标排除（**破坏性：否**）
+
+1. **事故经过**：第 105 批把 `cluster-node` 加进默认 install 集，CI 的
+   `Windows cross-compile (-Ddb=none)`（`zig build -Ddb=none -Dtarget=x86_64-windows` 会编译
+   **所有** install 产物）随之分析到 `src/cluster_node.zig` 及其触达的集群传输层
+   （`src/core/sockread.zig`、`RaftTransport` 帧写路径）——这些代码是 **POSIX-only** 存量
+   （raw `posix.read` / `send(MSG.NOSIGNAL)` / `sendmsg` / `msghdr_const`，RaftTransport 里的
+   那份从 v0.23.0 就在），此前从未被任何 Windows 编译单元触达（Zig 惰性分析），于是一夜之间
+   6 个编译错。**105/106 推送时没盯 CI（上一轮该起的 watcher 漏了），红灯从 105 一路挂到
+   107 才被发现** —— 流程教训：批次推送后 watcher 不可省。
+2. **处置**（不是修 Windows 可移植性——那是一个独立的大工作项，且集群传输从未宣称支持
+   Windows）：`build.zig` 里 `cluster-node` 的 `installArtifact` / step / `soak-compile` 依赖
+   全部按 `target.result.os.tag != .windows` 收拢，门禁覆盖面**逐字回到 105 之前**（lib、
+   examples、tools 的 Windows 编译分支照旧被守着）。注释里写明因果，避免下一个人再踩。
+3. **文档**：`docs/DISTRIBUTED.md` 的滚动升级注记旁新增「平台边界」段：集群传输层
+   POSIX-only（Linux/macOS 可用，Windows 不可编译），可移植化不在当前路线图。
+4. **验证**：本机 `zig build -Ddb=none -Dtarget=x86_64-windows` 复红→修复后转绿；
+   host 侧 `zig build cluster-node` 与全量套件不受影响（门禁复跑）。
+
 ### 第 107 批：Raft 日志压缩（§7 InstallSnapshot）从"类型在、生产零调用"补成可用闭环（**破坏性：否**）
 
 1. **offset 修正（本批的地基）**：压缩后 `log` 只存 `last_included_index` 之后的活条目，绝对 index

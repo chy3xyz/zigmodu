@@ -376,6 +376,11 @@ prev 在边界**外**→ 活条目比对，冲突照常截断（截不到快照�
 > 选不了主、进不了 membership。对跑证据与 harness：`src/cluster_node.zig` +
 > `scripts/ci-mixed-version.sh`（同版本三节点选主/复制 + v0.32.0↔master 混合对跑；夜间 CI
 > `soak` job 的 "Mixed-version cluster gate" 步骤，见 `docs/dev/v1.0-readiness-v0.35.md` B-11）。
+>
+> **平台边界**：集群传输层（`src/core/sockread.zig`、`RaftTransport` 帧写路径）
+> 目前是 **POSIX-only**（raw `posix.read` / `send(MSG_NOSIGNAL)` / `sendmsg`）——Linux 与 macOS
+> 可用；Windows 上整个集群面不可编译（CI 的 windows-cross 门禁因此不编译 `cluster-node`，
+> 见 `build.zig` 该 artifact 的注释）。Windows 可移植化是独立工作项，不在当前路线图上。
 
 ### Recommended cluster size: 3-7 nodes
 
