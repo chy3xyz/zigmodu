@@ -252,7 +252,40 @@ pub const ElectionConfig = struct {
     /// When set, every inbound Raft frame must carry a valid HMAC-SHA256 tag and
     /// every outbound one is signed. When null the frames are bare — which is why
     /// `ClusterBootstrap.start()` refuses a multi-node cluster without one.
+    ///
+    /// **A shared key authenticates a frame but binds no identity**: any holder of
+    /// the PSK can sign as any `candidate_id` / `leader_id`. The identity-bound
+    /// path is `own_key` / `peer_keys` below; when either is set it wins over
+    /// this field (falling back to the shared key would re-open exactly the
+    /// impersonation hole per-node mode exists to close).
     cluster_secret: ?[32]u8 = null,
+
+    /// A-1 (docs/dev/cluster-auth-design.md, the Raft half of
+    /// docs/dev/cluster-identity-design.md's bus-side identity binding):
+    /// **this node's own
+    /// credential** — the key every outbound frame is signed with, and the key
+    /// peers must have on record as `peer_keys[this node_id]` to verify them.
+    /// Source it from `security.SecretsManager`; the framework deliberately does
+    /// not read keys for you (the same convention as `cluster_secret`).
+    ///
+    /// Setting this (or any `peer_keys` entry) switches the cluster port to
+    /// per-node identity: a frame is verified against the key of the sender id
+    /// it *claims* (`candidate_id` / `leader_id` / `responder_id` — already in
+    /// every frame, and inside the MAC's coverage), so only the holder of
+    /// node-X's key can appear as X. The mode is fail-closed: a peer with no key
+    /// on record is never dialled and its inbound frames are refused.
+    own_key: ?[32]u8 = null,
+
+    /// A-1: the peers' credentials — `key` is the key **that node** signs with
+    /// (its own `own_key`), `id` is the same namespace as `Peer.id` / `node_id`
+    /// (the `@id` half of `BootstrapConfig.peers`). `RaftElection.init` copies
+    /// the slice and the ids, so the caller's storage may be freed after init.
+    ///
+    /// Response frames carry no sender id; the synchronous RPC paths verify a
+    /// reply against the key of the peer they dialled, which is why a missing
+    /// entry here means "cannot talk to that peer at all", not "talk less
+    /// safely".
+    peer_keys: []const PeerKey = &.{},
 
     /// §7 log compaction, leader-side automatic trigger: once the **live** log
     /// (`log.items.len`, i.e. entries past the snapshot boundary) exceeds this
@@ -303,6 +336,15 @@ pub const RaftState = enum {
 pub const Peer = struct {
     id: []const u8,
     address: []const u8,
+};
+
+/// A-1: one node's credential on the cluster port (`ElectionConfig.peer_keys`).
+/// `id` is the same namespace as `Peer.id` / `node_id`; `key` is the key that
+/// node signs its frames with (its own `own_key`). See `ElectionConfig.own_key`
+/// for the mode this enables.
+pub const PeerKey = struct {
+    id: []const u8,
+    key: [32]u8,
 };
 
 /// Vote request sent to peers
@@ -454,11 +496,27 @@ pub const RaftElection = struct {
             try peers_copy.append(allocator, .{ .id = id_copy, .address = addr_copy });
         }
 
+        // A-1: the peer-key table is read on every inbound frame for the raft's
+        // whole life, so it cannot borrow the caller's config slice — copy the
+        // entries (ids included) and point the kept config at the copy.
+        const peer_keys_copy = try allocator.alloc(PeerKey, config.peer_keys.len);
+        var peer_keys_init: usize = 0;
+        errdefer {
+            for (peer_keys_copy[0..peer_keys_init]) |pk| allocator.free(pk.id);
+            allocator.free(peer_keys_copy);
+        }
+        for (config.peer_keys, 0..) |pk, i| {
+            peer_keys_copy[i] = .{ .id = try allocator.dupe(u8, pk.id), .key = pk.key };
+            peer_keys_init = i + 1;
+        }
+        var config_kept = config;
+        config_kept.peer_keys = peer_keys_copy;
+
         const now_ms = Time.monotonicNowMilliseconds();
 
         return .{
             .allocator = allocator,
-            .config = config,
+            .config = config_kept,
             .log = std.ArrayList(LogEntry).empty,
             .pending_snapshot = std.ArrayList(u8).empty,
             .next_index = std.StringHashMap(u64).init(allocator),
@@ -498,6 +556,9 @@ pub const RaftElection = struct {
             self.allocator.free(peer.address);
         }
         self.peers.deinit(self.allocator);
+        // The A-1 peer-key table: owned by this raft since `init` (see there).
+        for (self.config.peer_keys) |pk| self.allocator.free(pk.id);
+        self.allocator.free(self.config.peer_keys);
         if (self.voted_for) |v| self.allocator.free(v);
         if (self.snapshot_data) |s| self.allocator.free(s);
         // leader_id may alias local_id (from becomeLeader); only free when they differ

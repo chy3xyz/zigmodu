@@ -75,6 +75,40 @@ fail-closed 是**整条路径**的，没有降级口：配了凭证但拨号到�
 重连时多付一次。另有每个 node 一把写锁（`publish` 的请求线程与 `heartbeatLoop` 的 fiber 不会在
 同一个 socket 上交错帧）。完整改动、残留清单与变异证据：`docs/dev/cluster-identity-design.md` §11。
 
+## Raft 端口：per-node 身份（A-1，对齐总线语义）
+
+总线用「挑战-应答握手 + 连接期绑定 id」钉住身份；Raft 端口是**短连接请求-响应**，同一形状会让每条
+RPC 多付一个 RTT，所以这里把身份钉在**每一帧**上：请求/应答帧里本就有自述 id（`candidate_id` /
+`leader_id` / `responder_id`），且在 MAC 覆盖之内 —— 验签改用 `peer_keys[自述id]`，伪造 id 就是
+MAC 不对。线格式不变：`[len][tag][payload][mac]`。
+
+```zig
+var cluster = try ClusterBootstrap.init(allocator, io, .{
+    .node_id = "n1",
+    .port = 9000,
+    .peers = &.{ "n2@10.0.0.2:9001", "n3@10.0.0.3:9002" },
+    .transport = my_transport,
+    // 对称预共享：n1 的 own_key 就是对端 peer_keys["n1"] 里那把。
+    .own_key = key_n1,
+    .peer_keys = &.{ .{ .id = "n2", .key = key_n2 }, .{ .id = "n3", .key = key_n3 } },
+});
+```
+
+- **模式判定**（`RaftTransport.zig` 文件头 §A-1）：`own_key` / `peer_keys` 任一配置 → per-node
+  （**优先于 `cluster_secret`，两者同配时共享钥匙被忽略** —— 回落会重开"任一持钥者冒充任一节点"的
+  洞）；只配 `cluster_secret` → 既有共享路径，**逐字节不变**（它认证帧但不绑身份）；都不配 → 裸帧
+  （dev，多节点仍被 `start()` 的门拦下）。
+- **签名一律自己的 key、验签一律发送方的 key**：入站按帧自述 id 查 `peer_keys`（id 没配 key → 拒，
+  **先于** L2 成员检查；relay 回推前也查 candidate 的 key）；同步 RPC 的应答帧没有 id，按**拨号
+  目标**的 key 验。
+- **fail-closed 没有降级口**：per-node 下本节点没配 `own_key` → 入站连接直接拒、出站丢消息（绝不发
+  裸帧）；对端没配 key → dial **之前**就丢（`TransportImpl.outboundKeys`），Raft 按丢消息重发。
+- **重放**：Raft 不需要总线那样的 seq —— term/index 单调 + AppendEntries/InstallSnapshot 幂等已拒旧
+  （`docs/dev/cluster-auth-design.md` §3.6）；总线要 seq 是因为它没有 term 的等价物。
+- **作用域**：这套 key 只管 **Raft 端口**。总线是另一个监听面、另一套握手机制，仍需自己的
+  `setOwnKey` / `setPeerKey`（`ClusterBootstrap` 只把 `cluster_secret` 传给总线，per-node key 不进
+  总线）。
+
 ## 读侧怎么被喂（membership → view → 请求路径）
 
 `ClusterView` 是**读侧**：引用计数快照 + rendezvous 选点，请求路径读它、不读 membership 的哈希表。
@@ -148,7 +182,8 @@ defer allocator.free(json);               // 挂到 /cluster/health 或 metrics 
    契约在下一节。
 2. **只要 membership + 读侧**：`.allow_stub_raft_transport = true` 显式承认；单节点用 `raft_cluster_size = 1`。
 
-同一条路上还有两道门：多节点 + 真传输但**没有** `cluster_secret` → `error.ClusterAuthRequired`
+同一条路上还有两道门：多节点 + 真传输但**没有任何凭证**（`cluster_secret` 与 per-node
+`own_key`/`peer_keys` 都空 —— 任一组配置都满足这道门）→ `error.ClusterAuthRequired`
 （或显式 `.allow_unauthenticated_cluster = true`）；`.peers` 里有 peer **没写 `@id`** →
 `error.PeerIdRequired`（见下文「peer id 与地址是两份事实」）。
 

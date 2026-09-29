@@ -22,8 +22,9 @@
 //! `scripts/ci-mixed-version.sh` drives both runs; this file is the node it
 //! launches. The source is deliberately **cross-compilable against v0.32.0**:
 //! every post-v0.32.0 API it touches (`BootstrapConfig.cluster_secret`, the bus
-//! credential/handshake surface, `snapshotNodes`, `inbound_idle_timeout_ms`) is
-//! reached through a comptime capability probe (`@hasField` / `@hasDecl`), and
+//! credential/handshake surface, `snapshotNodes`, `inbound_idle_timeout_ms`,
+//! A-1's `BootstrapConfig.own_key` / `peer_keys`) is reached through a comptime
+//! capability probe (`@hasField` / `@hasDecl`), and
 //! the outbound transport signs frames only when the build it is compiled
 //! against has the cluster-auth wire at all — so the same file, copied into a
 //! v0.32.0 tree, produces a node that speaks exactly the v0.32.0 wire (bare
@@ -31,7 +32,7 @@
 //!
 //! ## What it logs (one greppable line per event, stderr, `CN ` prefix)
 //!
-//!   CN BOOT id=… raft=… bus=… auth=on|off|unsupported peers=…
+//!   CN BOOT id=… raft=… bus=… auth=on|off|unsupported raftid=on|off|unsupported peers=…
 //!   CN LISTEN raft=… bus=…
 //!   CN RAFT_STATE node=… state=follower|candidate|leader term=… leader=…|-   (on change)
 //!   CN LEADER_ELECTED id=… term=…                                            (on change, once known)
@@ -87,6 +88,10 @@ const wire_auth = @hasField(BootstrapConfig, "cluster_secret");
 const bus_credentials = @hasDecl(DistributedEventBus, "setOwnKey");
 const bus_snapshot = @hasDecl(DistributedEventBus, "snapshotNodes");
 const bus_idle_knob = @hasField(DistributedEventBus, "inbound_idle_timeout_ms");
+/// A-1 per-node identity on the raft port (`ElectionConfig.own_key` /
+/// `peer_keys`). Same discipline as `wire_auth`: on a v0.32.0 build the argv
+/// flags parse but are reported `raftid=unsupported`, never silently honored.
+const raft_node_keys = @hasField(BootstrapConfig, "own_key");
 
 // ── argv / config (pure parsing — unit-tested below) ─────────────────────────
 
@@ -123,6 +128,13 @@ pub const Config = struct {
     cluster_size: usize = 0, // 0 → derived as raft_count + 1
     secret: ?[32]u8 = null,
     bus_key: ?[32]u8 = null,
+    // A-1 per-node identity (raft port). Version-free shape: parallel arrays,
+    // not the framework's `PeerKey` — that type does not exist on a v0.32.0
+    // build, and `Config` must compile there.
+    own_key: ?[32]u8 = null,
+    peer_key_ids: [max_peers][]const u8 = undefined,
+    peer_key_vals: [max_peers][32]u8 = undefined,
+    peer_key_count: usize = 0,
     tick_ms: u64 = 25,
     mesh_ms: u64 = 2000,
     bus_idle_ms: u32 = 0, // 0 → keep the bus default
@@ -223,6 +235,19 @@ pub fn parseArgs(args: []const []const u8) ParseError!Config {
             cfg.secret = try parseKeyHex(try value(args, &i));
         } else if (std.mem.eql(u8, a, "--bus-key-hex")) {
             cfg.bus_key = try parseKeyHex(try value(args, &i));
+        } else if (std.mem.eql(u8, a, "--own-key-hex")) {
+            cfg.own_key = try parseKeyHex(try value(args, &i));
+        } else if (std.mem.eql(u8, a, "--peer-key-hex")) {
+            // `<id>:<64 hex>` — the id is the raft node id (`--peer-raft`'s
+            // `@`-prefixed half), split at the FIRST `:` so the grammar stays
+            // open if ids ever grow separators of their own.
+            const raw = try value(args, &i);
+            const colon = std.mem.indexOfScalar(u8, raw, ':') orelse return error.BadPeerSpec;
+            if (colon == 0) return error.BadPeerSpec;
+            if (cfg.peer_key_count >= max_peers) return error.TooManyPeers;
+            cfg.peer_key_ids[cfg.peer_key_count] = raw[0..colon];
+            cfg.peer_key_vals[cfg.peer_key_count] = try parseKeyHex(raw[colon + 1 ..]);
+            cfg.peer_key_count += 1;
         } else if (std.mem.eql(u8, a, "--tick-ms")) {
             cfg.tick_ms = @max(try parseU64(try value(args, &i)), 1);
         } else if (std.mem.eql(u8, a, "--mesh-ms")) {
@@ -366,10 +391,22 @@ fn verifyFrameMac(secret: [32]u8, frame: []const u8) ?[]const u8 {
     return frame[0..signed_len];
 }
 
+/// A-1 harness-side key entry: `id` the raft node id, `key` that node's own
+/// key (a symmetric pre-shared-key scheme — the same secret the peer sets as
+/// its `own_key`). Harness-local and version-free, unlike the framework's
+/// `PeerKey`, which a v0.32.0 build does not have.
+const NodeKey = struct { id: []const u8, key: [32]u8 };
+
 const HarnessTransport = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     secret: ?[32]u8, // signing is active only when this build has the auth wire
+    /// A-1: when set (or `peer_keys` non-empty), frames are signed with this
+    /// and replies verified against the dialled peer's entry — the master
+    /// build's per-node mode. Both stay null/empty on a v0.32.0 build, where
+    /// the behaviour is byte-identical to before (`secret` only).
+    own_key: ?[32]u8 = null,
+    peer_keys: []const NodeKey = &.{},
     rpc_timeout_ms: u32,
     peers: []const PeerSpec,
     node_id: []const u8,
@@ -391,6 +428,33 @@ const HarnessTransport = struct {
     };
 
     var bound: ?*HarnessTransport = null;
+
+    /// The two keys one outbound RPC needs — the harness mirror of master's
+    /// `TransportImpl.outboundKeys` (RaftTransport.zig §A-1). Per-node mode
+    /// (`own_key` or any peer key configured): sign with our own key, verify
+    /// the reply against the dialled peer's own key, and refuse **before the
+    /// dial** when either half is missing — no silent downgrade to the bare
+    /// wire. Shared mode is `secret` for both halves; bare is both null.
+    const OutboundKeys = struct { sign: ?[32]u8, verify: ?[32]u8 };
+
+    fn keysFor(self: *HarnessTransport, peer_id: ?[]const u8) ?OutboundKeys {
+        if (self.own_key != null or self.peer_keys.len > 0) {
+            const sign = self.own_key orelse {
+                note("RAFTID_DROP reason=no-own-key", .{});
+                return null;
+            };
+            const id = peer_id orelse {
+                note("RAFTID_DROP reason=no-peer-id", .{});
+                return null;
+            };
+            for (self.peer_keys) |pk| {
+                if (std.mem.eql(u8, pk.id, id)) return .{ .sign = sign, .verify = pk.key };
+            }
+            note("RAFTID_DROP reason=no-peer-key peer={s}", .{id});
+            return null;
+        }
+        return .{ .sign = self.secret, .verify = self.secret };
+    }
 
     fn transport(self: *HarnessTransport) zigmodu.RaftElection.ElectionTransport {
         return @ptrCast(&self.vtable);
@@ -422,6 +486,7 @@ const HarnessTransport = struct {
     }
 
     fn sendVoteRequest(self: *HarnessTransport, peer_id: ?[]const u8, address: []const u8, req: VoteRequest) void {
+        const keys = self.keysFor(peer_id) orelse return; // fail-closed, before the dial
         const ep = self.resolve(peer_id, address) orelse return;
         var frame = std.ArrayList(u8).empty;
         defer frame.deinit(self.allocator);
@@ -439,13 +504,14 @@ const HarnessTransport = struct {
         setSockTimeoutMs(stream.socket.handle, std.posix.SO.SNDTIMEO, self.rpc_timeout_ms);
         // Fire-and-forget: the voter answers on its own initiative (the inbound
         // half relays a granted ballot), so the write is all there is.
-        writeFrameAuth(self.io, stream, self.secret, frame.items) catch |err| {
+        writeFrameAuth(self.io, stream, keys.sign, frame.items) catch |err| {
             note("WIRE_WRITE_FAIL what=vote_request peer={s}:{d} err={s}", .{ ep.host, ep.port, @errorName(err) });
         };
     }
 
     fn sendAppendEntries(self: *HarnessTransport, peer_id: ?[]const u8, address: []const u8, req: AppendEntriesRequest) AppendEntriesResponse {
         const lost: AppendEntriesResponse = .{ .term = 0, .success = false, .match_index = 0 };
+        const keys = self.keysFor(peer_id) orelse return lost; // fail-closed, before the dial
         const ep = self.resolve(peer_id, address) orelse return lost;
 
         var frame = std.ArrayList(u8).empty;
@@ -457,11 +523,11 @@ const HarnessTransport = struct {
         defer stream.close(self.io);
         setSockTimeoutMs(stream.socket.handle, std.posix.SO.SNDTIMEO, self.rpc_timeout_ms);
         setSockTimeoutMs(stream.socket.handle, std.posix.SO.RCVTIMEO, self.rpc_timeout_ms);
-        writeFrameAuth(self.io, stream, self.secret, frame.items) catch return lost;
+        writeFrameAuth(self.io, stream, keys.sign, frame.items) catch return lost;
 
         const reply = recvFrameAlloc(self.allocator, stream) catch return lost;
         defer self.allocator.free(reply);
-        const body = if (self.secret) |key| verifyFrameMac(key, reply) orelse {
+        const body = if (keys.verify) |key| verifyFrameMac(key, reply) orelse {
             // The mixed-version signal this harness exists to make visible: the
             // peer answered, but its frame is not one this build can accept
             // (a v0.32.0 peer signs nothing). The raft treats it as a lost
@@ -488,6 +554,7 @@ const HarnessTransport = struct {
     /// shape, not a path a run is expected to take.
     fn sendInstallSnapshot(self: *HarnessTransport, peer_id: ?[]const u8, address: []const u8, req: InstallSnapshotRequest) InstallSnapshotResponse {
         const lost: InstallSnapshotResponse = .{ .term = 0 };
+        const keys = self.keysFor(peer_id) orelse return lost; // fail-closed, before the dial
         const ep = self.resolve(peer_id, address) orelse return lost;
 
         var frame = std.ArrayList(u8).empty;
@@ -499,11 +566,11 @@ const HarnessTransport = struct {
         defer stream.close(self.io);
         setSockTimeoutMs(stream.socket.handle, std.posix.SO.SNDTIMEO, self.rpc_timeout_ms);
         setSockTimeoutMs(stream.socket.handle, std.posix.SO.RCVTIMEO, self.rpc_timeout_ms);
-        writeFrameAuth(self.io, stream, self.secret, frame.items) catch return lost;
+        writeFrameAuth(self.io, stream, keys.sign, frame.items) catch return lost;
 
         const reply = recvFrameAlloc(self.allocator, stream) catch return lost;
         defer self.allocator.free(reply);
-        const body = if (self.secret) |key| verifyFrameMac(key, reply) orelse {
+        const body = if (keys.verify) |key| verifyFrameMac(key, reply) orelse {
             note("PEER_REPLY_REFUSED peer={s}", .{peer_id orelse ep.host});
             return lost;
         } else reply;
@@ -517,6 +584,18 @@ const HarnessTransport = struct {
 };
 
 var the_transport: HarnessTransport = undefined;
+
+/// Storage for the harness-side per-node keyring the transport reads.
+var the_node_keys: [max_peers]NodeKey = undefined;
+
+/// The element type of `BootstrapConfig.peer_keys` — derived, not named,
+/// because the framework's `PeerKey` decl does not exist on a v0.32.0 build.
+/// Referenced only behind `raft_node_keys`, so the old build never analyzes it.
+const RaftPeerKeyElem = @typeInfo(@FieldType(BootstrapConfig, "peer_keys")).pointer.child;
+
+/// Backing storage for the `peer_keys` slice `buildBootstrapConfig` returns —
+/// the config outlives that call, so a stack local cannot hold these.
+var the_raft_peer_keys: [max_peers]RaftPeerKeyElem = undefined;
 
 // ── shutdown signalling ──────────────────────────────────────────────────────
 
@@ -607,8 +686,9 @@ fn meshPass(ctx: *MeshCtx, connected: *[max_peers]bool, ever_dialed: *[max_peers
 fn buildBootstrapConfig(cfg: *const Config) BootstrapConfig {
     if (wire_auth) {
         // Master: a multi-node cluster with a real transport must either carry
-        // the cluster secret or say out loud that it runs unauthenticated
-        // (ClusterBootstrap.start()'s ClusterAuthRequired gate).
+        // credentials or say out loud that it runs unauthenticated
+        // (ClusterBootstrap.start()'s ClusterAuthRequired gate). A-1 per-node
+        // keys count as credentials — the stronger scheme, not an exemption.
         var bcfg = BootstrapConfig{
             .node_id = cfg.node_id,
             .port = cfg.raft_port,
@@ -616,9 +696,27 @@ fn buildBootstrapConfig(cfg: *const Config) BootstrapConfig {
             .raft_cluster_size = cfg.cluster_size,
             .transport = the_transport.transport(),
         };
+        var keyed = false;
+        if (raft_node_keys) {
+            if (cfg.own_key) |k| {
+                bcfg.own_key = k;
+                keyed = true;
+            }
+            if (cfg.peer_key_count > 0) {
+                for (0..cfg.peer_key_count) |i| {
+                    the_raft_peer_keys[i] = .{ .id = cfg.peer_key_ids[i], .key = cfg.peer_key_vals[i] };
+                }
+                bcfg.peer_keys = the_raft_peer_keys[0..cfg.peer_key_count];
+                keyed = true;
+            }
+        }
         if (cfg.secret) |s| {
+            // Note: with per-node keys also set the raft port ignores this
+            // (per-node wins; a shared-key fallback would re-open the
+            // impersonation hole). The bus below still reads it — that surface
+            // has its own credential scheme.
             bcfg.cluster_secret = s;
-        } else {
+        } else if (!keyed) {
             bcfg.allow_unauthenticated_cluster = true;
         }
         return bcfg;
@@ -743,6 +841,8 @@ const usage =
     \\  --cluster-size <n>          raft cluster size (default: peers + 1)
     \\  --secret-hex <64 hex>       cluster secret (builds with the auth wire)
     \\  --bus-key-hex <64 hex>      bus credential; required with --secret-hex
+    \\  --own-key-hex <64 hex>      A-1: this node's own raft-port key
+    \\  --peer-key-hex <id>:<64hex> A-1: a peer node's own key (repeatable)
     \\  --tick-ms <ms>              cluster.tick() cadence (default 25)
     \\  --mesh-ms <ms>              bus mesh maintenance cadence (default 2000)
     \\  --bus-idle-ms <ms>          bus inbound idle timeout override (0 = default)
@@ -785,15 +885,24 @@ pub fn main(init: std.process.Init) !void {
     // Frames are signed only when the build has the auth wire at all: copied
     // into a v0.32.0 tree this compiles to "always bare", which is exactly the
     // old binary's wire — the experiment needs the *version* to decide, not an
-    // argv flag the old code could never honor.
+    // argv flag the old code could never honor. A-1's per-node keys follow the
+    // same discipline: parsed everywhere, honored only where the fields exist.
     const eff_secret: ?[32]u8 = if (wire_auth) cfg.secret else null;
+    const eff_own_key: ?[32]u8 = if (raft_node_keys) cfg.own_key else null;
+    const eff_peer_key_count: usize = if (raft_node_keys) cfg.peer_key_count else 0;
     const auth_desc: []const u8 = if (!wire_auth) "unsupported" else if (cfg.secret != null) "on" else "off";
-    note("BOOT id={s} raft={d} bus={d} auth={s} peers={d}", .{ cfg.node_id, cfg.raft_port, cfg.bus_port, auth_desc, cfg.raft_count });
+    const raftid_desc: []const u8 = if (!raft_node_keys) "unsupported" else if (cfg.own_key != null or cfg.peer_key_count > 0) "on" else "off";
+    note("BOOT id={s} raft={d} bus={d} auth={s} raftid={s} peers={d}", .{ cfg.node_id, cfg.raft_port, cfg.bus_port, auth_desc, raftid_desc, cfg.raft_count });
 
+    for (0..eff_peer_key_count) |i| {
+        the_node_keys[i] = .{ .id = cfg.peer_key_ids[i], .key = cfg.peer_key_vals[i] };
+    }
     the_transport = .{
         .allocator = allocator,
         .io = io,
         .secret = eff_secret,
+        .own_key = eff_own_key,
+        .peer_keys = the_node_keys[0..eff_peer_key_count],
         .rpc_timeout_ms = 100,
         .peers = cfg.raftSpecs(),
         .node_id = cfg.node_id,
@@ -942,6 +1051,33 @@ test "parseArgs: too many peers is bounded" {
         argv[6 + i * 2 + 1] = "n@127.0.0.1:25000";
     }
     try std.testing.expectError(error.TooManyPeers, parseArgs(&argv));
+}
+
+test "parseArgs: per-node key flags parse into the version-free Config shape" {
+    const key_a = "aa0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    const key_b = "bb0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    const key_c = "cc0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    const cfg = try parseArgs(&.{
+        "--id",           "n1",
+        "--raft-port",    "24001",
+        "--bus-port",     "24101",
+        "--own-key-hex",  key_a,
+        "--peer-key-hex", "n2:" ++ key_b,
+        "--peer-key-hex", "n3:" ++ key_c,
+    });
+    try std.testing.expectEqual(@as(u8, 0xaa), cfg.own_key.?[0]);
+    try std.testing.expectEqual(@as(usize, 2), cfg.peer_key_count);
+    try std.testing.expectEqualStrings("n2", cfg.peer_key_ids[0]);
+    try std.testing.expectEqual(@as(u8, 0xbb), cfg.peer_key_vals[0][0]);
+    try std.testing.expectEqualStrings("n3", cfg.peer_key_ids[1]);
+    try std.testing.expectEqual(@as(u8, 0xcc), cfg.peer_key_vals[1][0]);
+
+    // No colon / empty id / bad hex are all refused at parse time; the split is
+    // the FIRST colon, so the hex half can never eat the id.
+    const base = [_][]const u8{ "--id", "n1", "--raft-port", "24001", "--bus-port", "24101" };
+    try std.testing.expectError(error.BadPeerSpec, parseArgs(&(base ++ .{ "--peer-key-hex", key_b })));
+    try std.testing.expectError(error.BadPeerSpec, parseArgs(&(base ++ .{ "--peer-key-hex", ":" ++ key_b })));
+    try std.testing.expectError(error.BadHexKey, parseArgs(&(base ++ .{ "--peer-key-hex", "n2:00" })));
 }
 
 test "frame auth: signed frames verify, bare and tampered frames do not" {

@@ -1,5 +1,77 @@
 # Changelog
 
+## [Unreleased]
+
+### 第 109 批：A-1 落地 —— Raft 端口 per-node 身份绑定（帧内自述 id + `peer_keys[自述id]` 验签；**破坏性：否**）
+
+1. **威胁模型与设计**：对齐总线（`DistributedEventBus`）已落地的身份绑定语义 —— 持有节点 B 合法
+   key 的攻击者（B 是集群成员，或 B 的凭证被拿到）不得**冒充节点 A**。总线的「挑战-应答握手 +
+   连接期绑定 id」模板不适合 Raft：短连接请求-响应下每条 RPC 要多付一个 RTT，所以身份钉在
+   **每一帧**上 —— 帧内本就有自述 id（`candidate_id` / `leader_id` / `responder_id`）且在 MAC
+   覆盖之内，入站验签从「一把共享钥匙」改为「`peer_keys[自述id]`」，伪造 id 即 MAC 不符。
+   线格式 `[len][tag][payload][mac]` **不变**。重放不引入 seq：term/index 单调 +
+   AppendEntries/InstallSnapshot 幂等已拒旧（`docs/dev/cluster-auth-design.md` §3.6 的判断在 Raft
+   侧成立；总线要 seq 是因为它没有 term 的等价物）。
+2. **实现**（`RaftTransport.zig` 新增 §A-1 节）：模式判定 `authMode` —— `own_key` / `peer_keys`
+   任一配置即 per-node，**优先于 `cluster_secret`**（同配时共享钥匙被忽略：回落会重开"任一持钥者
+   冒充任一节点"的洞）。签名一律自己的 key（`signAuth`）、验签一律发送方的 key：入站按未验签帧的
+   自述 id 查 `nodeKey`（`claimedSenderId` 按 tag 解析偏移；截断 / 无 id / 未配 key 的 id 均拒，
+   **先于** L2 成员检查）；同步 RPC 的应答帧没有 id，按**拨号目标**的 key 验
+   （`TransportImpl.outboundKeys`，dial 前解析）。fail-closed 无降级口：per-node 下无 `own_key` →
+   `SignAuth.drop`（入站拒答、出站丢消息，绝不降级发裸帧）；对端无 key → **dial 之前**丢
+   （vote/append/snapshot 三路径同，debug 日志 + Raft 按丢消息重发）；vote relay 回推前同样查
+   candidate 的 key。`verifiedRecv` 拆出纯函数 `verifyFrameMac`（签名不变，既有测试逐字不动）。
+3. **配置**：`ElectionConfig` 新增 `own_key: ?[32]u8` 与 `peer_keys: []const PeerKey`
+   （`PeerKey{ id, key }` 为 pub；`RaftElection.init` 深拷贝、deinit 释放 —— 调用方切片可随 config
+   释放）。`ClusterBootstrap.BootstrapConfig` 同名透传；`ClusterAuthRequired` 门接受 per-node 凭证
+   （它是满足门禁的**更强**方案，不是豁免），warn 文案同步列出两种配法。per-node key **不进总线**：
+   总线是另一个监听面、另一套握手机制，仍需自己的 `setOwnKey` / `setPeerKey`（本批未动总线代码）。
+4. **兼容**：只配 `cluster_secret` → 既有共享路径**逐字节不变**（认证帧但不绑身份，文档写明）；
+   都不配 → 裸帧（dev，多节点仍被 `start()` 的门拦）。混合版本契约不动：`ci-mixed-version.sh`
+   逐字未改（v0.32.0 裸帧仍被拒），`cluster_node.zig` 只增 argv、不改脚本。
+5. **测试**（全真 loopback，端口 19840–20129 段）：`RaftTransport.zig` +6 —— `claimedSenderId`
+   五帧形状 / 截断 / 未知 tag 单测；`authMode`/`nodeKey`/`signAuth` 单测（含 per-node 优先于
+   shared、无 own_key → drop）；三节点全 per-node 选主 + 复制 + commit 收敛；**冒充测试**（持
+   node-b 的 key 自称 node-a：vote_request 与 append_entries 均被拒、term/log 不动；拿 node-a 的
+   key 才放行 —— 阳性对照，应答另按 node-b 自己的 key 验回包；vote_response 分支以"伪造 grant
+   不得让候选人上位、真 grant 上位"收尾）；fail-closed（成员但无 key 的 node-z 入站被拒 + 阳性
+   对照；出站对无 key 对端三条 RPC 全部 dial 前丢 —— 计数 listener 断言 0 次 accept；无 own_key
+   节点拒发）；per-node × InstallSnapshot 三节点追平。`ClusterBootstrap.zig` +1（per-node 凭证过
+   `ClusterAuthRequired` 门、raft config 落地、深拷贝不别名、bus 拿不到 raft 的 key）。
+   `cluster_node.zig` +1（`--own-key-hex` / `--peer-key-hex <id>:<64hex>` 解析与拒绝形状）。
+6. **变异验红证据**：① 入站验签改成「任一已配 key 通过即收」→ 冒充测试红：
+   `expected error.ConnectionClosed, found { 2, 0, … }`（伪造帧被当作 node-a 处理并回了
+   vote_response），还原复绿；② 出站去掉「无 key 拒拨」→ fail-closed 测试红：
+   `expected 0, found 3`（无 key 对端被三条 RPC 路径各拨通一次），还原复绿。
+7. **harness**（夜间门禁覆盖用）：`cluster_node.zig` 新增 `--own-key-hex` /
+   `--peer-key-hex <id>:<64hex>`（首个 `:` 切 id，hex 复用 `parseKeyHex`）；`raft_node_keys`
+   comptime 探测 —— v0.32.0 侧解析照收、BOOT 报 `raftid=unsupported`、绝不静默生效（与
+   `--secret-hex` 同一纪律）；HarnessTransport 镜像 `outboundKeys` 语义（per-node 缺 key =
+   `RAFTID_DROP` + lost，dial 前）；BOOT 行加 `raftid=on|off|unsupported`。
+8. **文档**：`docs/DISTRIBUTED.md` 新增「Raft 端口：per-node 身份」节（三条契约写清：wire 形状
+   不变 / 自述 id → `peer_keys` 验 MAC → fail-closed / `cluster_secret`-only 行为逐字不变），门禁
+   文案同步；`docs/dev/cluster-auth-design.md` 标题与 §0 改为「A-1 已实现（第 109 批）」；
+   `docs/dev/README.md` 两行状态；`docs/dev/v1.0-readiness-v0.35.md` §七 加 A-1 跟进注记
+   （判定表不回改）。
+9. **门禁读数**：`zig build fmt-check` ✓ · `zig build check`（check-production）✓ ·
+   `bash scripts/check-version.sh` ✓ · 全量 `zig build test`（`-Ddb=all`，force-run）
+   **2247/2307 通过、60 skip、0 fail**（较基线 +8：RaftTransport 6、ClusterBootstrap 1、
+   cluster_node 1）· `zig build soak-cluster` ✓（18 条 delivery 对全部 2400/2400，
+   send_failures 水位 0，rss 10 MiB 内）· `bash scripts/ci-mixed-version.sh` ✓（同版本三节点
+   唯一选主+复制+干净退出；混合对跑：v0.32.0 旧节点 `auth=unsupported`、其裸帧被拒绝
+   ≥3 行、应答拒绝 74 行、新侧两节点照常选主复制、三方 SIGTERM 干净退出）。
+10. **不在范围**：key 轮换/下发不在框架内（沿用 SecretsManager 手工分发）；总线侧未动；
+    follower 侧主动压缩等既有开放项不变。
+11. **验收期抓到的既有 flake（顺手修复）**：`RaftTransport.zig` 测试
+    "a black-holed dial returns on the bound, not on the kernel's default" 在本批独立复跑中红了一次
+    —— 探针 dial 拿到 `ConnectTimeout`（ARP 无应答、黑洞成立）后，测量 dial 拿到
+    `HostUnreachable`：link-local 黑洞依赖 ARP 无应答，连续两次 dial 会撞上内核邻居表的
+    **负缓存**（probe 的 ARP 失败把第二跳立刻变成 EHOSTUNREACH），纯环境竞态，与 A-1 无关
+    （diff 未触 `connectTimeout` / 该测试；隔离重跑即转绿）。修法与探针同哲学：测量 dial 拿到
+    非 `ConnectTimeout` 错误 = 黑洞前提在测量窗口内不稳，记日志跳过，不再断言环境产物。
+    教训记档：**验收管道 `zig build test 2>&1 | tail` 会吃掉退出码**（无 pipefail 时管道返回
+    tail 的状态），本轮正是这样差点把 1 fail 当全绿 —— 门禁复跑必须直接看退出码。
+
 ## [0.38.0] - 2026-09-29
 
 ### 第 108 批：Windows 交叉编译腿被 cluster-node 打红 —— harness 按 POSIX-only 边界从该目标排除（**破坏性：否**）

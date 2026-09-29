@@ -1,7 +1,9 @@
-# 集群入站认证 —— 设计（**L1 逐帧 HMAC + L2 成员校验已实现**；Raft 侧**身份绑定**仍未实现）
+# 集群入站认证 —— 设计（**L1 逐帧 HMAC + L2 成员校验已实现**；Raft 侧**身份绑定已实现**，见 A-1）
 
 > 状态：**§3（L1 逐帧 HMAC 认证）与 §3.5（fail-closed 门禁）已实现并验证；
-> §4（L2 成员校验）已实现 —— 它当初被 §10 的缺陷阻断，§10 修完后随之解锁。**
+> §4（L2 成员校验）已实现 —— 它当初被 §10 的缺陷阻断，§10 修完后随之解锁；
+> A-1（Raft 侧 per-node 身份绑定）已实现：帧内自述 id + `peer_keys[自述id]` 验签，
+> 见 `RaftTransport.zig` 文件头 §A-1 与 `docs/DISTRIBUTED.md`「Raft 端口：per-node 身份」。**
 > 来源是 `docs/dev/security-audit-cluster.md` 的第 3 条高危，
 > 以及本次评估中对 `handleVoteRequest` / `handleAppendEntries` 的复核。
 > 所有事实都带 `文件:行`；推测的地方显式标注"未验证"。
@@ -9,8 +11,10 @@
 ## 0. 结论（一句话，记的是**写这份设计时**的现状）
 
 > **今天的状态在标题下面那段"状态"里**；本节保留的是当时的问题陈述 ——
-> L1/L2 已实现，剩下的缺口是 `docs/dev/v1.0-readiness-v0.35.md` 的 A-1（Raft 侧仍是**一把共享
+> L1/L2 已实现，剩下的缺口曾是 `docs/dev/v1.0-readiness-v0.35.md` 的 A-1（Raft 侧仍是**一把共享
 > PSK**，`ClusterAuth` 只做帧认证、不绑定节点身份；总线的每节点凭证握手未推广过来）。
+> **A-1 已由第 109 批关闭**：Raft 是短连接请求-响应，握手+长连接的模板不适用，身份改为钉在
+> 每一帧上（自述 id 在 MAC 覆盖内，验签用 `peer_keys[自述id]`）。
 
 当时：**TCP 可达即集群成员**：`TlsTransport.ClusterAuth`（HMAC-PSK）定义在案、有单测，
 但**全仓库零调用点**，连"打开它"的入口都不存在。要用 HS256 把每个入站帧按

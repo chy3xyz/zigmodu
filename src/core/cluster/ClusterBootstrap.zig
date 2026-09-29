@@ -33,6 +33,7 @@ const DistributedEventBus = @import("../DistributedEventBus.zig").DistributedEve
 const RaftElection = @import("RaftElection.zig").RaftElection;
 const RaftState = @import("RaftElection.zig").RaftState;
 const ElectionConfig = @import("RaftElection.zig").ElectionConfig;
+const PeerKey = @import("RaftElection.zig").PeerKey;
 const VoteRequest = @import("RaftElection.zig").VoteRequest;
 const AppendEntriesRequest = @import("RaftElection.zig").AppendEntriesRequest;
 const AppendEntriesResponse = @import("RaftElection.zig").AppendEntriesResponse;
@@ -87,8 +88,28 @@ pub const BootstrapConfig = struct {
     /// 32-byte pre-shared key authenticating the cluster port. Source it from
     /// `security.SecretsManager` (env > file > vault); the framework deliberately
     /// does not read it for you. Required for a multi-node cluster with a real
-    /// `.transport` — see the gate in `start()`.
+    /// `.transport` — see the gate in `start()` — **unless** per-node keys below
+    /// are configured instead.
+    ///
+    /// A shared key authenticates the frame but binds no identity: any holder of
+    /// it can appear as any node. `own_key` / `peer_keys` close that (A-1); when
+    /// either is set the shared key is ignored on this port (`RaftTransport.zig`
+    /// §A-1 — a fallback would re-open the impersonation hole).
     cluster_secret: ?[32]u8 = null,
+    /// A-1 per-node identity: this node's own signing key (frames it sends are
+    /// keyed with it; peers verify them against the `peer_keys` entry for this
+    /// node's id). Forwarded to `ElectionConfig.own_key`. Every node of a
+    /// per-node cluster sets its own; a node without one refuses to serve or
+    /// send rather than drift onto the unauthenticated wire.
+    own_key: ?[32]u8 = null,
+    /// A-1 per-node identity: one entry per *other* node — `id` is the Raft node
+    /// id (the same string `peers` declares), `key` that node's own key. This is
+    /// a symmetric pre-shared-key scheme, so the "peer key" for node B is the
+    /// same secret B sets as its `own_key`. Forwarded to
+    /// `ElectionConfig.peer_keys` (which deep-copies). Setting either this or
+    /// `own_key` switches the port to per-node mode and satisfies the
+    /// `ClusterAuthRequired` gate in `start()`.
+    peer_keys: []const PeerKey = &.{},
     /// Loud acknowledgement that a multi-node cluster runs **unauthenticated**.
     /// Same idiom as `allow_stub_raft_transport`: refuse unless set.
     allow_unauthenticated_cluster: bool = false,
@@ -217,16 +238,20 @@ pub const ClusterBootstrap = struct {
         // (`docs/dev/cluster-auth-design.md` §1: anyone who can connect can win a
         // vote, forge a leader, or clear the log). Refuse unless the app either
         // supplies a key or says so out loud. `raft_cluster_size <= 1` needs no
-        // key: there is no peer to talk to.
+        // key: there is no peer to talk to. A-1 per-node credentials
+        // (`own_key` / `peer_keys`) satisfy this gate just as `cluster_secret`
+        // does — they are the stronger scheme, not an exemption from it.
         if (self.config.transport != null and self.config.raft_cluster_size > 1 and
-            self.config.cluster_secret == null and !self.config.allow_unauthenticated_cluster)
+            self.config.cluster_secret == null and self.config.own_key == null and
+            self.config.peer_keys.len == 0 and !self.config.allow_unauthenticated_cluster)
         {
             // `warn`, not `err`: the returned error is the loud part, and the test
             // harness treats an `err`-level log as a failure by itself.
             std.log.warn(
                 "[ClusterBootstrap] refusing to start node {s}: raft_cluster_size={d} with a real transport but no " ++
-                    "`cluster_secret`, so every frame on the cluster port would be unauthenticated. Set it from " ++
-                    "SecretsManager, or acknowledge with `.allow_unauthenticated_cluster = true`.",
+                    "`cluster_secret` and no per-node `own_key`/`peer_keys`, so every frame on the cluster port would be " ++
+                    "unauthenticated. Set `cluster_secret` (or the A-1 per-node keys) from SecretsManager, or acknowledge " ++
+                    "with `.allow_unauthenticated_cluster = true`.",
                 .{ self.config.node_id, self.config.raft_cluster_size },
             );
             return error.ClusterAuthRequired;
@@ -260,6 +285,8 @@ pub const ClusterBootstrap = struct {
         }
         const election_cfg = ElectionConfig{
             .cluster_secret = self.config.cluster_secret,
+            .own_key = self.config.own_key,
+            .peer_keys = self.config.peer_keys,
             .snapshot_threshold_entries = self.config.snapshot_threshold_entries,
             .snapshot_chunk_bytes = self.config.snapshot_chunk_bytes,
             .snapshotter = self.config.snapshotter,
@@ -692,6 +719,40 @@ test "ClusterBootstrap starts a multi-node cluster that has a cluster secret" {
     // and its own wire format: leaving it keyless would keep the third call site
     // of §3.3 unauthenticated.
     try std.testing.expectEqual(secret, authed.getEventBus().?.cluster_secret.?);
+}
+
+test "ClusterBootstrap starts a multi-node cluster on per-node keys without a cluster secret" {
+    const allocator = std.testing.allocator;
+    if (!@import("../../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    // The A-1 positive control for the `ClusterAuthRequired` gate: per-node
+    // credentials are the stronger scheme, so they must satisfy it on their own.
+    const own: [32]u8 = @splat(0xa1);
+    const peer: [32]u8 = @splat(0xb2);
+    const peer_keys = [_]PeerKey{.{ .id = "peer-node", .key = peer }};
+    var keyed = try ClusterBootstrap.init(allocator, std.testing.io, .{
+        .node_id = "pernode-node",
+        .port = 19014,
+        .peers = &.{"peer-node@127.0.0.1:19015"},
+        .raft_cluster_size = 3,
+        .transport = gateTransport(),
+        .own_key = own,
+        .peer_keys = &peer_keys,
+    });
+    defer keyed.deinit();
+
+    try keyed.start();
+    const raft_cfg = &keyed.getRaft().?.config;
+    try std.testing.expectEqual(own, raft_cfg.own_key.?);
+    try std.testing.expectEqual(@as(usize, 1), raft_cfg.peer_keys.len);
+    try std.testing.expectEqualStrings("peer-node", raft_cfg.peer_keys[0].id);
+    try std.testing.expectEqual(peer, raft_cfg.peer_keys[0].key);
+    // The raft deep-copies (the caller's slice may die with the config it came
+    // from), so the stored id must not alias the test's literal-backed entry.
+    try std.testing.expect(raft_cfg.peer_keys[0].id.ptr != peer_keys[0].id.ptr);
+    // The bus is a separate surface: raft's per-node keys deliberately do not
+    // reach it (it has its own `setOwnKey`/`setPeerKey` handshake scheme).
+    try std.testing.expect(keyed.getEventBus().?.cluster_secret == null);
 }
 
 test "ClusterBootstrap refuses a multi-node cluster whose peers carry no id" {

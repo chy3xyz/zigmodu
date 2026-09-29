@@ -32,6 +32,7 @@ const ClusterAuth = @import("TlsTransport.zig").ClusterAuth;
 const RaftElection = @import("RaftElection.zig").RaftElection;
 const ElectionConfig = @import("RaftElection.zig").ElectionConfig;
 const Peer = @import("RaftElection.zig").Peer;
+const PeerKey = @import("RaftElection.zig").PeerKey;
 const VoteRequest = @import("RaftElection.zig").VoteRequest;
 const VoteResponse = @import("RaftElection.zig").VoteResponse;
 const AppendEntriesRequest = @import("RaftElection.zig").AppendEntriesRequest;
@@ -57,6 +58,18 @@ const log = std.log.scoped(.raft_transport);
 // the MAC is stripped there, so `tagOf` / `payloadOf` / the six `decode*` read
 // exactly the bytes they read when the feature is off
 // (`docs/dev/cluster-auth-design.md` §3.1).
+//
+// A-1 (`ElectionConfig.own_key` / `peer_keys`): the frame shape is unchanged —
+// what changes is **which key** the MAC is checked against. Instead of one
+// shared secret, a frame is verified with the key of the sender id it claims
+// (requests carry `candidate_id` / `leader_id`; a vote response carries
+// `responder_id`; the synchronous RPC replies are verified against the peer the
+// caller dialled). Raft needs no handshake for this — unlike the bus
+// (`docs/dev/cluster-identity-design.md`): its RPCs are one short
+// request/response connection each, so a challenge/response would cost an RTT
+// per RPC, while the claimed id already travels inside the MAC's coverage.
+// Pinning the identity **per frame** costs nothing extra: only the holder of
+// node-X's key can produce a frame that verifies as X.
 
 /// First byte of a payload: which RPC the rest carries.
 pub const MessageTag = enum(u8) {
@@ -349,10 +362,6 @@ fn writeFrame(stream: std.Io.net.Stream, frame: []const u8) !void {
 /// Length of the tag `sendSigned` appends and `verifiedRecv` strips.
 const auth_mac_bytes = 32;
 
-/// The `ClusterAuth` this node signs with, or null when
-/// `ElectionConfig.cluster_secret` is null (bare frames — the state
-/// `ClusterBootstrap.start()` refuses for a multi-node cluster). A non-null
-/// result must be `deinit`ed.
 /// Sign `frame` (already `[tag][payload]`) and write it length-prefixed.
 /// `frame` is NOT modified — the MAC is appended into a temp buffer, making the
 /// wire bytes `[len][tag][payload][mac]`.
@@ -378,7 +387,14 @@ fn sendSigned(key: [32]u8, conn: *NetworkTransport.ClusterConnection, frame: []c
 /// frame from a peer that has no secret configured) as well as a MAC that does
 /// not match; callers treat both as "drop this peer".
 fn verifiedRecv(key: [32]u8, conn: *NetworkTransport.ClusterConnection, buf: *std.ArrayList(u8)) ![]const u8 {
-    const frame = try conn.recv(buf);
+    return verifyFrameMac(key, try conn.recv(buf));
+}
+
+/// The pure half of `verifiedRecv`: strip the trailing MAC and check it against
+/// `key`, constant-time. Kept separate because the per-node path (A-1) must read
+/// the claimed sender id out of the **unverified** bytes before it knows which
+/// key to verify with.
+fn verifyFrameMac(key: [32]u8, frame: []const u8) ![]const u8 {
     if (frame.len < auth_mac_bytes + 1) return error.ClusterAuthFailed;
     const signed_len = frame.len - auth_mac_bytes;
 
@@ -390,20 +406,107 @@ fn verifiedRecv(key: [32]u8, conn: *NetworkTransport.ClusterConnection, buf: *st
     return frame[0..signed_len];
 }
 
-/// Write one frame on an already-open connection: signed when the node has a
-/// secret, bare otherwise. One place decides, so the outbound half (both RPCs),
-/// the reply, and the vote-response relay cannot drift apart.
-fn writeFrameAuth(secret: ?[32]u8, conn: *NetworkTransport.ClusterConnection, frame: []const u8) !void {
-    if (secret) |k| return sendSigned(k, conn, frame);
-    return writeFrame(conn.stream, frame);
+// ── A-1: per-node identity (which key a frame is keyed with) ────────────────
+//
+// `docs/dev/cluster-identity-design.md`'s threat model applied to the Raft
+// port: attacker B holds **one** node's key (a cluster member, or someone who
+// obtained that node's credential) and must be unable to appear as any other
+// node. With one shared `cluster_secret` B appears as anyone; with per-node
+// keys B appears only as the node whose key it holds.
+//
+// The bus pins identity per *connection* (challenge/response handshake, then a
+// bound id for the connection's life). Raft's RPCs are one short connection
+// per request/response, so the same shape would cost an RTT per RPC — instead
+// the identity is pinned per **frame**: the sender id is already inside every
+// frame (`candidate_id` / `leader_id` / `responder_id`), and inside the MAC's
+// coverage, so verifying `HMAC(peer_keys[claimed], frame)` binds the two
+// together with no extra round trip. Replay needs no sequence numbers here:
+// term/index monotonicity plus the idempotent AppendEntries/InstallSnapshot
+// handlers already refuse staleness (`cluster-auth-design.md` §3.6) — the bus
+// needed `seq` because it has no equivalent of term.
+
+/// How the frames on the cluster port are keyed, derived from the config.
+const AuthMode = enum { bare, shared, per_node };
+
+/// Per-node wins over `cluster_secret` when both are set: falling back to the
+/// shared key on a per-node miss would re-open exactly the hole this mode
+/// exists to close (any PSK holder could sign as any node). Neither set is the
+/// bare development path `ClusterBootstrap.start()` gates multi-node clusters
+/// away from.
+fn authMode(config: *const ElectionConfig) AuthMode {
+    if (config.own_key != null or config.peer_keys.len > 0) return .per_node;
+    if (config.cluster_secret != null) return .shared;
+    return .bare;
 }
 
-/// The read side of `writeFrameAuth`: a peer with a secret signs its replies
-/// too, so the reply read has to verify for the same reason the inbound one
-/// does (and a decoder that ignores trailing bytes would otherwise accept a
-/// frame it never authenticated).
-fn readFrameAuth(secret: ?[32]u8, conn: *NetworkTransport.ClusterConnection, buf: *std.ArrayList(u8)) ![]const u8 {
-    if (secret) |k| return verifiedRecv(k, conn, buf);
+/// The key a frame **from** `id` must verify against: that node's own key.
+/// `id == local_id` maps to our own `own_key` (null when unset — i.e. refused,
+/// which is also the right answer for the nonsense claim "I am you").
+fn nodeKey(config: *const ElectionConfig, local_id: []const u8, id: []const u8) ?[32]u8 {
+    if (std.mem.eql(u8, id, local_id)) return config.own_key;
+    for (config.peer_keys) |pk| {
+        if (std.mem.eql(u8, pk.id, id)) return pk.key;
+    }
+    return null;
+}
+
+/// The sender id a frame **claims**, read from the unverified bytes. The
+/// result borrows `frame` and is trusted only far enough to select the
+/// verification key; the raft still sees a `candidate_id` / `leader_id` /
+/// `responder_id` decoded from the verified bytes, which are the same bytes.
+///
+/// The id's offset is tag-dependent (`[tag][term: u64]…`):
+/// `vote_request` / `append_entries` / `install_snapshot` carry it first;
+/// `vote_response` carries `granted` in between. The two *response* tags for
+/// the synchronous RPCs carry no id at all — a caller reading such a reply
+/// verifies it against the peer it dialled, and inbound they are strays
+/// (`handleConnection` drops both tags), so no key can be selected for them.
+fn claimedSenderId(frame: []const u8) ?[]const u8 {
+    const tag = tagOf(frame) orelse return null;
+    const off: usize = switch (tag) {
+        .vote_request, .append_entries, .install_snapshot => 1 + 8,
+        .vote_response => 1 + 8 + 1,
+        .append_entries_response, .install_snapshot_response => return null,
+    };
+    if (frame.len < off + 2) return null;
+    const n = std.mem.readInt(u16, frame[off..][0..2], .big);
+    if (frame.len < off + 2 + @as(usize, n)) return null;
+    return frame[off + 2 ..][0..n];
+}
+
+/// What this node signs an outbound frame with. `.drop` is the fail-closed
+/// answer for "per-node mode but no `own_key`": sending bare there would be a
+/// silent downgrade to the unauthenticated wire, so the message is lost instead
+/// (Raft re-sends; the misconfiguration surfaces as a cluster that cannot make
+/// progress plus the debug line, not as quiet plaintext).
+const SignAuth = union(enum) { bare, key: [32]u8, drop };
+
+fn signAuth(config: *const ElectionConfig) SignAuth {
+    return switch (authMode(config)) {
+        .bare => .bare,
+        .shared => .{ .key = config.cluster_secret.? },
+        .per_node => if (config.own_key) |k| .{ .key = k } else .drop,
+    };
+}
+
+/// Write one frame on an already-open connection under a resolved `SignAuth`.
+/// One place decides, so the outbound half (all three RPCs), the reply, and
+/// the vote-response relay cannot drift apart.
+fn writeFrameSigned(auth: SignAuth, conn: *NetworkTransport.ClusterConnection, frame: []const u8) !void {
+    switch (auth) {
+        .bare => try writeFrame(conn.stream, frame),
+        .key => |k| try sendSigned(k, conn, frame),
+        .drop => return error.OwnKeyMissing,
+    }
+}
+
+/// The read side of the signing rule: the peer signs its replies with its own
+/// key, so the reply read has to verify against the key of whoever answered
+/// (the dialled peer, resolved by the caller) — and a decoder that ignores
+/// trailing bytes would otherwise accept a frame it never authenticated.
+/// `null` is the bare path.
+fn readFrameAuth(key: ?[32]u8, conn: *NetworkTransport.ClusterConnection, buf: *std.ArrayList(u8)) ![]const u8 {
+    if (key) |k| return verifiedRecv(k, conn, buf);
     return conn.recv(buf);
 }
 
@@ -732,9 +835,35 @@ pub fn TransportImpl(comptime slot: usize) type {
             return null;
         }
 
+        /// The two keys one outbound RPC needs, resolved before the dial.
+        /// `sign` is always this node's own key (`signAuth`); `verify` is the
+        /// key the *answering* peer signs its reply with — under per-node that
+        /// is the peer's own key, resolved by the dial target's id.
+        const OutboundKeys = struct { sign: SignAuth, verify: ?[32]u8 };
+
+        /// Resolve both halves of one outbound RPC, or fail closed: per-node
+        /// mode with a keyless target (or no `own_key`) returns null, and the
+        /// caller loses the message instead of dialling. The dial target is
+        /// the identity the reply has to verify against, so a null `peer_id`
+        /// there is unverifiable and refused for the same reason.
+        fn outboundKeys(self: *Self, peer_id: ?[]const u8) ?OutboundKeys {
+            const config = &self.raft.config;
+            switch (authMode(config)) {
+                .bare => return .{ .sign = .bare, .verify = null },
+                .shared => return .{ .sign = .{ .key = config.cluster_secret.? }, .verify = config.cluster_secret },
+                .per_node => {
+                    const sign = signAuth(config);
+                    if (sign == .drop) return null;
+                    const id = peer_id orelse return null;
+                    const verify = nodeKey(config, self.raft.local_id, id) orelse return null;
+                    return .{ .sign = sign, .verify = verify };
+                },
+            }
+        }
+
         /// Dial + write once. A failure here is a lost message (Raft re-sends),
         /// so it is worth a debug line and nothing more.
-        pub fn sendFrame(self: *Self, ep: Endpoint, frame: []const u8) void {
+        pub fn sendFrame(self: *Self, ep: Endpoint, frame: []const u8, auth: SignAuth) void {
             var conn = dialTo(self.allocator, self.io, ep, self.rpcTimeoutMs()) catch |err| {
                 log.debug("[raft] connect {s}:{d} failed, message dropped ({})", .{ ep.host, ep.port, err });
                 return;
@@ -744,7 +873,7 @@ pub fn TransportImpl(comptime slot: usize) type {
             // stops reading would otherwise block the writing thread on a full
             // send buffer, inside the same spin lock.
             sockread.setSendTimeout(conn.stream, self.rpcTimeoutMs());
-            writeFrameAuth(self.raft.config.cluster_secret, &conn, frame) catch |err| {
+            writeFrameSigned(auth, &conn, frame) catch |err| {
                 log.debug("[raft] write {s}:{d} failed, message dropped ({})", .{ ep.host, ep.port, err });
             };
         }
@@ -756,13 +885,17 @@ pub fn TransportImpl(comptime slot: usize) type {
                 log.debug("[raft] no address for peer {s}, vote request dropped", .{peer_id orelse "?"});
                 return;
             };
+            const keys = self.outboundKeys(peer_id) orelse {
+                log.debug("[raft] no key for peer {s}, vote request dropped", .{peer_id orelse "?"});
+                return;
+            };
             var frame = std.ArrayList(u8).empty;
             defer frame.deinit(self.allocator);
             encodeVoteRequest(&frame, self.allocator, req) catch |err| {
                 log.debug("[raft] encoding the vote request failed ({})", .{err});
                 return;
             };
-            self.sendFrame(ep, frame.items);
+            self.sendFrame(ep, frame.items, keys.sign);
         }
 
         /// Synchronous: the follower answers on the same connection. Every
@@ -771,6 +904,10 @@ pub fn TransportImpl(comptime slot: usize) type {
         pub fn sendAppendEntries(self: *Self, peer_id: ?[]const u8, address: []const u8, req: AppendEntriesRequest) AppendEntriesResponse {
             const lost = AppendEntriesResponse{ .term = 0, .success = false, .match_index = 0 };
             const ep = self.resolve(peer_id, address) orelse return lost;
+            const keys = self.outboundKeys(peer_id) orelse {
+                log.debug("[raft] no key for peer {s}, AppendEntries dropped", .{peer_id orelse "?"});
+                return lost;
+            };
 
             var frame = std.ArrayList(u8).empty;
             defer frame.deinit(self.allocator);
@@ -782,7 +919,7 @@ pub fn TransportImpl(comptime slot: usize) type {
             var conn = dialTo(self.allocator, self.io, ep, self.rpcTimeoutMs()) catch return lost;
             defer conn.deinit();
             sockread.setSendTimeout(conn.stream, self.rpcTimeoutMs());
-            writeFrameAuth(self.raft.config.cluster_secret, &conn, frame.items) catch return lost;
+            writeFrameSigned(keys.sign, &conn, frame.items) catch return lost;
 
             // Bound the wait for the reply as well as the dial: a peer that
             // accepts the connection and never answers is the failure this is
@@ -793,7 +930,7 @@ pub fn TransportImpl(comptime slot: usize) type {
 
             var reply = std.ArrayList(u8).empty;
             defer reply.deinit(self.allocator);
-            const bytes = readFrameAuth(self.raft.config.cluster_secret, &conn, &reply) catch |err| {
+            const bytes = readFrameAuth(keys.verify, &conn, &reply) catch |err| {
                 log.debug("[raft] no reply from {s}:{d} within {d}ms, or the peer closed ({}) — message dropped", .{ ep.host, ep.port, self.rpcTimeoutMs(), err });
                 return lost;
             };
@@ -821,6 +958,10 @@ pub fn TransportImpl(comptime slot: usize) type {
         pub fn sendInstallSnapshot(self: *Self, peer_id: ?[]const u8, address: []const u8, req: InstallSnapshotRequest) InstallSnapshotResponse {
             const lost = InstallSnapshotResponse{ .term = 0 };
             const ep = self.resolve(peer_id, address) orelse return lost;
+            const keys = self.outboundKeys(peer_id) orelse {
+                log.debug("[raft] no key for peer {s}, InstallSnapshot dropped", .{peer_id orelse "?"});
+                return lost;
+            };
 
             var frame = std.ArrayList(u8).empty;
             defer frame.deinit(self.allocator);
@@ -832,7 +973,7 @@ pub fn TransportImpl(comptime slot: usize) type {
             var conn = dialTo(self.allocator, self.io, ep, self.rpcTimeoutMs()) catch return lost;
             defer conn.deinit();
             sockread.setSendTimeout(conn.stream, self.rpcTimeoutMs());
-            writeFrameAuth(self.raft.config.cluster_secret, &conn, frame.items) catch return lost;
+            writeFrameSigned(keys.sign, &conn, frame.items) catch return lost;
 
             // Same bounded reply wait as `sendAppendEntries` — a snapshot can be
             // the largest frame a peer ever gets, so a WAN should raise
@@ -841,7 +982,7 @@ pub fn TransportImpl(comptime slot: usize) type {
 
             var reply = std.ArrayList(u8).empty;
             defer reply.deinit(self.allocator);
-            const bytes = readFrameAuth(self.raft.config.cluster_secret, &conn, &reply) catch |err| {
+            const bytes = readFrameAuth(keys.verify, &conn, &reply) catch |err| {
                 log.debug("[raft] no snapshot reply from {s}:{d} within {d}ms, or the peer closed ({}) — message dropped", .{ ep.host, ep.port, self.rpcTimeoutMs(), err });
                 return lost;
             };
@@ -915,8 +1056,20 @@ pub fn handleConnection(raft: *RaftElection, addresses: ?*const AddressBook, con
     // The key travels by value: it is all the MAC needs, and building a
     // `ClusterAuth` per frame would allocate (and could fail) on every vote and
     // heartbeat — dropping a vote because a 6-byte `dupe` failed is not a failure
-    // mode this path should have.
-    const secret = raft.config.cluster_secret;
+    // mode this path should have. Per-node mode picks the key off the frame's
+    // claimed sender id (A-1, see the section at the top of this file).
+    const config = &raft.config;
+    const sign = signAuth(config);
+    switch (sign) {
+        // Per-node mode without an `own_key` cannot even answer: the reply
+        // would have to go out bare, which the caller refuses to read. Refuse
+        // the connection instead of drifting off the authenticated wire.
+        .drop => {
+            log.debug("[raft] inbound connection dropped: per-node credentials configured but this node has no own_key", .{});
+            return;
+        },
+        else => {},
+    }
 
     var in = std.ArrayList(u8).empty;
     defer in.deinit(conn.allocator);
@@ -924,14 +1077,37 @@ pub fn handleConnection(raft: *RaftElection, addresses: ?*const AddressBook, con
     // *before* any decoder sees it; a bad tag is the same shape of failure as an
     // unreadable frame — drop the connection and keep serving.
     const frame = blk: {
-        if (secret) |k| break :blk verifiedRecv(k, conn, &in) catch |err| {
-            log.debug("[raft] inbound frame not authenticated ({})", .{err});
-            return;
-        };
-        break :blk conn.recv(&in) catch |err| {
-            log.debug("[raft] inbound frame not readable ({})", .{err});
-            return;
-        };
+        switch (authMode(config)) {
+            .bare => break :blk conn.recv(&in) catch |err| {
+                log.debug("[raft] inbound frame not readable ({})", .{err});
+                return;
+            },
+            .shared => break :blk verifiedRecv(config.cluster_secret.?, conn, &in) catch |err| {
+                log.debug("[raft] inbound frame not authenticated ({})", .{err});
+                return;
+            },
+            .per_node => {
+                // Raw read first: the claimed sender id selects the key and can
+                // only be read off the unverified bytes — it sits inside the
+                // MAC's coverage, so a forged id fails the verification below.
+                const raw = conn.recv(&in) catch |err| {
+                    log.debug("[raft] inbound frame not readable ({})", .{err});
+                    return;
+                };
+                const claimed = claimedSenderId(raw) orelse {
+                    log.debug("[raft] inbound frame carries no sender id, dropped", .{});
+                    return;
+                };
+                const key = nodeKey(config, raft.local_id, claimed) orelse {
+                    log.debug("[raft] inbound frame from unkeyed node {s}, dropped", .{claimed});
+                    return;
+                };
+                break :blk verifyFrameMac(key, raw) catch |err| {
+                    log.debug("[raft] inbound frame not authenticated as {s} ({})", .{ claimed, err });
+                    return;
+                };
+            },
+        }
     };
 
     var arena_state = std.heap.ArenaAllocator.init(conn.allocator);
@@ -982,13 +1158,17 @@ pub fn handleConnection(raft: *RaftElection, addresses: ?*const AddressBook, con
         .append_entries_response, .install_snapshot_response => return,
     }
 
-    writeFrameAuth(secret, conn, out.items) catch |err| {
+    writeFrameSigned(sign, conn, out.items) catch |err| {
         log.debug("[raft] replying on the inbound connection failed ({})", .{err});
     };
 
     if (relay_candidate) |candidate| {
         const ep = if (addresses) |book| book.lookup(candidate) else null;
         if (ep) |endpoint| {
+            if (authMode(config) == .per_node and nodeKey(config, raft.local_id, candidate) == null) {
+                log.debug("[raft] candidate {s} has no configured key, vote response not relayed", .{candidate});
+                return;
+            }
             var conn_out = dialTo(conn.allocator, conn.io, endpoint, raft.config.rpc_timeout_ms) catch |err| {
                 log.debug("[raft] relaying the vote response to {s}:{d} failed ({})", .{ endpoint.host, endpoint.port, err });
                 return;
@@ -996,7 +1176,7 @@ pub fn handleConnection(raft: *RaftElection, addresses: ?*const AddressBook, con
             defer conn_out.deinit();
             // The candidate verifies its inbound frames, so the relay has to be
             // signed too — an unsigned relay is a vote the candidate drops.
-            writeFrameAuth(secret, &conn_out, out.items) catch |err| {
+            writeFrameSigned(sign, &conn_out, out.items) catch |err| {
                 log.debug("[raft] relaying the vote response failed ({})", .{err});
             };
         } else {
@@ -2429,6 +2609,642 @@ test "with a cluster_secret, a loopback AppendEntries round-trip is signed end t
     try testing.expectEqualStrings("node-a", b_raft.getLeader().?);
 }
 
+// ── A-1: per-node identity ───────────────────────────────────────────────────
+
+test "claimedSenderId reads the sender id off each frame shape" {
+    const allocator = testing.allocator;
+    var frame = std.ArrayList(u8).empty;
+    defer frame.deinit(allocator);
+
+    try encodeVoteRequest(&frame, allocator, .{ .term = 9, .candidate_id = "node-a", .last_log_index = 1, .last_log_term = 1 });
+    try testing.expectEqualStrings("node-a", claimedSenderId(frame.items).?);
+    frame.clearRetainingCapacity();
+
+    // The vote response tucks `granted` between the term and the id.
+    try encodeVoteResponse(&frame, allocator, .{ .term = 9, .vote_granted = true }, "node-b");
+    try testing.expectEqualStrings("node-b", claimedSenderId(frame.items).?);
+    frame.clearRetainingCapacity();
+
+    try encodeAppendEntries(&frame, allocator, .{ .term = 9, .leader_id = "node-c", .prev_log_index = 0, .prev_log_term = 0, .entries = &.{}, .leader_commit = 0 });
+    try testing.expectEqualStrings("node-c", claimedSenderId(frame.items).?);
+    frame.clearRetainingCapacity();
+
+    try encodeInstallSnapshot(&frame, allocator, .{ .term = 9, .leader_id = "node-d", .last_included_index = 3, .last_included_term = 2, .offset = 0, .data = "snap", .done = true });
+    try testing.expectEqualStrings("node-d", claimedSenderId(frame.items).?);
+    frame.clearRetainingCapacity();
+
+    // The synchronous-RPC replies carry no id: no key can be selected inbound.
+    try encodeAppendEntriesResponse(&frame, allocator, .{ .term = 9, .success = true, .match_index = 1 });
+    try testing.expectEqual(@as(?[]const u8, null), claimedSenderId(frame.items));
+    frame.clearRetainingCapacity();
+    try encodeInstallSnapshotResponse(&frame, allocator, .{ .term = 9 });
+    try testing.expectEqual(@as(?[]const u8, null), claimedSenderId(frame.items));
+    frame.clearRetainingCapacity();
+
+    // Truncations are refused without reading past the bytes that are there:
+    // a bare tag, and a frame cut off inside the id's length-prefixed body.
+    try testing.expectEqual(@as(?[]const u8, null), claimedSenderId(&.{@backingInt(MessageTag.vote_request)}));
+    try encodeVoteRequest(&frame, allocator, .{ .term = 9, .candidate_id = "node-a", .last_log_index = 1, .last_log_term = 1 });
+    try testing.expectEqual(@as(?[]const u8, null), claimedSenderId(frame.items[0 .. 1 + 8 + 3]));
+    // An unknown tag claims nothing.
+    try testing.expectEqual(@as(?[]const u8, null), claimedSenderId(&[_]u8{ 0xfe, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }));
+}
+
+test "authMode and nodeKey resolve keys per node, fail-closed" {
+    const key_own: [32]u8 = @splat(0x0a);
+    const key_b: [32]u8 = @splat(0x0b);
+    const key_s: [32]u8 = @splat(0x5e);
+
+    // Nothing configured: the development path.
+    try testing.expectEqual(AuthMode.bare, authMode(&.{}));
+    try testing.expectEqual(SignAuth.bare, signAuth(&.{}));
+
+    // `cluster_secret` alone: the shared path, wire-compatible with what shipped.
+    const shared = ElectionConfig{ .cluster_secret = key_s };
+    try testing.expectEqual(AuthMode.shared, authMode(&shared));
+    switch (signAuth(&shared)) {
+        .key => |k| try testing.expectEqual(key_s, k),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Per-node wins over a shared key when both are set: a fallback would
+    // re-open exactly the impersonation hole this mode exists to close.
+    const peers = [_]PeerKey{.{ .id = "node-b", .key = key_b }};
+    const both = ElectionConfig{ .cluster_secret = key_s, .own_key = key_own, .peer_keys = &peers };
+    try testing.expectEqual(AuthMode.per_node, authMode(&both));
+    switch (signAuth(&both)) {
+        .key => |k| try testing.expectEqual(key_own, k),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // `peer_keys` alone already selects per-node mode, and without an `own_key`
+    // the node refuses to sign at all rather than drift onto the bare wire.
+    const listen_only = ElectionConfig{ .peer_keys = &peers };
+    try testing.expectEqual(AuthMode.per_node, authMode(&listen_only));
+    try testing.expectEqual(SignAuth.drop, signAuth(&listen_only));
+
+    // nodeKey: the local id maps to `own_key` (null when unset — "I am you" is
+    // refused), a peer id to its entry, an unknown id to null.
+    try testing.expectEqual(@as(?[32]u8, key_own), nodeKey(&both, "node-a", "node-a"));
+    try testing.expectEqual(@as(?[32]u8, key_b), nodeKey(&both, "node-a", "node-b"));
+    try testing.expectEqual(@as(?[32]u8, null), nodeKey(&both, "node-a", "node-z"));
+    try testing.expectEqual(@as(?[32]u8, null), nodeKey(&listen_only, "node-a", "node-a"));
+}
+
+/// The trio of keys the per-node loopback tests below run on.
+const pernode_key_a: [32]u8 = @splat(0xa1);
+const pernode_key_b: [32]u8 = @splat(0xb2);
+const pernode_key_c: [32]u8 = @splat(0xc3);
+
+test "real loopback per-node election: three keyed nodes elect a leader and replicate" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    if (!@import("../../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var a_impl: ElectionTransportImpl = undefined;
+    var b_impl: TransportImpl(1) = undefined;
+    var c_impl: TransportImpl(2) = undefined;
+    var a_raft: RaftElection = undefined;
+    var b_raft: RaftElection = undefined;
+    var c_raft: RaftElection = undefined;
+    var a_inbound: InboundServer = undefined;
+    var b_inbound: InboundServer = undefined;
+    var c_inbound: InboundServer = undefined;
+    var a_thread: std.Thread = undefined;
+    var b_thread: std.Thread = undefined;
+    var c_thread: std.Thread = undefined;
+
+    // Defers are registered before the work so they unwind in lifetime order:
+    // servers first, then the rafts, then the transports they point at.
+    var impls_up: u8 = 0;
+    var rafts_up: u8 = 0;
+    var servers_up: u8 = 0;
+    defer {
+        if (impls_up >= 3) a_impl.deinit();
+        if (impls_up >= 2) c_impl.deinit();
+        if (impls_up >= 1) b_impl.deinit();
+    }
+    defer {
+        if (rafts_up >= 3) a_raft.deinit();
+        if (rafts_up >= 2) c_raft.deinit();
+        if (rafts_up >= 1) b_raft.deinit();
+    }
+    defer {
+        if (servers_up >= 3) stopInbound(io, &a_inbound, &a_thread);
+        if (servers_up >= 2) stopInbound(io, &c_inbound, &c_thread);
+        if (servers_up >= 1) stopInbound(io, &b_inbound, &b_thread);
+    }
+
+    b_impl.init(allocator, io, &b_raft);
+    impls_up = 1;
+    const b_port = try startInbound(allocator, io, &b_raft, &b_impl.addresses, 19840, &b_inbound, &b_thread);
+    servers_up = 1;
+
+    c_impl.init(allocator, io, &c_raft);
+    impls_up = 2;
+    const c_port = try startInbound(allocator, io, &c_raft, &c_impl.addresses, b_port + 1, &c_inbound, &c_thread);
+    servers_up = 2;
+
+    a_impl.init(allocator, io, &a_raft);
+    impls_up = 3;
+    const a_port = try startInbound(allocator, io, &a_raft, &a_impl.addresses, c_port + 1, &a_inbound, &a_thread);
+    servers_up = 3;
+
+    const b_endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{b_port});
+    defer allocator.free(b_endpoint);
+    const c_endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{c_port});
+    defer allocator.free(c_endpoint);
+    const a_endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{a_port});
+    defer allocator.free(a_endpoint);
+
+    // Same wiring as the shared-key election: node-a dials from its address book,
+    // node-b/node-c reach node-a to push granted votes back (the relay).
+    try a_impl.addresses.addEndpoint("node-b", b_endpoint);
+    try a_impl.addresses.addEndpoint("node-c", c_endpoint);
+    try b_impl.addresses.addEndpoint("node-a", a_endpoint);
+    try c_impl.addresses.addEndpoint("node-a", a_endpoint);
+
+    // Every node signs with its own key and verifies each peer against that
+    // peer's own key — the same secret is `own_key` on one side and the
+    // `peer_keys` entry on the other (a symmetric pre-shared-key scheme).
+    const b_keys = [_]PeerKey{ .{ .id = "node-a", .key = pernode_key_a }, .{ .id = "node-c", .key = pernode_key_c } };
+    const c_keys = [_]PeerKey{ .{ .id = "node-a", .key = pernode_key_a }, .{ .id = "node-b", .key = pernode_key_b } };
+    const a_keys = [_]PeerKey{ .{ .id = "node-b", .key = pernode_key_b }, .{ .id = "node-c", .key = pernode_key_c } };
+
+    var b_peers = [_]Peer{ .{ .id = "node-a", .address = "" }, .{ .id = "node-c", .address = "" } };
+    b_raft = try RaftElection.init(allocator, "node-b", &b_peers, .{ .own_key = pernode_key_b, .peer_keys = &b_keys }, &b_impl.transport());
+    rafts_up = 1;
+    var c_peers = [_]Peer{ .{ .id = "node-a", .address = "" }, .{ .id = "node-b", .address = "" } };
+    c_raft = try RaftElection.init(allocator, "node-c", &c_peers, .{ .own_key = pernode_key_c, .peer_keys = &c_keys }, &c_impl.transport());
+    rafts_up = 2;
+    var a_peers = [_]Peer{ .{ .id = "node-b", .address = "" }, .{ .id = "node-c", .address = "" } };
+    a_raft = try RaftElection.init(allocator, "node-a", &a_peers, .{ .own_key = pernode_key_a, .peer_keys = &a_keys }, &a_impl.transport());
+    rafts_up = 3;
+
+    // The election itself exercises every per-node path at once: signed vote
+    // requests out, per-frame verification inbound, and the granted vote relayed
+    // back signed with the voter's own key.
+    a_raft.election_deadline_ms = Time.monotonicNowMilliseconds() - 1;
+    try a_raft.tick();
+
+    var spins: usize = 0;
+    while (!a_raft.isLeader() and spins < 3000) : (spins += 1) {
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    try testing.expect(a_raft.isLeader());
+    try testing.expectEqual(@as(u64, 1), a_raft.getTerm());
+    try testing.expect(waitForTerm(io, &b_raft, 1, 2000));
+    try testing.expect(waitForTerm(io, &c_raft, 1, 2000));
+    try testing.expectEqualStrings("node-a", b_raft.voted_for.?);
+    try testing.expectEqualStrings("node-a", c_raft.voted_for.?);
+
+    // Replication on the keyed wire: AppendEntries signed by the leader, each
+    // follower's same-connection reply signed by the follower.
+    a_raft.config.heartbeat_interval_ms = 0;
+    _ = try a_raft.appendEntry("pernode-cmd-1");
+    var ticks: usize = 0;
+    while (ticks < 12 and
+        (b_raft.getCommitIndex() < 1 or c_raft.getCommitIndex() < 1)) : (ticks += 1)
+    {
+        try a_raft.tick();
+    }
+    try testing.expectEqual(@as(usize, 1), b_raft.logLen());
+    try testing.expectEqual(@as(usize, 1), c_raft.logLen());
+    try testing.expectEqualStrings("pernode-cmd-1", b_raft.getLogEntry(1).?.command);
+    try testing.expectEqualStrings("pernode-cmd-1", c_raft.getLogEntry(1).?.command);
+    try testing.expectEqual(@as(u64, 1), a_raft.getCommitIndex());
+    try testing.expectEqual(@as(u64, 1), b_raft.getCommitIndex());
+    try testing.expectEqual(@as(u64, 1), c_raft.getCommitIndex());
+}
+
+// The A-1 acceptance test, and it must stay *mutant-sensitive*: an inbound
+// verifier that accepts a frame signed by **any** configured key (instead of
+// the claimed sender's own) turns steps 1/4 red — that mutation was run, and
+// both steps failed before the fix was restored.
+test "per-node: a frame signed with another node's key is refused (impersonation)" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    if (!@import("../../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    // node-b's inbound, per-node keyed. The attacker holds node-b's key — a
+    // legitimate cluster credential — and claims to be node-a with it.
+    var b_impl: TransportImpl(1) = undefined;
+    var b_raft: RaftElection = undefined;
+    var b_inbound: InboundServer = undefined;
+    var b_thread: std.Thread = undefined;
+
+    var impl_up = false;
+    var raft_up = false;
+    var server_up = false;
+    defer if (impl_up) b_impl.deinit();
+    defer if (raft_up) b_raft.deinit();
+    defer if (server_up) stopInbound(io, &b_inbound, &b_thread);
+
+    b_impl.init(allocator, io, &b_raft);
+    impl_up = true;
+    const b_port = try startInbound(allocator, io, &b_raft, &b_impl.addresses, 19900, &b_inbound, &b_thread);
+    server_up = true;
+
+    const b_keys = [_]PeerKey{.{ .id = "node-a", .key = pernode_key_a }};
+    var b_peers = [_]Peer{.{ .id = "node-a", .address = "" }};
+    b_raft = try RaftElection.init(allocator, "node-b", &b_peers, .{ .own_key = pernode_key_b, .peer_keys = &b_keys }, &b_impl.transport());
+    raft_up = true;
+    // The candidacy in step 5 dials node-a: an unreachable placeholder, so the
+    // request is a lost message and the test drives the vote itself.
+    try b_impl.addresses.addEndpoint("node-a", "127.0.0.1:1");
+
+    // 1. Impersonated vote_request: claims `candidate_id = "node-a"`, signed
+    //    with node-b's key. Refused at the verifier, and the raft never sees it.
+    {
+        var conn = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = b_port }, test_dial_timeout_ms);
+        defer conn.deinit();
+        sockread.setRecvTimeout(conn.stream, stalled_peer_patience_ms);
+        var frame = std.ArrayList(u8).empty;
+        defer frame.deinit(allocator);
+        try encodeVoteRequest(&frame, allocator, .{ .term = 5, .candidate_id = "node-a", .last_log_index = 0, .last_log_term = 0 });
+        try sendSigned(pernode_key_b, &conn, frame.items);
+        var reply = std.ArrayList(u8).empty;
+        defer reply.deinit(allocator);
+        try testing.expectError(error.ConnectionClosed, conn.recv(&reply));
+    }
+    try testing.expectEqual(@as(u64, 0), b_raft.getTerm());
+
+    // 2. Positive control: the same frame signed with node-a's *own* key is
+    //    served — and the reply verifies against node-b's own key, which is the
+    //    binding the caller checks on every synchronous RPC.
+    {
+        var conn = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = b_port }, test_dial_timeout_ms);
+        defer conn.deinit();
+        sockread.setRecvTimeout(conn.stream, stalled_peer_patience_ms);
+        var frame = std.ArrayList(u8).empty;
+        defer frame.deinit(allocator);
+        try encodeVoteRequest(&frame, allocator, .{ .term = 5, .candidate_id = "node-a", .last_log_index = 0, .last_log_term = 0 });
+        try sendSigned(pernode_key_a, &conn, frame.items);
+        var reply = std.ArrayList(u8).empty;
+        defer reply.deinit(allocator);
+        const bytes = try verifiedRecv(pernode_key_b, &conn, &reply);
+        const decoded = try decodeVoteResponse(allocator, bytes);
+        defer allocator.free(decoded.responder_id);
+        try testing.expect(decoded.resp.vote_granted);
+        try testing.expectEqual(@as(u64, 5), decoded.resp.term);
+        try testing.expectEqualStrings("node-b", decoded.responder_id);
+    }
+    try testing.expectEqual(@as(u64, 5), b_raft.getTerm());
+    try testing.expectEqualStrings("node-a", b_raft.voted_for.?);
+
+    // 3. Impersonated AppendEntries: same shape, the log must not grow.
+    const entries = [_]LogEntry{.{ .term = 5, .index = 1, .command = "forged-cmd" }};
+    {
+        var conn = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = b_port }, test_dial_timeout_ms);
+        defer conn.deinit();
+        sockread.setRecvTimeout(conn.stream, stalled_peer_patience_ms);
+        var frame = std.ArrayList(u8).empty;
+        defer frame.deinit(allocator);
+        try encodeAppendEntries(&frame, allocator, .{ .term = 5, .leader_id = "node-a", .prev_log_index = 0, .prev_log_term = 0, .entries = &entries, .leader_commit = 1 });
+        try sendSigned(pernode_key_b, &conn, frame.items);
+        var reply = std.ArrayList(u8).empty;
+        defer reply.deinit(allocator);
+        try testing.expectError(error.ConnectionClosed, conn.recv(&reply));
+    }
+    try testing.expectEqual(@as(usize, 0), b_raft.logLen());
+
+    // 4. Positive control: signed with node-a's key the entry lands.
+    {
+        var conn = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = b_port }, test_dial_timeout_ms);
+        defer conn.deinit();
+        sockread.setRecvTimeout(conn.stream, stalled_peer_patience_ms);
+        var frame = std.ArrayList(u8).empty;
+        defer frame.deinit(allocator);
+        try encodeAppendEntries(&frame, allocator, .{ .term = 5, .leader_id = "node-a", .prev_log_index = 0, .prev_log_term = 0, .entries = &entries, .leader_commit = 1 });
+        try sendSigned(pernode_key_a, &conn, frame.items);
+        var reply = std.ArrayList(u8).empty;
+        defer reply.deinit(allocator);
+        const bytes = try verifiedRecv(pernode_key_b, &conn, &reply);
+        const ack = try decodeAppendEntriesResponse(bytes);
+        try testing.expect(ack.success);
+    }
+    try testing.expectEqual(@as(usize, 1), b_raft.logLen());
+    try testing.expectEqualStrings("forged-cmd", b_raft.getLogEntry(1).?.command);
+
+    // 5. The vote_response branch, driven for a real outcome: with node-b a
+    //    candidate of size 2, one genuine grant from node-a elects it — so a
+    //    *forged* grant must not. (This tag gets no reply either way; the raft
+    //    state is the observable.)
+    b_raft.election_deadline_ms = Time.monotonicNowMilliseconds() - 1;
+    try b_raft.tick();
+    try testing.expectEqual(RaftState.candidate, b_raft.getState());
+    const candidacy_term = b_raft.getTerm();
+    {
+        var conn = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = b_port }, test_dial_timeout_ms);
+        defer conn.deinit();
+        sockread.setRecvTimeout(conn.stream, stalled_peer_patience_ms);
+        var frame = std.ArrayList(u8).empty;
+        defer frame.deinit(allocator);
+        try encodeVoteResponse(&frame, allocator, .{ .term = candidacy_term, .vote_granted = true }, "node-a");
+        try sendSigned(pernode_key_b, &conn, frame.items);
+        var reply = std.ArrayList(u8).empty;
+        defer reply.deinit(allocator);
+        try testing.expectError(error.ConnectionClosed, conn.recv(&reply));
+    }
+    var settle: usize = 0;
+    while (settle < 100) : (settle += 1) {
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    try testing.expect(!b_raft.isLeader());
+    {
+        var conn = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = b_port }, test_dial_timeout_ms);
+        defer conn.deinit();
+        var frame = std.ArrayList(u8).empty;
+        defer frame.deinit(allocator);
+        try encodeVoteResponse(&frame, allocator, .{ .term = candidacy_term, .vote_granted = true }, "node-a");
+        try sendSigned(pernode_key_a, &conn, frame.items);
+    }
+    var spins: usize = 0;
+    while (!b_raft.isLeader() and spins < 2000) : (spins += 1) {
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    try testing.expect(b_raft.isLeader());
+}
+
+/// Counts accepted connections; the fail-closed assertions below are "the dial
+/// never happened", so the peer is a listener, not a raft.
+var failclosed_accepts = std.atomic.Value(u64).init(0);
+
+fn failClosedHandler(context: ?*anyopaque, conn: NetworkTransport.ClusterConnection) void {
+    _ = context;
+    var c = conn;
+    defer c.deinit();
+    _ = failclosed_accepts.fetchAdd(1, .monotonic);
+}
+
+// Mutant-sensitive the other way: an `outboundKeys` that dials anyway when the
+// per-node target has no key turns step 2 red (the listener sees the
+// connection) — that mutation was run and failed before the fix was restored.
+test "per-node fail-closed: unkeyed sender refused inbound, unkeyed peer never dialled" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    if (!@import("../../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    // 1. Inbound: node-z is a raft **member** (the L2 check would admit it) but
+    //    has no configured key — so the L1 verifier refuses it first. That
+    //    isolation is the point: the refusal is the missing key, not membership.
+    var b_impl: TransportImpl(1) = undefined;
+    var b_raft: RaftElection = undefined;
+    var b_inbound: InboundServer = undefined;
+    var b_thread: std.Thread = undefined;
+
+    var impl_up = false;
+    var raft_up = false;
+    var server_up = false;
+    defer if (impl_up) b_impl.deinit();
+    defer if (raft_up) b_raft.deinit();
+    defer if (server_up) stopInbound(io, &b_inbound, &b_thread);
+
+    b_impl.init(allocator, io, &b_raft);
+    impl_up = true;
+    const b_port = try startInbound(allocator, io, &b_raft, &b_impl.addresses, 19960, &b_inbound, &b_thread);
+    server_up = true;
+
+    const b_keys = [_]PeerKey{.{ .id = "node-a", .key = pernode_key_a }};
+    var b_peers = [_]Peer{ .{ .id = "node-a", .address = "" }, .{ .id = "node-z", .address = "" } };
+    b_raft = try RaftElection.init(allocator, "node-b", &b_peers, .{ .own_key = pernode_key_b, .peer_keys = &b_keys }, &b_impl.transport());
+    raft_up = true;
+
+    {
+        var conn = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = b_port }, test_dial_timeout_ms);
+        defer conn.deinit();
+        sockread.setRecvTimeout(conn.stream, stalled_peer_patience_ms);
+        var frame = std.ArrayList(u8).empty;
+        defer frame.deinit(allocator);
+        try encodeVoteRequest(&frame, allocator, .{ .term = 7, .candidate_id = "node-z", .last_log_index = 0, .last_log_term = 0 });
+        try sendSigned(@splat(0x99), &conn, frame.items); // any key: none is configured for node-z
+        var reply = std.ArrayList(u8).empty;
+        defer reply.deinit(allocator);
+        try testing.expectError(error.ConnectionClosed, conn.recv(&reply));
+    }
+    try testing.expectEqual(@as(u64, 0), b_raft.getTerm());
+
+    // Control: the same port serves a keyed member, so the refusal above was
+    // the missing key, not a dead listener.
+    {
+        var conn = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = b_port }, test_dial_timeout_ms);
+        defer conn.deinit();
+        sockread.setRecvTimeout(conn.stream, stalled_peer_patience_ms);
+        var frame = std.ArrayList(u8).empty;
+        defer frame.deinit(allocator);
+        try encodeVoteRequest(&frame, allocator, .{ .term = 7, .candidate_id = "node-a", .last_log_index = 0, .last_log_term = 0 });
+        try sendSigned(pernode_key_a, &conn, frame.items);
+        var reply = std.ArrayList(u8).empty;
+        defer reply.deinit(allocator);
+        const bytes = try verifiedRecv(pernode_key_b, &conn, &reply);
+        const decoded = try decodeVoteResponse(allocator, bytes);
+        defer allocator.free(decoded.responder_id);
+        try testing.expect(decoded.resp.vote_granted);
+    }
+
+    // 2. Outbound: a peer with no configured key is never even dialled, on all
+    //    three RPC paths — the message is lost (Raft re-sends), the wire stays
+    //    authenticated-only.
+    failclosed_accepts.store(0, .monotonic);
+    var listener = NetworkTransport.ClusterServer.init(allocator, io, 20010);
+    var listener_up = false;
+    defer if (listener_up) listener.stop();
+    const listener_thread = try std.Thread.spawn(.{}, NetworkTransport.ClusterServer.start, .{ &listener, failClosedHandler, null });
+    listener_up = true;
+    var spins: usize = 0;
+    while (!listener.running.load(.monotonic) and spins < 2000) : (spins += 1) {
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    try testing.expect(listener.running.load(.monotonic));
+
+    var a_impl: ElectionTransportImpl = undefined;
+    var a_raft: RaftElection = undefined;
+    var a_impl_up = false;
+    var a_raft_up = false;
+    defer if (a_impl_up) a_impl.deinit();
+    defer if (a_raft_up) a_raft.deinit();
+    a_impl.init(allocator, io, &a_raft);
+    a_impl_up = true;
+    const a_keys = [_]PeerKey{.{ .id = "node-b", .key = pernode_key_b }};
+    var a_peers = [_]Peer{ .{ .id = "node-b", .address = "" }, .{ .id = "node-c", .address = "" } };
+    a_raft = try RaftElection.init(allocator, "node-a", &a_peers, .{ .own_key = pernode_key_a, .peer_keys = &a_keys }, &a_impl.transport());
+    a_raft_up = true;
+    // node-c is addressable but keyless; node-b is the keyed control, dialled at
+    // the same listener.
+    try a_impl.addresses.addEndpoint("node-c", "127.0.0.1:20010");
+    try a_impl.addresses.addEndpoint("node-b", "127.0.0.1:20010");
+
+    const lost = a_impl.sendAppendEntries("node-c", "", .{ .term = 1, .leader_id = "node-a", .prev_log_index = 0, .prev_log_term = 0, .entries = &.{}, .leader_commit = 0 });
+    try testing.expect(!lost.success);
+    try testing.expectEqual(@as(u64, 0), lost.term);
+    a_impl.transport().*.sendVoteRequest("node-c", "", .{ .term = 1, .candidate_id = "node-a", .last_log_index = 0, .last_log_term = 0 });
+    const lost_snap = a_impl.sendInstallSnapshot("node-c", "", .{ .term = 1, .leader_id = "node-a", .last_included_index = 0, .last_included_term = 0, .offset = 0, .data = "", .done = true });
+    try testing.expectEqual(@as(u64, 0), lost_snap.term);
+    try testing.expectEqual(@as(u64, 0), failclosed_accepts.load(.monotonic));
+
+    // Control: the keyed peer at the same address *is* dialled (the listener
+    // closes without answering, which is a lost reply — the accept is the
+    // assertion, not the response).
+    _ = a_impl.sendAppendEntries("node-b", "", .{ .term = 1, .leader_id = "node-a", .prev_log_index = 0, .prev_log_term = 0, .entries = &.{}, .leader_commit = 0 });
+    try testing.expectEqual(@as(u64, 1), failclosed_accepts.load(.monotonic));
+
+    // 3. A node with peer keys but no `own_key` refuses to send at all
+    //    (`SignAuth.drop`): sending bare would be a silent downgrade.
+    var d_impl: TransportImpl(3) = undefined;
+    var d_raft: RaftElection = undefined;
+    var d_impl_up = false;
+    var d_raft_up = false;
+    defer if (d_impl_up) d_impl.deinit();
+    defer if (d_raft_up) d_raft.deinit();
+    d_impl.init(allocator, io, &d_raft);
+    d_impl_up = true;
+    var d_peers = [_]Peer{.{ .id = "node-b", .address = "" }};
+    d_raft = try RaftElection.init(allocator, "node-d", &d_peers, .{ .peer_keys = &a_keys }, &d_impl.transport());
+    d_raft_up = true;
+    try d_impl.addresses.addEndpoint("node-b", "127.0.0.1:20010");
+    const d_lost = d_impl.sendAppendEntries("node-b", "", .{ .term = 1, .leader_id = "node-d", .prev_log_index = 0, .prev_log_term = 0, .entries = &.{}, .leader_commit = 0 });
+    try testing.expect(!d_lost.success);
+    try testing.expectEqual(@as(u64, 1), failclosed_accepts.load(.monotonic));
+
+    listener.stop();
+    if (dialTo(allocator, io, .{ .host = "127.0.0.1", .port = 20010 }, test_dial_timeout_ms)) |wake| {
+        var c = wake;
+        c.deinit();
+    } else |err| {
+        std.log.debug("[raft test] wake connection not needed ({s})", .{@errorName(err)});
+    }
+    listener_thread.join();
+    listener_up = false;
+}
+
+test "real loopback per-node snapshot catch-up: keyed InstallSnapshot converges" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    if (!@import("../../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var a_impl: ElectionTransportImpl = undefined;
+    var b_impl: TransportImpl(1) = undefined;
+    var c_impl: TransportImpl(2) = undefined;
+    var a_raft: RaftElection = undefined;
+    var b_raft: RaftElection = undefined;
+    var c_raft: RaftElection = undefined;
+    var b_inbound: InboundServer = undefined;
+    var b_thread: std.Thread = undefined;
+    var c_inbound: InboundServer = undefined;
+    var c_thread: std.Thread = undefined;
+
+    var impls_up: u8 = 0;
+    var rafts_up: u8 = 0;
+    var servers_up: u8 = 0;
+    defer {
+        if (impls_up >= 3) c_impl.deinit();
+        if (impls_up >= 2) a_impl.deinit();
+        if (impls_up >= 1) b_impl.deinit();
+    }
+    defer {
+        if (rafts_up >= 3) c_raft.deinit();
+        if (rafts_up >= 2) a_raft.deinit();
+        if (rafts_up >= 1) b_raft.deinit();
+    }
+    defer if (servers_up >= 2) stopInbound(io, &c_inbound, &c_thread);
+    defer if (servers_up >= 1) stopInbound(io, &b_inbound, &b_thread);
+
+    // b serves from the start; c stays unreachable until after the compaction,
+    // which is what strands it behind the snapshot boundary.
+    b_impl.init(allocator, io, &b_raft);
+    impls_up = 1;
+    const b_port = try startInbound(allocator, io, &b_raft, &b_impl.addresses, 20040, &b_inbound, &b_thread);
+    servers_up = 1;
+    const b_endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{b_port});
+    defer allocator.free(b_endpoint);
+
+    a_impl.init(allocator, io, &a_raft);
+    impls_up = 2;
+    try a_impl.addresses.addEndpoint("node-b", b_endpoint);
+
+    c_impl.init(allocator, io, &c_raft);
+    impls_up = 3;
+
+    // Same per-node keyring as the election test: each node signs with its own
+    // key, verifies each peer against that peer's own key.
+    const b_keys = [_]PeerKey{ .{ .id = "node-a", .key = pernode_key_a }, .{ .id = "node-c", .key = pernode_key_c } };
+    const c_keys = [_]PeerKey{ .{ .id = "node-a", .key = pernode_key_a }, .{ .id = "node-b", .key = pernode_key_b } };
+    const a_keys = [_]PeerKey{ .{ .id = "node-b", .key = pernode_key_b }, .{ .id = "node-c", .key = pernode_key_c } };
+
+    var b_peers = [_]Peer{ .{ .id = "node-a", .address = "" }, .{ .id = "node-c", .address = "" } };
+    b_raft = try RaftElection.init(allocator, "node-b", &b_peers, .{ .own_key = pernode_key_b, .peer_keys = &b_keys }, &b_impl.transport());
+    rafts_up = 1;
+    var c_peers = [_]Peer{ .{ .id = "node-a", .address = "" }, .{ .id = "node-b", .address = "" } };
+    c_raft = try RaftElection.init(allocator, "node-c", &c_peers, .{ .own_key = pernode_key_c, .peer_keys = &c_keys }, &c_impl.transport());
+    rafts_up = 2;
+    var a_peers = [_]Peer{ .{ .id = "node-b", .address = "" }, .{ .id = "node-c", .address = "" } };
+    a_raft = try RaftElection.init(allocator, "node-a", &a_peers, .{ .own_key = pernode_key_a, .peer_keys = &a_keys }, &a_impl.transport());
+    rafts_up = 3;
+
+    // node-a leads term 1 with four entries; node-c's endpoint is not in the
+    // address book yet, so the early rounds drop its frames as lost messages
+    // and back its next_index down to 1.
+    a_raft.state = .leader;
+    a_raft.current_term = 1;
+    a_raft.config.heartbeat_interval_ms = 0;
+    for (0..4) |i| {
+        var buf: [16]u8 = undefined;
+        _ = try a_raft.appendEntry(try std.fmt.bufPrint(&buf, "cmd-{d}", .{i}));
+    }
+    var ticks: usize = 0;
+    while (ticks < 12 and (b_raft.logLen() < 4 or a_raft.getCommitIndex() < 4)) : (ticks += 1) {
+        try a_raft.tick();
+    }
+    try testing.expectEqual(@as(usize, 4), b_raft.logLen());
+    try testing.expectEqual(@as(u64, 4), a_raft.getCommitIndex()); // quorum: a + b
+
+    // Compact the committed prefix, then grow past it. A follower whose
+    // next_index is at/below 3 can no longer be fed AppendEntries — §7.
+    try a_raft.compactLog(3, "snap-pernode");
+    _ = try a_raft.appendEntry("cmd-4");
+    _ = try a_raft.appendEntry("cmd-5");
+    try testing.expectEqual(@as(usize, 3), a_raft.logLen()); // live: 4, 5, 6
+
+    // node-c joins the network now, one snapshot and three entries behind.
+    const c_port = try startInbound(allocator, io, &c_raft, &c_impl.addresses, 20090, &c_inbound, &c_thread);
+    servers_up = 2;
+    const c_endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{c_port});
+    defer allocator.free(c_endpoint);
+    try a_impl.addresses.addEndpoint("node-c", c_endpoint);
+
+    // Bounded rounds: the keyed snapshot branch fires for c (next_index 1 <= the
+    // boundary 3), then keyed AppendEntries resumes at boundary + 1 until c
+    // holds the live tail and the commit that covers it.
+    ticks = 0;
+    while (ticks < 40 and
+        (c_raft.logLen() < 3 or c_raft.getCommitIndex() < 6)) : (ticks += 1)
+    {
+        try a_raft.tick();
+    }
+
+    // The snapshot landed verbatim…
+    try testing.expectEqual(@as(u64, 3), c_raft.last_included_index);
+    try testing.expectEqual(@as(u64, 1), c_raft.last_included_term);
+    try testing.expectEqualStrings("snap-pernode", c_raft.snapshot_data.?);
+
+    // …and the live tail replicated on top of it, in absolute coordinates.
+    try testing.expectEqual(@as(usize, 3), c_raft.logLen());
+    var i: u64 = 4;
+    while (i <= 6) : (i += 1) {
+        const ldr = a_raft.getLogEntry(i).?;
+        const fwr = c_raft.getLogEntry(i).?;
+        try testing.expectEqual(ldr.term, fwr.term);
+        try testing.expectEqual(ldr.index, fwr.index);
+        try testing.expectEqualStrings(ldr.command, fwr.command);
+    }
+    try testing.expectEqual(@as(u64, 6), a_raft.getCommitIndex());
+    try testing.expectEqual(@as(u64, 6), c_raft.getCommitIndex());
+
+    // Leader bookkeeping: c resumed just past the snapshot and ended caught up.
+    try testing.expectEqual(@as(?u64, 7), a_raft.next_index.get("node-c"));
+    try testing.expectEqual(@as(?u64, 6), a_raft.match_index.get("node-c"));
+}
+
 // ── Bounded dial ────────────────────────────────────────────────────────────
 
 /// `O_NONBLOCK` as the *kernel* sees it on `fd`, read back with `fcntl` — the
@@ -2478,8 +3294,18 @@ test "a black-holed dial returns on the bound, not on the kernel's default" {
     if (result) |stream| {
         stream.close(io);
         return error.SkipZigTest; // answered inside the bound after all
-    } else |err| {
-        try testing.expectEqual(error.ConnectTimeout, err);
+    } else |err| switch (err) {
+        error.ConnectTimeout => {},
+        else => {
+            // Black-holing a link-local address relies on its ARP going
+            // unanswered; back-to-back dials race the kernel's neighbour
+            // cache, and a negative entry turns this second dial into an
+            // immediate EHOSTUNREACH even though the probe above timed out.
+            // The premise (the address hangs) proved unstable — skip, as the
+            // probe does, rather than assert on an environment artifact.
+            std.log.info("[raft] {s}:80 stopped black-holing between probe and measurement ({s}) — skipping the connect-bound test", .{ "169.254.255.254", @errorName(err) });
+            return error.SkipZigTest;
+        },
     }
 
     // The bound, and not something shorter: `ConnectionRefused` and friends
