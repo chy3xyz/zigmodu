@@ -2,6 +2,46 @@
 
 ## [Unreleased]
 
+### 第 114 批：CI 墙钟提速（gate 过滤执行 + 第二波并行化）+ §12.16 batch sweep 快照竞态修复（**破坏性：否**）
+
+1. **缘起**：迭代反馈被 CI 时长卡住（全程 ~25min）。腿级实测：第一波三平台
+   `Build & Test` 各 ~14–18min；第二波 `Test (DB=mysql|postgres)` /
+   `Redis+NATS+Kafka live` / `Integration (full)` 各 ~8min，且全部
+   `needs: [build-and-test]` 串行等待。macOS 腿 step 级分解：**Test-collection
+   gate 337s（42%）+ Run tests 273s（34%）**——同一套 2133 测试跑两遍，编译只有 7s
+   （缓存有效），瓶颈是纯执行。
+2. **A · gate 改运行时过滤（`scripts/check-test-collection.sh`）**：gate 的判定材料是
+   编译期的 `builtin.test_functions` 全集 + 运行时树遍历，**不需要执行其他测试**。框架行
+   改为 `zig build test -Dtest-force-run=true -Dtest-filter="test-collection gate"`：
+   过滤器是 `scripts/test-runner.zig` 的**运行时**过滤（编译期 `--test-filter` 会让
+   `builtin.test_functions` 萎缩、恰好毁掉 gate——build.zig:62-88 有实测记档），二进制
+   仍携带全量收集清单，gate 判定零变化。CLI 行不过滤（套件本身秒级，且
+   `tools/zmodu/build.zig` 无 test-filter 选项）。顺手修 macOS bash 3.2 下空数组
+   `"${extra[@]}"` 撞 `set -u` 的展开陷阱（改两条拼写完整的命令）。本地读数：整脚本
+   337s 量级 → **12s**（CLI 行 ~10s + 框架行 ~2s）；CI 上每腿 gate step 预计省 ~5min。
+   已知取舍：gate step 不再复跑全套件，「第二次运行才暴露」的 flake 不再被它捕捉——
+   这类捕捉本来就是偶然价值，归 nightly/soak 管。
+3. **D · 第二波 4 腿去 `needs` 并行（`ci.yml`）**：integration-full / test-postgres /
+   test-mysql / test-live-services 全部是 fresh checkout + 自己编译、不消费第一波任何
+   产物，`needs: [build-and-test]` 是纯排序门。移除后四腿与平台矩阵同时起跑，绿路径省
+   ~8min；红路径的代价是多烧一次服务腿算力（公开仓库免费），且基座红时 db 腿照常给出
+   自己的信号（如 macOS-only flake 不再阻塞 mysql 结果）。release 链
+   （docker → release）的 needs 保持不变。
+4. **§12.16 batch sweep 快照竞态修复（`runtime.zig` 的 `runShape`）**：第 113 批 CI
+   macOS 腿（run 36537286223）红在 gate 复跑阶段 `runtime.zig:7968`
+   `expectEqual(0, r.ready_len)`——首次 Run tests 绿、复跑才红，又是第二次运行限定。
+   机制在 `PoolSettled` 的 doc 里早有记档：生产者的 announce 落在最后一个 claim 内部时
+   会推一个「空 token」，它要等 pool 下一次 idle poll 才被排干；`runShape` 在
+   handled-wait 通过后**立即**快照 `poolStats()`，快照与排干之间存在合法窗口。兄弟测试
+   （fairness，7806 行）早已在快照前 `waitUntil(PoolSettled…)`，batch sweep 漏了。
+   修法照搬：停表后、快照前等 PoolSettled（`claimed == 0 && ready_len == 0`，有界预算；
+   真卡住的 token 永远到不了零，断言牙齿还在）。吞吐测量不受影响（settle 等待在
+   elapsed_ns 停表之后）。
+5. **门禁读数**：`bash scripts/check-test-collection.sh` 全跑 ✓（12s，两行 gate 均 OK）·
+   §12.16 过滤（batch sweep + fairness）**30/30 连跑 0 失败** · `zig fmt --check
+   src/runtime/runtime.zig` ✓ · `check-production.sh` ✓ · ci.yml `yaml.safe_load` ✓ ·
+   needs 残留复查 ✓（仅 release 链 1062/1107 两行，刻意保留）。
+
 ### 第 113 批：scheduler 竞态测试的线程计数测量加固（持续性区分器）+ supervisor SEGV 挂观察（**破坏性：否**）
 
 1. **缘起（第 111 批 CI macOS 腿红，run 36527902517）**：`check-test-collection` 复跑阶段两例失败 ——

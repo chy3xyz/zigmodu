@@ -7580,6 +7580,14 @@ fn runShape(
     }
     const elapsed_ns = time_mod.monotonicNow() - start_ns;
 
+    // The handled-wait can outrun the ready ring: a producer whose announce
+    // lands inside the last claim pushes a token with nothing behind it, and
+    // that token is drained one idle poll later (`PoolSettled` has the
+    // mechanism). Snapshot at the settled moment, not the handled one — a
+    // token that is *stuck* rather than merely un-drained never reaches zero,
+    // so the caller's `ready_len == 0` assertion keeps its teeth.
+    try waitUntil(PoolSettled(@TypeOf(rt)){ .rt = &rt }, observation_budget_ms);
+
     const pool = rt.poolStats().?;
     return .{
         .total = total,

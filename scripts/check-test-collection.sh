@@ -26,21 +26,27 @@
 # FUZZ_ROOTS: a package whose gate is added gets a row here, and a row whose gate
 # call site has been deleted fails the check instead of skipping silently.
 #
-#   <package build.zig>|<gate call site>|<source path prefix in build.zig>
+#   <package build.zig>|<gate call site>|<source path prefix in build.zig>|<test filter or ->
 #
 # The framework row (`build.zig|src/tests.zig|src`) is listed too. Its gate can
-# only run inside the library artifact, so the forced run below is the whole
-# 5-artifact suite (minutes, not seconds) rather than the CLI's seconds. CI's
-# `Run tests` step executes the same gate on a cold cache; this script is what
-# forces it to look at the tree *now* instead of replaying a cached verdict.
+# only run inside the library artifact — a 2000+ test binary whose full
+# execution takes minutes — so its forced run passes `-Dtest-filter=` and
+# executes just the gate test. That is sound because the filter is applied at
+# *runtime* by scripts/test-runner.zig: the binary still carries the complete
+# `builtin.test_functions` list the gate compares against the tree, and the
+# gate itself does the tree walk when it runs. The CLI row runs its whole
+# suite instead: it costs seconds, and tools/zmodu/build.zig has no
+# test-filter option. CI's `Run tests` step executes the same gate on a cold
+# cache; this script is what forces it to look at the tree *now* instead of
+# replaying a cached verdict.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$ROOT/.zig-global-cache}"
 
 GATES=(
-  "tools/zmodu/build.zig|tools/zmodu/src/main.zig|src"
-  "build.zig|src/tests.zig|src"
+  "tools/zmodu/build.zig|tools/zmodu/src/main.zig|src|-"
+  "build.zig|src/tests.zig|src|test-collection gate"
 )
 
 fail=0
@@ -62,7 +68,7 @@ exclusions_of() {
 }
 
 for row in "${GATES[@]}"; do
-  IFS='|' read -r build_zig call_site prefix <<<"$row"
+  IFS='|' read -r build_zig call_site prefix filter <<<"$row"
   if [[ ! -f "$call_site" ]]; then
     echo "check-test-collection: gate call site is missing: $call_site" >&2
     fail=1
@@ -83,11 +89,21 @@ for row in "${GATES[@]}"; do
   done < <(exclusions_of "$call_site")
 
   # Forced run: the gate must look at the tree *now*, not at a cached verdict.
+  # A row with a filter executes only the gate test — the filter is applied at
+  # runtime (scripts/test-runner.zig), so the binary's `builtin.test_functions`
+  # still lists every collected test and the comparison is unchanged.
   log="$(mktemp -t zm-test-collection.XXXXXX)"
   pkg_dir="$(dirname "$build_zig")"
-  if (cd "$pkg_dir" && zig build test -Dtest-force-run=true --summary all) >"$log" 2>&1; then
+  # Two spelled-out commands rather than an args array: the macOS bash is 3.2,
+  # where `"${arr[@]}"` on an empty array trips `set -u`.
+  if [[ "$filter" != "-" ]]; then
+    (cd "$pkg_dir" && zig build test -Dtest-force-run=true "-Dtest-filter=$filter" --summary all) >"$log" 2>&1 && run_ok=1 || run_ok=0
+  else
+    (cd "$pkg_dir" && zig build test -Dtest-force-run=true --summary all) >"$log" 2>&1 && run_ok=1 || run_ok=0
+  fi
+  if [[ "$run_ok" -eq 1 ]]; then
     grep -E 'Build Summary:' "$log" | tail -1 | sed "s|^|check-test-collection: ${pkg_dir}: |"
-    grep -E 'test-collection' "$log" | sed 's/^/check-test-collection: /' || true
+    grep -E 'test-collection gate:' "$log" | sed 's/^/check-test-collection: /' || true
   else
     echo "check-test-collection: the test-collection gate failed in ${pkg_dir}:" >&2
     cat "$log" >&2

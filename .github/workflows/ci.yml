@@ -246,7 +246,10 @@ jobs:
         # `builtin.test_functions` and runs *inside* the test artifacts — so it
         # needs the `Run tests` step's cold compile to see every file, and this
         # forced re-run is what makes a newly added, imported-by-nobody file fail
-        # here. See src/test/TestCollection.zig.
+        # here. The framework row runs with `-Dtest-filter=test-collection gate`
+        # (a *runtime* filter — the full collected list stays in the binary), so
+        # this step executes only the gate test instead of the suite a second
+        # time. See src/test/TestCollection.zig.
         run: bash scripts/check-test-collection.sh
 
       - name: Build framework examples
@@ -516,7 +519,10 @@ jobs:
     name: Integration (full)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [build-and-test]
+    # No `needs: [build-and-test]` on purpose: this job consumes nothing from
+    # the platform matrix (fresh checkout, own compile), and starting in
+    # parallel takes ~8 minutes off the green path. A broken base build costs
+    # a wasted run here, never a wrong result.
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     steps:
       - uses: actions/checkout@v4
@@ -579,7 +585,9 @@ jobs:
     # A hanging test used to burn the run's 6-hour default here; the step also
     # lacked the logged-runner wrapper, so a hang produced no artifact at all.
     timeout-minutes: 30
-    needs: [build-and-test]
+    # No `needs: [build-and-test]`: fresh checkout, own compile, nothing
+    # consumed from the platform matrix — starting in parallel takes ~8
+    # minutes off the green path.
     services:
       postgres:
         image: postgres:16
@@ -653,7 +661,9 @@ jobs:
     name: Test (DB=mysql)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [build-and-test]
+    # No `needs: [build-and-test]`: fresh checkout, own compile, nothing
+    # consumed from the platform matrix — starting in parallel takes ~8
+    # minutes off the green path.
     services:
       mysql:
         image: mariadb:11
@@ -720,7 +730,9 @@ jobs:
     name: Test (Redis + NATS + Kafka live)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [build-and-test]
+    # No `needs: [build-and-test]`: fresh checkout, own compile, nothing
+    # consumed from the platform matrix — starting in parallel takes ~8
+    # minutes off the green path.
     services:
       redis:
         image: redis:7
