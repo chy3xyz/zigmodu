@@ -12,6 +12,7 @@
 //!   CREATE <name>\t<partitions>    → OK | ERR <message>
 
 const std = @import("std");
+const netdial = @import("../core/netdial.zig");
 const Connector = @import("FluvioConnector.zig");
 
 const Record = Connector.Record;
@@ -25,7 +26,9 @@ pub const NativeTransport = struct {
 
     pub fn connect(allocator: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) !Self {
         const addr = try std.Io.net.IpAddress.parseIp4(host, port);
-        const stream = try addr.connect(io, .{ .mode = .stream });
+        // netdial, not std: a signal inside std's blocking connect panics on
+        // the EINTR retry's EISCONN (`errnoBug`) — core/netdial.zig.
+        const stream = try netdial.connectBlocking(io, addr);
         return .{ .allocator = allocator, .io = io, .stream = stream };
     }
 

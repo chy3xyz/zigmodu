@@ -49,6 +49,7 @@ test "compile all source files" {
     _ = @import("core/HealthEndpoint.zig");
     _ = @import("extensions/HotReloader.zig");
     _ = @import("core/Lifecycle.zig");
+    _ = @import("core/netdial.zig");
     _ = @import("core/Module.zig");
     _ = @import("core/ModuleBoundary.zig");
     _ = @import("core/ModuleCapabilities.zig");

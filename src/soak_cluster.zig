@@ -148,6 +148,11 @@ const Time = zigmodu.time;
 const RaftWire = zigmodu.RaftTransport;
 const DistributedEventBus = zigmodu.DistributedEventBus;
 const ClusterBootstrap = zigmodu.ClusterBootstrap;
+// Through the zigmodu module, not a path import: a path import would compile
+// netdial.zig into this module while the zigmodu module already owns it
+// ("file exists in modules 'root' and 'zigmodu'"). Same discipline as the
+// RaftElection note below — one instance, reached through the public surface.
+const netdial = zigmodu.netdial;
 
 // ── sizing (build options) ──────────────────────────────────────────────────
 
@@ -557,7 +562,7 @@ fn SoakTransport(comptime slot: usize) type {
                 return;
             };
             const addr = std.Io.net.IpAddress.parse(ep.host, ep.port) catch return;
-            const stream = addr.connect(io, .{ .mode = .stream }) catch |err| {
+            const stream = netdial.connectBlocking(io, addr) catch |err| {
                 std.log.debug("[soak-cluster] connect {s}:{d} failed, vote dropped ({})", .{ ep.host, ep.port, err });
                 return;
             };
@@ -580,7 +585,7 @@ fn SoakTransport(comptime slot: usize) type {
             RaftWire.encodeAppendEntries(&frame, self.allocator, req) catch return lost;
 
             const addr = std.Io.net.IpAddress.parse(ep.host, ep.port) catch return lost;
-            const stream = addr.connect(io, .{ .mode = .stream }) catch return lost;
+            const stream = netdial.connectBlocking(io, addr) catch return lost;
             defer stream.close(io);
             setSockTimeoutMs(stream.socket.handle, std.posix.SO.SNDTIMEO, self.rpc_timeout_ms);
             setSockTimeoutMs(stream.socket.handle, std.posix.SO.RCVTIMEO, self.rpc_timeout_ms);
@@ -616,7 +621,7 @@ fn SoakTransport(comptime slot: usize) type {
             RaftWire.encodeInstallSnapshot(&frame, self.allocator, req) catch return lost;
 
             const addr = std.Io.net.IpAddress.parse(ep.host, ep.port) catch return lost;
-            const stream = addr.connect(io, .{ .mode = .stream }) catch return lost;
+            const stream = netdial.connectBlocking(io, addr) catch return lost;
             defer stream.close(io);
             setSockTimeoutMs(stream.socket.handle, std.posix.SO.SNDTIMEO, self.rpc_timeout_ms);
             setSockTimeoutMs(stream.socket.handle, std.posix.SO.RCVTIMEO, self.rpc_timeout_ms);

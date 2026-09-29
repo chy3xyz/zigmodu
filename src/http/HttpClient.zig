@@ -1,5 +1,6 @@
 const std = @import("std");
 const Time = @import("../core/Time.zig");
+const netdial = @import("../core/netdial.zig");
 
 /// HTTP client with connection pool and retry
 pub const HttpClient = struct {
@@ -165,7 +166,9 @@ pub const HttpClient = struct {
             }
 
             const addr = try std.Io.net.IpAddress.resolve(self.io, host, port);
-            const stream = try addr.connect(self.io, .{ .mode = .stream });
+            // netdial, not std: a signal inside std's blocking connect panics
+            // on the EINTR retry's EISCONN (`errnoBug`) — core/netdial.zig.
+            const stream = try netdial.connectBlocking(self.io, addr);
             // Nothing owns the socket or the copy yet, so these are the only
             // chances to close/free them if a later step fails: the append below
             // is the last fallible operation before the pool takes over.

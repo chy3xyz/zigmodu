@@ -2,6 +2,75 @@
 
 ## [Unreleased]
 
+### 第 112 批：修掉全框架阻塞 dial 的「EINTR 重试 → EISCONN → panic」陷阱（**破坏性：否**）
+
+1. **根因（一句话）**：std 0.17.0-dev.2151 的 `Io.Threaded.posixConnect`
+   （Threaded.zig:12194-12224）对阻塞 `connect(2)` 的 `.INTR` 分支在**同一 socket** 上
+   `continue` 重试，却把重试撞上的 `.ISCONN` 送进 `errnoBug` → panic；POSIX 语义是
+   "阻塞 connect 被信号打断后连接在后台继续建立，重试返回 EISCONN **就是**成功报告"，
+   所以任何落在阻塞 dial 窗口内的信号（实测是 SIGTERM）都会带走进程。事故栈：
+   `ci-mixed-version.sh` 复跑时 mv-c 节点退出码 134（SIGABRT），
+   `errnoBug` ← `posixConnect` ← `netConnectIpPosix` ← `Io.net.IpAddress.connect` ←
+   `HarnessTransport.sendAppendEntries` ← `RaftElection.tick`；loopback 下握手微秒级
+   完成，EINTR 重试几乎必然撞 EISCONN。
+2. **影响面**：不是 harness 独有 —— 全框架**所有**阻塞 dial 共用 std 这条路：
+   集群传输（`RaftTransport.connectTimeout` 的 timeout==0 无界回落、`NetworkTransport.connect`、
+   `ClusterBootstrap.wakeAccept`）、`KafkaConnector.connect`、`DistributedEventBus.registerNode`
+   的出站 dial、`redis`、`Nats`、`FluvioNative`、`HttpClient` 连接池，以及 soak/cluster-node
+   两个 harness。（任务清单实测漏了 redis×2 / Nats / FluvioNative / HttpClient /
+   soak_cluster 第三处 sendInstallSnapshot —— 同一 grep 复查补齐，一并未换。）
+3. **修法**：新建 `src/core/netdial.zig`（经 `root.zig` 导出为 `zigmodu.netdial`）——
+   `connectBlocking(io, addr)` 用 raw `posix.system.socket/connect` 自管重试循环，
+   errno 分类提成纯函数 `classifyConnectErrno`：`ISCONN → connected`（POSIX 正解）、
+   `INTR → retry`、具名 errno 全部映射到与 std **同名**错误（`ConnectionRefused` /
+   `HostUnreachable` / `NetworkUnreachable` / `Timeout` / `AccessDenied` / `NetworkDown` /
+   `ConnectionPending` / `WouldBlock` …，显式 error set 是 `IpAddress.ConnectError` 的子集，
+   调用点 `try`/`catch` 形状零改动）；std 当作程序 bug panic 的 errno 集
+   （BADF/CONNABORTED/FAULT/NOENT/NOTSOCK/PERM/PROTOTYPE）一律降为 `error.Unexpected`
+   —— dial 不许带走进程（EPERM 正是 macOS seatbelt 沙箱对 connect 的回答，本就是
+   可报告失败，`test/NetworkProbe.zig` 存在的理由）。Windows 腿：`connectBlocking` 经
+   comptime 分支委派回 std 的 `IpAddress.connect`（WSA 阻塞 connect 无此 EINTR/EISCONN
+   不对称），POSIX 半边在 Windows 目标永不被分析。harness 侧 `src/cluster_node.zig`
+   **本地复制**一份 ~35 行 `dialBlocking`（不许 import netdial：该文件同源码跨
+   master/v0.32.0 两棵树编译，v0.32.0 没有 netdial.zig；走的 `std.posix.system` /
+   `std.Io.Threaded.addressToPosix` 都是 std，同一钉死工具链下两棵树一致）。
+   `soak_cluster.zig` 走 `zigmodu.netdial` 模块导出而非 path import —— path import 会把
+   netdial.zig 重复编进 harness 模块（`file exists in modules 'root' and 'zigmodu'`），
+   与 RaftElection vtable 的"第二实例"纪律同源。
+4. **测试与变异证据**：netdial 6 条新单测全绿 —— classify 逐条断言
+   （SUCCESS/ISCONN→connected、INTR→retry、12 个具名 errno→同名错误、std panic 集
+   7 个→unexpected）+ loopback 实测（连本地监听口收发 "ping" 往返；连已关闭端口
+   `ConnectionRefused`）。变异验红：把 classify 的 `.ISCONN => .connected` 改成
+   `.unexpected = e }`（= std 的"当 bug"语义）→ `classifyConnectErrno: SUCCESS and
+   ISCONN both mean connected` 红（`expected .connected, found .unexpected`，
+   test-fast exit 1）→ 还原后 6/6 复绿（exit 0）。不刻意写信号竞态压力测试
+   （天然 flaky）：覆盖方式是纯函数表单测把 EISCONN 语义钉死 + 门禁 6 的事故现场
+   复跑连续绿。
+5. **门禁读数**（逐条串行，直看退出码）：`zig build fmt-check` **exit 0** ·
+   `zig build check`（check-production）**exit 0** · `scripts/check-version.sh`
+   **exit 0** · 全量 `zig build test`（默认 `-Ddb=all`）**exit 0**（226 s 真实执行 +
+   缓存复跑 exit 0；日志中两条 `failed command` 行为 master 既有打印怪癖 ——
+   runtime_stress/soak harness 二进制先打 `RESULT: PASS`，第 111 批
+   `tmp/a2-batch111-test.log` 同形，非本批引入）· 聚焦回归：netdial 6/6 ·
+   RaftTransport 29/29 · DistributedEventBus 53/53 · HttpClient 32/32 · redis 18+5skip
+   （live 门控）· ClusterBootstrap 14/14 · Nats 3+3skip（live 门控）·
+   `zig build soak-cluster` **exit 0** · `bash scripts/ci-mixed-version.sh`
+   **连续 3 次 exit 0**（正是事故现场：同版本三节点唯一选主、混合对跑拒旧节点、
+   六节点 SIGTERM 全部 `CN SHUTDOWN clean`）·
+   `zig build -Ddb=none -Dtarget=x86_64-windows` **exit 0**（产物新编确认；
+   逐文件：netdial/RaftTransport/NetworkTransport/ClusterBootstrap 属 POSIX-only 集群层，
+   Windows 腿本就不分析；KafkaConnector/DistributedEventBus/redis/Nats/FluvioNative/
+   HttpClient 改动的函数体是惰性分析、Windows 安装产物（example/gen-jwt/replay-inspect）
+   均不触达，且替换进去的 `netdial.connectBlocking` 本身 Windows 安全；
+   soak_cluster/cluster_node 不在 Windows 默认安装集）。
+6. **不在范围**：std 上游**不修**（netdial 是绕过，std 修复后本 helper 无害保留 ——
+   语义就是 POSIX 正解）；`RaftTransport.connectTimeout` 的非阻塞主路径（timeout>0：
+   单次 connect + poll/SO_ERROR）**本来就免疫** —— 核实过它对 `.INPROGRESS/.AGAIN/.INTR`
+   一律进 `awaitConnect` 等结果而**不重试** connect，没有重试就没有 EISCONN，本批只把
+   它 timeout==0 的无界回落从 std 换成 netdial；`.ALREADY`（重试时连接仍在飞）保持 std
+   的 `ConnectionPending` 映射不变（拉成 poll 等待会改 dial 的有界契约，另行评估）；
+   Unix-domain socket（std 另有 `posixConnectUnix`，同形不同路径）不在本批。
+
 ### 第 111 批：A-2 定界 —— 集群面明文/TLS 边界收口（删死代码 + 认证 helpers 文件改名归位；**破坏性：否**）
 
 1. **批次性质**：这是**定界批**，不是加密实现批。v0.35 判定表 A-2 行（"无加密（帧明文）"）

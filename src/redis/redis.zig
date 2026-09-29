@@ -14,6 +14,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const errors = @import("../sqlx/errors.zig");
+const netdial = @import("../core/netdial.zig");
 const sockread = @import("../core/sockread.zig");
 
 // ==== §1  RESP framing ====
@@ -260,7 +261,9 @@ pub const Redis = struct {
     /// Connect to Redis server (opens primary stream; pool fills on demand).
     pub fn connect(self: *Redis) !void {
         const address = std.Io.net.IpAddress.parseIp4(self.config.host, self.config.port) catch return error.RedisError;
-        self.stream = address.connect(self.io, .{ .mode = .stream }) catch return error.RedisError;
+        // netdial, not std: a signal inside std's blocking connect panics on
+        // the EINTR retry's EISCONN (`errnoBug`) — core/netdial.zig.
+        self.stream = netdial.connectBlocking(self.io, address) catch return error.RedisError;
         // `write_timeout_ms` used to be declared and never applied: a stalled
         // Redis made writes block forever (and held `stream_mu` while doing it).
         if (self.stream) |s| sockread.setSendTimeout(s, self.config.write_timeout_ms);
@@ -288,7 +291,7 @@ pub const Redis = struct {
                     return .{ .stream = slot.*.?, .pool_idx = i };
                 }
                 const address = std.Io.net.IpAddress.parseIp4(self.config.host, self.config.port) catch return error.RedisError;
-                const s = address.connect(self.io, .{ .mode = .stream }) catch return error.RedisError;
+                const s = netdial.connectBlocking(self.io, address) catch return error.RedisError;
                 slot.* = s;
                 p.in_use[i] = true;
                 return .{ .stream = s, .pool_idx = i };

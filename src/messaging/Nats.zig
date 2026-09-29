@@ -7,6 +7,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Time = @import("../core/Time.zig");
+const netdial = @import("../core/netdial.zig");
 const sockread = @import("../core/sockread.zig");
 
 pub const NatsConfig = struct {
@@ -97,7 +98,9 @@ pub const NatsClient = struct {
     /// Returns server info parsed from the INFO line.
     pub fn connect(self: *Self) !ServerInfo {
         const addr = try std.Io.net.IpAddress.parseIp4(self.config.url, self.config.port);
-        const stream = try addr.connect(self.io, .{ .mode = .stream });
+        // netdial, not std: a signal inside std's blocking connect panics on
+        // the EINTR retry's EISCONN (`errnoBug`) — core/netdial.zig.
+        const stream = try netdial.connectBlocking(self.io, addr);
         errdefer stream.close(self.io);
 
         // ── Read server INFO ──

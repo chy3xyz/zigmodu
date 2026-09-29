@@ -248,6 +248,10 @@ pub const RaftElection = @import("core/cluster/RaftElection.zig").RaftElection;
 /// The real transport behind `RaftElection` (`docs/DISTRIBUTED.md`「真选主要什么」):
 /// outbound vote/replication RPCs over TCP, inbound dispatch, address book.
 pub const RaftTransport = @import("core/cluster/RaftTransport.zig");
+/// Blocking TCP dial without std's EINTR→EISCONN panic (`posixConnect` reads
+/// the retry's EISCONN as `errnoBug`; POSIX says it is the success report).
+/// Every framework blocking dial goes through this.
+pub const netdial = @import("core/netdial.zig");
 /// Peer discovery for multi-node deployments (seeds / registry).
 pub const PeerDiscovery = @import("core/cluster/PeerDiscovery.zig").PeerDiscovery;
 /// Client-side load balancing across peers.

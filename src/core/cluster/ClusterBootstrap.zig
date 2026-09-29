@@ -25,6 +25,7 @@
 //!   const owner = cluster.pick("order-1") orelse return error.NoHealthyNode;
 
 const std = @import("std");
+const netdial = @import("../netdial.zig");
 const PeerDiscovery = @import("PeerDiscovery.zig").PeerDiscovery;
 const NetworkTransport = @import("NetworkTransport.zig");
 const RaftTransport = @import("RaftTransport.zig");
@@ -589,9 +590,12 @@ pub const ClusterBootstrap = struct {
 };
 
 /// Poke a listener whose accept loop is blocked, so it can observe `running=false`.
+///
+/// netdial rather than std: the wake is a blocking connect like any other, and
+/// std's panics when a signal interrupts it (EINTR retry → EISCONN → errnoBug).
 fn wakeAccept(io: std.Io, port: u16) void {
     const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", port) catch return;
-    const stream = addr.connect(io, .{ .mode = .stream }) catch return;
+    const stream = netdial.connectBlocking(io, addr) catch return;
     stream.close(io);
 }
 

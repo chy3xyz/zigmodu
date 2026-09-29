@@ -1,5 +1,6 @@
 const std = @import("std");
 const Time = @import("Time.zig");
+const netdial = @import("netdial.zig");
 const sockread = @import("sockread.zig");
 const TypedEventBus = @import("EventBus.zig").TypedEventBus;
 const ArrayList = std.array_list.Managed;
@@ -2535,7 +2536,11 @@ pub const DistributedEventBus = struct {
         // while they run, and the entry is inert until the socket is installed
         // (`reservation`, and `socket == null`).
         var stream: ?std.Io.net.Stream = null;
-        stream = address.connect(self.io, .{ .mode = .stream }) catch |err| blk: {
+        // netdial, not std's `IpAddress.connect`: a signal landing inside the
+        // blocking dial makes std's EINTR retry panic on EISCONN (`errnoBug`)
+        // — the batch-112 trap, see core/netdial.zig. The helper's error set
+        // is a subset of the std call's, so this catch reads exactly as before.
+        stream = netdial.connectBlocking(self.io, address) catch |err| blk: {
             std.log.warn("[DistributedEventBus] Connection to {s} at {any} failed: {}", .{ node_id, address, err });
             break :blk null;
         };
@@ -5475,7 +5480,7 @@ test "a registry snapshot is safe while the registry is being rebuilt" {
     try std.testing.expect(accepted.load(.acquire) > 0);
 
     stop.store(true, .release);
-    if (addr.connect(io, .{ .mode = .stream })) |wake| {
+    if (netdial.connectBlocking(io, addr)) |wake| {
         wake.close(io);
     } else |err| {
         std.log.debug("[test] peer drain wake-up failed: {}", .{err});

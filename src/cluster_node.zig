@@ -354,6 +354,45 @@ fn setSockTimeoutMs(stream: std.posix.socket_t, opt: u32, timeout_ms: u32) void 
     if (rc != 0) note("SOCKOPT_FAILED opt={d} errno={s}", .{ opt, @tagName(std.posix.errno(rc)) });
 }
 
+/// Blocking connect(2) with std's EINTR→EISCONN panic fixed by hand.
+///
+/// std 0.17.0-dev.2151's `Io.Threaded.posixConnect` retries an interrupted
+/// blocking connect on the same socket and maps the retry's EISCONN to
+/// `errnoBug` → panic (Threaded.zig:12218). POSIX says the EINTR'd attempt
+/// establishes asynchronously, so EISCONN *is* the success report — a SIGTERM
+/// landing inside this dial used to abort the node (exit 134, measured on
+/// mv-c in ci-mixed-version.sh).
+///
+/// This is a local copy of master's `src/core/netdial.zig`, on purpose: this
+/// file also compiles against a v0.32.0 tree (see the header), which has no
+/// netdial.zig to import. The surface it touches (`std.posix.system`,
+/// `std.Io.Threaded.addressToPosix`) is std, identical under the one pinned
+/// toolchain both builds use — the same discipline as `readFullSock` above.
+fn dialBlocking(addr: std.Io.net.IpAddress) !std.Io.net.Stream {
+    var storage: std.Io.Threaded.PosixAddress = undefined;
+    const addr_len = std.Io.Threaded.addressToPosix(&addr, &storage);
+    const rc = std.posix.system.socket(std.Io.Threaded.posixAddressFamily(&addr), std.posix.SOCK.STREAM, 0);
+    const fd: std.posix.socket_t = switch (std.posix.errno(rc)) {
+        .SUCCESS => @intCast(rc),
+        else => |e| return std.posix.unexpectedErrno(e),
+    };
+    errdefer std.Io.Threaded.closeFd(fd);
+    while (true) {
+        switch (std.posix.errno(std.posix.system.connect(fd, &storage.any, addr_len))) {
+            .SUCCESS, .ISCONN => break,
+            .INTR => continue,
+            .CONNREFUSED => return error.ConnectionRefused,
+            .HOSTUNREACH => return error.HostUnreachable,
+            .NETUNREACH => return error.NetworkUnreachable,
+            .TIMEDOUT => return error.Timeout,
+            .ACCES => return error.AccessDenied,
+            .NETDOWN => return error.NetworkDown,
+            else => |e| return std.posix.unexpectedErrno(e),
+        }
+    }
+    return .{ .socket = .{ .handle = fd, .address = addr } };
+}
+
 fn writeFrameAuth(io: std.Io, stream: std.Io.net.Stream, secret: ?[32]u8, frame: []const u8) !void {
     var header: [4]u8 = undefined;
     if (secret) |key| {
@@ -495,7 +534,7 @@ const HarnessTransport = struct {
             return;
         };
         const addr = std.Io.net.IpAddress.parse(ep.host, ep.port) catch return;
-        const stream = addr.connect(self.io, .{ .mode = .stream }) catch {
+        const stream = dialBlocking(addr) catch {
             // A peer that is down or refused is a lost vote, re-tried at the
             // next election timeout — raft's own failure model.
             return;
@@ -519,7 +558,7 @@ const HarnessTransport = struct {
         RaftWire.encodeAppendEntries(&frame, self.allocator, req) catch return lost;
 
         const addr = std.Io.net.IpAddress.parse(ep.host, ep.port) catch return lost;
-        const stream = addr.connect(self.io, .{ .mode = .stream }) catch return lost;
+        const stream = dialBlocking(addr) catch return lost;
         defer stream.close(self.io);
         setSockTimeoutMs(stream.socket.handle, std.posix.SO.SNDTIMEO, self.rpc_timeout_ms);
         setSockTimeoutMs(stream.socket.handle, std.posix.SO.RCVTIMEO, self.rpc_timeout_ms);
@@ -562,7 +601,7 @@ const HarnessTransport = struct {
         RaftWire.encodeInstallSnapshot(&frame, self.allocator, req) catch return lost;
 
         const addr = std.Io.net.IpAddress.parse(ep.host, ep.port) catch return lost;
-        const stream = addr.connect(self.io, .{ .mode = .stream }) catch return lost;
+        const stream = dialBlocking(addr) catch return lost;
         defer stream.close(self.io);
         setSockTimeoutMs(stream.socket.handle, std.posix.SO.SNDTIMEO, self.rpc_timeout_ms);
         setSockTimeoutMs(stream.socket.handle, std.posix.SO.RCVTIMEO, self.rpc_timeout_ms);

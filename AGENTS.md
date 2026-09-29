@@ -95,6 +95,7 @@ CI、`scripts/ci-*.sh`、本文件都用那个。`cd tools/zmodu && zig build` �
 | WS 路由：`ws_routes` 每项**显式** `.meta.auth = .public`（`ComptimeRouter.zig:734-758` 强制；非 public 或省掉 `.meta` 都是**编译错**，`permission`/`roles` 也被拒） | 省掉 `.meta`（`.auth` 默认 `.inherit` → 编译不过）；给 WS 路由挂 `permission`/`roles` |
 | CSPRNG：`std.Io.randomSecure(io, buf)` —— 每次系统调用，失败即 `error.EntropyUnavailable`、**无回落** | `std.crypto.random`（**本工具链无此声明**）；`std.Io.random`（文档明写失败回落 pid+墙钟+ASLR）；单一时间戳种子；`std.Random.DefaultPrng.init(seed)`（时钟^指针 → 同一个 challenge） |
 | sqlx：`Client.open` 后注意 pool/client 指针；CB 传 `io` | 在 ConnPool 上缓存失效的 `*Client` |
+| 阻塞 TCP dial：`zigmodu.netdial.connectBlocking(io, addr)`（std `posixConnect` 的 EINTR 重试撞 EISCONN 会 `errnoBug` panic —— 信号落进 dial 窗口 = 进程死；第 112 批） | 新代码直接 `addr.connect(io, .{ .mode = .stream })`（生产路径全已换走；需超时要 `RaftTransport.connectTimeout`，其非阻塞主路径本免疫） |
 | sqlx 驱动链接：`-Ddb=sqlite\|postgres\|mysql\|all`（默认 `all`） | 小系统用 `.db = "sqlite"`，勿默认三库全链 |
 | Runtime 监督树：`rt.spawnGroup(.one_for_one\|.one_for_all\|.rest_for_one\|.stop_group)` + `Supervision.group`；重建是原地 `deinit`+`init`（`docs/RUNTIME.md` §14） | 让 handler 自己 `catch` 装作没事（错误预算就废了）；把声明 `run` 的 worker 放进会重建的组（spawn 报 `NotRestartable`） |
 | Agent：`AgentSpec{.guard=…}` + 技能声明 `.action`（默认 `execute`）；`ai.ProposalPipeline` 走提议→风险→执行 | 裸 `Agent{}` 不设 `guard`（= **无界**）；用 `MemoryStore.formatContext` 给 agent 喂记忆（`0` = 任意 = 跨租户） |

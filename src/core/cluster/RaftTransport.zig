@@ -27,6 +27,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const NetworkTransport = @import("NetworkTransport.zig");
+const netdial = @import("../netdial.zig");
 const sockread = @import("../sockread.zig");
 const ClusterAuth = @import("ClusterAuth.zig").ClusterAuth;
 const RaftElection = @import("RaftElection.zig").RaftElection;
@@ -591,11 +592,18 @@ pub const ConnectTimeoutError = std.Io.net.IpAddress.ConnectError || error{Conne
 /// path, for one, treats as a programmer bug and panics on in debug builds.
 ///
 /// POSIX only: on Windows, where `std.posix.system` has no `poll`, this falls
-/// back to the unbounded `IpAddress.connect`. The raw-syscall layer it is built
-/// on (`sockread`) is POSIX-only already.
+/// back to the unbounded dial — `netdial.connectBlocking`, which delegates to
+/// `IpAddress.connect` there. The raw-syscall layer it is built on
+/// (`sockread`) is POSIX-only already. The unbounded branch goes through
+/// netdial on POSIX too: std's blocking connect panics when a signal
+/// interrupts it (EINTR retry → EISCONN → `errnoBug`; see `core/netdial.zig`).
 pub fn connectTimeout(io: std.Io, addr: std.Io.net.IpAddress, timeout_ms: u32) ConnectTimeoutError!std.Io.net.Stream {
     if (builtin.os.tag == .windows or timeout_ms == 0) {
-        return addr.connect(io, .{ .mode = .stream });
+        // The unbounded fallback still must not panic on EINTR→EISCONN (std's
+        // posixConnect reads the retry's EISCONN as errnoBug — the batch-112
+        // trap), so it dials through netdial rather than std. On Windows
+        // netdial delegates back to std, which is fine there.
+        return netdial.connectBlocking(io, addr);
     }
 
     var storage: std.Io.Threaded.PosixAddress = undefined;

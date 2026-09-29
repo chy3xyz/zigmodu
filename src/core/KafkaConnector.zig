@@ -23,6 +23,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Time = @import("../core/Time.zig");
+const netdial = @import("netdial.zig");
 const sockread = @import("sockread.zig");
 
 // ==== §1  Message & config types ====
@@ -209,7 +210,9 @@ pub const RobustMQTransport = struct {
     pub fn connect(self: *Self) !void {
         if (self.stream != null) return;
         const addr = try std.Io.net.IpAddress.parseIp4(self.host, self.port);
-        const stream = try addr.connect(self.io, .{ .mode = .stream });
+        // netdial, not std: a signal landing inside std's blocking connect
+        // panics on the EINTR retry's EISCONN (`errnoBug`) — core/netdial.zig.
+        const stream = try netdial.connectBlocking(self.io, addr);
         self.stream = stream;
         // Negotiate API versions (best-effort; ignore body details).
         self.sendApiVersions() catch |err| {

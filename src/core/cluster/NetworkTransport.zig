@@ -7,6 +7,7 @@
 //! Protocol: 4-byte big-endian length + JSON payload
 
 const std = @import("std");
+const netdial = @import("../netdial.zig");
 const sockread = @import("../sockread.zig");
 
 /// Maximum message size (1MB) to prevent memory exhaustion.
@@ -201,9 +202,14 @@ pub const ClusterServer = struct {
 };
 
 /// Connect to a remote cluster node.
+///
+/// Dials through `netdial.connectBlocking` rather than std: a signal landing
+/// inside std's blocking connect makes its EINTR retry panic on EISCONN
+/// (`errnoBug`), which is a process kill from a shutdown signal — see
+/// `core/netdial.zig`.
 pub fn connect(allocator: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) !ClusterConnection {
     const addr = try std.Io.net.IpAddress.parse(host, port);
-    const stream = try addr.connect(io, .{});
+    const stream = try netdial.connectBlocking(io, addr);
     return ClusterConnection.init(allocator, stream, io);
 }
 
