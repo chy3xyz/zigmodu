@@ -2,6 +2,36 @@
 
 ## [Unreleased]
 
+### 第 113 批：scheduler 竞态测试的线程计数测量加固（持续性区分器）+ supervisor SEGV 挂观察（**破坏性：否**）
+
+1. **缘起（第 111 批 CI macOS 腿红，run 36527902517）**：`check-test-collection` 复跑阶段两例失败 ——
+   ① `scheduler: two concurrent first starts spawn exactly one pool thread` 红：`expected 4, found 5`
+   （`scheduler.zig` 的 OS 线程计数断言，期望值 = before+3）；② `Supervisor: the budget is spent…`
+   **SEGV**，崩溃在 `std/atomic.zig:21 load` 且栈只有一帧（unwind 即坏），fault 地址
+   0x1090e0974；同run汇总另有 3 leaks（崩溃测试的 defer 未跑，是崩溃的附带物不是第二个问题）。
+   同 commit 的首次 `zig build test`（Run tests 步）全绿，第 110/112 批 CI 同测试也全绿。
+2. **本地复现结论（master @ 第 112 批）**：聚焦 20/20 × 两条测试全绿；全量套件
+   `-Dtest-force-run=true` × 6 连续全绿（0 SEGV）。判定为**罕见环境 flake**（CI 共享 runner），
+   不是确定性回归。
+3. **scheduler 测试加固（本批改动）**：`start()` 的并发断言靠 `task_threads`/`/proc/self/task`
+   的 OS 线程计数 —— 它是孤儿 pool 线程的唯一见证（孤儿没有被记录的句柄，调度器内部计数看不见
+   它），但也把**外来线程**算进去（macOS 的 GCD worker、上一个测试未收完的线程）。孤儿永不退出
+   （`poolMain` 循环到 shutdown），外来线程转瞬即逝 —— 按**持续性**区分：新增
+   `expectLiveThreadCount(want)`，~2s 窗口内 10ms 间隔复测，收敛即过、超时才败并打印
+   卡住的读数。四处断言点（declared-width 测试 3 处 + 竞态测试 1 处）全部换用。
+   **这比原单发断言更强**：真孤儿（原 bug 形态：两个 start 各 spawn 一个 pool 线程）依旧必败，
+   瞬时外来线程不再误伤。`start()` 的 start_claim CAS 逻辑本身审读无缺陷。
+4. **supervisor SEGV 挂观察（未关）**：崩溃测试本身是纯单线程逻辑（Group 预算计数 + Probe 栈上
+   原子计数，锁纪律审读干净），单帧崩溃+unwind 即坏指向**同进程先前测试的堆/栈污染**而非
+   supervisor 本身 —— 大二进制 2100+ 测试共享地址空间。现有证据不足以定位污染源；本地 6 次
+   全量+20 次聚焦不复现。处置：本条记档为 open-watch（CI run 36527902517 的完整栈已留档
+   /tmp/ci-111-macos.log 的叙事进本条目），CI 再发即升级为 P0 调查（带 seed 与 test-collection
+   复跑顺序二分）。
+5. **门禁读数**：聚焦回归 `concurrent` 过滤 17 通过 2 skip 0 fail、`declared width` 1/1 ·
+   `zig build fmt-check` ✓ · `zig build check` ✓ · `check-version.sh` ✓ · 全量
+   `zig build test`（db=all）✓（直看退出码）· `soak-cluster` ✓ · `ci-mixed-version.sh` ✓ ·
+   `x86_64-windows` 交叉编译 ✓（改动只在 scheduler.zig 的测试段，非测试编译单元不分析）。
+
 ### 第 112 批：修掉全框架阻塞 dial 的「EINTR 重试 → EISCONN → panic」陷阱（**破坏性：否**）
 
 1. **根因（一句话）**：std 0.17.0-dev.2151 的 `Io.Threaded.posixConnect`

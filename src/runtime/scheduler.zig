@@ -1791,19 +1791,19 @@ test "scheduler: the declared width is the number of threads started — and all
     // The count is the declared width, not "one if anything is running".
     try std.testing.expectEqual(@as(usize, width), sched.stats().pool_threads);
     try std.testing.expect(sched.stats().running);
-    if (before) |n| try std.testing.expectEqual(n + width, settledThreadCount().?);
+    if (before) |n| try expectLiveThreadCount(n + width);
 
     // Idempotent with a width too: a second `start` must not widen the pool.
     try sched.start();
     try std.testing.expectEqual(@as(usize, width), sched.stats().pool_threads);
-    if (before) |n| try std.testing.expectEqual(n + width, settledThreadCount().?);
+    if (before) |n| try expectLiveThreadCount(n + width);
 
     // Every thread is joined, not just the last one: `shutdown` takes the count
     // and joins that many, and `pool_threads` reads 0 once it is done.
     sched.shutdown();
     try std.testing.expectEqual(@as(usize, 0), sched.stats().pool_threads);
     try std.testing.expect(!sched.stats().running);
-    if (before) |n| try std.testing.expectEqual(n, settledThreadCount().?);
+    if (before) |n| try expectLiveThreadCount(n);
 }
 
 /// The live thread count, with a linger guard: a thread that has just returned
@@ -1814,6 +1814,34 @@ fn settledThreadCount() ?usize {
     var spins: usize = 0;
     while (spins < 200_000) : (spins += 1) std.atomic.spinLoopHint();
     return @min(first, liveThreadCount() orelse return null);
+}
+
+/// Assert-grade read of the OS thread count. The count is the only witness for
+/// an orphan thread (a leaked pool thread has no stored handle, so no counter
+/// inside the scheduler can see it), but it also counts *foreigners* — a GCD
+/// worker macOS spawned mid-measurement, a previous test's thread still tearing
+/// down (observed once on CI: `expected 4, found 5`). The orphan never exits on
+/// its own and the foreigner is transient, so discriminate by persistence:
+/// re-poll until the count reads `want`, and fail only when it has not
+/// converged after ~2 s. A null reading (platform cannot count) skips the
+/// assertion, same as the single-shot callers did.
+fn expectLiveThreadCount(want: usize) !void {
+    var waited_ms: u32 = 0;
+    while (true) {
+        const got = settledThreadCount() orelse return;
+        if (got == want) return;
+        if (waited_ms >= 2_000) {
+            std.log.info("[scheduler-test] live thread count stuck at {d}, want {d} (a persistent excess is an orphan thread; a transient one has converged by now)", .{ got, want });
+            return error.LiveThreadCountMismatch;
+        }
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .awake) catch |err| {
+            // A failed sleep must not spin hot for the rest of the window:
+            // count the slice as elapsed and keep polling — the assertion is on
+            // the thread count, not on the wall clock.
+            std.log.debug("[scheduler-test] poll sleep failed ({s}); treating the slice as elapsed", .{@errorName(err)});
+        };
+        waited_ms += 10;
+    }
 }
 
 /// How many OS threads this process runs right now, or null where the platform
@@ -1897,7 +1925,7 @@ test "scheduler: two concurrent first starts spawn exactly one pool thread" {
         }
 
         // Two callers, one pool thread: `before + 2 (the callers) + 1`.
-        try std.testing.expectEqual(before + 3, settledThreadCount().?);
+        try expectLiveThreadCount(before + 3);
         try std.testing.expect(ok.load(.acquire));
         try std.testing.expectEqual(@as(usize, 1), sched.stats().pool_threads);
 
