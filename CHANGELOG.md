@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.38.0] - 2026-09-29
 
 ### 第 108 批：Windows 交叉编译腿被 cluster-node 打红 —— harness 按 POSIX-only 边界从该目标排除（**破坏性：否**）
 
