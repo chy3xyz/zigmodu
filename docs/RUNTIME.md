@@ -1581,7 +1581,7 @@ p99 ≈ 1 ms 上（`mixed-x2` 正好是 `p99 = 947 µs` 而 `p50 = 10 µs` 的�
 > 只对 `.pooled` 有意义；给 `.dedicated` 声明它是**编译错误**（与 `.execution_class` 的门同形，
 > fail loud 而不是静默忽略；`scripts/check-pool-guard.sh` 有这条门的 fixture）。
 > 测试：`src/runtime/scheduler.zig` 三条（无线程，直接驱动环）+ `src/runtime/runtime.zig`
-> 两条接线用例，名字里都带 `§12.17`。
+> 两条接线用例 + 一条三类混合活跑实测，名字里都带 `§12.17`。
 
 **形状**：ready 环从一个变三个 —— 每类一条，各自独立满足 §12.12 的容量不变量
 （`ceilPowerOfTwo(max_pooled_workers + pool_threads)`，三环同容量）。`push` 按 token 上的
@@ -1609,8 +1609,11 @@ per-worker 的 `batch` 覆盖同理仍不做（§12.16 末尾已记）。
 
 **`RuntimeStats` 口径**：`ready_len` = 三环之和（`PoolSettled` 等既有断言零改动）、
 `ready_high_water` = 三环各自 high-water 的 max、`ready_capacity` = 单环容量（三环同值）。
-MetricsBridge 的**每类拆分 gauge 仍没做** —— 现有 `zigmodu_runtime_pool_*` 读数语义不变，
-按类拆开是已知的下一步。
+另有 `ready_len_by_class: [3]usize`（按 `@backingInt(Priority)` 索引）—— MetricsBridge 的
+每类拆分 gauge **已落地**：`zigmodu_runtime_pool_ready_len_high|_normal|_low` 与阻塞池同形三条，
+无池时与聚合 gauge 一样报 0（"无池"与"没有任何一类在等"不靠缺 series 区分）。聚合读数回答
+"有没有人在等"，拆分读数回答"是哪一类在等" —— 保留槽是否在干活（饱和 high/normal 下 low
+仍被排空）从面板上直接可读。
 
 **测试证据**（三条 scheduler 测试都是无线程的环驱动，断言的是顺序本身，与宿主速度无关）：
 
@@ -1625,9 +1628,25 @@ MetricsBridge 的**每类拆分 gauge 仍没做** —— 现有 `zigmodu_runtime
 两条 runtime 接线用例：pooled + `.high` 的声明落在 token 上（`h.pool.?.priority`）且收发守恒；
 `.blocking` + `.low` 组合落在**阻塞池自己的调度器**上（同一协议，零特判）。
 
-**没说明什么 / 仍开**：优先级对吞吐与延迟尾巴的影响**没有实测**（§12.16 的扫描是单类形状；
-三类混合的 bench 是下一步，也是"要不要可配权重"的唯一正当输入）；保留周期 8 是设计值、
-不是实测值；§12.7 对 affinity/NUMA 的立场不变。
+**活跑实测**（`runtime.zig` 的 `Pooled (§12.17): a saturated high/normal/low mix …`：
+1 池线程、三个邮箱全程灌满的 high/normal/low worker，窗口 = high 处理 50,000 条；
+µs 列只打印不断言，断言的全是宿主无关的关系）。两次本地读数一致：**high ≈ 78–80%，
+low ≈ 15–16%，normal ≈ 4–6%**。
+
+* **实测发现：被挤压的是 normal，不是 low。** 严格轮 high 优先、保留轮 low 优先，
+  normal 只吃到 high 偶尔跑干的剩隙 —— 机制按设计工作（没人承诺过 normal 的界），
+  但这意味着"声明了 high 和 low 并且两者都饱和"的应用会把**默认类**压到低类之下。
+  尾巴上同样可见：normal p99 比 high 高约两个数量级。测试不为 normal 断言地板，
+  因为设计从未给过这个语义；这正是"要不要可配权重"需要的输入数据。
+* **断言钉住的关系**：high 份额最大（`handled[high] > handled[normal]` 且 `> handled[low]`）；
+  保留槽在活跑中兑现 —— low 在 high 饱和下仍处理 ≥ 1,000 条（实测约 10,000）；
+  low 的中位入队→处理延迟高于 high（实测约 5–50×，两个同轮中位数之比，不是 µs 预算）；
+  守恒与健康照旧（sent == received、dropped == 各 feeder 的 Full 计数、push_failures == 0、
+  三环 `ready_len_by_class` 收官全 0）。
+
+**没说明什么 / 仍开**：保留周期 8 是设计值、不是实测值；可配权重与类别数仍不做，
+但现在的实测数据（normal 挤压、low ≈ 1/8 份额）就是将来反驳或支持它的依据；
+§12.7 对 affinity/NUMA 的立场不变。
 
 ## 13. Runtime Replay —— v1 已实现（见 §13.7）
 

@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+### 第 118 批：§12.17 收尾 —— MetricsBridge 按类 gauge + 三类混合活跑实测（**破坏性：否**）
+
+1. **缘起**：§12.17 留下两条"仍开"——MetricsBridge 的每类拆分 gauge 没做、优先级对吞吐与
+   延迟尾巴没有实测。本批两条都收，其中实测的第一批数据就纠正了一个先验判断。
+2. **每类 gauge**：`Scheduler.Stats` 新增 `ready_len_by_class: [3]usize`（按
+   `@backingInt(Priority)` 索引，与三环布局同源）；MetricsBridge 新增 6 条无标签 gauge ——
+   `zigmodu_runtime_pool_ready_len_high|_normal|_low` 与阻塞池同形三条。语义沿用既有约定：
+   无池报 0 而非缺 series（"无池"与"没有任何一类在等"不靠缺行区分）。聚合 gauge 回答
+   "有没有人在等"，拆分回答"是哪一类在等"——保留槽是否在干活从面板上直接可读。
+   三条 MetricsBridge 测试接线（cold/warm 对照 `poolStats()` 同快照、无池零值名单加 6 条）。
+3. **活跑实测**（`runtime.zig` 新增 `Pooled (§12.17): a saturated high/normal/low mix …`，
+   §12.16 harness 同纪律：handler 采样、feeder 盖时间戳、1 池线程、三邮箱全程灌满、
+   `error.Full` 重试不丢、收官 `PoolSettled`）。窗口 = high 处理 50,000 条，两次本地读数
+   一致：**high ≈ 78–80%、low ≈ 15–16%、normal ≈ 4–6%**。
+4. **实测发现：被挤压的是 normal，不是 low。** 严格轮 high 优先、保留轮 low 优先，normal
+   只吃 high 偶尔跑干的剩隙；尾巴上 normal p99 比 high 高约两个数量级。机制按设计工作
+   （从未承诺 normal 的界），但"声明了 high 和 low 且两者饱和"会把默认类压到低类之下 ——
+   这正是"要不要可配权重"需要的输入数据，已写入 §12.17。测试**刻意不为 normal 断言地板**
+   （钉一个设计从未给过的语义是伪造保证）；断言钉的是机制真正拥有的关系：high 份额最大、
+   low 在 high 饱和下 ≥ 1,000 条（实测约 10,000，保留槽活跑兑现）、low 中位延迟 > high
+   中位（同轮两中位数之比，非 µs 预算）、守恒与健康照旧。
+5. **文档**：`docs/RUNTIME.md` §12.17 两处"仍开"改写 —— 每类 gauge 落地（含 6 条 series 名）
+   与实测读数 + normal 挤压发现；"保留周期 8 是设计值"与"权重旋钮仍不开"维持原判，但现在
+   有数据垫底。
+6. **门禁读数**：聚焦 `12.17` 6/6 绿（3 scheduler + 3 runtime，含新实测）；
+   `MetricsBridge` 5/5 绿；fmt ✓；check-production ✓；check-test-collection ✓（2139）；
+   全量见本条门禁段。
+
 ### 第 117 批：check-bench 确认复跑（duration-only 失败自动复跑一遍再判）（**破坏性：否**）
 
 1. **缘起**：第 114 批 CI macOS 腿的 false red —— `100 checks x10K` 42.9ms vs 基线 19.9ms

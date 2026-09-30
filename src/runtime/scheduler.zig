@@ -538,6 +538,12 @@ pub const Scheduler = struct {
         ready_push_failures: u64,
         idle_waits: u64,
         ready_high_water: usize,
+        /// Per-class ring occupancy, indexed by `@backingInt(Priority)` —
+        /// the aggregate `ready_len` answers "is anyone waiting", these answer
+        /// "is one *class* queueing behind another" (the starvation question
+        /// §12.17's reservation slot bounds). Published as per-class gauges by
+        /// the MetricsBridge.
+        ready_len_by_class: [priority_classes]usize,
     };
 
     pub fn deinit(self: *Self) void {
@@ -674,6 +680,7 @@ pub const Scheduler = struct {
             // "a ring came nowhere near its capacity", and summing three disjoint
             // rings could exceed it legitimately.
             .ready_high_water = @max(self.ready[0].high_water.load(.monotonic), @max(self.ready[1].high_water.load(.monotonic), self.ready[2].high_water.load(.monotonic))),
+            .ready_len_by_class = .{ self.ready[0].len(), self.ready[1].len(), self.ready[2].len() },
         };
     }
 

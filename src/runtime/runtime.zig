@@ -2056,6 +2056,17 @@ pub const Runtime = struct {
             blocking_pool_claimed: *MetricsT.Gauge,
             blocking_pool_dispatches: *MetricsT.Gauge,
             blocking_pool_ready_push_failures: *MetricsT.Gauge,
+            // Per-class splits of `*_ready_len` (docs/RUNTIME.md §12.17): the
+            // aggregate occupancy answers "is anyone waiting", the per-class
+            // gauges answer "which priority class is waiting" — the reading that
+            // shows the reservation slot working (low drained against a busy
+            // high/normal mix) or starving.
+            pool_ready_len_high: *MetricsT.Gauge,
+            pool_ready_len_normal: *MetricsT.Gauge,
+            pool_ready_len_low: *MetricsT.Gauge,
+            blocking_pool_ready_len_high: *MetricsT.Gauge,
+            blocking_pool_ready_len_normal: *MetricsT.Gauge,
+            blocking_pool_ready_len_low: *MetricsT.Gauge,
 
             /// Registers the gauges. Startup-time call: if a later `createGauge`
             /// fails, the earlier ones stay registered in `metrics`.
@@ -2087,6 +2098,12 @@ pub const Runtime = struct {
                     .blocking_pool_claimed = try metrics.createGauge("zigmodu_runtime_blocking_pool_claimed", "Blocking workers a blocking thread is executing right now (never above blocking_pool_threads)"),
                     .blocking_pool_dispatches = try metrics.createGauge("zigmodu_runtime_blocking_pool_dispatches", "Batches the blocking pool's threads ran (0 with .blocking spawns means they never reached that pool)"),
                     .blocking_pool_ready_push_failures = try metrics.createGauge("zigmodu_runtime_blocking_pool_ready_push_failures", "MUST stay 0: a refused token push strands a blocking worker (scheduler desync, not backpressure)"),
+                    .pool_ready_len_high = try metrics.createGauge("zigmodu_runtime_pool_ready_len_high", "High-priority ready-ring occupancy: .priority = .high pooled workers waiting for a pool thread"),
+                    .pool_ready_len_normal = try metrics.createGauge("zigmodu_runtime_pool_ready_len_normal", "Normal-priority ready-ring occupancy: pooled workers waiting for a pool thread"),
+                    .pool_ready_len_low = try metrics.createGauge("zigmodu_runtime_pool_ready_len_low", "Low-priority ready-ring occupancy: drained by the reservation slot (§12.17), so a persistent nonzero here is expected under load, not a bug"),
+                    .blocking_pool_ready_len_high = try metrics.createGauge("zigmodu_runtime_blocking_pool_ready_len_high", "High-priority blocking ready-ring occupancy: .priority = .high blocking workers waiting for a blocking thread"),
+                    .blocking_pool_ready_len_normal = try metrics.createGauge("zigmodu_runtime_blocking_pool_ready_len_normal", "Normal-priority blocking ready-ring occupancy: blocking workers waiting for a blocking thread"),
+                    .blocking_pool_ready_len_low = try metrics.createGauge("zigmodu_runtime_blocking_pool_ready_len_low", "Low-priority blocking ready-ring occupancy: drained by the reservation slot (§12.17), so a persistent nonzero here is expected under load, not a bug"),
                 };
             }
 
@@ -2135,6 +2152,16 @@ pub const Runtime = struct {
                 self.blocking_pool_claimed.set(@floatFromInt(if (bp) |x| x.claimed else 0));
                 self.blocking_pool_dispatches.set(@floatFromInt(if (bp) |x| x.dispatches else 0));
                 self.blocking_pool_ready_push_failures.set(@floatFromInt(if (bp) |x| x.ready_push_failures else 0));
+
+                // Same "0 = no pool declared" answer for the per-class splits
+                // (docs/RUNTIME.md §12.17): indexed by `@backingInt(Priority)`
+                // — high = 0, normal = 1, low = 2.
+                self.pool_ready_len_high.set(@floatFromInt(if (p) |x| x.ready_len_by_class[0] else 0));
+                self.pool_ready_len_normal.set(@floatFromInt(if (p) |x| x.ready_len_by_class[1] else 0));
+                self.pool_ready_len_low.set(@floatFromInt(if (p) |x| x.ready_len_by_class[2] else 0));
+                self.blocking_pool_ready_len_high.set(@floatFromInt(if (bp) |x| x.ready_len_by_class[0] else 0));
+                self.blocking_pool_ready_len_normal.set(@floatFromInt(if (bp) |x| x.ready_len_by_class[1] else 0));
+                self.blocking_pool_ready_len_low.set(@floatFromInt(if (bp) |x| x.ready_len_by_class[2] else 0));
             }
         };
     }
@@ -4724,6 +4751,11 @@ test "Runtime.MetricsBridge publishes the pool's counters, and they move with th
     try check(cold_text, "zigmodu_runtime_pool_claimed", @floatFromInt(cold.claimed));
     try check(cold_text, "zigmodu_runtime_pool_dispatches", @floatFromInt(cold.dispatches));
     try check(cold_text, "zigmodu_runtime_pool_ready_push_failures", @floatFromInt(cold.ready_push_failures));
+    // Per-class splits (§12.17): they sum to the aggregate and are compared
+    // against the same after-join snapshot, so they cannot disagree with it.
+    try check(cold_text, "zigmodu_runtime_pool_ready_len_high", @floatFromInt(cold.ready_len_by_class[0]));
+    try check(cold_text, "zigmodu_runtime_pool_ready_len_normal", @floatFromInt(cold.ready_len_by_class[1]));
+    try check(cold_text, "zigmodu_runtime_pool_ready_len_low", @floatFromInt(cold.ready_len_by_class[2]));
 
     // Warm: messages reach the pool thread, so `pool_dispatches` moves — the
     // reading that says "the pooled path was actually taken" rather than merely
@@ -4751,6 +4783,9 @@ test "Runtime.MetricsBridge publishes the pool's counters, and they move with th
     try check(warm_text, "zigmodu_runtime_pool_claimed", @floatFromInt(warm.claimed));
     try check(warm_text, "zigmodu_runtime_pool_ready_len", @floatFromInt(warm.ready_len));
     try check(warm_text, "zigmodu_runtime_pool_ready_push_failures", @floatFromInt(warm.ready_push_failures));
+    try check(warm_text, "zigmodu_runtime_pool_ready_len_high", @floatFromInt(warm.ready_len_by_class[0]));
+    try check(warm_text, "zigmodu_runtime_pool_ready_len_normal", @floatFromInt(warm.ready_len_by_class[1]));
+    try check(warm_text, "zigmodu_runtime_pool_ready_len_low", @floatFromInt(warm.ready_len_by_class[2]));
 }
 
 test "Runtime.MetricsBridge reports no pool as zeros" {
@@ -4786,6 +4821,15 @@ test "Runtime.MetricsBridge reports no pool as zeros" {
         "zigmodu_runtime_blocking_pool_claimed",
         "zigmodu_runtime_blocking_pool_dispatches",
         "zigmodu_runtime_blocking_pool_ready_push_failures",
+        // The per-class splits (§12.17) report 0 as well: "no pool" and "no
+        // one waiting in any class" must not be distinguishable by an absent
+        // series.
+        "zigmodu_runtime_pool_ready_len_high",
+        "zigmodu_runtime_pool_ready_len_normal",
+        "zigmodu_runtime_pool_ready_len_low",
+        "zigmodu_runtime_blocking_pool_ready_len_high",
+        "zigmodu_runtime_blocking_pool_ready_len_normal",
+        "zigmodu_runtime_blocking_pool_ready_len_low",
     }) |name| {
         var buf: [128]u8 = undefined;
         const line = try std.fmt.bufPrint(&buf, "{s} {d:.6}", .{ name, @as(f64, 0) });
@@ -8083,4 +8127,230 @@ test "Pooled (§12.16): the batch sweep — throughput against latency, measured
             );
         }
     }
+}
+
+// §12.17  Priority in a live mix, measured
+// ─────────────────────────────────────────────────
+//
+// §12.17's scheduler tests pin the mechanism turn by turn — the strict order,
+// the reservation slot, the wait bound — on constructed rings. What they
+// cannot show is what the mechanism does to a *live* traffic mix: how much of
+// the pool each class actually takes when all three are saturated at once, and
+// what that does to each class's queued→handled latency tail. This run is that
+// reading, and its numbers are the input to the question the section leaves
+// open — whether the classes ever need configurable weights.
+//
+// Same reading discipline as §12.16: the feeder stamps the message immediately
+// before `send`, the handler takes the sample, and the pool is the contended
+// resource (one thread, three mailboxes kept full by feeders that retry
+// `error.Full` rather than drop), so what is measured is the scheduler's
+// choice, not arrival timing.
+
+test "Pooled (§12.17): a saturated high/normal/low mix — shares and the latency tail, measured and printed" {
+    const allocator = std.testing.allocator;
+    const capacity = 256;
+    // The run's window: feeders run until the high-class worker has handled
+    // this many messages. At batch-sized claims that is thousands of
+    // scheduling turns, so the shares below are a steady-state reading rather
+    // than a sample of a few turns.
+    const high_target = 50_000;
+    const sample_room = 400_000;
+
+    const store = try allocator.alloc(i64, 3 * sample_room);
+    defer allocator.free(store);
+    var logs: [3]LatencyLog = undefined;
+    for (0..3) |i| logs[i] = .{ .samples = store[i * sample_room ..][0..sample_room] };
+
+    var rt = try Runtime.initWithOptions(allocator, std.testing.io, .{
+        // One pool thread again: the three classes compete for the execution
+        // resource, which is the only shape in which "priority" is a question
+        // at all (§12.5's discipline, applied to classes instead of workers).
+        .scheduler = .{ .max_pooled_workers = 4, .pool_threads = 1 },
+    });
+    defer rt.deinit();
+
+    const H = Handle(TimedWorker, capacity);
+    const class_names = [_][]const u8{ "high", "normal", "low" };
+    const class_priorities = [_]Priority{ .high, .normal, .low };
+    var handles: [3]*H = undefined;
+    inline for (0..3) |i| {
+        handles[i] = try rt.spawn(TimedWorker, .{ .log = &logs[i] }, .{
+            .capacity = capacity,
+            .mode = .pooled,
+            .priority = class_priorities[i],
+        });
+    }
+    try std.testing.expectEqual(@as(usize, 1), rt.poolStats().?.pool_threads);
+
+    var feeding = std.atomic.Value(bool).init(true);
+    var accepted: [3]std.atomic.Value(usize) = undefined;
+    var refused: [3]std.atomic.Value(u64) = undefined;
+    var seq: [3]std.atomic.Value(u64) = undefined;
+    for (0..3) |i| {
+        accepted[i] = std.atomic.Value(usize).init(0);
+        refused[i] = std.atomic.Value(u64).init(0);
+        seq[i] = std.atomic.Value(u64).init(0);
+    }
+
+    const Feed = struct {
+        fn run(
+            h: *H,
+            feeding_: *std.atomic.Value(bool),
+            accepted_: *std.atomic.Value(usize),
+            refused_: *std.atomic.Value(u64),
+            seq_: *std.atomic.Value(u64),
+        ) void {
+            while (feeding_.load(.acquire)) {
+                const msg = TimedMessage{ .seq = seq_.fetchAdd(1, .monotonic), .sent_ns = time_mod.monotonicNow() };
+                h.send(msg) catch |err| switch (err) {
+                    // Same discipline as §12.16's feeders: `error.Full` is
+                    // backpressure and is retried — a dropped message would
+                    // make the run's denominator a different number, and a
+                    // mailbox left unfilled would end the saturated shape
+                    // rather than exercise it.
+                    error.Full => {
+                        _ = refused_.fetchAdd(1, .monotonic);
+                        std.atomic.spinLoopHint();
+                        continue;
+                    },
+                    else => return,
+                };
+                _ = accepted_.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+
+    var feeders: [3]std.Thread = undefined;
+    for (0..3) |i| {
+        feeders[i] = try std.Thread.spawn(.{}, Feed.run, .{ handles[i], &feeding, &accepted[i], &refused[i], &seq[i] });
+    }
+
+    // The window closes when the high class has demonstrably been served at
+    // volume — by construction normal and low have been served through the
+    // same interval (the reservation slot is what §12.17 promises low), and
+    // their counts at this moment are the measured shares.
+    waitUntil(Published(@TypeOf(logs[0].handled), usize){ .value = &logs[0].handled, .want = high_target }, observation_budget_ms) catch |err| {
+        const p = rt.poolStats();
+        std.debug.print(
+            "[§12.17 stall] waited for high handled >= {d}; high={d} normal={d} low={d}; pool ready_len={d} claimed={d} dispatches={d} idle_waits={d} push_failures={d}\n",
+            .{
+                high_target,
+                logs[0].observed(),
+                logs[1].observed(),
+                logs[2].observed(),
+                if (p) |x| x.ready_len else 0,
+                if (p) |x| x.claimed else 0,
+                if (p) |x| x.dispatches else 0,
+                if (p) |x| x.idle_waits else 0,
+                if (p) |x| x.ready_push_failures else 0,
+            },
+        );
+        return err;
+    };
+
+    // One snapshot of the per-class occupancies while the mix is still live:
+    // which ring is holding a waiting token is the gauge-level view of the
+    // shares (printed, not asserted — the instant is racy by construction).
+    const mid = rt.poolStats().?;
+    std.debug.print(
+        "[§12.17 mix]   mid-run ready_len_by_class: high={d} normal={d} low={d} (one racy instant; the gauges scrape this)\n",
+        .{ mid.ready_len_by_class[0], mid.ready_len_by_class[1], mid.ready_len_by_class[2] },
+    );
+
+    feeding.store(false, .release);
+    for (feeders) |t| t.join();
+
+    // Conservation, per worker: every accepted message is handled before any
+    // number below is read. The counts are final (the feeders are joined), so
+    // the wait can only fail by the pool stopping delivery — which is exactly
+    // what it is there to catch.
+    for (0..3) |i| {
+        try waitUntil(Published(@TypeOf(logs[i].handled), usize){ .value = &logs[i].handled, .want = accepted[i].load(.acquire) }, observation_budget_ms);
+        try waitUntil(Drained(H){ .handle = handles[i] }, observation_budget_ms);
+    }
+    // Same settled-reading discipline as §12.16: the ring is a later moment
+    // than the drains, and the assertions below take the settled one.
+    try waitUntil(PoolSettled(@TypeOf(rt)){ .rt = &rt }, observation_budget_ms);
+
+    const pool = rt.poolStats().?;
+    const stats = rt.stats();
+    const lat = [3]Latency{ latencyInPlace(&logs[0]), latencyInPlace(&logs[1]), latencyInPlace(&logs[2]) };
+    const handled = [3]usize{ logs[0].observed(), logs[1].observed(), logs[2].observed() };
+    const total_handled = handled[0] + handled[1] + handled[2];
+    const total_refused = refused[0].load(.acquire) + refused[1].load(.acquire) + refused[2].load(.acquire);
+
+    std.debug.print(
+        "[§12.17 mix] one pool thread; high/normal/low fed continuously until high handled {d}\n",
+        .{high_target},
+    );
+    for (0..3) |i| {
+        const share = 100.0 * @as(f64, @floatFromInt(handled[i])) / @as(f64, @floatFromInt(total_handled));
+        std.debug.print(
+            "[§12.17 mix]   {s:<7} handled {d:<7} ({d:>5.1}%) | n={d:<7} p50={d:>10.1}us p99={d:>10.1}us max={d:>10.1}us | mailbox-full refused {d}\n",
+            .{ class_names[i], handled[i], share, lat[i].n, us(lat[i].p50), us(lat[i].p99), us(lat[i].max), refused[i].load(.acquire) },
+        );
+    }
+    std.debug.print(
+        "[§12.17 mix]   shares and the latency tail are the reading; the µs columns move with the host, the order between the classes is what the mechanism owns\n",
+        .{},
+    );
+    std.debug.print(
+        "[§12.17 mix]   note: normal is the squeezed class in this shape — strict turns go high-first, reserved turns go low-first, so normal is served only from instants high ran dry (a designed boundary, not a bug; §12.17)\n",
+        .{},
+    );
+    std.debug.print(
+        "[§12.17 pool] dispatches={d} claim_misses={d} ready_len={d} ready_high_water={d} idle_waits={d} push_failures={d} claimed={d} pool_threads={d}\n",
+        .{ pool.dispatches, pool.claim_misses, pool.ready_len, pool.ready_high_water, pool.idle_waits, pool.ready_push_failures, pool.claimed, pool.pool_threads },
+    );
+    std.debug.print(
+        "[§12.17 runtime] sent={d} received={d} dropped={d} discarded_on_stop={d} handler_errors={d}\n",
+        .{ stats.messages_sent, stats.messages_received, stats.messages_dropped, stats.messages_discarded_on_stop, stats.handler_errors },
+    );
+
+    // Health first, same as §12.16: a reading taken from a broken shape cannot
+    // pass as a reading. Nothing refused a token, nothing is left in any ring
+    // (the new per-class split is pinned at the same settled moment), every
+    // accepted message was handled, and no log ran out of room.
+    try std.testing.expectEqual(@as(u64, 0), pool.ready_push_failures);
+    try std.testing.expectEqual(@as(usize, 0), pool.ready_len);
+    try std.testing.expectEqual(@as(usize, 0), pool.ready_len_by_class[0]);
+    try std.testing.expectEqual(@as(usize, 0), pool.ready_len_by_class[1]);
+    try std.testing.expectEqual(@as(usize, 0), pool.ready_len_by_class[2]);
+    try std.testing.expectEqual(@as(usize, 0), pool.claimed);
+    try std.testing.expectEqual(@as(usize, 1), pool.pool_threads);
+    try std.testing.expectEqual(total_refused, stats.messages_dropped);
+    try std.testing.expectEqual(stats.messages_sent, stats.messages_received);
+    try std.testing.expectEqual(@as(usize, total_handled), @as(usize, @intCast(stats.messages_received)));
+    for (0..3) |i| try std.testing.expectEqual(@as(usize, 0), logs[i].overflowed());
+
+    // What priority means, asserted rather than implied — every relation below
+    // is between two numbers of the same window on the same host, so a loaded
+    // runner moves the absolute figures without moving the relations:
+    //
+    // 1. The strict order expresses: with every mailbox full, the high class
+    //    is served on the plain turns, so it takes the largest share of the
+    //    three.
+    // 2. The reservation expresses: the low class still moves — §12.17's
+    //    promise that priority is not a starvation licence, in a live mix
+    //    rather than on a constructed ring. The floor is an order of magnitude
+    //    under the share the slot actually delivers, so a scheduler regression
+    //    (not a slow host) is what trips it.
+    // 3. The tail follows the reservation: low's messages wait for the
+    //    reserved turn, so its median queued→handled latency sits above
+    //    high's. This is a relation between two medians of the same run, not
+    //    a µs budget.
+    //
+    // What is deliberately **not** asserted: a floor for the normal class. The
+    // measured finding of this run (see docs/RUNTIME.md §12.17) is that under
+    // a saturated high *and* low mix, normal is the squeezed class — the
+    // strict turns go high-first and the reserved turns go low-first, so
+    // normal is served only from the instants high ran dry. That is the
+    // mechanism working as designed (nothing promised normal a bound), and
+    // the squeeze is exactly the data the open "configurable weights" question
+    // needed; pinning a floor here would assert a semantics the design never
+    // made.
+    try std.testing.expect(handled[0] > handled[1]);
+    try std.testing.expect(handled[0] > handled[2]);
+    try std.testing.expect(handled[2] >= 1_000);
+    try std.testing.expect(lat[2].p50 > lat[0].p50);
 }
