@@ -2,6 +2,39 @@
 
 ## [Unreleased]
 
+### 第 116 批：runtime-stress 历史趋势化 v1（commit → 结果的纵向序列）（**破坏性：否**）
+
+1. **缘起**：v1.0-gap 证据层主线 —— 仓库自己承认"`runtime-stress` 仍是 synthetic workload，
+   且没有跨 commit 的历史数据"。单跑一次只回答"现在绿不绿"；序列才回答"**哪个 commit 让它
+   变差的**"。本批把序列的写、读、归档三件套落地，不新增任何 runtime 功能。
+2. **harness（`src/runtime_stress.zig`）**：设 `RUNTIME_STRESS_HISTORY=<path>` 后，每次 run 末尾
+   追加一行 schema-v1 JSON（实测 ~1.1KB）。字段全部是报告里已有的**计数器**（两池
+   dispatches/push_failures/high_water/ready_len、timers、sent/handled、supervision、windows
+   内分配、isolation、alloc probe、shutdown、steady samples），宿主相关的 RSS/线程数是可空
+   子对象，**µs 列刻意不收** —— 宿主拥有时钟，把时间列趋势化等于趋势化 runner（§12.15/
+   §12.16 同一条分工）。commit 取自 `GITHUB_SHA`/`GIT_SHA`，**hex 校验就是转义策略**；写入走
+   `writePositionalAll(stat(io).size)`（免 seek 追加）+ 全程栈缓冲（不经过 probe 分配器 ——
+   它自己量的就是分配契约，不能自我污染）；**写失败只 warn 不 fail**（历史是观测，不变量才是门）。
+3. **读侧**：`scripts/runtime_stress_trend.py` —— 硬门只收宿主无关契约（harness 自身失败 /
+   两池 `push_failures` / 窗口内分配，违例 exit 1）；dispatches、RSS spread、shutdown、probe
+   bytes 等宿主相关读数只打印基线中位数 + delta，不门禁。**第一条真实数据就纠了一个设计错**：
+   `timers.dropped` 初版被列进硬门，实测一次 PASS 运行 `dropped=3` —— drop-on-full 是 §5
+   写明的背压语义、harness 自己从不 fail 它，已移去漂移表（设计先于数据时最容易犯这类错，
+   记录在此）。`scripts/runtime-stress-record.sh` 包一层 env（默认写仓库根
+   `runtime-stress-history.jsonl`，已 gitignore）。
+4. **CI**：nightly 的 runtime-stress step 加两个 env（`RUNTIME_STRESS_HISTORY` →
+   `$RUNNER_TEMP/nightly-logs/`，`GIT_SHA` → `github.sha`）；文件随既有
+   `nightly-soak-<sha>` artifact 归档 30 天 —— **artifact 序列天然就是 commit→结果史**，
+   零新增 CI 写回、零 bot token。
+5. **门禁读数**：stress 二进制 1→3 条（JSONL 双行 append + std.json 解析断言 schema/null 语义 +
+   commit 校验），smoke 1/1 绿；trend 脚本真数据 exit 0、注入 `push_failures=1` exit 1（自检）；
+   `check-test-collection.sh` ✓（12s）；`zig fmt --check` ✓；`check-production.sh` ✓；
+   ci.yml `yaml.safe_load` ✓；全量 `zig build test` 19/19 steps —— 大二进制 2138 为**缓存复跑**
+   （本批未触碰它的任何源文件，与第 115 批同一份二进制位；stress 二进制重新编译实跑 3/3）。
+6. **仍开**：CI 侧暂无自动基线对比（每夜 fresh runner，trend 目前是本地/发版期工具；攒够序列
+   再谈门禁化）；`soak` / `soak-cluster` 未接同款 history（先看 runtime-stress 这条攒出什么，
+   再决定要不要推广 —— 同一纪律：不一次把三个都改了）。
+
 ### 第 115 批：Scheduler 三级优先级 + 保留槽（§12.17）+ A-7/A-8 环境边界定界写档（**破坏性：否**）
 
 1. **缘起**：v1.0-gap A 组收尾 —— A-6 是评估矩阵 §15 的 Priority 项（调度优先级，原列 P1/P2）；

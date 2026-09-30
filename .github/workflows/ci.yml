@@ -870,6 +870,13 @@ jobs:
       - name: Runtime stress (supervision tree / pools / timers)
         # The runtime harness asserts the things a short single-threaded test
         # cannot: claims, ready-ring fairness, timer ownership under churn.
+        # RUNTIME_STRESS_HISTORY makes it append one schema-v1 JSON line per
+        # night; the file lands in nightly-logs, so the nightly-soak-<sha>
+        # artifact below *is* the commit -> stress-result series (30 days).
+        # scripts/runtime_stress_trend.py reads a concatenated series back.
+        env:
+          RUNTIME_STRESS_HISTORY: ${{ runner.temp }}/nightly-logs/runtime-stress-history.jsonl
+          GIT_SHA: ${{ github.sha }}
         run: zig build runtime-stress -Druntime-stress-duration-ms=60000 2>&1 | tee "$RUNNER_TEMP/nightly-logs/runtime-stress.log"
 
       - name: Mixed-version cluster gate (v0.32.0 node vs master nodes)

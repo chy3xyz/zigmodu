@@ -84,6 +84,22 @@
 //! `zig build test` builds the same file with a *smoke* option set (1.5 s), so
 //! the default suite covers the code path and every check while the long run
 //! stays its own step — the split `soak` uses.
+//!
+//! ## History (the commit → result time series)
+//!
+//! One run prints a report for a human; a *series* of runs is what answers "did
+//! this commit make the runtime worse". Setting `RUNTIME_STRESS_HISTORY=<path>`
+//! appends one JSON line per run to that file (schema `v:1`; the commit comes
+//! from `GITHUB_SHA`/`GIT_SHA`, validated to hex so no JSON escaping exists).
+//! Every field is a counter the report already prints — host-clock latencies are
+//! deliberately absent: they belong to the host, the counters belong to the
+//! runtime. `scripts/runtime-stress-record.sh` wraps the invocation;
+//! `scripts/runtime_stress_trend.py` reads the series back (hard gates: the
+//! host-independent invariants; the rest is printed drift, not asserted — the
+//! same split §12.15/§12.16 use). A write failure is a warn, never a failure:
+//! history is observability, the invariants above are the gate. The nightly CI
+//! step sets the variable into `$RUNNER_TEMP/nightly-logs/`, which the
+//! `nightly-soak-<sha>` artifact already archives.
 
 const std = @import("std");
 
@@ -183,6 +199,11 @@ const Params = struct {
     blocking_threads: usize,
     rss_budget_bytes: u64,
     timers: usize,
+    /// Set from `RUNTIME_STRESS_HISTORY` by `main` (the test entry leaves it
+    /// null — the suite must not write files outside tmpDir).
+    history_path: ?[]const u8 = null,
+    /// Hex-validated `GITHUB_SHA`/`GIT_SHA`; "unknown" otherwise.
+    commit: []const u8 = "unknown",
 
     fn warmupMs(self: Params) i64 {
         return @divTrunc(self.duration_ms, 4);
@@ -780,6 +801,166 @@ const Report = struct {
         return self.total == 0;
     }
 };
+
+// ── history (JSONL, schema v1) ──────────────────────────────────────────────
+
+/// The counters of one run, flattened for the JSONL series. All `u64`/`i64`
+/// (cast at the fill site) so the schema is stable across hosts; the two
+/// platform-dependent readings (RSS, OS threads) are nullable. What is *not*
+/// here, deliberately: every µs column — the host owns those, and a trend of
+/// them would be a trend of the runner, not of the runtime.
+const HistoryRec = struct {
+    pass: bool,
+    fails: u64,
+    warns: u64,
+    cpu_dispatches: u64,
+    cpu_push_failures: u64,
+    cpu_high_water: u64,
+    cpu_ready_len: u64,
+    blk_dispatches: u64,
+    blk_push_failures: u64,
+    blk_high_water: u64,
+    blk_ready_len: u64,
+    timer_fires: u64,
+    timer_dropped: u64,
+    timers_discarded: u64,
+    cpu_sent: u64,
+    cpu_full: u64,
+    blk_sent: u64,
+    blk_full: u64,
+    progress_sent: u64,
+    boom_sent: u64,
+    boom_closed: u64,
+    handled_cpu: u64,
+    handled_blk: u64,
+    handled_progress: u64,
+    boom_errors: u64,
+    restarts: u64,
+    supervised_stops: u64,
+    dead: u64,
+    windows_attempted: u64,
+    windows_covered: u64,
+    window_alloc_calls: u64,
+    window_alloc_bytes: u64,
+    isolation_intervals: u64,
+    isolation_saturated: u64,
+    probe_calls: u64,
+    probe_bytes: u64,
+    probe_attempts: u64,
+    rss_min: ?u64,
+    rss_max: ?u64,
+    thr_min: ?u64,
+    thr_max: ?u64,
+    shutdown_ms: i64,
+    in_flight_claimed: u64,
+    steady_samples: u64,
+};
+
+/// The commit goes into JSON verbatim, so its charset is the escaping
+/// strategy: 7–64 hex chars or it is replaced by "unknown".
+fn validCommit(s: []const u8) bool {
+    if (s.len < 7 or s.len > 64) return false;
+    for (s) |c| {
+        switch (c) {
+            '0'...'9', 'a'...'f', 'A'...'F' => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
+fn warnOverflow(report: *Report, buf_len: usize) void {
+    report.warn("history: the JSON line overflowed its {d}-byte buffer", .{buf_len});
+}
+
+/// Appends one JSON line to `path`. Stack buffers only — the probe allocator's
+/// totals are part of the report, so history must not allocate through it.
+/// Every failure is a warn: a lost history line costs a data point, a failed
+/// run over a full disk would cost the signal the run exists for.
+fn appendHistory(io: std.Io, path: []const u8, p: Params, report: *Report, rec: HistoryRec) void {
+    const ts = std.Io.Timestamp.now(io, .real).toSeconds();
+
+    var rss_buf: [96]u8 = undefined;
+    const rss_json: []const u8 = if (rec.rss_min) |mn|
+        std.fmt.bufPrint(&rss_buf, "{{\"min\":{d},\"max\":{d},\"spread\":{d}}}", .{ mn, rec.rss_max.?, rec.rss_max.? - mn }) catch {
+            report.warn("history: rss sub-format overflowed its buffer", .{});
+            return;
+        }
+    else
+        "null";
+    var thr_buf: [64]u8 = undefined;
+    const thr_json: []const u8 = if (rec.thr_min) |mn|
+        std.fmt.bufPrint(&thr_buf, "{{\"min\":{d},\"max\":{d}}}", .{ mn, rec.thr_max.? }) catch {
+            report.warn("history: threads sub-format overflowed its buffer", .{});
+            return;
+        }
+    else
+        "null";
+
+    var buf: [1664]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    // One print per object: fmt calls cap at 32 arguments, and splitting on the
+    // object boundaries keeps each call readable.
+    w.print("{{\"v\":1,\"ts\":{d},\"commit\":\"{s}\",\"os\":\"{s}\",\"arch\":\"{s}\",", .{
+        ts, p.commit, @tagName(builtin.os.tag), @tagName(builtin.cpu.arch),
+    }) catch return warnOverflow(report, buf.len);
+    w.print("\"params\":{{\"duration_ms\":{d},\"sample_ms\":{d},\"cpu_workers\":{d},\"producers\":{d},\"pool_threads\":{d}," ++
+        "\"blocking_workers\":{d},\"blocking_threads\":{d},\"restarts\":{d},\"timers\":{d}}},", .{
+        p.duration_ms,      p.sample_ms,        p.cpu_workers, p.cpu_producers, p.pool_threads,
+        p.blocking_workers, p.blocking_threads, p.restarts,    p.timers,
+    }) catch return warnOverflow(report, buf.len);
+    w.print("\"result\":{{\"pass\":{},\"fails\":{d},\"warns\":{d}}},", .{ rec.pass, rec.fails, rec.warns }) catch return warnOverflow(report, buf.len);
+    w.print("\"cpu\":{{\"dispatches\":{d},\"push_failures\":{d},\"high_water\":{d},\"ready_len_end\":{d}}},", .{
+        rec.cpu_dispatches, rec.cpu_push_failures, rec.cpu_high_water, rec.cpu_ready_len,
+    }) catch return warnOverflow(report, buf.len);
+    w.print("\"blocking\":{{\"dispatches\":{d},\"push_failures\":{d},\"high_water\":{d},\"ready_len_end\":{d}}},", .{
+        rec.blk_dispatches, rec.blk_push_failures, rec.blk_high_water, rec.blk_ready_len,
+    }) catch return warnOverflow(report, buf.len);
+    w.print("\"timers\":{{\"fires\":{d},\"dropped\":{d},\"discarded\":{d}}},", .{
+        rec.timer_fires, rec.timer_dropped, rec.timers_discarded,
+    }) catch return warnOverflow(report, buf.len);
+    w.print("\"sent\":{{\"cpu\":{d},\"cpu_full\":{d},\"blocking\":{d},\"blocking_full\":{d},\"progress\":{d},\"boom\":{d},\"boom_closed\":{d}}},", .{
+        rec.cpu_sent, rec.cpu_full, rec.blk_sent, rec.blk_full, rec.progress_sent, rec.boom_sent, rec.boom_closed,
+    }) catch return warnOverflow(report, buf.len);
+    w.print("\"handled\":{{\"cpu\":{d},\"blocking\":{d},\"progress\":{d},\"boom_errors\":{d}}},", .{
+        rec.handled_cpu, rec.handled_blk, rec.handled_progress, rec.boom_errors,
+    }) catch return warnOverflow(report, buf.len);
+    w.print("\"supervision\":{{\"restarts\":{d},\"stops\":{d},\"dead\":{d}}},", .{
+        rec.restarts, rec.supervised_stops, rec.dead,
+    }) catch return warnOverflow(report, buf.len);
+    w.print("\"windows\":{{\"attempted\":{d},\"covered\":{d},\"alloc_calls\":{d},\"alloc_bytes\":{d}}},", .{
+        rec.windows_attempted, rec.windows_covered, rec.window_alloc_calls, rec.window_alloc_bytes,
+    }) catch return warnOverflow(report, buf.len);
+    w.print("\"isolation\":{{\"intervals\":{d},\"saturated\":{d}}},", .{
+        rec.isolation_intervals, rec.isolation_saturated,
+    }) catch return warnOverflow(report, buf.len);
+    w.print("\"alloc_probe\":{{\"calls\":{d},\"bytes\":{d},\"attempts\":{d}}},", .{
+        rec.probe_calls, rec.probe_bytes, rec.probe_attempts,
+    }) catch return warnOverflow(report, buf.len);
+    w.print("\"rss\":{s},\"threads\":{s},", .{ rss_json, thr_json }) catch return warnOverflow(report, buf.len);
+    w.print("\"shutdown\":{{\"ms\":{d},\"bound_ms\":{d},\"in_flight_claimed\":{d}}},\"steady_samples\":{d}}}\n", .{
+        rec.shutdown_ms, shutdown_bound_ms, rec.in_flight_claimed, rec.steady_samples,
+    }) catch return warnOverflow(report, buf.len);
+    const line = w.buffered();
+
+    const file = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false, .read = true }) catch |err| {
+        report.warn("history: cannot open {s}: {s}", .{ path, @errorName(err) });
+        return;
+    };
+    defer file.close(io);
+    const end = (file.stat(io) catch |err| {
+        report.warn("history: cannot stat {s}: {s}", .{ path, @errorName(err) });
+        return;
+    }).size;
+    // Positional write at the current end: append without a seek. Two writers
+    // racing one file would interleave badly — the protocol is one run at a
+    // time per path (CI: one runner, one file; locally: the record script).
+    file.writePositionalAll(io, line, end) catch |err| {
+        report.warn("history: append to {s} failed: {s}", .{ path, @errorName(err) });
+        return;
+    };
+    std.debug.print("[stress] history: appended {d} byte(s) to {s} (commit {s})\n", .{ line.len, path, p.commit });
+}
 
 /// One sample of the time series. RSS and thread count are `?` because the
 /// platform may not offer them; the runtime readings never are.
@@ -1636,6 +1817,55 @@ fn run(io: std.Io, backing: std.mem.Allocator, p: Params) !Report {
         probe.calls(), probe.bytesOut(), probe.attempts.load(.monotonic),
     });
 
+    if (p.history_path) |path| {
+        appendHistory(io, path, p, &report, .{
+            .pass = report.passed(),
+            .fails = report.total,
+            .warns = report.warnings,
+            .cpu_dispatches = cpu_end.dispatches,
+            .cpu_push_failures = cpu_end.ready_push_failures,
+            .cpu_high_water = @intCast(cpu_end.ready_high_water),
+            .cpu_ready_len = @intCast(cpu_end.ready_len),
+            .blk_dispatches = blk_end.dispatches,
+            .blk_push_failures = blk_end.ready_push_failures,
+            .blk_high_water = @intCast(blk_end.ready_high_water),
+            .blk_ready_len = @intCast(blk_end.ready_len),
+            .timer_fires = stats_end.timer_fires,
+            .timer_dropped = stats_end.timer_deliveries_dropped,
+            .timers_discarded = after.timers_discarded,
+            .cpu_sent = shared.cpu_sent.load(.monotonic),
+            .cpu_full = shared.cpu_full.load(.monotonic),
+            .blk_sent = shared.blocking_sent.load(.monotonic),
+            .blk_full = shared.blocking_full.load(.monotonic),
+            .progress_sent = shared.progress_sent.load(.monotonic),
+            .boom_sent = shared.boom_sent.load(.monotonic),
+            .boom_closed = shared.boom_closed.load(.monotonic),
+            .handled_cpu = shared.handled_cpu.load(.monotonic),
+            .handled_blk = shared.handled_blocking.load(.monotonic),
+            .handled_progress = shared.handled_progress.load(.monotonic),
+            .boom_errors = stats_end.handler_errors,
+            .restarts = stats_end.group_restarts,
+            .supervised_stops = stats_end.supervised_stops,
+            .dead = @intCast(dead_end),
+            .windows_attempted = @intCast(windows_attempted),
+            .windows_covered = @intCast(windows_covered),
+            .window_alloc_calls = window_alloc_calls,
+            .window_alloc_bytes = window_alloc_bytes,
+            .isolation_intervals = @intCast(isolation_intervals),
+            .isolation_saturated = @intCast(saturation_seen),
+            .probe_calls = probe.calls(),
+            .probe_bytes = probe.bytesOut(),
+            .probe_attempts = probe.attempts.load(.monotonic),
+            .rss_min = if (rss_seen > 0) rss_min else null,
+            .rss_max = if (rss_seen > 0) rss_max else null,
+            .thr_min = if (thr_seen > 0) thr_min else null,
+            .thr_max = if (thr_seen > 0) thr_max else null,
+            .shutdown_ms = shutdown_ms,
+            .in_flight_claimed = @intCast(in_flight_claimed),
+            .steady_samples = @intCast(sample_n),
+        });
+    }
+
     report.dump();
     std.debug.print("[stress] RESULT: {s}\n", .{if (report.passed()) "PASS" else "FAIL"});
     return report;
@@ -1654,11 +1884,114 @@ fn stopProducers(shared: *Shared, producers: *[max_producers]std.Thread, n: usiz
 // ── entry points ────────────────────────────────────────────────────────────
 
 pub fn main(init: std.process.Init) !void {
-    const report = try run(init.io, init.gpa, paramsFromOptions());
+    var p = paramsFromOptions();
+    if (init.environ_map.get("RUNTIME_STRESS_HISTORY")) |path| {
+        p.history_path = path;
+        if (init.environ_map.get("GITHUB_SHA") orelse init.environ_map.get("GIT_SHA")) |sha| {
+            if (validCommit(sha)) p.commit = sha;
+        }
+    }
+    const report = try run(init.io, init.gpa, p);
     if (!report.passed()) std.process.exit(1);
 }
 
 test "runtime stress: sustained load walks every runtime invariant" {
     const report = try run(std.testing.io, stressAllocator(), paramsFromOptions());
     try std.testing.expectEqual(@as(u64, 0), report.total);
+}
+
+fn dummyHistoryRec() HistoryRec {
+    return .{
+        .pass = true,
+        .fails = 0,
+        .warns = 0,
+        .cpu_dispatches = 12345,
+        .cpu_push_failures = 0,
+        .cpu_high_water = 2,
+        .cpu_ready_len = 0,
+        .blk_dispatches = 678,
+        .blk_push_failures = 0,
+        .blk_high_water = 1,
+        .blk_ready_len = 0,
+        .timer_fires = 48,
+        .timer_dropped = 0,
+        .timers_discarded = 0,
+        .cpu_sent = 100,
+        .cpu_full = 3,
+        .blk_sent = 50,
+        .blk_full = 0,
+        .progress_sent = 10,
+        .boom_sent = 5,
+        .boom_closed = 5,
+        .handled_cpu = 100,
+        .handled_blk = 50,
+        .handled_progress = 10,
+        .boom_errors = 5,
+        .restarts = 3,
+        .supervised_stops = 1,
+        .dead = 1,
+        .windows_attempted = 12,
+        .windows_covered = 12,
+        .window_alloc_calls = 0,
+        .window_alloc_bytes = 0,
+        .isolation_intervals = 10,
+        .isolation_saturated = 10,
+        .probe_calls = 111,
+        .probe_bytes = 2222,
+        .probe_attempts = 90,
+        .rss_min = null,
+        .rss_max = null,
+        .thr_min = null,
+        .thr_max = null,
+        .shutdown_ms = 40,
+        .in_flight_claimed = 1,
+        .steady_samples = 50,
+    };
+}
+
+test "history append writes one schema-v1 JSON line per call and appends" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/history.jsonl", .{tmp.sub_path[0..]});
+
+    var p = paramsFromOptions();
+    p.commit = "deadbee";
+    var report = Report{};
+
+    appendHistory(std.testing.io, path, p, &report, dummyHistoryRec());
+    appendHistory(std.testing.io, path, p, &report, dummyHistoryRec());
+    // History failures degrade to warns; a clean append must not even warn.
+    try std.testing.expectEqual(@as(u64, 0), report.warnings);
+
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(1 << 16));
+    defer std.testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    const l1 = lines.next().?;
+    const l2 = lines.next().?;
+    try std.testing.expectEqual(@as(usize, 0), lines.next().?.len); // trailing newline, then EOF
+
+    for ([_][]const u8{ l1, l2 }) |line| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, line, .{});
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        try std.testing.expectEqual(@as(i64, 1), root.get("v").?.integer);
+        try std.testing.expectEqualStrings("deadbee", root.get("commit").?.string);
+        try std.testing.expect(root.get("result").?.object.get("pass").?.bool);
+        try std.testing.expectEqual(@as(i64, 12345), root.get("cpu").?.object.get("dispatches").?.integer);
+        try std.testing.expectEqual(@as(i64, 0), root.get("windows").?.object.get("alloc_calls").?.integer);
+        // No platform reading was offered: both sub-objects must be JSON null,
+        // not absent — a missing key and a null mean different things to the
+        // trend reader.
+        try std.testing.expect(root.get("rss").? == .null);
+        try std.testing.expect(root.get("threads").? == .null);
+    }
+}
+
+test "history commit validation is the escaping strategy" {
+    try std.testing.expect(validCommit("deadbee"));
+    try std.testing.expect(validCommit("0123456789abcdef0123456789abcdef01234567"));
+    try std.testing.expect(!validCommit("ab")); // too short
+    try std.testing.expect(!validCommit("not-a-sha!\"\\")); // would break the JSON
+    try std.testing.expect(!validCommit("")); // empty
 }

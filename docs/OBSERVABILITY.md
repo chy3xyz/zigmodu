@@ -215,3 +215,14 @@ annotations:
    现在 push 还多了一道 `zig build soak-smoke`（同样只在 Linux 腿），用 `build.zig` 里**写死**的小预算真跑
    `soak` 与 `soak-cluster` 的断言（`runtime-stress` 已由 `zig build test` 覆盖，不重复），所以"这三个目标只在
    夜间跑"对其中两个已不再成立。
+
+6. **runtime-stress 历史序列（commit → 结果的纵向趋势）**：harness 设了
+   `RUNTIME_STRESS_HISTORY=<path>` 就会每次运行追加一行 schema-v1 JSON（计数器全集，不含宿主时钟列；
+   commit 取自 `GITHUB_SHA`/`GIT_SHA`，hex 校验过所以 JSON 无需转义）。夜间 CI 已把它接进
+   `$RUNNER_TEMP/nightly-logs/`，随 `nightly-soak-<sha>` artifact 归档 30 天 —— 那条 artifact 就是
+   天然的 commit→结果序列。本地/发版前用 `bash scripts/runtime-stress-record.sh [duration_ms] [path]`
+   （默认写仓库根的 `runtime-stress-history.jsonl`，已 gitignore），读序列用
+   `python3 scripts/runtime_stress_trend.py <path> [--window N]`：**硬门**只收宿主无关的契约
+   （harness 自身失败 / `push_failures` / 窗口内分配，违例 exit 1）；dispatch 量、RSS spread、
+   shutdown 耗时这类宿主相关读数只打印中位数与 delta 不门禁（§12.15/§12.16 的同一条分工；
+   `timers.dropped` 是背压语义不是契约，也只在漂移表里）。
