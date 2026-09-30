@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+### 第 117 批：check-bench 确认复跑（duration-only 失败自动复跑一遍再判）（**破坏性：否**）
+
+1. **缘起**：第 114 批 CI macOS 腿的 false red —— `100 checks x10K` 42.9ms vs 基线 19.9ms
+   （2.16× > 2.0×），同 commit 原样重跑 28.9ms 即绿。median-of-3 防得住样本级尖峰，
+   防不住**整轮级**负载（共享 runner 上隔壁的编译把一整轮拖过阈值）。当时的手工处置
+   "重跑一遍再信"是对的，本批把它自动化。
+2. **设计**：duration-only 失败不再直接判红 —— 套件复跑一遍（同一二进制、无第二次预热，
+   页缓存已就位），只对越界的条目用**同一份判定代码**重判：复现 = 真回归（与旧行为同判红）；
+   不复现 = 记为宿主负载，两遍数字都留在日志里。**alloc 越界不走此路** —— 它是精确计数
+   不是时长，首测即终判（脚本原有注释本就写着 "re-running is not the answer"）。
+   `BENCH_CONFIRM=0` 可关闭。
+3. **实现**：check 模式的 393 行 python heredoc 抽成 `scripts/lib/bench-check.py`
+   （`scripts/lib/bench-log.py` 已有先例），新增 `--only <csv>`（确认复判）与
+   `--breach-out <path>`（把失败的**形状**结构化给 bash：duration 破了哪几条、alloc 破了
+   哪几条）。抽取是机械平移 + 5 处守卫（`--only` 下跳过 alloc 判据 / ci-refresh 合并 /
+   基线卫生 WARN），主判与确认复判**永远同一份代码**，不存在两处实现漂移的可能。
+4. **自检**（合成数据，6 条路径全过）：primary 破戒 → exit 1 + `breach.json` 形状正确；
+   confirm 干净 → exit 0 且带 `OK (confirm pass)`；confirm 仍破戒 → exit 1；
+   alloc 破戒 → `breach.json` 的 `slower` 为空（复跑不会被触发）；primary 全绿 → exit 0
+   且基线卫生 WARN（gone/new）照旧；`bash -n` + `ast.parse` 语法双过。
+5. **门禁读数**：本地真跑 `bash scripts/check-bench.sh` 绿（走的就是新代码路径：
+   `32/32 metric(s) within 2.0x`，`32/32 alloc budget(s) held`，BENCH_EXIT=0）。
+6. **刻意不做**：阈值不变（2.0× 哲学照旧 —— "never raise it just to make a real regression
+   pass"）；不做按条目阈值覆写（没有数据指出哪条该宽）；confirm 固定只复跑一次、不做 N 次
+   投票 —— 一次已足够区分"邻居编译"与"真回归"，更多次是给真回归送时间。
+
 ### 第 116 批：runtime-stress 历史趋势化 v1（commit → 结果的纵向序列）（**破坏性：否**）
 
 1. **缘起**：v1.0-gap 证据层主线 —— 仓库自己承认"`runtime-stress` 仍是 synthetic workload，
