@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+### 第 119 批：readiness 表两条"未验证"收口 + PG 零超时的响亮警告（**破坏性：否**）
+
+1. **`Config.query_timeout_ms = 0` 不再静默无界**（A-5 残余的定界一半）：`Client.connect`
+   对 postgres + 0 的组合打一次响亮警告（语义沿用 DEB 无凭证警告的体例 —— 0 仍允许，
+   维护工具可能要它，但不许无声）。判定抽成纯函数 `hasUnboundedPgReads`（该字段是 PG 专属，
+   其它驱动不经此旋钮无界），配 5 分支单测。
+2. **双实例 `permissionGateWith` 对拍 —— 核实为早已存在**：`Middleware.zig` 的
+   `one process, two servers: each gate enforces its own catalog`（同进程两个 Server、共享
+   一个 SecurityModule、同一 token 在两个 app 拿相反答案即视为泄漏）+ loader 隔离配套用例，
+   第 13 批就已落地。readiness v0.35 的 §六 行是时点快照，本批按该文档体例补**跟进注**
+   （追加而不回改），不重开已有关闭的覆盖。
+3. **HTTPS loopback 复用端到端观测**（readiness §六 最后一行）：新测试 `HttpClient reuses
+   the pooled TLS connection on loopback` —— `openssl req` 就地生成自签证书 + `python3`
+   单文件 HTTP/1.1 keep-alive 服务（**不用** `s_server -HTTP`：它答 HTTP/1.0 无 keep-alive，
+   std 正确地拒绝入池，实测确认）。trust 密封：常驻 client 的 bundle 只装这张证书、直置
+   `now` 跳过系统 rescan —— 过测不沾宿主 CA 库的光。两次 200 后断言
+   `https_clients_created == 1` 且 `connection_pool.free_len == 1`（第二个请求复用了第一个
+   的 TLS 连接）。无 openssl/python3/网络 → skip。顺手修掉 std 0.17 的一个用法陷阱：
+   `Child.kill(io)` 自带 wait+cleanup，再调 `wait` 撞 `assert(child.id != null)` unreachable。
+4. **门禁读数**：聚焦测试 `hasUnboundedPgReads` 1/1、`loopback` 2/2（含新 TLS 用例）、
+   `one process, two servers` 3/3 绿；fmt ✓；check-production ✓；
+   check-test-collection ✓（2141）；全量见本条门禁段（FULLTEST_EXIT 记录于提交说明）。
+
 ### 第 118 批：§12.17 收尾 —— MetricsBridge 按类 gauge + 三类混合活跑实测（**破坏性：否**）
 
 1. **缘起**：§12.17 留下两条"仍开"——MetricsBridge 的每类拆分 gauge 没做、优先级对吞吐与

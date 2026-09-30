@@ -2801,3 +2801,145 @@ test "std.http.Client drains and re-pools a half-read body unless it is closing"
     try probeFetch(&client, url);
     try std.testing.expectEqual(@as(usize, 1), client.connection_pool.free_len);
 }
+
+// ── HTTPS loopback reuse, end to end ─────────────────────────────────────
+//
+// The pooling unit evidence (`https_clients_created == 1`, the clock re-arm
+// test) pins the mechanism without a TLS peer; what it cannot show is that a
+// real TLS connection survives a whole response and is picked up by the next
+// request. This test stands up a TLS server on loopback (std has no
+// server-side TLS — the A-2 boundary): cert by `openssl req`, serving by a
+// `python3` one-file HTTP/1.1 server (HTTP/1.1 because `s_server -HTTP`
+// answers HTTP/1.0-without-keep-alive, which std correctly refuses to pool).
+// No openssl / python3 / network → skip, not fail.
+//
+// Trust is hermetic on purpose: the resident client's bundle is loaded with
+// ONLY the freshly generated self-signed cert — `now` is set directly so the
+// request path never rescans the system bundle over the addition (std rescans
+// exactly when `now == null`) — so a pass cannot be owed to the host's CA
+// store, and the host's store is not needed either.
+test "HttpClient reuses the pooled TLS connection on loopback" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    const probe = std.process.run(allocator, io, .{ .argv = &.{ "openssl", "version" } }) catch return error.SkipZigTest;
+    allocator.free(probe.stdout);
+    allocator.free(probe.stderr);
+    if (!probe.term.success()) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A one-day self-signed cert for 127.0.0.1, generated into the tmp dir
+    // (the same shape examples/production-deploy/certs/README.md documents).
+    const gen = std.process.run(allocator, io, .{
+        .argv = &.{
+            "openssl", "req",     "-x509", "-newkey",  "rsa:2048", "-nodes",        "-days",   "1",
+            "-keyout", "key.pem", "-out",  "cert.pem", "-subj",    "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1",
+        },
+        .cwd = .{ .dir = tmp.dir },
+    }) catch return error.SkipZigTest;
+    allocator.free(gen.stdout);
+    allocator.free(gen.stderr);
+    if (!gen.term.success()) return error.SkipZigTest;
+
+    const port = try deadLoopbackPort();
+
+    // The one-file HTTP/1.1 keep-alive server. Content-Length is what makes
+    // the response self-delimiting, which is what lets the connection go back
+    // to the pool instead of being closed at the end of the body.
+    const server_py =
+        \\import http.server, ssl, sys
+        \\class H(http.server.BaseHTTPRequestHandler):
+        \\    protocol_version = "HTTP/1.1"
+        \\    def do_GET(self):
+        \\        b = b"ok"
+        \\        self.send_response(200)
+        \\        self.send_header("Content-Type", "text/plain")
+        \\        self.send_header("Content-Length", str(len(b)))
+        \\        self.end_headers()
+        \\        self.wfile.write(b)
+        \\    def log_message(self, *a): pass
+        \\ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        \\ctx.load_cert_chain("cert.pem", "key.pem")
+        \\s = http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H)
+        \\s.socket = ctx.wrap_socket(s.socket, server_side=True)
+        \\s.serve_forever()
+        \\
+    ;
+    {
+        const f = try tmp.dir.createFile(io, "server.py", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, server_py);
+    }
+
+    const py = std.process.run(allocator, io, .{ .argv = &.{ "python3", "--version" } }) catch return error.SkipZigTest;
+    allocator.free(py.stdout);
+    allocator.free(py.stderr);
+    if (!py.term.success()) return error.SkipZigTest;
+
+    var port_buf: [8]u8 = undefined;
+    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+    var server = std.process.spawn(io, .{
+        .argv = &.{ "python3", "server.py", port_arg },
+        .cwd = .{ .dir = tmp.dir },
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return error.SkipZigTest;
+    defer server.kill(io); // kill reaps: it terminates, waits, and cleans up
+
+    // Readiness: poll a raw TCP connect until s_server has its listener up.
+    // Each probe costs one `-naccept` slot (the TLS handshake never happens);
+    // 64 leaves ample room for the real requests.
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+    var probes: usize = 0;
+    ready: while (probes < 200) : (probes += 1) {
+        const stream = addr.connect(io, .{ .mode = .stream }) catch {
+            std.Io.sleep(io, .{ .nanoseconds = 25 * std.time.ns_per_ms }, .real) catch {};
+            continue;
+        };
+        stream.close(io);
+        break :ready;
+    } else return error.SkipZigTest; // the server never came up: environment, not product
+
+    var client = HttpClient.init(allocator, io, 1, 500);
+    defer client.deinit();
+    // A failure here is the test failing, not something to retry away (the
+    // retry path would also discard the pooled connection, hiding the very
+    // reuse being observed).
+    client.retry_policy.max_retries = 0;
+
+    const shared = try client.httpsClient();
+    {
+        const now = std.Io.Clock.real.now(io);
+        try shared.ca_bundle_lock.lock(io);
+        defer shared.ca_bundle_lock.unlock(io);
+        var dir_abs_buf: [4096]u8 = undefined;
+        const dir_abs = dir_abs_buf[0..try tmp.dir.realPath(io, &dir_abs_buf)];
+        var cert_abs_buf: [4096 + 16]u8 = undefined;
+        const cert_abs = try std.fmt.bufPrint(&cert_abs_buf, "{s}/cert.pem", .{dir_abs});
+        try shared.ca_bundle.addCertsFromFilePathAbsolute(allocator, io, now, cert_abs);
+        shared.now = now;
+    }
+    client.releaseHttpsClient();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/", .{port});
+    for (0..2) |_| {
+        var req = HttpClient.HttpRequest.init(allocator, "GET", url);
+        defer req.deinit();
+        var resp = try client.request(req);
+        defer resp.deinit();
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+    }
+
+    // One resident std client, and — the observation this test exists for —
+    // exactly one connection in its pool after two requests: the second
+    // request was served by the first request's TLS connection.
+    try std.testing.expectEqual(@as(u32, 1), client.https_clients_created);
+    const pool = &client.https_client.?.connection_pool;
+    pool.mutex.lockUncancelable(io);
+    defer pool.mutex.unlock(io);
+    try std.testing.expectEqual(@as(usize, 1), pool.free_len);
+}

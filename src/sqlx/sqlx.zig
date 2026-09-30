@@ -4887,11 +4887,22 @@ pub const Config = struct {
     max_wait_ms: u32 = 5000,
     max_lifetime_secs: u32 = 3600,
     max_idle_time_secs: u32 = 300,
-    /// libpq socket read timeout (ms). 0 = disabled. Guards against a hung
-    /// synchronous PQexec* permanently wedging a fiber/worker thread — the
-    /// query fails with error.Timeout and the connection is re-established.
+    /// libpq socket read timeout (ms). 0 = disabled — an explicit choice the
+    /// caller owns: a hung synchronous read then holds its worker thread
+    /// forever, and `connect` says so once (loudly) at open. Guards against a
+    /// hung synchronous PQexec* permanently wedging a fiber/worker thread —
+    /// the query fails with error.Timeout and the connection is
+    /// re-established.
     query_timeout_ms: u32 = 30000,
 };
+
+/// True when the config leaves synchronous PG reads unbounded (the field is
+/// PG-specific, so other drivers are never "unbounded" through it).
+/// `Client.connect` warns once when this holds — 0 stays allowed (maintenance
+/// tooling may want it), but never silently.
+pub fn hasUnboundedPgReads(cfg: Config) bool {
+    return cfg.driver == .postgres and cfg.query_timeout_ms == 0;
+}
 
 /// Transaction options aligned with Go's sql.TxOptions.
 pub const TxOptions = struct {
@@ -5187,6 +5198,9 @@ pub const Client = struct {
 
     pub fn connect(self: *Client) !void {
         if (self.conn != null) return;
+        if (hasUnboundedPgReads(self.config)) {
+            std.log.warn("[sqlx] postgres query_timeout_ms=0: a hung synchronous PQexec* read holds its worker thread forever. Set a bound (default 30000) unless this client is maintenance tooling that owns the risk", .{});
+        }
         self.conn = try self.newConn();
     }
 
@@ -11510,4 +11524,14 @@ test "postgres prepared-statement bind walk reports allocation failures as OutOf
     }
     try std.testing.expect(succeeded);
     try std.testing.expect(failures > 0);
+}
+
+test "hasUnboundedPgReads: only postgres with a zero timeout leaves reads unbounded" {
+    // The field is PG-specific, so a zero timeout on other drivers is not an
+    // unbounded-reads choice through this knob.
+    try std.testing.expect(hasUnboundedPgReads(.{ .driver = .postgres, .query_timeout_ms = 0 }));
+    try std.testing.expect(!hasUnboundedPgReads(.{ .driver = .postgres, .query_timeout_ms = 30000 }));
+    try std.testing.expect(!hasUnboundedPgReads(.{ .driver = .postgres })); // default 30000
+    try std.testing.expect(!hasUnboundedPgReads(.{ .driver = .sqlite, .query_timeout_ms = 0 }));
+    try std.testing.expect(!hasUnboundedPgReads(.{ .driver = .mysql, .query_timeout_ms = 0 }));
 }
