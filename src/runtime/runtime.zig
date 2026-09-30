@@ -8142,9 +8142,15 @@ test "Pooled (§12.16): the batch sweep — throughput against latency, measured
 //
 // Same reading discipline as §12.16: the feeder stamps the message immediately
 // before `send`, the handler takes the sample, and the pool is the contended
-// resource (one thread, three mailboxes kept full by feeders that retry
-// `error.Full` rather than drop), so what is measured is the scheduler's
-// choice, not arrival timing.
+// resource (one thread, three feeders that retry `error.Full` rather than
+// drop). One honest caveat, learned from the CI runners: the *shares* this
+// shape produces are a reading of the host's **thread** scheduler as much as
+// of the class mechanism — on an oversubscribed host a descheduled feeder lets
+// a mailbox run dry, and the ring-empty window hands the turn to another
+// class. So the run asserts only what held on every host (conservation, the
+// low class's reservation floor, the latency ordering), prints the shares, and
+// leaves the turn-order claim to the thread-free scheduler tests where it
+// belongs.
 
 test "Pooled (§12.17): a saturated high/normal/low mix — shares and the latency tail, measured and printed" {
     const allocator = std.testing.allocator;
@@ -8291,11 +8297,11 @@ test "Pooled (§12.17): a saturated high/normal/low mix — shares and the laten
         );
     }
     std.debug.print(
-        "[§12.17 mix]   shares and the latency tail are the reading; the µs columns move with the host, the order between the classes is what the mechanism owns\n",
+        "[§12.17 mix]   shares and the latency tail are the reading; the µs columns move with the host, and — as the CI runners showed — so do the shares: which class a dry mailbox hands its turns to is decided by *thread* scheduling, not by the class mechanism\n",
         .{},
     );
     std.debug.print(
-        "[§12.17 mix]   note: normal is the squeezed class in this shape — strict turns go high-first, reserved turns go low-first, so normal is served only from instants high ran dry (a designed boundary, not a bug; §12.17)\n",
+        "[§12.17 mix]   note: on an oversubscribed host a descheduled feeder lets a mailbox run dry, and the ring-empty window is what the pool sees — the order the mechanism owns (strict, reserved slot) is pinned thread-free in scheduler.zig; this run pins what stays true under live traffic either way\n",
         .{},
     );
     std.debug.print(
@@ -8323,34 +8329,25 @@ test "Pooled (§12.17): a saturated high/normal/low mix — shares and the laten
     try std.testing.expectEqual(@as(usize, total_handled), @as(usize, @intCast(stats.messages_received)));
     for (0..3) |i| try std.testing.expectEqual(@as(usize, 0), logs[i].overflowed());
 
-    // What priority means, asserted rather than implied — every relation below
-    // is between two numbers of the same window on the same host, so a loaded
-    // runner moves the absolute figures without moving the relations:
+    // What stays true under live traffic, asserted rather than implied — every
+    // relation below held on four host shapes (macOS arm64, ubuntu x64 + arm64
+    // CI) while the *shares* inverted between them (high 20–80%, normal
+    // 4–68%): shares are a reading of the host's thread scheduler (a
+    // descheduled feeder lets a mailbox run dry, and the pool serves whoever
+    // holds a token), so no share order is asserted — that ordering belongs to
+    // the thread-free scheduler tests. What the live mix adds:
     //
-    // 1. The strict order expresses: with every mailbox full, the high class
-    //    is served on the plain turns, so it takes the largest share of the
-    //    three.
-    // 2. The reservation expresses: the low class still moves — §12.17's
+    // 1. The reservation expresses: the low class still moves — §12.17's
     //    promise that priority is not a starvation licence, in a live mix
     //    rather than on a constructed ring. The floor is an order of magnitude
-    //    under the share the slot actually delivers, so a scheduler regression
-    //    (not a slow host) is what trips it.
-    // 3. The tail follows the reservation: low's messages wait for the
-    //    reserved turn, so its median queued→handled latency sits above
-    //    high's. This is a relation between two medians of the same run, not
-    //    a µs budget.
-    //
-    // What is deliberately **not** asserted: a floor for the normal class. The
-    // measured finding of this run (see docs/RUNTIME.md §12.17) is that under
-    // a saturated high *and* low mix, normal is the squeezed class — the
-    // strict turns go high-first and the reserved turns go low-first, so
-    // normal is served only from the instants high ran dry. That is the
-    // mechanism working as designed (nothing promised normal a bound), and
-    // the squeeze is exactly the data the open "configurable weights" question
-    // needed; pinning a floor here would assert a semantics the design never
-    // made.
-    try std.testing.expect(handled[0] > handled[1]);
-    try std.testing.expect(handled[0] > handled[2]);
+    //    under the share the slot delivered on every host observed (9.7k–27k),
+    //    so a scheduler regression (not a slow host) is what trips it.
+    // 2. The tail follows the mechanism: high is drained first whenever its
+    //    token is present, so its mailbox stays shallow and its median
+    //    queued→handled latency sits below low's — whose token waits for the
+    //    reserved turn whenever a busier class holds one. A relation between
+    //    two medians of the same run, not a µs budget (held 6–70× on all four
+    //    hosts).
     try std.testing.expect(handled[2] >= 1_000);
     try std.testing.expect(lat[2].p50 > lat[0].p50);
 }
