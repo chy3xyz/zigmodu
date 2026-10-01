@@ -285,7 +285,7 @@ const zigmodu_zon_url = "https://github.com/chy3xyz/zigmodu/archive/refs/tags/v"
 /// "expected .hash = ..." hint is printed verbatim. (`zig fetch <the same url>`
 /// prints the same string directly and is what was used for the last refresh —
 /// `--fetch` alone did not surface the hint unless the dependency was built.)
-const zigmodu_zon_hash = "zigmodu-0.39.2-U40vs-RgkgAcwP1R_ho5llI9hozM-SIsR_7PxXez4v5n";
+const zigmodu_zon_hash = "zigmodu-0.39.3-U40vszBpkgCVLZCyvoiKm4RGXH9vRicZzdQEwj8-uuWZ";
 
 comptime {
     // The pinned hash can only be computed **after** the tag for its version
