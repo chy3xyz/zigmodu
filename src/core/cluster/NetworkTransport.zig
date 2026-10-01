@@ -110,8 +110,16 @@ pub const ClusterServer = struct {
     /// running one); there is exactly one place that knows what a handler is for.
     pub fn start(self: *ClusterServer, handler: Handler, context: ?*anyopaque) !void {
         const addr = try std.Io.net.IpAddress.parseIp4("0.0.0.0", self.port);
-        self.listener = try addr.listen(self.io, .{ .reuse_address = true });
-        self.running.store(true, .monotonic);
+        const listener = try addr.listen(self.io, .{ .reuse_address = true });
+        // Publish the *bound* port before anything can observe `running`:
+        // `listen` has already answered getsockname, so an ephemeral (`0`)
+        // config reads back the kernel-chosen port, and `stop()`'s wake dials
+        // that number — reading `0` there would skip the wake with an accept
+        // blocked. Written once, ahead of the release store, so any thread
+        // that observed `running == true` observes this too.
+        self.port = listener.socket.address.getPort();
+        self.listener = listener;
+        self.running.store(true, .release);
 
         while (self.running.load(.monotonic)) {
             const stream = (self.listener orelse break).accept(self.io) catch |err| {
@@ -167,17 +175,21 @@ pub const ClusterServer = struct {
         // `seq_cst`, because the accept loop's re-check relies on this store
         // being ordered against its own claim (see `start`).
         self.running.store(false, .seq_cst);
-        if (self.listener) |*l| {
-            // Wake only — the fd is *not* closed here. The accept loop runs on
-            // `start()`'s own thread, which `stop()` cannot join; closing the
-            // fd now would race that thread's next `accept()` into an EBADF
-            // that `std.Io` punishes with a panic, not an error
-            // (`sockread.wakeListener`). `shutdown` makes the blocked and every
-            // later `accept` fail with EINVAL instead, and `start()` closes the
-            // fd itself once its loop has exited — the only ordering with no
-            // cross-thread close at all.
-            sockread.wakeListener(l);
-        }
+        // Wake by port, never by dereferencing `self.listener`: the accept
+        // thread closes the listener itself on its exit path (`start()`), and
+        // `Server.deinit` poisons the struct in debug builds, so a concurrent
+        // `wakeListener` can read a corrupt union tag out of `socket.address`
+        // and panic — observed as "switch on corrupt value" in `getPort`
+        // during soak-cluster teardown on ubuntu CI. The port is stable from
+        // `listen` to close, and a connect to a port whose listener is already
+        // closed just answers ECONNREFUSED. The fd is *not* closed here
+        // either: the accept loop runs on `start()`'s own thread, which
+        // `stop()` cannot join; closing it now would race that thread's next
+        // `accept()` into an EBADF that `std.Io` punishes with a panic, not
+        // an error (`sockread.wakeListener`). `start()` closes the fd itself
+        // once its loop has exited — the only ordering with no cross-thread
+        // close at all.
+        sockread.wakeListenerByPort(self.port);
         // The accept loop may be one dispatch short of handing a connection
         // over; let it finish that step so the await below covers that fiber too
         // (bounded by one `Group.concurrent` call — no later one can start,
@@ -237,4 +249,39 @@ test "message framing round-trip" {
 
 test "max message size constant" {
     try std.testing.expect(MAX_MESSAGE_SIZE == 1024 * 1024);
+}
+
+fn closeOnlyHandler(context: ?*anyopaque, conn: ClusterConnection) void {
+    _ = context;
+    var c = conn;
+    c.deinit();
+}
+
+test "ClusterServer stop vs the accept thread's own listener close: no race, port published" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    if (!@import("../../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    // Regression hunt for the soak-cluster teardown panic ("switch on corrupt
+    // value" in `wakeListener` → `getPort`): `stop()` used to dereference
+    // `self.listener` while the accept thread was concurrently `deinit`-ing it
+    // (debug builds poison the struct). The wake now dials by port only, and
+    // `start` publishes the ephemeral port before `running` — both halves are
+    // exercised over enough iterations to walk through the race window.
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        var server = ClusterServer.init(allocator, io, 0);
+        const t = try std.Thread.spawn(.{}, ClusterServer.start, .{ &server, closeOnlyHandler, null });
+        var spins: usize = 0;
+        while (!server.running.load(.monotonic) and spins < 2000) : (spins += 1) {
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+        }
+        try std.testing.expect(server.running.load(.monotonic));
+        // An ephemeral (`0`) config must read back the kernel-chosen port —
+        // that number is what `stop()`'s wake dials.
+        try std.testing.expect(server.port != 0);
+        server.stop();
+        t.join();
+        server.deinit();
+    }
 }

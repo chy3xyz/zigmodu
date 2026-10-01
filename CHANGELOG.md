@@ -1,5 +1,37 @@
 # Changelog
 
+## [Unreleased]
+
+### 第 123 批：ClusterServer stop/accept 竞态修复 —— v0.39.1 发布后 CI soak smoke 抓到的真崩溃（**破坏性：否**）
+
+1. **缘起**：v0.39.1 发布提交推送后，master 的 CI（`Build & Test (ubuntu-latest)` 的
+   "Soak smoke" 步骤）在 teardown 节点 sc-b 时 panic：`switch on corrupt value` ——
+   `std.Io.net.Server.getPort` ← `sockread.wakeListener` ← `ClusterServer.stop`。
+   122 批同代码绿过、本次才踩中 —— 是潜在竞态 flake，不是确定性失败。
+2. **根因（代码实证）**：`std.Io.net.Server.deinit` = `close(fd); self.* = undefined`
+   （debug 下 0xaa 毒化）。`ClusterServer` 是树内唯一"accept 线程自己关 listener"的
+   形状：`start()` 退出循环后 `l.deinit(); self.listener = null`，而 `stop()` 在另
+   一线程读 `self.listener` 并调 `wakeListener(l)` —— 其 `getPort()` 读到毒化 union
+   tag → panic。`wakeListener` 其余调用方（DistributedEventBus、WebMonitor）都是
+   "wake→join→deinit"的同线程形状，逐读核实过，不受影响。
+3. **修法 —— wake 按端口号，永不解引用 listener**：
+   - `sockread.zig` 新增 `wakeListenerByPort(port)`：只做自连唤醒（`wakeListener` 的
+     后半段），不碰 listener 结构体。有意**不带** `shutdown(SHUT.RDWR)` 那一半：fd
+     并发关闭后同一 fd 号可能已复用为别人的 socket，shutdown 会误伤无关连接。自连
+     的充分性前提（accept 循环每次返回后复查 running）树内所有循环都满足。
+   - `start()` 在发布 `running` 前回填 `self.port = listener.socket.address.getPort()`
+     —— `listen` 内部已 getsockname（std Threaded 实证），ephemeral `0` 读回真实
+     端口；此前 port=0 路径下 `stop()` 的 wake 会读到 0 而跳过，顺手修好。
+   - `stop()` 改调 `wakeListenerByPort(self.port)`：端口号从 listen 到 close 稳定，
+     连已关端口只是 ECONNREFUSED，无害。
+4. **回归测试**：`ClusterServer stop vs the accept thread's own listener close` ——
+   port 0 起服务、观察到 running、立即 stop、join，200 次迭代穿越竞态窗口；并断言
+   `server.port != 0`（ephemeral 回填成为新契约）。
+5. **门禁读数**：聚焦 `ClusterServer` 1/1（新测试）、`Raft` 77/77、`cluster`
+   144/144（2 个 skip 为环境性——redis cluster 与黑洞拨号探测，核实与本次无关）；
+   fmt ✓；check-production ✓；check-test-collection ✓（2142，+1 新测试）；
+   全量 FULLTEST_EXIT 记录于提交说明。
+
 ## [0.39.1] - 2026-10-01
 
 ### 第 122 批：PoolSettled 探针持续化 —— ARM CI 抓到幻影 claim 竞态（**破坏性：否**）

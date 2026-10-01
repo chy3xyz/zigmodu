@@ -111,6 +111,37 @@ pub fn wakeListener(listener: *std.Io.net.Server) void {
     _ = std.c.connect(fd, @ptrCast(&sa), @sizeOf(std.posix.sockaddr.in));
 }
 
+/// Wake a blocked `accept()` by port, **without touching the listener**.
+///
+/// The self-connect half of `wakeListener`, for callers that must not
+/// dereference the `std.Io.net.Server` at all: `ClusterServer`'s accept thread
+/// closes the listener itself on its exit path, and `Server.deinit` poisons
+/// the struct in debug builds, so a concurrent `wakeListener` can read a
+/// corrupt union tag out of `socket.address` and panic ("switch on corrupt
+/// value", observed in soak-cluster teardown on ubuntu CI). The port number is
+/// stable from `listen` to close, and connecting to a port whose listener is
+/// already closed just answers ECONNREFUSED — ignored here.
+///
+/// This deliberately skips `wakeListener`'s `shutdown(SHUT.RDWR)` half: that
+/// half operates on the fd, and after a concurrent close the same fd number
+/// may already name somebody else's socket. The self-connect alone is
+/// sufficient when the accept loop re-checks its running flag after every
+/// `accept()` return (every in-tree loop does): the wake connection is
+/// accepted, the flag read says stop, the loop exits and closes the fd itself.
+pub fn wakeListenerByPort(port: u16) void {
+    if (port == 0) return;
+    const fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    if (fd < 0) return;
+    defer _ = std.c.close(fd);
+    var sa: std.posix.sockaddr.in = .{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7f000001), // 127.0.0.1
+        .zero = std.mem.zeroes([8]u8),
+    };
+    _ = std.c.connect(fd, @ptrCast(&sa), @sizeOf(std.posix.sockaddr.in));
+}
+
 /// Close a listening socket so a thread already blocked in `accept()` returns.
 ///
 /// `wakeBlockedSyscall` is the shutdown half, and the reason it is not optional:
