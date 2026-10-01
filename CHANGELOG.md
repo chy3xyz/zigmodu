@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+### 第 120 批：runtime-stress 时长耦合清零 —— 1h 首跑抓到的 harness 缺陷（**破坏性：否**）
+
+1. **缘起**：1 小时 runtime-stress 首跑 RESULT: FAIL —— 但 FAIL 的不是 runtime：
+   一小时里 cpu 四类 worker 各收 ~37.5 亿条、两池 `push_failures=0`、RSS spread 1.3MB
+   （预算 24MB）、OS 线程恒定 10、监督守恒、shutdown 45ms，**runtime 不变量全绿**；
+   挂的是 harness 自己的覆盖率门（`windows: attempted=1658 covered=0`）。这正是 soak
+   的价值证明：它先抓到了测量工具本身的假绿。
+2. **根因（代码实证）**：窗口等待预算硬编码 2s（`window_deadline = loop_now + 2000`），
+   而 `Params.spacingMs()` 让 fire 间隔随时长线性放大 —— 1h 跑 spacing=56243ms，凑齐
+   `fires_per_window=2` 需 ~112s ≫ 2s → 每个窗口都超时。5s 档 spacing=71ms 所以绿；
+   **时长 >~46s 覆盖即静默归零**。
+3. **修法一：窗口异步化**（新 `WindowProbe`）：在某个采样 tick 开窗（快照计数器），
+   在观察到足够 fire 的那个 tick 关窗求值 —— 不再内联等待，采样节奏与 fire 间隔解耦，
+   任何时长下窗口语义都是"两次 fire 的跨度"。"窗口内零 arming"契约不变（arm burst 仍
+   一次性前置），空转窗（deadline 前未关窗）只打印不判负（长跑下合法），覆盖下限仍是
+   硬门 —— fire 真停走时长跑照样红。
+4. **修法二：序列分档存储**：`max_samples=1024` + 固定 100ms 采样原本会让 1h 跑的稳态
+   序列在 ~102s 处截断（invariant 6 的 RSS 慢爬 95% 时段根本未被测量；1h 首跑是靠窗口
+   空等把循环拖慢才意外多覆盖了 ~34min）。现在存储步长随时长跑大（短跑 stride=1 不变），
+   头部打印 `series_stride`。
+5. **验证**：5s 默认档 PASS（13/13 窗口，行为同前）；smoke（2s/min_windows=1）PASS；
+   **120s（旧实现必断：spacing 1868ms，2 fires=3.7s>2s）PASS，24/24**；
+   10min（spacing 9368ms，stride=5，871 样本覆盖整个 450s 稳态）PASS，24/24，
+   隔离区间 4628、RSS spread 1.4MB。history 测试 5/5。
+6. **门禁读数**：fmt ✓；check-production ✓；check-test-collection ✓（2141）；
+   聚焦 `runtime stress` 1/1、`history` 5/5 绿；全量见本条门禁段（FULLTEST_EXIT 记录于
+   提交说明）。
+
 ### 第 119 批：readiness 表两条"未验证"收口 + PG 零超时的响亮警告（**破坏性：否**）
 
 1. **`Config.query_timeout_ms = 0` 不再静默无界**（A-5 残余的定界一半）：`Client.connect`

@@ -61,13 +61,19 @@
 //!    window contains *no arming at all*, so its `allocations == 0` is
 //!    attributable to the fire path (timer delivery, pool dispatch, mailbox
 //!    hand-off) rather than to `Handle.after`, which allocates one payload by
-//!    design (see the alloc contract's last two tests). A window only counts as
-//!    walked when timers fired, messages were received and *both* pools
+//!    design (see the alloc contract's last two tests). A window opens at one
+//!    sample tick and closes once `fires_per_window` more fires have landed —
+//!    asynchronous, because the fire spacing scales with the run's duration
+//!    (`Params.spacingMs`) and no fixed inline wait can be right for every run —
+//!    and only counts as walked when messages were received and *both* pools
 //!    dispatched inside it.
 //! 6. **RSS and OS thread count do not walk up** — from a *time series*, not one
 //!    reading: RSS spread inside a budget and not strictly increasing, thread
 //!    count flat. The thread count is the OS's own, which is the only judge
-//!    §12.11-2 leaves for a thread no counter can see.
+//!    §12.11-2 leaves for a thread no counter can see. The stored series spans
+//!    the whole steady phase at any duration: past the 1024-slot array bound
+//!    the store stride widens rather than truncating the tail a slow leak would
+//!    hide in.
 //! 7. **Shutdown is predictable** — called with work in flight it returns inside
 //!    a wall-clock bound, and afterwards `workers == 0`, `claimed == 0` on both
 //!    pools, no token left in a ready ring and `pool_threads == 0` (no claim
@@ -149,9 +155,10 @@ const blocking_sleep_ms: i64 = 5;
 /// 16-message batch and put a single `dispatches` step in each window.
 const blocking_feed_ms: i64 = 6;
 
-/// Fires to wait for per measured window. One window is therefore
-/// `fires_per_window × spacing` long, which is the resolution of the
-/// zero-allocation check.
+/// Fires per measured window. A window is asynchronous — it opens at one sample
+/// tick and closes once this many more fires have landed — so it is
+/// `fires_per_window × spacing` long at any duration, which is the resolution
+/// of the zero-allocation check.
 const fires_per_window: usize = 2;
 
 // Floors. Each one is a "a green below this would be hollow" gate — see the
@@ -990,6 +997,23 @@ const MemberProgress = struct {
     windows: u64 = 0,
 };
 
+/// The counter snapshots of one open zero-allocation window. The window closes
+/// on the first loop tick that observes `fires_per_window` more timer fires
+/// than `fires0`, however many ticks that takes — never by waiting inline:
+/// `Params.spacingMs` scales the fire cadence with the run's duration, so any
+/// fixed inline budget is silently wrong past some length (the first one-hour
+/// run: spacing 56 s against the old 2 s inline budget — 1658 windows
+/// attempted, 0 covered, a green-shaped failure until the floor refused it).
+const WindowProbe = struct {
+    open: bool = false,
+    fires0: u64 = 0,
+    allocs0: u64 = 0,
+    bytes0: u64 = 0,
+    received0: u64 = 0,
+    cpu_dispatches0: u64 = 0,
+    blocking_dispatches0: u64 = 0,
+};
+
 /// One member's readings, taken while its handle is still alive.
 ///
 /// Not an optimisation: `Runtime.shutdown` destroys every `*Handle` in the
@@ -1023,8 +1047,18 @@ fn run(io: std.Io, backing: std.mem.Allocator, p: Params) !Report {
     var probe = ProbeAllocator{ .backing = backing };
     const alloc = probe.allocator();
 
-    std.debug.print("[stress] runtime-stress: duration={d}ms sample={d}ms timers={d} spacing={d}ms\n", .{
-        p.duration_ms, p.sample_ms, p.timers, p.spacingMs(),
+    // The stored series covers the *whole* steady phase at any duration: with a
+    // tick every `sample_ms` and only `max_samples` slots, a fixed stride of 1
+    // truncates an hour-long run to its first ~102 s — the tail invariant 6
+    // exists to watch would go unmeasured, silently. The stride widens with the
+    // run instead (it is 1 for any steady phase under ~102 s, so short runs are
+    // unchanged).
+    const steady_ms = @max(p.duration_ms - p.warmupMs(), 1);
+    const steady_ticks = @as(u64, @intCast(@divTrunc(steady_ms, @max(p.sample_ms, 1))));
+    const store_stride = @max(@as(u64, 1), @divTrunc(steady_ticks + max_samples - 1, max_samples));
+
+    std.debug.print("[stress] runtime-stress: duration={d}ms sample={d}ms timers={d} spacing={d}ms series_stride={d}\n", .{
+        p.duration_ms, p.sample_ms, p.timers, p.spacingMs(), store_stride,
     });
     std.debug.print("[stress]   cpu_workers={d} producers={d} pool_threads={d} | blocking_workers={d} width={d} | restarts={d}\n", .{
         p.cpu_workers, p.cpu_producers, p.pool_threads, p.blocking_workers, p.blocking_threads, p.restarts,
@@ -1254,9 +1288,13 @@ fn run(io: std.Io, backing: std.mem.Allocator, p: Params) !Report {
     var windows_covered: usize = 0;
     var window_alloc_calls: u64 = 0;
     var window_alloc_bytes: u64 = 0;
+    // The one window in flight (at most one). Snapshots taken when it opened;
+    // it closes on the first tick that observes `fires_per_window` more fires.
+    var window: WindowProbe = .{};
     var isolation_intervals: usize = 0;
     var saturation_seen: usize = 0;
     var restarts_bound_violations: usize = 0;
+    var steady_tick: u64 = 0;
 
     const settle_deadline = start_ms + 3000;
     var settled = false;
@@ -1272,40 +1310,47 @@ fn run(io: std.Io, backing: std.mem.Allocator, p: Params) !Report {
         if (loop_now >= deadline) break;
 
         // ── one measured window: zero allocation + fire-path coverage ───────
-        const fires_now = runtime.stats().timer_fires;
-        const fires_left = @as(u64, @intCast(p.timers)) - @min(fires_now, @as(u64, @intCast(p.timers)));
-        if (fires_left >= fires_per_window and loop_now + 400 < deadline) {
-            const cpu0 = runtime.poolStats().?;
-            const blk0 = runtime.blockingPoolStats().?;
-            const a0 = probe.calls();
-            const b0 = probe.bytesOut();
-            const r0 = runtime.stats().messages_received;
-            const window_deadline = loop_now + 2000;
-            while (runtime.stats().timer_fires < fires_now + fires_per_window and nowMs() < window_deadline) {
-                sleepMs(io, 2);
-            }
-            const fires = runtime.stats().timer_fires - fires_now;
-            const alloc_calls = probe.calls() - a0;
-            const alloc_bytes = probe.bytesOut() - b0;
-            const recv = runtime.stats().messages_received - r0;
-            const cpu1 = runtime.poolStats().?;
-            const blk1 = runtime.blockingPoolStats().?;
-            const cpu_runs = cpu1.dispatches - cpu0.dispatches;
-            const blk_runs = blk1.dispatches - blk0.dispatches;
+        //
+        // Asynchronous by construction (see `WindowProbe`): opening snapshots
+        // the counters, closing evaluates them. No inline wait — the loop keeps
+        // sampling at `sample_ms` while a window spans its fires.
+        const fires_total = runtime.stats().timer_fires;
+        if (window.open) {
+            if (fires_total - window.fires0 >= fires_per_window) {
+                const alloc_calls = probe.calls() - window.allocs0;
+                const alloc_bytes = probe.bytesOut() - window.bytes0;
+                const recv = runtime.stats().messages_received - window.received0;
+                const cpu_runs = runtime.poolStats().?.dispatches - window.cpu_dispatches0;
+                const blk_runs = runtime.blockingPoolStats().?.dispatches - window.blocking_dispatches0;
+                window.open = false;
 
-            windows_attempted += 1;
-            window_alloc_calls += alloc_calls;
-            window_alloc_bytes += alloc_bytes;
-            if (alloc_calls != 0 or alloc_bytes != 0) {
-                report.fail(
-                    .window_alloc,
-                    "zero-allocation window #{d}: {d} allocation(s)/{d} byte(s) in a window with no arming in it " ++
-                        "(fires={d} received={d} cpu_dispatches={d} blocking_dispatches={d})",
-                    .{ windows_attempted, alloc_calls, alloc_bytes, fires, recv, cpu_runs, blk_runs },
-                );
+                window_alloc_calls += alloc_calls;
+                window_alloc_bytes += alloc_bytes;
+                if (alloc_calls != 0 or alloc_bytes != 0) {
+                    report.fail(
+                        .window_alloc,
+                        "zero-allocation window #{d}: {d} allocation(s)/{d} byte(s) in a window with no arming in it " ++
+                            "(fires={d} received={d} cpu_dispatches={d} blocking_dispatches={d})",
+                        .{ windows_attempted, alloc_calls, alloc_bytes, fires_total - window.fires0, recv, cpu_runs, blk_runs },
+                    );
+                }
+                if (recv > 0 and cpu_runs > 0 and blk_runs > 0 and alloc_calls == 0) {
+                    windows_covered += 1;
+                }
             }
-            if (fires >= fires_per_window and recv > 0 and cpu_runs > 0 and blk_runs > 0 and alloc_calls == 0) {
-                windows_covered += 1;
+        } else {
+            const fires_left = @as(u64, @intCast(p.timers)) - @min(fires_total, @as(u64, @intCast(p.timers)));
+            if (fires_left >= fires_per_window and loop_now + 400 < deadline) {
+                window = .{
+                    .open = true,
+                    .fires0 = fires_total,
+                    .allocs0 = probe.calls(),
+                    .bytes0 = probe.bytesOut(),
+                    .received0 = runtime.stats().messages_received,
+                    .cpu_dispatches0 = runtime.poolStats().?.dispatches,
+                    .blocking_dispatches0 = runtime.blockingPoolStats().?.dispatches,
+                };
+                windows_attempted += 1;
             }
         }
 
@@ -1315,23 +1360,26 @@ fn run(io: std.Io, backing: std.mem.Allocator, p: Params) !Report {
         const stats = runtime.stats();
         const cpu = runtime.poolStats().?;
         const blk = runtime.blockingPoolStats().?;
-        if (now >= warmup_at and sample_n < samples.len) {
-            samples[sample_n] = .{
-                .t_ms = now,
-                .rss = info.rss_bytes,
-                .threads = info.threads,
-                .workers = stats.workers,
-                .running = stats.running,
-                .supervised_stops = stats.supervised_stops,
-                .group_restarts = stats.group_restarts,
-                .cpu_dispatches = cpu.dispatches,
-                .cpu_claimed = cpu.claimed,
-                .blocking_dispatches = blk.dispatches,
-                .blocking_claimed = blk.claimed,
-                .cpu_push_failures = cpu.ready_push_failures,
-                .blocking_push_failures = blk.ready_push_failures,
-            };
-            sample_n += 1;
+        if (now >= warmup_at) {
+            steady_tick += 1;
+            if (steady_tick % store_stride == 0 and sample_n < samples.len) {
+                samples[sample_n] = .{
+                    .t_ms = now,
+                    .rss = info.rss_bytes,
+                    .threads = info.threads,
+                    .workers = stats.workers,
+                    .running = stats.running,
+                    .supervised_stops = stats.supervised_stops,
+                    .group_restarts = stats.group_restarts,
+                    .cpu_dispatches = cpu.dispatches,
+                    .cpu_claimed = cpu.claimed,
+                    .blocking_dispatches = blk.dispatches,
+                    .blocking_claimed = blk.claimed,
+                    .cpu_push_failures = cpu.ready_push_failures,
+                    .blocking_push_failures = blk.ready_push_failures,
+                };
+                sample_n += 1;
+            }
         }
 
         // ── invariant 4: the push contract, on both pools ──────────────────
@@ -1742,8 +1790,12 @@ fn run(io: std.Io, backing: std.mem.Allocator, p: Params) !Report {
 
     // ── the report ──────────────────────────────────────────────────────────
     std.debug.print("[stress] steady samples={d} (floor {d})\n", .{ sample_n, min_steady_samples });
-    std.debug.print("[stress] windows: attempted={d} covered={d} (floor {d}); allocations inside them: calls={d} bytes={d}\n", .{
-        windows_attempted, windows_covered, min_windows, window_alloc_calls, window_alloc_bytes,
+    std.debug.print("[stress] windows: attempted={d} covered={d} (floor {d}){s}; allocations inside them: calls={d} bytes={d}\n", .{
+        windows_attempted,                                      windows_covered,    min_windows,
+        // A window still open at the deadline is inconclusive, not failed: it
+        // opened with fires pending and the run ended first (legitimate on
+        // long runs, where the spacing dwarfs the 400ms open guard).
+        if (window.open) " (one open at the deadline)" else "", window_alloc_calls, window_alloc_bytes,
     });
     std.debug.print("[stress] isolation: intervals={d} (floor {d}), samples with a blocking claim={d}, holding now={d}\n", .{
         isolation_intervals, min_isolation_intervals, saturation_seen, shared.blocking_holding.load(.monotonic),
