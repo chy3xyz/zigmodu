@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.39.3] - 2026-10-01
 
 ### 第 124 批：ReadyRing.len 撕裂读饱和化 —— mysql CI job 抓到 gauge 路径整数溢出崩溃（**破坏性：否**）
 
