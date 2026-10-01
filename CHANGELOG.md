@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.39.2] - 2026-10-01
 
 ### 第 123 批：ClusterServer stop/accept 竞态修复 —— v0.39.1 发布后 CI soak smoke 抓到的真崩溃（**破坏性：否**）
 
