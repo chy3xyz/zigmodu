@@ -28,12 +28,22 @@
 #
 # Env knobs:
 #   MIXED_OLD_REF   git ref for the old side (default: v0.32.0)
+#   MIXED_EXPECT    refuse (default) | interop — the mixed phase's verdict for
+#                   the pair. `refuse` is the hard wire cutover (v0.32.0);
+#                   `interop` is the rolling-upgrade shape (e.g. v0.38.0 ×
+#                   master, where A-1/A-3 changed no wire bytes): one mesh,
+#                   one leader, replication into the old node, zero refusals.
 #   ZIG             zig binary (default: zig)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$ROOT/.zig-global-cache}"
 ZIG="${ZIG:-zig}"
 OLD_REF="${MIXED_OLD_REF:-v0.32.0}"
+MIXED_EXPECT="${MIXED_EXPECT:-refuse}"
+case "$MIXED_EXPECT" in
+  refuse|interop) ;;
+  *) echo "mixed-version: MIXED_EXPECT must be refuse or interop, got '$MIXED_EXPECT'" >&2; exit 2 ;;
+esac
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/zm-mixed-version.XXXXXX")"
 LOGS="$WORK/logs"
@@ -248,9 +258,15 @@ git -C "$ROOT" worktree add --detach "$WORKTREE" "$OLD_REF" >/dev/null 2>&1 || \
   fail "git worktree add $OLD_REF failed"
 cp "$ROOT/src/cluster_node.zig" "$WORKTREE/src/cluster_node.zig"
 
-# The old build.zig's last line is the closing brace of build(); drop it,
+# Newer old refs (v0.38.0+) already carry the harness and its build step —
+# only the harness source copy above is needed there (both sides then run the
+# identical source). For refs that predate it (v0.32.0), inject the stanza:
+# the old build.zig's last line is the closing brace of build(); drop it,
 # append the stanza, re-close. (`sed '$d'`, not `head -n -1`: BSD head on
 # macOS has no negative counts.)
+if grep -q 'b.step("cluster-node"' "$WORKTREE/build.zig"; then
+  echo "mixed-version: $OLD_REF already carries the cluster-node step; skipping stanza injection"
+else
 sed '$d' "$WORKTREE/build.zig" > "$WORKTREE/build.zig.new"
 cat >> "$WORKTREE/build.zig.new" <<'ZIGEOF'
 
@@ -277,10 +293,114 @@ cat >> "$WORKTREE/build.zig.new" <<'ZIGEOF'
 }
 ZIGEOF
 mv "$WORKTREE/build.zig.new" "$WORKTREE/build.zig"
+fi
 
 ( cd "$WORKTREE" && "$ZIG" build cluster-node -Ddb=none --prefix "$WORK/old-dist" )
 OLD_BIN="$WORK/old-dist/bin/cluster-node"
 [ -x "$OLD_BIN" ] || fail "old cluster-node missing at $OLD_BIN"
+
+# ── interop mode: the rolling-upgrade pair ───────────────────────────────────
+#
+# For a pair whose wire did NOT cut over (e.g. v0.38.0 × master — A-1 put the
+# raft self-id inside existing frame fields and A-3's rotation window moved no
+# bytes), the design verdict is the opposite of section 4's: the two builds
+# must mesh under one cluster_secret + one bus key. The assertions are the
+# mirror image of the refuse phase — full membership across versions, one
+# shared leader whoever wins, replication INTO the old node, and not one
+# refusal line anywhere (a silent drop would pass the mesh checks while the
+# wire is actually broken, so their absence is asserted explicitly).
+
+if [ "$MIXED_EXPECT" = "interop" ]; then
+  echo "mixed-version: interop mode — $OLD_REF and master are expected to mesh"
+
+  MV_A_R=$((PB+10)); MV_B_R=$((PB+11)); MV_C_R=$((PB+12))
+  MV_A_U=$((PB+15)); MV_B_U=$((PB+16)); MV_C_U=$((PB+17))
+  COMMON_MV="--secret-hex $SECRET_HEX --bus-key-hex $BUSKEY_HEX --cluster-size 3 --bus-idle-ms 3000"
+
+  launch mva "$OLD_BIN" mv-old.log --id mv-old --raft-port $MV_A_R --bus-port $MV_A_U \
+    --peer-raft mv-b@127.0.0.1:$MV_B_R --peer-raft mv-c@127.0.0.1:$MV_C_R \
+    --peer-bus mv-b@127.0.0.1:$MV_B_U --peer-bus mv-c@127.0.0.1:$MV_C_U $COMMON_MV
+  launch mvb "$NEW_BIN" mv-b.log --id mv-b --raft-port $MV_B_R --bus-port $MV_B_U \
+    --peer-raft mv-old@127.0.0.1:$MV_A_R --peer-raft mv-c@127.0.0.1:$MV_C_R \
+    --peer-bus mv-old@127.0.0.1:$MV_A_U --peer-bus mv-c@127.0.0.1:$MV_C_U $COMMON_MV
+  launch mvc "$NEW_BIN" mv-c.log --id mv-c --raft-port $MV_C_R --bus-port $MV_C_U \
+    --peer-raft mv-old@127.0.0.1:$MV_A_R --peer-raft mv-b@127.0.0.1:$MV_B_R \
+    --peer-bus mv-old@127.0.0.1:$MV_A_U --peer-bus mv-b@127.0.0.1:$MV_B_U $COMMON_MV
+
+  no_boot_fail() {
+    if grep -q "CN BOOT_FAIL" "$LOGS"/*.log 2>/dev/null; then
+      fail "a node printed CN BOOT_FAIL"
+    fi
+  }
+
+  # auth=on on all three: the version bridge must have compiled WITH the
+  # cluster-auth wire on the old side too, or this run proves nothing.
+  mx_boot() {
+    grep -q "CN BOOT id=mv-old .* auth=on" "$LOGS/mv-old.log" && \
+    grep -q "CN BOOT id=mv-b .* auth=on" "$LOGS/mv-b.log" && \
+    grep -q "CN BOOT id=mv-c .* auth=on" "$LOGS/mv-c.log" && \
+    grep -q "CN LISTEN" "$LOGS/mv-old.log" && \
+    grep -q "CN LISTEN" "$LOGS/mv-b.log" && \
+    grep -q "CN LISTEN" "$LOGS/mv-c.log"
+  }
+  no_boot_fail
+  wait_until 20 "interop: all three boot with auth=on and listen" mx_boot
+
+  mx_one_leader() {
+    [ "$(leader_line_count "$LOGS"/mv-*.log)" = "1" ] || return 1
+    local la lb lc
+    la="$(last_leader_id "$LOGS/mv-old.log")"; lb="$(last_leader_id "$LOGS/mv-b.log")"; lc="$(last_leader_id "$LOGS/mv-c.log")"
+    [ -n "$la" ] && [ "$la" = "$lb" ] && [ "$lb" = "$lc" ]
+  }
+  no_boot_fail
+  wait_until 40 "interop: exactly one leader, same id on old and new alike" mx_one_leader
+
+  mx_full_mesh() {
+    grep -q "CN VIEW members=3" "$LOGS/mv-old.log" && \
+    grep -q "CN VIEW members=3" "$LOGS/mv-b.log" && \
+    grep -q "CN VIEW members=3" "$LOGS/mv-c.log" && \
+    grep -q "CN MESH peer=.*state=connected" "$LOGS/mv-old.log" && \
+    grep -q "CN MESH peer=.*state=connected" "$LOGS/mv-b.log" && \
+    grep -q "CN MESH peer=.*state=connected" "$LOGS/mv-c.log"
+  }
+  no_boot_fail
+  wait_until 30 "interop: all three see members=3 and a connected bus mesh" mx_full_mesh
+
+  # The old node applying the log proves master → old replication; the new
+  # nodes holding members=3 with mv-old in the view proves old → new gossip.
+  mx_replicates() {
+    local a b c
+    a="$(max_log_len "$LOGS/mv-old.log")"; b="$(max_log_len "$LOGS/mv-b.log")"; c="$(max_log_len "$LOGS/mv-c.log")"
+    [ -n "$a" ] && [ -n "$b" ] && [ -n "$c" ] && [ "$a" -ge 2 ] && [ "$b" -ge 2 ] && [ "$c" -ge 2 ]
+  }
+  no_boot_fail
+  wait_until 30 "interop: raft log replicates to old and new alike (len >= 2)" mx_replicates
+
+  # Mirror image of the refuse evidence blocks: not one refusal anywhere.
+  if grep -q "inbound frame not authenticated" "$LOGS"/mv-*.log; then
+    fail "interop: a raft frame was refused: $(grep -h 'inbound frame not authenticated' "$LOGS"/mv-*.log | head -1)"
+  fi
+  if grep -q "CN PEER_REPLY_REFUSED" "$LOGS"/mv-*.log; then
+    fail "interop: a raft reply was refused: $(grep -h 'CN PEER_REPLY_REFUSED' "$LOGS"/mv-*.log | head -1)"
+  fi
+  if grep -qE "dropping connection|refused the handshake" "$LOGS"/mv-*.log; then
+    fail "interop: a bus handshake was refused: $(grep -hE 'dropping connection|refused the handshake' "$LOGS"/mv-*.log | head -1)"
+  fi
+
+  no_panics "$LOGS"/mv-*.log
+  MV_LEADER="$(last_leader_id "$LOGS/mv-old.log")"
+  stop_node mva mv-old.log
+  stop_node mvb mv-b.log
+  stop_node mvc mv-c.log
+  no_panics "$LOGS"/mv-*.log
+
+  echo "mixed-version: evidence summary"
+  echo "  same-version leader:        $SV_LEADER (all three agreed)"
+  echo "  interop leader:             $MV_LEADER (old + new agreed)"
+  echo "  interop raft refusals:      $(count_grep "$LOGS/mv-old.log" 'inbound frame not authenticated')+$(count_grep "$LOGS/mv-b.log" 'inbound frame not authenticated')+$(count_grep "$LOGS/mv-c.log" 'inbound frame not authenticated') line(s) (want 0)"
+  echo "mixed-version: OK — interop: $OLD_REF and master shared one mesh, one leader and one log, with zero refusals"
+  exit 0
+fi
 
 # ── 4. mixed run: 1 × old + 2 × master ───────────────────────────────────────
 #

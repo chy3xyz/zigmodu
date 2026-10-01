@@ -1,5 +1,31 @@
 # Changelog
 
+## [Unreleased]
+
+### 第 126 批：混合版本门禁新增 `interop` 模式 —— 滚动升级（v0.38.0 × master）实测互通（**破坏性：否**）
+
+1. **缘起**：B-11 门禁此前只覆盖**硬切**形状（v0.32.0 裸帧 × master 认证帧
+   → 拒绝）。v0.39.0 的 A-1（Raft 自述 id 复用帧内既有字段）与 A-3（密钥
+   轮换窗）都**未动 wire 字节**，意味着 v0.38.0 → v0.39.x 应当是滚动升级
+   而非旗日切换——但这条从未有跨进程实证。
+2. **修法（脚本侧）**：`scripts/ci-mixed-version.sh` 新增 `MIXED_EXPECT`
+   旋钮（默认 `refuse` 行为不变）；`interop` 模式的断言是 refuse 的镜像——
+   三方 `auth=on` 启动、跨版本唯一选主（新旧日志同一 id）、三方
+   `members=3` + 总线 mesh 全连、Raft 日志复制**进旧节点**（三方 len≥2）、
+   三条拒绝线（raft 入站帧 / reply / 总线握手）**显式断言零命中**（静默
+   丢包能骗过 mesh 检查，故缺席也要断言）。顺手修一处脚本缺口：v0.38.0
+   起旧树自带 `cluster-node` 构建步骤，无条件注入 stanza 撞名
+   （`redeclaration of local constant 'cluster_node_mod'`），现按
+   `b.step("cluster-node"` 探测跳过注入（harness 源码仍拷贝，两侧跑同一份）。
+3. **回归测试（实测读数）**：
+   - 默认 refuse（v0.32.0 × master）：同版本唯一选主 + 混合拒绝全绿
+     （raft 拒绝 4 行、reply 拒绝 75 行、总线拒绝 1 行），改后复跑绿。
+   - interop（v0.38.0 × master）：唯一选主（leader=mv-b，master 侧）、
+     三方 members=3、复制进旧节点、拒绝线 0+0+0、SIGTERM 三方干净退出，
+     exit=0。
+4. **门禁读数**：脚本/文档改动，无 src 变更；`bash -n` 语法通过；
+   fmt / check-production / check-test-collection 见提交脚注。
+
 ## [0.39.4] - 2026-10-01
 
 ### 第 125 批：MpscRing.init 编译期配额 —— 下游（zalpha）真实消费抓到 v0.39.3 编译断（**破坏性：否**）
