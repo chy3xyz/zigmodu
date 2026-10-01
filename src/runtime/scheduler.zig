@@ -381,8 +381,20 @@ const ReadyRing = struct {
         }
     }
 
+    /// Not a consistent snapshot — the cursors are two separate atomics, and
+    /// under load thousands of tokens can flow between the two loads. Loading
+    /// `enqueue` first lets the `dequeue` load observe a newer world (pops
+    /// keep completing), and a *wrapping* subtraction then reads ~`usize` max:
+    /// observed as an integer-overflow panic in `readyLen`'s plain `+`
+    /// (DB=mysql CI, §12.17's mid-run `poolStats`), and the same reading feeds
+    /// the published `zigmodu_runtime_pool_ready_*` gauges. Saturating
+    /// instead: a torn pair reads as 0 — the right direction for a depth
+    /// gauge — and the result stays within `[0, capacity]`, so `readyLen`'s
+    /// sum across the three class rings cannot overflow.
     fn len(self: *const Self) usize {
-        return self.enqueue_pos.load(.acquire) -% self.dequeue_pos.load(.acquire);
+        const enq = self.enqueue_pos.load(.acquire);
+        const deq = self.dequeue_pos.load(.acquire);
+        return enq -| deq;
     }
 };
 
@@ -1114,6 +1126,34 @@ test "scheduler: a producer that announces after its message was consumed leaves
     try std.testing.expect(sched.step());
     try std.testing.expectEqual(@as(usize, 1), fake.handled_len);
     try std.testing.expectEqual(@as(usize, 0), sched.readyLen());
+}
+
+test "ReadyRing.len saturates a torn cursor pair instead of wrapping" {
+    // The cursors are two atomics; under load the dequeue load can observe a
+    // newer world than the enqueue load (pops keep completing between them),
+    // and a wrapping subtraction then reads ~usize max — observed as an
+    // integer-overflow panic in `readyLen`'s `+` (DB=mysql CI, §12.17's
+    // mid-run `poolStats`). The contract: a torn pair reads as 0, and the
+    // reading stays within [0, capacity].
+    var ring = try ReadyRing.init(std.testing.allocator, 8);
+    defer ring.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), ring.len());
+
+    // Dequeue ahead of enqueue cannot be produced through the API — and that
+    // is exactly the torn state the saturating read must survive.
+    ring.enqueue_pos.store(5, .monotonic);
+    ring.dequeue_pos.store(7, .monotonic);
+    try std.testing.expectEqual(@as(usize, 0), ring.len());
+
+    // The ordinary case still measures.
+    ring.dequeue_pos.store(2, .monotonic);
+    try std.testing.expectEqual(@as(usize, 3), ring.len());
+
+    // And `readyLen`'s sum across the class rings cannot overflow: every
+    // reading is bounded by capacity.
+    ring.dequeue_pos.store(0, .monotonic);
+    try std.testing.expect(ring.len() <= ring.capacity());
 }
 
 // ─────────────────────────────────────────────────

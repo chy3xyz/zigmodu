@@ -1,5 +1,32 @@
 # Changelog
 
+## [Unreleased]
+
+### 第 124 批：ReadyRing.len 撕裂读饱和化 —— mysql CI job 抓到 gauge 路径整数溢出崩溃（**破坏性：否**）
+
+1. **缘起**：v0.39.2 pin 刷新提交的 CI（`Test (DB=mysql)` job，runner 上还跑着真
+   mysql 服务、CPU 超订）里 §12.17 混合份额测试 **crash**：`thread panic: integer
+   overflow` —— `scheduler.zig:690 readyLen` 的 `self.ready[0].len() + ...`，调用链
+   是测试体内的 mid-run `rt.poolStats()` 快照。
+2. **根因（代码实证）**：`ReadyRing.len()` = `enqueue_pos.load() -% dequeue_pos.load()`
+   —— 两个独立原子、非一致快照。高吞吐下（该测试 ~2M msg/s）两次 load 之间可流过
+   数千 token：先读 enqueue 再读 dequeue，后者能观察到**更新**的世界（pop 持续完成），
+   wrapping 减法于是读作 ~`usize` max —— 三路 class ring 求和的裸 `+` 溢出即 panic。
+   同文件的 tryPush 早已记录过同形事故（注释：high_water 曾读出 18446744073709551615），
+   但 `len()` 这条读路径漏修了。**这不是测试-only 缺陷**：`poolStats` 同路径喂
+   MetricsBridge 的 `zigmodu_runtime_pool_ready_*` gauge，ReleaseSafe 生产 scrape 在
+   洪流下同样会 panic。
+3. **修法**：`len()` 改**饱和减法**（`-|`）：撕裂对读作 0 —— 深度 gauge 的正确方向
+   （绝不报垃圾巨值）；非撕裂时读数 ∈ [0, capacity]（Vyukov 不变量），故 `readyLen`
+   的三路求和数学上不可能再溢出。`PoolSettled` 语义不受影响（其 0 保持读数发生在
+   feeder join 后，无新 push，不可能出现 dequeue 反超）。
+4. **回归测试**：`ReadyRing.len saturates a torn cursor pair instead of wrapping` ——
+   直接构造 API 不可能产生的撕裂态（dequeue 7 > enqueue 5）断言读 0，普通态照测，
+   并钉 `len() <= capacity` 上界。
+5. **门禁读数**：聚焦 `ReadyRing` 1/1（新）、`scheduler` 38/38、`12.17` 6/6 绿；
+   fmt ✓；check-production ✓；check-test-collection ✓（2143，+1）；全量
+   FULLTEST_EXIT 记录于提交说明。
+
 ## [0.39.2] - 2026-10-01
 
 ### 第 123 批：ClusterServer stop/accept 竞态修复 —— v0.39.1 发布后 CI soak smoke 抓到的真崩溃（**破坏性：否**）
