@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### 第 121 批：§12.17 活跑混合测试的溢出断言改打印 —— CI postgres job 证伪（**破坏性：否**）
+
+1. **缘起**：第 120 批的 CI 全绿前最后一关失败 —— `Test (DB=postgres)` job 里
+   `Pooled (§12.17): a saturated high/normal/low mix` 挂在
+   `expectEqual(0, logs[i].overflowed())`（`runtime.zig:8330`）。该 job 的 runner 上还
+   跑着一个真 postgres 服务，4 vCPU 超订最狠，份额反转超过 8:1 → 某类在 high 到达 50k
+   的窗口内处理量越过 400k 样本缓冲。
+2. **判定**：这条断言是伪装成簿记检查的 **8:1 份额上限** —— 与第 118 批删掉的份额断言
+   同属"宿主线程调度拥有"的一类（238eed2 的修正方向没覆盖到它）。内存安全从不靠它
+   （`LatencyLog.record` 有 `i < len` 守卫），延迟统计本就按 `min(observed, len)` 饱和
+   截断 —— 溢出的日志是稳态流的截断子采样，中位数关系不受影响。
+3. **修法**：断言删除，溢出计数并入每类的打印行（`log overflow {d}` 列）——"Reported
+   rather than hidden"的注释原意现在才名副实。保留的机制断言不变：守恒、
+   `push_failures=0`、low ≥ 1000（保留槽不挨饿）、`low.p50 > high.p50`（尾巴跟着机制走）。
+   同文件的另两处 `overflowed()` 不受影响：§12.16 fairness 本就是纯打印；batch sweep 的
+   断言有 sizing 数学担保（`per_worker` 按总量+歪斜封顶，溢出即真缺陷），保留。
+4. **门禁读数**：聚焦 `12.17` 6/6 绿（含新打印列）；fmt ✓；check-production ✓；
+   check-test-collection ✓（2141）；全量见本条门禁段（FULLTEST_EXIT 记录于提交说明）。
+
 ### 第 120 批：runtime-stress 时长耦合清零 —— 1h 首跑抓到的 harness 缺陷（**破坏性：否**）
 
 1. **缘起**：1 小时 runtime-stress 首跑 RESULT: FAIL —— 但 FAIL 的不是 runtime：

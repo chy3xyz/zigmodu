@@ -8292,8 +8292,8 @@ test "Pooled (§12.17): a saturated high/normal/low mix — shares and the laten
     for (0..3) |i| {
         const share = 100.0 * @as(f64, @floatFromInt(handled[i])) / @as(f64, @floatFromInt(total_handled));
         std.debug.print(
-            "[§12.17 mix]   {s:<7} handled {d:<7} ({d:>5.1}%) | n={d:<7} p50={d:>10.1}us p99={d:>10.1}us max={d:>10.1}us | mailbox-full refused {d}\n",
-            .{ class_names[i], handled[i], share, lat[i].n, us(lat[i].p50), us(lat[i].p99), us(lat[i].max), refused[i].load(.acquire) },
+            "[§12.17 mix]   {s:<7} handled {d:<7} ({d:>5.1}%) | n={d:<7} p50={d:>10.1}us p99={d:>10.1}us max={d:>10.1}us | mailbox-full refused {d} | log overflow {d}\n",
+            .{ class_names[i], handled[i], share, lat[i].n, us(lat[i].p50), us(lat[i].p99), us(lat[i].max), refused[i].load(.acquire), logs[i].overflowed() },
         );
     }
     std.debug.print(
@@ -8315,8 +8315,14 @@ test "Pooled (§12.17): a saturated high/normal/low mix — shares and the laten
 
     // Health first, same as §12.16: a reading taken from a broken shape cannot
     // pass as a reading. Nothing refused a token, nothing is left in any ring
-    // (the new per-class split is pinned at the same settled moment), every
-    // accepted message was handled, and no log ran out of room.
+    // (the new per-class split is pinned at the same settled moment), and every
+    // accepted message was handled. The logs' overflow counts are printed, not
+    // asserted: "no class passes 400k handled while high reaches 50k" is an 8:1
+    // share bound in disguise — a reading of the host's thread scheduler, which
+    // the postgres CI runner (a live database sharing its four vCPUs with this
+    // test) falsified by inverting the shares past it. An overflowed log is a
+    // truncated subsample of a steady-state stream, which is all the median
+    // relation below needs.
     try std.testing.expectEqual(@as(u64, 0), pool.ready_push_failures);
     try std.testing.expectEqual(@as(usize, 0), pool.ready_len);
     try std.testing.expectEqual(@as(usize, 0), pool.ready_len_by_class[0]);
@@ -8327,7 +8333,6 @@ test "Pooled (§12.17): a saturated high/normal/low mix — shares and the laten
     try std.testing.expectEqual(total_refused, stats.messages_dropped);
     try std.testing.expectEqual(stats.messages_sent, stats.messages_received);
     try std.testing.expectEqual(@as(usize, total_handled), @as(usize, @intCast(stats.messages_received)));
-    for (0..3) |i| try std.testing.expectEqual(@as(usize, 0), logs[i].overflowed());
 
     // What stays true under live traffic, asserted rather than implied — every
     // relation below held on four host shapes (macOS arm64, ubuntu x64 + arm64
