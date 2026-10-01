@@ -1,5 +1,35 @@
 # Changelog
 
+## [Unreleased]
+
+### 第 125 批：MpscRing.init 编译期配额 —— 下游（zalpha）真实消费抓到 v0.39.3 编译断（**破坏性：否**）
+
+1. **缘起**：用真实下游 **zalpha**（crypto alpha engine，深用 runtime/scheduler/
+   HotBus/监督/Replay/AI Guard，九条验收断言）对 v0.39.3 做兼容性验证：基线
+   （v0.38.0 checkout）九断言全 PASS；指到 v0.39.3 后**编译失败** —
+   `src/runtime/ring.zig:150: evaluation exceeded 1000 backwards branches`。
+2. **根因（代码实证）**：`Mailbox` 把 ring 声明为**默认字段值**
+   （`ring: MpscRing(T, capacity) = .init()`，mailbox.zig:51），默认值在每个
+   defaulting 调用点走**编译期求值**；`MpscRing.init` 的槽位初始化循环在
+   Zig 默认 1000 反向分支配额下只覆盖 capacity ≤ ~1000。树内所有 mailbox
+   容量都在配额内所以全绿；zalpha 的 state 模块 `mailbox_capacity = 4096`
+   直接越界 —— **这是典型的"树内测试全绿但下游编译断"盲区**。
+   第一版修复配额给小了（`2*capacity+1000` 被实测击穿：多捕获 for 每槽
+   ~2.25 分支），最终 `4 * capacity + 2000`。
+3. **修法**：`MpscRing.init` 顶部 `@setEvalBranchQuota(4 * capacity + 2000)`
+   （运行时调用为零开销 no-op）。排查过同族：树内仅此一处 capacity 参数化
+   的 comptime-eval 默认初始化（ReadyRing/TimerWheel/HotBus 均 allocator
+   运行时 init）。
+4. **回归测试**：`MpscRing.init comptime-evaluates past the default branch
+   quota` —— `comptime R.init()`（4096）钉住配额；修复前整个测试二进制
+   **编译不过**，是最硬的一类回归。
+5. **下游复验**：修复后 zalpha × v0.39.3 `zig build test` ✓ +
+   `zig build run` 九条验收断言全 PASS（A1 回放确定性 / A7 有界背压 /
+   A8 监督预算 / A9 agent 只提案不执行等）——本次验证同时证明 v0.38→v0.39.3
+   对该下游零 API 破坏。
+6. **门禁读数**：聚焦 `MpscRing` 4/4（含新测试）；fmt ✓；check-production ✓；
+   check-test-collection ✓（2144，+1）；全量 FULLTEST_EXIT 记录于提交说明。
+
 ## [0.39.3] - 2026-10-01
 
 ### 第 124 批：ReadyRing.len 撕裂读饱和化 —— mysql CI job 抓到 gauge 路径整数溢出崩溃（**破坏性：否**）

@@ -146,6 +146,19 @@ pub fn MpscRing(comptime T: type, comptime capacity: usize) type {
         high_water: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
         pub fn init() Self {
+            // `Mailbox` wires this as a *default field value* (`ring: MpscRing(T,
+            // capacity) = .init()`), and default values are comptime-evaluated —
+            // so this loop runs under the comptime branch quota whenever a
+            // consumer defaults the ring. The default quota (1000 backwards
+            // branches) covers capacities only up to ~1000; a downstream with a
+            // default 1000 backwards-branch quota covers capacities only up to
+            // ~1000, and the multi-capture `for` costs ~2.25 branches per slot
+            // (measured: 4096 slots exceeded 2*capacity+1000) — so a downstream
+            // with a bigger mailbox (zalpha's state module, 4096) failed *its*
+            // compile with "evaluation exceeded N backwards branches" while
+            // every in-tree capacity compiled fine. The quota is sized to the
+            // loop with wide margin; a no-op when init runs at runtime.
+            @setEvalBranchQuota(4 * capacity + 2000);
             var self: Self = .{ .slots = undefined };
             for (&self.slots, 0..) |*slot, i| slot.sequence = std.atomic.Value(usize).init(i);
             return self;
@@ -334,6 +347,22 @@ test "MpscRing reports full instead of overwriting" {
     try std.testing.expectEqual(@as(u8, 1), ring.tryPop().?); // the refused push did not clobber slot 0
     try std.testing.expectEqual(@as(u8, 2), ring.tryPop().?);
     try std.testing.expect(ring.tryPop() == null);
+}
+
+test "MpscRing.init comptime-evaluates past the default branch quota" {
+    // `Mailbox` declares `ring: MpscRing(T, capacity) = .init()` — a default
+    // field value, so it is comptime-evaluated at every defaulting call site.
+    // The default comptime quota (1000 backwards branches) only covers
+    // capacities up to ~1000, and every in-tree mailbox fits under it — so the
+    // failure only surfaced downstream (zalpha's state module, capacity 4096:
+    // "evaluation exceeded 1000 backwards branches" in *their* build). A
+    // comptime `init` at 4096 here keeps the quota sized by construction:
+    // without `@setEvalBranchQuota` in `init`, this test binary does not
+    // compile at all.
+    const R = MpscRing(u64, 4096);
+    const r = comptime R.init();
+    try std.testing.expectEqual(@as(usize, 0), r.len());
+    try std.testing.expect(r.isEmpty());
 }
 
 test "MpscRing: high_water stays a ring level with more than one producer" {
