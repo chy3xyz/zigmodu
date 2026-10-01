@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.39.1] - 2026-10-01
 
 ### 第 122 批：PoolSettled 探针持续化 —— ARM CI 抓到幻影 claim 竞态（**破坏性：否**）
 
