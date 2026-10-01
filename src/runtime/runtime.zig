@@ -4905,8 +4905,16 @@ fn PoolUnclaimed(comptime RT: type) type {
     };
 }
 
+/// How long the settled state must hold before `PoolSettled` reports it. The
+/// phantom-claim window (pop → claim, see below) is microseconds; 25 ms of
+/// continuously-observed settle cannot straddle it unless the pool thread is
+/// descheduled for 25 ms inside a ~100 ns critical section — and on the ARM CI
+/// runner the instantaneous probe did straddle it, failing §12.17 on a reading
+/// (`claimed == 1`) taken after the wait had passed.
+const pool_settle_hold_ms: i64 = 25;
+
 /// Probe: the pool has nothing left to *schedule*, not just nothing left to run
-/// — no claim held and the ready ring empty.
+/// — no claim held and the ready ring empty, **and it stays that way**.
 ///
 /// Those are two different moments, and the §12.16 fairness run is the shape
 /// that tells them apart. A producer announces **after** `mailbox.send` has
@@ -4919,17 +4927,37 @@ fn PoolUnclaimed(comptime RT: type) type {
 /// hands the claim back without re-arming — but it is drained **one park away**
 /// (the pool's idle loop is a poll), so a `poolStats()` read taken straight
 /// after the joins can see `ready_len == 1` in a run where every message was
-/// handled (`sent == received`, and every probe's log full). Waiting on the
-/// reading the assertions take is the same discipline as `PoolUnclaimed`; a
-/// token that is *stuck* rather than merely un-drained never reaches zero, so
-/// the assertions below keep their teeth.
+/// handled (`sent == received`, and every probe's log full).
+///
+/// Why *hold* and not just *reach*: the phantom cycle is pop → claim → release,
+/// and between the pop and the claim the counters read exactly `ready_len == 0
+/// and claimed == 0` — an instantaneous probe can pass inside that gap, and the
+/// caller's assertion read then catches the phantom claim (ubuntu-24.04-arm CI,
+/// §12.17: `claimed == 1` after the wait had passed). Once the feeders are
+/// joined no announce can push another token, so the stray population is finite
+/// and only drains: the settled state, once truly reached, is final. Requiring
+/// it to hold for `pool_settle_hold_ms` is what separates "settled" from
+/// "mid-drain of a phantom" — and a token that is *stuck* rather than merely
+/// un-drained never reaches zero at all, so the callers' assertions keep their
+/// teeth.
+///
+/// `since` is caller-owned because `waitUntil` takes the probe by value.
 fn PoolSettled(comptime RT: type) type {
     return struct {
         rt: *RT,
+        /// Monotonic ms of the first settled poll in the current streak;
+        /// 0 = the last poll was not settled.
+        since: *i64,
 
         pub fn ready(self: @This()) bool {
             const s = self.rt.poolStats() orelse return true;
-            return s.claimed == 0 and s.ready_len == 0;
+            if (s.claimed != 0 or s.ready_len != 0) {
+                self.since.* = 0;
+                return false;
+            }
+            const now = time_mod.monotonicNowMilliseconds();
+            if (self.since.* == 0) self.since.* = now;
+            return now - self.since.* >= pool_settle_hold_ms;
         }
     };
 }
@@ -7715,7 +7743,8 @@ fn runShape(
     // mechanism). Snapshot at the settled moment, not the handled one — a
     // token that is *stuck* rather than merely un-drained never reaches zero,
     // so the caller's `ready_len == 0` assertion keeps its teeth.
-    try waitUntil(PoolSettled(@TypeOf(rt)){ .rt = &rt }, observation_budget_ms);
+    var settle_since: i64 = 0;
+    try waitUntil(PoolSettled(@TypeOf(rt)){ .rt = &rt, .since = &settle_since }, observation_budget_ms);
 
     const pool = rt.poolStats().?;
     return .{
@@ -7940,7 +7969,8 @@ test "Pooled (§12.16): a continuously busy worker starves nobody — the wait i
     // The joins say nothing is left to *run*; the ring is a later moment than
     // that (`PoolSettled` has the mechanism), so wait for the reading the
     // assertions below take instead of snapshotting it.
-    try waitUntil(PoolSettled(@TypeOf(rt)){ .rt = &rt }, observation_budget_ms);
+    var settle_since: i64 = 0;
+    try waitUntil(PoolSettled(@TypeOf(rt)){ .rt = &rt, .since = &settle_since }, observation_budget_ms);
 
     const pool = rt.poolStats().?;
     const stats = rt.stats();
@@ -8276,7 +8306,8 @@ test "Pooled (§12.17): a saturated high/normal/low mix — shares and the laten
     }
     // Same settled-reading discipline as §12.16: the ring is a later moment
     // than the drains, and the assertions below take the settled one.
-    try waitUntil(PoolSettled(@TypeOf(rt)){ .rt = &rt }, observation_budget_ms);
+    var settle_since: i64 = 0;
+    try waitUntil(PoolSettled(@TypeOf(rt)){ .rt = &rt, .since = &settle_since }, observation_budget_ms);
 
     const pool = rt.poolStats().?;
     const stats = rt.stats();

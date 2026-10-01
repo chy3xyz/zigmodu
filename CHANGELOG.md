@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### 第 122 批：PoolSettled 探针持续化 —— ARM CI 抓到幻影 claim 竞态（**破坏性：否**）
+
+1. **缘起**：121 批修完溢出断言后，`Build & Test (ubuntu-24.04-arm)` 又把 §12.17 打红，
+   这次是 `expectEqual(0, pool.claimed)` 读到 `claimed=1` —— 发生在 `PoolSettled` 等待
+   **已通过之后**。这不是 runtime 缺陷，是探针竞态：幻影 token 的 pop→claim 间隙里计数器
+   恰好读作 `ready_len==0 && claimed==0`，瞬时探针在这个 ~100ns 缝隙里通过，断言读数随后
+   撞上幻影 claim。feeder join 后 announce 不再产生新 token，幻影总量有限只减不增 ——
+   **真正到达的 settled 态是终态**，所以正确修法是要求它"持续"而非"到达"。
+2. **修法**：`PoolSettled` 从瞬时探针改为持续探针 —— settled 状态须连续保持
+   `pool_settle_hold_ms=25ms` 才算通过（幻影窗口是 µs 级；假阴性需要池线程精确在 100ns
+   关键段里被调度走 25ms，可忽略；卡住不还的 token 永远到不了零，牙齿仍在）。三个调用点
+   （§12.16 batch sweep、§12.16 fairness、§12.17 mix）全部升级 —— 它们都在 feeder 停止/
+   join 之后等待，"不再产生新 token"的前提全部成立，逐个核实过。
+3. **门禁读数**：聚焦 `12.1` 8/6+2/2 绿（两处 settle 点都在新探针下复跑）；fmt ✓；
+   check-production ✓；check-test-collection ✓（2141）；全量见本条门禁段（FULLTEST_EXIT
+   记录于提交说明）。
+
 ### 第 121 批：§12.17 活跑混合测试的溢出断言改打印 —— CI postgres job 证伪（**破坏性：否**）
 
 1. **缘起**：第 120 批的 CI 全绿前最后一关失败 —— `Test (DB=postgres)` job 里
