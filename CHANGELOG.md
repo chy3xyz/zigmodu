@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.39.4] - 2026-10-01
 
 ### 第 125 批：MpscRing.init 编译期配额 —— 下游（zalpha）真实消费抓到 v0.39.3 编译断（**破坏性：否**）
 
