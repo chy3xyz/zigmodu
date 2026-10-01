@@ -93,3 +93,4 @@ docs/modules.md
 
 # runtime-stress history series (scripts/runtime-stress-record.sh default path)
 runtime-stress-history.jsonl
+.soak/
