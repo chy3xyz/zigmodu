@@ -307,7 +307,6 @@ test "adaptive shedder basic" {
 
     // Should allow normally
     const p = try shedder.allow();
-    // Note: Blocking sleep unavailable in Zig 0.16.0 - test validates sync behavior
     _ = {};
     p.pass();
 
@@ -340,7 +339,6 @@ test "adaptive shedder drops under high load" {
     while (i < 20) : (i += 1) {
         if (shedder.allow()) |p| {
             allowed += 1;
-            // Note: Blocking sleep unavailable in Zig 0.16.0 - test validates sync behavior
             _ = {};
             p.pass();
         } else |_| {

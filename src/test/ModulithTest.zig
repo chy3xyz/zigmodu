@@ -195,8 +195,7 @@ pub const TestUtils = struct {
             if (@as(u64, @intCast(0 - start)) > timeout_ms) {
                 return error.Timeout;
             }
-            // Note: Blocking sleep unavailable in Zig 0.16.0 - poll-based wait
-            break; // Exit in sync context
+            break; // sync shim: no sleep in this context; real waits go through std.Io.sleep
         }
     }
 };

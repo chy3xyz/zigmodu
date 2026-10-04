@@ -22,7 +22,7 @@ const zent = @import("zent");
 /// Serialize a zent entity array as a JSON array via zent's toMaskedJson —
 /// raw entities cannot go through ctx.jsonStruct: the injected json_arena /
 /// Allocator field makes std.json walk comptime-only fn pointers under
-/// zig 0.17-dev.1422.
+/// zig 0.17.
 fn maskedArrayJson(
     allocator: std.mem.Allocator,
     comptime infos: []const zent.codegen.graph.TypeInfo,

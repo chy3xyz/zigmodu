@@ -339,7 +339,7 @@ pub const Application = struct {
     }
 
     /// Run the application blocking until SIGINT/SIGTERM.
-    /// Uses Zig 0.16 std.posix APIs (sigaction returns void, sigemptyset for mask).
+    /// Uses std.posix APIs (sigaction returns void, sigemptyset for mask).
     pub fn run(self: *Self) !void {
         try self.start();
 

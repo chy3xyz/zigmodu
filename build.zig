@@ -67,11 +67,12 @@ pub fn build(b: *std.Build) void {
     // at all — so its `@import`s never run and the imported files' tests are never
     // even seen. Filtering is transitive only through *matching* test bodies, and
     // this repo's suite hangs off one aggregate test (`src/tests.zig` →
-    // `test "compile all source files"` → …). Measured on 0.17.0-dev.2151:
+    // `test "compile all source files"` → …). Measured on 0.17.0:
     // `-Dtest-filter=RaftElection` produced a binary containing exactly one test
     // (`root.test_0`, an unnamed block no filter can match) and exited 0, while
-    // `-Dtest-filter=.` — which matches everything — ran the full 1416. Silent,
-    // and useless for the thing this option is for.
+    // `-Dtest-filter=.` — which matches everything — ran the entire suite
+    // (count tracked by scripts/check-test-collection.sh; don't hardcode it here).
+    // Silent, and useless for the thing this option is for.
     //
     // So the filter is applied at *runtime* by `scripts/test-runner.zig`: the
     // whole suite is compiled, the runner sees every test name, and only matches

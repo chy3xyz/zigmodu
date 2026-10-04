@@ -2533,12 +2533,7 @@ pub const KafkaWireFormat = struct {
         try body.appendSlice(allocator, records.items);
 
         // Kafka message CRC is CRC-32C (Castagnoli / ISCSI).
-        // Zig renamed `Crc32Iscsi` → `@"CRC-32/ISCSI"` in 0.17-dev ~1422.
-        const Crc32c = if (@hasDecl(std.hash.crc, "Crc32Iscsi"))
-            std.hash.crc.Crc32Iscsi
-        else
-            std.hash.crc.@"CRC-32/ISCSI";
-        const crc = Crc32c.hash(body.items);
+        const crc = std.hash.crc.@"CRC-32/ISCSI".hash(body.items);
 
         var batch = std.ArrayList(u8).empty;
         errdefer batch.deinit(allocator);

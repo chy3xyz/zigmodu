@@ -36,8 +36,7 @@ pub fn retry(comptime T: type, policy: Policy, operation: *const fn () errors.Re
             // Calculate delay with exponential backoff and jitter
             const jitter_amount = @as(f64, @floatFromInt(delay_ms)) * policy.jitter;
             _ = jitter_amount;
-            // Note: Blocking sleep unavailable in Zig 0.16.0 sync context
-            // In async context, use: try io.sleep(delay_ms * std.time.ms_per_s, io);
+            // sync shim: no sleep in this context; the io-aware path uses std.Io.sleep
             delay_ms = @min(policy.max_delay_ms, @as(u64, @intFromFloat(@as(f64, @floatFromInt(delay_ms)) * policy.multiplier)));
         }
     }
@@ -58,7 +57,7 @@ pub fn retryVoid(policy: Policy, operation: *const fn () errors.Result) errors.R
 
             const jitter_amount = @as(f64, @floatFromInt(delay_ms)) * policy.jitter;
             _ = jitter_amount;
-            // Note: Blocking sleep unavailable in Zig 0.16.0 sync context
+            // sync shim: no sleep in this context; the io-aware path uses std.Io.sleep
 
             delay_ms = @min(policy.max_delay_ms, @as(u64, @intFromFloat(@as(f64, @floatFromInt(delay_ms)) * policy.multiplier)));
         };

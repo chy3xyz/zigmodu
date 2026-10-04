@@ -10,8 +10,6 @@ const zigmodu = @import("zigmodu");
 // - Cluster configuration via environment variables
 //
 // This demo shows the structure of a distributed ZigModu application.
-// Due to Zig 0.16.0 API differences, the full DistributedEventBus
-// network code may require adjustments for your Zig version.
 //
 // Docker Compose runs 3 containers, each running this example.
 // See docker-compose.yml for the configuration.

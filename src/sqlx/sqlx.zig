@@ -219,7 +219,7 @@ pub const Row = struct {
 pub const Rows = struct {
     arena: std.heap.ArenaAllocator,
     /// Mutable — queryRows/queryRow update row.arena to point to this Rows.arena.
-    /// Using `[]Row` (not `[]const Row`) avoids @constCast which Zig 0.17-dev
+    /// Using `[]Row` (not `[]const Row`) avoids @constCast, which Zig 0.17
     /// may optimize away in certain monomorphized instances.
     rows: []Row,
 

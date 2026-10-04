@@ -1,5 +1,42 @@
 # Changelog
 
+## [Unreleased]
+
+### 第 129 批：Zig 0.17 特性化清理 —— CRC shim 退役、Dashboard 版本接 build_options、陈旧版本注释清扫（**破坏性：否**）
+
+1. **缘起**：0.17.0 stable 适配（第 127 批）后的系统性盘点——对照 stable std
+   与 0.16→0.17 release notes，清出"为兼容旧 dev 构建而存在的包袱"。
+2. **修法**：
+   - **CRC 双写 shim ×2 删除**（`KafkaConnector.zig`、`delivery_log.zig`）：
+     `@hasDecl(std.hash.crc, "Crc32Iscsi")` 在 0.17 只认 public decl，且
+     dev.1567 与 stable 的 std 都只有 `@"CRC-32/ISCSI"`——旧名分支是永久死
+     代码，直写新名（`delivery_log` 保留 `Crc32c` 别名供三处流式
+     `init/update/final` 用）。
+   - **Dashboard 版本号去硬编码**：`Dashboard.zig` 写死的 `version="0.8.0"` /
+     `zig_version="0.16.0"`（HTML 徽标、页脚、测试断言全是陈值）→ 编译期从
+     `build_options.version`（build.zig.zon 单一事实源）与
+     `builtin.zig_version` 经 `comptimePrint` 渲染；HTML 用普通字符串段
+     `++` 注入（多行字符串每行自带 `\n`，不能在字面量里断行拼）。
+   - **陈旧版本注释清扫 ×10**：`Blocking sleep unavailable in Zig 0.16.0`
+     ×6（Benchmark/IntegrationTest/ModulithTest/LoadShedder×2/Retry×2——
+     这些 `_ = {}` 占位是 sync 上下文刻意不 sleep，与版本无关）、
+     `Application.zig` 的 "Zig 0.16 std.posix"、`redis.zig` 的 "0.17 compat"
+     措辞、`sqlx.zig` 的 "0.17-dev"、`examples/distributed` 的误导性
+     "0.16.0 API differences" 段、`features_demo.zig` 的 dev.1422、
+     `build.zig` 注释里的 "ran the full 1416"（与 AGENTS.md「勿抄数字」
+     自相矛盾，改指 `check-test-collection` 门禁）。
+   - **AGENTS.md 搭车优化 ×6**：文档地图补「集群传输/混合版本对跑 →
+     DISTRIBUTED.md + ci-mixed-version.sh」与「v1.0 差距 →
+     v1.0-readiness-v0.35.md」两行；「近期栈 DO/DON'T（v0.14.x 升级后）」
+     标题正名为「工程 DO / DON'T」；CSPRNG 行去重（指向 §Security）；
+     删烂数字「跑满 1416」；删旧自评分「~98/100」（改指 CHANGELOG 与
+     readiness 文档）；zent v0.32.3–v0.41.1 版本考古弹压缩为当前版本 +
+     两条实测陷阱 + 指向 ZENT.md §14。
+3. **回归测试**：Dashboard 3 测试改写后通过（新增断言：HTML 含框架版本
+   ≥2 处、zig 版本 ≥1 处）；其余为死分支/注释删除，无行为面。
+4. **门禁读数**：fmt 净 · check-production OK · check-test-collection 2144 不变 ·
+   全量测试 exit=0（`--force-run`，nice 压载保护双 soak）。
+
 ## [0.39.5] - 2026-10-04
 
 ### 第 128 批：soak-cluster 采样序列上限从"跑 69 分钟白死"改成编译期拒绝（**破坏性：否**）

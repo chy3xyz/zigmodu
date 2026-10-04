@@ -1,13 +1,21 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const build_options = @import("build_options");
 const Time = @import("../core/Time.zig");
 const Server = @import("../api/Server.zig");
 const Context = Server.Context;
 const HandlerFn = Server.HandlerFn;
 
+/// Framework version, comptime-rendered from `build.zig.zon` (single source of
+/// truth) — the dashboard never hardcodes it.
+pub const framework_version = std.fmt.comptimePrint("{f}", .{build_options.version});
+/// Toolchain version this binary was compiled with.
+pub const zig_version = std.fmt.comptimePrint("{f}", .{builtin.zig_version});
+
 /// System information rendered by the dashboard (version, uptime, counters).
 pub var system_info = SystemInfo{
-    .version = "0.8.0",
-    .zig_version = "0.16.0",
+    .version = framework_version,
+    .zig_version = zig_version,
     .started_at = 0,
     .module_count = 0,
     .test_passed = 0,
@@ -148,7 +156,7 @@ const DASHBOARD_HTML =
     \\<div class="max-w-7xl mx-auto px-6 flex items-center justify-between h-16">
     \\  <div class="flex items-center gap-3">
     \\    <span class="text-2xl font-black tracking-tight">⚡ ZigModu</span>
-    \\    <span class="badge-up text-xs">v0.8.0</span>
+++ "    <span class=\"badge-up text-xs\">v" ++ framework_version ++ "</span>\n" ++
     \\  </div>
     \\  <div class="flex items-center gap-4">
     \\    <button @click="dark=!dark;document.documentElement.classList.toggle('dark')"
@@ -227,7 +235,7 @@ const DASHBOARD_HTML =
     \\<!-- Footer -->
     \\<footer class="max-w-7xl mx-auto px-6 py-8 mt-12 border-t border-zinc-200 dark:border-zinc-800">
     \\<div class="flex justify-between text-xs text-zinc-400">
-    \\  <span>ZigModu v0.8.0 · Zig 0.16.0</span>
+++ "  <span>ZigModu v" ++ framework_version ++ " · Zig " ++ zig_version ++ "</span>\n" ++
     \\  <span>Dashboard · HTMX + Alpine.js + TailwindCSS</span>
     \\</div>
     \\</footer>
@@ -241,8 +249,10 @@ const DASHBOARD_HTML =
 // ─────────────────────────────────────────────────
 
 test "SystemInfo defaults" {
-    try std.testing.expectEqualStrings("0.8.0", system_info.version);
-    try std.testing.expectEqualStrings("0.16.0", system_info.zig_version);
+    // Defaults track build.zig.zon / the toolchain, never a hardcoded string.
+    try std.testing.expectEqualStrings(framework_version, system_info.version);
+    try std.testing.expectEqualStrings(zig_version, system_info.zig_version);
+    try std.testing.expect(std.mem.indexOfScalar(u8, framework_version, '.') != null);
 }
 
 test "Dashboard HTML is valid" {
@@ -254,6 +264,9 @@ test "Dashboard HTML is valid" {
     try std.testing.expect(std.mem.containsAtLeast(u8, DASHBOARD_HTML, 1, "/api/dashboard/modules"));
     try std.testing.expect(std.mem.containsAtLeast(u8, DASHBOARD_HTML, 1, "/api/dashboard/stats"));
     try std.testing.expect(std.mem.containsAtLeast(u8, DASHBOARD_HTML, 1, "/api/dashboard/system"));
+    // Badge + footer render the build-time version, not a stale literal.
+    try std.testing.expect(std.mem.containsAtLeast(u8, DASHBOARD_HTML, 2, framework_version));
+    try std.testing.expect(std.mem.containsAtLeast(u8, DASHBOARD_HTML, 1, zig_version));
 }
 
 test "SystemInfo update" {

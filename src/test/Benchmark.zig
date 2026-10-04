@@ -511,7 +511,6 @@ test "BenchmarkScenarios" {
         .module_name = "test_module",
         .init_fn = struct {
             fn init() !void {
-                // Note: Blocking sleep unavailable in Zig 0.16.0
                 _ = {};
             }
         }.init,

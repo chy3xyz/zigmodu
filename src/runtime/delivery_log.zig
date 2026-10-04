@@ -172,12 +172,8 @@ comptime {
 
 /// `CRC-32/ISCSI` (Castagnoli) — the polynomial `src/core/KafkaConnector.zig`
 /// already uses for its wire frames, so a damaged-frame check is a familiar
-/// primitive and not a homegrown checksum. The `@hasDecl` shim covers the
-/// `Crc32Iscsi` → `@"CRC-32/ISCSI"` rename (0.17-dev ~1422).
-const Crc32c = if (@hasDecl(std.hash.crc, "Crc32Iscsi"))
-    std.hash.crc.Crc32Iscsi
-else
-    std.hash.crc.@"CRC-32/ISCSI";
+/// primitive and not a homegrown checksum.
+const Crc32c = std.hash.crc.@"CRC-32/ISCSI";
 
 fn crc32Of(bytes: []const u8) u32 {
     return Crc32c.hash(bytes);

@@ -19,10 +19,9 @@ const sockread = @import("../core/sockread.zig");
 
 // ==== §1  RESP framing ====
 
-/// Write command bytes to Redis stream (Zig 0.17 compat: stream.write removed).
+/// Write command bytes to the Redis stream.
 /// Must flush: `Writer.writeAll` only fills the buffer; without flush the
 /// RESP command never reaches Redis and the subsequent read hangs forever.
-/// Reads one complete RESP reply into a caller-owned buffer.
 ///
 /// The old code did a single `readSome` per command, which is wrong on two
 /// counts: a reply larger than the buffer was truncated (and the remainder
