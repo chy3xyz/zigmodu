@@ -163,6 +163,25 @@ const sample_ms: u64 = build_options.soak_cluster_sample_ms;
 const tick_ms: u64 = build_options.soak_cluster_tick_ms;
 const quiesce_ms: u64 = build_options.soak_cluster_quiesce_ms;
 
+// The sample series is a fixed `[max_samples]` array, and the run samples
+// every `sample_ms` for its whole worst-case window (publish phase + quiesce
+// + drain deadline: `iterations*publish_ms + 5s + 30s`). A config whose window
+// needs more samples than the cap does not fail at compile time today — it
+// fails AFTER HOURS of soaking (series-exhausted marks the run failed by
+// design; measured: a 24h run at sample_ms=1000 died at minute 69). The knobs
+// are all comptime build options, so reject the shape here, naming the
+// minimum cadence that fits.
+comptime {
+    const window_ms: u64 = @as(u64, iterations) * publish_ms + 35_000;
+    const needed = window_ms / @max(sample_ms, 1) + 1;
+    if (needed > max_samples) {
+        @compileError(std.fmt.comptimePrint(
+            "soak-cluster config needs up to {d} samples but the series holds {d}; raise -Dsoak-cluster-sample-ms to at least {d}ms",
+            .{ needed, max_samples, window_ms / max_samples + 1 },
+        ));
+    }
+}
+
 /// Publisher threads per node. Two is the whole point of the harness shape (see
 /// `publisherMain`): one writer cannot overtake itself, so a single writer
 /// cannot tell a correct outbound funnel from one that stamps the replay seq

@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### 第 128 批：soak-cluster 采样序列上限从"跑 69 分钟白死"改成编译期拒绝（**破坏性：否**）
+
+1. **缘起（首个 24h soak 实测收账）**：以 `iterations=345600, publish-ms=250,
+   sample-ms=1000` 跑 24h soak-cluster，**69 分钟后以 FAIL 结束**——采样序列是
+   定长 `[4096]Sample`，1s 一采只够 68 分钟；序列耗尽按设计置
+   `drain_timed_out` 大声失败（正确行为：宁响不默），但操作者得到的是
+   一小时白跑。同窗的 24h runtime-stress 跑满全程，RSS/线程/分配全在预算内，
+   仅一次 100ms 隔离采样窗口触发（blocking 持 claim 且 cpu 池 0 推进）——
+   发生时段本机并行跑过 mixed-version 全量编译，系统噪声嫌疑大，判据是
+   安静机重跑。
+2. **修法**：四个旋钮全是 comptime 构建选项，把"最坏窗口 ÷ 采样间隔 >
+   序列容量"提到**编译期**：`iterations*publish_ms + 35s` 窗口所需样本数
+   超 4096 即 `@compileError`，报文直接给出最小可用 `sample-ms`
+   （实测：`needs up to 86436 samples … at least 21103ms`——秒级报错替代
+   69 分钟白死）。默认配置（2400×25ms/500ms → 191 样本）与 CI 冒烟配置
+   （120×10ms/50ms → 725 样本）均远低于上限，不受影响。
+3. **回归测试**：坏配置编译期即拒（报文含建议值）；24h 配置改
+   `sample-ms=25000`（3457 样本 < 4096）编译通过并**已重新挂上双 24h soak**
+   （soak-cluster + runtime-stress，nohup 脱离会话）；默认冒烟配置编译绿。
+4. **门禁读数**：fmt 净 · check-production OK · check-test-collection
+   2144 不变（harness 非测试收集对象）。
+
 ### 第 127 批：Zig 0.17.0 正式版适配 —— std `Stream.read` 在 stable 上根本不能编译（**破坏性：否**）
 
 1. **缘起**：Zig 0.17.0 正式版发布，工具链从 dev 构建（dev.2151）切到 stable。
