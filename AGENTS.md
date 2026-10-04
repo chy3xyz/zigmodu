@@ -21,6 +21,8 @@
 | Worker / 邮箱 / 定时器 / RingBuffer / **池化（§12）** | `docs/RUNTIME.md`（定位、契约、背压语义、兼容 10 条；§12.10 = WorkerPool Phase 1 落地边界） |
 | 架构检查 / 依赖图 / `zmodu doctor` | `docs/ARCHITECTURE.md`「Architecture engine」+ `src/core/ModuleGraph.zig` |
 | 集群成员读侧（请求路径选节点/健康度） | `docs/DISTRIBUTED.md`「集群读侧」+ `zigmodu.ClusterView`（`acquire`/`release`，别读写入侧的哈希表） |
+| 集群传输 / Raft / 密钥轮换 / 混合版本对跑 | `docs/DISTRIBUTED.md`（「传输加密边界」：HMAC=认证不加密，生产走边车 mTLS）· `scripts/ci-mixed-version.sh`（`MIXED_EXPECT=refuse\|interop`） |
+| v1.0 差距与证据状态（勿重复报告已关项） | `docs/dev/v1.0-readiness-v0.35.md`（A/B/C 组逐条带证据 + 各批跟进注） |
 | 长流程 / 崩溃续跑（Saga、补偿、检查点） | `docs/WORKFLOW.md` + `SagaOrchestrator.resumeInstance`（有副作用的一步必须幂等） |
 | 改 `src/ai/**` 前（它只能依赖领域缝） | `docs/AI_BOUNDARY.md` + `src/test/AiBoundary.zig`（驱动层 import 数只减不增） |
 | Agent 能做什么（默认不能执行） | `docs/AGENT_RUNTIME.md` + `ai.Guard` / `ai.AgentSpec` / `ai.ProposalPipeline` / `ai.AgentWorker`（闸门已接进 `Agent.run`；Agent 可跑成运行时 worker） |
@@ -76,7 +78,7 @@ CI、`scripts/ci-*.sh`、本文件都用那个。`cd tools/zmodu && zig build` �
 `src/config.zig` / `src/modules/health.zig` 直接写进了框架树，而且事后被误报成"并行工作的产物"。
 所以：跑这些命令要用 `--dry-run` 或**临时目录**，跑完 `git status --porcelain` 自查有没有多出未跟踪文件。
 
-## 近期栈 DO / DON'T（v0.14.x 升级后 · AI 必守）
+## 工程 DO / DON'T（AI 必守）
 
 | DO | DON'T |
 |----|--------|
@@ -93,7 +95,7 @@ CI、`scripts/ci-*.sh`、本文件都用那个。`cd tools/zmodu && zig build` �
 | `http.HttpClient`：`https://` 经 `std.http.Client`（OTLP/Vault/AI 出站共用；`requestStream` HTTPS 真增量） | 自签证书未入系统信任库即报 TLS 失败 |
 | WS：`on_message(session, msg, kind)` — **text+binary**（`WsFrameKind`）；`writeBinary`/`writeData` | 假定只收 0x1；丢弃 0x2（会破坏 OpenIM protobuf） |
 | WS 路由：`ws_routes` 每项**显式** `.meta.auth = .public`（`ComptimeRouter.zig:734-758` 强制；非 public 或省掉 `.meta` 都是**编译错**，`permission`/`roles` 也被拒） | 省掉 `.meta`（`.auth` 默认 `.inherit` → 编译不过）；给 WS 路由挂 `permission`/`roles` |
-| CSPRNG：`std.Io.randomSecure(io, buf)` —— 每次系统调用，失败即 `error.EntropyUnavailable`、**无回落** | `std.crypto.random`（**本工具链无此声明**）；`std.Io.random`（文档明写失败回落 pid+墙钟+ASLR）；单一时间戳种子；`std.Random.DefaultPrng.init(seed)`（时钟^指针 → 同一个 challenge） |
+| CSPRNG：`std.Io.randomSecure(io, buf)`（失败即 `error.EntropyUnavailable`，无回落；细则与审计豁免见 §Security「CSPRNG」） | `std.crypto.random`（本工具链无此声明）；`std.Io.random`（失败回落 pid+墙钟）；播种非加密 PRNG 取 challenge/令牌/盐 |
 | sqlx：`Client.open` 后注意 pool/client 指针；CB 传 `io` | 在 ConnPool 上缓存失效的 `*Client` |
 | 阻塞 TCP dial：`zigmodu.netdial.connectBlocking(io, addr)`（std `posixConnect` 的 EINTR 重试撞 EISCONN 会 `errnoBug` panic —— 信号落进 dial 窗口 = 进程死；第 112 批） | 新代码直接 `addr.connect(io, .{ .mode = .stream })`（生产路径全已换走；需超时要 `RaftTransport.connectTimeout`，其非阻塞主路径本免疫） |
 | sqlx 驱动链接：`-Ddb=sqlite\|postgres\|mysql\|all`（默认 `all`） | 小系统用 `.db = "sqlite"`，勿默认三库全链 |
@@ -411,7 +413,7 @@ filter 是**测试全限定名的子串**（形如 `core.cluster.RaftElection.te
 |------|----------|
 | `zig build test -- --test-filter X` | build runner 把 `--` 之后的参数**整体丢弃**：filter 无效，全套照跑（~47s），**exit 0** |
 | `zig test src/root.zig --test-filter X` | 缺 `build_options` 模块与 SQL 驱动链接；就算用 `-Mroot=` 拼出来，产物二进制在**运行期拒绝** `--test-filter`（该 flag 是编译期的） |
-| Zig 自带 `--test-filter`（`Compile.filters`） | **编译期**过滤：被排除的 test 连函数体都不分析，它 body 里的 `@import` 不会发生 → 被导入文件的测试**根本不在编译里**。本仓库整套挂在一个聚合测试下（`src/tests.zig` → `test "compile all source files"`），所以实测 `-Dtest-filter=RaftElection` 编出的二进制只有 1 个测试（`root.test_0`，无名 `test { … }` 块，任何 filter 都匹配不到）且 **exit 0**；只有 `-Dtest-filter=.`（匹配一切）能跑满 1416 |
+| Zig 自带 `--test-filter`（`Compile.filters`） | **编译期**过滤：被排除的 test 连函数体都不分析，它 body 里的 `@import` 不会发生 → 被导入文件的测试**根本不在编译里**。本仓库整套挂在一个聚合测试下（`src/tests.zig` → `test "compile all source files"`），所以实测 `-Dtest-filter=RaftElection` 编出的二进制只有 1 个测试（`root.test_0`，无名 `test { … }` 块，任何 filter 都匹配不到）且 **exit 0**；只有 `-Dtest-filter=.`（匹配一切）能跑满全集（当前计数以 `check-test-collection` 门禁为准，勿抄数字） |
 | 命中 0 个 | 自带机制打印 `All 0 tests passed.` 且 **exit 0**。`scripts/test-fast.sh` 汇总 5 个 test 二进制的 `zm-test-runner:` 行，总数 0 时 **exit 2** 并明确说"没有验证任何东西" |
 | 第二次 `zig build test`（缓存热） | Zig 连 test **运行**结果一起缓存：输出 `run test cached`，测试**没有执行**、也没有计数。要能引用的证据就加 `--force-run` |
 
@@ -429,8 +431,7 @@ filter 是**测试全限定名的子串**（形如 `core.cluster.RaftElection.te
 - 其它测试入口：`zig build soak`（N 并发 × M 租户，默认 16×50；CI 夜间 64×200）·
   `zig build test -Dnet-tests=false`（沙箱里跳过全部 socket 用例）·
   `bash scripts/test-fast.sh [--filter …]`（聚焦单测/强制重跑；见 §Testing）
-- Score: ~98/100（`docs/EVALUATION_REPORT.md` v5.6；该报告早于 2026-09 加固批次，
-  当前状态以本文件与 `CHANGELOG.md` 为准）
+- 质量现状：以 `CHANGELOG.md` 与 `docs/dev/v1.0-readiness-v0.35.md` 为准（`docs/EVALUATION_REPORT.md` 是 2026-09 加固批次之前的旧快照，勿引其分数）
 - Roadmap: `docs/PRODUCTION_ROADMAP.md`（phases 1–9 ✅）
 
 ### Release 流程（强制）
@@ -459,7 +460,7 @@ filter 是**测试全限定名的子串**（形如 `core.cluster.RaftElection.te
 - Sandbox cache：`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`.
 - Auth Path A + `CatalogPermLoadInput` 已落地；legacy JWT 只写 `auth_info`。
 - x402 fail-closed；OTLP/Vault 已支持 HTTPS（系统 CA）。
-- zent **v0.76.2**（示例按此验证）与 `data.sqlx` 正交，勿混驱动/共享事务（`docs/ZENT.md`）。**0.76 起可按驱动裁剪构建**：`b.dependency("zent", .{ …, .pg = false, .mysql = false })` 跳过对应 `translate-c`（关掉一个确实 import 的驱动会在首次使用时编译失败而非静默降级；本仓库两个示例已用，但本机实测端到端开销不变——省下的两条与 SQLite 那条并行）。**0.75 起** junction 表名与实体表名撞车报 `junction_name_collision`（read-breaking；`migrateSchema` 只 `warn`，改名是调用方的决定）。0.76.1 修三处 OOM 路径泄漏。v0.54 起 `CrudService.create(entity, tenant_id)` 为双参（租户是形参，不再从实体读）；v0.66 起空 `dept_ids` 拒绝而非放行、无谓词 `BulkDelete` 报 `NoPredicate`；v0.67 起无 `last_insert_id` 报 `MissingLastInsertId`、MySQL 批量改逐行；v0.57 起 MySQL 的 `String`/`Enum` 落 `VARCHAR(255)`；v0.58–0.59 `driver.Error` 新增 `ParamCountMismatch`/`PoolWaitTimeout`（**无 `else` 的穷尽 switch 会编译失败**）。**两条升级陷阱**：① `client.<entity>.deinitRow(&e)` 只适用于驱动扫描出来的行——`CrudService.getOwned`（zent 0.73 改名，旧名 `get`）返回的是 `ownedCopy(ctx.allocator, …)`，这类行的释放是 `deinitRowWith(allocator, &e)`；交给 `deinitRow` 会分配器不匹配并打死进程（实测 `free of invalid memory`），`zmodu audit` 的 b23 规则拦这一类；② 改 pin 后先 `rm -rf .zig-cache`，增量缓存会沿用旧 fetch 模块（实测"编译通过"却仍跑旧版本）。v0.32.3 起 sqlite 单连接串行化（`Rows` 持锁至 `deinit()`）；v0.33.0 起 `UseInterceptor` 覆盖 Create/BulkInsert（create 上 `whereEq` = 缺省才填）；v0.35.0 起 outbox 认领式派发（崩溃遗留用 `requeueStale` 回收）；v0.36.0 起迁移默认加锁、outbox 新增 `claimed_at` 列、`createAllTables` 增加 allocator 参数；v0.37.0 起 `max_wait_ms` 真正阻塞等待、嵌套预加载每层一次查询；v0.38.0 起 `queryTargets*` fail-closed（旧语义改名 `*Unscoped`），新增 NULL 容忍扫描器；v0.39.0 起 `zent.scope` 让手写 SQL 也能带上软删/隐私/拦截器契约（**裸 SQL 不再自动隔离，必须接 scope**），并有 `<col>Like` 与 `zent.version`；v0.40.0 起一行式释放 `deinitRows`/`deinitRow`/`deinitEdgeRows`，v0.41.0 明确 `crud_helpers.queryRows` 也是需要 `zent.scope` 的裸路径，v0.41.1 修复 `deinitRows` 指针形态回归。
+- zent **v0.76.2**（示例按此验证）与 `data.sqlx` 正交，勿混驱动/共享事务；版本行为差（`getOwned`/裁剪构建/`zent.scope`/junction 撞名等）全在 `docs/ZENT.md`「版本口径」与 §14。两条实测陷阱：① `deinitRow(s)` 只用于**驱动扫描出来**的行——`getOwned` 这类带 allocator 返回的要用 `deinitRowWith(allocator, &e)`，配错 = 跨分配器 free 打死进程（`zmodu audit` b23 拦）；② 改依赖 pin 后先 `rm -rf .zig-cache`——增量缓存会沿用旧 fetch 模块（实测"编译通过"却跑旧版本）。
 - SQLx 选择性链接：`-Ddb=` / `.db=`，默认 `all`；框架测试勿收窄；见 `docs/SQLX_DRIVERS.md`。
 - WS：`WsMessageFn` 含 `WsFrameKind`；fiber/io_uring 分发 text+binary（OpenIM protobuf OK）。
 - CI：`bash scripts/ci-integration.sh`（tenant-mgmt + stress + shopdemo，`-Ddb=sqlite`）。
