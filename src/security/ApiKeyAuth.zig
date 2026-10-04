@@ -20,19 +20,22 @@ pub const ApiKeyConfig = struct {
 /// and verifies that it is in the allowed key list
 ///
 /// Usage:
-///   server.addMiddleware(.{
-///       .func = apiKeyAuth(.{ .keys = &.{"sk-123", "sk-456"} })
+///   try server.addMiddleware(.{
+///       .func = try apiKeyAuth(.{ .keys = &.{"sk-123", "sk-456"} })
 ///   });
 ///
 /// Supports loading keys from external storage (e.g. Redis):
-///   server.addMiddleware(.{
-///       .func = apiKeyAuthWithLoader(.{ .loader = loadKeysFromDb })
+///   try server.addMiddleware(.{
+///       .func = try apiKeyAuthWithLoader(.{ .loader = loadKeysFromDb })
 ///   });
 ///
 /// Every call gets its own configuration — a middleware built from one key list
 /// or loader never authenticates against another one's. See `max_key_auth_instances`.
-pub fn apiKeyAuth(config: ApiKeyAuthConfig) api.MiddlewareFn {
-    return key_auth_middlewares[Instances.claim(.{ .static_keys = config })];
+///
+/// Returns `error.SlotPoolExhausted` when the comptime-sized pool is full —
+/// raise `max_key_auth_instances`.
+pub fn apiKeyAuth(config: ApiKeyAuthConfig) error{SlotPoolExhausted}!api.MiddlewareFn {
+    return key_auth_middlewares[try Instances.claim(.{ .static_keys = config })];
 }
 
 /// API key authentication configuration (with a static key list)
@@ -46,8 +49,11 @@ pub const ApiKeyAuthConfig = struct {
 ///
 /// A loader cannot report why it said no — see `ApiKeyLoaderConfig.loader` for
 /// what that means for a storage failure and what a loader must do about it.
-pub fn apiKeyAuthWithLoader(config: ApiKeyLoaderConfig) api.MiddlewareFn {
-    return key_auth_middlewares[Instances.claim(.{ .loader = config })];
+///
+/// Returns `error.SlotPoolExhausted` when the comptime-sized pool is full —
+/// raise `max_key_auth_instances`.
+pub fn apiKeyAuthWithLoader(config: ApiKeyLoaderConfig) error{SlotPoolExhausted}!api.MiddlewareFn {
+    return key_auth_middlewares[try Instances.claim(.{ .loader = config })];
 }
 
 /// Number of independently configured key-auth middlewares one process may build.
@@ -66,7 +72,10 @@ pub fn apiKeyAuthWithLoader(config: ApiKeyLoaderConfig) api.MiddlewareFn {
 /// public signature — the bound is the price of leaving it alone.
 ///
 /// Slots are claimed at wiring time and never released, so this bounds how many
-/// middlewares an application *builds*, not how many requests it serves.
+/// middlewares an application *builds*, not how many requests it serves. Past
+/// the bound, `apiKeyAuth` / `apiKeyAuthWithLoader` fail with
+/// `error.SlotPoolExhausted` — raise this constant if an application
+/// legitimately builds more.
 pub const max_key_auth_instances = 64;
 
 /// Per-call store of one key-auth middleware (one kind per factory).
@@ -83,10 +92,10 @@ const Instances = struct {
     /// slot (which would put two middlewares on one configuration again).
     var claimed: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 
-    fn claim(store: KeyAuthStore) usize {
+    fn claim(store: KeyAuthStore) error{SlotPoolExhausted}!usize {
         const slot = claimed.fetchAdd(1, .seq_cst);
         if (slot >= max_key_auth_instances) {
-            @panic("ApiKeyAuth: middleware slot pool exhausted — raise max_key_auth_instances");
+            return error.SlotPoolExhausted;
         }
         slots[slot] = store;
         return slot;
@@ -403,8 +412,8 @@ test "each apiKeyAuth keeps its own key list" {
     // A judges: while both shared one function-level `var`, the second
     // `apiKeyAuth` retargeted the first middleware at its own key list, so
     // key2 authenticated against A's routes.
-    const mw_a = apiKeyAuth(.{ .keys = &.{"key1"} });
-    const mw_b = apiKeyAuth(.{ .keys = &.{"key2"} });
+    const mw_a = try apiKeyAuth(.{ .keys = &.{"key1"} });
+    const mw_b = try apiKeyAuth(.{ .keys = &.{"key2"} });
 
     Reached.value = false;
     var ctx_foreign = try api.Context.init(allocator, .GET, "/thing");
@@ -445,8 +454,8 @@ test "each apiKeyAuthWithLoader keeps its own loader" {
         }
     };
 
-    const mw_a = apiKeyAuthWithLoader(.{ .loader = Loaders.onlyKey1 });
-    const mw_b = apiKeyAuthWithLoader(.{ .loader = Loaders.onlyKey2 });
+    const mw_a = try apiKeyAuthWithLoader(.{ .loader = Loaders.onlyKey1 });
+    const mw_b = try apiKeyAuthWithLoader(.{ .loader = Loaders.onlyKey2 });
 
     Reached.value = false;
     var ctx_foreign = try api.Context.init(allocator, .GET, "/thing");

@@ -301,9 +301,9 @@ pub fn main(init: std.process.Init) !void {
     // products CRUD trusts.
     const jwt_secret = init.environ_map.get("JWT_SECRET") orelse "dev-secret-change-me";
     var app_sec = zigmodu.security.AppSecurity.init(allocator, io, .{ .jwt_secret = jwt_secret });
-    try server.addMiddleware(zigmodu.http.jwtAuthFromCatalog(&app_sec.module, &catalog_slot, .{}));
+    try server.addMiddleware(try zigmodu.http.jwtAuthFromCatalog(&app_sec.module, &catalog_slot, .{}));
 
-    try server.addMiddleware(zigmodu.http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
+    try server.addMiddleware(try zigmodu.http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
 
     // Dev token mint — a backdoor by construction, so it only exists when
     // ZENT_DEV_TOKEN=1. See dev_auth.zig.
@@ -342,7 +342,7 @@ pub fn main(init: std.process.Init) !void {
     try server.addRoute(.{
         .method = .GET,
         .path = "openapi.json",
-        .handler = zigmodu.http.openApiFromCatalog(&catalog_slot, .{
+        .handler = try zigmodu.http.openApiFromCatalog(&catalog_slot, .{
             .title = "zent-modulith",
             .version = "0.1.0",
             .description = "ComptimeRouter + zent catalog",

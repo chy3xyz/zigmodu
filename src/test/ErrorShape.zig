@@ -71,7 +71,7 @@ test "in-chain error shape: legacy envelope by default, problem+json under useRf
     var h = try Harness.init(allocator);
     defer h.deinit();
 
-    const deny = mw.moduleGate(&h.slot, .{ .unknown = .deny });
+    const deny = try mw.moduleGate(&h.slot, .{ .unknown = .deny });
 
     // No renderer installed: the gate's `.reject` default is `defaultReject`,
     // which is the legacy envelope.
@@ -105,7 +105,7 @@ test "in-chain error shape: legacy envelope by default, problem+json under useRf
     {
         var ctx = try api.Context.init(allocator, .GET, "/not-in-catalog");
         defer ctx.deinit();
-        try runMiddleware(mw.moduleGate(&h.slot, .{ .unknown = .deny, .reject = mw.envelopeReject(.default) }), &ctx);
+        try runMiddleware(try mw.moduleGate(&h.slot, .{ .unknown = .deny, .reject = mw.envelopeReject(.default) }), &ctx);
         try std.testing.expectEqualStrings("{\"code\":404,\"msg\":\"Unknown route module\",\"data\":null}", ctx.response_body.items);
     }
 

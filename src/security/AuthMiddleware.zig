@@ -34,7 +34,7 @@ pub fn jwtAuth(security: *SecurityModule, allocator: std.mem.Allocator) !api.Mid
     // One store per call: a function-level `var` is process-wide, so a second
     // `jwtAuth` (another server, another secret) would silently overwrite the
     // first one's security module and make both verify with the last secret.
-    const stored = std.heap.page_allocator.create(Store) catch @panic("jwtAuth setup: out of memory");
+    const stored = try std.heap.page_allocator.create(Store);
     stored.* = .{ .security = security, .allocator = allocator };
 
     return .{
@@ -57,7 +57,7 @@ pub fn jwtAuthWithPermissions(security: *SecurityModule, allocator: std.mem.Allo
         allocator: std.mem.Allocator,
         loader: PermissionLoader,
     };
-    const stored = std.heap.page_allocator.create(Store) catch @panic("jwtAuthWithPermissions setup: out of memory");
+    const stored = try std.heap.page_allocator.create(Store);
     stored.* = .{ .security = security, .allocator = allocator, .loader = loader };
 
     return .{

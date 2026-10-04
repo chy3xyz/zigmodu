@@ -461,7 +461,7 @@ test "auditAuthCoverage flags meta ↔ runtime drift" {
     var slot: comptime_router2.CatalogSlot = .{};
     defer slot.deinit();
     var sec = SecurityModule.init(allocator, "test-secret", 3600);
-    try server.addMiddleware(http_middleware.jwtAuthFromCatalog(&sec, &slot, .{}));
+    try server.addMiddleware(try http_middleware.jwtAuthFromCatalog(&sec, &slot, .{}));
 
     var scope = router.scope("/api");
     try scope.mount(Mod, &st);

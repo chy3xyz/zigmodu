@@ -2,6 +2,47 @@
 
 ## [Unreleased]
 
+### 第 134 批：中间件 setup 路径的 `@panic` 收敛为 `error` —— 13 个工厂 + 4 个槽位池函数签名换血（**破坏性：是**——接线处加 `try`）
+
+1. **缘起**：Zig 0.17 特性化盘点的 P1 项。中间件工厂的 setup 分配失败与槽位池耗尽过去一律
+   `@panic`——启动期一次 OOM 直接打死进程，而不是把错误交还给本来就有 `try` 落点的调用方
+   （`main` / 模块 `init`）。`security/AuthMiddleware.zig` 的两个工厂是既有先例（签名本就
+   `!api.Middleware`，这批只把 body 里的 `@panic("…setup: out of memory")` 改成
+   `return error.OutOfMemory`，签名不动）；其余同类一并拉齐。**刻意不动**：timer_wheel /
+   mailbox 的并发契约 panic（违反契约是程序 bug，panic 是对的）、sqlx 的 magic 金丝雀、
+   Orm/sqlx 的 deinitArena 误用 panic、`Server.zig` 测试块内的 panic、`RaftTransport.zig`
+   的 doc 引用。
+2. **修法（两类共 17 处，外加编译器逼出的第 18 处传染点）**：
+   - **setup OOM 类 → `error{OutOfMemory}!api.Middleware`**（13 处）：`Middleware.zig` 的
+     `cors` / `jwtAuth` / `jwtAuthFromCatalog` / `jwtAuthFromCatalogWithPermissions` /
+     `authFromCatalog` / `tenantResolver` / `moduleGate` / `permissionGate` /
+     `permissionGateWith` / `csrf` / `csrfWith` / `securityHeaders`，外加 `Compression.zig`
+     的 `compressionMiddleware` 与 `middleware/Tracing.zig` 的 `rateLimitPerClient`。
+   - **槽位池耗尽类 → `error{SlotPoolExhausted}`**（4 个函数）：`catalogLoaderFromTable`
+     （64 槽）、`CatalogPermDb.loaderFromClient`、`ApiKeyAuth.apiKeyAuth` /
+     `apiKeyAuthWithLoader`、`ComptimeRouter.openApiFromCatalog`（内部
+     `claimOpenApiBinding`，16 槽）。原 panic 文本里「抬高哪个 `max_*` 常量」的指引移进
+     各池的 doc 注释，没有丢。第 18 处是 `openApiRoutes`——它内部调
+     `claimOpenApiBinding`，编译器逼着签名一起换血。
+   - **连锁（24 文件，+232/−192）**：src 内 `Profiles` / `Testkit` / `Server` /
+     `ErrorShape` / `CombinationMatrix` 及文件内测试约 60 处加 `try`；四个 example
+     （tenant-mgmt 7、zmsaas 3、tenant-shop 2、zent-modulith 3）的接线同步；
+     `tools/zmodu` 生成模板 6 行同步（生成物保持直接可编译）；`docs/ROUTE_TABLE.md` /
+     `docs/BEST_PRACTICES.md` 示例同步加 `try`。消费方改法见 `docs/UPGRADING.md`。
+3. **顺带收口（本批验收抓到）**：**HEAD 上 `examples/tenant-mgmt` 本就编不过**——第 129 批
+   （09d252b）把 `Dashboard.zig` 的版本号接到 `build_options`，而 tenant-mgmt 是全仓唯一
+   自建 `build_options` 且引用 Dashboard 的 example，即 `ci-integration.sh` 在 HEAD
+   （ae62d85）上是红的。修复：`examples/tenant-mgmt/build.zig` 用 `b.graph.io` +
+   `std.Io.Dir.cwd().readFileAlloc` 读 `../../build.zig.zon` 抠出 `.version` 字符串并
+   `addOption(std.SemanticVersion, "version", …)`（跨包 `@import("build.zig.zon")` 会被
+   编译器拒绝，读文件是唯一路径）。
+4. **回归测试**：签名换血本身就是最硬的回归——全树 + 4 个 example 编译通过即证。
+   池耗尽路径**刻意不写测试**：槽位池是进程级只增无回收的，耗尽测试会毒化同二进制里
+   排在后面的其他测试，此决策记档。
+5. **门禁读数**：fmt 净（22 个 zig 文件）· check-production OK · check-test-collection OK
+   （2161 持平；tools 155/157）· 全量 `zig build test` exit=0（227s 真实全量 + 缓存复跑）·
+   tenant-mgmt / zmsaas / tenant-shop / zent-modulith 四个 example 冒烟 exit 0。
+
 ### 第 133 批：Fx.zig 的「假并行」兑现 —— Parallel/Map 接 `std.Io.Group` 真并发（**破坏性：是**——两函数签名换血）
 
 1. **缘起**：0.16 删掉 `std.Thread.WaitGroup` 时这两个函数退化为「静默串行」——

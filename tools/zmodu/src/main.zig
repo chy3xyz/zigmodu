@@ -9770,7 +9770,7 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
         \\    defer server.deinit();
         \\    server.withGracefulDrain(zigmodu.getInFlightCounter());
         \\    // CORS (allow all origins in dev)
-        \\    try server.addMiddleware(zigmodu.http.http_middleware.cors(.{}));
+        \\    try server.addMiddleware(try zigmodu.http.http_middleware.cors(.{}));
         \\
         \\    // -- Health Checks --
         \\    var health_endpoint = zigmodu.HealthEndpoint.init(allocator);
@@ -9797,14 +9797,14 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
             \\        .{ .role = "admin", .permissions = &.{ "system:admin", "system:write", "system:read" } },
             \\        .{ .role = "user", .permissions = &.{ "system:read" } },
             \\    } };
-            \\    try server.addMiddleware(zigmodu.http.jwtAuthFromCatalogWithPermissions(
+            \\    try server.addMiddleware(try zigmodu.http.jwtAuthFromCatalogWithPermissions(
             \\        &app_sec.module,
             \\        &catalog_slot,
-            \\        zigmodu.http.catalogLoaderFromTable(&role_perms),
+            \\        try zigmodu.http.catalogLoaderFromTable(&role_perms),
             \\        .{},
             \\    ));
-            \\    try server.addMiddleware(zigmodu.http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
-            \\    try server.addMiddleware(zigmodu.http.permissionGateWith(&catalog_slot, .{ .mode = .rbac }));
+            \\    try server.addMiddleware(try zigmodu.http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
+            \\    try server.addMiddleware(try zigmodu.http.permissionGateWith(&catalog_slot, .{ .mode = .rbac }));
             \\
             \\    // Rate limiter
             \\    var auth_limiter = try zigmodu.RateLimiter.init(allocator, "api", 1000, 100);
@@ -9815,7 +9815,7 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
         );
     } else {
         try buf.appendSlice(allocator,
-            \\    try server.addMiddleware(zigmodu.http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
+            \\    try server.addMiddleware(try zigmodu.http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
             \\
         );
     }
@@ -9909,7 +9909,7 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
         \\    try server.addRoute(.{
         \\        .method = .GET,
         \\        .path = "openapi.json",
-        \\        .handler = zigmodu.http.openApiFromCatalog(&catalog_slot, .{
+        \\        .handler = try zigmodu.http.openApiFromCatalog(&catalog_slot, .{
         \\            .title = "
     );
     try buf.appendSlice(allocator, project_name);

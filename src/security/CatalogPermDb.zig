@@ -94,10 +94,13 @@ pub fn permissionsCsv(allocator: std.mem.Allocator, client: *sqlx.Client, roles:
 /// Each call is bound to its own client: two loaders built from two clients
 /// (two permission databases) read their own table and never each other's.
 /// See `max_loader_slots` for how that is possible for a bare function pointer.
-pub fn loaderFromClient(client: *sqlx.Client) http_middleware.CatalogPermissionLoader {
+///
+/// Returns `error.SlotPoolExhausted` when the comptime-sized pool is full —
+/// raise `max_loader_slots`.
+pub fn loaderFromClient(client: *sqlx.Client) error{SlotPoolExhausted}!http_middleware.CatalogPermissionLoader {
     const slot = LoaderSlots.claimed.fetchAdd(1, .seq_cst);
     if (slot >= max_loader_slots) {
-        @panic("CatalogPermDb.loaderFromClient: loader slot pool exhausted — raise max_loader_slots");
+        return error.SlotPoolExhausted;
     }
     LoaderSlots.clients[slot] = client;
     return loader_trampolines[slot];
@@ -120,7 +123,9 @@ pub fn loaderFromClient(client: *sqlx.Client) http_middleware.CatalogPermissionL
 /// bound is the price of leaving that type — and every call site — alone.
 ///
 /// Slots are claimed at wiring time and never released, so this bounds how many
-/// loaders an application *builds*, not how many requests it serves.
+/// loaders an application *builds*, not how many requests it serves. Past the
+/// bound, `loaderFromClient` fails with `error.SlotPoolExhausted` — raise this
+/// constant if an application legitimately builds more.
 pub const max_loader_slots = 64;
 
 const LoaderSlots = struct {
@@ -204,8 +209,8 @@ test "each loaderFromClient reads its own database" {
     // Two loaders, two permission databases. While the client lived in a
     // function-level `var`, the second `loaderFromClient` retargeted the first
     // loader too, so A's middleware answered from B's table.
-    const load_a = loaderFromClient(&client_a);
-    const load_b = loaderFromClient(&client_b);
+    const load_a = try loaderFromClient(&client_a);
+    const load_b = try loaderFromClient(&client_b);
 
     const csv_a = try load_a(allocator, .{ .sub = "u1", .aud = "t1", .roles = &.{"admin"} });
     defer allocator.free(csv_a);

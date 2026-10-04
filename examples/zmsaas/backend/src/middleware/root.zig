@@ -21,22 +21,22 @@ pub fn jwtAuthMiddleware(
     sec: *zigmodu.security.SecurityModule,
     slot: *http.CatalogSlot,
     db: *zigmodu.data.Client,
-) http.Middleware {
+) !http.Middleware {
     return http.jwtAuthFromCatalogWithPermissions(
         sec,
         slot,
-        zigmodu.security.CatalogPermDb.loaderFromClient(db),
+        try zigmodu.security.CatalogPermDb.loaderFromClient(db),
         .{},
     );
 }
 
 /// ModuleGate: injects `module` attr from catalog; unknown paths allowed (API may 404 later).
-pub fn moduleGateMiddleware(slot: *http.CatalogSlot) http.Middleware {
+pub fn moduleGateMiddleware(slot: *http.CatalogSlot) !http.Middleware {
     return http.moduleGate(slot, .{ .unknown = .allow });
 }
 
 /// PermissionGate (RBAC): `RouteMeta.permission` must appear in loaded permission codes.
-pub fn permissionGateMiddleware(slot: *http.CatalogSlot) http.Middleware {
+pub fn permissionGateMiddleware(slot: *http.CatalogSlot) !http.Middleware {
     return http.permissionGateWith(slot, .{ .mode = .rbac });
 }
 

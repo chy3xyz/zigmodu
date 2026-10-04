@@ -12,6 +12,17 @@ pub fn build(b: *std.Build) void {
 
     const build_options = b.addOptions();
     db_link.addToOptions(build_options, features);
+    // Dashboard.zig renders the framework version from build_options (batch
+    // 129); this example builds its own build_options, so read the framework
+    // zon's version (the single source of truth) and re-export it. The build
+    // runner's cwd is this example's root.
+    const io = b.graph.io;
+    const zon_text = std.Io.Dir.cwd().readFileAlloc(io, "../../build.zig.zon", b.allocator, .limited(4096)) catch unreachable;
+    const version_key = ".version = \"";
+    const version_start = std.mem.indexOf(u8, zon_text, version_key) orelse unreachable;
+    const version_rest = zon_text[version_start + version_key.len ..];
+    const version_end = std.mem.indexOfScalar(u8, version_rest, '"') orelse unreachable;
+    build_options.addOption(std.SemanticVersion, "version", std.SemanticVersion.parse(version_rest[0..version_end]) catch unreachable);
     const build_options_mod = build_options.createModule();
 
     const zigmodu_mod = b.addModule("zigmodu", .{

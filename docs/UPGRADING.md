@@ -134,6 +134,76 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 
 ---
 
+## v0.39.5 之后（未发布批次）
+
+> 本节收 v0.39.5 之后、下一发布号之前的「会咬人」变更；发布时把标题改成版本号。
+> **3 处破坏性**：① 中间件工厂与槽位池函数返回错误（编译错）；② `Fx.Parallel` / `Fx.Map`
+> 真并发化、签名换血（编译错）；③ JWT 段改用 std 严格 base64url，带 `=` padding 的段被拒
+> （行为收紧）。逐条背景见 [`../CHANGELOG.md`](../CHANGELOG.md) `[Unreleased]` 段的
+> 第 134 / 133 / 130 批。
+
+### ① 中间件工厂与槽位池函数返回错误（第 134 批，**编译错**）
+
+**Breaking?** 是 —— 一批启动期函数从「失败即 `@panic`」改成「失败返回错误」，忘了 `try`
+一律编译不过：
+
+- **`error{OutOfMemory}!api.Middleware`**（13 个工厂）：`http.jwtAuthFromCatalog` /
+  `http.jwtAuthFromCatalogWithPermissions` / `http.authFromCatalog` / `http.tenantResolver` /
+  `http.moduleGate` / `http.permissionGate` / `http.permissionGateWith` /
+  `http.compressionMiddleware`，以及 `http.http_middleware` 下的 `cors` / `jwtAuth` /
+  `csrf` / `csrfWith` / `securityHeaders` / `rateLimitPerClient`。
+- **`error{SlotPoolExhausted}`**（槽位池）：`http.catalogLoaderFromTable`（64 槽）、
+  `zigmodu.security.CatalogPermDb.loaderFromClient`、`zigmodu.security.ApiKeyAuth`（即
+  `apiKeyAuth`）与 `ApiKeyAuthWithLoader`、`http.openApiFromCatalog` 与
+  `http.openApiRoutes`（16 槽）。
+
+**影响面**：所有自己接线中间件 / 权限 loader 的应用（每个接线点一处编译错，逐处加
+`try` 即修完）。
+
+**一行改法**：
+
+```zig
+// 旧
+try server.addMiddleware(http.permissionGateWith(&slot, .{ .mode = .rbac }));
+// 新（注意嵌套的那一层 try）
+try server.addMiddleware(try http.permissionGateWith(&slot, .{ .mode = .rbac }));
+
+// 旧
+const loader = zigmodu.security.CatalogPermDb.loaderFromClient(db);
+// 新
+const loader = try zigmodu.security.CatalogPermDb.loaderFromClient(db);
+```
+
+`SlotPoolExhausted` 只在接线次数超过池上限时发生；一次性接线（每 app 一张表 / 一个 slot）
+不受影响。真撞上时把错误冒泡给 `main`——**别 `catch` 掉继续跑**：那意味着后面的路由没有
+授权 loader。要抬高上限看各池 doc 注释里点名的 `max_*` 常量。
+
+### ② `Fx.Parallel` / `Fx.Map` 真并发化（第 133 批，**编译错**）
+
+**Breaking?** 是 —— 两函数首参换成 `io: std.Io`；`Parallel` 删掉了从未使用的 allocator
+参数。行为变化：从静默串行变成真并发（`std.Io.Group` 按 `max_workers` 分块），传入的
+`func` 必须线程安全。
+
+**影响面**：直接调 `zigmodu.fx.Parallel` / `fx.Map` 的代码（框架仓内零调用点）。
+
+**一行改法**：
+
+```zig
+// 旧
+try zigmodu.fx.Parallel(allocator, T, items, 4, func);
+// 新
+try zigmodu.fx.Parallel(io, T, items, 4, func);
+```
+
+### ③ JWT 段改用 std 严格 base64url（第 130 批，**行为收紧**）
+
+**Breaking?** 对依赖宽松解码的部署是 —— 带 `=` padding 的 JWT 段从此被拒（RFC 7515 的
+base64url 本无 padding）。**影响面**：收过非标准实现的 token 的应用。**一行改法**：让
+签发方输出无 padding 段（标准实现本来如此）；没有这类客户端就不需要动。顺带：此前修过的
+「解码失败泄漏缓冲区」语义在新实现下保留，下游为该泄漏加的 e2e 豁免可以随本版退役。
+
+---
+
 ## v0.35.0
 
 > **没有公开 API 被删**（`docs/API.md` 里的名字一个没动）。**一条口径变化**：WS 帧推送的

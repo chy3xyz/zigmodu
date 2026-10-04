@@ -142,7 +142,7 @@ pub fn main(init: std.process.Init) !void {
 
     try server.addMiddleware(middleware.tenantMiddleware());
     try server.addMiddleware(middleware.jwtAuthMiddleware(&app_sec.module, &catalog_slot));
-    try server.addMiddleware(middleware.moduleGateMiddleware(&catalog_slot));
+    try server.addMiddleware(try middleware.moduleGateMiddleware(&catalog_slot));
     try server.addMiddleware(middleware.dataPermissionMiddleware());
 
     // ComptimeRouter — all modules via mountAll (smoke-friendly: default_auth = .public)
@@ -186,7 +186,7 @@ pub fn main(init: std.process.Init) !void {
     try server.addRoute(.{
         .method = .GET,
         .path = "openapi.json",
-        .handler = zigmodu.http.openApiFromCatalog(&catalog_slot, .{
+        .handler = try zigmodu.http.openApiFromCatalog(&catalog_slot, .{
             .title = "tenant-shop",
             .version = "0.1.0",
             .description = "ComptimeRouter catalog (live)",

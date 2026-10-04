@@ -342,6 +342,8 @@ const OpenApiBinding = struct {
 ///
 /// Slots are claimed at wiring time and never released, so this bounds how many
 /// OpenAPI endpoints an application *builds*, not how many requests it serves.
+/// Past the bound, `openApiFromCatalog` fails with `error.SlotPoolExhausted` —
+/// raise this constant if an application legitimately builds more.
 pub const max_openapi_bindings = 16;
 
 const OpenApiBindings = struct {
@@ -355,8 +357,10 @@ const OpenApiBindings = struct {
 
 /// Claim the binding for `slot`, reusing the existing slot when the same
 /// `CatalogSlot` registers twice: a re-registration updates that app's config,
-/// as it always did, and leaves every other app alone.
-fn claimOpenApiBinding(slot: *CatalogSlot, config: OpenApiFromCatalogConfig) usize {
+/// as it always did, and leaves every other app alone. Returns
+/// `error.SlotPoolExhausted` when the comptime-sized pool is full — raise
+/// `max_openapi_bindings`.
+fn claimOpenApiBinding(slot: *CatalogSlot, config: OpenApiFromCatalogConfig) error{SlotPoolExhausted}!usize {
     const binding: OpenApiBinding = .{
         .catalog_slot = slot,
         .title = config.title,
@@ -375,7 +379,7 @@ fn claimOpenApiBinding(slot: *CatalogSlot, config: OpenApiFromCatalogConfig) usi
     }
     const index = OpenApiBindings.claimed.fetchAdd(1, .seq_cst);
     if (index >= max_openapi_bindings) {
-        @panic("openApiFromCatalog: OpenAPI binding pool exhausted — raise max_openapi_bindings");
+        return error.SlotPoolExhausted;
     }
     OpenApiBindings.bindings[index] = binding;
     return index;
@@ -419,8 +423,11 @@ const openapi_handlers: [max_openapi_bindings]HandlerFn = blk: {
 /// app's title/version/description. Register after
 /// `catalog_slot.set(try router.finish())` (the handler reads the slot per
 /// request, so only requests before `set` see 503).
-pub fn openApiFromCatalog(slot: *CatalogSlot, config: OpenApiFromCatalogConfig) HandlerFn {
-    return openapi_handlers[claimOpenApiBinding(slot, config)];
+///
+/// Returns `error.SlotPoolExhausted` when the comptime-sized binding pool is
+/// full — raise `max_openapi_bindings`.
+pub fn openApiFromCatalog(slot: *CatalogSlot, config: OpenApiFromCatalogConfig) error{SlotPoolExhausted}!HandlerFn {
+    return openapi_handlers[try claimOpenApiBinding(slot, config)];
 }
 
 /// Standalone handler serving an interactive Swagger UI HTML page pointing to `spec_url`.
@@ -496,12 +503,14 @@ pub fn wrapHandler(comptime State: type, comptime handler: HandlerFn) TypedHandl
 
 /// Zero-boilerplate RouteSpec tuple for mounting OpenAPI JSON + Swagger UI + Scalar UI.
 /// Returns 3 routes (`openapi.json`, `docs`, `scalar`) preconfigured for public access.
+/// Returns `error.SlotPoolExhausted` when the comptime-sized binding pool is
+/// full — raise `max_openapi_bindings`.
 pub fn openApiRoutes(
     comptime State: type,
     slot: *CatalogSlot,
     config: OpenApiFromCatalogConfig,
-) [3]RouteSpec(State) {
-    const index = claimOpenApiBinding(slot, config);
+) error{SlotPoolExhausted}![3]RouteSpec(State) {
+    const index = try claimOpenApiBinding(slot, config);
     // `RouteSpec(State).handler` is a `TypedHandler(State)`, and the binding
     // index is a runtime value, so the adapter that bridges to the slot's
     // `HandlerFn` has to exist per (State, slot) — one distinct fn per binding,
@@ -1185,7 +1194,7 @@ test "openApiRoutes generates 3 public UI and spec routes" {
     const State = struct {};
     var slot = CatalogSlot{};
     defer slot.deinit();
-    const routes = openApiRoutes(State, &slot, .{ .title = "Test App" });
+    const routes = try openApiRoutes(State, &slot, .{ .title = "Test App" });
     try std.testing.expectEqual(@as(usize, 3), routes.len);
     try std.testing.expectEqualStrings("openapi.json", routes[0].path);
     try std.testing.expectEqualStrings("docs", routes[1].path);
@@ -1252,12 +1261,12 @@ test "one process, two servers: each /openapi.json serves its own catalog" {
     try shop_srv.addRoute(.{
         .method = .GET,
         .path = "openapi.json",
-        .handler = openApiFromCatalog(&shop_slot, .{ .title = "Shop App" }),
+        .handler = try openApiFromCatalog(&shop_slot, .{ .title = "Shop App" }),
     });
     try admin_srv.addRoute(.{
         .method = .GET,
         .path = "openapi.json",
-        .handler = openApiFromCatalog(&admin_slot, .{ .title = "Admin App" }),
+        .handler = try openApiFromCatalog(&admin_slot, .{ .title = "Admin App" }),
     });
     {
         var shop_root = shop_router.scope("");

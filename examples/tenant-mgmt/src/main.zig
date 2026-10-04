@@ -141,10 +141,10 @@ pub fn main(init: std.process.Init) !void {
     // The framework's own middleware: it now stamps the request (not just the
     // response header), so the handler's log scope picks the id up for free.
     try server.addMiddleware(zigmodu.http.tracingMiddleware());
-    try server.addMiddleware(middleware.jwtAuthMiddleware(&app_sec.module, &catalog_slot, &db_client));
+    try server.addMiddleware(try middleware.jwtAuthMiddleware(&app_sec.module, &catalog_slot, &db_client));
     try server.addMiddleware(middleware.tenantMiddleware());
-    try server.addMiddleware(middleware.moduleGateMiddleware(&catalog_slot));
-    try server.addMiddleware(middleware.permissionGateMiddleware(&catalog_slot));
+    try server.addMiddleware(try middleware.moduleGateMiddleware(&catalog_slot));
+    try server.addMiddleware(try middleware.permissionGateMiddleware(&catalog_slot));
     try server.addMiddleware(middleware.dataPermissionMiddleware());
 
     // ── 7. API Routes (v1) — all modules via ComptimeRouter ──
@@ -177,7 +177,7 @@ pub fn main(init: std.process.Init) !void {
     try server.addRoute(.{
         .method = .GET,
         .path = "openapi.json",
-        .handler = zigmodu.http.openApiFromCatalog(&catalog_slot, .{
+        .handler = try zigmodu.http.openApiFromCatalog(&catalog_slot, .{
             .title = "tenant-mgmt",
             .version = "0.1.0",
             .description = "ComptimeRouter catalog (live)",

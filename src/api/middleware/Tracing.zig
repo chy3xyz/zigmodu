@@ -126,16 +126,16 @@ pub fn rateLimit(limiter: *RateLimiter) api.Middleware {
 }
 
 /// Per-client rate limiting — uses a specific key from the request (IP, API key, etc).
-/// Usage: `server.addMiddleware(rateLimitPerClient(&registry, extractKey))`
+/// Usage: `try server.addMiddleware(try rateLimitPerClient(&registry, extractKey))`
 pub fn rateLimitPerClient(
     registry: *RateLimiterRegistry,
     key_extractor: *const fn (*api.Context) []const u8,
-) api.Middleware {
+) error{OutOfMemory}!api.Middleware {
     const S = struct {
         stored_registry: *RateLimiterRegistry,
         stored_extractor: *const fn (*api.Context) []const u8,
     };
-    const stored = std.heap.page_allocator.create(S) catch @panic("tracing middleware setup: out of memory");
+    const stored = try std.heap.page_allocator.create(S);
     stored.* = .{ .stored_registry = registry, .stored_extractor = key_extractor };
 
     return .{

@@ -26,10 +26,10 @@ DB 权限表示例：
 ```zig
 try zigmodu.security.CatalogPermDb.ensureSchema(&db_client);
 try zigmodu.security.CatalogPermDb.grant(&db_client, "admin", "tenant:suspend");
-try server.addMiddleware(http.jwtAuthFromCatalogWithPermissions(
-    &sec, &slot, zigmodu.security.CatalogPermDb.loaderFromClient(&db_client), .{},
+try server.addMiddleware(try http.jwtAuthFromCatalogWithPermissions(
+    &sec, &slot, try zigmodu.security.CatalogPermDb.loaderFromClient(&db_client), .{},
 ));
-try server.addMiddleware(http.permissionGateWith(&slot, .{ .mode = .rbac }));
+try server.addMiddleware(try http.permissionGateWith(&slot, .{ .mode = .rbac }));
 ```
 
 ---
@@ -273,17 +273,17 @@ const table = security.Rbac.RolePermissionTable{ .rows = &.{
     .{ .role = "admin", .permissions = &.{ "tenant:suspend", "tenant:write" } },
     .{ .role = "user", .permissions = &.{ "tenant:read" } },
 } };
-try server.addMiddleware(http.jwtAuthFromCatalogWithPermissions(
-    &sec, &catalog_slot, http.catalogLoaderFromTable(&table), .{},
+try server.addMiddleware(try http.jwtAuthFromCatalogWithPermissions(
+    &sec, &catalog_slot, try http.catalogLoaderFromTable(&table), .{},
 ));
-try server.addMiddleware(http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
-try server.addMiddleware(http.permissionGateWith(&catalog_slot, .{ .mode = .rbac }));
+try server.addMiddleware(try http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
+try server.addMiddleware(try http.permissionGateWith(&catalog_slot, .{ .mode = .rbac }));
 // … mountAll …
 catalog_slot.set(try router.finish());
 try server.addRoute(.{
     .method = .GET,
     .path = "openapi.json",
-    .handler = http.openApiFromCatalog(&catalog_slot, .{ .title = "app", .version = "1.0" }),
+    .handler = try http.openApiFromCatalog(&catalog_slot, .{ .title = "app", .version = "1.0" }),
 });
 ```
 

@@ -62,7 +62,7 @@ pub const HttpProfileState = struct {
 pub fn applyHttpDefaults(server: *Server, cfg: ProfileConfig, state: *HttpProfileState) !void {
     if (cfg.security_basics) {
         state.cors_origins[0] = cfg.cors_origin;
-        try server.addMiddleware(mw.cors(.{ .allow_origins = &state.cors_origins }));
+        try server.addMiddleware(try mw.cors(.{ .allow_origins = &state.cors_origins }));
         try server.addMiddleware(mw.requestId());
         try server.addMiddleware(mw.recover());
     }
@@ -259,7 +259,7 @@ pub fn productionProfile(server: *Server, cfg: ProductionConfig, state: *Product
 
     // 2. Security + observability middleware (CORS, request-id, recover, access log, counters).
     try applyHttpDefaults(server, cfg.http, &state.http_state);
-    try server.addMiddleware(mw.securityHeaders(null));
+    try server.addMiddleware(try mw.securityHeaders(null));
     if (cfg.tracing) try server.addMiddleware(tracingMiddleware());
 
     // 3. Prometheus exposition — golden signals, labeled by route template.

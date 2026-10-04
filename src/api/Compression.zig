@@ -1,6 +1,6 @@
 //! Opt-in **response compression** middleware (`Accept-Encoding: gzip` / `deflate`).
 //!
-//!   try server.addMiddleware(zigmodu.http.compressionMiddleware(.{}));
+//!   try server.addMiddleware(try zigmodu.http.compressionMiddleware(.{}));
 //!
 //! The middleware wraps the rest of the chain and re-encodes whatever the
 //! handler left in `ctx.response_body`. A response is encoded only when all of
@@ -263,10 +263,10 @@ fn varyAcceptEncoding(ctx: *api.Context) !void {
 /// this middleware's post-processing, so an oversized error body is compressed
 /// too. Position relative to auth gates does not matter — they all wrap the
 /// handler, and the body is final by the time the chain unwinds.
-pub fn compressionMiddleware(config: CompressionConfig) api.Middleware {
+pub fn compressionMiddleware(config: CompressionConfig) error{OutOfMemory}!api.Middleware {
     // Per-instance configuration on `user_data` (process lifetime), like `cors`
     // and `csrf`: two servers with different thresholds must not share state.
-    const stored = std.heap.page_allocator.create(CompressionConfig) catch @panic("compression middleware setup: out of memory");
+    const stored = try std.heap.page_allocator.create(CompressionConfig);
     stored.* = config;
     return .{ .func = compressionMw, .user_data = stored };
 }
@@ -486,7 +486,7 @@ test "Compression: Accept-Encoding negotiation" {
 
 test "Compression: gzip round-trips a large JSON body" {
     const allocator = std.testing.allocator;
-    const mw = compressionMiddleware(.{});
+    const mw = try compressionMiddleware(.{});
     var ctx = try api.Context.init(allocator, .GET, "/api/items");
     defer ctx.deinit();
     try putRequestHeader(&ctx, "accept-encoding", "gzip");
@@ -507,7 +507,7 @@ test "Compression: the registered middleware encodes on the server chain" {
     const Testkit = @import("../http/Testkit.zig");
     var server = api.Server.init(std.testing.io, allocator, 0);
     defer server.deinit();
-    try server.addMiddleware(compressionMiddleware(.{}));
+    try server.addMiddleware(try compressionMiddleware(.{}));
     var group = server.group("");
     try group.get("items", handlerFor("application/json", &big_json), null);
 
@@ -525,7 +525,7 @@ test "Compression: the registered middleware encodes on the server chain" {
 
 test "Compression: deflate is the zlib stream and round-trips too" {
     const allocator = std.testing.allocator;
-    const mw = compressionMiddleware(.{});
+    const mw = try compressionMiddleware(.{});
     var ctx = try api.Context.init(allocator, .GET, "/api/items");
     defer ctx.deinit();
     try putRequestHeader(&ctx, "accept-encoding", "deflate");
@@ -541,7 +541,7 @@ test "Compression: deflate is the zlib stream and round-trips too" {
 
 test "Compression: no Accept-Encoding means no encoding, but Vary is still set" {
     const allocator = std.testing.allocator;
-    const mw = compressionMiddleware(.{});
+    const mw = try compressionMiddleware(.{});
     var ctx = try api.Context.init(allocator, .GET, "/api/items");
     defer ctx.deinit();
 
@@ -557,7 +557,7 @@ test "Compression: no Accept-Encoding means no encoding, but Vary is still set" 
 
 test "Compression: a body below the threshold stays uncompressed" {
     const allocator = std.testing.allocator;
-    const mw = compressionMiddleware(.{});
+    const mw = try compressionMiddleware(.{});
     var ctx = try api.Context.init(allocator, .GET, "/api/items");
     defer ctx.deinit();
     try putRequestHeader(&ctx, "accept-encoding", "gzip");
@@ -570,7 +570,7 @@ test "Compression: a body below the threshold stays uncompressed" {
 
     // The same body *is* encoded once the threshold allows it, which is what
     // makes the assertion above about the threshold rather than the payload.
-    const zero_mw = compressionMiddleware(.{ .min_size = 0 });
+    const zero_mw = try compressionMiddleware(.{ .min_size = 0 });
     var zero = try api.Context.init(allocator, .GET, "/api/items");
     defer zero.deinit();
     try putRequestHeader(&zero, "accept-encoding", "gzip");
@@ -589,7 +589,7 @@ test "Compression: a body below the threshold stays uncompressed" {
 
 test "Compression: an already-encoded response is never encoded twice" {
     const allocator = std.testing.allocator;
-    const mw = compressionMiddleware(.{});
+    const mw = try compressionMiddleware(.{});
     var ctx = try api.Context.init(allocator, .GET, "/api/items");
     defer ctx.deinit();
     try putRequestHeader(&ctx, "accept-encoding", "gzip");
@@ -606,7 +606,7 @@ test "Compression: an already-encoded response is never encoded twice" {
 
 test "Compression: streaming responses are left alone" {
     const allocator = std.testing.allocator;
-    const mw = compressionMiddleware(.{});
+    const mw = try compressionMiddleware(.{});
     var ctx = try api.Context.init(allocator, .GET, "/api/events");
     defer ctx.deinit();
     try putRequestHeader(&ctx, "accept-encoding", "gzip");
@@ -625,7 +625,7 @@ test "Compression: streaming responses are left alone" {
 
 test "Compression: Vary merges with an existing value and is not duplicated" {
     const allocator = std.testing.allocator;
-    const mw = compressionMiddleware(.{});
+    const mw = try compressionMiddleware(.{});
     var ctx = try api.Context.init(allocator, .GET, "/api/items");
     defer ctx.deinit();
     try ctx.setHeader("Content-Type", "application/json");
@@ -643,7 +643,7 @@ test "Compression: Vary merges with an existing value and is not duplicated" {
 
 test "Compression: non-compressible media types get neither encoding nor Vary" {
     const allocator = std.testing.allocator;
-    const mw = compressionMiddleware(.{});
+    const mw = try compressionMiddleware(.{});
     var ctx = try api.Context.init(allocator, .GET, "/img/logo.bin");
     defer ctx.deinit();
     try putRequestHeader(&ctx, "accept-encoding", "gzip");
@@ -657,7 +657,7 @@ test "Compression: non-compressible media types get neither encoding nor Vary" {
 
 test "Compression: a stale Content-Length is dropped with the original body" {
     const allocator = std.testing.allocator;
-    const mw = compressionMiddleware(.{});
+    const mw = try compressionMiddleware(.{});
     var ctx = try api.Context.init(allocator, .GET, "/api/items");
     defer ctx.deinit();
     try putRequestHeader(&ctx, "accept-encoding", "gzip");
@@ -677,7 +677,7 @@ test "Compression: a stale Content-Length is dropped with the original body" {
 
 test "Compression: an allocation failure leaves the response untouched" {
     const allocator = std.testing.allocator;
-    const mw = compressionMiddleware(.{});
+    const mw = try compressionMiddleware(.{});
     var ctx = try api.Context.init(allocator, .GET, "/api/items");
     defer ctx.deinit();
     try putRequestHeader(&ctx, "accept-encoding", "gzip");

@@ -7857,7 +7857,7 @@ test "a 300-byte Origin is echoed in a response that reaches the client" {
     defer server.deinit();
     // A `*.example.com` suffix entry matches any prefix length, so the *client*
     // picks how long the echoed `Access-Control-Allow-Origin` becomes.
-    try server.addMiddleware(@import("Middleware.zig").cors(.{ .allow_origins = &.{"*.example.com"} }));
+    try server.addMiddleware(try @import("Middleware.zig").cors(.{ .allow_origins = &.{"*.example.com"} }));
     var group = server.group("");
     try group.get("ping", struct {
         fn h(ctx: *Context) anyerror!void {

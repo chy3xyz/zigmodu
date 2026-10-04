@@ -1270,7 +1270,7 @@ pub const OrdersApi = zigmodu.http.CrudApi(model.Orders, service.OrdersService, 
   user_col)`（镜像 TenantInterceptor）由 `DataPermissionContext` 产出 scope
   子句（`.all` 返回 null、`.self_` 生成 `user_col = ?`、`.dept_*` 生成 IN）；
   中间件解析角色→作用域，handler 只把注入的子句拼进查询——不手写过滤。
-- 零配置交互式 API 文档：`http.openApiRoutes(State, &slot, .{ .title = "App" })`
+- 零配置交互式 API 文档：`try http.openApiRoutes(State, &slot, .{ .title = "App" })`
   一行接入 `/openapi.json`、`/docs` (Swagger UI) 与 `/scalar` (Scalar UI)
   公开路由组；亦可使用 `http.swaggerUiHandler("spec.json")` 或
   `http.scalarUiHandler("spec.json")` 单独挂载。
@@ -2510,19 +2510,19 @@ var catalog_slot: http.CatalogSlot = .{};
 defer catalog_slot.deinit();
 
 // 1) JWT + 权限展开（写入 attrs；不碰 user_data）
-try server.addMiddleware(http.jwtAuthFromCatalogWithPermissions(
+try server.addMiddleware(try http.jwtAuthFromCatalogWithPermissions(
     &app_sec.module,
     &catalog_slot,
-    // 简单应用：http.catalogLoaderFromTable(&table)
-    // 或：zigmodu.security.CatalogPermDb.loaderFromClient(&db)
+    // 简单应用：try http.catalogLoaderFromTable(&table)
+    // 或：try zigmodu.security.CatalogPermDb.loaderFromClient(&db)
     // 多主体：自定义 CatalogPermissionLoader（见下）
-    http.catalogLoaderFromTable(&role_perm_table),
+    try http.catalogLoaderFromTable(&role_perm_table),
     .{ .skip_prefixes = &.{ "api/health", "health", "dashboard", "openapi.json" } },
 ));
 // 2) 可选：写入 module attr
-try server.addMiddleware(http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
+try server.addMiddleware(try http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
 // 3) 门禁：RouteMeta.permission ⊆ permissions CSV
-try server.addMiddleware(http.permissionGateWith(&catalog_slot, .{ .mode = .rbac }));
+try server.addMiddleware(try http.permissionGateWith(&catalog_slot, .{ .mode = .rbac }));
 
 // … Router.mountAll …
 catalog_slot.set(try router.finish());

@@ -6,11 +6,11 @@
 //! Example:
 //!   server.addMiddleware(zigmodu.http_middleware.recover());
 //!   server.addMiddleware(zigmodu.http_middleware.requestId());
-//!   server.addMiddleware(zigmodu.http_middleware.cors(.{}));
-//!   server.addMiddleware(zigmodu.http_middleware.jwtAuth("my-secret"));
+//!   server.addMiddleware(try zigmodu.http_middleware.cors(.{}));
+//!   server.addMiddleware(try zigmodu.http_middleware.jwtAuth("my-secret"));
 //!   // Production (wall-clock exp): share a SecurityModule initialized with initWithIo
 //!   server.addMiddleware(zigmodu.http_middleware.jwtAuthWithSecurity(&sec));
-//!   server.addMiddleware(zigmodu.http_middleware.csrf());
+//!   server.addMiddleware(try zigmodu.http_middleware.csrf());
 //!
 //! STRUCTURE:
 //!   §1  Reject hooks & envelopes —— AuthRejectFn, defaultReject, problemReject, envelopeReject
@@ -131,8 +131,9 @@ pub const CorsConfig = struct {
     max_age: u32 = 86400,
 };
 
-/// CORS middleware — config stored at module scope to avoid heap allocation.
-pub fn cors(config: CorsConfig) api.Middleware {
+/// CORS middleware — per-instance config allocated once at setup
+/// (`error.OutOfMemory` when that allocation fails).
+pub fn cors(config: CorsConfig) error{OutOfMemory}!api.Middleware {
     // An empty allowlist rejects every cross-origin request — including the
     // preflight — with no other signal, which reads as "CORS is broken" during
     // integration. Default is `&.{"*"}` (allow all), so this only fires when a
@@ -143,7 +144,7 @@ pub fn cors(config: CorsConfig) api.Middleware {
     // Per-instance configuration on `user_data` (allocated once, process
     // lifetime): multiple Servers / registrations with different configs no
     // longer overwrite each other via module-level statics.
-    const cfg = std.heap.page_allocator.create(CorsConfig) catch @panic("cors middleware setup: out of memory");
+    const cfg = try std.heap.page_allocator.create(CorsConfig);
     cfg.* = config;
     return .{
         .func = struct {
@@ -295,8 +296,8 @@ pub fn recover() api.Middleware {
 /// construction is free. The expiry argument is irrelevant for verification (the
 /// token's own `exp` claim is checked) — it only matters for token GENERATION,
 /// so use `jwtAuthWithSecurity` / `AppSecurity` when you also issue tokens.
-pub fn jwtAuth(secret: []const u8) api.Middleware {
-    const secret_copy = std.heap.page_allocator.create([]const u8) catch @panic("jwtAuth setup: out of memory");
+pub fn jwtAuth(secret: []const u8) error{OutOfMemory}!api.Middleware {
+    const secret_copy = try std.heap.page_allocator.create([]const u8);
     secret_copy.* = secret;
     return .{
         .func = struct {
@@ -481,13 +482,13 @@ pub const JwtFromCatalogConfig = struct {
 
 /// JWT that skips when catalog marks the route `.public`, or path matches skip_prefixes.
 /// Fill `slot` with `slot.set(try router.finish())` after mounts.
-pub fn jwtAuthFromCatalog(security: *SecurityModule, slot: *comptime_router.CatalogSlot, config: JwtFromCatalogConfig) api.Middleware {
+pub fn jwtAuthFromCatalog(security: *SecurityModule, slot: *comptime_router.CatalogSlot, config: JwtFromCatalogConfig) error{OutOfMemory}!api.Middleware {
     const Store = struct {
         sec: *SecurityModule,
         catalog_slot: *comptime_router.CatalogSlot,
         cfg: JwtFromCatalogConfig,
     };
-    const stored = std.heap.page_allocator.create(Store) catch @panic("middleware setup: out of memory");
+    const stored = try std.heap.page_allocator.create(Store);
     stored.* = .{ .sec = security, .catalog_slot = slot, .cfg = config };
     return .{
         .func = struct {
@@ -523,14 +524,14 @@ pub fn jwtAuthFromCatalogWithPermissions(
     slot: *comptime_router.CatalogSlot,
     loader: CatalogPermissionLoader,
     config: JwtFromCatalogConfig,
-) api.Middleware {
+) error{OutOfMemory}!api.Middleware {
     const Store = struct {
         sec: *SecurityModule,
         catalog_slot: *comptime_router.CatalogSlot,
         cfg: JwtFromCatalogConfig,
         load: CatalogPermissionLoader,
     };
-    const stored = std.heap.page_allocator.create(Store) catch @panic("middleware setup: out of memory");
+    const stored = try std.heap.page_allocator.create(Store);
     stored.* = .{ .sec = security, .catalog_slot = slot, .cfg = config, .load = loader };
     return .{
         .func = struct {
@@ -564,7 +565,10 @@ pub fn jwtAuthFromCatalogWithPermissions(
 /// Each table gets its own loader: two loaders built from two tables read their
 /// own table and never each other's. See `max_table_loader_slots` for how that
 /// is possible for a bare function pointer.
-pub fn catalogLoaderFromTable(table: *const Rbac.RolePermissionTable) CatalogPermissionLoader {
+///
+/// Returns `error.SlotPoolExhausted` when the comptime-sized pool is full —
+/// raise `max_table_loader_slots`.
+pub fn catalogLoaderFromTable(table: *const Rbac.RolePermissionTable) error{SlotPoolExhausted}!CatalogPermissionLoader {
     const claimed = TableLoaderSlots.tables_claimed.load(.seq_cst);
     for (0..claimed) |i| {
         if (TableLoaderSlots.tables[i]) |existing| {
@@ -575,7 +579,7 @@ pub fn catalogLoaderFromTable(table: *const Rbac.RolePermissionTable) CatalogPer
     }
     const slot = TableLoaderSlots.tables_claimed.fetchAdd(1, .seq_cst);
     if (slot >= max_table_loader_slots) {
-        @panic("catalogLoaderFromTable: loader slot pool exhausted — raise max_table_loader_slots");
+        return error.SlotPoolExhausted;
     }
     TableLoaderSlots.tables[slot] = table;
     return table_loader_trampolines[slot];
@@ -599,7 +603,9 @@ pub fn catalogLoaderFromTable(table: *const Rbac.RolePermissionTable) CatalogPer
 /// the price of leaving that type — and every call site — alone.
 ///
 /// Slots are claimed at wiring time and never released, so this bounds how many
-/// loaders an application *builds*, not how many requests it serves.
+/// loaders an application *builds*, not how many requests it serves. Past the
+/// bound, `catalogLoaderFromTable` fails with `error.SlotPoolExhausted` —
+/// raise this constant if an application legitimately builds more.
 pub const max_table_loader_slots = 64;
 
 const TableLoaderSlots = struct {
@@ -710,13 +716,13 @@ fn noteVerifyFailure(ctx: *api.Context, err: anyerror) bool {
 /// skip-prefix) — the catalog is the sole bypass truth, no parallel path
 /// lists. On success sets identity attrs (`user_id` / `tenant_id` / `roles`)
 /// and the optional `permissions` CSV; pair with `permissionGateWith`.
-pub fn authFromCatalog(slot: *comptime_router.CatalogSlot, backend: AuthBackend, config: AuthFromCatalogConfig) api.Middleware {
+pub fn authFromCatalog(slot: *comptime_router.CatalogSlot, backend: AuthBackend, config: AuthFromCatalogConfig) error{OutOfMemory}!api.Middleware {
     const Store = struct {
         catalog_slot: *comptime_router.CatalogSlot,
         backend: AuthBackend,
         cfg: AuthFromCatalogConfig,
     };
-    const stored = std.heap.page_allocator.create(Store) catch @panic("middleware setup: out of memory");
+    const stored = try std.heap.page_allocator.create(Store);
     stored.* = .{ .catalog_slot = slot, .backend = backend, .cfg = config };
     return .{
         .func = struct {
@@ -917,8 +923,8 @@ pub const TenantResolverConfig = struct {
 /// query param into the `tenant_id` attr (M7). Register before handlers that
 /// call `ctx.tenantId()`; with JWT auth, register after it so `aud` wins
 /// unless `override_existing` is set.
-pub fn tenantResolver(config: TenantResolverConfig) api.Middleware {
-    const stored = std.heap.page_allocator.create(TenantResolverConfig) catch @panic("tenantResolver setup: out of memory");
+pub fn tenantResolver(config: TenantResolverConfig) error{OutOfMemory}!api.Middleware {
+    const stored = try std.heap.page_allocator.create(TenantResolverConfig);
     stored.* = config;
     return .{
         .func = struct {
@@ -978,12 +984,12 @@ pub const ModuleGateConfig = struct {
 };
 
 /// Resolves catalog module → ctx attr; optional allow-list / deny-unknown.
-pub fn moduleGate(slot: *comptime_router.CatalogSlot, config: ModuleGateConfig) api.Middleware {
+pub fn moduleGate(slot: *comptime_router.CatalogSlot, config: ModuleGateConfig) error{OutOfMemory}!api.Middleware {
     const Store = struct {
         catalog_slot: *comptime_router.CatalogSlot,
         cfg: ModuleGateConfig,
     };
-    const stored = std.heap.page_allocator.create(Store) catch @panic("middleware setup: out of memory");
+    const stored = try std.heap.page_allocator.create(Store);
     stored.* = .{ .catalog_slot = slot, .cfg = config };
     return .{
         .func = struct {
@@ -1090,11 +1096,11 @@ pub const PermissionGateConfig = struct {
 
 /// Enforces `RouteMeta.permission` (default mode = JWT roles, `|` = OR).
 /// Skips public routes and paths without a permission.
-pub fn permissionGate(slot: *comptime_router.CatalogSlot) api.Middleware {
+pub fn permissionGate(slot: *comptime_router.CatalogSlot) error{OutOfMemory}!api.Middleware {
     return permissionGateWith(slot, .{});
 }
 
-pub fn permissionGateWith(slot: *comptime_router.CatalogSlot, config: PermissionGateConfig) api.Middleware {
+pub fn permissionGateWith(slot: *comptime_router.CatalogSlot, config: PermissionGateConfig) error{OutOfMemory}!api.Middleware {
     const Store = struct {
         catalog_slot: *comptime_router.CatalogSlot,
         cfg: PermissionGateConfig,
@@ -1103,7 +1109,7 @@ pub fn permissionGateWith(slot: *comptime_router.CatalogSlot, config: Permission
     // second gate (another server, another catalog slot, another `.mode`) would
     // silently overwrite this one's slot and config. Same shape as
     // `jwtAuthFromCatalog*` / `authFromCatalog` / `tenantResolver` / `moduleGate`.
-    const stored = std.heap.page_allocator.create(Store) catch @panic("middleware setup: out of memory");
+    const stored = try std.heap.page_allocator.create(Store);
     stored.* = .{ .catalog_slot = slot, .cfg = config };
     return .{
         .func = struct {
@@ -1232,7 +1238,7 @@ fn constantTimeEql(a: []const u8, b: []const u8) bool {
 /// rewriting `Host` to an internal name — must now either preserve the public
 /// `Host` or pass `csrfWith(.{ .trust_forwarded_host = true })`; without one of
 /// those, state-changing browser requests are refused with `403`.
-pub fn csrf() api.Middleware {
+pub fn csrf() error{OutOfMemory}!api.Middleware {
     return csrfWith(.{});
 }
 
@@ -1283,7 +1289,7 @@ const CsrfStore = struct {
 
 /// CSRF middleware with explicit configuration. `csrf()` is exactly
 /// `csrfWith(.{})`, so the defaults are the conservative ones.
-pub fn csrfWith(config: CsrfConfig) api.Middleware {
+pub fn csrfWith(config: CsrfConfig) error{OutOfMemory}!api.Middleware {
     var resolved = config;
     if (resolved.sign_key) |key| {
         if (key.len == 0) {
@@ -1297,7 +1303,7 @@ pub fn csrfWith(config: CsrfConfig) api.Middleware {
     // Per-instance configuration on `user_data` (allocated once, process
     // lifetime), like `cors` / `securityHeaders`: two middleware registrations
     // with different configs must not share state.
-    const stored = std.heap.page_allocator.create(CsrfStore) catch @panic("csrf middleware setup: out of memory");
+    const stored = try std.heap.page_allocator.create(CsrfStore);
     stored.* = .{ .config = resolved };
     return .{
         .func = struct {
@@ -1596,11 +1602,11 @@ pub const defaultSecurityHeadersWithCsp = defaultSecurityHeaders ++ [_]SecurityH
 /// One store per call (like `cors` / `moduleGate`): a function-level `var` would
 /// be process-wide, so a second `securityHeaders(custom)` in the same process
 /// would silently retarget the first middleware's headers too.
-pub fn securityHeaders(headers: ?[]const SecurityHeader) api.Middleware {
+pub fn securityHeaders(headers: ?[]const SecurityHeader) error{OutOfMemory}!api.Middleware {
     const Store = struct {
         headers: []const SecurityHeader,
     };
-    const stored = std.heap.page_allocator.create(Store) catch @panic("securityHeaders setup: out of memory");
+    const stored = try std.heap.page_allocator.create(Store);
     stored.* = .{ .headers = headers orelse &.{} };
     return .{
         .func = struct {
@@ -1621,7 +1627,7 @@ pub fn securityHeaders(headers: ?[]const SecurityHeader) api.Middleware {
 
 test "csrf rejects state-changing requests without a matching token" {
     const allocator = std.testing.allocator;
-    const mw = csrf();
+    const mw = try csrf();
     var ctx = try api.Context.init(allocator, .POST, "/api/orders");
     defer ctx.deinit();
     try ctx.headers.put(try allocator.dupe(u8, "cookie"), try allocator.dupe(u8, "csrf_token=abc"));
@@ -1634,7 +1640,7 @@ test "csrf rejects state-changing requests without a matching token" {
 
 test "csrf allows matching double-submit tokens" {
     const allocator = std.testing.allocator;
-    const mw = csrf();
+    const mw = try csrf();
     var ctx = try api.Context.init(allocator, .POST, "/api/orders");
     defer ctx.deinit();
     try ctx.headers.put(try allocator.dupe(u8, "cookie"), try allocator.dupe(u8, "csrf_token=tok123"));
@@ -1664,7 +1670,7 @@ test "csrf rejects a cross-origin Origin even with a matching double-submit toke
         var reached: bool = false;
     };
     S.reached = false;
-    const mw = csrf();
+    const mw = try csrf();
     try mw.func(&ctx, struct {
         fn n(c: *api.Context) anyerror!void {
             _ = c;
@@ -1679,7 +1685,7 @@ test "csrf rejects a cross-origin Origin even with a matching double-submit toke
 
 test "csrf accepts same-origin Origin and leaves missing Origin/Referer alone" {
     const allocator = std.testing.allocator;
-    const mw = csrf();
+    const mw = try csrf();
     const next = struct {
         fn n(_: *api.Context) anyerror!void {}
     }.n;
@@ -1734,7 +1740,7 @@ test "csrf accepts same-origin Origin and leaves missing Origin/Referer alone" {
 
 test "csrf rejects Origin null, decoy userinfo and a cross-host Referer" {
     const allocator = std.testing.allocator;
-    const mw = csrf();
+    const mw = try csrf();
     const next = struct {
         fn n(_: *api.Context) anyerror!void {}
     }.n;
@@ -1771,7 +1777,7 @@ test "csrf rejects Origin null, decoy userinfo and a cross-host Referer" {
 test "csrf compares against X-Forwarded-Host and X-Forwarded-Proto behind a proxy" {
     const allocator = std.testing.allocator;
     // Only the explicit opt-in consults the forwarded headers.
-    const mw = csrfWith(.{ .trust_forwarded_host = true });
+    const mw = try csrfWith(.{ .trust_forwarded_host = true });
     const next = struct {
         fn n(_: *api.Context) anyerror!void {}
     }.n;
@@ -1823,8 +1829,8 @@ test "csrf ignores a forged X-Forwarded-Host unless the app opts in" {
     const next = struct {
         fn n(_: *api.Context) anyerror!void {}
     }.n;
-    const default_mw = csrf();
-    const trust_mw = csrfWith(.{ .trust_forwarded_host = true });
+    const default_mw = try csrf();
+    const trust_mw = try csrfWith(.{ .trust_forwarded_host = true });
 
     // The exploit the default has to stop: the browser addresses the real site
     // (`Host` is always set to the target, and page script cannot change it),
@@ -1926,7 +1932,7 @@ test "csrfMintSignedToken mints nonce.signature and validates the shape" {
 test "csrf with sign_key rejects tampered, unsigned and foreign-key tokens" {
     const allocator = std.testing.allocator;
     const key = "csrf-sign-key-1";
-    const mw = csrfWith(.{ .sign_key = key });
+    const mw = try csrfWith(.{ .sign_key = key });
 
     const S = struct {
         fn next(_: *api.Context) anyerror!void {}
@@ -1967,7 +1973,7 @@ test "csrf with sign_key rejects tampered, unsigned and foreign-key tokens" {
 
     // An empty key is a configuration error, not a silent empty-secret signer:
     // signing is dropped (with a warning) and the pair is plain double-submit.
-    const unsigned = csrfWith(.{ .sign_key = "" });
+    const unsigned = try csrfWith(.{ .sign_key = "" });
     try std.testing.expectEqual(@as(u16, 200), try S.attempt(unsigned, "tok123", "tok123"));
 }
 
@@ -1976,7 +1982,7 @@ test "csrf blocks a cross-origin POST through the dispatch path" {
     const Testkit = @import("../http/Testkit.zig");
     var server = api.Server.init(std.testing.io, allocator, 0);
     defer server.deinit();
-    try server.addMiddleware(csrf());
+    try server.addMiddleware(try csrf());
     var group = server.group("");
     try group.post("orders", struct {
         fn h(ctx: *api.Context) anyerror!void {
@@ -2016,7 +2022,7 @@ test "csrf signing holds through the dispatch path" {
 
     var server = api.Server.init(std.testing.io, allocator, 0);
     defer server.deinit();
-    try server.addMiddleware(csrfWith(.{ .sign_key = key }));
+    try server.addMiddleware(try csrfWith(.{ .sign_key = key }));
     var group = server.group("");
     try group.post("orders", struct {
         fn h(ctx: *api.Context) anyerror!void {
@@ -2060,7 +2066,7 @@ test "SecurityHeader: defaults carry no CSP, securityHeaders(null) adds one" {
 
     // The opt-in middleware, default policy → CSP present.
     {
-        const mw = securityHeaders(null);
+        const mw = try securityHeaders(null);
         var ctx = try api.Context.init(allocator, .GET, "/");
         defer ctx.deinit();
         try mw.func(&ctx, next, mw.user_data);
@@ -2070,7 +2076,7 @@ test "SecurityHeader: defaults carry no CSP, securityHeaders(null) adds one" {
     // A caller-supplied slice replaces the whole set (CSP included, if wanted).
     {
         const custom = [_]SecurityHeader{.{ .name = "X-Policy-A", .value = "a" }};
-        const mw = securityHeaders(&custom);
+        const mw = try securityHeaders(&custom);
         var ctx = try api.Context.init(allocator, .GET, "/");
         defer ctx.deinit();
         try mw.func(&ctx, next, mw.user_data);
@@ -2081,7 +2087,7 @@ test "SecurityHeader: defaults carry no CSP, securityHeaders(null) adds one" {
 
 test "securityHeaders injects defaults and calls through" {
     const allocator = std.testing.allocator;
-    const mw = securityHeaders(null);
+    const mw = try securityHeaders(null);
     var ctx = try api.Context.init(allocator, .GET, "/");
     defer ctx.deinit();
     const State = struct {
@@ -2101,8 +2107,8 @@ test "each securityHeaders instance keeps its own headers" {
     const allocator = std.testing.allocator;
     const custom_a = [_]SecurityHeader{.{ .name = "X-Policy-A", .value = "a" }};
     const custom_b = [_]SecurityHeader{.{ .name = "X-Policy-B", .value = "b" }};
-    const mw_a = securityHeaders(&custom_a);
-    const mw_b = securityHeaders(&custom_b);
+    const mw_a = try securityHeaders(&custom_a);
+    const mw_b = try securityHeaders(&custom_b);
     const next = struct {
         fn n(_: *api.Context) anyerror!void {}
     }.n;
@@ -2125,7 +2131,7 @@ test "cors middleware sets headers" {
     defer ctx.deinit();
 
     const cfg = CorsConfig{};
-    const mw = cors(cfg);
+    const mw = try cors(cfg);
     const next = struct {
         fn n(c: *api.Context) anyerror!void {
             _ = c;
@@ -2145,7 +2151,7 @@ test "cors matches Origin case-insensitively (lowercased request headers)" {
     // `Origin:` header arrives with key "origin".
     try ctx.headers.put(try allocator.dupe(u8, "origin"), try allocator.dupe(u8, "https://app.example.com"));
 
-    const mw = cors(.{ .allow_origins = &.{"https://app.example.com"} });
+    const mw = try cors(.{ .allow_origins = &.{"https://app.example.com"} });
     const next = struct {
         fn n(c: *api.Context) anyerror!void {
             _ = c;
@@ -2163,7 +2169,7 @@ test "cors rejects origins outside the allow-list with 403" {
     defer ctx.deinit();
     try ctx.headers.put(try allocator.dupe(u8, "origin"), try allocator.dupe(u8, "https://evil.example.com"));
 
-    const mw = cors(.{ .allow_origins = &.{"https://app.example.com"} });
+    const mw = try cors(.{ .allow_origins = &.{"https://app.example.com"} });
     const next = struct {
         fn n(c: *api.Context) anyerror!void {
             _ = c;
@@ -2186,8 +2192,8 @@ test "cors instances with different configs stay isolated (no static overwrite)"
     // Register the first instance, then a second with a different whitelist.
     // With the old module-level static storage, mw_b would overwrite mw_a's
     // config and a.example.com would be rejected.
-    const mw_a = cors(.{ .allow_origins = &.{"https://a.example.com"} });
-    const mw_b = cors(.{ .allow_origins = &.{"https://b.example.com"} });
+    const mw_a = try cors(.{ .allow_origins = &.{"https://a.example.com"} });
+    const mw_b = try cors(.{ .allow_origins = &.{"https://b.example.com"} });
 
     var ctx_a = try api.Context.init(allocator, .GET, "/api/v1/users");
     defer ctx_a.deinit();
@@ -2243,7 +2249,7 @@ test "jwtAuth middleware rejects missing authorization" {
     var ctx = try api.Context.init(allocator, .GET, "/test");
     defer ctx.deinit();
 
-    const mw = jwtAuth("secret");
+    const mw = try jwtAuth("secret");
     const next = struct {
         fn n(c: *api.Context) anyerror!void {
             _ = c;
@@ -2285,7 +2291,7 @@ test "jwtAuth middleware accepts valid token" {
         var reached: bool = false;
     };
     S.reached = false;
-    const mw = jwtAuth("secret");
+    const mw = try jwtAuth("secret");
     const next = struct {
         fn n(c: *api.Context) anyerror!void {
             _ = c;
@@ -2312,7 +2318,7 @@ test "jwtAuth middleware rejects tampered token" {
     defer ctx.deinit();
     try putBearerAuth(&ctx, tampered);
 
-    const mw = jwtAuth("secret");
+    const mw = try jwtAuth("secret");
     const next = struct {
         fn n(c: *api.Context) anyerror!void {
             _ = c;
@@ -2334,7 +2340,7 @@ test "jwtAuth middleware rejects expired token" {
     defer ctx.deinit();
     try putBearerAuth(&ctx, token);
 
-    const mw = jwtAuth("secret");
+    const mw = try jwtAuth("secret");
     const next = struct {
         fn n(c: *api.Context) anyerror!void {
             _ = c;
@@ -2375,7 +2381,7 @@ test "csrf middleware rejects POST without matching token" {
     var ctx = try api.Context.init(allocator, .POST, "/test");
     defer ctx.deinit();
 
-    const mw = csrf();
+    const mw = try csrf();
     const next = struct {
         fn n(c: *api.Context) anyerror!void {
             _ = c;
@@ -2398,7 +2404,7 @@ test "csrf middleware accepts POST with double-submit token" {
         var reached: bool = false;
     };
     S.reached = false;
-    const mw = csrf();
+    const mw = try csrf();
     const next = struct {
         fn n(c: *api.Context) anyerror!void {
             _ = c;
@@ -2420,7 +2426,7 @@ test "csrf middleware allows GET without token" {
         var reached: bool = false;
     };
     S.reached = false;
-    const mw = csrf();
+    const mw = try csrf();
     const next = struct {
         fn n(c: *api.Context) anyerror!void {
             _ = c;
@@ -2446,7 +2452,7 @@ test "jwtAuthFromCatalog skips public and skip_prefixes" {
     slot.set(.{ .allocator = alloc, .entries = entries });
 
     var sec = SecurityModule.init(alloc, "test-secret", 3600);
-    const mw = jwtAuthFromCatalog(&sec, &slot, .{});
+    const mw = try jwtAuthFromCatalog(&sec, &slot, .{});
     const next = struct {
         fn n(_: *api.Context) anyerror!void {}
     }.n;
@@ -2480,7 +2486,7 @@ test "moduleGate sets attr and can deny unknown" {
     defer slot.deinit();
     slot.set(.{ .allocator = alloc, .entries = entries });
 
-    const mw = moduleGate(&slot, .{ .unknown = .deny });
+    const mw = try moduleGate(&slot, .{ .unknown = .deny });
     const next = struct {
         fn n(_: *api.Context) anyerror!void {}
     }.n;
@@ -2510,7 +2516,7 @@ test "permissionGate requires role matching RouteMeta.permission" {
     defer slot.deinit();
     slot.set(.{ .allocator = alloc, .entries = entries });
 
-    const mw = permissionGate(&slot);
+    const mw = try permissionGate(&slot);
     const next = struct {
         fn n(_: *api.Context) anyerror!void {}
     }.n;
@@ -2549,7 +2555,7 @@ test "permissionGate accepts any OR alternative" {
     defer slot.deinit();
     slot.set(.{ .allocator = alloc, .entries = entries });
 
-    const mw = permissionGate(&slot);
+    const mw = try permissionGate(&slot);
     const next = struct {
         fn n(_: *api.Context) anyerror!void {}
     }.n;
@@ -2589,8 +2595,8 @@ test "each permissionGateWith keeps its own catalog slot and config" {
     defer slot_b.deinit();
     slot_b.set(.{ .allocator = alloc, .entries = entries_b });
 
-    const mw_a = permissionGateWith(&slot_a, .{});
-    const mw_b = permissionGateWith(&slot_b, .{ .deny_by_default = true });
+    const mw_a = try permissionGateWith(&slot_a, .{});
+    const mw_b = try permissionGateWith(&slot_b, .{ .deny_by_default = true });
     const S = struct {
         var reached = false;
         fn n(_: *api.Context) anyerror!void {
@@ -2708,10 +2714,10 @@ test "one process, two servers: each gate enforces its own catalog" {
 
     // Production order: middleware first (a route's chain is snapshotted at
     // registration), then routes, then the catalog slot is filled.
-    try shop_srv.addMiddleware(jwtAuthFromCatalogWithPermissions(&sec, &shop_slot, load, .{}));
-    try shop_srv.addMiddleware(permissionGateWith(&shop_slot, .{ .mode = .rbac }));
-    try admin_srv.addMiddleware(jwtAuthFromCatalogWithPermissions(&sec, &admin_slot, load, .{}));
-    try admin_srv.addMiddleware(permissionGateWith(&admin_slot, .{ .mode = .rbac }));
+    try shop_srv.addMiddleware(try jwtAuthFromCatalogWithPermissions(&sec, &shop_slot, load, .{}));
+    try shop_srv.addMiddleware(try permissionGateWith(&shop_slot, .{ .mode = .rbac }));
+    try admin_srv.addMiddleware(try jwtAuthFromCatalogWithPermissions(&sec, &admin_slot, load, .{}));
+    try admin_srv.addMiddleware(try permissionGateWith(&admin_slot, .{ .mode = .rbac }));
 
     var shop_state: ShopState = .{};
     var shop_mod: ShopApi = .{};
@@ -2869,10 +2875,10 @@ test "one process, two servers: each loader table feeds only its own app" {
     var slot_b: cr.CatalogSlot = .{};
     defer slot_b.deinit();
 
-    try srv_a.addMiddleware(jwtAuthFromCatalogWithPermissions(&sec, &slot_a, catalogLoaderFromTable(&table_a), .{}));
-    try srv_a.addMiddleware(permissionGateWith(&slot_a, .{ .mode = .rbac }));
-    try srv_b.addMiddleware(jwtAuthFromCatalogWithPermissions(&sec, &slot_b, catalogLoaderFromTable(&table_b), .{}));
-    try srv_b.addMiddleware(permissionGateWith(&slot_b, .{ .mode = .rbac }));
+    try srv_a.addMiddleware(try jwtAuthFromCatalogWithPermissions(&sec, &slot_a, try catalogLoaderFromTable(&table_a), .{}));
+    try srv_a.addMiddleware(try permissionGateWith(&slot_a, .{ .mode = .rbac }));
+    try srv_b.addMiddleware(try jwtAuthFromCatalogWithPermissions(&sec, &slot_b, try catalogLoaderFromTable(&table_b), .{}));
+    try srv_b.addMiddleware(try permissionGateWith(&slot_b, .{ .mode = .rbac }));
 
     var state_a: AppState = .{};
     var mod_a: ReportApi = .{};
@@ -2931,7 +2937,7 @@ test "permissionGateWith fails closed before the catalog is ready" {
     var slot: comptime_router.CatalogSlot = .{}; // never `.set()` — startup window / unwired server
     defer slot.deinit();
 
-    const mw = permissionGateWith(&slot, .{});
+    const mw = try permissionGateWith(&slot, .{});
     const S = struct {
         var reached = false;
         fn n(_: *api.Context) anyerror!void {
@@ -2966,7 +2972,7 @@ test "permissionGate rbac mode uses permissions attr not roles" {
     defer slot.deinit();
     slot.set(.{ .allocator = alloc, .entries = entries });
 
-    const mw = permissionGateWith(&slot, .{ .mode = .rbac });
+    const mw = try permissionGateWith(&slot, .{ .mode = .rbac });
     const next = struct {
         fn n(_: *api.Context) anyerror!void {}
     }.n;
@@ -3008,7 +3014,7 @@ test "jwtAuthFromCatalogWithPermissions loads permission CSV" {
     const token = try sec.generateTokenWithTenant("u1", &.{"admin"}, "42");
     defer alloc.free(token);
 
-    const mw = jwtAuthFromCatalogWithPermissions(&sec, &slot, catalogLoaderFromTable(&table), .{});
+    const mw = try jwtAuthFromCatalogWithPermissions(&sec, &slot, try catalogLoaderFromTable(&table), .{});
     const next = struct {
         fn n(_: *api.Context) anyerror!void {}
     }.n;
@@ -3059,7 +3065,7 @@ test "CatalogPermissionLoader receives sub and aud" {
     const token = try sec.generateTokenWithTenant("99", &.{"shop"}, "1001");
     defer alloc.free(token);
 
-    const mw = jwtAuthFromCatalogWithPermissions(&sec, &slot, S.load, .{});
+    const mw = try jwtAuthFromCatalogWithPermissions(&sec, &slot, S.load, .{});
     const next = struct {
         fn n(_: *api.Context) anyerror!void {}
     }.n;
@@ -3102,7 +3108,7 @@ test "authFromCatalog wraps a custom backend; catalog is sole bypass truth" {
             }
         }.verify,
     };
-    const mw = authFromCatalog(&slot, backend, .{ .reject = envelopeReject(.thinkphp) });
+    const mw = try authFromCatalog(&slot, backend, .{ .reject = envelopeReject(.thinkphp) });
     const next = struct {
         fn n(_: *api.Context) anyerror!void {}
     }.n;
@@ -3143,7 +3149,7 @@ test "authFromCatalog with jwtBackend verifies real tokens" {
     const token = try sec.generateTokenWithTenant("42", &.{"admin"}, "tenant-a");
     defer alloc.free(token);
 
-    const mw = authFromCatalog(&slot, jwtBackend(&sec), .{});
+    const mw = try authFromCatalog(&slot, jwtBackend(&sec), .{});
     const next = struct {
         fn n(_: *api.Context) anyerror!void {}
     }.n;
@@ -3168,7 +3174,7 @@ test "tenantResolver resolves header/query and respects existing attr" {
         fn n(_: *api.Context) anyerror!void {}
     }.n;
 
-    const mw = tenantResolver(.{});
+    const mw = try tenantResolver(.{});
     var ctx = try api.Context.init(alloc, .POST, "/api/orders");
     defer ctx.deinit();
     try ctx.headers.put(try alloc.dupe(u8, "appid"), try alloc.dupe(u8, "shop-9"));
@@ -3184,7 +3190,7 @@ test "tenantResolver resolves header/query and respects existing attr" {
     try std.testing.expectEqualStrings("jwt-tenant", ctx2.tenantId().?);
 
     // require → 400 when unresolved
-    const mw_req = tenantResolver(.{ .require = true });
+    const mw_req = try tenantResolver(.{ .require = true });
     var ctx3 = try api.Context.init(alloc, .POST, "/api/orders");
     defer ctx3.deinit();
     try mw_req.func(&ctx3, next, mw_req.user_data);
@@ -3221,7 +3227,7 @@ test "permissionGate enforces RouteMeta.roles before permission" {
     defer slot.deinit();
     slot.set(.{ .allocator = alloc, .entries = entries });
 
-    const mw = permissionGateWith(&slot, .{ .reject = envelopeReject(.thinkphp) });
+    const mw = try permissionGateWith(&slot, .{ .reject = envelopeReject(.thinkphp) });
     const next = struct {
         fn n(_: *api.Context) anyerror!void {}
     }.n;
@@ -3278,7 +3284,7 @@ test "Auth.optional: identity when a token is valid, no 401 otherwise" {
 
     // Ordering matters (and the framework says so): middleware added *after*
     // routes are registered is not part of those routes' chain snapshot.
-    try server.addMiddleware(jwtAuthFromCatalog(&sec, &slot, .{}));
+    try server.addMiddleware(try jwtAuthFromCatalog(&sec, &slot, .{}));
 
     var router = cr.Router(AppState).init(std.testing.io, allocator, &server, &app_state);
     defer router.deinit();
@@ -3390,7 +3396,7 @@ test "jwtBackend reports an unknown kid as a server error, not as an anonymous r
     var slot: comptime_router.CatalogSlot = .{};
     defer slot.deinit();
     slot.set(.{ .allocator = allocator, .entries = entries });
-    const mw = authFromCatalog(&slot, backend, .{});
+    const mw = try authFromCatalog(&slot, backend, .{});
     const next = struct {
         fn n(_: *api.Context) anyerror!void {}
     }.n;
@@ -3403,7 +3409,7 @@ test "jwtBackend reports an unknown kid as a server error, not as an anonymous r
 
     // Same answer on the legacy catalog path (`jwtAuthFromCatalog`), which runs
     // its own verify pass.
-    const legacy = jwtAuthFromCatalog(&sec, &slot, .{});
+    const legacy = try jwtAuthFromCatalog(&sec, &slot, .{});
     var legacy_ctx = try api.Context.init(allocator, .GET, "/api/me");
     defer legacy_ctx.deinit();
     try putBearerAuth(&legacy_ctx, token);
@@ -3469,7 +3475,7 @@ test "jwtBackend verification allocation failure surfaces as an error, never as 
     // one above would let this call through.
     var failing_again = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
     var sec_again = SecurityModule.init(failing_again.allocator(), secret, 3600);
-    const mw = authFromCatalog(&slot, jwtBackend(&sec_again), .{});
+    const mw = try authFromCatalog(&slot, jwtBackend(&sec_again), .{});
     var stack_ctx = try api.Context.init(allocator, .GET, "/api/me");
     defer stack_ctx.deinit();
     try putBearerAuth(&stack_ctx, token);

@@ -160,10 +160,10 @@ const Stack = struct {
         // Every middleware must be registered before the mounts below:
         // `addRoute` snapshots the global chain at registration time.
         try self.server.addMiddleware(http.tracingMiddleware());
-        try self.server.addMiddleware(middleware.jwtAuthMiddleware(&self.sec.module, &self.slot, &self.db));
+        try self.server.addMiddleware(try middleware.jwtAuthMiddleware(&self.sec.module, &self.slot, &self.db));
         try self.server.addMiddleware(middleware.tenantMiddleware());
-        try self.server.addMiddleware(middleware.moduleGateMiddleware(&self.slot));
-        try self.server.addMiddleware(middleware.permissionGateMiddleware(&self.slot));
+        try self.server.addMiddleware(try middleware.moduleGateMiddleware(&self.slot));
+        try self.server.addMiddleware(try middleware.permissionGateMiddleware(&self.slot));
         try self.server.addMiddleware(middleware.dataPermissionMiddleware());
 
         comptime http.assertNoDupes(.{ TenantApiT, UserApiT });

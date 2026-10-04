@@ -57,7 +57,7 @@ test "moduleGate(unknown = .deny) denies outside the catalog but honors skip_pre
     defer slot.deinit();
     slot.set(try router.finish());
 
-    const gate = mw.moduleGate(&slot, .{ .unknown = .deny });
+    const gate = try mw.moduleGate(&slot, .{ .unknown = .deny });
 
     // 1) Known catalog route → module attr set, chain continues.
     {
@@ -93,7 +93,7 @@ test "tenantResolver: JWT aud wins by default, header wins with override_existin
         defer ctx.deinit();
         try ctx.setAttr("tenant_id", "from-jwt");
         try ctx.headers.put(try allocator.dupe(u8, "appid"), try allocator.dupe(u8, "from-header"));
-        try runMiddleware(allocator, mw.tenantResolver(.{}), &ctx);
+        try runMiddleware(allocator, try mw.tenantResolver(.{}), &ctx);
         try std.testing.expectEqualStrings("from-jwt", ctx.tenantId().?);
     }
     // override_existing = true: the transport value is the explicit override.
@@ -102,7 +102,7 @@ test "tenantResolver: JWT aud wins by default, header wins with override_existin
         defer ctx.deinit();
         try ctx.setAttr("tenant_id", "from-jwt");
         try ctx.headers.put(try allocator.dupe(u8, "appid"), try allocator.dupe(u8, "from-header"));
-        try runMiddleware(allocator, mw.tenantResolver(.{ .override_existing = true }), &ctx);
+        try runMiddleware(allocator, try mw.tenantResolver(.{ .override_existing = true }), &ctx);
         try std.testing.expectEqualStrings("from-header", ctx.tenantId().?);
     }
     // No JWT and no header, `require = true` → rejected instead of proceeding
@@ -110,7 +110,7 @@ test "tenantResolver: JWT aud wins by default, header wins with override_existin
     {
         var ctx = try api.Context.init(allocator, .GET, "/x");
         defer ctx.deinit();
-        try runMiddleware(allocator, mw.tenantResolver(.{ .require = true }), &ctx);
+        try runMiddleware(allocator, try mw.tenantResolver(.{ .require = true }), &ctx);
         try std.testing.expect(ctx.responded);
     }
     // Query fallback still works when no header is present.
@@ -118,7 +118,7 @@ test "tenantResolver: JWT aud wins by default, header wins with override_existin
         var ctx = try api.Context.init(allocator, .GET, "/x");
         defer ctx.deinit();
         try ctx.query.put("app_id", "from-query");
-        try runMiddleware(allocator, mw.tenantResolver(.{}), &ctx);
+        try runMiddleware(allocator, try mw.tenantResolver(.{}), &ctx);
         try std.testing.expectEqualStrings("from-query", ctx.tenantId().?);
     }
 }

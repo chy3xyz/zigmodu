@@ -46,7 +46,7 @@ pub fn jwtAuthMiddleware(sec: *zigmodu.security.SecurityModule, _: *http.Catalog
 }
 
 /// ModuleGate: injects `module` attr from catalog.
-pub fn moduleGateMiddleware(slot: *http.CatalogSlot) http.Middleware {
+pub fn moduleGateMiddleware(slot: *http.CatalogSlot) !http.Middleware {
     return http.moduleGate(slot, .{ .unknown = .allow });
 }
 
