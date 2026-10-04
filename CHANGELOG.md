@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### 第 130 批：JWT base64url 手写编解码退役，换 std `url_safe_no_pad`（**破坏性：是**——带 `=` padding 的 JWT 段从此被拒）
+
+1. **缘起**：0.17 盘点发现 `SecurityModule.zig` 仍在手写 base64url：编码先按
+   标准字母表编再逐字节替换 `+/-`、`/ _` 并 `realloc` 去 padding；解码手工补
+   `=` 再反向替换。std 的 `url_safe_no_pad` 一步到位，且仓库内已有 3 处先例
+   （`Middleware.zig`、`Server.zig` ×2、`Http2Server.zig`）。
+2. **修法**：`base64UrlEncode`/`base64UrlDecode` 整体替换为
+   `std.base64.url_safe_no_pad` 的 Encoder/Decoder——编码从「alloc+替换+
+   realloc」三步变一次 alloc；解码从「补 padding+替换+标准 decode」变直接
+   decode。所有失败统一映射 `error.InvalidEncoding`（旧实现会把 std decode 的
+   `InvalidPadding`/`InvalidCharacter` 原样漏进 `verifyToken` 的推导错误集；
+   `AuthMiddleware.zig` 与 `api/Middleware.zig` 两处 401 归类 switch 同步删掉
+   这两个死 case，InvalidEncoding 原本就在 401 组）。**行为变化**：带 `=` 的
+   JWT 段旧实现容忍、新实现拒绝——RFC 7515 本就无 padding，更严且更正确；
+   上一轮修的「decode 失败泄漏」errdefer 语义保留（zweq 下游的泄漏豁免可随
+   本版彻底退役）。
+3. **回归测试**：新增「base64url decode rejects padded input」钉死严格化
+   行为；原泄漏回归对（standard/url 各一）保持；Security 29 + base64 5 +
+   jwt 16 全绿。
+4. **门禁读数**：fmt 净 · check-production OK · check-test-collection
+   2144→2145（+1 新测试）· 全量测试 exit=0。
+
 ### 第 129 批：Zig 0.17 特性化清理 —— CRC shim 退役、Dashboard 版本接 build_options、陈旧版本注释清扫（**破坏性：否**）
 
 1. **缘起**：0.17.0 stable 适配（第 127 批）后的系统性盘点——对照 stable std

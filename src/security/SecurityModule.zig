@@ -473,55 +473,24 @@ fn timingSafeSliceEql(a: []const u8, b: []const u8) bool {
     return @as(bool, @bitCast(@as(u1, @truncate((extended -% 1) >> s))));
 }
 
-/// Base64 URL encoding (JWT alphabet: `-`/`_` instead of `+`/`/`, padding stripped)
+/// Base64 URL encoding per RFC 7515 (JWT alphabet `-`/`_`, no padding).
 fn base64UrlEncode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
-    const encoder = std.base64.Base64Encoder.init(std.base64.standard_alphabet_chars, '=');
-    const encoded = try allocator.alloc(u8, encoder.calcSize(data.len));
-    // The shrink below is a second allocation point: if it fails, `encoded` is
-    // still live and nobody else can free it — same class as the `errdefer` in
-    // `base64UrlDecode`, and the same way of not leaking.
-    errdefer allocator.free(encoded);
-    _ = encoder.encode(encoded, data);
-
-    // Replace + with -, / with _, remove =
-    for (encoded) |*c| {
-        if (c.* == '+') c.* = '-';
-        if (c.* == '/') c.* = '_';
-    }
-
-    // Remove padding
-    var len = encoded.len;
-    while (len > 0 and encoded[len - 1] == '=') {
-        len -= 1;
-    }
-
-    return try allocator.realloc(encoded, len);
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    const out = try allocator.alloc(u8, enc.calcSize(data.len));
+    _ = enc.encode(out, data);
+    return out;
 }
 
-/// Base64 URL decoding (restores padding and maps `-`/`_` back to `+`/`/`)
+/// Base64 URL decoding per RFC 7515. Padding is *rejected* — JWT segments never
+/// carry `=`; input that the old hand-rolled version tolerated now fails with
+/// `error.InvalidEncoding` (stricter, and RFC-correct).
 fn base64UrlDecode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
-    // Restore padding
-    const padding_needed = (4 - (data.len % 4)) % 4;
-    const padded_data = try allocator.alloc(u8, data.len + padding_needed);
-    defer allocator.free(padded_data);
-
-    @memcpy(padded_data[0..data.len], data);
-    for (padded_data[data.len..]) |*c| {
-        c.* = '=';
-    }
-
-    // Replace - with +, _ with /
-    for (padded_data) |*c| {
-        if (c.* == '-') c.* = '+';
-        if (c.* == '_') c.* = '/';
-    }
-
-    const decoder = std.base64.Base64Decoder.init(std.base64.standard_alphabet_chars, '=');
-    const decoded = try allocator.alloc(u8, decoder.calcSizeForSlice(padded_data) catch return error.InvalidEncoding);
-    errdefer allocator.free(decoded);
-    try decoder.decode(decoded, padded_data);
-
-    return decoded;
+    const dec = std.base64.url_safe_no_pad.Decoder;
+    const out = try allocator.alloc(u8, dec.calcSizeForSlice(data) catch return error.InvalidEncoding);
+    // A failed decode must not leak its buffer — see the test pair below.
+    errdefer allocator.free(out);
+    dec.decode(out, data) catch return error.InvalidEncoding;
+    return out;
 }
 
 // A failed `decode` must not leak its buffer. `calcSizeForSlice` accepts this
@@ -546,10 +515,19 @@ test "a base64 decode failure frees its buffer (standard)" {
 
 test "a base64 url decode failure frees its buffer" {
     const allocator = std.testing.allocator;
-    // The URL variant pads and rewrites in place, so it needs a mutable buffer.
-    var buf: [16]u8 = undefined;
-    @memcpy(buf[0..4], "AA*A");
-    const result = base64UrlDecode(allocator, buf[0..4]);
+    const result = base64UrlDecode(allocator, "AA*A");
+    if (result) |decoded| {
+        allocator.free(decoded);
+        return error.ExpectedDecodeFailure;
+    } else |_| {}
+}
+
+test "base64url decode rejects padded input (RFC 7515 segments never carry `=`)" {
+    const allocator = std.testing.allocator;
+    // "QQ==" decoded fine under the hand-rolled decoder (it restored padding
+    // before validating). The std `url_safe_no_pad` decoder refuses: padding
+    // in a JWT segment is a malformed token, not a style choice.
+    const result = base64UrlDecode(allocator, "QQ==");
     if (result) |decoded| {
         allocator.free(decoded);
         return error.ExpectedDecodeFailure;

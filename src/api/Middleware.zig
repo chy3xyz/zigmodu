@@ -683,14 +683,13 @@ fn noteVerifyFailure(ctx: *api.Context, err: anyerror) bool {
     switch (err) {
         // `verifyToken`: bad shape, bad signature, expired, unsupported `alg`,
         // plus the base64 failures its header/payload decode can hand back for a
-        // token the client made up.
+        // token the client made up (since batch 130 the `url_safe_no_pad`
+        // decoder collapses every decode failure to `InvalidEncoding`).
         error.InvalidToken,
         error.InvalidSignature,
         error.TokenExpired,
         error.UnsupportedAlgorithm,
         error.InvalidEncoding,
-        error.InvalidPadding,
-        error.InvalidCharacter,
         => {
             std.log.debug("[auth] {s} {s}: token ignored ({s})", .{ ctx.method.toString(), ctx.path, @errorName(err) });
             return false;

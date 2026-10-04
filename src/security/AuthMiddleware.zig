@@ -118,9 +118,10 @@ fn runJwtAuth(
             // payload segment is decoded after it, so this name also covers a
             // corrupt token we signed ourselves. The error set cannot tell the
             // two apart at this layer, and both mean "unusable credential".
+            // (Since batch 130 the decoder is `url_safe_no_pad` and every
+            // decode failure — bad char, padding, length — collapses to
+            // `InvalidEncoding`.)
             error.InvalidEncoding,
-            error.InvalidPadding,
-            error.InvalidCharacter,
             => try ctx.sendErrorResponse(401, 401, "Invalid or expired token"),
             // Our side: the module's allocator refused (OutOfMemory), a decode
             // ran out of destination space, or a payload we signed failed to
