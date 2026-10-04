@@ -351,3 +351,47 @@ test "textFields bridge feeds the loose struct binder" {
     try testing.expectEqualStrings("Zhang San", map.get("full_name").?);
     try testing.expectEqual(@as(usize, 2), map.count()); // file part excluded
 }
+
+// ── Fuzz: the body parser only errors or succeeds ──────────────────────────
+//
+// `parse` consumes the whole body of an upload request: any outcome — a Form
+// or a refusal — is a pass; a crash, an out-of-bounds read or a leak is not.
+// The boundary is a fixed constant so the mutator starts next to real framing
+// instead of having to guess a token. The limits are sized to the harness
+// buffer (not the 8 MB defaults) so the size-refusal paths are in reach of a
+// 4 KiB input, and the testing allocator is what turns a missed free inside
+// `parse` into a failed replay.
+
+fn fuzzMultipartBody(_: void, smith: *std.testing.Smith) !void {
+    var body: [4096]u8 = undefined;
+    smith.bytes(&body);
+
+    var form = parse(std.testing.allocator, &body, "multipart/form-data; boundary=ZmFzZBoundary", .{
+        .max_parts = 8,
+        .max_part_bytes = 1024,
+        .max_total_bytes = 2048,
+    }) catch return;
+    form.deinit();
+}
+
+test "fuzz: multipart body parser only errors or succeeds on arbitrary bytes" {
+    const corpus = [_][]const u8{
+        // A well-formed single text part.
+        "--ZmFzZBoundary\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nhello\r\n--ZmFzZBoundary--\r\n",
+        // A mixed form: text part + file part with a binary payload.
+        "--ZmFzZBoundary\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n--ZmFzZBoundary\r\nContent-Disposition: form-data; name=\"f\"; filename=\"a.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n\x00\x01\x02\r\n--ZmFzZBoundary--\r\n",
+        // Bare-LF framing, which `parse` tolerates.
+        "--ZmFzZBoundary\nContent-Disposition: form-data; name=\"a\"\n\n1\n--ZmFzZBoundary--\n",
+        // No closing delimiter.
+        "--ZmFzZBoundary\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n",
+        // Boundary-shaped text inside a payload.
+        "--ZmFzZBoundary\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n--ZmFzZBoundary-not-a-delimiter\r\n--ZmFzZBoundary--\r\n",
+        // A part without Content-Disposition is malformed, not dropped.
+        "--ZmFzZBoundary\r\nContent-Type: text/plain\r\n\r\nx\r\n--ZmFzZBoundary--\r\n",
+        // A header line far longer than the part budget is framed for.
+        "--ZmFzZBoundary\r\nContent-Disposition: form-data; name=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\r\n\r\nx\r\n--ZmFzZBoundary--\r\n",
+        "",
+        "\xff\xfe\xfd\xfc\xfb\xfa",
+    };
+    try std.testing.fuzz({}, fuzzMultipartBody, .{ .corpus = &corpus });
+}

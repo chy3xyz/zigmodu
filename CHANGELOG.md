@@ -2,6 +2,40 @@
 
 ## [Unreleased]
 
+### 第 131 批：fuzz 面扩展第一波 —— HPACK 块解码 / H2 帧编解码 / ws_uring 帧解析 / multipart 体解析（**破坏性：否**）
+
+1. **缘起**：0.17 特性化盘点里 `std.testing.fuzz`（Smith 语料变异）是性价比最高的
+   品质工具；此前全树只有 3 个 fuzz 根（`Server.zig` 请求行/头解析、
+   `RaftTransport.zig`、`DistributedEventBus.zig`），而网络字节进框架的前几道
+   关口还有四个解析器没有覆盖。
+2. **修法**：新增 4 个 fuzz 根，统一契约「任意字节只许 error 或成功，不许崩溃 /
+   越界 / 泄漏」，语料 = 合法形状（真实编码器构造）+ 拒绝形状 + 非协议字节：
+   - `src/http/Hpack.zig`（`fuzzHpackBlock`，语料 13）：H2 对端 HEADERS 载荷的
+     落点 `Decoder.decode`；含 RFC 7541 C.3.1/C.4.1 样例、动态表尺寸越限
+     （4097）、Huffman 超长 padding、未知动态索引、截断。每次输入一个新解码器
+     ——失败后的表状态本就未定义，要测的是字节自己建出来的状态。
+   - `src/http/Http2.zig`（`fuzzHttp2Frame`，语料 14）：preface 之后每个字节的
+     落点 `decodeFrame`；成功成帧后再喂 payload 级解析（`stripPadding` /
+     `decodePriority` / `decodeSettings`，唯一的分配当场释放以保住泄漏检测）。
+     十种帧型各一 + PADDED DATA + 截断头 + stream 0 的 DATA。
+   - `src/im/ws_uring.zig`（`fuzzParseFrame`，语料 13）：io_uring 路径 WS 连接的
+     首道解析；`parseFrame` 平台无关（Linux-only 的是 ring），macOS 直接可跑。
+     含 16/64 位扩展长度、三个控制 opcode、RSV 置位、未注册 opcode、未掩码帧、
+     `maxInt(u64)` 长度的溢出形。解析器原地解掩码，输入落在真实连接缓冲尺寸
+     （`Conn.BufSize`）的独立 buffer 里，长度边界看到的数字与线上一致。
+   - `src/http/Multipart.zig`（`fuzzMultipartBody`，语料 9）：上传体整解析；
+     boundary 固定常量让变异器贴着真实 framing 起爆，限额收到 4 KiB 输入够得着
+     的尺寸（非默认 8 MB）。含裸 LF framing、缺闭合分隔符、payload 内嵌
+     boundary 形文本、无 Content-Disposition 的 part、超长头行。
+   - `scripts/check-production.sh` 的 `FUZZ_ROOTS` 同步 +4（漏登记门禁即红）。
+   - 全部语料 + Smith 变异跑完零崩溃零泄漏——没炸出存量 bug，这批是纯防线
+     扩面。
+3. **回归测试**：4 个新 `test "fuzz: …"` 块即回归本身；聚焦
+   `zig build test -Dtest-filter=fuzz` **7/7 绿**。
+4. **门禁读数**：fmt 净（4 个 zig 文件）· check-production OK ·
+   check-test-collection 2145→2149（+4）· 全量测试 exit=0（`--force-run`，
+   nice 压载保护双 soak）。
+
 ### 第 130 批：JWT base64url 手写编解码退役，换 std `url_safe_no_pad`（**破坏性：是**——带 `=` padding 的 JWT 段从此被拒）
 
 1. **缘起**：0.17 盘点发现 `SecurityModule.zig` 仍在手写 base64url：编码先按

@@ -1149,3 +1149,69 @@ test "SETTINGS_MAX_HEADER_LIST_SIZE round-trips through encode/decode" {
     try std.testing.expectEqual(@as(u16, 0x6), got[0].id);
     try std.testing.expectEqual(@as(u32, 16 * 1024), got[0].value);
 }
+
+// ── Fuzz: the frame codec only errors or succeeds ──────────────────────────
+//
+// `decodeFrame` is where every byte a peer sends after the preface lands, so
+// an arbitrary buffer may produce a frame or a refusal — never a crash or an
+// out-of-bounds read. A successfully framed payload is then handed to the
+// payload-level parsers (`stripPadding`, `decodePriority`, `decodeSettings`):
+// a refusal from any of them is a pass too, and the one allocation among them
+// (`decodeSettings`) is freed on the spot so the testing allocator keeps leak
+// detection on.
+
+fn fuzzHttp2Frame(_: void, smith: *std.testing.Smith) !void {
+    var raw: [4096]u8 = undefined;
+    smith.bytes(&raw);
+
+    const frame = decodeFrame(&raw) catch return;
+    if (stripPadding(frame.header.typ, frame.header.flags, frame.payload)) |unpadded| {
+        _ = unpadded;
+    } else |_| {}
+    if (decodePriority(frame.payload)) |pri| {
+        _ = pri;
+    } else |_| {}
+    if (decodeSettings(std.testing.allocator, frame.payload)) |settings| {
+        std.testing.allocator.free(settings);
+    } else |_| {}
+}
+
+test "fuzz: h2 frame codec only errors or succeeds on arbitrary bytes" {
+    const allocator = std.testing.allocator;
+
+    // One valid frame per type, built with the real encoders; then a PADDED
+    // DATA, a truncated header, a DATA on stream 0, and bytes that are not a
+    // frame at all.
+    const data = try encodeFrame(allocator, .data, 0, 1, "hello");
+    defer allocator.free(data);
+    const headers = try encodeFrame(allocator, .headers, FrameFlags.end_headers, 1, "\x83");
+    defer allocator.free(headers);
+    const priority = try encodePriority(allocator, 1, .{ .exclusive = false, .depends_on = 0, .weight = 15 });
+    defer allocator.free(priority);
+    const rst = try encodeRstStream(allocator, 1, ErrorCode.CANCEL);
+    defer allocator.free(rst);
+    const settings = try encodeSettings(allocator, false, &.{ .{ SettingsId.initial_window_size, 65535 }, .{ SettingsId.max_frame_size, 16384 } });
+    defer allocator.free(settings);
+    const push = try encodeFrame(allocator, .push_promise, FrameFlags.end_headers, 1, "\x00\x00\x00\x03\x83");
+    defer allocator.free(push);
+    const ping = try encodeFrame(allocator, .ping, 0, 0, "12345678");
+    defer allocator.free(ping);
+    const goaway = try encodeGoAway(allocator, 1, ErrorCode.NO_ERROR, "bye");
+    defer allocator.free(goaway);
+    const wu = try encodeWindowUpdate(allocator, 1, 1024);
+    defer allocator.free(wu);
+    const cont = try encodeFrame(allocator, .continuation, FrameFlags.end_headers, 1, "\x83");
+    defer allocator.free(cont);
+    const padded_data = try encodeFrame(allocator, .data, FrameFlags.padded, 1, "\x02hi\x00\x00");
+    defer allocator.free(padded_data);
+
+    const corpus = [_][]const u8{
+        data, headers, priority, rst,  settings,    push,
+        ping, goaway,  wu,       cont, padded_data,
+        "\x00\x00\x05", // a truncated header
+        "\x00\x00\x01\x00\x00\x00\x00\x00\x00\xff", // DATA, length 1, on stream 0
+        "\xff\xff\xff\xff\xff\xff\xff\xff\xff",
+        "",
+    };
+    try std.testing.fuzz({}, fuzzHttp2Frame, .{ .corpus = &corpus });
+}

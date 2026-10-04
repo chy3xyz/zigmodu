@@ -1621,3 +1621,50 @@ test "Hpack budget-dropped fields survive every allocation point failing (OOM sc
     };
     try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{block.items});
 }
+
+// ── Fuzz: the header-block decoder only errors or succeeds ─────────────────
+//
+// `Decoder.decode` is where an HTTP/2 peer's HEADERS payloads land (via
+// `Http2Server`), so an arbitrary block may produce a header list or a
+// decoding error — never a crash, an out-of-bounds read, or a leak. One fresh
+// decoder per input: a failed decode leaves the table state undefined (see
+// `decode`), and the interesting state is the one the bytes themselves build.
+// The testing allocator is what turns a missed `freeHeaders` half into a
+// failed replay instead of a silent leak.
+
+fn fuzzHpackBlock(_: void, smith: *std.testing.Smith) !void {
+    var block: [2048]u8 = undefined;
+    smith.bytes(&block);
+
+    var dec = Decoder.init(std.testing.allocator);
+    defer dec.deinit();
+    const headers = dec.decode(&block) catch return;
+    freeHeaders(std.testing.allocator, headers);
+}
+
+test "fuzz: hpack block decoder only errors or succeeds on arbitrary bytes" {
+    // Success-path shapes from the unit tests above — indexed, literal with
+    // incremental indexing (new name and table name), Huffman string, dynamic
+    // table size updates — then the refusal shapes (unknown dynamic index,
+    // table size past the advertised limit, over-long Huffman padding,
+    // truncation) and bytes that are not HPACK at all.
+    const corpus = [_][]const u8{
+        &[_]u8{0x83}, // indexed static 3 → :method POST
+        // RFC 7541 C.3.1: three indexed fields + an indexed-name literal.
+        &[_]u8{ 0x82, 0x86, 0x84, 0x41, 0x0f, 'w', 'w', 'w', '.', 'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'c', 'o', 'm' },
+        // :authority with a Huffman-encoded value (RFC 7541 C.4.1).
+        &[_]u8{ 0x41, 0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff },
+        &[_]u8{ 0x40, 0x01, 'a', 0x01, '1' }, // literal, incremental indexing, new name
+        &[_]u8{ 0x00, 0x04, 'n', 'a', 'm', 'e', 0x05, 'v', 'a', 'l', 'u', 'e' }, // literal without indexing
+        &[_]u8{ 0x20, 0x82 }, // table size update to 0, then an indexed field
+        &[_]u8{ 0x3f, 0xe1, 0x1f }, // multi-byte table size update to 4096
+        &[_]u8{ 0x3f, 0xe2, 0x1f }, // 4097 — one past the advertised limit
+        &[_]u8{0xbe}, // dynamic index 62 against an empty table
+        // :authority whose Huffman value carries 8+ padding bits (§5.2 error).
+        &[_]u8{ 0x41, 0x8d, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff, 0xff },
+        &[_]u8{0x41}, // truncated: indexed-name literal with no value bytes
+        "",
+        "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
+    };
+    try std.testing.fuzz({}, fuzzHpackBlock, .{ .corpus = &corpus });
+}

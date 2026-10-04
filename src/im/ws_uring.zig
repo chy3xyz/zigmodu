@@ -701,6 +701,66 @@ test "writeControl: a control frame above 125 bytes is rejected, not truncated" 
     try std.testing.expectError(error.ControlFrameTooLarge, writeControl(-1, 0xA, &payload));
 }
 
+// ── Fuzz: the frame parser only errors or succeeds ─────────────────────────
+//
+// `parseFrame` is the first thing bytes off a WebSocket connection reach on
+// the io_uring path, and it is platform-independent (the Linux-only parts of
+// this file are the ring; see the module note), so this harness runs on every
+// target. Any outcome — a parsed frame or a refusal — is a pass; a crash or
+// an out-of-bounds read is not. The parser de-masks in place, so the input
+// lands in its own buffer of the real connection buffer's size: the
+// payload-length bounds then see the same numbers they see live.
+
+fn fuzzParseFrame(_: void, smith: *std.testing.Smith) !void {
+    var buf: [Conn.BufSize]u8 = undefined;
+    smith.bytes(&buf);
+    _ = parseFrame(&buf) catch return;
+}
+
+test "fuzz: ws_uring frame parser only errors or succeeds on arbitrary bytes" {
+    // Valid shapes first — text, binary with 16-bit and 64-bit extended
+    // lengths, the three control opcodes — then the refusal shapes the shared
+    // header rules own (RSV set, unknown opcode, unmasked), a truncation, a
+    // 64-bit length that must not overflow the frame total, and bytes that
+    // are not a frame at all.
+    var b_text: [64]u8 = undefined;
+    var b_bin126: [256]u8 = undefined;
+    var b_bin127: [1100]u8 = undefined;
+    var b_close: [16]u8 = undefined;
+    var b_ping: [16]u8 = undefined;
+    var b_pong: [16]u8 = undefined;
+    var b_rsv: [64]u8 = undefined;
+    var b_opcode: [64]u8 = undefined;
+    var b_trunc: [64]u8 = undefined;
+    var b_huge: [14]u8 = undefined;
+    var payload200: [200]u8 = @splat('x');
+    var payload1024: [1024]u8 = @splat('y');
+
+    const rsv = buildFrame(&b_rsv, 0x1, true, "hi");
+    rsv[0] |= 0x40; // RSV1 with no negotiated extension
+    b_huge[0] = 0x82; // FIN + binary
+    b_huge[1] = 0x80 | 127; // masked, 64-bit length
+    std.mem.writeInt(u64, b_huge[2..10], std.math.maxInt(u64), .big);
+    @memcpy(b_huge[10..14], &test_mask_key);
+
+    const corpus = [_][]const u8{
+        buildFrame(&b_text, 0x1, true, "hi"),
+        buildFrame(&b_bin126, 0x2, true, &payload200),
+        buildFrame(&b_bin127, 0x2, true, &payload1024),
+        buildFrame(&b_close, 0x8, true, ""),
+        buildFrame(&b_ping, 0x9, true, "p"),
+        buildFrame(&b_pong, 0xA, true, "p"),
+        rsv,
+        buildFrame(&b_opcode, 0x3, true, "hi"), // not a registered opcode
+        buildFrame(&b_trunc, 0x1, true, "hello")[0..5], // header + mask, payload short
+        &[_]u8{ 0x81, 0x02, 'h', 'i' }, // unmasked client frame
+        &b_huge,
+        "\xff\xff\xff\xff\xff\xff\xff\xff",
+        "",
+    };
+    try std.testing.fuzz({}, fuzzParseFrame, .{ .corpus = &corpus });
+}
+
 const Conn = struct {
     const BufSize = 4096;
 
