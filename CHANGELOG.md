@@ -2,6 +2,54 @@
 
 ## [Unreleased]
 
+### 第 132 批：fuzz 面扩展第二波 —— JWT 验签 / chunked 解码 / cron 解析 / CSV 解析；**首次炸出存量 bug ×2 并同批修复**（**破坏性：否**）
+
+1. **缘起**：第一波（第 131 批）之后评估清单还剩四个「任意输入只许 error 或
+   成功」的解析入口。本批落地，并让 fuzz **第一次兑现了它的存在理由**：炸出
+   2 个存量整数溢出 panic，红证据→修复→语料回归全在同批闭环。
+2. **修法（4 个新 fuzz 根，模板同第 131 批）**：
+   - `SecurityModule.zig`（`fuzzJwtVerify`，语料 11）：`verifyToken`——Bearer
+     值的落点。固定 32 字节 fuzz secret；语料含**运行期用该 secret 生成的真
+     token**（走通含 payload 拷贝的完整成功路径，testing allocator 抓
+     `freePayload` 漏半）、错 secret 形（InvalidSignature 路径）、`alg:none`
+     混淆形、字母表外字符、2/4 段、空段、无点巨串。输入在首个 NUL 截断
+     （HTTP header 值不可能含 NUL），否则短语料被零填充吞掉、成功路径永不
+     可达。
+   - `HttpClient.zig`（`fuzzChunkedBuffer`，语料 13）：`decodeChunkedBuffer`——
+     `Transfer-Encoding: chunked` 响应是服务器控制的 framing。含 chunk 扩展、
+     trailer、十六进制大小写混排、缺终止块、声明长度越界、maxInt(u64) size。
+   - `Cron.zig`（`fuzzCronExpression`，语料 15）：`Expression.parse`——调用方
+     （或 agent 的 `schedule_job`）传入的调度串。成功路径再调 `matches(0)` 把
+     位图索引安全一并钉住。语料含 `*/0`（曾是死循环）、反转区间、字段数不对、
+     u8 贴界与越界步进。
+   - `csv.zig`（`fuzzCsvParse`，语料 12）：`parse`——上传/导入路径的用户字节。
+     含引号内逗号/换行/双引号转义、CRLF 与裸 LF 混排、未闭合引号、4 KiB 巨
+     字段。
+   - `scripts/check-production.sh` 的 `FUZZ_ROOTS` +4（现 11 项）。
+3. **炸出的存量 bug ×2 与修复**（红证据：装回触发语料 + 旧代码 → 两处均
+   `thread panic: integer overflow`、`Build Summary 17/19 (1 failed)`）：
+   - **chunked 解码 u64 溢出 panic**（`HttpClient.zig` 的 `decodeChunkedBuffer`）：
+     `"ffffffffffffffff\r\nx\r\n0\r\n\r\n"`（maxInt(u64) 的 size）→
+     `i + size + 2 > data.len` 回绕前触发 checked-arithmetic panic，ReleaseFast
+     下是 UB。该函数**并非纯测试 helper**——`StaticFiles.zig` 两处生产路径在
+     调。修复：比较改写成减法形 `size > remaining -| 2`（`remaining = data.len
+     - i`，此处 `i ≤ data.len` 恒成立），数学上与 `i + size + 2 > data.len`
+     等价但不可能溢出。
+   - **cron `parseField` u8 溢出 panic**（`Cron.zig`）：`"59/200 * * * *"`——
+     start=59 ≤ max=59 进循环，`i += step` = 259 > 255 → panic。修复：步进循环
+     计数器 u8 → **u16**（最大和 59+255=314，永不再触界；`*` base 经推演本
+     安全，但同函数两把尺子没有意义，一并放宽）。
+   - 两条触发输入**永久留在 fuzz 语料**里，另各配一条确定性单测
+     （maxInt size → `error.IncompleteChunked`；`59/200` 解析成功且只命中
+     第 59 分钟）——fuzz 管「别再崩」，单测管「语义对」。
+4. **顺带的工具链发现**：`x ** n` 数组重复语法在本工具链被解析成 `* *`
+   （编译错），两个大字段语料改运行期 `alloc + @memset` 构造。
+5. **回归测试**：4 个新 fuzz 块 + 2 条确定性单测；聚焦 `-Dtest-filter=fuzz`
+   **11/11 绿**（含触发语料）、两条新单测各自聚焦 1/1 绿。
+6. **门禁读数**：fmt 净 · check-production OK · check-test-collection OK
+   （本批 +6：4 fuzz + 2 单测；同树的第 133 批 Fx 改动 +6，门禁读数合计
+   2161）· 全量测试 exit=0（nice 压载保护双 soak）。
+
 ### 第 131 批：fuzz 面扩展第一波 —— HPACK 块解码 / H2 帧编解码 / ws_uring 帧解析 / multipart 体解析（**破坏性：否**）
 
 1. **缘起**：0.17 特性化盘点里 `std.testing.fuzz`（Smith 语料变异）是性价比最高的

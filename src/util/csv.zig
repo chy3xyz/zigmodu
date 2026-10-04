@@ -222,3 +222,50 @@ test "reader reads header then rows" {
     try std.testing.expectEqualStrings("1", row.?[0]);
     try std.testing.expect(try r.readRow() == null);
 }
+
+// ── Fuzz: the CSV parser only errors or succeeds ───────────────────────────
+//
+// `parse` is the convenience front of the `Reader` an upload or import path
+// hands user-controlled bytes to: arbitrary input may produce rows or an
+// error (`EmptyFile`, `UnterminatedQuote`) — never a crash, an over-read, or
+// a leak. The header row is consumed and dropped by `readAll` (that drop had
+// a leak once), so the success path frees every row slice and the testing
+// allocator turns a missed half into a failed replay. Trailing NUL padding
+// just reads as one more field of NUL bytes, so whole-buffer input is fine.
+
+fn fuzzCsvParse(_: void, smith: *std.testing.Smith) !void {
+    var raw: [4096]u8 = undefined;
+    smith.bytes(&raw);
+
+    var rows = parse(std.testing.allocator, &raw) catch return;
+    defer {
+        for (rows.items) |row| std.testing.allocator.free(row);
+        rows.deinit(std.testing.allocator);
+    }
+}
+
+test "fuzz: csv parser only errors or succeeds on arbitrary bytes" {
+    const a = std.testing.allocator;
+    // Header "h", then one row whose single field is near the input cap.
+    const big = try a.alloc(u8, 2 + 4000);
+    defer a.free(big);
+    big[0] = 'h';
+    big[1] = '\n';
+    @memset(big[2..], 'x');
+
+    const corpus = [_][]const u8{
+        "a,b\n1,2\n3,4", // plain rows
+        "name,note\nAlice,\"Hi, there\"", // quoted field with a comma inside
+        "a,b\n\"x\ny\",2", // newline inside quotes
+        "\"q\"\"q\",b\n1,2", // escaped double quote in a quoted field
+        "a,b\r\n1,2\r\n3,4", // CRLF framing
+        "a,b\r\n1,2\n3,4", // CRLF then bare LF
+        "a,b\n\"1,2", // unterminated quote
+        "", // empty file → EmptyFile
+        "only-a-header", // one line, no newline — header only, zero rows
+        big,
+        "a,,b\n1,,3", // empty field between delimiters
+        ",\n,", // delimiters only
+    };
+    try std.testing.fuzz({}, fuzzCsvParse, .{ .corpus = &corpus });
+}

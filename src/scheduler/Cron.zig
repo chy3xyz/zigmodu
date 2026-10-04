@@ -89,12 +89,15 @@ fn parseField(part: []const u8, target: []bool, max: u8) !void {
             // the agent's `schedule_job`, model-) supplied: `*/0` spun `i += 0`
             // forever, and a range end past `max` indexed straight past `target`.
             if (step == 0) return error.InvalidCronExpr;
+            // `i` is u16, not u8: any start ≤ max (≤ 59) plus any step ≤ 255
+            // sums to at most 314, which silently wrapped a u8 (`59/200` →
+            // 259, fuzz-found) into a checked-arithmetic panic.
             if (std.mem.eql(u8, base, "*")) {
-                var i: u8 = 0;
+                var i: u16 = 0;
                 while (i <= max) : (i += step) target[i] = true;
             } else {
                 const start = std.fmt.parseInt(u8, base, 10) catch return error.InvalidCronExpr;
-                var i = start;
+                var i: u16 = start;
                 while (i <= max) : (i += step) target[i] = true;
             }
         } else if (std.mem.indexOfScalar(u8, s, '-')) |dash| {
@@ -385,6 +388,14 @@ test "cron parse refuses a zero step and an out-of-range endpoint" {
     // (A *range* with a step is not part of this parser's grammar — the base must
     // be `*` or a single number — so it keeps failing as it always did.)
     try std.testing.expectError(error.InvalidCronExpr, Expression.parse("10-50/10 * * * *"));
+}
+
+test "cron parse with a step that overflows u8 from a large start" {
+    // `59/200`: start ≤ max enters the fill loop, and `i += step` then sums to
+    // 259 — a u8 counter panics on the wrap (fuzz-found), a u16 one just exits.
+    const expr = try Expression.parse("59/200 * * * *");
+    try std.testing.expect(expr.minutes[59]);
+    try std.testing.expect(!expr.minutes[0] and !expr.minutes[58]);
 }
 
 test "scheduler tick fires a matching job once per minute" {
@@ -855,4 +866,47 @@ test "listJobNames frees the names it already copied when a later copy fails" {
     defer allocator.free(names);
     defer for (names) |n| allocator.free(n);
     try std.testing.expectEqual(@as(usize, 2), names.len);
+}
+
+// ── Fuzz: the cron-expression parser only errors or succeeds ───────────────
+//
+// `Expression.parse` consumes the schedule string a caller — or, via an
+// agent's `schedule_job`, a model — hands to `Scheduler.addJob`: arbitrary
+// text may produce an expression or `error.InvalidCronExpr`, never a crash
+// or an out-of-bounds write into the field bitmaps (that is where the
+// `*/0` infinite loop and the range-end bounds fixes landed). Nothing is
+// allocated; the bitmaps are inline. The input is cut at the first NUL — a
+// real cron line cannot contain one — so a short corpus entry replays
+// byte-exact instead of trailing zero padding into the fifth field, which
+// would turn every well-formed seed into an InvalidCronExpr.
+
+fn fuzzCronExpression(_: void, smith: *std.testing.Smith) !void {
+    var raw: [256]u8 = undefined;
+    smith.bytes(&raw);
+
+    const expr = Expression.parse(std.mem.sliceTo(&raw, 0)) catch return;
+    // A parsed expression must also answer `matches` without tripping an
+    // index: the bitmaps are sized one past each field's maximum.
+    _ = expr.matches(0);
+}
+
+test "fuzz: cron expression parser only errors or succeeds on arbitrary bytes" {
+    const corpus = [_][]const u8{
+        "* * * * *", // every minute
+        "*/5 * * * *", // step
+        "1-5 0 * * 0", // range plus specific fields
+        "1,2,3 4,5 * * *", // lists
+        "0 22 * * 1-5", // weekday-night shape
+        "61 * * * *", // minute out of range (silently matches nothing)
+        "* * * *", // one field short
+        "* * * * * *", // one field too many
+        "JAN * * * *", // month names are not supported
+        "*/0 * * * *", // zero step — was an infinite loop
+        "5-1 * * * *", // reversed range
+        "59/196 * * * *", // start + step lands exactly on u8 max
+        "59/200 * * * *", // start + step overflows u8 entirely — must not panic
+        "abc def ghi jkl mno", // non-numeric everywhere
+        "", // empty
+    };
+    try std.testing.fuzz({}, fuzzCronExpression, .{ .corpus = &corpus });
 }

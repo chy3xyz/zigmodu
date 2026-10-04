@@ -1093,7 +1093,13 @@ pub const HttpClient = struct {
             const size = std.fmt.parseInt(usize, data[i..line_end], 16) catch return error.InvalidChunked;
             i = line_end + 2;
             if (size == 0) break;
-            if (i + size + 2 > data.len) return error.IncompleteChunked;
+            // Overflow-safe bounds check: `size` is peer-controlled hex and may
+            // be maxInt(usize), where `i + size + 2` wraps (a panic in safe
+            // builds, UB in ReleaseFast). `i <= data.len` holds here (the CRLF
+            // was found), so `remaining -| 2` is the honest shape: we need the
+            // chunk bytes *and* their trailing CRLF.
+            const remaining = data.len - i;
+            if (size > remaining -| 2) return error.IncompleteChunked;
             try out.appendSlice(allocator, data[i .. i + size]);
             i += size + 2;
         }
@@ -1300,6 +1306,15 @@ test "HttpClient decodeChunkedBuffer" {
     const body = try HttpClient.decodeChunkedBuffer(a, raw);
     defer a.free(body);
     try std.testing.expectEqualStrings("hello world", body);
+}
+
+test "HttpClient decodeChunkedBuffer rejects a maxInt-size chunk without overflowing" {
+    // size = maxInt(usize): `i + size + 2` would wrap before the comparison
+    // (fuzz-found) — the bounds check stays subtraction-shaped.
+    try std.testing.expectError(
+        error.IncompleteChunked,
+        HttpClient.decodeChunkedBuffer(std.testing.allocator, "ffffffffffffffff\r\nx\r\n0\r\n\r\n"),
+    );
 }
 
 test "HttpClient parseTarget https defaults to 443" {
@@ -2942,4 +2957,41 @@ test "HttpClient reuses the pooled TLS connection on loopback" {
     pool.mutex.lockUncancelable(io);
     defer pool.mutex.unlock(io);
     try std.testing.expectEqual(@as(usize, 1), pool.free_len);
+}
+
+// ── Fuzz: the chunked-body decoder only errors or succeeds ─────────────────
+//
+// `decodeChunkedBuffer` buffers what the streaming path decodes off the wire
+// (`streamChunkedBody`): a `Transfer-Encoding: chunked` response from an
+// arbitrary server is peer-controlled framing, so arbitrary bytes may
+// produce a body or an error — never a crash, an over-read, or a leak. The
+// zero-chunk terminator is what lets short corpus entries decode to success
+// even padded out to the buffer; the testing allocator turns a missed
+// `out.deinit` into a failed replay instead of a silent leak.
+
+fn fuzzChunkedBuffer(_: void, smith: *std.testing.Smith) !void {
+    var raw: [4096]u8 = undefined;
+    smith.bytes(&raw);
+
+    const body = HttpClient.decodeChunkedBuffer(std.testing.allocator, &raw) catch return;
+    std.testing.allocator.free(body);
+}
+
+test "fuzz: chunked body decoder only errors or succeeds on arbitrary bytes" {
+    const corpus = [_][]const u8{
+        "5\r\nhello\r\n0\r\n\r\n", // one chunk, clean terminator
+        "3\r\nfoo\r\n4\r\nbar!\r\n0\r\n\r\n", // two chunks
+        "5;foo=bar\r\nhello\r\n0\r\n\r\n", // chunk extension: rejected by parseInt
+        "5\r\nhello\r\n0\r\nX-Trailer: 1\r\n\r\n", // trailer after the 0 chunk
+        "a\r\n0123456789\r\nA\r\n0123456789\r\n0\r\n\r\n", // hex size, case mix
+        "5\r\nhello\r\n", // missing the terminating 0 chunk
+        "5hello\r\n0\r\n\r\n", // no CRLF ending the size line
+        "ffffffffffffff\r\nx\r\n0\r\n\r\n", // a 60-bit size — huge but parseable
+        "ffffffffffffffff\r\nx\r\n0\r\n\r\n", // maxInt(u64): the bounds check must not overflow
+        "1\r\na", // declared chunk runs past the buffer end
+        "0\r\n\r\n", // empty body
+        "", // empty input decodes to an empty body
+        "\r\n\r\n", // no hex on the size line at all
+    };
+    try std.testing.fuzz({}, fuzzChunkedBuffer, .{ .corpus = &corpus });
 }

@@ -219,8 +219,12 @@ FUZZ_ROOTS=(
   src/core/DistributedEventBus.zig
   src/http/Hpack.zig
   src/http/Http2.zig
+  src/http/HttpClient.zig
   src/http/Multipart.zig
   src/im/ws_uring.zig
+  src/scheduler/Cron.zig
+  src/security/SecurityModule.zig
+  src/util/csv.zig
 )
 want="$(printf '%s\n' "${FUZZ_ROOTS[@]}" | sort)"
 found="$(grep -rl 'std\.testing\.fuzz' --include='*.zig' "${SCAN_ROOTS[@]}" 2>/dev/null | sort || true)"

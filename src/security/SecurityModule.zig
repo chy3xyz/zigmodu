@@ -849,3 +849,61 @@ test "verifyToken survives every allocation point failing (OOM scan)" {
         token,
     });
 }
+
+// ── Fuzz: the JWT verifier only errors or succeeds ─────────────────────────
+//
+// `verifyToken` is where an `Authorization: Bearer` value lands once the
+// catalog middleware strips the prefix: three base64url segments of
+// attacker-controlled bytes. Arbitrary input may produce a payload or an
+// error — never a crash, an out-of-bounds read, or a leak. The secret is
+// fixed so the token is the only fuzzed variable. The input is cut at the
+// first NUL (a header value cannot carry one): that is what lets a corpus
+// token replay byte-exact instead of trailing zero padding into the
+// signature segment, so the full success path — payload copies included —
+// runs under the testing allocator and a missed `freePayload` half turns
+// red instead of leaking silently.
+
+const fuzz_jwt_secret = "fuzz-secret-fuzz-secret-fuzz-sec";
+
+fn fuzzJwtVerify(_: void, smith: *std.testing.Smith) !void {
+    var raw: [4096]u8 = undefined;
+    smith.bytes(&raw);
+
+    var sec = SecurityModule.init(std.testing.allocator, fuzz_jwt_secret, 3600);
+    const payload = sec.verifyToken(std.mem.sliceTo(&raw, 0)) catch return;
+    sec.freePayload(payload);
+}
+
+test "fuzz: jwt verifyToken only errors or succeeds on arbitrary bytes" {
+    const allocator = std.testing.allocator;
+
+    // A genuine token signed with the fuzz secret (the success path), and a
+    // well-formed one signed with a different secret (the InvalidSignature
+    // path). Both come from the real generator so the shapes stay in sync
+    // with the code under test.
+    var sec = SecurityModule.init(allocator, fuzz_jwt_secret, 3600);
+    const valid = try sec.generateToken("fuzz-user", &.{"user"});
+    defer allocator.free(valid);
+    var sec_wrong = SecurityModule.init(allocator, "fuzz-secret-wrong-wrong-wrong-wr", 3600);
+    const wrong_secret = try sec_wrong.generateToken("fuzz-user", &.{"user"});
+    defer allocator.free(wrong_secret);
+    // One segment far past any real JWT's size (no dots at all).
+    const huge_segment = try allocator.alloc(u8, 4096);
+    defer allocator.free(huge_segment);
+    @memset(huge_segment, 'A');
+
+    const corpus = [_][]const u8{
+        valid,
+        wrong_secret,
+        "a.b", // two segments
+        "a.b.c.d", // four segments
+        "..", // three empty segments
+        "e30..AAAA", // header `{}` — no HS256 in it
+        "eyJhbGciOiJub25lIn0.e30.AAAA", // {"alg":"none"} — alg confusion shape
+        "!!!.???.***", // outside the base64url alphabet
+        huge_segment,
+        "", // empty token
+        "not-a-token", // no dots at all
+    };
+    try std.testing.fuzz({}, fuzzJwtVerify, .{ .corpus = &corpus });
+}
