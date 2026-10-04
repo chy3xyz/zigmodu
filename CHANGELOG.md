@@ -2,6 +2,36 @@
 
 ## [Unreleased]
 
+### 第 133 批：Fx.zig 的「假并行」兑现 —— Parallel/Map 接 `std.Io.Group` 真并发（**破坏性：是**——两函数签名换血）
+
+1. **缘起**：0.16 删掉 `std.Thread.WaitGroup` 时这两个函数退化为「静默串行」——
+   `_ = max_workers; for (items) func(item)`，名字叫 Parallel 却单线程跑。0.17 的
+   正解是 `std.Io.Group`（`concurrent` + `await`），树内已有先例
+   （NetworkTransport / DistributedEventBus）。公开 API 说谎是品质污点；树内零
+   调用点（仅 `root.fx` 导出），趁 v1.0 前换掉。
+2. **修法**：
+   - `Parallel(io, T, items, max_workers, func)`：签名首参从（从未使用的）
+     allocator 换成 `io`。按 `min(max_workers, len)` 切**连续块**，每块一个
+     `group.concurrent`——`max_workers` 由分块兑现，不依赖 executor 自己的并发
+     上限，任何 `Io` 上都成立。某块 spawn 失败（`ConcurrencyUnavailable`）→
+     `group.cancel(io)` 收掉已跑的块再返回错误，**绝不把跑了一半当成功**；
+     `await` 的 `Canceled` 如实传播。
+   - `Map(io, In, Out, allocator, items, max_workers, func)`：同形分块，每块写
+     `results` 的不相交区间（保序）；失败路径 `errdefer` 释放 buffer，绝不返回
+     写了一半的切片。
+   - 删掉从未使用的 `errors` import 与两则「0.16 WaitGroup 移除所以串行」的
+     陈旧注释。
+   - `Stream` 从未承诺并发（eager 容器），不动。
+3. **回归测试**（3 条保留改写 + 6 条新增 = 9）：
+   - **并发实证**：`fx parallel really runs chunks concurrently`——两个块各自
+     进入后自旋等对方（5s 界），串行 executor 上会**超时报红**而不是静默通过；
+     `std.testing.io`（Threaded，unlimited）下两块真并行。
+   - **分块数学**：7 项 3 块（3/2/2）逐项计数恰好一次；`max_workers=0` = 每项
+     一块；空切片无操作 / Map 返回空 owned slice；Map 跨块保序。
+4. **门禁读数**：聚焦 `fx ` 过滤 **9/9 绿** · fmt 净 · check-production OK ·
+   check-test-collection OK（2161：第 132 批 +6、本批 +6）· 全量测试 exit=0
+   （与第 132 批同一棵验证树，nice 压载保护双 soak）。
+
 ### 第 132 批：fuzz 面扩展第二波 —— JWT 验签 / chunked 解码 / cron 解析 / CSV 解析；**首次炸出存量 bug ×2 并同批修复**（**破坏性：否**）
 
 1. **缘起**：第一波（第 131 批）之后评估清单还剩四个「任意输入只许 error 或
