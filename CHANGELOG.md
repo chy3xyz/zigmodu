@@ -2,6 +2,45 @@
 
 ## [Unreleased]
 
+### 第 135 批：24h soak 第 13 小时的 scheduler abort —— `push` 预算耗尽从「断言」改为「永不放弃」（**破坏性：否**——行为变化，无 API 变化）
+
+1. **事故**：双 24h soak 期间 `runtime-stress` 在第 13 小时 abort，栈为
+   `push ← runOne ← turn ← poolMain`（回执重推路径），断言点是 `scheduler.zig`
+   的 `std.debug.assert(false)`。同窗的 soak-cluster 24h 健康存活 → 排除机器级
+   故障；崩溃在凌晨 3:52、并行跑着 32 线程集群 soak 的宿主机上。
+2. **根因（先排除环逻辑）**：对 `queued`/`claimed` 双位协议做全交错推导 ——
+   claim-miss 唯一可达窗口（回执 step1/step2 之间）里 token 建立者必赢 `queued`
+   swap、runOne step3 必输，「一环两 token」数学上不可达；环占用 ≤ workers(4) +
+   consumers(2) = 6 < 容量 8，持久占满不可能。真因是**瞬时假满**：槽位持有者在
+   `tryPop`/`tryPush` 的两条指令之间被宿主抢占，超过 `push` 的整段重试预算
+   （1M 自旋 + 4096 让出，轻载折合墙钟仅 ~100ms）。与 `61eee60` 的 2 核 CI 事故
+   同形状（失败时 `high_water` 远低于容量 = 环根本没满）。**加重情节**：
+   ReleaseFast/Small 下 `std.debug.assert` 被剥掉，旧代码计数后**直接返回** →
+   token 静默丢弃 → `queued` 恒 true → worker 永久失联而邮箱照收 —— 正是容量
+   不变式要防的事故形态，从「断言拦下」退化成「无声发生」。
+3. **修法**（`src/runtime/scheduler.zig`）：`push` 永不放弃。自旋/让出预算保留为
+   **软预算**；耗尽后 ① 每次调用只计一次 `ready_push_failures`（语义从「丢过
+   token」精确化为「有 push 等过整个预算」，恒 0 读数不变，runtime-stress 不变式 4
+   原样把守）；② 每调度器一次性环取证 dump（新 `ring_dumped` 守卫 +
+   `ReadyRing.debugDump`：容量/游标/high_water/失败 ctx + 逐槽序号，live 槽附 ctx，
+   racy 为取证可接受 —— 重复 ctx = 重复 token 实锤，全不同且满 = 瞬时窗口实锤）；
+   ③ 停机则返回（token 停 `queued` 位，停机路径既有形态），否则 1ms 睡眠重试直到
+   槽位出现。等待总是对的：容量不变式保证「真满」结构不可达，槽位总会出现 ——
+   等待把「宿主抢占」从 abort 降级为一次被计数的延迟毛刺。
+4. **回归测试与配套**：新增 `scheduler: a push outlives a window held past its
+   whole retry budget`（手工 half-pop 撑开窗口，releaser 等到失败计数跳变后再压
+   50ms —— 保证观察的是睡眠相而非自旋尾 —— 然后才释放；断言 push 落地且计数
+   恰好为 1）。**变异验证**：旧代码（计数+断言）在该测试下 abort；把等待循环改成
+   「计数后返回」（ReleaseFast 旧形状）得到 `readyLen == 1` 的红（本批实测两条
+   变异均红）。`runtime_stress.zig` 启动时打印每个成员的句柄指针
+   （`cpu-N handle=0x…` / `blocking-N handle=0x…`），让 dump 的 ctx 能对号到具体
+   worker。文档：`docs/RUNTIME.md` §4 表 / §5 规则 4 / §12.10 同步，§12.11 加前向
+   指针，**新增 §12.18** 记本次事故全程；`docs/UPGRADING.md` 未发布段补行为变化注。
+5. **门禁读数**：fmt 净（2 文件）· 聚焦 `scheduler` 过滤 **41/41 绿** ·
+   `outlives` 过滤 1/1 绿（dump 取证输出随测试可见）· 变异两轮（assert 旧形 / 计数
+   后返回）均按预期红、还原后复绿。全量测试与 check-production / check-test-collection
+   读数见提交注脚（本批全程 nice -n 19 压载，保护同窗 soak-cluster）。
+
 ### 第 134 批：中间件 setup 路径的 `@panic` 收敛为 `error` —— 13 个工厂 + 4 个槽位池函数签名换血（**破坏性：是**——接线处加 `try`）
 
 1. **缘起**：Zig 0.17 特性化盘点的 P1 项。中间件工厂的 setup 分配失败与槽位池耗尽过去一律

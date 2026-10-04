@@ -139,8 +139,8 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 > 本节收 v0.39.5 之后、下一发布号之前的「会咬人」变更；发布时把标题改成版本号。
 > **3 处破坏性**：① 中间件工厂与槽位池函数返回错误（编译错）；② `Fx.Parallel` / `Fx.Map`
 > 真并发化、签名换血（编译错）；③ JWT 段改用 std 严格 base64url，带 `=` padding 的段被拒
-> （行为收紧）。逐条背景见 [`../CHANGELOG.md`](../CHANGELOG.md) `[Unreleased]` 段的
-> 第 134 / 133 / 130 批。
+> （行为收紧）。另有 ④ 一条**非破坏性**行为变化（scheduler `push` 的预算语义）。逐条背景见
+> [`../CHANGELOG.md`](../CHANGELOG.md) `[Unreleased]` 段的第 135 / 134 / 133 / 130 批。
 
 ### ① 中间件工厂与槽位池函数返回错误（第 134 批，**编译错**）
 
@@ -201,6 +201,17 @@ try zigmodu.fx.Parallel(io, T, items, 4, func);
 base64url 本无 padding）。**影响面**：收过非标准实现的 token 的应用。**一行改法**：让
 签发方输出无 padding 段（标准实现本来如此）；没有这类客户端就不需要动。顺带：此前修过的
 「解码失败泄漏缓冲区」语义在新实现下保留，下游为该泄漏加的 e2e 豁免可以随本版退役。
+
+### ④ Scheduler `push`：预算耗尽从断言改为等待（第 135 批，**非破坏性行为变化**）
+
+**Breaking?** 否 —— 无 API 变化。行为变化在一条**过去等于进程 abort** 的路径上：
+池化调度器的 `push` 在自旋/让出预算全部耗尽后，不再 `assert`（Debug/ReleaseSafe 下 abort），
+而是转为 1ms 睡眠重试直到槽位出现或调度器停机。对消费方的可见影响只有三个：
+`ready_push_failures` 的语义从「丢过 token」精确化为「有 push 等过了整个预算」（**仍是
+必须恒 0 的契约读数**，非零 = 宿主把出队窗口持有者抢占得超过 ~100ms，值得查宿主机而不是查框架）；
+首次越预算时 stderr 多一段环取证 dump（每调度器一次）；以及 ReleaseFast/Small 下那条
+「计数后静默返回、worker 永久失联」的路径**不再存在**。背景与根因推导见
+[`RUNTIME.md` §12.18](RUNTIME.md)。
 
 ---
 

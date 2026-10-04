@@ -1179,6 +1179,11 @@ fn run(io: std.Io, backing: std.mem.Allocator, p: Params) !Report {
     std.debug.print("[stress] members={d} (cpu={d} pooled/.cpu, blocking={d} pooled/.blocking, 1 dedicated, 1 supervised actor)\n", .{
         member_count, p.cpu_workers, p.blocking_workers,
     });
+    // The scheduler's forensic ring dump identifies tokens by `ctx` — the
+    // type-erased handle pointer — so print the mapping once, up front: a dump
+    // hours into the run can then be attributed to a member without a debugger.
+    for (cpu_handles, 0..) |h, i| std.debug.print("[stress]   cpu-{d} handle=0x{x}\n", .{ i, @intFromPtr(h) });
+    for (blocking_handles, 0..) |h, i| std.debug.print("[stress]   blocking-{d} handle=0x{x}\n", .{ i, @intFromPtr(h) });
 
     if (runtime.stats().workers != member_count) {
         report.fail(.member_count, "runtime reports {d} workers right after spawn, the harness spawned {d}", .{

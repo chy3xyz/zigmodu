@@ -66,12 +66,24 @@
 //!   accepting the spawn and dropping the push — is what the invariant exists to
 //!   rule out.
 //!
-//! A `push` that fails anyway is therefore *not* backpressure. It is counted
-//! (`Stats.ready_push_failures`), asserted in Debug/ReleaseSafe, and never
-//! silently dropped: "the ring was full" is not a reason to stop running a
-//! worker, it is a bug with a number attached. Before it counts anything, `push`
-//! waits the dequeue window out (below) — the one reading that *looks* like
-//! "full" without being it.
+//! A `push` that meets a full ring is therefore *not* backpressure, and it is
+//! never allowed to conclude anything from it: per the invariant a genuinely
+//! full ring cannot happen, and the one reading that *looks* like full — a
+//! consumer holding its slot inside the dequeue window (below) — always clears
+//! itself. So `push` waits: a spin budget, a yield budget, and past both of
+//! those a millisecond sleep, retried until the slot opens or the scheduler
+//! stops. It never drops and never asserts. The failure mode an assert would
+//! hide is worse than the wait: in ReleaseFast/Small the assert is stripped, so
+//! "count and assert" *returned* — and the token was silently gone, which is
+//! exactly the lost worker the invariant exists to prevent. Both times this
+//! shape fired in the wild (the 24h soak's hour-13 abort, and `61eee60`'s
+//! 2-core CI abort), `high_water` was nowhere near capacity: a consumer
+//! descheduled mid-window for longer than the whole budget, i.e. a scheduling
+//! accident to wait out, not a bug to report. A push that had to wait past its
+//! whole budget is still counted — once per call, in `Stats.ready_push_failures`,
+//! so the harness's "must stay 0" reading keeps meaning "nobody ever waited
+//! that long" — and the first one per scheduler dumps the ring, so the next
+//! occurrence is diagnosed from evidence, not from a stack.
 //!
 //! ## The dequeue window (why a push retries)
 //!
@@ -81,9 +93,9 @@
 //! previous round's sequence and is told the ring is full — while the ring is
 //! one slot short of full and the release is about to land. In a plain bounded
 //! queue that is a conservative answer and the caller waits. Here, returning it
-//! would drop a token, so `push` spins over the window instead: the retry is
-//! what makes "the ring was full" mean *full*, and only that, before the assert
-//! fires.
+//! would drop a token, so `push` waits over the window instead: the retry is
+//! what makes "the ring was full" mean *full* — and per the capacity invariant
+//! even that reading is only ever the window held open longer than a budget.
 //!
 //! ## The hand-back order (the easy thing to get wrong)
 //!
@@ -197,23 +209,27 @@ pub const reservation_period: u64 = 8;
 /// a width runs exactly one pool thread (docs/RUNTIME.md §12.12).
 pub const default_pool_threads: usize = 1;
 
-/// How long `push` waits for a slot it was told is full, in spin rounds, before
-/// it concludes the ring really is full (which, per the capacity invariant, is a
-/// bug). The window it exists for is two instructions wide on the consumer side;
-/// the budget is orders of magnitude larger so that a *preempted* consumer is
-/// still waited out rather than blamed.
+/// How long `push` spins for a slot it was told is full before it starts
+/// yielding. A *soft* budget: spending it (and the yield budget after it) does
+/// not conclude the ring is full — per the capacity invariant it cannot be —
+/// it only moves the wait into the sleep loop, which outlasts whatever the host
+/// did to the window holder. The window the spin exists for is two instructions
+/// wide on the consumer side; the budget is orders of magnitude larger so that
+/// a *preempted* consumer is waited out without the producer ever sleeping.
 const push_retry_rounds: usize = 1 << 20;
 
-/// After the spin budget, how many times `push` yields before it asserts.
+/// After the spin budget, how many times `push` yields before it moves to the
+/// sleep loop.
 ///
 /// Spinning only helps while the consumer is *runnable*; a consumer that the OS
 /// descheduled between advancing `dequeue_pos` and releasing its slot holds that
 /// slot for as long as it stays off-CPU, and spinning does not shorten that.
-/// Measured: on a 2-core macOS CI runner the smoke harness hit the assert with
-/// `push_failures` at 1 and `high_water` nowhere near capacity in the runs that
-/// completed (2 of 4) — the shape of a descheduled consumer, not of a full ring.
-/// Yielding hands the CPU to it instead of burning the budget: the assert the
-/// invariant deserves is still there, one yield budget later.
+/// Measured: on a 2-core macOS CI runner the smoke harness outran this whole
+/// budget with `high_water` nowhere near capacity (`61eee60`; 2 of 4 runs), and
+/// the 24h soak aborted at hour 13 on the same shape — a descheduled consumer,
+/// never a full ring. Yielding hands the CPU to the window holder instead of
+/// burning the budget; past the yield budget only a sleep still gives time back,
+/// so that is where the wait continues (see `push`).
 const push_yield_rounds: usize = 1 << 12;
 
 /// A pool thread's spin budget before it parks, and how long it parks. Parking is
@@ -396,6 +412,37 @@ const ReadyRing = struct {
         const deq = self.dequeue_pos.load(.acquire);
         return enq -| deq;
     }
+
+    /// Forensic dump, emitted once per scheduler by `push` when a push has
+    /// waited past its whole retry budget: the state the capacity invariant
+    /// says is unreachable, printed so the *next* occurrence is diagnosed from
+    /// evidence rather than from a stack. Deliberately racy — the ring is live
+    /// and the reads tear, which the comment on each line owns: a duplicated
+    /// `ctx` across two live slots would convict a duplicate token, a ring full
+    /// of distinct tokens would convict the capacity invariant, and a ring full
+    /// whose slots keep changing across two dumps is just a busy window. A slot
+    /// counts as live when its sequence says "written, not yet released" —
+    /// `(deq, enq]` in this round's coordinates — and it is only read for its
+    /// `ctx` when it has been written at least once (`s > i`: slot `i` starts
+    /// at sequence `i`), so no `undefined` value is ever dereferenced. The
+    /// boundary `s == enq` can misattribute the slot a producer is mid-CAS on;
+    /// that is the tearing the dump exists despite of.
+    fn debugDump(self: *const Self, failing_ctx: *anyopaque) void {
+        const enq = self.enqueue_pos.load(.monotonic);
+        const deq = self.dequeue_pos.load(.monotonic);
+        std.debug.print(
+            "[scheduler] ready ring outlived a push's retry budget: capacity={d} len={d} enqueue_pos={d} dequeue_pos={d} high_water={d} failing_ctx=0x{x}\n",
+            .{ self.slots.len, enq -| deq, enq, deq, self.high_water.load(.monotonic), @intFromPtr(failing_ctx) },
+        );
+        for (self.slots, 0..) |*slot, i| {
+            const s = slot.sequence.load(.monotonic);
+            if (s > i and s > deq and s <= enq) {
+                std.debug.print("[scheduler]   slot[{d}] sequence={d} live ctx=0x{x}\n", .{ i, s, @intFromPtr(slot.value.ctx) });
+            } else {
+                std.debug.print("[scheduler]   slot[{d}] sequence={d}\n", .{ i, s });
+            }
+        }
+    }
 };
 
 /// The pool. Owned by `Runtime`, created when the pool is declared, and it
@@ -471,6 +518,11 @@ pub const Scheduler = struct {
     claim_misses: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     ready_push_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     idle_waits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Guards the forensic dump `push` emits the first time it waits past its
+    /// whole retry budget: once per scheduler, because a scheduler that hit the
+    /// window once will hit it again under the same host contention, and a
+    /// second dump adds log volume, not evidence.
+    ring_dumped: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -546,7 +598,12 @@ pub const Scheduler = struct {
         /// once (one running it, one arriving after the hand-back started), and
         /// the skip is the protocol working (docs/RUNTIME.md §12.12).
         claim_misses: u64,
-        /// Must stay 0. See the capacity invariant.
+        /// Pushes that had to wait past the whole spin/yield budget for a ring
+        /// slot — counted once per call, after which the push sleeps and retries
+        /// until the slot opens (see `push`). Must stay 0: a healthy host never
+        /// holds the dequeue window that long, so any reading above 0 is host
+        /// contention worth a look. The token is *not* dropped when this counts:
+        /// the wait replaced the drop.
         ready_push_failures: u64,
         idle_waits: u64,
         ready_high_water: usize,
@@ -709,9 +766,9 @@ pub const Scheduler = struct {
     }
 
     /// Push a token. Infallible — see the capacity invariant at the top of this
-    /// file. A failure here is counted (and asserted in Debug/ReleaseSafe) rather
-    /// than swallowed, because a dropped token is a worker that stops being
-    /// scheduled, not a message that gets lost.
+    /// file. "The ring is full" is never a reason to give up on a token: a
+    /// dropped token is a worker that stops being scheduled, not a message that
+    /// gets lost.
     ///
     /// The retry is not backpressure and not a second chance: it is the only way
     /// to tell "the ring is full" from "the consumer has advanced `dequeue_pos`
@@ -719,9 +776,24 @@ pub const Scheduler = struct {
     /// instructions wide). Both readings come back as `false` from Vyukov's check,
     /// and the second one clears itself — so waiting is exactly what the first
     /// one cannot do, and treating them alike is what eats the token.
+    ///
+    /// The spin/yield budget is **soft**. Past it the push sleeps a millisecond
+    /// at a time and retries until the slot opens — or until the scheduler
+    /// stops, in which case the token stays parked on its `queued` bit, the
+    /// documented shutdown shape the drain already tolerates. It never asserts:
+    /// the assert this replaced was stripped in ReleaseFast/Small, where "count
+    /// and assert" became "count and return" — the token silently gone, the
+    /// worker never scheduled again. Waiting cannot produce that outcome, and
+    /// per the capacity invariant the slot always opens: a consumer descheduled
+    /// mid-window longer than the whole budget (both wild occurrences had
+    /// `high_water` nowhere near capacity) is host contention to outwait, not a
+    /// defect to die on. The wait is still *counted* — once per call, so the
+    /// harness's "must stay 0" reading keeps meaning "nobody waited that
+    /// long" — and the first one per scheduler dumps the ring (`dumpRingOnce`).
     fn push(self: *Self, item: Ready) void {
         const target = self.ring(item.priority);
         var round: usize = 0;
+        var counted = false;
         while (true) {
             if (target.tryPush(item)) {
                 // Published *after* the token is in the ring, so a pool thread
@@ -732,7 +804,26 @@ pub const Scheduler = struct {
                 return;
             }
             round += 1;
-            if (round > push_retry_rounds + push_yield_rounds) break;
+            if (round > push_retry_rounds + push_yield_rounds) {
+                if (!counted) {
+                    counted = true;
+                    _ = self.ready_push_failures.fetchAdd(1, .monotonic);
+                    self.dumpRingOnce(target, item);
+                }
+                // A stopping scheduler releases the wait instead: the token
+                // stays parked on its `queued` bit, which the shutdown path
+                // already documents and tolerates. Sleeping a millisecond at a
+                // time keeps the check cheap and the wait responsive — and the
+                // sleep, not another yield, is what gives the descheduled
+                // window holder its time back.
+                if (self.stopping.load(.acquire)) return;
+                // A cut-short sleep just retries sooner; the window holder is
+                // still off-CPU either way, so the retry cadence is the fix,
+                // not the sleep's own success.
+                std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(1), .real) catch |err|
+                    std.log.debug("[scheduler] push wait sleep interrupted ({s})", .{@errorName(err)});
+                continue;
+            }
             if (round > push_retry_rounds) {
                 // Out of spin: the consumer holding the slot may be off-CPU, and
                 // only the scheduler can bring it back. See `push_yield_rounds`.
@@ -743,8 +834,16 @@ pub const Scheduler = struct {
             }
             std.atomic.spinLoopHint();
         }
-        _ = self.ready_push_failures.fetchAdd(1, .monotonic);
-        std.debug.assert(false);
+    }
+
+    /// The forensic dump `push` emits the first time it waits past its whole
+    /// budget — once per scheduler, because a scheduler that hit the window
+    /// once will hit it again under the same host contention, and a second dump
+    /// adds log volume, not evidence.
+    fn dumpRingOnce(self: *Self, target: *ReadyRing, item: Ready) void {
+        if (self.ring_dumped.swap(true, .acq_rel)) return;
+        std.debug.print("[scheduler] scheduler=0x{x} class={s}: a push outlived its retry budget\n", .{ @intFromPtr(self), @tagName(item.priority) });
+        target.debugDump(item.ctx);
     }
 
     /// What one scheduling turn did. `poolMain` needs the difference between the
@@ -1217,10 +1316,68 @@ test "scheduler: a producer waits out the slot its consumer is mid-release on" {
     sched.push(c.ready()); // must wait for the release, not report "full"
     releaser.join();
 
-    // The push landed: the third token is in the ring, and the counter that says
-    // "a worker stopped being scheduled" reads zero.
+    // The push landed: the third token is in the ring, and the release came
+    // inside the spin budget, so the wait never reached the counted phase.
     try std.testing.expectEqual(@as(usize, 2), sched.readyLen());
     try std.testing.expectEqual(@as(u64, 0), sched.stats().ready_push_failures);
+}
+
+test "scheduler: a push outlives a window held past its whole retry budget" {
+    // The 24h soak's hour-13 abort, replayed deterministically: the consumer's
+    // release lands only *after* the producer has spent its spin budget, its
+    // yield budget, and then some. The old push asserted there — and in
+    // ReleaseFast/Small, where the assert is stripped, it returned, silently
+    // dropping the token: the worker's `queued` bit stays set, so no producer
+    // ever pushes for it again, and the worker is never scheduled while its
+    // mailbox keeps accepting. The contract now: wait the window out, count the
+    // wait once, deliver the token.
+    var sched = try testScheduler(.{ .max_pooled_workers = 1 }); // ring capacity 2
+    defer sched.deinit();
+    const ring = sched.ring(.normal);
+
+    var a = FakeWorker{ .scheduler = sched };
+    var b = FakeWorker{ .scheduler = sched };
+    try std.testing.expect(ring.tryPush(a.ready()));
+    try std.testing.expect(ring.tryPush(b.ready()));
+
+    // `tryPop`, split in half by hand: the value is copied out, `dequeue_pos`
+    // has moved on, and the slot is *not* released — the window, held open
+    // until the releaser decides. (Same construction as the test above; what
+    // differs is how long it is held.)
+    const taken = ring.slots[0].value;
+    ring.dequeue_pos.store(1, .monotonic);
+    try std.testing.expectEqual(@as(*anyopaque, @ptrCast(&a)), taken.ctx);
+
+    const Releaser = struct {
+        fn run(s: *Scheduler, r: *ReadyRing) void {
+            // The push's crossing of its whole budget has exactly one
+            // observable edge: the failure counter. Wait for it, with a
+            // wall-clock bound so a push that stopped counting (the mutation
+            // target) cannot hang the suite — in that case the slot is released
+            // anyway and the assertion below fails on the counter.
+            const deadline = std.Io.Timestamp.now(std.testing.io, .awake).nanoseconds + 30 * std.time.ns_per_s;
+            var counted = s.ready_push_failures.load(.monotonic) != 0;
+            while (!counted and std.Io.Timestamp.now(std.testing.io, .awake).nanoseconds <= deadline) {
+                std.Thread.yield() catch {};
+                counted = s.ready_push_failures.load(.monotonic) != 0;
+            }
+            // Hold one more beat once the counter moved, so the push the main
+            // thread is in has demonstrably entered the *sleep* phase before
+            // the slot opens — the phase this test exists for.
+            if (counted) std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(50), .awake) catch {};
+            r.slots[0].sequence.store(0 +% r.slots.len, .release); // the second half
+        }
+    };
+    const releaser = try std.Thread.spawn(.{}, Releaser.run, .{ sched, ring });
+
+    var c = FakeWorker{ .scheduler = sched };
+    sched.push(c.ready()); // must outlive the window, not report it
+    releaser.join();
+
+    // The push landed, and the wait was counted exactly once — per call, not
+    // per retry — so the harness's "must stay 0" reading keeps its meaning.
+    try std.testing.expectEqual(@as(usize, 2), sched.readyLen());
+    try std.testing.expectEqual(@as(u64, 1), sched.stats().ready_push_failures);
 }
 
 test "scheduler: a hammered ring never eats a token" {

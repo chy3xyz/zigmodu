@@ -261,7 +261,7 @@ defer app.stop();   // 先请求停止 + join worker，再停模块
 | `Sequencer` | 多线程 | 无锁单调序列：`next()` / `nextBatch(n)` / `advanceTo()`；**不是时钟**（只在进程生命期内有意义） |
 | `HotBus(E, N)` | 1 发布者 / 多订阅者 | freeze 后无锁发布、drop-on-full、计数齐全（见 §3c） |
 | `Recorder(E, C)` | N 生产者 / 单线程重放 | 定容追加日志，**满即 `error.Full`（不覆盖、不静默丢弃）**；序号即槽位，`entries()` 无锁给出 seq 升序前缀；`replay` 驱动 `Clock.Manual`、不 sleep（见 §11.6） |
-| `Scheduler`（池化执行，§12） | N 生产者 / **1 池线程**（Phase 1） | 就绪环（Vyukov，堆上切片）：容量 = `ceilPowerOfTwo(max_pooled_workers)`，**按声明的上界算出来，不是常数**；D4 ⇒ 每 worker 至多一个 token ⇒ `push` 永不失败（失败 = 调度器失联，不是背压：断言 + `ready_push_failures`）。`claimed`（正被跑）/ `queued`（在环里等）是**两个位**；worker 数超过声明上界时 `spawn` 直接 `error.PoolCapacityExceeded`。见 §12.10 |
+| `Scheduler`（池化执行，§12） | N 生产者 / **1 池线程**（Phase 1） | 就绪环（Vyukov，堆上切片）：容量 = `ceilPowerOfTwo(max_pooled_workers)`，**按声明的上界算出来，不是常数**；D4 ⇒ 每 worker 至多一个 token ⇒ `push` 永不放弃（自旋/让出预算耗尽后转 1ms 睡眠重试，直到槽位出现或停机；越过预算每次调用计一次 `ready_push_failures` + 每调度器一次环取证 dump —— 不是背压，不是失败，见 §12.18）。`claimed`（正被跑）/ `queued`（在环里等）是**两个位**；worker 数超过声明上界时 `spawn` 直接 `error.PoolCapacityExceeded`。见 §12.10 |
 
 **为什么池用自旋锁而不是无锁栈**：Treiber 栈在索引上有一个 ABA 窗口，会把同一个对象发给两个调用者 ——
 那是任何测试都不稳定复现的数据竞争。临界区只有一次指针交换，锁的代价远小于"正确性靠运气"。
@@ -331,9 +331,12 @@ error.Full        阻塞等待（recv(0)）或超时（recv(ms)）
 3. **消息是值**。`T` 按值拷贝进队列；要传堆对象就传指针并显式约定所有权，别让 `T` 偷偷拥有内存。
 4. **"环满"不是背压**。就绪环（§12）里的 token 不是消息，是**一个 worker 的调度权**：丢一条消息是丢工作，
    丢一个 token 是丢 worker —— 邮箱继续收、`send` 继续成功、而它永远不再运行。所以那个环的容量是按
-   **声明的池化上界**算出来的（因此 `push` 不可能失败），`SchedulerConfig.max_pooled_workers` 是硬上限
-   （第 N+1 个 `.pooled` spawn 在启动期被拒），真失败时 `std.debug.assert` + `ready_push_failures` 计数。
-   把它当背压"丢掉就好"是错的。
+   **声明的池化上界**算出来的（因此"真满"在结构上不可能发生），`SchedulerConfig.max_pooled_workers` 是硬上限
+   （第 N+1 个 `.pooled` spawn 在启动期被拒）。`push` 对"看起来满"的应答是**等**：自旋 → 让出 → 1ms 睡眠重试，
+   直到槽位出现或停机；越过整个软预算的等待每次调用计一次 `ready_push_failures`（恒 0 读数，
+   语义 = "从没人等过那么久"）并做一次性环取证 dump，**token 绝不丢**。把它当背压"丢掉就好"是错的；
+   把它当 bug `assert` 掉也是错的 —— ReleaseFast/Small 里 assert 被剥掉，"计数 + 断言"会退化成
+   "计数 + 返回"，即静默丢 token（§12.18 有这两次野外的完整经过）。
 
 ## 6. 事件分层（L0 / L1 / L2）
 
@@ -451,7 +454,7 @@ worker 先停（邮箱关闭）、定时器随后到点，于是它跳一次 —
 | `pool_ready_len` | 就绪环里现有 token 数 = 排队等池线程的 worker 数 | 每个 worker 至多一个 token（D4），所以它 ≤ `pool_declared` |
 | `pool_claimed` | **此刻**正被池线程执行的 worker 数 | 池化后 `running` 不再回答"有多少活儿在跑"，这条回答 |
 | `pool_dispatches` | 池线程跑过的批次总数 | **有 `.pooled` spawn 却是 0 = 那些 worker 从没到过池线程** |
-| `pool_ready_push_failures` | 被环拒收的 token 数 | **必须恒为 0**。见 §5 第 4 条：这不是背压，是调度器失联 |
+| `pool_ready_push_failures` | 等过整个自旋/让出预算的 push 数（每次调用计一次；token **未丢**，随后睡眠重试到落地） | **必须恒为 0**。见 §5 第 4 条与 §12.18：这不是背压也不是丢 token，是宿主把出队窗口持有者抢占了 ~100ms 以上 |
 
 没有池的 runtime 这 6 条**报 0 而不是缺行**：`pool_declared=0` 本身就是"这里没人声明过池"的答案，
 仪表盘不必为它写特例。
@@ -1058,8 +1061,9 @@ var app = try b.withName("app").withMaxPooledWorkers(64).build(.{MyModule});
   不是常数 —— 它必须 ≥ 池化 worker 数，否则"环满丢 token"会等于**永久停掉一个 worker**；
 * 上界也是硬上限：第 `max+1` 个 `.pooled` spawn 被 `error.PoolCapacityExceeded` 拒（启动期），
   而不是先收下再让某个 token 无处可放；
-* `push` 失败 = 不变量被破坏：Debug/ReleaseSafe 断言 + `ready_push_failures` 计数，
-  **绝不当背压丢**。`Runtime.poolStats()` 读得到。
+* `push` 对"满"的应答是**等待而非裁决**（§12.18）：自旋/让出预算耗尽后转 1ms 睡眠重试，直到槽位出现或
+  停机；越过预算的等待每次调用计一次 `ready_push_failures`（仍是恒 0 读数）+ 每调度器一次取证 dump。
+  `Runtime.poolStats()` 读得到。
 
 **实测后收紧的两处（不改就会丢 worker）**：
 
@@ -1159,6 +1163,8 @@ dedicated 加"抽干后再停"，两者都是会动到 D5 那条回执出口的�
 （Phase 1 `pool_threads = 1`），只按 worker 数取就正好会少这一格；② `push` 首次被拒后**自旋重试**
 （预算 `push_retry_rounds`），只有整个预算都没等到才计数 + Debug/ReleaseSafe 断言 —— 从此"环满"只表示
 真的满。`ready_push_failures` 仍然是"必须恒 0"的读数。
+（**后续**：24h soak 在第 13 小时证明"自旋 + 让出"两段预算在宿主抢占下仍会耗尽 —— 窗口持有者可被
+deschedule 得比整个预算还久；②的"耗尽即断言"随后改为"耗尽即 1ms 睡眠重试、token 永不丢"，见 §12.18。）
 测试：`scheduler: a producer waits out the slot its consumer is mid-release on`（把窗口手工撑开，
 确定性）· `scheduler: a hammered ring never eats a token`（真打频率）。
 
@@ -1654,6 +1660,53 @@ per-worker 的 `batch` 覆盖同理仍不做（§12.16 末尾已记）。
 **没说明什么 / 仍开**：保留周期 8 是设计值、不是实测值；可配权重与类别数仍不做，
 但现在的实测数据（份额随宿主调度大幅摆动、low 稳定 ~1/8）就是将来反驳或支持它的依据；
 §12.7 对 affinity/NUMA 的立场不变。
+
+### 12.18 24h soak 抓到的 assert：窗口可以比整个重试预算活得久（`push` 改为永不放弃）
+
+> 一次真实事故的完整经过与修法。它是 §12.11 第 1 条的后续：那一版把"出队窗口被读成环满"改成了
+> 自旋/让出重试，这一版把"预算耗尽"从断言改成了**等待** —— 因为 soak 证明窗口可以比任何静态预算活得久。
+
+**事故**：24h `runtime-stress` 在第 13 小时 abort，`scheduler.zig` 的 `std.debug.assert(false)`，
+栈为 `push ← runOne ← turn ← poolMain`（回执重推路径）。同一台机器、同一时间窗里的 soak-cluster 24h
+**仍在健康运行**（排除机器级故障）；崩溃发生在凌晨 3:52，并行跑着 32 线程的集群 soak。
+
+**根因调查先做排除法**（对 `queued`/`claimed` 双位协议做全交错推导）：
+
+* claim-miss 唯一可达的窗口是回执的 step1（`queued=false`）与 step2（`claimed=false`）之间；
+  该窗口里 token 的建立者（`announce`）必赢 `queued` 的 swap、runOne step3 的 swap 必输 ——
+  **"一环两 token"在数学上不可达**；
+* 环占用 ≤ 池化 worker 数 + 消费者数（当次 4 + 2 = 6 < 容量 8）—— **持久占满不可能**。
+
+环逻辑无 bug。真因是**瞬时"假满"**：槽位持有者在 `tryPop`（已推进 `dequeue_pos`、未释放序号）或
+`tryPush`（已赢 CAS、未发布）的两条指令之间被宿主抢占，抢占时长超过了 `push` 的整个重试预算
+（1M 自旋 + 4096 让出，轻载下折合墙钟仅 ~100ms）。证据形状与 `61eee60` 的 2 核 CI 事故一致：
+失败时 `high_water` 远低于容量 —— 环根本没满，是窗口持有者被 deschedule 得比预算还久。
+
+**加重情节**（比崩溃本身更值得修的那条）：ReleaseFast/Small 下 `std.debug.assert` 被剥掉，
+旧代码计数后**直接返回** —— token 被静默丢弃，worker 的 `queued` 还是 true，从此再无人替它推 token：
+**worker 永久失联，而邮箱继续收条**。这正是容量不变式要防的事故形态，只是从"断言拦下"退化成了
+"无声发生"。
+
+**修法**（`push` 永不放弃）：
+
+1. 自旋/让出预算保留，但降级为**软预算** —— 它仍然存在是为了让"正常窗口"零睡眠通过；
+2. 预算耗尽后：每次调用**只计一次** `ready_push_failures` —— 该读数仍是"必须恒 0"的契约
+   （runtime-stress 不变式 4 原样把守），语义从"丢过 token"精确化为"有 push 等过了整个预算"；
+3. 每个调度器**一次性** dump 环取证（`ring_dumped` 守卫；打印容量/游标/high_water/失败 token 的
+   ctx，再逐槽打印序号，live 槽附 ctx —— 读数是 racy 的，这是取证可接受的代价：dump 里重复出现的
+   ctx = 重复 token 实锤，全不同且满 = 瞬时窗口实锤）；
+4. 进入等待循环：停机则返回（token 停在 `queued` 位上，是停机路径既有且容忍的形态），否则
+   睡 1ms 重试 `tryPush`，直到槽位出现。
+
+**为什么等待总是对的**：容量不变式保证"真满"结构上不可达，所以槽位**总会**出现；等待把
+"宿主抢占了窗口持有者"从一次 abort 降级成一次被计数的延迟毛刺。
+
+**回归测试**：`scheduler: a push outlives a window held past its whole retry budget` ——
+手工 half-pop 撑开窗口，releaser 线程等到失败计数跳变（预算耗尽的可见边缘）后再压 50ms
+（保证观察的是睡眠相而非自旋尾），然后才释放槽位：push 必须落地、计数恰好为 1。变异验证：
+旧代码（计数 + 断言）在该测试下 abort；任何人把等待循环改成"计数后返回"（ReleaseFast 的旧形状）
+得到 `readyLen == 1` 的红。配套的 `runtime_stress.zig` 在启动时打印每个成员的句柄指针，
+让 dump 里的 ctx 能对号到具体 worker。
 
 ## 13. Runtime Replay —— v1 已实现（见 §13.7）
 
