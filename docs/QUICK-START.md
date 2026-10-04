@@ -10,19 +10,18 @@ CI pins:
 
 ```bash
 # https://ziglang.org/download/ · zigup: https://github.com/marler8997/zigup
-zigup 0.17.0-dev.2151+2ec5523d5
+zigup 0.17.0
 
-# ziglang's mirrors garbage-collect old dev builds (they start returning 404),
-# so the version above goes stale by design: `.github/workflows/ci.yml` →
-# `ZIG_VERSION` is the source of truth.
-# `brew install zig` installs a *stable* Zig → not usable for this repo.
+# `.github/workflows/ci.yml` → `ZIG_VERSION` is the source of truth. 0.17.0 is
+# a stable release (ziglang.org/download/0.17.0/…), so unlike the dev builds
+# the mirrors garbage-collected, this tarball stays.
 ```
 
 Verify installation:
 ```bash
 zig version
 # Should show the value pinned in .github/workflows/ci.yml → ZIG_VERSION,
-# e.g. 0.17.0-dev.2151+2ec5523d5
+# e.g. 0.17.0
 ```
 
 ## Step 1: Create a Module

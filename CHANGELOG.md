@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+### 第 127 批：Zig 0.17.0 正式版适配 —— std `Stream.read` 在 stable 上根本不能编译（**破坏性：否**）
+
+1. **缘起**：Zig 0.17.0 正式版发布，工具链从 dev 构建（dev.2151）切到 stable。
+   冒烟编译（`zig build`）即绿，但全量测试抓到一处**只有 stable 才炸**的编译断。
+2. **根因（代码实证）**：`std/Io/net.zig` 的 `Stream.read` 在 dev.2151 里直接返回
+   `(try io.operate(.{.net_read = …})).net_read`（usize）；stable 0.17.0 给
+   `net_read` 换上了 `ReadResult` 结构体（`data_len/control_len/control_truncated`），
+   而 `Stream.read` 仍按元组解构 `const rc, _ = …` —— **std 自身这行在 stable 上
+   一旦实例化就编译失败**（`ReadResult cannot be destructured`）。全树只有
+   `src/api/Server.zig:1516` 的 `StreamReader.readInto` 无截止分支实例化它
+   （有截止分支早已走 raw posix read——那条 `net_read` 路径在 macOS 本就会挂，
+   见 `core/sockread.zig`）。
+3. **修法**：无截止分支同样改走 `std.posix.read(stream.socket.handle, …)`，
+   与有截止分支同一族原语——既绕开 std 的破碎函数，也消掉对"会挂的 io
+   net_read 路径"的最后依赖。语义不变：阻塞 socket 读，`0` → `EndOfStream`。
+   测试不受影响：`StreamReader` 的测试全走 socketpair + 截止分支（原本就是
+   raw posix）。
+4. **CI/工具链治理**：`ZIG_VERSION` dev.2151 → `0.17.0`；12 处下载步骤加
+   URL 分支（版本含 `dev` 走 `ziglang.org/builds/…`，否则走
+   `ziglang.org/download/<ver>/…`——stable tarball 不被镜像回收，dev 构建会，
+   dev.1567 的 404 事故不会重演）；三平台 tarball URL 已实测 200。
+   AGENTS.md / README×2 / QUICK-START / BEST_PRACTICES 的版本引用同步刷新。
+5. **回归测试**：`zig build test -Dtest-force-run=true` on 0.17.0 stable
+   **exit=0**；`runtime-stress` / `soak-cluster` / `cluster-node` / `zmodu`
+   四个辅助二进制 stable 下编译+冒烟全绿。
+6. **门禁读数**：fmt 净 · check-production OK · check-test-collection
+   2144 不变 · check-version OK。
+
 ### 第 126 批：混合版本门禁新增 `interop` 模式 —— 滚动升级（v0.38.0 × master）实测互通（**破坏性：否**）
 
 1. **缘起**：B-11 门禁此前只覆盖**硬切**形状（v0.32.0 裸帧 × master 认证帧

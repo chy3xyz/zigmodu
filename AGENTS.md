@@ -420,7 +420,7 @@ filter 是**测试全限定名的子串**（形如 `core.cluster.RaftElection.te
 
 ## Version
 - Framework: **v0.39.4** (`build.zig.zon`)
-- Zig: **0.17.0-dev.1970+67f39b551**（CI 同款锁定版本，见 `.github/workflows/ci.yml` → `ZIG_VERSION`；避免 fmt 行为漂移。注意 ziglang 镜像会回收旧 dev 构建——dev.1567 已 404，升级时本地先验证再改 CI）
+- Zig: **0.17.0（正式版）**（CI 同款锁定版本，见 `.github/workflows/ci.yml` → `ZIG_VERSION`；避免 fmt 行为漂移。stable tarball 走 `ziglang.org/download/0.17.0/…`，不会被镜像回收——旧 dev 构建会，dev.1567 已 404）
 - Tests: **以 `zig build test` 输出为准**（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`）。
   本文件不再抄写具体数字：`-Ddb` 收窄、平台（Linux/macOS）、门控用例都会改变计数，
   抄下来的数字必然漂移。要在文档里写数字，先跑一次并与输出核对。

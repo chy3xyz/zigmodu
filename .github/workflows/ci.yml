@@ -27,10 +27,13 @@ concurrency:
 
 env:
   # Pin the exact toolchain used for local development so fmt/build behavior
-  # is reproducible in CI. NOTE: ziglang mirrors garbage-collect old dev
-  # builds — dev.1567 404'd and broke Setup Zig; when that recurs, bump to
-  # the current master dev build and verify locally first.
-  ZIG_VERSION: "0.17.0-dev.2151+2ec5523d5"
+  # is reproducible in CI. This is the 0.17.0 STABLE release tarball
+  # (ziglang.org/download/…); a dev build here instead comes from
+  # ziglang.org/builds/… (the Setup Zig steps branch on "dev" in the version).
+  # NOTE: ziglang mirrors garbage-collect old dev builds — dev.1567 404'd and
+  # broke Setup Zig; another reason to track the stable release now that one
+  # exists.
+  ZIG_VERSION: "0.17.0"
 
 jobs:
   # ── Windows cross-compile (no DB drivers) ──────
@@ -44,9 +47,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Setup Zig
         # mlugg/setup-zig@v1 builds old-pattern URLs (zig-<os>-<arch>) that
-        # 404 for current dev builds; download the tarball from ziglang.org
-        # directly using the arch-first name. Old dev builds get
-        # garbage-collected — bump ZIG_VERSION when this 404s again.
+        # 404 for current builds; download the tarball from ziglang.org
+        # directly using the arch-first name. The URL branch below picks
+        # /builds/ for dev versions and /download/<ver>/ for stable.
         shell: bash
         run: |
           case "$RUNNER_OS" in
@@ -54,7 +57,11 @@ jobs:
             macOS) ART="zig-aarch64-macos" ;;
             *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
           esac
-          curl -fsSL "https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          case "$ZIG_VERSION" in
+            *dev*) ZIG_URL="https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" ;;
+            *) ZIG_URL="https://ziglang.org/download/$ZIG_VERSION/$ART-$ZIG_VERSION.tar.xz" ;;
+          esac
+          curl -fsSL "$ZIG_URL" -o "$RUNNER_TEMP/zig.tar.xz"
           mkdir -p "$RUNNER_TEMP/zig"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig"
           echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
@@ -88,9 +95,9 @@ jobs:
 
       - name: Setup Zig
         # mlugg/setup-zig@v1 builds old-pattern URLs (zig-<os>-<arch>) that
-        # 404 for current dev builds; download the tarball from ziglang.org
-        # directly using the arch-first name. Old dev builds get
-        # garbage-collected — bump ZIG_VERSION when this 404s again.
+        # 404 for current builds; download the tarball from ziglang.org
+        # directly using the arch-first name. The URL branch below picks
+        # /builds/ for dev versions and /download/<ver>/ for stable.
         shell: bash
         run: |
           case "$RUNNER_OS" in
@@ -98,7 +105,11 @@ jobs:
             macOS) ART="zig-aarch64-macos" ;;
             *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
           esac
-          curl -fsSL "https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          case "$ZIG_VERSION" in
+            *dev*) ZIG_URL="https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" ;;
+            *) ZIG_URL="https://ziglang.org/download/$ZIG_VERSION/$ART-$ZIG_VERSION.tar.xz" ;;
+          esac
+          curl -fsSL "$ZIG_URL" -o "$RUNNER_TEMP/zig.tar.xz"
           mkdir -p "$RUNNER_TEMP/zig"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig"
           echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
@@ -382,9 +393,9 @@ jobs:
 
       - name: Setup Zig
         # mlugg/setup-zig@v1 builds old-pattern URLs (zig-<os>-<arch>) that
-        # 404 for current dev builds; download the tarball from ziglang.org
-        # directly using the arch-first name. Old dev builds get
-        # garbage-collected — bump ZIG_VERSION when this 404s again.
+        # 404 for current builds; download the tarball from ziglang.org
+        # directly using the arch-first name. The URL branch below picks
+        # /builds/ for dev versions and /download/<ver>/ for stable.
         shell: bash
         run: |
           case "$RUNNER_OS" in
@@ -392,7 +403,11 @@ jobs:
             macOS) ART="zig-aarch64-macos" ;;
             *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
           esac
-          curl -fsSL "https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          case "$ZIG_VERSION" in
+            *dev*) ZIG_URL="https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" ;;
+            *) ZIG_URL="https://ziglang.org/download/$ZIG_VERSION/$ART-$ZIG_VERSION.tar.xz" ;;
+          esac
+          curl -fsSL "$ZIG_URL" -o "$RUNNER_TEMP/zig.tar.xz"
           mkdir -p "$RUNNER_TEMP/zig"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig"
           echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
@@ -462,9 +477,9 @@ jobs:
 
       - name: Setup Zig
         # mlugg/setup-zig@v1 builds old-pattern URLs (zig-<os>-<arch>) that
-        # 404 for current dev builds; download the tarball from ziglang.org
-        # directly using the arch-first name. Old dev builds get
-        # garbage-collected — bump ZIG_VERSION when this 404s again.
+        # 404 for current builds; download the tarball from ziglang.org
+        # directly using the arch-first name. The URL branch below picks
+        # /builds/ for dev versions and /download/<ver>/ for stable.
         shell: bash
         run: |
           case "$RUNNER_OS" in
@@ -472,7 +487,11 @@ jobs:
             macOS) ART="zig-aarch64-macos" ;;
             *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
           esac
-          curl -fsSL "https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          case "$ZIG_VERSION" in
+            *dev*) ZIG_URL="https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" ;;
+            *) ZIG_URL="https://ziglang.org/download/$ZIG_VERSION/$ART-$ZIG_VERSION.tar.xz" ;;
+          esac
+          curl -fsSL "$ZIG_URL" -o "$RUNNER_TEMP/zig.tar.xz"
           mkdir -p "$RUNNER_TEMP/zig"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig"
           echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
@@ -529,9 +548,9 @@ jobs:
 
       - name: Setup Zig
         # mlugg/setup-zig@v1 builds old-pattern URLs (zig-<os>-<arch>) that
-        # 404 for current dev builds; download the tarball from ziglang.org
-        # directly using the arch-first name. Old dev builds get
-        # garbage-collected — bump ZIG_VERSION when this 404s again.
+        # 404 for current builds; download the tarball from ziglang.org
+        # directly using the arch-first name. The URL branch below picks
+        # /builds/ for dev versions and /download/<ver>/ for stable.
         shell: bash
         run: |
           case "$RUNNER_OS" in
@@ -539,7 +558,11 @@ jobs:
             macOS) ART="zig-aarch64-macos" ;;
             *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
           esac
-          curl -fsSL "https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          case "$ZIG_VERSION" in
+            *dev*) ZIG_URL="https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" ;;
+            *) ZIG_URL="https://ziglang.org/download/$ZIG_VERSION/$ART-$ZIG_VERSION.tar.xz" ;;
+          esac
+          curl -fsSL "$ZIG_URL" -o "$RUNNER_TEMP/zig.tar.xz"
           mkdir -p "$RUNNER_TEMP/zig"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig"
           echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
@@ -607,9 +630,9 @@ jobs:
 
       - name: Setup Zig
         # mlugg/setup-zig@v1 builds old-pattern URLs (zig-<os>-<arch>) that
-        # 404 for current dev builds; download the tarball from ziglang.org
-        # directly using the arch-first name. Old dev builds get
-        # garbage-collected — bump ZIG_VERSION when this 404s again.
+        # 404 for current builds; download the tarball from ziglang.org
+        # directly using the arch-first name. The URL branch below picks
+        # /builds/ for dev versions and /download/<ver>/ for stable.
         shell: bash
         run: |
           case "$RUNNER_OS" in
@@ -617,7 +640,11 @@ jobs:
             macOS) ART="zig-aarch64-macos" ;;
             *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
           esac
-          curl -fsSL "https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          case "$ZIG_VERSION" in
+            *dev*) ZIG_URL="https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" ;;
+            *) ZIG_URL="https://ziglang.org/download/$ZIG_VERSION/$ART-$ZIG_VERSION.tar.xz" ;;
+          esac
+          curl -fsSL "$ZIG_URL" -o "$RUNNER_TEMP/zig.tar.xz"
           mkdir -p "$RUNNER_TEMP/zig"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig"
           echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
@@ -682,9 +709,9 @@ jobs:
 
       - name: Setup Zig
         # mlugg/setup-zig@v1 builds old-pattern URLs (zig-<os>-<arch>) that
-        # 404 for current dev builds; download the tarball from ziglang.org
-        # directly using the arch-first name. Old dev builds get
-        # garbage-collected — bump ZIG_VERSION when this 404s again.
+        # 404 for current builds; download the tarball from ziglang.org
+        # directly using the arch-first name. The URL branch below picks
+        # /builds/ for dev versions and /download/<ver>/ for stable.
         shell: bash
         run: |
           case "$RUNNER_OS" in
@@ -692,7 +719,11 @@ jobs:
             macOS) ART="zig-aarch64-macos" ;;
             *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
           esac
-          curl -fsSL "https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          case "$ZIG_VERSION" in
+            *dev*) ZIG_URL="https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" ;;
+            *) ZIG_URL="https://ziglang.org/download/$ZIG_VERSION/$ART-$ZIG_VERSION.tar.xz" ;;
+          esac
+          curl -fsSL "$ZIG_URL" -o "$RUNNER_TEMP/zig.tar.xz"
           mkdir -p "$RUNNER_TEMP/zig"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig"
           echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
@@ -764,9 +795,9 @@ jobs:
 
       - name: Setup Zig
         # mlugg/setup-zig@v1 builds old-pattern URLs (zig-<os>-<arch>) that
-        # 404 for current dev builds; download the tarball from ziglang.org
-        # directly using the arch-first name. Old dev builds get
-        # garbage-collected — bump ZIG_VERSION when this 404s again.
+        # 404 for current builds; download the tarball from ziglang.org
+        # directly using the arch-first name. The URL branch below picks
+        # /builds/ for dev versions and /download/<ver>/ for stable.
         shell: bash
         run: |
           case "$RUNNER_OS" in
@@ -774,7 +805,11 @@ jobs:
             macOS) ART="zig-aarch64-macos" ;;
             *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
           esac
-          curl -fsSL "https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          case "$ZIG_VERSION" in
+            *dev*) ZIG_URL="https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" ;;
+            *) ZIG_URL="https://ziglang.org/download/$ZIG_VERSION/$ART-$ZIG_VERSION.tar.xz" ;;
+          esac
+          curl -fsSL "$ZIG_URL" -o "$RUNNER_TEMP/zig.tar.xz"
           mkdir -p "$RUNNER_TEMP/zig"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig"
           echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
@@ -816,7 +851,11 @@ jobs:
             macOS) ART="zig-aarch64-macos" ;;
             *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
           esac
-          curl -fsSL "https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          case "$ZIG_VERSION" in
+            *dev*) ZIG_URL="https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" ;;
+            *) ZIG_URL="https://ziglang.org/download/$ZIG_VERSION/$ART-$ZIG_VERSION.tar.xz" ;;
+          esac
+          curl -fsSL "$ZIG_URL" -o "$RUNNER_TEMP/zig.tar.xz"
           mkdir -p "$RUNNER_TEMP/zig"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig"
           echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
@@ -953,9 +992,9 @@ jobs:
 
       - name: Setup Zig
         # mlugg/setup-zig@v1 builds old-pattern URLs (zig-<os>-<arch>) that
-        # 404 for current dev builds; download the tarball from ziglang.org
-        # directly using the arch-first name. Old dev builds get
-        # garbage-collected — bump ZIG_VERSION when this 404s again.
+        # 404 for current builds; download the tarball from ziglang.org
+        # directly using the arch-first name. The URL branch below picks
+        # /builds/ for dev versions and /download/<ver>/ for stable.
         shell: bash
         run: |
           case "$RUNNER_OS" in
@@ -963,7 +1002,11 @@ jobs:
             macOS) ART="zig-aarch64-macos" ;;
             *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
           esac
-          curl -fsSL "https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          case "$ZIG_VERSION" in
+            *dev*) ZIG_URL="https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" ;;
+            *) ZIG_URL="https://ziglang.org/download/$ZIG_VERSION/$ART-$ZIG_VERSION.tar.xz" ;;
+          esac
+          curl -fsSL "$ZIG_URL" -o "$RUNNER_TEMP/zig.tar.xz"
           mkdir -p "$RUNNER_TEMP/zig"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig"
           echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
@@ -1122,9 +1165,9 @@ jobs:
 
       - name: Setup Zig
         # mlugg/setup-zig@v1 builds old-pattern URLs (zig-<os>-<arch>) that
-        # 404 for current dev builds; download the tarball from ziglang.org
-        # directly using the arch-first name. Old dev builds get
-        # garbage-collected — bump ZIG_VERSION when this 404s again.
+        # 404 for current builds; download the tarball from ziglang.org
+        # directly using the arch-first name. The URL branch below picks
+        # /builds/ for dev versions and /download/<ver>/ for stable.
         shell: bash
         run: |
           case "$RUNNER_OS" in
@@ -1132,7 +1175,11 @@ jobs:
             macOS) ART="zig-aarch64-macos" ;;
             *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
           esac
-          curl -fsSL "https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          case "$ZIG_VERSION" in
+            *dev*) ZIG_URL="https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" ;;
+            *) ZIG_URL="https://ziglang.org/download/$ZIG_VERSION/$ART-$ZIG_VERSION.tar.xz" ;;
+          esac
+          curl -fsSL "$ZIG_URL" -o "$RUNNER_TEMP/zig.tar.xz"
           mkdir -p "$RUNNER_TEMP/zig"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig"
           echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
@@ -1178,9 +1225,9 @@ jobs:
       - name: Setup Zig
         if: ${{ env.LLM_API_KEY != '' }}
         # mlugg/setup-zig@v1 builds old-pattern URLs (zig-<os>-<arch>) that
-        # 404 for current dev builds; download the tarball from ziglang.org
-        # directly using the arch-first name. Old dev builds get
-        # garbage-collected — bump ZIG_VERSION when this 404s again.
+        # 404 for current builds; download the tarball from ziglang.org
+        # directly using the arch-first name. The URL branch below picks
+        # /builds/ for dev versions and /download/<ver>/ for stable.
         shell: bash
         run: |
           case "$RUNNER_OS" in
@@ -1188,7 +1235,11 @@ jobs:
             macOS) ART="zig-aarch64-macos" ;;
             *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
           esac
-          curl -fsSL "https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          case "$ZIG_VERSION" in
+            *dev*) ZIG_URL="https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" ;;
+            *) ZIG_URL="https://ziglang.org/download/$ZIG_VERSION/$ART-$ZIG_VERSION.tar.xz" ;;
+          esac
+          curl -fsSL "$ZIG_URL" -o "$RUNNER_TEMP/zig.tar.xz"
           mkdir -p "$RUNNER_TEMP/zig"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig"
           echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"

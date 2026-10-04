@@ -1512,8 +1512,12 @@ const StreamReader = struct {
             if (n == 0) return error.EndOfStream;
             return n;
         }
-        var iovecs = [1][]u8{out};
-        const n = self.stream.read(self.io, &iovecs) catch return error.ReadFailed;
+        // Raw read here too, not `stream.read(io, …)`: stable Zig 0.17.0's
+        // `Io.net.Stream.read` destructures the `ReadResult` struct as a tuple
+        // (std/Io/net.zig) and cannot compile at all, and the io `net_read`
+        // path can hang on macOS anyway (see core/sockread.zig). The stream
+        // is a blocking socket in every mode this server runs.
+        const n = std.posix.read(self.stream.socket.handle, out) catch return error.ReadFailed;
         if (n == 0) return error.EndOfStream;
         return n;
     }

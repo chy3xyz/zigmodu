@@ -347,8 +347,8 @@ Disabled drivers → C stubs; runtime `error.DriverNotEnabled` (HTTP 400). Full 
 ### Prerequisites
 
 ```bash
-# Install the pinned Zig toolchain — CI uses this exact dev build:
-zigup 0.17.0-dev.2151+2ec5523d5
+# Install the pinned Zig toolchain — CI uses this exact release:
+zigup 0.17.0
 # (https://ziglang.org/download/ · https://github.com/marler8997/zigup)
 
 # dev builds are garbage-collected from ziglang's mirrors (old ones start
