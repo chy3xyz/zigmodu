@@ -2,6 +2,36 @@
 
 ## [Unreleased]
 
+### 第 142 批：soak-cluster 两阶段 deadline（24h 首跑假红根因修复——harness 预算缺陷，非框架缺陷）（**破坏性：否**——仅 harness）
+
+**24h 首跑报告**（`.soak/soak-cluster-24h.log`，345600 iterations × 250ms × 6 writers）：
+唯一红项是 `drain_timed_out`（deadline-after-sampling）；**其余全部不变量
+24h 健康**：appends=734032（`not_leader_races=0`）· log 三节点收敛
+734023（差 9 = 截止时复制在途，**零洞**）· leader steady、transitions=14、
+leaderless=0、two_leader=0 · presence 100% · bus `send_failures=0` ·
+fds 23→23（max 25，预算内；teardown=5=baseline）· rss 9MiB（max 92，
+预算 128MiB）· threads 28–32。**根因**：publisher 按间隔配速
+（`now - last_publish_ms >= publish_ms`，≤5ms 轮询），每迭代漂移
+~0.9ms；旧 deadline 的 35s 常数余量只够 ≤2.7h 的 run——t=83770s 时仅
+publish 96.6%，deadline 比 writers 跑完早 ~5 分钟触发，假红。
+
+1. **两阶段 deadline**（`src/soak_cluster.zig`）：Phase 1 发布看门狗 =
+   `publish_phase + max(35s, phase/20)`（5% 随相位长度缩放：24h → +72min，
+   1h → +3min）；Phase 2 自 `publishers_remaining` 首次归 0 起改固定
+   `drain_budget_ms = 60s`——无帧可产，投递只需秒级。新增
+   `deadlineNowMs()` 统一盖章 `publish_done_ms` 并计算当前 deadline，
+   before/after-sampling 两个检查点共用（防双拷贝漂移，与
+   `drainDeadlineHit` 同一纪律）。
+2. **comptime Sizing 同步**：worst-case window 公式改
+   `publish_phase + max(35s, phase/20) + drain_budget_ms`（max_samples
+   容量校验随新窗口放大，24h 配置需 3632 ≤ 4096）；模块 doc 公式描述
+   同步更新。
+3. **验证**：fmt 净 · check-production OK · check-test-collection 2172 OK
+   · `soak-compile` exit=0（默认与 **24h 实配** `-Diterations=345600
+   -Dpublish-ms=250 -Dsample-ms=25000` 两发编译验证）· 短跑端到端
+   （iterations=400/publish=10ms/sample=200ms）全投递 400/400、1 passed、
+   0 leaked。
+
 ### 第 141 批：Zig 0.17.0 正式版特性对齐（`addPassthruArgs` 恢复 CLI 透传 + `SafeAllocator` 迁移 + `@divCeil`）（**破坏性：否**）
 
 1. **审计先行**：通读 [0.17.0 release notes](https://ziglang.org/download/0.17.0/release-notes.html)

@@ -164,15 +164,17 @@ const tick_ms: u64 = build_options.soak_cluster_tick_ms;
 const quiesce_ms: u64 = build_options.soak_cluster_quiesce_ms;
 
 // The sample series is a fixed `[max_samples]` array, and the run samples
-// every `sample_ms` for its whole worst-case window (publish phase + quiesce
-// + drain deadline: `iterations*publish_ms + 5s + 30s`). A config whose window
-// needs more samples than the cap does not fail at compile time today — it
-// fails AFTER HOURS of soaking (series-exhausted marks the run failed by
-// design; measured: a 24h run at sample_ms=1000 died at minute 69). The knobs
-// are all comptime build options, so reject the shape here, naming the
-// minimum cadence that fits.
+// every `sample_ms` for its whole worst-case window: publish phase +
+// publish-watchdog margin + drain budget (`iterations*publish_ms + 5s` +
+// `max(35s, phase/20)` + `drain_budget_ms` — see the two-phase deadline in
+// the soak test body). A config whose window needs more samples than the cap
+// does not fail at compile time today — it fails AFTER HOURS of soaking
+// (series-exhausted marks the run failed by design; measured: a 24h run at
+// sample_ms=1000 died at minute 69). The knobs are all comptime build
+// options, so reject the shape here, naming the minimum cadence that fits.
 comptime {
-    const window_ms: u64 = @as(u64, iterations) * publish_ms + 35_000;
+    const publish_phase: u64 = @as(u64, iterations) * publish_ms + 5_000;
+    const window_ms: u64 = publish_phase + @max(35_000, publish_phase / 20) + drain_budget_ms;
     const needed = window_ms / @max(sample_ms, 1) + 1;
     if (needed > max_samples) {
         @compileError(std.fmt.comptimePrint(
@@ -1269,6 +1271,11 @@ const Sample = struct {
 const max_samples = 4096;
 var series: [max_samples]Sample = undefined;
 
+/// Phase-2 deadline budget: once every writer has finished its quota, nothing
+/// is left to produce, so delivery needs seconds, not minutes. Part of the
+/// comptime sample-series sizing above as well as the runtime deadline.
+const drain_budget_ms: u64 = 60_000;
+
 // ── reading the bus's peer registry ─────────────────────────────────────────
 //
 // Every reading below goes through `bus.snapshotNodes(allocator)`
@@ -1445,6 +1452,21 @@ fn reconnectMissingMeshPeers() void {
 // function so the pre-sampling and post-sampling call sites cannot drift apart
 // (two copies of a "did the deadline pass, and if so dump the recv matrix"
 // block is how one of them ends up silently not dumping).
+
+/// The deadline the loop enforces right now, stamping `publish_done_ms` the
+/// first time every writer has finished its quota. The two-phase shape —
+/// publish watchdog while any writer is still producing, publish-done +
+/// `drain_budget_ms` once all are done — is what lets a long run size its
+/// margin to its phase length (see the setup in the soak test body); a
+/// constant margin measured 9x too small on the first 24h run, a false red
+/// with every invariant green. Both `drainDeadlineHit` call sites go through
+/// here so the phase switch cannot fire at only one of them.
+fn deadlineNowMs(publish_watchdog_ms: i64, publish_done_ms: *?i64) i64 {
+    if (publish_done_ms.* == null and publishers_remaining.load(.acquire) == 0) {
+        publish_done_ms.* = Time.monotonicNowMilliseconds();
+    }
+    return if (publish_done_ms.*) |t| t + @as(i64, @intCast(drain_budget_ms)) else publish_watchdog_ms;
+}
 
 /// True when the drain deadline has passed, logging the recv matrix first.
 /// `when` names which of the two check positions fired, so a log whose last
@@ -1638,7 +1660,21 @@ test "soak: 3-node cluster — raft + event bus, leader/fd/RSS invariants" {
     var max_send_failures: u64 = 0;
 
     const publish_phase_ms: u64 = @as(u64, iterations) * publish_ms + 5000;
-    const deadline_ms = Time.monotonicNowMilliseconds() + @as(i64, @intCast(publish_phase_ms + 30_000));
+    // Two-phase deadline. Phase 1 — while any writer is still filling its
+    // quota — is a publish *watchdog*: phase length plus a margin that scales
+    // with it (5%, floor 35s), because the writers pace by interval
+    // (`now - last_publish_ms >= publish_ms` on a `publish_poll_ms` poll) and
+    // every iteration drifts a fraction of the poll period, so a constant
+    // margin only fits short runs. Measured on the first 24h run: 345600
+    // iterations x 250 ms had published 96.6% when the old fixed 35s margin
+    // expired — the deadline fired ~5 minutes before the writers were done, a
+    // false red with every invariant green (log convergence 734023/734032: 9
+    // in flight, zero holes; fds/rss/threads/leader all in budget). Phase 2 —
+    // once `publishers_remaining` hits 0 — shrinks the budget to the fixed
+    // `drain_budget_ms` window: nothing is left to produce, so delivery needs
+    // seconds, not minutes.
+    const publish_watchdog_ms = Time.monotonicNowMilliseconds() + @as(i64, @intCast(publish_phase_ms + @max(35_000, publish_phase_ms / 20)));
+    var publish_done_ms: ?i64 = null;
     const loop_start_ms = Time.monotonicNowMilliseconds();
 
     while (true) {
@@ -1650,7 +1686,7 @@ test "soak: 3-node cluster — raft + event bus, leader/fd/RSS invariants" {
         // reached it at all. Nothing about the verdict changes: the deadline is
         // a wall-clock assertion on a red path either way, and a run that
         // finishes inside its budget never reaches this branch.
-        if (drainDeadlineHit(deadline_ms, "before sampling")) {
+        if (drainDeadlineHit(deadlineNowMs(publish_watchdog_ms, &publish_done_ms), "before sampling")) {
             drain_timed_out = true;
             break_reason = "deadline-before-sampling";
             break;
@@ -1744,7 +1780,7 @@ test "soak: 3-node cluster — raft + event bus, leader/fd/RSS invariants" {
             break;
         }
         probeBusState("run");
-        if (drainDeadlineHit(deadline_ms, "after sampling")) {
+        if (drainDeadlineHit(deadlineNowMs(publish_watchdog_ms, &publish_done_ms), "after sampling")) {
             drain_timed_out = true;
             break_reason = "deadline-after-sampling";
             break;
