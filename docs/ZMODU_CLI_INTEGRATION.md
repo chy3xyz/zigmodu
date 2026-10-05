@@ -29,10 +29,10 @@ zig build zmodu   # 构建 + 安装到 zig-out/bin/zmodu
 zig-out/bin/zmodu scaffold --sql ./schema.sql --name myapp --tenant-column app_id
 ```
 
-> **为什么不是 `zig build zmodu -- scaffold …`**：本仓锁定的 0.17 工具链已移除
-> `b.args`，`zig build <step> -- args` 的 `--` 后参数**不会**传给 run step（实测
-> `zig build zmodu -- version` 只打 usage）。所有需要参数的子命令都必须走
-> `zig-out/bin/zmodu` 形态。
+> **`zig build zmodu -- scaffold …` 也可以**：0.17.0 正式版的
+> `addPassthruArgs` 把 `--` 后参数透传进 run step（dev 工具链移除 `b.args`
+> 造成的断档已补，且改参数不再触发 build 脚本重编）。需要反复调用的脚本仍
+> 建议 `zig-out/bin/zmodu` 形态——每次调用不过构建图检查。
 
 `--tenant-column`（默认 `tenant_id`）控制生成的 `WHERE` 与 scaffold `main` 里的 `zigmodu.setTenantColumn(...)`。模型字段须与列名一致（如 `app_id: i64`）。
 

@@ -418,7 +418,7 @@ pub const RenderExt = struct {
             .total = total,
             .page = page_num,
             .pageSize = page_size,
-            .totalPages = (total + page_size - 1) / page_size,
+            .totalPages = @divCeil(total, page_size),
         } });
     }
 };

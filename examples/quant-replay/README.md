@@ -56,6 +56,7 @@ The run leaves the `ZDL1` log at `./quant-replay-day/`. The offline inspector
 
 ```bash
 ../../zig-out/bin/replay-inspect quant-replay-day --track md --limit 3
+# or, from the repo root: zig build replay-inspect -- examples/quant-replay/quant-replay-day --track md --limit 3
 ```
 
 ```

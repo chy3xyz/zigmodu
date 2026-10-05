@@ -52,7 +52,9 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    // b.args removed in Zig 0.17-dev
+    // Args after `--` reach the app (0.17.0's passthrough API; the dev
+    // toolchain's `b.args` removal is what disabled this form for a while).
+    run_cmd.addPassthruArgs();
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
@@ -337,6 +339,12 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(&zmodu_install.step);
 
     const run_zmodu_cmd = b.addRunArtifact(zmodu_cli_exe);
+    // `zig build zmodu -- scaffold --sql schema.sql --name my_app`: 0.17.0's
+    // passthrough API restores the `b.args` form the dev toolchain removed —
+    // args after `--` reach the CLI and no longer force a build-script rebuild
+    // when they change. The installed `zig-out/bin/zmodu …` form stays valid
+    // for scripts (docs/ZMODU_CLI_INTEGRATION.md).
+    run_zmodu_cmd.addPassthruArgs();
     const zmodu_step = b.step("zmodu", "Build and install the unified zmodu CLI code generator");
     zmodu_step.dependOn(&run_zmodu_cmd.step);
     zmodu_step.dependOn(&zmodu_install.step);
@@ -669,12 +677,11 @@ pub fn build(b: *std.Build) void {
     // not link the framework module (no libc, no DB drivers) so it stays a
     // seconds-fast build.
     //
-    // Invocation is the *installed binary* (`zig build` →
-    // `zig-out/bin/replay-inspect <dir>`), not `zig build replay-inspect --
-    // <dir>`: this pinned toolchain (0.17.0-dev) removed `b.args`, so args
-    // after `--` never reach a run step. The run step below stays as the
-    // self-documenting entry point — run without args the tool prints its
-    // usage, which names the binary form.
+    // Invocation: `zig build replay-inspect -- <dir> …` (passthru args, see
+    // below) or the *installed binary* (`zig build` → `zig-out/bin/
+    // replay-inspect <dir>`) for scripts that should not pay a build-graph
+    // check per call. Run without args the tool prints its usage, which names
+    // both forms.
     const replay_inspect_mod = b.createModule(.{
         .root_source_file = b.path("src/replay_inspect.zig"),
         .target = target,
@@ -686,10 +693,17 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(replay_inspect_exe);
     const run_replay_inspect = b.addRunArtifact(replay_inspect_exe);
+    // `zig build replay-inspect -- <dir> [--from N] [--to N] [--limit N]
+    // [--track NAME]...`: 0.17.0's `addPassthruArgs` forwards everything after
+    // `--` (the dev toolchain's `b.args` removal is what made the installed
+    // binary the only form; the release restored passthrough as a first-class
+    // API). The installed `zig-out/bin/replay-inspect` stays the form for
+    // scripts that should not pay a build-graph check per call.
+    run_replay_inspect.addPassthruArgs();
     // Without this, a cached run result prints nothing on the second
-    // invocation — and printing the usage is all this step does.
+    // invocation — and printing the usage is all a no-arg invocation does.
     run_replay_inspect.has_side_effects = true;
-    const replay_inspect_step = b.step("replay-inspect", "Inspect a delivery-log directory (records, tracks, holes, damage); args via the installed binary: zig-out/bin/replay-inspect <dir> [--from N] [--to N]");
+    const replay_inspect_step = b.step("replay-inspect", "Inspect a delivery-log directory (records, tracks, holes, damage): zig build replay-inspect -- <dir> [--from N] [--to N] [--limit N] [--track NAME]...");
     replay_inspect_step.dependOn(&run_replay_inspect.step);
 
     // Its unit tests ride the default suite (the same file is the tool's root),

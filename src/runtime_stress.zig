@@ -109,15 +109,16 @@
 
 const std = @import("std");
 
-/// Root allocator for the run. `DebugAllocator` keeps the canaries and the leak
-/// check while `stack_trace_frames = 0` turns off the per-alloc stack capture —
-/// on this toolchain each capture permanently leaks ~313 B into
+/// Root allocator for the run. `SafeAllocator` (0.17.0's rename of
+/// `DebugAllocator`) keeps the canaries and the leak check while
+/// `stack_trace_frames = 0` turns off the per-alloc stack capture — on the dev
+/// toolchains each capture permanently leaked ~313 B into
 /// `std.debug.getDebugInfoAllocator()`'s never-reset arena, which is what made
 /// this harness's RSS spread a function of *allocation count* rather than of the
 /// runtime (measured in `src/soak_cluster.zig`: 200k isolated alloc/free with
 /// capture on → +125 MiB, capture off → flat; that harness's RSS went 89 MiB →
 /// 12 MiB with this same swap, at both 2400 and 4800 messages per writer).
-var stress_gpa = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }){};
+var stress_gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
 
 fn stressAllocator() std.mem.Allocator {
     return stress_gpa.allocator();

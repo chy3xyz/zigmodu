@@ -1,10 +1,11 @@
 //! `replay-inspect` — offline incident inspection for a delivery-log
 //! directory (docs/RUNTIME.md §13.9–§13.12).
 //!
-//! Invocation: `zig build` installs it as `zig-out/bin/replay-inspect`;
-//! `zig build replay-inspect` runs it (but the pinned 0.17 toolchain removed
-//! `b.args`, so CLI args after `--` never arrive — pass them to the installed
-//! binary).
+//! Invocation: `zig build replay-inspect -- <dir> …` (0.17.0's
+//! `addPassthruArgs` forwards args after `--`; the dev toolchain's `b.args`
+//! removal is what once broke that form), or the installed
+//! `zig-out/bin/replay-inspect <dir> …` for scripts that should not pay a
+//! build-graph check per call.
 //!
 //! ## What this is
 //!
@@ -340,9 +341,9 @@ pub fn inspect(
 const usage =
     \\Usage: replay-inspect <dir> [--from N] [--to N] [--limit N] [--track NAME]...
     \\
-    \\  (`zig build replay-inspect` builds and runs this tool, but the pinned
-    \\  toolchain does not forward args after `--` — invoke the installed
-    \\  binary: `zig build` once, then `zig-out/bin/replay-inspect <dir> …`)
+    \\  (invoke as `zig build replay-inspect -- <dir> …` — 0.17.0 passthru
+    \\  args reach this tool — or run the installed binary:
+    \\  `zig build` once, then `zig-out/bin/replay-inspect <dir> …`)
     \\
     \\Read a delivery-log directory (docs/RUNTIME.md §13.9) and report what an
     \\incident replay starts from: verified records, the seq range, per-track

@@ -952,7 +952,7 @@ pub fn Orm(comptime B: type) type {
                     var result = try self.orm.backend.queryRows(T, sql, &args);
                     const owned = result.take();
                     const total = try self.countUnscoped();
-                    const total_page = if (size > 0) (total + size - 1) / size else 0;
+                    const total_page = if (size > 0) @divCeil(total, size) else 0;
                     return .{
                         .items = owned.items,
                         .arena = owned.arena,
@@ -979,7 +979,7 @@ pub fn Orm(comptime B: type) type {
                     var result = try self.orm.backend.queryRows(T, sql, &args);
                     const owned = result.take();
                     const total = try self.countForTenant(col, tenant_id);
-                    const total_page = if (size > 0) (total + size - 1) / size else 0;
+                    const total_page = if (size > 0) @divCeil(total, size) else 0;
                     return .{
                         .items = owned.items,
                         .arena = owned.arena,
@@ -1044,7 +1044,7 @@ pub fn Orm(comptime B: type) type {
 
                     var result = try self.orm.backend.queryRows(T, data_sql, all_args);
                     const owned = result.take();
-                    const total_page = if (size > 0) (total + size - 1) / size else 0;
+                    const total_page = if (size > 0) @divCeil(total, size) else 0;
                     return .{
                         .items = owned.items,
                         .arena = owned.arena,
@@ -1098,7 +1098,7 @@ pub fn Orm(comptime B: type) type {
 
                     var result = try self.orm.backend.queryRows(T, data_sql, all_args);
                     const owned = result.take();
-                    const total_page = if (size > 0) (total + size - 1) / size else 0;
+                    const total_page = if (size > 0) @divCeil(total, size) else 0;
                     return .{
                         .items = owned.items,
                         .arena = owned.arena,

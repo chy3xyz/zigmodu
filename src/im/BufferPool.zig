@@ -98,7 +98,7 @@ pub const BufferPool = struct {
 
         // A buffer this pool did not hand out is not ours to free: `allocator.free`
         // needs the allocation's own length, so freeing a differently-sized slice is
-        // wrong (the DebugAllocator rejects it outright). The old code just `return`ed
+        // wrong (the safe allocator rejects it outright). The old code just `return`ed
         // here — the caller's buffer was then neither pooled nor freed, and
         // `allocated` stayed inflated, so `acquire` would eventually report
         // `PoolExhausted` while nothing was actually live. It is a caller bug either

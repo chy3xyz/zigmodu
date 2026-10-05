@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+### 第 141 批：Zig 0.17.0 正式版特性对齐（`addPassthruArgs` 恢复 CLI 透传 + `SafeAllocator` 迁移 + `@divCeil`）（**破坏性：否**）
+
+1. **审计先行**：通读 [0.17.0 release notes](https://ziglang.org/download/0.17.0/release-notes.html)
+   并对照全仓扫描。落地三项，**明确不动**五项：`BufferFirstAllocator`（无
+   stackFallback 使用）、`@hasDecl` 公开语义收窄（模块契约本就是 `pub`，测试
+   全绿无影响）、fuzzer（0.17 无变化，readiness 排期不变）、增量编译
+   （x86_64-linux ELF debug-only，CI 暂不接）、`zig fmt --complexity`
+   （批 136 已接入 `scripts/fmt-complexity.sh`）。
+2. **`addPassthruArgs`：CLI 参数透传恢复**（dev 工具链移除 `b.args` 的断档，
+   正式版补为一等 API，且改参数不再触发 build 脚本重编）。接线三处 run
+   step：`zmodu`（`zig build zmodu -- scaffold …` 恢复可用）、
+   `replay-inspect`（`zig build replay-inspect -- <dir> --track md …`
+   恢复可用）、demo app `run`。**实跑验证**：两条命令各打一发真实调用
+   （inspect 带 --track/--limit 出完整报告、zmodu --help exit 0）。
+   文档回写：`build.zig` 注释、`src/replay_inspect.zig` 模块 doc 与 usage、
+   `docs/RUNTIME.md` §13.14、`docs/ZMODU_CLI_INTEGRATION.md`、`AGENTS.md`
+   文档地图行、`examples/quant-replay/README.md`；安装二进制形态保留为
+   脚本推荐（不过构建图检查）。
+3. **`std.heap.DebugAllocator` → `std.heap.SafeAllocator`**（0.17.0 改名 +
+   线程安全重写；旧名已 deprecated）。迁移两处 harness 根分配器
+   （`soak_cluster.zig` / `runtime_stress.zig`）：`.init(page_allocator,
+   .{ .stack_trace_frames = 0 })` 保持既有语义（关栈捕获防 dev 工具链的
+   per-capture 泄漏，canary 与泄漏门禁不变）；判定 API 从 `std.heap.Check.ok`
+   改为泄漏计数 `@as(usize, 0)`（`soak_cluster.zig` 的 teardown 精确门）。
+   `im/BufferPool.zig` 注释同步正名。
+4. **`@divCeil` 替换手工向上取整 5 处**（`http.zig` 分页 `totalPages` +
+   `Orm.zig` ×4）：新内建语义相同但**无 `total + size - 1` 的溢出窗口**；
+   `size > 0` 守卫保留（除零语义不变）。
+5. **门禁读数**：fmt 净 · check-production OK · `soak-compile` exit=0
+   （两 harness 编译验证）· passthru 两命令实跑验证 · 全量 `zig build test`
+   exit=0。
+
 ### 第 140 批：Deterministic Runtime Phase D（`examples/quant-replay` 同日志双跑实演）——S 级四阶段全量落地（**破坏性：否**——新增示例 + `runtime.delivery_log` 桶导出，既有行为一字未动）
 
 1. **Phase D 实演落地**（设计稿 §4.2/§5，`docs/RUNTIME.md` §15/§15.1；新示例

@@ -1324,13 +1324,14 @@ var series: [max_samples]Sample = undefined;
 ///   writer — versus the 89 / 163 MiB this test used to fail on (including on an
 ///   unchanged tree).
 ///
-/// So the RSS growth was the probe, not the cluster: ~0.75 KB per allocation.
-/// `DebugAllocator` with stack capture off keeps what the harness actually wants
-/// (double-free / write-after-free canaries, leak detection on `deinit`, and a
-/// hard `0 leaked` verdict via `soak_gpa.deinit()` below) without the per-capture
-/// leak. Leak reports lose their call stacks — the tradefair price, and the
-/// snapshots' `defer` discipline is what those stacks were diagnosing.
-var soak_gpa = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }){};
+/// So RSS growth was the probe, not the cluster: ~0.75 KB per allocation.
+/// `SafeAllocator` (0.17.0's rename of `DebugAllocator`) with stack capture off
+/// keeps what the harness actually wants (double-free / write-after-free
+/// canaries, leak detection on `deinit`, and a hard `0` verdict via
+/// `soak_gpa.deinit()` below) without the per-capture leak. Leak reports lose
+/// their call stacks — the tradefair price, and the snapshots' `defer`
+/// discipline is what those stacks were diagnosing.
+var soak_gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
 
 fn soakAllocator() std.mem.Allocator {
     return soak_gpa.allocator();
@@ -1978,6 +1979,7 @@ test "soak: 3-node cluster — raft + event bus, leader/fd/RSS invariants" {
     // The precise gate the RSS envelope is only an approximation of: every
     // byte the fixtures and snapshots took is back. `deinit` also runs the
     // canary checks, so this replaces the runner's `0 leaked` line for this
-    // test (which no longer uses `std.testing.allocator`).
-    try std.testing.expectEqual(std.heap.Check.ok, soak_gpa.deinit());
+    // test (which no longer uses `std.testing.allocator`). `SafeAllocator`'s
+    // verdict is the leaked-allocation count.
+    try std.testing.expectEqual(@as(usize, 0), soak_gpa.deinit());
 }

@@ -2489,11 +2489,10 @@ D7 清单里的 "CLI" 一项落地为 `src/replay_inspect.zig` + 安装产物 `z
 它是**只读**的：事故后第一件事是回答"这份 log 里到底有什么、值不值得重放、从哪个 seq 开始"，
 而不是先起一个 runtime。
 
-**调用形态**：`zig build` 装出 `zig-out/bin/replay-inspect <dir> [--from N] [--to N] [--limit N] [--track NAME]...`。
-（锁定的 0.17 工具链移除了 `b.args`，`zig build replay-inspect -- <args>` 的参数**到不了** run step
-—— 本仓 `zig build zmodu -- …` 的文档形态曾同样受影响，已在第 104 批改为
-`zig-out/bin/zmodu …` 形态，见 `docs/ZMODU_CLI_INTEGRATION.md`。）
-`zig build replay-inspect` 本身保留为自文档入口：无参运行时打印用法并退出。
+**调用形态**：`zig build replay-inspect -- <dir> [--from N] [--to N] [--limit N] [--track NAME]...`
+（0.17.0 的 `addPassthruArgs` 把 `--` 后的参数透传进 run step——dev 工具链移除 `b.args`
+造成的断档已由正式版的一等 API 补上）；或装出后用 `zig-out/bin/replay-inspect <dir> …`，
+适合不想每次调用都过一遍构建图检查的脚本。
 
 **报告什么**（全部来自 `delivery_log.scan` 的已验证前缀，工具自己不猜任何字节）：
 段数、已验证记录数、`seq` 范围、按轨计数（计数降序 + 名字升序，输出字节级稳定可 diff）、
