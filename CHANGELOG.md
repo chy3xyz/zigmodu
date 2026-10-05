@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.39.6] - 2026-10-05
 
 ### 第 143 批：zent 升级 v0.76.2 → v0.83.0（两示例改 pin + `insertMany` 双参适配 + 切换 `linkDrivers`）（**破坏性：否**——示例与文档）
 
