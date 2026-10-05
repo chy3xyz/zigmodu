@@ -296,7 +296,11 @@ BEGIN {
   # InitOptions.deterministic.seed（可复现就是目的），非 det 走 randomSecure +
   # 多源回落；rng() 文档明写非 CSPRNG。
   ENTROPY_OK[6] = "src/runtime/runtime.zig|return std.Random.DefaultPrng.init(seed);"
-  ENTROPY_OK_N = 6
+  # replay_driver 测试辅助：规格侧复现 det seed 的 rng 流（验收 §4.3-1 的
+  # 「不信任录制端」期望流就是靠同 seed 重放 rng 序列算出来的）。它不是熵源 —
+  # 确定性正是断言的内容。
+  ENTROPY_OK[7] = "src/runtime/replay_driver.zig|var prng = std.Random.DefaultPrng.init(seed);"
+  ENTROPY_OK_N = 7
 
   # dettime 豁免（锚定到行文本）：Clock union 的 real 分支本体、
   # PrecisionTimer 真实钟原语本体、以及测试辅助里的真实时间预算

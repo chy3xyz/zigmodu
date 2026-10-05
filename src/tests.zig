@@ -154,6 +154,10 @@ test "compile all source files" {
     _ = @import("runtime.zig");
     // Scheduler: the pooled execution mode of `Runtime.spawn` (docs/RUNTIME.md §12)
     _ = @import("runtime/scheduler.zig");
+    // The deterministic replay driver (docs/RUNTIME.md §15). Reached from the
+    // `runtime.zig` barrel too, but pinned here like `scheduler.zig` is, so a
+    // barrel edit can never orphan its tests.
+    _ = @import("runtime/replay_driver.zig");
     // Delivery-log segments: the storage layer §13.3 Q4 tier 2 builds on. Not
     // re-exported from `runtime.zig` (nothing consumes it yet), so this import is
     // the only thing that makes its tests run at all — the same wiring

@@ -22,10 +22,16 @@
 //!   repairable) or a corrupt record (fully written, does not verify — a
 //!   human's decision, `repair` refuses it).
 //!
-//! With `--from`/`--to` it also lists the records inside one `[from, to)`
-//! window — the same endpoint semantics `ReplayFromLog.open` documents in
-//! §13.12: `from` inclusive, `to` exclusive, `from >= to` an empty window and
-//! not an error.
+//! With `--from`/`--to` it lists the records inside one `[from, to)` window —
+//! the same endpoint semantics `ReplayFromLog.open` documents in §13.12:
+//! `from` inclusive, `to` exclusive, `from >= to` an empty window and not an
+//! error. `--track NAME` (repeatable, union) narrows the listing to named
+//! tracks and `--limit N` caps how many rows are printed; both narrow only
+//! what is *listed* — per-track counts, holes and damage always cover the
+//! whole log, and what a filter screens out is counted
+//! (`skipped unselected`), never invisible. A `--track` name the log does not
+//! mention is refused (`error.UnknownTrack`, exit 1): a typo is not an empty
+//! window.
 //!
 //! ## What this is not
 //!
@@ -60,14 +66,34 @@ const dlog = @import("runtime/delivery_log.zig");
 
 /// The `[from, to)` listing window — §13.12's semantics, verbatim: `from`
 /// inclusive, `to` exclusive, and `to` a *stop* (records at or past it are
-/// counted as skipped-after, never listed). Both `null` means "no window":
-/// the report is a summary and `rows` is empty.
+/// counted as skipped-after, never listed). All four fields null/default means
+/// "no window": the report is a summary and `rows` is empty.
+///
+/// `tracks` narrows the listing to the named tracks (union; the slice is the
+/// caller's and must outlive the report build). What it screens out is counted
+/// (`skipped_unselected`), never invisible — the same discipline
+/// `ReplayFromLog.onlyTracks` has, with one deliberate difference: the filter
+/// here decides *what is listed*, never what is true. Track counts, holes and
+/// damage still cover the whole log.
+///
+/// `limit` caps how many rows are listed; everything past the cap counts as
+/// skipped-after. `0` lists nothing, which is an answer, not an error.
 pub const Window = struct {
     from: ?u64 = null,
     to: ?u64 = null,
+    limit: ?u64 = null,
+    tracks: ?[]const []const u8 = null,
 
     pub fn active(self: Window) bool {
-        return self.from != null or self.to != null;
+        return self.from != null or self.to != null or self.limit != null or self.tracks != null;
+    }
+
+    fn selects(self: Window, track_id: []const u8) bool {
+        const tracks = self.tracks orelse return true;
+        for (tracks) |id| {
+            if (std.mem.eql(u8, id, track_id)) return true;
+        }
+        return false;
     }
 };
 
@@ -126,6 +152,8 @@ pub const Report = struct {
     rows: []Row,
     skipped_before: u64,
     skipped_after: u64,
+    /// Records inside the window the track filter screened out.
+    skipped_unselected: u64,
 
     pub fn deinit(self: *Report, allocator: std.mem.Allocator) void {
         for (self.tracks) |t| allocator.free(t.track_id);
@@ -186,6 +214,24 @@ pub fn inspect(
     var out_of_order: u64 = 0;
     var skipped_before: u64 = 0;
     var skipped_after: u64 = 0;
+    var skipped_unselected: u64 = 0;
+
+    // A track filter names tracks *of this log*: a name it does not mention is
+    // a typo, not an empty answer — refused like `ReplayFromLog.onlyTracks`
+    // refuses it, because "the window you asked for does not exist" must never
+    // read as "the window was empty".
+    if (window.tracks) |tracks| {
+        for (tracks) |id| {
+            var found = false;
+            for (scanned.records) |r| {
+                if (std.mem.eql(u8, r.track_id, id)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return error.UnknownTrack;
+        }
+    }
 
     for (scanned.records, 0..) |r, i| {
         switch (r.kind) {
@@ -225,6 +271,16 @@ pub fn inspect(
             }
             if (window.to) |t| {
                 if (r.seq >= t) {
+                    skipped_after += 1;
+                    continue;
+                }
+            }
+            if (!window.selects(r.track_id)) {
+                skipped_unselected += 1;
+                continue;
+            }
+            if (window.limit) |cap| {
+                if (rows.items.len >= cap) {
                     skipped_after += 1;
                     continue;
                 }
@@ -275,13 +331,14 @@ pub fn inspect(
         .rows = try rows.toOwnedSlice(allocator),
         .skipped_before = skipped_before,
         .skipped_after = skipped_after,
+        .skipped_unselected = skipped_unselected,
     };
 }
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
 const usage =
-    \\Usage: replay-inspect <dir> [--from N] [--to N]
+    \\Usage: replay-inspect <dir> [--from N] [--to N] [--limit N] [--track NAME]...
     \\
     \\  (`zig build replay-inspect` builds and runs this tool, but the pinned
     \\  toolchain does not forward args after `--` — invoke the installed
@@ -292,9 +349,15 @@ const usage =
     \\and per-kind counts, holes in the sequence chain, and the damage that
     \\stopped the scan. Never writes.
     \\
-    \\  <dir>       directory holding delivery-<id>.log segments
-    \\  --from N    list records with seq >= N (inclusive)
-    \\  --to N      stop listing at seq N (exclusive; §13.12 window semantics)
+    \\  <dir>        directory holding delivery-<id>.log segments
+    \\  --from N     list records with seq >= N (inclusive)
+    \\  --to N       stop listing at seq N (exclusive; §13.12 window semantics)
+    \\  --limit N    list at most N records (the rest counts as skipped-after)
+    \\  --track NAME list only this track; repeatable (union). A NAME the log
+    \\               does not mention is refused — a typo is not an empty window.
+    \\
+    \\Filtering narrows only what is *listed*: per-track counts, holes and
+    \\damage always cover the whole log.
     \\
     \\Exit codes: 0 clean · 1 usage/I-O error · 2 torn tail · 3 corrupt record.
     \\
@@ -321,6 +384,8 @@ pub fn main(init: std.process.Init) !void {
 
     var dir_path: ?[]const u8 = null;
     var window: Window = .{};
+    var tracks: std.ArrayList([]const u8) = .empty;
+    defer tracks.deinit(allocator);
     var i: usize = 1; // args[0] is the executable name
     while (i < args.items.len) : (i += 1) {
         const a = args.items[i];
@@ -334,6 +399,15 @@ pub fn main(init: std.process.Init) !void {
             if (i >= args.items.len) return usageError("missing value after --to");
             window.to = std.fmt.parseInt(u64, args.items[i], 10) catch
                 return usageError("--to needs a non-negative integer");
+        } else if (std.mem.eql(u8, a, "--limit")) {
+            i += 1;
+            if (i >= args.items.len) return usageError("missing value after --limit");
+            window.limit = std.fmt.parseInt(u64, args.items[i], 10) catch
+                return usageError("--limit needs a non-negative integer");
+        } else if (std.mem.eql(u8, a, "--track")) {
+            i += 1;
+            if (i >= args.items.len) return usageError("missing value after --track");
+            try tracks.append(allocator, args.items[i]);
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
             try out.writeAll(usage);
             try out.flush();
@@ -346,6 +420,7 @@ pub fn main(init: std.process.Init) !void {
             return usageError(a);
         }
     }
+    if (tracks.items.len > 0) window.tracks = tracks.items;
 
     const dir = dir_path orelse {
         try out.writeAll(usage);
@@ -354,7 +429,18 @@ pub fn main(init: std.process.Init) !void {
     };
 
     var report = inspect(allocator, io, dir, window) catch |err| {
-        try out.print("replay-inspect: {s}: {s}\n", .{ dir, @errorName(err) });
+        if (err == error.UnknownTrack) {
+            try out.writeAll("replay-inspect: ");
+            try out.writeAll(dir);
+            try out.writeAll(": unknown --track (not in this log):");
+            for (window.tracks.?) |id| {
+                try out.writeAll(" ");
+                try out.writeAll(id);
+            }
+            try out.writeAll("\n");
+        } else {
+            try out.print("replay-inspect: {s}: {s}\n", .{ dir, @errorName(err) });
+        }
         try out.flush();
         std.process.exit(1);
     };
@@ -414,14 +500,25 @@ fn printReport(out: anytype, dir: []const u8, report: *const Report) !void {
             } else {
                 try out.print("window [{d}, end): ", .{f});
             }
+        } else if (report.window.to) |t| {
+            try out.print("window [start, {d}): ", .{t});
         } else {
-            // `active()` means at least one bound is set, so this is `--to` only.
-            try out.print("window [start, {d}): ", .{report.window.to.?});
+            try out.writeAll("window [start, end): ");
         }
-        try out.print("{d} record(s) listed (skipped {d} before, {d} after)\n", .{
+        if (report.window.tracks) |tracks| {
+            try out.writeAll("tracks {");
+            for (tracks, 0..) |id, k| {
+                if (k != 0) try out.writeAll(", ");
+                try out.writeAll(id);
+            }
+            try out.writeAll("} ");
+        }
+        if (report.window.limit) |cap| try out.print("limit {d} ", .{cap});
+        try out.print("{d} record(s) listed (skipped {d} before, {d} after, {d} unselected)\n", .{
             report.rows.len,
             report.skipped_before,
             report.skipped_after,
+            report.skipped_unselected,
         });
         for (report.rows) |r| {
             try out.print("  seq={d} track={s} kind={s} recorded_ns={d} payload={d}B\n", .{
@@ -664,4 +761,80 @@ test "replay-inspect: a missing directory is an error, not an empty report" {
         error.FileNotFound,
         inspect(std.testing.allocator, io, ".zig-cache/tmp/replay-inspect-no-such-dir", .{}),
     );
+}
+
+test "replay-inspect: --track narrows the listing, never the truth" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var t = TestDir.init();
+    defer t.deinit();
+    const dir_path = try t.path();
+    try writeTestLog(io, dir_path);
+
+    // One track: book holds seq 0, 2, 11; the two risk records are counted,
+    // not hidden — and the hole report still covers the whole log.
+    const one = [_][]const u8{"book"};
+    var book = try inspect(allocator, io, dir_path, .{ .tracks = &one });
+    defer book.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 3), book.rows.len);
+    try std.testing.expectEqual(@as(u64, 0), book.rows[0].seq);
+    try std.testing.expectEqual(@as(u64, 2), book.rows[1].seq);
+    try std.testing.expectEqual(@as(u64, 11), book.rows[2].seq);
+    try std.testing.expectEqual(@as(u64, 2), book.skipped_unselected);
+    try std.testing.expectEqual(@as(u64, 0), book.skipped_before);
+    try std.testing.expectEqual(@as(u64, 0), book.skipped_after);
+    try std.testing.expectEqual(@as(usize, 1), book.holes.len);
+    try std.testing.expectEqual(@as(usize, 2), book.tracks.len); // counts unfiltered
+    try std.testing.expectEqual(@as(usize, 5), book.records);
+
+    // The union of both tracks is the whole log.
+    const both = [_][]const u8{ "book", "risk" };
+    var all = try inspect(allocator, io, dir_path, .{ .tracks = &both });
+    defer all.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 5), all.rows.len);
+    try std.testing.expectEqual(@as(u64, 0), all.skipped_unselected);
+
+    // A track the log never mentions is a typo, not an empty window.
+    const typo = [_][]const u8{"bok"};
+    try std.testing.expectError(
+        error.UnknownTrack,
+        inspect(allocator, io, dir_path, .{ .tracks = &typo }),
+    );
+}
+
+test "replay-inspect: --limit caps the listing and counts the rest as after" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var t = TestDir.init();
+    defer t.deinit();
+    const dir_path = try t.path();
+    try writeTestLog(io, dir_path);
+
+    // The cap lists the window's first N records in log order; what does not
+    // fit is skipped-after, exactly like records past `--to`.
+    var two = try inspect(allocator, io, dir_path, .{ .limit = 2 });
+    defer two.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), two.rows.len);
+    try std.testing.expectEqual(@as(u64, 0), two.rows[0].seq);
+    try std.testing.expectEqual(@as(u64, 1), two.rows[1].seq);
+    try std.testing.expectEqual(@as(u64, 3), two.skipped_after);
+
+    // 0 lists nothing, which is an answer, not an error.
+    var none = try inspect(allocator, io, dir_path, .{ .limit = 0 });
+    defer none.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), none.rows.len);
+    try std.testing.expectEqual(@as(u64, 5), none.skipped_after);
+
+    // Combined with a track filter: unselected and past-cap count separately.
+    // risk holds seq 1 and 10; the cap keeps seq 1, seq 10 is after, and the
+    // three book records are unselected.
+    const risk = [_][]const u8{"risk"};
+    var combo = try inspect(allocator, io, dir_path, .{ .tracks = &risk, .limit = 1 });
+    defer combo.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), combo.rows.len);
+    try std.testing.expectEqual(@as(u64, 1), combo.rows[0].seq);
+    try std.testing.expectEqualStrings("risk", combo.rows[0].track_id);
+    try std.testing.expectEqual(@as(u64, 3), combo.skipped_unselected);
+    try std.testing.expectEqual(@as(u64, 1), combo.skipped_after);
+    try std.testing.expectEqual(@as(u64, 0), combo.skipped_before);
 }

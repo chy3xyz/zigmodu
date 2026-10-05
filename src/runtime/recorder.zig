@@ -1590,6 +1590,22 @@ pub const ReplayFromLog = struct {
     /// (§13.10 D3): a replay that jumps a hole silently is a replay that looks
     /// complete without being one.
     allow_holes: bool = false,
+    /// Whether a `.timer` record is handed back **without being delivered**:
+    /// the deterministic replay driver (`replay_driver.zig`) reproduces timer
+    /// deliveries from the replayed runtime's own wheel — the handler re-arms
+    /// the same timer for the same reason, and the wheel fires it when the
+    /// driver advances the clock across its deadline. Re-posting the file's
+    /// copy as well would hand the worker every timer payload twice. What the
+    /// file's `.timer` record remains good for is exactly what it was recorded
+    /// for: evidence — it anchors the seq chain, moves the clock to the
+    /// recorded stamp (so the driver's next tick fires the reproduction at the
+    /// recorded deadline), and is counted (`timerRecords`) so "reproduced" and
+    /// "silently dropped" never read the same. Default `false`: every record
+    /// is delivered, the §13.10 contract the pinned tests sit on.
+    reproduce_timers: bool = false,
+    /// `.timer` records walked past in reproduce mode. Not part of `skipped()`:
+    /// nothing was skipped — the delivery happens, produced by the wheel.
+    timer_records: u64 = 0,
     /// The track id the last refusal was about, or null when there was none. Set
     /// by every refusing call and cleared where it is set, so it is never stale
     /// (the discipline `DeliveryLog.drainRefusal` has). Read back with
@@ -1764,6 +1780,23 @@ pub const ReplayFromLog = struct {
                 self.refusal_seq = self.pending_first;
                 return self.refuse(record.track_id, error.LogHasHoles);
             }
+            if (self.reproduce_timers and record.kind == .timer) {
+                // Reproduce mode (see the field): the wheel fires this delivery
+                // again, so the file's copy is evidence, not input. The clock
+                // still moves to the recorded stamp — the driver's tick at this
+                // step is what fires the reproduction at its recorded deadline —
+                // and the record still anchors the seq chain, exactly like a
+                // delivery that crossed whatever gap came before it… except the
+                // hole folding stays pending: *crossing* is a delivery's word,
+                // and this record delivered nothing.
+                const clock_ms = @divTrunc(record.recorded_ns, std.time.ns_per_ms);
+                self.manual.set(clock_ms);
+                self.last_seq = record.seq;
+                self.cursor += 1;
+                self.timer_records += 1;
+                self.arrival_folded = false;
+                return .{ .seq = record.seq, .clock_ms = clock_ms, .id = record.track_id, .kind = record.kind };
+            }
             const slot = self.slotIndex(record.track_id) orelse {
                 self.refusal_seq = record.seq;
                 return self.refuse(record.track_id, error.UnboundTrack);
@@ -1894,6 +1927,30 @@ pub const ReplayFromLog = struct {
         self.allow_holes = false;
     }
 
+    /// Reproduce mode for `.timer` records (the field documents the whole
+    /// contract): they are handed back as steps — clock moved, chain anchored,
+    /// counted — but **not delivered**, because the replayed runtime's own
+    /// wheel fires them again. The deterministic replay driver
+    /// (`replay_driver.zig`) turns this on at `init`; a caller driving
+    /// `ReplayFromLog` by hand and pumping the wheel itself may do the same.
+    /// `replayAll` rides along: its count then includes timer steps, which are
+    /// not deliveries — in reproduce mode prefer reading `timerRecords()`
+    /// beside it.
+    pub fn reproduceTimers(self: *Self) void {
+        self.reproduce_timers = true;
+    }
+
+    /// Back to delivering every record, the §13.10 default.
+    pub fn deliverTimers(self: *Self) void {
+        self.reproduce_timers = false;
+    }
+
+    /// `.timer` records walked past in reproduce mode — the deliveries the
+    /// replayed runtime's wheel is expected to produce by itself.
+    pub fn timerRecords(self: *const Self) u64 {
+        return self.timer_records;
+    }
+
     /// Deliveries the file does not hold, seen so far: the gaps the reader has
     /// walked over, plus the gap (if any) in front of the entry the cursor is at —
     /// so a refusal reports how much is missing too. A gap *after* the last record
@@ -1948,6 +2005,9 @@ pub const ReplayFromLog = struct {
     pub fn isFullyBound(self: *const Self) bool {
         for (self.records) |record| {
             if (!self.selects(record.track_id)) continue;
+            // Reproduce mode: a timer-only track is never delivered into, so it
+            // needs no codec and no handle — the wheel is its channel.
+            if (self.reproduce_timers and record.kind == .timer) continue;
             const slot = self.slotIndex(record.track_id) orelse return false;
             const state = &self.tracks.items[slot];
             if (state.deliver == null or state.target == null) return false;
@@ -2012,6 +2072,7 @@ pub const ReplayFromLog = struct {
         self.pending_first = null;
         self.first_hole_seq = null;
         self.duplicates = 0;
+        self.timer_records = 0;
         self.arrival_folded = false;
         while (self.cursor < self.order.len) {
             const record = self.records[self.order[self.cursor]];
@@ -4088,4 +4149,96 @@ test "ReplayFromLog: remaining is exact with duplicates ahead, and repositioning
     try std.testing.expectEqual(@as(u64, 0), split.duplicateSeqs());
     split.seekTo(0);
     try std.testing.expectEqual(@as(usize, 3), split.remaining());
+}
+
+test "ReplayFromLog.reproduceTimers: timer records are walked, not delivered — and the chain, clock and counts still hold" {
+    const allocator = std.testing.allocator;
+
+    // Five records, one interior hole (seq 4): two "evt" messages, then three
+    // "tick" timer records around the gap. Hand-built: §13.11 already pins the
+    // kind's path from funnel to file; what is on trial here is the reader.
+    var payloads: [5][4]u8 = undefined;
+    var records: [5]dlog.Record = undefined;
+    const shapes = [_]struct { seq: u64, id: []const u8, kind: dlog.Kind, value: u32 }{
+        .{ .seq = 0, .id = "evt", .kind = .message, .value = 10 },
+        .{ .seq = 1, .id = "tick", .kind = .timer, .value = 99 },
+        .{ .seq = 2, .id = "evt", .kind = .message, .value = 20 },
+        .{ .seq = 3, .id = "tick", .kind = .timer, .value = 98 },
+        .{ .seq = 5, .id = "tick", .kind = .timer, .value = 97 },
+    };
+    for (shapes, 0..) |shape, i| {
+        std.mem.writeInt(u32, &payloads[i], shape.value, .little);
+        records[i] = .{
+            .seq = shape.seq,
+            .track_id = shape.id,
+            .kind = shape.kind,
+            .recorded_ns = @as(i64, @intCast(shape.seq)) * 10 * std.time.ns_per_ms,
+            .payload = &payloads[i],
+        };
+    }
+
+    var manual = Clock.Manual{ .now_ms = 0 };
+    var evt_target = FakeTarget(u32){};
+    var loader = try ReplayFromLog.init(allocator, &manual, &records);
+    defer loader.deinit();
+    try loader.setCodec("evt", U32Codec, u32);
+    try loader.bindDecoded("evt", &evt_target);
+    loader.reproduceTimers();
+    // "tick" carries only timer records, and reproduce mode needs no channel
+    // for those — the wheel is their channel. So the reader is fully bound with
+    // nothing declared for "tick" at all.
+    try std.testing.expect(loader.isFullyBound());
+    try std.testing.expectEqual(@as(usize, 5), loader.remaining()); // steps, both kinds
+
+    // seq 0: a plain delivery, reproduce mode changes nothing for it.
+    const first = (try loader.step()).?;
+    try std.testing.expectEqual(dlog.Kind.message, first.kind);
+    try std.testing.expectEqualSlices(u32, &.{10}, evt_target.taken());
+
+    // seq 1: a timer step — clock moved, chain anchored, counted, **not** delivered.
+    const timer_step = (try loader.step()).?;
+    try std.testing.expectEqual(dlog.Kind.timer, timer_step.kind);
+    try std.testing.expectEqual(@as(u64, 1), timer_step.seq);
+    try std.testing.expectEqual(@as(i64, 10), timer_step.clock_ms);
+    try std.testing.expectEqual(@as(i64, 10), manual.now_ms);
+    try std.testing.expectEqualStrings("tick", timer_step.id);
+    try std.testing.expectEqual(@as(usize, 1), evt_target.taken().len); // still just the one
+    try std.testing.expectEqual(@as(u64, 1), loader.timerRecords());
+    try std.testing.expectEqual(@as(usize, 0), loader.skipped()); // not skipped: walked, on purpose
+
+    // seq 2 delivered, seq 3 walked; then the hole in front of seq 5 still
+    // refuses by default — reproduce mode is not a hole mode.
+    _ = (try loader.step()).?;
+    _ = (try loader.step()).?;
+    try std.testing.expectError(error.LogHasHoles, loader.step());
+    try std.testing.expectEqualStrings("tick", loader.refusal().?);
+    try std.testing.expectEqual(@as(?u64, 4), loader.refusalSeq());
+    try std.testing.expectEqual(@as(?u64, 4), loader.firstHoleSeq());
+
+    // Crossing declared: the timer step is handed over, the hole is *seen* —
+    // and stays pending rather than crossed, because crossing is a delivery's
+    // word and this record delivered nothing.
+    loader.allowHoles();
+    const last = (try loader.step()).?;
+    try std.testing.expectEqual(@as(u64, 5), last.seq);
+    try std.testing.expectEqual(@as(i64, 50), manual.now_ms);
+    try std.testing.expectEqual(@as(?LogStep, null), try loader.step());
+    try std.testing.expectEqual(@as(u64, 1), loader.holesSeen());
+    try std.testing.expectEqual(@as(u64, 0), loader.crossedHoles());
+    try std.testing.expectEqual(@as(u64, 3), loader.timerRecords());
+    try std.testing.expectEqualSlices(u32, &.{ 10, 20 }, evt_target.taken());
+
+    // Back to the §13.10 default: re-seek, bind the timer track too, and every
+    // record is delivered — the mode is a switch, not a second reader. The
+    // targets accumulate, so evt's slice shows the first walk's pair and this
+    // walk's pair: a re-seek really re-delivers.
+    var tick_target = FakeTarget(u32){};
+    try loader.setCodec("tick", U32Codec, u32);
+    try loader.bindDecoded("tick", &tick_target);
+    loader.deliverTimers();
+    loader.seekTo(0);
+    try std.testing.expectEqual(@as(usize, 5), try loader.replayAll());
+    try std.testing.expectEqualSlices(u32, &.{ 10, 20, 10, 20 }, evt_target.taken());
+    try std.testing.expectEqualSlices(u32, &.{ 99, 98, 97 }, tick_target.taken());
+    try std.testing.expectEqual(@as(u64, 0), loader.timerRecords()); // no reproduce-mode steps this walk
 }

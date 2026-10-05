@@ -35,6 +35,10 @@ pub const sequencer = @import("runtime/sequencer.zig");
 pub const hot_bus = @import("runtime/hot_bus.zig");
 /// Recorder module: bounded delivery log + replay against a manual clock.
 pub const recorder = @import("runtime/recorder.zig");
+/// Replay driver module: the deterministic (S-level) playback of a delivery
+/// log through a det-mode runtime — tick + settle between steps
+/// (docs/RUNTIME.md §15, dev/deterministic-runtime-design.md §4.2).
+pub const replay_driver = @import("runtime/replay_driver.zig");
 /// Scheduler module: the pool behind `.mode = .pooled` (docs/RUNTIME.md §12).
 pub const scheduler = @import("runtime/scheduler.zig");
 /// Supervisor module: supervision groups — policies, restart budget, the tree

@@ -2489,7 +2489,7 @@ D7 清单里的 "CLI" 一项落地为 `src/replay_inspect.zig` + 安装产物 `z
 它是**只读**的：事故后第一件事是回答"这份 log 里到底有什么、值不值得重放、从哪个 seq 开始"，
 而不是先起一个 runtime。
 
-**调用形态**：`zig build` 装出 `zig-out/bin/replay-inspect <dir> [--from N] [--to N]`。
+**调用形态**：`zig build` 装出 `zig-out/bin/replay-inspect <dir> [--from N] [--to N] [--limit N] [--track NAME]...`。
 （锁定的 0.17 工具链移除了 `b.args`，`zig build replay-inspect -- <args>` 的参数**到不了** run step
 —— 本仓 `zig build zmodu -- …` 的文档形态曾同样受影响，已在第 104 批改为
 `zig-out/bin/zmodu …` 形态，见 `docs/ZMODU_CLI_INTEGRATION.md`。）
@@ -2507,12 +2507,20 @@ kind 分布、**洞列表**（`after/before/缺多少条`，§13.9 D3 的两类�
 （完整性是 log 的属性，不是窗口的属性）。`skipped before/after` 两个计数让"窗口外有多少"
 始终可见。载荷只按长度报告 —— 解码与投递是 `ReplayFromLog` 的事，本节不越界。
 
+**过滤（第 139 批，§13.10 D7 的 seek/limit/filter 三半收齐）**：`--track NAME`
+（可重复、取并集）把列出收窄到具名轨，`--limit N` 截断列出条数（`0` 列零条，是答案不是错误）。
+两者只收窄**列出**：按轨计数、洞、damage 永远覆盖整份 log；被滤掉的记录分别计入
+`skipped_unselected` / `skipped_after`，永不隐身（与 `ReplayFromLog.onlyTracks` 同一纪律）。
+log 里不存在的 track 名直接拒（`UnknownTrack`，exit 1）—— typo 不是空窗。
+
 **退出码即门禁**：`0` clean · `1` 用法/IO · `2` torn tail · `3` corrupt record ——
 脚本可以 `replay-inspect data/delivery || exit` 直接当"log 是否完整"的探针用。
 
 **编译门禁**：该文件是独立根模块（同 `runtime_stress.zig` 路线），单元测试经 `addTest` 进
-`zig build test` 默认套件（6 条：干净 log 全字段 / 窗口五态含单边与空窗 / 撕裂尾字节数 +
-exit 2 / 翻转字节 → corrupt 定位 + exit 3 / 空 log / 目录缺失是错误不是空报告），
+`zig build test` 默认套件（8 条：干净 log 全字段 / 窗口五态含单边与空窗 / 撕裂尾字节数 +
+exit 2 / 翻转字节 → corrupt 定位 + exit 3 / 空 log / 目录缺失是错误不是空报告 /
+`--track` 收窄列出但计数洞报告不窄 + 并集 + 未知轨拒收 / `--limit` 截断计入 after +
+`--limit 0` + track×limit 组合），
 `src/tests.zig` 的 `tests_in_other_artifacts` 有对应条目 —— 不进任何编译单元而烂掉的
 那类事故（`RequestParser.parse`、`PanicHook`）在这个文件上不可能重演。
 
@@ -2520,7 +2528,7 @@ exit 2 / 翻转字节 → corrupt 定位 + exit 3 / 空 log / 目录缺失是错
 跨进程/跨机、压缩加密、修复操作（`repair` 保持 API 级显式调用，不进 CLI —— 报告里指名它，
 是让运维决定，不是让工具替他决定）。
 
-## 15. Deterministic mode —— Phase B 已落地（v0.36 后批次 138）
+## 15. Deterministic mode —— Phase C 已落地（v0.36 后批次 139）
 
 > 设计与分级（D/S/P 三级、六条不变式、四阶段路线）在
 > [`dev/deterministic-runtime-design.md`](dev/deterministic-runtime-design.md)；
@@ -2559,5 +2567,46 @@ HotBus 的 drop-on-full 在 det 下由「订阅者同线程 drain」约束覆盖
 production 不得直读 `core/Time.zig`（豁免仅 Clock real 分支 / PrecisionTimer 本体 /
 测试辅助，逐行锚定，变异实测被抓）。
 
-**仍未做（Phase C/D）**：replay driver + `ZDL1` 的 seek/limit/filter CLI
-（§13.10 自列缺口）、quant 场景同日志双跑实演、P 级进程确定性（明确不做）。
+**仍未做（Phase D）**：quant 场景同日志双跑实演、P 级进程确定性（明确不做）。
+
+### 15.1 Replay driver（Phase C，批次 139）——把 ZDL1 日志开回 runtime
+
+`runtime/replay_driver.zig` 的 `replay.Driver` 是 §4.2 设计稿的落地：把一份录制好的
+delivery log 在 det runtime 上**逐条开回去**，时钟、消息、定时器、级联全部走受控链路。
+
+```zig
+var rt = try Runtime.initWithOptions(allocator, io, .{
+    .clock = .{ .manual = &clk },
+    .scheduler = .{ .max_pooled_workers = 8 },   // det 下 pool_threads 必须 = 1（默认）
+    .deterministic = .{ .seed = 42 },
+});
+defer rt.deinit();
+// … spawn worker、绑定 track …
+var loader = try recorder.ReplayFromLog.open(allocator, io, .{ .dir_path = dir });
+defer loader.deinit();
+var driver = try replay.Driver.init(&rt, io, &loader);  // 自动开 reproduce 模式
+const report = try driver.runToEnd();   // 或 runUntilSeq(N) / runUntilClock(t)
+```
+
+**init 三拒**（Fail fast，错误点名模式）：det 未开 → `error.NotDeterministic`；
+无池（`max_pooled_workers` 缺省 0）→ `error.NoPool`；ticker 已在跑 →
+`error.TickerRunning`（两个时间源不可并存）。
+
+**迭代循环**：`loader.step()`（Manual Clock 拨到记录时间 + 投递 `.message` 记录）→
+`rt.tick()`（drain 命令环 + TimerWheel 触发到期定时器）→ `settle()`（等
+`poolStats().idle_waits` 首次增量；driver 是唯一外部生产者、park 只发生在 `turn()`
+空转后，故首次 park ⟹ 级联淬火；30 万迭代 × 200 µs 的纯计数预算防 wedge，**不读钟**，
+D1 的 dettime 门禁零豁免）。同戳记录与日志同序（先投记录再 tick）。
+
+**定时器是复现，不是重投**：`reproduce` 模式下 `.timer` 记录**不投递**——它们由
+回放端的 TimerWheel 在相同时钟点上确定性重现（记录本身仍拨钟、锚 seq 链、计数，
+洞纪律与默认模式一字不变）。`isFullyBound` 相应跳过 `.timer`：纯定时器轨无需绑定。
+
+**录制纪律（S 级）**：只录**输入边界 worker**。级联消息与定时器同为输入的确定性
+函数，回放端必然重现——录了再投就是双投递。`.timer` 记录是证据，不是输入。
+
+**验收（§4.3-1/2/3 全量，设计稿 §5 表）**：同 seed 十跑 digest 字节级相同；A 录制端
+与 B 回放端输入轨逐条一致；级联流与**本地同 seed Prng 独立预算**的期望流一致
+（不信录制端）；12 个 `.timer` 全由 wheel 复现；seed=43 合法分叉。三条变异实测红：
+manual 改直读真实钟（`expected 24, found 12`）、`seedPrng` 无视 det seed
+（digest idx 573 分叉）、TimerWheel 改回 LIFO（D4 测试 `expected 100, found 200`）。

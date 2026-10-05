@@ -2,6 +2,45 @@
 
 ## [Unreleased]
 
+### 第 139 批：Deterministic Runtime Phase C（replay.Driver + `replay-inspect --limit/--track`）——同一份日志开回 runtime，可证明（**破坏性：否**——`ReplayFromLog` 默认行为一字未动，CLI 纯增量）
+
+1. **Phase C-A：`replay.Driver` 落地**（设计稿 §4.2，`docs/RUNTIME.md` 新增 §15.1；
+   新文件 `src/runtime/replay_driver.zig`）：把 `ZDL1` delivery log 在 det runtime 上
+   逐条开回去。`init` 三拒（Fail fast，错误点名模式）：det 未开 →
+   `error.NotDeterministic`、无池 → `error.NoPool`、ticker 在跑 →
+   `error.TickerRunning`。迭代循环 = `loader.step()`（Manual Clock 拨到记录时间 +
+   投递 `.message`）→ `rt.tick()`（drain 命令环 + TimerWheel 触发到期定时器）→
+   `settle()`（等 `poolStats().idle_waits` 首次增量——driver 是唯一外部生产者、
+   park 只发生在 `turn()` 空转后，故首次 park ⟹ 级联淬火；30 万迭代 × 200 µs
+   纯计数预算防 wedge，**不读钟**，D1 dettime 门禁零豁免）。三种 run 界
+   （`runToEnd` / `runUntilSeq`（含）/ `runUntilClock`（含）），返回 `RunReport`，
+   拒绝后 cursor 不动可续跑。配套 `recorder.zig`：`ReplayFromLog` 新增 reproduce
+   模式（`reproduceTimers()`——`.timer` 记录不投递只拨钟/锚链/计数，洞纪律不变；
+   `isFullyBound` 跳过 `.timer`，纯定时器轨无需绑定）。**录制纪律落定（S 级）**：
+   只录输入边界 worker——级联消息与定时器同为输入的确定性函数，回放端必然重现，
+   录了再投即双投递；`.timer` 记录是证据不是输入。
+2. **验收 §4.3-1/2/3 全量**：同 seed=42 十跑 digest 字节级相同；A 录制端与 B 回放端
+   输入轨逐条一致；级联流与**本地同 seed Prng 独立预算**的期望流一致（不信录制端）；
+   12 个 `.timer` 全由 wheel 复现（`delivered=12, timer_steps=12`）；seed=43 双跑
+   一致且 ≠ 42（合法分叉）；同 deadline 双定时器经 driver 全链路 FIFO（D4 回归）。
+   **三变异实测红**（均已回退）：manual 分支改直读真实钟 → `expected 24, found 12`；
+   `seedPrng` 无视 det seed → digest idx 573 分叉；TimerWheel 改回 LIFO → D4 测试
+   `expected 100, found 200`。
+3. **Phase C-B：`replay-inspect --limit N` / `--track NAME`**（§13.10 D7 的
+   seek/limit/filter 三半收齐，RUNTIME.md §13.14）：`--track` 可重复取并集，
+   `--limit 0` 列零条是答案不是错误；两者只收窄**列出**——按轨计数、洞、damage
+   永远覆盖整份 log，被滤掉的计入 `skipped_unselected`/`skipped_after` 永不隐身
+   （与 `ReplayFromLog.onlyTracks` 同纪律）；log 里不存在的 track 名拒
+   `UnknownTrack`（exit 1）——typo 不是空窗。CLI 测试 6 → 8 条。
+4. **门禁读数**：fmt 净 · check-production OK（entropy 扫描新增 `ENTROPY_OK[7]`
+   锚——driver 测试辅助的规格侧 rng 流复现；dettime 对 `replay_driver.zig` 零命中）
+   · check-test-collection **2172**（+5：reproduce 模式 1 + driver 4）·
+   `replay-inspect` 8/8 · `replay` 过滤 29/29 · 全量 `zig build test` exit=0（241s）。
+5. **文档同步**：RUNTIME.md §15 标题改 Phase C、新增 §15.1（driver 使用契约 +
+   录制纪律 + 验收数字）、§13.14 补 --limit/--track 段（测试数 6 → 8）；
+   设计稿 §5 表 C 行标 ✅（含三变异数字）；readiness A-6 行标 Phase C ✅
+   （剩 Phase D：quant 场景同日志双跑实演）。
+
 ### 第 138 批：Deterministic Runtime Phase B（det 配置面 + `rng()`）+ D4 定时器同 deadline LIFO→FIFO + allocPrint 清零（**破坏性：窄**——TimerWheel 同槽触发序方向反转）
 
 1. **Phase B 落地**（设计稿 `docs/dev/deterministic-runtime-design.md`，使用契约
