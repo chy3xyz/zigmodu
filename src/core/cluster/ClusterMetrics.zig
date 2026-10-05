@@ -55,7 +55,7 @@ pub const ClusterMetrics = struct {
 
     /// Export in Prometheus text format.
     pub fn toPrometheus(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
-        return std.fmt.allocPrint(allocator,
+        return allocator.print(
             \\# HELP zigmodu_cluster_nodes_active Number of active cluster nodes
             \\# TYPE zigmodu_cluster_nodes_active gauge
             \\zigmodu_cluster_nodes_active {d}

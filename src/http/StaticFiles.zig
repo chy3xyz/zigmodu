@@ -122,7 +122,7 @@ fn serve(ctx: *api.Context, mount: *Mount) anyerror!void {
         return;
     }
 
-    const full = try std.fmt.allocPrint(a, "{s}/{s}", .{ mount.root, rel.? });
+    const full = try a.print("{s}/{s}", .{ mount.root, rel.? });
     const file = std.Io.Dir.cwd().openFile(mount.io, full, .{}) catch {
         try ctx.sendError(404, "Not Found");
         return;
@@ -165,7 +165,7 @@ fn serve(ctx: *api.Context, mount: *Mount) anyerror!void {
             switch (parseRange(range, stat.size)) {
                 .none => {},
                 .invalid => {
-                    try ctx.setHeader("Content-Range", try std.fmt.allocPrint(a, "bytes */{d}", .{stat.size}));
+                    try ctx.setHeader("Content-Range", try a.print("bytes */{d}", .{stat.size}));
                     try ctx.sendError(416, "Range Not Satisfiable");
                     return;
                 },
@@ -181,7 +181,7 @@ fn serve(ctx: *api.Context, mount: *Mount) anyerror!void {
     const content_type = mimeFor(rel.?, mount.config);
     try ctx.setHeader("Content-Type", content_type);
     if (partial) {
-        try ctx.setHeader("Content-Range", try std.fmt.allocPrint(a, "bytes {d}-{d}/{d}", .{ offset, offset + length - 1, stat.size }));
+        try ctx.setHeader("Content-Range", try a.print("bytes {d}-{d}/{d}", .{ offset, offset + length - 1, stat.size }));
     }
 
     ctx.status_code = if (partial) 206 else 200;
@@ -194,7 +194,7 @@ fn serve(ctx: *api.Context, mount: *Mount) anyerror!void {
     // as `GET` and no body at all, so it never takes the chunked path.
     const streamed = ctx.method == .GET and ctx.stream != null and ctx.io != null and
         length > @as(u64, mount.config.chunk_bytes);
-    if (!streamed) try ctx.setHeader("Content-Length", try std.fmt.allocPrint(a, "{d}", .{length}));
+    if (!streamed) try ctx.setHeader("Content-Length", try a.print("{d}", .{length}));
     if (ctx.method == .HEAD) {
         ctx.responded = true;
         return;

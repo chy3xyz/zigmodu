@@ -104,7 +104,7 @@ pub fn run(allocator: std.mem.Allocator, checks: []const Check) Report {
     for (checks) |check| {
         check.run(check.ctx, allocator) catch |err| {
             if (check.severity == .fatal) report.failures += 1 else report.warnings += 1;
-            const message = std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)}) catch continue;
+            const message = allocator.print("{s}", .{@errorName(err)}) catch continue;
             const name_copy = allocator.dupe(u8, check.name) catch {
                 allocator.free(message);
                 continue;

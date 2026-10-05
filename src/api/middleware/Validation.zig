@@ -164,7 +164,7 @@ fn sendStructuredErrors(ctx: anytype, code: i32, violations: FieldValidation.Vio
         defer ctx.allocator.free(rule_json);
         const msg_json = try std.json.Stringify.valueAlloc(ctx.allocator, v.message, .{});
         defer ctx.allocator.free(msg_json);
-        const item = try std.fmt.allocPrint(ctx.allocator, "{{\"field\":{s},\"rule\":{s},\"message\":{s}}}", .{ field_json, rule_json, msg_json });
+        const item = try ctx.allocator.print("{{\"field\":{s},\"rule\":{s},\"message\":{s}}}", .{ field_json, rule_json, msg_json });
         defer ctx.allocator.free(item);
         try data.appendSlice(ctx.allocator, item);
     }
@@ -174,7 +174,7 @@ fn sendStructuredErrors(ctx: anytype, code: i32, violations: FieldValidation.Vio
     try ctx.setHeader("Content-Type", "application/json");
     const first_json = try std.json.Stringify.valueAlloc(ctx.allocator, first, .{});
     defer ctx.allocator.free(first_json);
-    const body = try std.fmt.allocPrint(ctx.allocator, "{{\"code\":{d},\"msg\":{s},\"data\":{s}}}", .{ code, first_json, data.items });
+    const body = try ctx.allocator.print("{{\"code\":{d},\"msg\":{s},\"data\":{s}}}", .{ code, first_json, data.items });
     defer ctx.allocator.free(body);
     try ctx.response_body.appendSlice(ctx.allocator, body);
     ctx.responded = true;

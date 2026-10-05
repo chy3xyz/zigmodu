@@ -209,8 +209,7 @@ pub const ArchitectureTester = struct {
             const module_info = entry.value_ptr.*;
 
             if (module_info.deps.len > max_deps) {
-                const msg = try std.fmt.allocPrint(
-                    self.allocator,
+                const msg = try self.allocator.print(
                     "Module has {d} dependencies, maximum recommended is {d}",
                     .{ module_info.deps.len, max_deps },
                 );
@@ -245,8 +244,7 @@ pub const ArchitectureTester = struct {
                 }
 
                 if (is_other_business_module) {
-                    const msg = try std.fmt.allocPrint(
-                        self.allocator,
+                    const msg = try self.allocator.print(
                         "Base module should not depend on business module '{s}'",
                         .{dep},
                     );
@@ -340,7 +338,7 @@ pub const ArchitectureTester = struct {
                             }
                         }
                         if (!found) {
-                            const msg = try std.fmt.allocPrint(self.allocator, "Contract requires service '{s}' but module does not declare it as a dependency", .{svc.name});
+                            const msg = try self.allocator.print("Contract requires service '{s}' but module does not declare it as a dependency", .{svc.name});
                             try self.addViolation("ContractsMatchDependencies", module_name, msg, Severity.err);
                             self.allocator.free(msg);
                         }

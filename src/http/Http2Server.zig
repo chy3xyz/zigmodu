@@ -1950,7 +1950,7 @@ fn buildStreamResponseWire(
             }
             var unary = try reg.handleHttpUnary(path, st.data.items);
             defer unary.deinit(allocator);
-            const status_str = try std.fmt.allocPrint(allocator, "{d}", .{@backingInt(unary.grpc_status)});
+            const status_str = try allocator.print("{d}", .{@backingInt(unary.grpc_status)});
             defer allocator.free(status_str);
             const wire = try Http2.encodeGrpcServerStream(allocator, stream_id, unary.body, status_str, unary.grpc_message);
             return try grpcWireWithoutBody(allocator, wire, no_body);
@@ -2119,7 +2119,7 @@ fn encodeSiteResponseWire(
     no_body: bool,
     conn_max_frame_size: u31,
 ) ![]u8 {
-    const status_str = try std.fmt.allocPrint(allocator, "{d}", .{status});
+    const status_str = try allocator.print("{d}", .{status});
     defer allocator.free(status_str);
     const block = try assembleSiteResponseBlock(allocator, status_str, content_type, extra, body.len, budget);
     defer allocator.free(block);
@@ -2686,7 +2686,7 @@ test "encodeSiteResponseWire never builds a HEADERS block past the peer's frame 
     var extra: [16]Hpack.Header = undefined;
     for (&values, &extra, 0..) |*v, *h, i| {
         @memset(v, 'x');
-        const name = try std.fmt.allocPrint(allocator, "x-bulk-{d}", .{i});
+        const name = try allocator.print("x-bulk-{d}", .{i});
         defer allocator.free(name);
         h.* = .{ .name = try allocator.dupe(u8, name), .value = v };
     }
@@ -3174,7 +3174,7 @@ test "h2 session decodes a padded HEADERS frame instead of failing the connectio
     // the decoder must see. The pad-length byte used to go in with it, so this
     // well-formed (if pointless) frame answered COMPRESSION_ERROR and the
     // connection died — RFC 9113 §10.7 is the reason clients pad at all.
-    const padded = try std.fmt.allocPrint(allocator, "\x02{s}\x00\x00", .{block});
+    const padded = try allocator.print("\x02{s}\x00\x00", .{block});
     defer allocator.free(padded);
     const frame = try Http2.encodeFrame(
         allocator,
@@ -4132,7 +4132,7 @@ test "h2 server arms ctx.io and the request budget on the dispatched Context" {
             // was null (storage unbounded).
             const sc = ctx.sqlContext();
             const rem = ctx.remainingMs();
-            const body = try std.fmt.allocPrint(ctx.allocator, "io={s} sql_deadline={s} within_budget={}", .{
+            const body = try ctx.allocator.print("io={s} sql_deadline={s} within_budget={}", .{
                 if (ctx.io != null) "set" else "null",
                 if (sc.deadline_ms != null) "set" else "none",
                 rem != null and rem.? <= budget_ms,

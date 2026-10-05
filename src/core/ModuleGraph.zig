@@ -408,7 +408,7 @@ pub fn analyzeRuntime(allocator: std.mem.Allocator, nodes_in: []const Node, limi
             try findings.append(allocator, .{
                 .kind = .too_many_dependencies,
                 .subject = try allocator.dupe(u8, node.name),
-                .detail = try std.fmt.allocPrint(allocator, "{d}", .{node.dependencies.len}),
+                .detail = try allocator.print("{d}", .{node.dependencies.len}),
             });
         }
     }

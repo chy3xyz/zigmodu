@@ -158,14 +158,14 @@ pub fn SqlLock(comptime Client: type) type {
 
             // Reap a holder that died without releasing (best effort: another
             // replica's cleanup is equally fine).
-            const reap_sql = try std.fmt.allocPrint(self.allocator, "DELETE FROM {s} WHERE name = ? AND expires_at <= ?", .{self.table});
+            const reap_sql = try self.allocator.print("DELETE FROM {s} WHERE name = ? AND expires_at <= ?", .{self.table});
             defer self.allocator.free(reap_sql);
             _ = self.client.exec(reap_sql, &.{ .{ .string = name }, .{ .int = now_ms } }) catch |err| std.log.debug("[lock] reap of '{s}' failed ({s}); a stale row may linger until the next attempt", .{ name, @errorName(err) });
 
             // Atomic claim: exactly one racer gets rows_affected == 1.
             const insert_sql = switch (self.dialect) {
-                .sqlite, .postgres => try std.fmt.allocPrint(self.allocator, "INSERT INTO {s} (name, owner, expires_at) VALUES (?, ?, ?) ON CONFLICT(name) DO NOTHING", .{self.table}),
-                .mysql => try std.fmt.allocPrint(self.allocator, "INSERT IGNORE INTO {s} (name, owner, expires_at) VALUES (?, ?, ?)", .{self.table}),
+                .sqlite, .postgres => try self.allocator.print("INSERT INTO {s} (name, owner, expires_at) VALUES (?, ?, ?) ON CONFLICT(name) DO NOTHING", .{self.table}),
+                .mysql => try self.allocator.print("INSERT IGNORE INTO {s} (name, owner, expires_at) VALUES (?, ?, ?)", .{self.table}),
             };
             defer self.allocator.free(insert_sql);
             const res = try self.client.exec(insert_sql, &.{
@@ -178,7 +178,7 @@ pub fn SqlLock(comptime Client: type) type {
             // No row inserted: somebody holds it. Confirm a holder exists —
             // absence would mean the statement was a no-op for another reason.
             const Row = struct { owner: []const u8 };
-            const select_sql = try std.fmt.allocPrint(self.allocator, "SELECT owner FROM {s} WHERE name = ?", .{self.table});
+            const select_sql = try self.allocator.print("SELECT owner FROM {s} WHERE name = ?", .{self.table});
             defer self.allocator.free(select_sql);
             var rows = try self.client.queryRows(Row, select_sql, &.{.{ .string = name }});
             defer rows.deinit(self.allocator);
@@ -210,7 +210,7 @@ pub fn SqlLock(comptime Client: type) type {
             if (self.table_ready) return;
             // VARCHAR(191): fits MySQL's index limit even on older utf8mb4
             // configurations; BIGINT is portable across the three drivers.
-            const ddl = try std.fmt.allocPrint(self.allocator, "CREATE TABLE IF NOT EXISTS {s} (name VARCHAR(191) PRIMARY KEY, owner VARCHAR(64) NOT NULL, expires_at BIGINT NOT NULL)", .{self.table});
+            const ddl = try self.allocator.print("CREATE TABLE IF NOT EXISTS {s} (name VARCHAR(191) PRIMARY KEY, owner VARCHAR(64) NOT NULL, expires_at BIGINT NOT NULL)", .{self.table});
             defer self.allocator.free(ddl);
             _ = try self.client.exec(ddl, &.{});
             self.table_ready = true;

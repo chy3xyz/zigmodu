@@ -67,7 +67,7 @@ pub const DistributedTransactionManager = struct {
         errdefer arena.deinit();
         const aa = arena.allocator();
 
-        const id = try std.fmt.allocPrint(aa, "tx-{d}", .{self.transaction_id_counter});
+        const id = try aa.print("tx-{d}", .{self.transaction_id_counter});
         self.transaction_id_counter += 1;
 
         const tx = SagaTransaction{

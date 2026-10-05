@@ -131,7 +131,7 @@ pub const EventLogger = struct {
         const second = Time.monotonicNowSeconds();
         const sequence = self.correlation_seq;
         self.correlation_seq += 1;
-        return std.fmt.allocPrint(self.allocator, "{d}-{d}", .{ second, sequence }) catch "";
+        return self.allocator.print("{d}-{d}", .{ second, sequence }) catch "";
     }
 };
 

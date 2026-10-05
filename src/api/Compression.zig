@@ -248,7 +248,7 @@ fn varyAcceptEncoding(ctx: *api.Context) !void {
     const merged = if (existing.len == 0)
         try ctx.allocator.dupe(u8, "Accept-Encoding")
     else
-        try std.fmt.allocPrint(ctx.allocator, "{s}, Accept-Encoding", .{existing});
+        try ctx.allocator.print("{s}, Accept-Encoding", .{existing});
     defer ctx.allocator.free(merged);
     try ctx.setHeader("Vary", merged);
 }

@@ -648,8 +648,7 @@ test "extractMultipart renders ProblemDetails for 415 / 413 / 400" {
 /// Multipart body with one file part, as it arrives on the wire. Allocated so
 /// a fixture's real bytes can be passed in — not just comptime literals.
 fn uploadBody(allocator: std.mem.Allocator, filename: []const u8, declared_type: []const u8, data: []const u8) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "--B\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"{s}\"\r\n" ++
             "Content-Type: {s}\r\n\r\n{s}\r\n--B--\r\n",
         .{ filename, declared_type, data },

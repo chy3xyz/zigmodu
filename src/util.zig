@@ -23,13 +23,13 @@ pub fn randomUuid(allocator: std.mem.Allocator) ![]const u8 {
 pub fn pluralize(allocator: std.mem.Allocator, singular: []const u8) ![]const u8 {
     if (singular.len == 0) return try allocator.dupe(u8, singular);
     const last = singular[singular.len - 1];
-    if (last == 's' or last == 'x' or last == 'z') return try std.fmt.allocPrint(allocator, "{s}es", .{singular});
-    if (std.mem.endsWith(u8, singular, "ch") or std.mem.endsWith(u8, singular, "sh")) return try std.fmt.allocPrint(allocator, "{s}es", .{singular});
+    if (last == 's' or last == 'x' or last == 'z') return try allocator.print("{s}es", .{singular});
+    if (std.mem.endsWith(u8, singular, "ch") or std.mem.endsWith(u8, singular, "sh")) return try allocator.print("{s}es", .{singular});
     if (last == 'y' and singular.len > 1 and !isVowel(singular[singular.len - 2])) {
         const stem = singular[0 .. singular.len - 1];
-        return try std.fmt.allocPrint(allocator, "{s}ies", .{stem});
+        return try allocator.print("{s}ies", .{stem});
     }
-    return try std.fmt.allocPrint(allocator, "{s}s", .{singular});
+    return try allocator.print("{s}s", .{singular});
 }
 
 fn isVowel(c: u8) bool {

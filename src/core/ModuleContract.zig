@@ -171,7 +171,7 @@ pub const ModuleContract = struct {
                 try result.addError("Publish event name cannot be empty");
             }
             if (event.payload_type.len == 0) {
-                try result.addError(try std.fmt.allocPrint(allocator, "Event '{s}' payload type cannot be empty", .{event.name}));
+                try result.addError(try allocator.print("Event '{s}' payload type cannot be empty", .{event.name}));
             }
         }
 
@@ -195,7 +195,7 @@ pub const ModuleContract = struct {
                 try result.addError("Dependent service name cannot be empty");
             }
             if (service.interface_type.len == 0) {
-                try result.addError(try std.fmt.allocPrint(allocator, "Service '{s}' interface type cannot be empty", .{service.name}));
+                try result.addError(try allocator.print("Service '{s}' interface type cannot be empty", .{service.name}));
             }
         }
 
@@ -291,7 +291,7 @@ pub const ContractRegistry = struct {
 
             if (!validation.valid) {
                 for (validation.errors.items) |err| {
-                    const msg = try std.fmt.allocPrint(allocator, "[{s}] {s}", .{ contract.name, err });
+                    const msg = try allocator.print("[{s}] {s}", .{ contract.name, err });
                     try result.addError(msg);
                     allocator.free(msg);
                 }
@@ -300,7 +300,7 @@ pub const ContractRegistry = struct {
             // Check if dependent service exists
             for (contract.required_services) |service| {
                 if (self.contracts.get(service.name) == null and service.required) {
-                    const msg = try std.fmt.allocPrint(allocator, "[{s}] dependency service '{s}' not found", .{ contract.name, service.name });
+                    const msg = try allocator.print("[{s}] dependency service '{s}' not found", .{ contract.name, service.name });
                     try result.addError(msg);
                     allocator.free(msg);
                 }
@@ -332,7 +332,7 @@ pub const ContractRegistry = struct {
 
                             // Check if load type matches
                             if (!std.mem.eql(u8, consumed_event.payload_type, published_event.payload_type)) {
-                                const msg = try std.fmt.allocPrint(result.errors.allocator, "[{s}] consumed event '{s}' payload type mismatch with publisher [{s}] match: {s} vs {s}", .{ consumer.name, consumed_event.name, publisher.name, consumed_event.payload_type, published_event.payload_type });
+                                const msg = try result.errors.allocator.print("[{s}] consumed event '{s}' payload type mismatch with publisher [{s}] match: {s} vs {s}", .{ consumer.name, consumed_event.name, publisher.name, consumed_event.payload_type, published_event.payload_type });
                                 try result.addError(msg);
                                 result.errors.allocator.free(msg);
                             }
@@ -344,7 +344,7 @@ pub const ContractRegistry = struct {
                 }
 
                 if (!found) {
-                    const msg = try std.fmt.allocPrint(result.errors.allocator, "[{s}] consumed event '{s}' has no corresponding publisher", .{ consumer.name, consumed_event.name });
+                    const msg = try result.errors.allocator.print("[{s}] consumed event '{s}' has no corresponding publisher", .{ consumer.name, consumed_event.name });
                     try result.addError(msg);
                     result.errors.allocator.free(msg);
                 }

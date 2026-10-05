@@ -1318,7 +1318,7 @@ pub const RaftElection = struct {
     /// thing; apps that need real snapshots supply `ElectionConfig.snapshotter`.
     fn defaultSnapshotBytes(self: *const Self, up_to_index: u64) ![]u8 {
         const term = self.termAt(up_to_index) orelse 0;
-        return std.fmt.allocPrint(self.allocator, "zigmodu-raft-snapshot:v1:last_included_index={d}:last_included_term={d}:compacted_entries={d}", .{
+        return self.allocator.print("zigmodu-raft-snapshot:v1:last_included_index={d}:last_included_term={d}:compacted_entries={d}", .{
             up_to_index,
             term,
             up_to_index - self.last_included_index,
@@ -2950,7 +2950,7 @@ const SnapshotterProbe = struct {
         calls += 1;
         seen_ctx = ctx;
         seen_up_to = up_to_index;
-        return std.fmt.allocPrint(allocator, "app-snapshot@{d}", .{up_to_index});
+        return allocator.print("app-snapshot@{d}", .{up_to_index});
     }
 };
 

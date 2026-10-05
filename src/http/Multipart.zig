@@ -188,7 +188,7 @@ pub fn parse(allocator: std.mem.Allocator, body: []const u8, content_type: []con
     };
     if (config.max_total_bytes > 0 and body.len > config.max_total_bytes) return Error.PayloadTooLarge;
 
-    const delim = try std.fmt.allocPrint(allocator, "--{s}", .{boundary});
+    const delim = try allocator.print("--{s}", .{boundary});
     defer allocator.free(delim);
 
     var form = Form{ .allocator = allocator };

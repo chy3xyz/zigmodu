@@ -19,7 +19,7 @@ pub fn healthJson(alloc: std.mem.Allocator, cluster: *ClusterBootstrap) ![]const
     const m = cluster.getMetrics();
     const raft = cluster.getRaft() orelse return error.ClusterNotStarted;
 
-    return std.fmt.allocPrint(alloc,
+    return alloc.print(
         \\{{
         \\  "status":"UP",
         \\  "node_id":"{s}",

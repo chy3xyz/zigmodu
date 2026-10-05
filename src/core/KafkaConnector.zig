@@ -910,7 +910,7 @@ pub const ConsumerGroupSession = struct {
     pub fn joinOffline(self: *Self, topics: []const []const u8) !void {
         self.state = .joining;
         if (self.member_id_owned) self.allocator.free(self.member_id);
-        self.member_id = try std.fmt.allocPrint(self.allocator, "member-{s}", .{self.group_id});
+        self.member_id = try self.allocator.print("member-{s}", .{self.group_id});
         self.member_id_owned = true;
         self.generation_id = 1;
         self.is_leader = true;

@@ -145,7 +145,7 @@ pub const DLQ = struct {
                 .entries = std.ArrayList(DLQEntry).empty,
             } },
             .sqlite => .{ .sqlite = .{
-                .db_path = try std.fmt.allocPrint(allocator, "{s}/dlq.db", .{"data"}),
+                .db_path = try allocator.print("{s}/dlq.db", .{"data"}),
             } },
         };
 

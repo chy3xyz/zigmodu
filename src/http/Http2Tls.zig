@@ -41,7 +41,7 @@ pub fn isHttp2Alpn(proto: []const u8) bool {
 
 /// Nginx / Caddy style snippet for operators (not executed).
 pub fn sidecarHint(allocator: std.mem.Allocator, listen_port: u16, backend_port: u16) ![]u8 {
-    return std.fmt.allocPrint(allocator,
+    return allocator.print(
         \\# Terminate TLS with ALPN h2, forward cleartext to ZigModu h2c/HTTP
         \\# listen {d} ssl http2;
         \\# proxy_pass http://127.0.0.1:{d};

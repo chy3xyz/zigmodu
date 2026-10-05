@@ -37,8 +37,7 @@ pub const PasswordEncoder = struct {
         const hash_b64 = try base64Encode(self.allocator, &derived_key);
         defer self.allocator.free(hash_b64);
 
-        return std.fmt.allocPrint(
-            self.allocator,
+        return self.allocator.print(
             "$pbkdf2${d}${s}${s}",
             .{ self.iterations, salt_b64, hash_b64 },
         );
@@ -278,7 +277,7 @@ test "matches refuses a digest longer than the derived key (no prefix match)" {
     defer allocator.free(salt_b64);
     const longer_b64 = try base64Encode(allocator, &longer);
     defer allocator.free(longer_b64);
-    const stored = try std.fmt.allocPrint(allocator, "$pbkdf2$1000${s}${s}", .{ salt_b64, longer_b64 });
+    const stored = try allocator.print("$pbkdf2$1000${s}${s}", .{ salt_b64, longer_b64 });
     defer allocator.free(stored);
 
     try std.testing.expectError(error.MalformedStoredHash, encoder.matches(password, stored));

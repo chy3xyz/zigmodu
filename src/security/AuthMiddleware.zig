@@ -265,7 +265,7 @@ pub fn getAuth(ctx: *api.Context) ?*Rbac.AuthInfo {
 fn testPutBearerAuth(ctx: *api.Context, token: []const u8) !void {
     const k = try ctx.allocator.dupe(u8, "authorization");
     errdefer ctx.allocator.free(k);
-    const v = try std.fmt.allocPrint(ctx.allocator, "Bearer {s}", .{token});
+    const v = try ctx.allocator.print("Bearer {s}", .{token});
     errdefer ctx.allocator.free(v);
     try ctx.headers.put(k, v);
 }

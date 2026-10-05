@@ -209,7 +209,7 @@ pub const LoadBalancer = struct {
 
     /// Build a peer key string. Caller owns the returned memory.
     fn peerKey(allocator: std.mem.Allocator, peer: Peer) ![]const u8 {
-        return try std.fmt.allocPrint(allocator, "{s}:{d}", .{ peer.host, peer.port });
+        return try allocator.print("{s}:{d}", .{ peer.host, peer.port });
     }
 };
 
@@ -478,7 +478,7 @@ test "LoadBalancer least_connections: an unreadable count is not read as idle" {
     var lb = LoadBalancer.init(allocator, .least_connections, &disco);
     defer lb.deinit();
 
-    const long_key = try std.fmt.allocPrint(allocator, "{s}:8080", .{long_host});
+    const long_key = try allocator.print("{s}:8080", .{long_host});
     defer allocator.free(long_key);
     for (0..7) |_| try lb.recordResult(long_key, true);
     try lb.recordResult("10.0.0.1:8080", true);

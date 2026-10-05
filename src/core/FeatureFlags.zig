@@ -251,7 +251,7 @@ test "FeatureFlagManager rollout percentage" {
     // Count how many of 100 users get the flag
     var enabled_count: usize = 0;
     for (0..100) |i| {
-        const user_id = try std.fmt.allocPrint(allocator, "user-{d}", .{i});
+        const user_id = try allocator.print("user-{d}", .{i});
         defer allocator.free(user_id);
         if (ffs.isEnabled("canary", user_id)) enabled_count += 1;
     }

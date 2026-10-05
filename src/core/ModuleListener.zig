@@ -94,7 +94,7 @@ pub const ModuleListenerRegistry = struct {
         handler: *anyopaque,
         is_async: bool,
     ) !void {
-        const key = try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ module_name, event_type });
+        const key = try self.allocator.print("{s}:{s}", .{ module_name, event_type });
         defer self.allocator.free(key);
 
         try self.listeners.put(key, .{

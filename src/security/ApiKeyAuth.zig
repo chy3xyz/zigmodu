@@ -258,7 +258,7 @@ pub const ApiKeyGenerator = struct {
             hex[i * 2] = hex_chars[byte >> 4];
             hex[i * 2 + 1] = hex_chars[byte & 0x0F];
         }
-        return std.fmt.allocPrint(allocator, "sk-{s}", .{hex[0..32]});
+        return allocator.print("sk-{s}", .{hex[0..32]});
     }
 
     /// Validates the API key format (sk-{32 hex})

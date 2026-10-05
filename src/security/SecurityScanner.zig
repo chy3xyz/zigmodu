@@ -56,7 +56,7 @@ pub const SecurityScanner = struct {
         suggestion: ?[]const u8,
 
         pub fn format(self: SecurityFinding, allocator: std.mem.Allocator) ![]const u8 {
-            return std.fmt.allocPrint(allocator, "[{s}] {s}: {s}", .{
+            return allocator.print("[{s}] {s}: {s}", .{
                 @tagName(self.severity),
                 self.rule_id,
                 self.message,
@@ -408,7 +408,7 @@ pub const DependencyScanner = struct {
 
     /// Adds one VulnerabilityInfo entry, keyed by package name and affected versions
     pub fn addVulnerability(self: *Self, vuln: Vulnerability) !void {
-        const key = try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{
+        const key = try self.allocator.print("{s}:{s}", .{
             vuln.package_name,
             vuln.affected_versions,
         });

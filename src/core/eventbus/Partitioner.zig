@@ -112,7 +112,7 @@ pub const ConsistentHashPartitioner = struct {
         // Add virtual nodes
         var i: usize = 0;
         while (i < self.virtual_node_count) : (i += 1) {
-            const virtual_id = try std.fmt.allocPrint(self.allocator, "{s}#{d}", .{ node_id, i });
+            const virtual_id = try self.allocator.print("{s}#{d}", .{ node_id, i });
             // Owned by the ring entry once the append lands; freed in
             // removeNode/deinit — or right here if the append is refused.
             self.ring.append(self.allocator, .{
@@ -458,7 +458,7 @@ test "ConsistentHashPartitioner uniform distribution" {
 
     var i: u32 = 0;
     while (i < 1000) : (i += 1) {
-        const key = std.fmt.allocPrint(allocator, "key-{d}", .{i}) catch continue;
+        const key = allocator.print("key-{d}", .{i}) catch continue;
         defer allocator.free(key);
 
         const node = partitioner.route(key);

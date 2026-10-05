@@ -66,7 +66,7 @@ fn handleModules(ctx: *Context) !void {
         return;
     }
 
-    const json = try std.fmt.allocPrint(ctx.allocator,
+    const json = try ctx.allocator.print(
         \\{{"modules":[
         \\  {{"name":"core","desc":"Core framework","status":"UP","deps":0}},
         \\  {{"name":"http","desc":"HTTP server & API","status":"UP","deps":2}},
@@ -92,7 +92,7 @@ fn handleStats(ctx: *Context) !void {
     const now = Time.monotonicNowSeconds();
     const uptime = now - system_info.started_at;
 
-    const json = try std.fmt.allocPrint(ctx.allocator,
+    const json = try ctx.allocator.print(
         \\{{"modules":{d},"routes":15,"middleware":8,"events":0,"uptime_seconds":{d},"tests":
         \\{{"passed":{d},"failed":{d},"skipped":{d},"total":{d}}}}}
     , .{
@@ -112,7 +112,7 @@ fn handleSystem(ctx: *Context) !void {
     const now = Time.monotonicNowSeconds();
     const uptime = now - system_info.started_at;
 
-    const json = try std.fmt.allocPrint(ctx.allocator,
+    const json = try ctx.allocator.print(
         \\{{"version":"{s}","zig":"{s}","started_at":{d},"uptime_seconds":{d},"status":"healthy",
         \\"allocator":"gpa","os":"{s}"}}
     , .{

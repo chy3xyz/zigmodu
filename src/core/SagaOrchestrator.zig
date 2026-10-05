@@ -156,7 +156,7 @@ pub const SagaOrchestrator = struct {
         if (!self.sagas.contains(saga_name)) return error.SagaNotFound;
 
         self.instance_counter += 1;
-        const instance_id = try std.fmt.allocPrint(self.allocator, "saga-{s}-{d}", .{ saga_name, self.instance_counter });
+        const instance_id = try self.allocator.print("saga-{s}-{d}", .{ saga_name, self.instance_counter });
 
         const instance = SagaInstance{
             .id = instance_id,
@@ -201,7 +201,7 @@ pub const SagaOrchestrator = struct {
 
             step.action() catch |err| {
                 const step_end = Time.monotonicNowSeconds();
-                const err_msg = try std.fmt.allocPrint(self.allocator, "{s}", .{@errorName(err)});
+                const err_msg = try self.allocator.print("{s}", .{@errorName(err)});
 
                 try running.step_logs.append(self.allocator, .{
                     .step_name = try self.allocator.dupe(u8, step.name),
@@ -242,7 +242,7 @@ pub const SagaOrchestrator = struct {
             if (step.timeout_seconds > 0 and
                 @as(u128, @intCast(elapsed_ms)) > @as(u128, step.timeout_seconds) * std.time.ms_per_s)
             {
-                running.last_error = try std.fmt.allocPrint(self.allocator, "step '{s}' exceeded its {d}s budget (took {d}ms)", .{ step.name, step.timeout_seconds, elapsed_ms });
+                running.last_error = try self.allocator.print("step '{s}' exceeded its {d}s budget (took {d}ms)", .{ step.name, step.timeout_seconds, elapsed_ms });
                 std.log.warn("[Saga] Step '{s}' in '{s}' timed out: {d}ms over a {d}s budget", .{ step.name, instance_id, elapsed_ms, step.timeout_seconds });
                 self.saveSagaState(instance_id);
                 try self.compensate(instance_id, i + 1);

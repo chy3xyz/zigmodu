@@ -148,8 +148,7 @@ pub const ModuleInteractionVerifier = struct {
 
         // 1. Check dependency depth
         if (module_info.dependencies.len > self.config.max_dependencies_per_module) {
-            const msg = try std.fmt.allocPrint(
-                self.allocator,
+            const msg = try self.allocator.print(
                 "Module '{s}' has {d} dependencies, exceeding max of {d}",
                 .{ module_info.name, module_info.dependencies.len, self.config.max_dependencies_per_module },
             );
@@ -169,8 +168,7 @@ pub const ModuleInteractionVerifier = struct {
                     if (std.mem.eql(u8, mod_info.name, dep_name)) {
                         for (mod_info.dependencies) |transitive_dep| {
                             if (std.mem.eql(u8, transitive_dep, module_info.name)) {
-                                const msg = try std.fmt.allocPrint(
-                                    self.allocator,
+                                const msg = try self.allocator.print(
                                     "Circular dependency: '{s}' ↔ '{s}'",
                                     .{ module_info.name, dep_name },
                                 );
@@ -192,8 +190,7 @@ pub const ModuleInteractionVerifier = struct {
         // 3. Check for self-dependency
         for (module_info.dependencies) |dep_name| {
             if (std.mem.eql(u8, dep_name, module_info.name)) {
-                const msg = try std.fmt.allocPrint(
-                    self.allocator,
+                const msg = try self.allocator.print(
                     "Module '{s}' declares self-dependency",
                     .{module_info.name},
                 );
@@ -272,8 +269,7 @@ pub const ModuleInteractionVerifier = struct {
         try buf.appendSlice(self.allocator, "╚══════════════════════════════════════════╝\n\n");
 
         for (self.violations.items, 0..) |v, i| {
-            const line = try std.fmt.allocPrint(
-                self.allocator,
+            const line = try self.allocator.print(
                 "[{d}] {s} → {s} ({s}): {s}\n",
                 .{ i + 1, v.from_module, v.to_module, @tagName(v.interaction_type), v.message },
             );
@@ -281,8 +277,7 @@ pub const ModuleInteractionVerifier = struct {
             try buf.appendSlice(self.allocator, line);
         }
 
-        const summary = try std.fmt.allocPrint(
-            self.allocator,
+        const summary = try self.allocator.print(
             "\nTotal violations: {d}\n",
             .{self.violations.items.len},
         );

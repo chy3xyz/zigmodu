@@ -181,7 +181,7 @@ fn benchHealthEndpoint(checks: usize, iterations: usize) !f64 {
     var ep = zigmodu.HealthEndpoint.init(harness_allocator);
     defer ep.deinit();
     for (0..checks) |i| {
-        const name = try std.fmt.allocPrint(harness_allocator, "check-{}", .{i});
+        const name = try harness_allocator.print("check-{}", .{i});
         defer harness_allocator.free(name);
         try ep.registerCheck(name, "bench", zigmodu.HealthEndpoint.alwaysUp);
     }
@@ -215,7 +215,7 @@ fn benchDbQuery(io: std.Io, queries: usize) !f64 {
     try client.connect();
     _ = try client.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, value REAL)", &.{});
     for (0..100) |i| {
-        const s = try std.fmt.allocPrint(harness_allocator, "INSERT INTO t VALUES ({}, 'item{}', {}.0)", .{ i, i, i });
+        const s = try harness_allocator.print("INSERT INTO t VALUES ({}, 'item{}', {}.0)", .{ i, i, i });
         defer harness_allocator.free(s);
         _ = try client.exec(s, &.{});
     }
@@ -1308,7 +1308,7 @@ fn benchWorkflow(allocator: std.mem.Allocator, io: std.Io, steps_count: usize, i
     defer allocator.free(steps);
     for (0..steps_count) |i| {
         steps[i] = .{
-            .name = try std.fmt.allocPrint(allocator, "step-{d}", .{i}),
+            .name = try allocator.print("step-{d}", .{i}),
             .kind = .{ .skill = .{ .name = "nop", .args = .{ .object = .{} } } },
         };
     }
@@ -1681,7 +1681,7 @@ fn allocWorkflow(io: std.Io, steps_count: usize, iterations: usize) !AllocReadin
     defer allocator.free(steps);
     for (0..steps_count) |i| {
         steps[i] = .{
-            .name = try std.fmt.allocPrint(allocator, "step-{d}", .{i}),
+            .name = try allocator.print("step-{d}", .{i}),
             .kind = .{ .skill = .{ .name = "nop", .args = .{ .object = .{} } } },
         };
     }
@@ -1745,7 +1745,7 @@ fn allocHealthEndpoint(checks: usize, iterations: usize) !AllocReading {
     var ep = zigmodu.HealthEndpoint.init(allocator);
     defer ep.deinit();
     for (0..checks) |i| {
-        const name = try std.fmt.allocPrint(allocator, "check-{}", .{i});
+        const name = try allocator.print("check-{}", .{i});
         defer allocator.free(name);
         try ep.registerCheck(name, "bench", zigmodu.HealthEndpoint.alwaysUp);
     }
@@ -1765,7 +1765,7 @@ fn allocDbQuery(io: std.Io, queries: usize) !AllocReading {
     try client.connect();
     _ = try client.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, value REAL)", &.{});
     for (0..100) |i| {
-        const s = try std.fmt.allocPrint(allocator, "INSERT INTO t VALUES ({}, 'item{}', {}.0)", .{ i, i, i });
+        const s = try allocator.print("INSERT INTO t VALUES ({}, 'item{}', {}.0)", .{ i, i, i });
         defer allocator.free(s);
         _ = try client.exec(s, &.{});
     }

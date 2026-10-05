@@ -374,9 +374,9 @@ pub const ErrorResponse = struct {
 /// Build a JSON error response string. Caller owns returned memory.
 pub fn toJson(allocator: std.mem.Allocator, err: ErrorResponse) ![]u8 {
     if (err.details) |details| {
-        return std.fmt.allocPrint(allocator, "{{\"code\":{d},\"message\":\"{s}\",\"details\":\"{s}\"}}", .{ err.code, err.message, details });
+        return allocator.print("{{\"code\":{d},\"message\":\"{s}\",\"details\":\"{s}\"}}", .{ err.code, err.message, details });
     } else {
-        return std.fmt.allocPrint(allocator, "{{\"code\":{d},\"message\":\"{s}\"}}", .{ err.code, err.message });
+        return allocator.print("{{\"code\":{d},\"message\":\"{s}\"}}", .{ err.code, err.message });
     }
 }
 

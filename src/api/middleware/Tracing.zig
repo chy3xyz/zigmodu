@@ -42,7 +42,7 @@ pub fn tracing() api.Middleware {
                 else blk: {
                     const now_ns: u64 = @intCast(Time.monotonicNow());
                     const counter = trace_id_counter.fetchAdd(1, .monotonic);
-                    break :blk try std.fmt.allocPrint(ctx.allocator, "{x:016}-{x:016}", .{ now_ns, counter });
+                    break :blk try ctx.allocator.print("{x:016}-{x:016}", .{ now_ns, counter });
                 };
                 defer ctx.allocator.free(trace_id);
 
@@ -88,7 +88,7 @@ pub fn tracingWithTrace(header_name: []const u8) api.Middleware {
                 } else {
                     const now_ns: u64 = @intCast(Time.monotonicNow());
                     const counter = trace_id_counter.fetchAdd(1, .monotonic);
-                    const trace_id = try std.fmt.allocPrint(ctx.allocator, "{x:016}-{x:016}", .{ now_ns, counter });
+                    const trace_id = try ctx.allocator.print("{x:016}-{x:016}", .{ now_ns, counter });
                     defer ctx.allocator.free(trace_id);
                     try ctx.setHeader("x-trace-id", trace_id);
                 }

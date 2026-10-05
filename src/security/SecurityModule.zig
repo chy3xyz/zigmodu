@@ -96,11 +96,11 @@ pub const SecurityModule = struct {
             defer allocator.free(payload_b64);
 
             // Create signature base
-            const signature_base = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ header_b64, payload_b64 });
+            const signature_base = try allocator.print("{s}.{s}", .{ header_b64, payload_b64 });
             defer allocator.free(signature_base);
 
             // Return final token
-            return std.fmt.allocPrint(allocator, "{s}.{s}.{s}", .{ header_b64, payload_b64, self.signature });
+            return allocator.print("{s}.{s}.{s}", .{ header_b64, payload_b64, self.signature });
         }
     };
 
@@ -157,7 +157,7 @@ pub const SecurityModule = struct {
         const payload_b64 = try base64UrlEncode(self.allocator, payload_json);
         defer self.allocator.free(payload_b64);
 
-        const signature_base = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ header_b64, payload_b64 });
+        const signature_base = try self.allocator.print("{s}.{s}", .{ header_b64, payload_b64 });
         defer self.allocator.free(signature_base);
 
         // Generate signature using HMAC-SHA256 (primary key when a keyring is set)
@@ -165,7 +165,7 @@ pub const SecurityModule = struct {
         defer self.allocator.free(signature);
 
         // Build the token string directly, avoiding an intermediate struct
-        return std.fmt.allocPrint(self.allocator, "{s}.{s}.{s}", .{ header_b64, payload_b64, signature });
+        return self.allocator.print("{s}.{s}.{s}", .{ header_b64, payload_b64, signature });
     }
 
     /// Enable key rotation. Keys live in `ring` (primary signs, all verify).
@@ -212,7 +212,7 @@ pub const SecurityModule = struct {
         }
 
         // Verify signature
-        const signature_base = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ header_b64, payload_b64 });
+        const signature_base = try self.allocator.print("{s}.{s}", .{ header_b64, payload_b64 });
         defer self.allocator.free(signature_base);
 
         const verify_secret = try self.verificationSecret(header_json);
@@ -322,7 +322,7 @@ pub const SecurityModule = struct {
         const hash_b64 = try base64Encode(self.allocator, &derived_key);
         defer self.allocator.free(hash_b64);
 
-        return std.fmt.allocPrint(self.allocator, "$pbkdf2$100000${s}${s}", .{ salt_b64, hash_b64 });
+        return self.allocator.print("$pbkdf2$100000${s}${s}", .{ salt_b64, hash_b64 });
     }
 
     /// Verify password.
@@ -691,7 +691,7 @@ test "verifyPassword refuses a digest longer than the derived key (no prefix mat
     defer allocator.free(salt_b64);
     const longer_b64 = try base64Encode(allocator, &longer);
     defer allocator.free(longer_b64);
-    const stored = try std.fmt.allocPrint(allocator, "$pbkdf2$1000${s}${s}", .{ salt_b64, longer_b64 });
+    const stored = try allocator.print("$pbkdf2$1000${s}${s}", .{ salt_b64, longer_b64 });
     defer allocator.free(stored);
 
     try std.testing.expectError(error.MalformedStoredHash, sec.verifyPassword(password, stored));
@@ -781,7 +781,7 @@ test "keyring rotation: old tokens stay valid, unknown kid is rejected" {
     var parts = std.mem.splitScalar(u8, t2, '.');
     _ = parts.next();
     const payload_b64 = parts.next().?;
-    const forged = try std.fmt.allocPrint(allocator, "{s}.{s}.{s}", .{ header_b64, payload_b64, parts.next().? });
+    const forged = try allocator.print("{s}.{s}.{s}", .{ header_b64, payload_b64, parts.next().? });
     defer allocator.free(forged);
     try std.testing.expectError(error.UnknownKeyId, sec.verifyToken(forged));
 }

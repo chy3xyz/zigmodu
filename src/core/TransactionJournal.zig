@@ -143,8 +143,7 @@ pub const TransactionJournal = struct {
     /// append-only heap works on sqlite, PostgreSQL and MySQL alike).
     pub fn migrate(self: *Self) !void {
         const backend = self.backend orelse return;
-        const ddl = try std.fmt.allocPrint(
-            self.allocator,
+        const ddl = try self.allocator.print(
             "CREATE TABLE IF NOT EXISTS {s} (tx_id VARCHAR(191) NOT NULL, state VARCHAR(16) NOT NULL, participants TEXT NOT NULL, updated_at BIGINT NOT NULL)",
             .{self.table_name},
         );
@@ -158,8 +157,7 @@ pub const TransactionJournal = struct {
         const updated_at = if (rec.updated_at != 0) rec.updated_at else Time.monotonicNowSeconds();
 
         if (self.backend) |backend| {
-            const sql = try std.fmt.allocPrint(
-                self.allocator,
+            const sql = try self.allocator.print(
                 "INSERT INTO {s} (tx_id, state, participants, updated_at) VALUES (?, ?, ?, ?)",
                 .{self.table_name},
             );
@@ -197,8 +195,7 @@ pub const TransactionJournal = struct {
     pub fn recover(self: *Self, allocator: std.mem.Allocator) ![]InDoubt {
         const backend = self.backend orelse return self.recoverFromMemory(allocator);
 
-        const sql = try std.fmt.allocPrint(
-            self.allocator,
+        const sql = try self.allocator.print(
             "SELECT tx_id, participants, updated_at FROM {s} WHERE state = ? AND tx_id NOT IN (SELECT tx_id FROM {s} WHERE state IN (?, ?)) ORDER BY updated_at DESC",
             .{ self.table_name, self.table_name },
         );

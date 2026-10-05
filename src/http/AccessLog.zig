@@ -149,7 +149,7 @@ pub const AccessLogger = struct {
 
         const Emit = struct {
             fn f(target: *std.ArrayList(u8), alloc: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
-                const s = try std.fmt.allocPrint(alloc, fmt, args);
+                const s = try alloc.print(fmt, args);
                 defer alloc.free(s);
                 try target.appendSlice(alloc, s);
             }

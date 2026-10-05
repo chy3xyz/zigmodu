@@ -215,7 +215,7 @@ pub const WAL = struct {
 // ── file helpers ──
 
 fn createSegment(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, id: u64) !*WAL.Segment {
-    const path = try std.fmt.allocPrint(allocator, "{s}/{:0>20}.wal", .{ dir, id });
+    const path = try allocator.print("{s}/{:0>20}.wal", .{ dir, id });
     errdefer allocator.free(path);
 
     const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false, .read = true });
@@ -309,7 +309,7 @@ test "WAL multi-append and commit tracking" {
     defer wal.deinit();
 
     for (0..5) |i| {
-        const payload = try std.fmt.allocPrint(allocator, "msg-{d}", .{i});
+        const payload = try allocator.print("msg-{d}", .{i});
         defer allocator.free(payload);
         _ = try wal.append(.{ .topic = "test", .payload = payload, .source_node = "n1" });
     }
