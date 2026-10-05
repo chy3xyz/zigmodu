@@ -1,7 +1,7 @@
 # ZigModu × zent 最佳实践
 
 **zent**: [chy3xyz/zent](https://github.com/chy3xyz/zent) — Zig 版 [ent](https://entgo.io/)（schema-as-code ORM）  
-**版本口径**: zent **v0.76.2**（**0.76 起可按驱动裁剪构建**：`b.dependency("zent", .{ .pg = false, .mysql = false })`，翻译期跳过对应 `translate-c`；**0.75 起** junction 表名与某个实体表名撞车时 `checkSchema` 报 **`junction_name_collision`** 并归为 read-breaking，`migrateSchema` 计划建表时 `warn` —— 只有一方能存在，改名是调用方的决定；0.76.1 修三处 OOM 路径泄漏（`Builder.initCapacity`/`takeQuery`/`Selector.init`）；0.73 起 `CrudService.get` → **`getOwned`**、配套 `deinitRowWith(allocator, &e)`；0.73 起 `Sum`/`Avg` 空集报 `EmptyAggregate`；0.70 起 **SQLite 强制外键**（`PRAGMA foreign_keys = ON`）；0.70 起 PG 的 `23502/23503` 不再误报 `UniqueViolation`；0.69 起 `SaveError` 增 `InconsistentRowFields`/`MissingPrimaryKey`；0.72 起 `Restore` 受策略过滤与拦截器约束；0.74 起 EntQL 拒绝未知字段；0.54 起 `CrudService.create(entity, tenant_id)` 双参；0.57 起 MySQL 的 `String`/`Enum` 落 `VARCHAR(255)`；0.40 起一行式实体释放 `deinitRows`/`deinitRow`/`deinitEdgeRows`；0.38 起 `queryTargets*` fail-closed；0.39 起 `zent.scope` 让裸 SQL 也走同一套读契约，见 §14/§15）· 本仓库示例按 **v0.76.2** 验证；`create` 双参签名要求 **≥ v0.54.0**，`getOwned` 要求 **≥ v0.73.0**，按驱动裁剪要求 **≥ v0.76.0**，其余条目见 §14 · ZigModu **v0.15.22+** · Zig **≥ 0.17**  
+**版本口径**: zent **v0.83.0**（**0.81 起 `insertMany`/`upsertMany` 必传 `tenant_id`**（与 0.54 的 `create` 双参同一契约，忽略实体自带租户值）；0.81 起 `cursorPage` 拒绝可空整数游标列（`NullableCursorColumn`，旧的 `has_more=true + next_cursor=null` 会死循环翻页）；0.78 起七个单值聚合（`Sum`/`Avg`/`Max`/`Min`/`SumOrZero`/`AggregateOne`/`AggregateText`）拒绝带 `GROUP BY` 的查询（`GroupByNotSupported`，分组聚合用 `AggregateBy`/`GroupCount`）；0.78 起 `SaveOne`/`ExecOne`/`ForceExecOne` 在驱动无计数时报 `RowsAffectedUnknown` 而非 `NotFound`（三内置驱动不可达）；0.82 起工具链钉 **0.17.0 正式版**（`minimum_zig_version`，旧 dev 快照不再满足）；0.83 comptime quota 显式化（300 实体图压测）+ `id.uuidv4/uuidv7` 换 threadlocal ChaCha+OS 熵（修并发 UB）+ `allocPrint` 弃用迁移；**0.76 起可按驱动裁剪构建**：`b.dependency("zent", .{ .pg = false, .mysql = false })`，翻译期跳过对应 `translate-c`；**0.75 起** junction 表名与某个实体表名撞车时 `checkSchema` 报 **`junction_name_collision`** 并归为 read-breaking，`migrateSchema` 计划建表时 `warn` —— 只有一方能存在，改名是调用方的决定；0.76.1 修三处 OOM 路径泄漏（`Builder.initCapacity`/`takeQuery`/`Selector.init`）；0.73 起 `CrudService.get` → **`getOwned`**、配套 `deinitRowWith(allocator, &e)`；0.73 起 `Sum`/`Avg` 空集报 `EmptyAggregate`；0.70 起 **SQLite 强制外键**（`PRAGMA foreign_keys = ON`）；0.70 起 PG 的 `23502/23503` 不再误报 `UniqueViolation`；0.69 起 `SaveError` 增 `InconsistentRowFields`/`MissingPrimaryKey`；0.72 起 `Restore` 受策略过滤与拦截器约束；0.74 起 EntQL 拒绝未知字段；0.54 起 `CrudService.create(entity, tenant_id)` 双参；0.57 起 MySQL 的 `String`/`Enum` 落 `VARCHAR(255)`；0.40 起一行式实体释放 `deinitRows`/`deinitRow`/`deinitEdgeRows`；0.38 起 `queryTargets*` fail-closed；0.39 起 `zent.scope` 让裸 SQL 也走同一套读契约，见 §14/§15）· 本仓库示例按 **v0.83.0** 验证；`create` 双参签名要求 **≥ v0.54.0**，`getOwned` 要求 **≥ v0.73.0**，按驱动裁剪要求 **≥ v0.76.0**，`insertMany`/`upsertMany` 双参要求 **≥ v0.81.0**，其余条目见 §14 · ZigModu **v0.15.22+** · Zig **≥ 0.17**  
 **主推组合**: **电商 / 社交类项目默认选 ZigModu + zent**（见 §2 决策表与 §4.8 场景能力矩阵）；只有存量 SQL 繁重、报表主导或 DBA 强管控的项目才默认 sqlx。这是**新项目选型建议**，与框架自带的默认实现不是一件事——口径见 §1「与框架自带那条的关系」。
 
 **参考实现**: [`examples/zent-modulith/`](../examples/zent-modulith/)  
@@ -539,7 +539,7 @@ pub const CatalogStore = struct {
 
 ## 11. 依赖接入
 
-zent **v0.76.2** 提供 `build.zig.zon`（模块名 `zent`；生产 pin git tag，本地开发可换 path 依赖）。
+zent **v0.83.0** 提供 `build.zig.zon`（模块名 `zent`；生产 pin git tag，本地开发可换 path 依赖）。
 
 **本地 sibling（开发）：**
 
@@ -558,7 +558,7 @@ exe_mod.addImport("zent", zent_dep.module("zent"));
 
 ```zon
 .zent = .{
-    .url = "https://github.com/chy3xyz/zent/archive/refs/tags/v0.76.2.tar.gz",
+    .url = "https://github.com/chy3xyz/zent/archive/refs/tags/v0.83.0.tar.gz",
     .hash = "<zig fetch 后填入>",
 },
 ```
@@ -623,7 +623,7 @@ zig_ws/
 
 ---
 
-## 14. 升级注意（zent 0.6 → 0.12 → 0.13 → … → 0.74 → 0.76）
+## 14. 升级注意（zent 0.6 → 0.12 → 0.13 → … → 0.76 → 0.83）
 
 > **升级自查（先跑命令，再读条目）**：
 > ```bash
@@ -635,6 +635,12 @@ zig_ws/
 
 | 主题 | 动作 / 新特性 |
 |------|--------------|
+| **v0.81.0 `insertMany`/`upsertMany` 必传 `tenant_id`（BREAKING，签名）** | 与 0.54 的 `create(entity, tenant_id)` 同一契约：批量写以前从实体自带租户列读，零值实体就写入租户 `0`；现在租户是**形参**，实体字段被忽略。一次调用 = 一个租户的行。本仓库 `zent-modulith` 的 `POST /products/batch` 已适配：批量项租户不一致直接 400（不再让某个租户"赢"），实跑同租户 201 `{"ids":[1,2]}` / 混合 400 验证。 |
+| **v0.81.0 `cursorPage` 拒绝可空整数游标列（BREAKING，错误集）** | 可空游标列遇到 SQL `NULL` 会产出 `next_cursor=null` + `has_more=true`——调用方 `while (has_more)` 无游标重查第一页，**无限翻页**。现在直接 `error.NullableCursorColumn`：把列改非空，或换列做游标。本仓库未用 `cursorPage`，无动作。 |
+| **v0.78.0 单值聚合拒绝分组查询（BREAKING，错误集）** | `Sum`/`Avg`/`Max`/`Min`/`SumOrZero`/`AggregateOne`/`AggregateText` 遇到带 `GROUP BY` 的查询以前读**第一组**的聚合行当全集答案；现在构建 SQL 前报 `error.GroupByNotSupported`。分组聚合用 `AggregateBy`/`GroupCount`。本仓库未用这七个，无动作。 |
+| **v0.78.0 `SaveOne`/`ExecOne`/`ForceExecOne` 无计数报 `RowsAffectedUnknown`（BREAKING，错误集）** | "我没数到行数"不再被报成 `NotFound`（"没有行匹配"）。三个内置驱动都会数 `UPDATE`/`DELETE`，实际不可达；穷尽 `switch` 才可能被打到。 |
+| **v0.82.0 工具链钉 0.17.0 正式版** | `minimum_zig_version = "0.17.0"`：pre-release 排序在正式版之前，旧 `0.17.0-dev.*` 快照**不再满足**——消费方必须升到 0.17.0 正式版。本仓库 CI/zon 早已钉 0.17.0，无动作。 |
+| **v0.83.0 正确性批次 + comptime quota 硬化** | 消费方无动作的升级即得项：`id.uuidv4/uuidv7` 换 threadlocal ChaCha + OS 熵（修"三 ASLR 地址播种 + 静态无锁"的并发 UB）；`pool.borrow` 失败记账关进同一临界区；全局 hook 注册改 `.release`/`.acquire` 发布；MySQL SSL 失败路径 `mysql_close` 泄漏修复；三驱动 `beginTx` OOM 不再遗留无主事务；`codegen` 各处 `@Struct` 构造的 comptime 分支预算显式化（300 实体图压测兜底，中型图不再偶发 "quota exceeded"）。 |
 | **v0.76.0 按驱动裁剪 translate-c（消费者构建开销）** | `b.dependency("zent", .{ …, .pg = false, .mysql = false })`：zent 只为声明的驱动做 `translate-c`。默认仍是"有头文件就译"，所以不传=旧行为；**关掉一个确实 import 的驱动会在首次使用时编译失败**（`no module named 'pg_c'`/`sqlite3_c`/`mysql_c`），是刻意 fail-loud 而不是静默降级。本仓库两个示例都用上了（`zent-modulith` 关 pg+mysql，`metaverse-creative` 只用 sqlite+pg 故只关 mysql）；**本机实测端到端不变**（763 MiB / 80 s vs 默认 723 MiB / 82 s）——省下的两条 translate-c 与 SQLite 那条（~597 MiB）并行，各 ~23 s / 30 MiB，只有它们在某些主机上成为主项时才明显（上游：每驱动 ~26 s / ~590 MB）。 |
 | **v0.75.0 junction 表名撞车报 `junction_name_collision`（BREAKING，schema 检查）** | `junctionTableForEdge` 推导的 `<a>_<b>` 可能正好是某个实体声明的表名，而两者都 `CREATE TABLE IF NOT EXISTS`、实体先建 —— 于是联结表的 `CREATE` 成了 no-op，该边的每次遍历都在**另一张表**上选列。以前 `checkSchema` 报的是症状（`missing_column` 之类）；现在报这个具名错误并归 **read-breaking**，`assertSchema(…, .read_breaking_only)` 会因此拦下一次发布。`migrateSchema` 在建联结表时（含 dry-run）只 `warn`：只有一个名字能存在，改哪个由调用方决定。本仓库示例不涉及撞名。 |
 | **v0.76.1 三处 OOM 路径泄漏** | `Builder.initCapacity` / `Builder.takeQuery` / `Selector.init`：同一种形状——同一个表达式里前面的 `try` 已经交出所有权、后面的 `try` 才失败，于是 OOM 时泄漏。非 OOM 路径完全看不出来，是 `std.testing.checkAllAllocationFailures` 扫出来的。消费方无动作，升级即得。 |

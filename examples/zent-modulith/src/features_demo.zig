@@ -301,6 +301,18 @@ pub fn BatchApi(comptime Crud: type) type {
         fn batch(ctx: *http.Context, self: *State) !void {
             const Entity = zent.codegen.entity(persist.infos, persist.ProductInfo);
             const items = ctx.bindJson([]BatchItem) catch return ctx.json(400, "{\"error\":\"invalid body\"}");
+            // zent ≥ v0.81.0: insertMany takes the tenant as a parameter and
+            // ignores the entity's own tenant field (same contract as create's
+            // v0.54 change) — one call inserts one tenant's rows, so a
+            // mixed-tenant batch is rejected instead of silently landing on
+            // whichever tenant won.
+            var tenant: i64 = 0;
+            if (items.len > 0) {
+                tenant = items[0].tenant_id;
+                for (items[1..]) |it| {
+                    if (it.tenant_id != tenant) return ctx.json(400, "{\"error\":\"mixed tenant_id in batch\"}");
+                }
+            }
             var entities = std.ArrayList(Entity).empty;
             defer entities.deinit(ctx.allocator);
             for (items) |it| {
@@ -316,7 +328,7 @@ pub fn BatchApi(comptime Crud: type) type {
                     .edges = .{},
                 });
             }
-            var ids = self.crud.insertMany(entities.items) catch |err| return http.respondErr(ctx, err);
+            var ids = self.crud.insertMany(entities.items, tenant) catch |err| return http.respondErr(ctx, err);
             defer ids.deinit();
             try ctx.jsonStruct(201, .{ .ids = ids.items });
         }

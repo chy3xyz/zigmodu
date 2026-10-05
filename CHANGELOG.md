@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+### 第 143 批：zent 升级 v0.76.2 → v0.83.0（两示例改 pin + `insertMany` 双参适配 + 切换 `linkDrivers`）（**破坏性：否**——示例与文档）
+
+1. **pin 升级**：`examples/zent-modulith` 与 `examples/metaverse-creative` 的
+   zent 依赖从 v0.76.2 升到 **v0.83.0**（tag `8309cffe`）；按文档记录的
+   升级陷阱先删 `.zig-cache`/`zig-pkg` 旧版本再构建。
+2. **唯一代码适配——`insertMany` 双参**（0.81.0 BREAKING）：
+   `features_demo.zig` 的 `POST /products/batch` 改为
+   `insertMany(entities, tenant)`；批量项租户不一致直接 400（一次调用 =
+   一个租户的行，不再让某个租户"赢"）。**实跑验证**：同租户 201
+   `{"ids":[1,2]}` / 混合 400 `mixed tenant_id in batch` / 停机零泄漏。
+   其余 BREAKING 条目（`cursorPage` 可空游标、单值聚合拒分组、
+   `SaveOne` 系 `RowsAffectedUnknown`、PG `PreparedCache` 句柄类型）
+   经全仓扫描**本仓库无使用点**，无动作。
+3. **`metaverse-creative` 切换到 zent 自己的 `linkDrivers`**（pin ≥0.81.1
+   解锁）：删掉镜像的 `db_link.linkDetected(postgres)` 调用点——上游
+   0.81.1 修跨编译探测时明说"镜像副本会漂移"，此前注释就标了 pin 升
+   上去即切换。`.mysql = false` 与依赖裁剪一致。
+4. **升级即得**（消费方无动作）：`uuidv4/v7` 并发 UB 修复（threadlocal
+   ChaCha + OS 熵）、`pool.borrow` 记账竞态、三驱动 `beginTx` OOM 遗留
+   事务、comptime quota 硬化（300 实体图兜底）、0.82 工具链钉 0.17.0
+   正式版。
+5. **文档**：`docs/ZENT.md` 版本口径 → v0.83.0、§14 表头与新增 6 行
+   （0.78/0.81/0.82/0.83 消费方相关条目）、远程 URL 示例；
+   `AGENTS.md` zent 行同步。
+6. **验证**：fmt 净 · check-production OK · zent-modulith `zig build` +
+   `zig build test`（smoke 43 checks 全绿、clean shutdown 无泄漏）·
+   metaverse-creative `zig build` + `demo`（`balanced=true outbox=1`）
+   · batch 端点实跑两发（同/混租户）。
+
 ### 第 142 批：soak-cluster 两阶段 deadline（24h 首跑假红根因修复——harness 预算缺陷，非框架缺陷）（**破坏性：否**——仅 harness）
 
 **24h 首跑报告**（`.soak/soak-cluster-24h.log`，345600 iterations × 250ms × 6 writers）：
