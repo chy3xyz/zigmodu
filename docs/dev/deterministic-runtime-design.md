@@ -92,8 +92,10 @@ const rt = try Runtime.init(allocator, io, .{
   单线程 pool 下，ready ring FIFO + 每 worker 单 token ⇒ **调度序 = 入环序**，
   而入环序由事件 seq 决定 —— 全序闭环。
 - **D4 定时器**：命令环 FIFO 已确定；**同 deadline 触发序**定为契约「按 arm 命令
-  到达序」，落地时先审计 `timer_wheel.zig:347 insert` 的槽内序（append 还是
-  prepend 未确认），补一条同 deadline 三连 arm 的顺序测试。
+  到达序」—— 第 138 批审计发现槽内是 prepend（**LIFO**，与直觉相反且测试名实
+  不符），已改为 append + 尾指针的 FIFO（`timer_wheel.zig`，`pushNode`/`unlink`/
+  `expireSlot`/`sweepDue`/`drainAll`/`alignNow` 六处尾簿记），同 deadline 三连
+  arm 与 sweepDue 部分到期两条顺序测试锁定。
 - **D5 邮箱**：det 模式下 mailbox 满 = **违规而非 drop**（`error.Full` 冒泡给
   调用方；drop-on-full 的不确定本就在 D 级回放外，S 级直接禁止）。容量规划是
   调用方契约，文档给公式（生产者速率 × 最坏调度延迟）。
@@ -129,7 +131,7 @@ send/timer arm，全部走同一受控链路）→ 下一条。**级联事件不
 | 期 | 内容 | 验收 |
 |----|------|------|
 | **A** ✅（第 137 批） | ~~D1/D2 收敛~~ → **审计 + 门禁**。审计结论：runtime 域 production 直读只有两处合法本体（`clock.zig` real 分支、`precision_timer.zig` 真实钟原语）；其余直读全是测试辅助（`waitUntil`/`awaitTrackLen`/`PoolSettled`/`runShape`/`LatencyLog`，真实预算防挂，本就在回放外）。D2 的 RNG 门禁**树级已在**（entropy 扫描禁 `DefaultPrng.init` 全家，`src/runtime` 零命中）；`Runtime.rng()` API **推迟到 B 期**（零消费者，且 seed 来源要等 det 配置面）。落地物：`zig-scan.awk` 新 `dettime` mode + `check-production.sh` 扫描块（12 条逐行豁免锚，覆盖全部合法直读；两条变异实测被抓：production 直读、豁免行改一字） | 门禁绿 + 变异双红 ✅ |
-| **B** | det 配置面：`RuntimeOptions.deterministic`、`Runtime.rng()`（seed 入配置）、单线程强制、dedicated/blocking 拒收、mailbox 满违规化、同 deadline 定时器序审计 + 测试 | §4.3-1/2/4 |
+| **B** ✅（第 138 批） | det 配置面：`RuntimeOptions.deterministic` ✅、`Runtime.rng()` ✅（det seed / 非 det 系统熵 + 多源回落）、单线程强制 ✅（`pool_threads != 1` 拒）、dedicated/blocking 拒收 ✅（池查找**之前**拒，错误点名模式）、batch 强制 1 ✅、同 deadline 定时器序 ✅（**审计发现是 LIFO**（prepend）—— 改为 FIFO（arm 序）+ 尾指针，旧 pin 测试名实不符（名「insertion order」断言 LIFO）一并纠正；全模式生效，不只 det） | §4.3-1/2/4 中 D2/D3/D4 部分 ✅（三条聚焦测试 + sweepDue 部分到期 FIFO 测试）；mailbox 满违规化 = 既有 `error.Full` 语义，无新分叉 |
 | **C** | replay driver + `ZDL1` 的 seek/limit/filter CLI（§13.10 自列缺口顺带收） | §4.3-1/2/3 全量 |
 | **D** | 真实验证：`examples/quant-runtime`（或 zalpha 场景）同日志双跑 —— Live 录制 → det 回放 → 信号序列逐字节比对 | 事故级演示入 CHANGELOG |
 

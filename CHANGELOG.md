@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+### 第 138 批：Deterministic Runtime Phase B（det 配置面 + `rng()`）+ D4 定时器同 deadline LIFO→FIFO + allocPrint 清零（**破坏性：窄**——TimerWheel 同槽触发序方向反转）
+
+1. **Phase B 落地**（设计稿 `docs/dev/deterministic-runtime-design.md`，使用契约
+   `docs/RUNTIME.md` §15）：`Runtime.InitOptions.deterministic = .{ .seed }` 打开
+   受控执行模式。**受验证而非被近似**：`pool_threads != 1` 与 `blocking_threads
+   != 0` 在 `initWithOptions` 即 `error.DeterministicViolation`；`spawn` 拒
+   `.dedicated` 与 `.execution_class = .blocking`（在池查找**之前**拒，错误点名
+   模式而非池的缺席）；`scheduler.batch` 强制 1（级联的最保守全序）。`Runtime.
+   rng()` 是 D2 的唯一随机入口：det 走配置 seed（同 seed 同序列），非 det 走
+   `randomSecure` + 多源回落（单一时钟种子是坏习惯，非安全域也不养）；文档明写
+   非 CSPRNG、单线程访问语义。三条聚焦测试（init 验证 / spawn 拒收 / rng 同异
+   seed 分叉），`rng()` 种子点与熵回落行同步进 ENTROPY_OK / DET_TIME_OK 锚表。
+2. **D4：TimerWheel 同 deadline 触发序 LIFO → FIFO（全模式生效）**：审计发现
+   槽内是 prepend —— 同 deadline 的定时器**后 arm 的先触发**，且 pin 测试名实
+   不符（名「insertion order」断言 LIFO）。改为 append + 每槽尾指针
+   （`tails[levels][spokes]`；`pushNode`/`unlink`/`expireSlot`/`sweepDue`/
+   `drainAll`/`alignNow` 六处尾簿记，插入仍 O(1)、零分配），触发序 = arm 命令
+   在命令环上的到达序 = 因果序。旧测试纠正为 FIFO，新增 sweepDue 部分到期
+   （混合 deadline 同槽）FIFO 测试。**行为变化**：依赖同槽 LIFO 序的代码会观察
+   到方向反转（树内无此依赖；该序此前从未写进契约）。
+3. **allocPrint → `Allocator.print` 第三批清零**（`7cecdf8`）：38 文件 92 处，
+   三批合计 351 处调用形迁移完毕，`src/` 下 `std.fmt.allocPrint` 全形态零命中。
+4. **readiness A-6 行同步**：det runtime 标 Phase A/B ✅（剩 C：replay driver +
+   ZDL1 CLI；D：quant 双跑）；「优先级 0 命中」纠偏为 ✅（§12.17 早已落地）。
+5. **门禁读数**：fmt 净 · check-production OK（含 dettime 块）·
+   check-test-collection **2167**（+4：三条 det 聚焦 + 一条 sweepDue FIFO）·
+   TimerWheel 聚焦 20/20 · 全量 `zig build test` exit=0（247s/259s 两轮）。
+
 ### 第 137 批：Deterministic Runtime Phase A（D1 防回退门禁）+ `allocPrint` 迁移第二批（**破坏性：否**）
 
 1. **Det Phase A 落地（设计稿 `docs/dev/deterministic-runtime-design.md` §5）**：

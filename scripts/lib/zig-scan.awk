@@ -292,7 +292,11 @@ BEGIN {
   ENTROPY_OK[3] = "src/core/cluster/LoadBalancer.zig|var prng = std.Random.DefaultPrng.init(seed);"
   ENTROPY_OK[4] = "src/core/cluster/RaftElection.zig|var rng = std.Random.DefaultPrng.init(@bitCast(now));"
   ENTROPY_OK[5] = "src/test/IntegrationTest.zig|.rng = std.Random.DefaultPrng.init(seed),"
-  ENTROPY_OK_N = 5
+  # Runtime.rng() 的唯一种子点（deterministic-runtime D2）：det 模式 seed 来自
+  # InitOptions.deterministic.seed（可复现就是目的），非 det 走 randomSecure +
+  # 多源回落；rng() 文档明写非 CSPRNG。
+  ENTROPY_OK[6] = "src/runtime/runtime.zig|return std.Random.DefaultPrng.init(seed);"
+  ENTROPY_OK_N = 6
 
   # dettime 豁免（锚定到行文本）：Clock union 的 real 分支本体、
   # PrecisionTimer 真实钟原语本体、以及测试辅助里的真实时间预算
@@ -309,7 +313,9 @@ BEGIN {
   DET_TIME_OK[10] = "src/runtime/runtime.zig|const start_ns = time_mod.monotonicNow();"
   DET_TIME_OK[11] = "src/runtime/runtime.zig|const elapsed_ns = time_mod.monotonicNow() - start_ns;"
   DET_TIME_OK[12] = "src/runtime/runtime.zig|if (i < self.samples.len) self.samples[i] = time_mod.monotonicNow() - sent_ns;"
-  DET_TIME_OK_N = 12
+  # seedPrng 的熵回落（D2 随机域，不是时间语义；det 模式根本不走这一支）。
+  DET_TIME_OK[13] = "src/runtime/runtime.zig|break :blk @as(u64, @bitCast(time_mod.monotonicNow())) ^ @as(u64, @intFromPtr(&buf));"
+  DET_TIME_OK_N = 13
 }
 
 BEGIN { in_test = 0; depth = 0; kw = 0; open = 0; seen = 0 }

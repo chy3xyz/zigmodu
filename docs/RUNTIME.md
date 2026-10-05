@@ -2519,3 +2519,45 @@ exit 2 / 翻转字节 → corrupt 定位 + exit 3 / 空 log / 目录缺失是错
 **照旧没做**（§13.9 D5 / §13.10 D7 的其余项不变）：边写边读（跟随活跃 log）、压实/保留、
 跨进程/跨机、压缩加密、修复操作（`repair` 保持 API 级显式调用，不进 CLI —— 报告里指名它，
 是让运维决定，不是让工具替他决定）。
+
+## 15. Deterministic mode —— Phase B 已落地（v0.36 后批次 138）
+
+> 设计与分级（D/S/P 三级、六条不变式、四阶段路线）在
+> [`dev/deterministic-runtime-design.md`](dev/deterministic-runtime-design.md)；
+> 本节只记**使用契约**。一句话：同一份输入 + 同一个 seed + 同一拓扑 ⇒ 同一条
+> 事件序列。它是「配置出来的执行模式」，不是第二套 runtime —— 默认（生产）模式
+> 一字不改。
+
+```zig
+var rt = try Runtime.initWithOptions(allocator, io, .{
+    .clock = .{ .manual = &clk },               // det 的时间也是受控源（D1）
+    .scheduler = .{ .max_pooled_workers = 8 },   // pool_threads 必须 = 1（默认即是）
+    .deterministic = .{ .seed = 42 },            // 打开即受控
+});
+const r = rt.rng();                              // D2 的唯一随机入口（非 CSPRNG）
+```
+
+**受验证，不是被近似**（违反即 `error.DeterministicViolation`）：
+
+- `scheduler.pool_threads` 必须 = 1 —— ready ring 的第二个消费者就是第二种交错；
+- `blocking_threads` 必须 = 0 —— 阻塞池是第二个调度域；
+- `spawn` 拒 `.dedicated`（它自有线程，全序看不见）与 `.execution_class = .blocking`
+  —— 在池查找**之前**拒，错误点名的是模式而不是池的缺席；
+- `scheduler.batch` 被强制为 1 —— 级联事件的最保守全序（设计 §6）。
+
+**定时器同 deadline 顺序（D4）**：TimerWheel 同槽从 LIFO 改为 **FIFO（arm 序）**——
+与 arm 命令在命令环上的到达序一致，是因果序而不是其倒置。该变化对**所有模式**
+生效（不只 det）：旧行为同样是确定的，但方向反直觉（先 arm 的后触发）。
+
+**邮箱（D5）**：满即 `error.Full` 冒泡给调用方（既有语义，det 无新分叉）；
+HotBus 的 drop-on-full 在 det 下由「订阅者同线程 drain」约束覆盖（单线程天然满足）。
+
+**rng()**：det 模式 seed 来自配置（同 seed 同序列），非 det 走系统熵 + 多源回落。
+单线程访问语义（det 单线程构造决定），**非 CSPRNG**，严禁派生密钥/令牌。
+
+**Phase A（D1 防回退）**：`check-production.sh` 的 `dettime` 扫描把守 runtime 域
+production 不得直读 `core/Time.zig`（豁免仅 Clock real 分支 / PrecisionTimer 本体 /
+测试辅助，逐行锚定，变异实测被抓）。
+
+**仍未做（Phase C/D）**：replay driver + `ZDL1` 的 seek/limit/filter CLI
+（§13.10 自列缺口）、quant 场景同日志双跑实演、P 级进程确定性（明确不做）。

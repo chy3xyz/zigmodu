@@ -1107,6 +1107,22 @@ pub fn WorkerContext(comptime W: type, comptime capacity: usize) type {
 
 // ==== §5  Runtime ====
 
+/// Seed the runtime's simulation PRNG. Det mode takes the caller's seed
+/// verbatim (reproducibility is the point); production draws system entropy,
+/// falling back to a multi-source mix (monotonic clock XOR a stack address)
+/// rather than a bare timestamp — the PRNG is documented non-CSPRNG
+/// throughout, but a single-source seed is a bad habit to keep anywhere.
+fn seedPrng(io: std.Io, det: ?Runtime.DeterministicOptions) std.Random.DefaultPrng {
+    const seed: u64 = if (det) |d| d.seed else blk: {
+        var buf: [8]u8 = undefined;
+        std.Io.randomSecure(io, &buf) catch {
+            break :blk @as(u64, @bitCast(time_mod.monotonicNow())) ^ @as(u64, @intFromPtr(&buf));
+        };
+        break :blk @as(u64, @bitCast(buf));
+    };
+    return std.Random.DefaultPrng.init(seed);
+}
+
 pub const Runtime = struct {
     const Self = @This();
 
@@ -1213,6 +1229,15 @@ pub const Runtime = struct {
     /// outlives `shutdown` on purpose: a replay normally happens *after* the run,
     /// with the handles gone and a fresh graph in their place.
     delivery_log: ?*DeliveryLog = null,
+    /// Deterministic execution mode (docs/dev/deterministic-runtime-design.md),
+    /// non-null only when `InitOptions.deterministic` was set. Its presence is
+    /// the switch `spawn` checks to refuse a second scheduling domain
+    /// (`.dedicated` / `.blocking`).
+    det: ?DeterministicOptions = null,
+    /// The simulation random source behind `rng()` (design D2's single entry).
+    /// Seeded from `InitOptions.deterministic.seed` in det mode, system entropy
+    /// otherwise. NOT a CSPRNG.
+    prng: std.Random.DefaultPrng,
 
     const Entry = struct {
         ptr: *anyopaque,
@@ -1252,6 +1277,26 @@ pub const Runtime = struct {
         /// is a configuration error at `spawn` rather than a thread appearing
         /// behind the caller's back.
         scheduler: SchedulerConfig = .{},
+        /// Deterministic execution mode (docs/dev/deterministic-runtime-design.md
+        /// §4.1): `null` (the default) is production, unchanged. Non-null switches
+        /// the runtime onto controlled sources, and that is *validated*, not
+        /// approximated: `scheduler.pool_threads` must be 1 (the default — a
+        /// second consumer of the ready ring is a second interleaving),
+        /// `blocking_threads` must be 0 (a blocking pool is a second scheduling
+        /// domain), `scheduler.batch` is forced to 1 (the most conservative
+        /// total order over cascades, §6 of the design), and `spawn` then refuses
+        /// `.dedicated` / `.blocking` with `error.DeterministicViolation`. For
+        /// backtests, incident replay and seed-as-testcase suites — never a
+        /// production deployment.
+        deterministic: ?DeterministicOptions = null,
+    };
+
+    /// Deterministic execution mode's knobs (see `InitOptions.deterministic`).
+    pub const DeterministicOptions = struct {
+        /// Every reproducible sequence hangs off this: `rng()` draws, and
+        /// anything downstream that seeds itself from `rng()`. Same seed + same
+        /// input + same clock ⇒ same event sequence.
+        seed: u64,
     };
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, clock: Clock) Self {
@@ -1259,6 +1304,7 @@ pub const Runtime = struct {
             .allocator = allocator,
             .io = io,
             .clock = clock,
+            .prng = seedPrng(io, null),
             // `now_ms` here is pre-ownership initialization: no driver exists
             // yet, so nobody can be reading the wheel concurrently. A driver
             // that starts later re-aligns it on its own thread (`Wheel.alignNow`).
@@ -1285,22 +1331,51 @@ pub const Runtime = struct {
     ) !Self {
         var self = init(allocator, io, options.clock);
         errdefer self.deinit();
-        if (options.scheduler.max_pooled_workers != 0) {
-            self.scheduler = try Scheduler.init(allocator, io, options.scheduler);
+        if (options.deterministic) |det| {
+            // Validated, not approximated (design D3): a second consumer of the
+            // ready ring — or a second pool of any kind — is a second
+            // interleaving the total order says nothing about.
+            if (options.scheduler.pool_threads != 1) return error.DeterministicViolation;
+            if (options.scheduler.blocking_threads != 0) return error.DeterministicViolation;
+            self.det = det;
+            self.prng = seedPrng(io, det);
         }
-        if (options.scheduler.blocking_threads != 0) {
-            const bound = if (options.scheduler.max_blocking_workers != 0)
-                options.scheduler.max_blocking_workers
+        var scheduler_config = options.scheduler;
+        if (options.deterministic != null) {
+            // The most conservative total order over cascades (design §6): one
+            // message per claim, so a drain cannot interleave two ready workers
+            // mid-batch.
+            scheduler_config.batch = 1;
+        }
+        if (scheduler_config.max_pooled_workers != 0) {
+            self.scheduler = try Scheduler.init(allocator, io, scheduler_config);
+        }
+        if (scheduler_config.blocking_threads != 0) {
+            const bound = if (scheduler_config.max_blocking_workers != 0)
+                scheduler_config.max_blocking_workers
             else
-                options.scheduler.max_pooled_workers;
+                scheduler_config.max_pooled_workers;
             if (bound == 0) return error.BlockingPoolNotConfigured;
             self.blocking_scheduler = try Scheduler.init(allocator, io, .{
                 .max_pooled_workers = bound,
-                .pool_threads = options.scheduler.blocking_threads,
-                .batch = options.scheduler.batch,
+                .pool_threads = scheduler_config.blocking_threads,
+                .batch = scheduler_config.batch,
             });
         }
         return self;
+    }
+
+    /// The simulation random source (deterministic-runtime design D2's single
+    /// entry). Det mode seeds it from `InitOptions.deterministic.seed` — same
+    /// seed, same sequence, reproducible cascades — anything else gets system
+    /// entropy. **Not a CSPRNG**: never derive keys, tokens or salts from it
+    /// (a security use of `DefaultPrng` is what the entropy gate exists to flag).
+    ///
+    /// Single-threaded access only, matching det mode's own construction (one
+    /// pool thread, no dedicated, no blocking): there is deliberately no
+    /// synchronization here, so a multi-threaded caller brings its own.
+    pub fn rng(self: *Self) std.Random {
+        return self.prng.random();
     }
 
     pub fn deinit(self: *Self) void {
@@ -1646,6 +1721,19 @@ pub const Runtime = struct {
         // thread (D2). *Which* pool is the execution class's one job: it decides
         // here and nowhere else, so the rest of the spawn — the ready link, the
         // hand-back, the stop policy — never has to know a class exists.
+        // Deterministic mode refuses a second scheduling domain outright
+        // (design D3): a dedicated worker owns a thread the total order cannot
+        // see, and `.blocking` targets a pool det mode refused to build in the
+        // first place — checked *before* the pool lookup, so the error names the
+        // actual mistake (the mode) rather than its downstream absence. A
+        // runtime check, because the mode is a construction-time choice rather
+        // than a comptime one — comptime pruning keeps it free when the branch
+        // is unreachable.
+        if (self.det != null) {
+            if (comptime !pooled) return error.DeterministicViolation;
+            if (comptime execution_class == .blocking) return error.DeterministicViolation;
+        }
+
         var sched: ?*Scheduler = null;
         if (pooled) sched = switch (execution_class) {
             .cpu => self.scheduler orelse return error.PoolNotConfigured,
@@ -5349,6 +5437,87 @@ test "Runtime: N pool threads conserve messages and never overlap on one worker"
     try std.testing.expectEqual(@as(u64, 0), pool.ready_push_failures);
     try std.testing.expectEqual(@as(usize, 0), pool.ready_len);
     try std.testing.expectEqual(@as(usize, 0), pool.claimed);
+}
+
+test "Runtime: deterministic mode is validated at init, not approximated (D3)" {
+    var clk = Clock.Manual{ .now_ms = 0 };
+
+    // A second consumer of the ready ring is a second interleaving.
+    try std.testing.expectError(error.DeterministicViolation, Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+        .clock = .{ .manual = &clk },
+        .scheduler = .{ .max_pooled_workers = 2, .pool_threads = 2 },
+        .deterministic = .{ .seed = 1 },
+    }));
+    // A blocking pool is a second scheduling domain.
+    try std.testing.expectError(error.DeterministicViolation, Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+        .clock = .{ .manual = &clk },
+        .scheduler = .{ .max_pooled_workers = 2, .blocking_threads = 1 },
+        .deterministic = .{ .seed = 1 },
+    }));
+
+    // A conforming declaration constructs fine, and the batch is forced to the
+    // most conservative total order over cascades (design §6).
+    var rt = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+        .clock = .{ .manual = &clk },
+        .scheduler = .{ .max_pooled_workers = 2, .batch = 64 },
+        .deterministic = .{ .seed = 1 },
+    });
+    defer rt.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rt.scheduler.?.batch);
+}
+
+test "Runtime: deterministic mode refuses a second scheduling domain at spawn (D3)" {
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+        .clock = .{ .manual = &clk },
+        .scheduler = .{ .max_pooled_workers = 2 },
+        .deterministic = .{ .seed = 7 },
+    });
+    defer rt.deinit();
+
+    // Dedicated: a thread of its own the total order cannot see. Refused even
+    // though the same spawn is legal outside det mode.
+    try std.testing.expectError(error.DeterministicViolation, rt.spawn(CounterWorker, .{}, .{ .capacity = 8 }));
+    // `.blocking`: refused naming the mode, not the (det-forbidden) pool.
+    try std.testing.expectError(error.DeterministicViolation, rt.spawn(
+        CounterWorker,
+        .{},
+        .{ .capacity = 8, .mode = .pooled, .execution_class = .blocking },
+    ));
+    // A pooled `.cpu` worker — the one shape det mode has — spawns fine.
+    _ = try rt.spawn(CounterWorker, .{}, .{ .capacity = 8, .mode = .pooled });
+}
+
+test "Runtime: rng() reproduces per seed and diverges across seeds (D2)" {
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var a = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+        .clock = .{ .manual = &clk },
+        .deterministic = .{ .seed = 42 },
+    });
+    defer a.deinit();
+    var b = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+        .clock = .{ .manual = &clk },
+        .deterministic = .{ .seed = 42 },
+    });
+    defer b.deinit();
+    var c = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+        .clock = .{ .manual = &clk },
+        .deterministic = .{ .seed = 43 },
+    });
+    defer c.deinit();
+
+    var ra = a.rng();
+    var rb = b.rng();
+    var rc = c.rng();
+    var same_ab = true;
+    var same_ac = true;
+    for (0..8) |_| {
+        const va = ra.int(u64);
+        same_ab = same_ab and va == rb.int(u64);
+        same_ac = same_ac and va == rc.int(u64);
+    }
+    try std.testing.expect(same_ab); // same seed ⇒ same stream
+    try std.testing.expect(!same_ac); // a different seed legally diverges
 }
 
 test "Runtime: `.pooled` without a declared pool is refused, and the bound is hard" {

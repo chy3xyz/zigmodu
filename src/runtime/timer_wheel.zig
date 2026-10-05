@@ -102,6 +102,14 @@ pub fn Wheel(comptime Payload: type) type {
         index: [levels]u64 = @splat(0),
         now_ms: i64 = 0,
         slots: [levels][spokes]?*Node = @splat(@splat(null)),
+        /// Tail of each slot's list, so `pushNode` appends. The list is singly
+        /// walked head-first on fire, and the contract is that timers sharing a
+        /// deadline fire **in arm order** (FIFO) — the same order their arm
+        /// commands arrived on the timer command ring (deterministic-runtime
+        /// D4, docs/dev/deterministic-runtime-design.md). The wheel used to
+        /// prepend, which made same-slot firing LIFO: deterministic too, but the
+        /// exact reverse of the causal order a replay (or a reader) expects.
+        tails: [levels][spokes]?*Node = @splat(@splat(null)),
         /// `id → node`, the only lookup structure the wheel has.
         ///
         /// An **array** hash map, not `AutoHashMapUnmanaged`, and that is a
@@ -285,6 +293,7 @@ pub fn Wheel(comptime Payload: type) type {
                 for (0..spokes) |s| {
                     var it = self.slots[l][s];
                     self.slots[l][s] = null;
+                    self.tails[l][s] = null;
                     while (it) |node| {
                         it = node.next;
                         node.next = null;
@@ -352,13 +361,13 @@ pub fn Wheel(comptime Payload: type) type {
         }
 
         fn pushNode(self: *Self, level: u32, slot: usize, node: *Node) void {
-            const head = self.slots[level][slot];
+            const tail = self.tails[level][slot];
             node.level = level;
             node.slot = slot;
-            node.prev = null;
-            node.next = head;
-            if (head) |h| h.prev = node;
-            self.slots[level][slot] = node;
+            node.prev = tail;
+            node.next = null;
+            if (tail) |t| t.next = node else self.slots[level][slot] = node;
+            self.tails[level][slot] = node;
         }
 
         fn unlink(self: *Self, node: *Node) void {
@@ -368,7 +377,12 @@ pub fn Wheel(comptime Payload: type) type {
                 // Head of its slot: the slot pointer must stop referring to it.
                 self.slots[node.level][node.slot] = node.next;
             }
-            if (node.next) |n| n.prev = node.prev;
+            if (node.next) |n| {
+                n.prev = node.prev;
+            } else {
+                // Tail of its slot: same upkeep on the other end.
+                self.tails[node.level][node.slot] = node.prev;
+            }
             node.prev = null;
             node.next = null;
         }
@@ -393,6 +407,7 @@ pub fn Wheel(comptime Payload: type) type {
             var fired_now: usize = 0;
             var it = self.slots[level][slot];
             self.slots[level][slot] = null;
+            self.tails[level][slot] = null;
             while (it) |node| {
                 it = node.next;
                 node.next = null;
@@ -443,7 +458,13 @@ pub fn Wheel(comptime Payload: type) type {
                     } else {
                         self.slots[level][slot] = next;
                     }
-                    if (next) |n| n.prev = prev;
+                    if (next) |n| {
+                        n.prev = prev;
+                    } else {
+                        // The tail just fired: the slot's tail pointer follows
+                        // the survivor (or empties with the list).
+                        self.tails[level][slot] = prev;
+                    }
                     node.prev = null;
                     node.next = null;
                     _ = self.nodes.swapRemove(node.id);
@@ -562,6 +583,7 @@ pub fn Wheel(comptime Payload: type) type {
                 for (0..spokes) |s| {
                     var it = self.slots[l][s];
                     self.slots[l][s] = null;
+                    self.tails[l][s] = null;
                     while (it) |node| : (it = node.next) {
                         node.next = null;
                         node.prev = null;
@@ -884,7 +906,30 @@ test "Wheel fires same-slot timers in insertion order" {
     _ = try wheel.schedule(100, 2);
     _ = try wheel.schedule(100, 3);
     _ = wheel.advance(200, &rec, Recorder(u32).on_fire);
-    try std.testing.expectEqualSlices(u32, &.{ 3, 2, 1 }, rec.fired.items); // list is LIFO
+    // FIFO (deterministic-runtime D4): same deadline ⇒ arm order, matching the
+    // order the arm commands arrived on the timer command ring. The list used
+    // to be prepend-LIFO — deterministic too, but the reverse of causal order.
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, rec.fired.items);
+}
+
+test "Wheel sweepDue keeps FIFO order when only part of a slot is due (D4)" {
+    var wheel = Wheel(u32).init(std.testing.allocator, 0);
+    defer wheel.deinit();
+    var rec = Recorder(u32){};
+    defer rec.deinit();
+
+    // Same fine slot, mixed deadlines: the due half fires in arm order, the
+    // survivor stays, and the next sweep fires it after any newly armed timer
+    // sharing ITS deadline — tail bookkeeping intact either way.
+    _ = try wheel.schedule(100, 1);
+    _ = try wheel.schedule(120, 2);
+    _ = try wheel.schedule(100, 3);
+    _ = wheel.advance(100, &rec, Recorder(u32).on_fire);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 3 }, rec.fired.items);
+    _ = try wheel.schedule(120, 4);
+    _ = wheel.advance(120, &rec, Recorder(u32).on_fire);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 3, 2, 4 }, rec.fired.items);
+    try std.testing.expectEqual(@as(usize, 0), wheel.pendingCount());
 }
 
 test "Wheel cancel removes a timer and frees it" {
