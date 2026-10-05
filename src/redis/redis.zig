@@ -386,7 +386,7 @@ pub const Redis = struct {
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
         {
-            const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$3\r\nGET\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
+            const cmd = self.allocator.print("*2\r\n$3\r\nGET\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
             defer self.allocator.free(cmd);
 
             try self.writeCmdEvicting(borrowed, cmd);
@@ -426,9 +426,9 @@ pub const Redis = struct {
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
         const cmd = if (ex_seconds) |ex|
-            std.fmt.allocPrint(self.allocator, "*5\r\n$3\r\nSET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n$2\r\nEX\r\n${d}\r\n{d}\r\n", .{ key.len, key, value.len, value, std.fmt.count("{d}", .{ex}), ex }) catch return error.RedisError
+            self.allocator.print("*5\r\n$3\r\nSET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n$2\r\nEX\r\n${d}\r\n{d}\r\n", .{ key.len, key, value.len, value, std.fmt.count("{d}", .{ex}), ex }) catch return error.RedisError
         else
-            std.fmt.allocPrint(self.allocator, "*3\r\n$3\r\nSET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{ key.len, key, value.len, value }) catch return error.RedisError;
+            self.allocator.print("*3\r\n$3\r\nSET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{ key.len, key, value.len, value }) catch return error.RedisError;
         defer self.allocator.free(cmd);
 
         try self.writeCmdEvicting(borrowed, cmd);
@@ -447,7 +447,7 @@ pub const Redis = struct {
         const borrowed = try self.acquireStream();
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
-        const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$5\r\nSETNX\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{ key.len, key, value.len, value }) catch return error.RedisError;
+        const cmd = self.allocator.print("*3\r\n$5\r\nSETNX\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{ key.len, key, value.len, value }) catch return error.RedisError;
         defer self.allocator.free(cmd);
 
         try self.writeCmdEvicting(borrowed, cmd);
@@ -510,7 +510,7 @@ pub const Redis = struct {
         const borrowed = try self.acquireStream();
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
-        const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$6\r\nEXISTS\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
+        const cmd = self.allocator.print("*2\r\n$6\r\nEXISTS\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
         defer self.allocator.free(cmd);
 
         try self.writeCmdEvicting(borrowed, cmd);
@@ -538,7 +538,7 @@ pub const Redis = struct {
         const borrowed = self.acquireStream() catch return error.RedisError;
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
-        const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$4\r\nINCR\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
+        const cmd = self.allocator.print("*2\r\n$4\r\nINCR\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
         defer self.allocator.free(cmd);
 
         try self.writeCmdEvicting(borrowed, cmd);
@@ -566,7 +566,7 @@ pub const Redis = struct {
         const borrowed = self.acquireStream() catch return error.RedisError;
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
-        const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$4\r\nDECR\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
+        const cmd = self.allocator.print("*2\r\n$4\r\nDECR\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
         defer self.allocator.free(cmd);
 
         try self.writeCmdEvicting(borrowed, cmd);
@@ -594,7 +594,7 @@ pub const Redis = struct {
         const borrowed = self.acquireStream() catch return error.RedisError;
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
-        const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$6\r\nEXPIRE\r\n${d}\r\n{s}\r\n${d}\r\n{d}\r\n", .{ key.len, key, std.fmt.count("{d}", .{seconds}), seconds }) catch return error.RedisError;
+        const cmd = self.allocator.print("*3\r\n$6\r\nEXPIRE\r\n${d}\r\n{s}\r\n${d}\r\n{d}\r\n", .{ key.len, key, std.fmt.count("{d}", .{seconds}), seconds }) catch return error.RedisError;
         defer self.allocator.free(cmd);
 
         try self.writeCmdEvicting(borrowed, cmd);
@@ -614,7 +614,7 @@ pub const Redis = struct {
         const borrowed = try self.acquireStream();
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
-        const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$3\r\nTTL\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
+        const cmd = self.allocator.print("*2\r\n$3\r\nTTL\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
         defer self.allocator.free(cmd);
 
         try self.writeCmdEvicting(borrowed, cmd);
@@ -683,7 +683,7 @@ pub const Redis = struct {
         const borrowed = try self.acquireStream();
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
-        const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$3\r\nDEL\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
+        const cmd = self.allocator.print("*2\r\n$3\r\nDEL\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
         defer self.allocator.free(cmd);
 
         try self.writeCmdEvicting(borrowed, cmd);
@@ -711,7 +711,7 @@ pub const Redis = struct {
         const borrowed = self.acquireStream() catch return error.RedisError;
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
-        const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$5\r\nLPUSH\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{ key.len, key, value.len, value }) catch return error.RedisError;
+        const cmd = self.allocator.print("*3\r\n$5\r\nLPUSH\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{ key.len, key, value.len, value }) catch return error.RedisError;
         defer self.allocator.free(cmd);
 
         try self.writeCmdEvicting(borrowed, cmd);
@@ -738,7 +738,7 @@ pub const Redis = struct {
         const borrowed = self.acquireStream() catch return error.RedisError;
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
-        const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$4\r\nRPOP\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
+        const cmd = self.allocator.print("*2\r\n$4\r\nRPOP\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
         defer self.allocator.free(cmd);
 
         try self.writeCmdEvicting(borrowed, cmd);
@@ -777,7 +777,7 @@ pub const Redis = struct {
         const borrowed = self.acquireStream() catch return error.RedisError;
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
-        const cmd = std.fmt.allocPrint(self.allocator, "*4\r\n$4\r\nHSET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{
+        const cmd = self.allocator.print("*4\r\n$4\r\nHSET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{
             key.len, key, field.len, field, value.len, value,
         }) catch return error.RedisError;
         defer self.allocator.free(cmd);
@@ -806,7 +806,7 @@ pub const Redis = struct {
         const borrowed = self.acquireStream() catch return error.RedisError;
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
-        const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$4\r\nHGET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{
+        const cmd = self.allocator.print("*3\r\n$4\r\nHGET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{
             key.len, key, field.len, field,
         }) catch return error.RedisError;
         defer self.allocator.free(cmd);
@@ -847,7 +847,7 @@ pub const Redis = struct {
         const borrowed = self.acquireStream() catch return error.RedisError;
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
-        const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$7\r\nPUBLISH\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{
+        const cmd = self.allocator.print("*3\r\n$7\r\nPUBLISH\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{
             channel.len, channel, message.len, message,
         }) catch return error.RedisError;
         defer self.allocator.free(cmd);

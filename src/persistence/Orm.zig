@@ -356,9 +356,9 @@ fn wherePredicate(where_sql: []const u8) []const u8 {
 fn tenantClause(allocator: std.mem.Allocator, comptime col: []const u8, where_sql: []const u8) ![]const u8 {
     const predicate = wherePredicate(where_sql);
     if (predicate.len == 0) {
-        return std.fmt.allocPrint(allocator, "WHERE {s} = ?", .{col});
+        return allocator.print("WHERE {s} = ?", .{col});
     }
-    return std.fmt.allocPrint(allocator, "WHERE ({s}) AND {s} = ?", .{ predicate, col });
+    return allocator.print("WHERE ({s}) AND {s} = ?", .{ predicate, col });
 }
 
 /// Runtime WHERE fragment for filtered reads: caller's `where_sql` plus
@@ -370,7 +370,7 @@ fn effectiveWhere(allocator: std.mem.Allocator, comptime T: type, where_sql: []c
     if (!@hasField(T, "deleted")) return where_sql;
     const predicate = wherePredicate(where_sql);
     if (predicate.len == 0) return try allocator.dupe(u8, "WHERE deleted = 0");
-    return try std.fmt.allocPrint(allocator, "WHERE ({s}) AND deleted = 0", .{predicate});
+    return try allocator.print("WHERE ({s}) AND deleted = 0", .{predicate});
 }
 
 fn comptimeSkipInsertField(comptime fname: []const u8, comptime auto_ts: bool) bool {
@@ -571,11 +571,11 @@ fn buildSelectPage(allocator: std.mem.Allocator, table: []const u8, sql_cols: []
 }
 
 fn buildCount(allocator: std.mem.Allocator, table: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "SELECT COUNT(*) as count FROM {s}", .{table});
+    return allocator.print("SELECT COUNT(*) as count FROM {s}", .{table});
 }
 
 fn buildDelete(allocator: std.mem.Allocator, table: []const u8, pk: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "DELETE FROM {s} WHERE {s} = ?", .{ table, pk });
+    return allocator.print("DELETE FROM {s} WHERE {s} = ?", .{ table, pk });
 }
 
 // ==================== Pagination ====================
@@ -1024,14 +1024,13 @@ pub fn Orm(comptime B: type) type {
 
                     const eff_where = try effectiveWhere(alloc, T, where_sql);
                     defer if (@hasField(T, "deleted")) alloc.free(eff_where);
-                    const count_sql = try std.fmt.allocPrint(alloc, "SELECT COUNT(*) AS count FROM {s} {s}", .{ meta.table_name, eff_where });
+                    const count_sql = try alloc.print("SELECT COUNT(*) AS count FROM {s} {s}", .{ meta.table_name, eff_where });
                     defer alloc.free(count_sql);
                     const count_row = try self.orm.backend.queryRow(struct { count: i64 }, count_sql, args);
                     const total: usize = if (count_row) |c| @intCast(c.count) else 0;
 
                     const offset: i64 = if (page > 0) @intCast((page - 1) * size) else 0;
-                    const data_sql = try std.fmt.allocPrint(
-                        alloc,
+                    const data_sql = try alloc.print(
                         "SELECT {s} FROM {s} {s} ORDER BY {s} DESC LIMIT ? OFFSET ?",
                         .{ col_list, meta.table_name, eff_where, meta.primary_key },
                     );
@@ -1074,7 +1073,7 @@ pub fn Orm(comptime B: type) type {
                     defer alloc.free(count_clause);
                     const eff_where = try effectiveWhere(alloc, T, count_clause);
                     defer if (@hasField(T, "deleted")) alloc.free(eff_where);
-                    const count_sql = try std.fmt.allocPrint(alloc, "SELECT COUNT(*) AS count FROM {s} {s}", .{ meta.table_name, eff_where });
+                    const count_sql = try alloc.print("SELECT COUNT(*) AS count FROM {s} {s}", .{ meta.table_name, eff_where });
                     defer alloc.free(count_sql);
                     const count_args = try alloc.alloc(B.Value, args.len + 1);
                     defer alloc.free(count_args);
@@ -1084,8 +1083,7 @@ pub fn Orm(comptime B: type) type {
                     const total: usize = if (count_row) |c| @intCast(c.count) else 0;
 
                     const offset: i64 = if (page > 0) @intCast((page - 1) * size) else 0;
-                    const data_sql = try std.fmt.allocPrint(
-                        alloc,
+                    const data_sql = try alloc.print(
                         "SELECT {s} FROM {s} {s} ORDER BY {s} DESC LIMIT ? OFFSET ?",
                         .{ col_list, meta.table_name, eff_where, meta.primary_key },
                     );
@@ -1210,7 +1208,7 @@ pub fn Orm(comptime B: type) type {
                             }
                         }
                     }
-                    const sql = try std.fmt.allocPrint(allocator, "INSERT INTO {s} ({s}) VALUES ({s})", .{ meta.table_name, cols.items, vals.items });
+                    const sql = try allocator.print("INSERT INTO {s} ({s}) VALUES ({s})", .{ meta.table_name, cols.items, vals.items });
                     defer allocator.free(sql);
                     const exec_result = try self.orm.backend.exec(sql, args.items);
                     try self.writeBackInsertedId(&e, exec_result);
@@ -1448,7 +1446,7 @@ pub fn Orm(comptime B: type) type {
                     }
                     if (set_clause.items.len == 0) return; // nothing to update
                     try args.append(allocator, fieldToBackendValue(B, @field(entity, meta.primary_key)));
-                    const sql = try std.fmt.allocPrint(allocator, "UPDATE {s} SET {s} WHERE {s} = ?", .{ meta.table_name, set_clause.items, meta.primary_key });
+                    const sql = try allocator.print("UPDATE {s} SET {s} WHERE {s} = ?", .{ meta.table_name, set_clause.items, meta.primary_key });
                     defer allocator.free(sql);
                     _ = try self.orm.backend.exec(sql, args.items);
                 }

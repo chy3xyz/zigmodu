@@ -1915,11 +1915,11 @@ test "real loopback election: tick sends real vote requests and the candidate wi
     const a_port = try startInbound(allocator, io, &a_raft, &a_impl.addresses, c_port + 1, &a_inbound, &a_thread);
     servers_up = 3;
 
-    const b_endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{b_port});
+    const b_endpoint = try allocator.print("127.0.0.1:{d}", .{b_port});
     defer allocator.free(b_endpoint);
-    const c_endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{c_port});
+    const c_endpoint = try allocator.print("127.0.0.1:{d}", .{c_port});
     defer allocator.free(c_endpoint);
-    const a_endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{a_port});
+    const a_endpoint = try allocator.print("127.0.0.1:{d}", .{a_port});
     defer allocator.free(a_endpoint);
 
     // node-a dials from its address book (its Peer entries carry no address, the
@@ -2001,7 +2001,7 @@ test "real loopback replication: sync AppendEntries and same-connection replies"
     impls_up = 1;
     const b_port = try startInbound(allocator, io, &b_raft, &b_impl.addresses, 19590, &b_inbound, &b_thread);
     servers_up = 1;
-    const b_endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{b_port});
+    const b_endpoint = try allocator.print("127.0.0.1:{d}", .{b_port});
     defer allocator.free(b_endpoint);
 
     a_impl.init(allocator, io, &a_raft);
@@ -2124,7 +2124,7 @@ test "real loopback catch-up: empty-log follower converges via per-peer nextInde
     impls_up = 1;
     const b_port = try startInbound(allocator, io, &b_raft, &b_impl.addresses, 19640, &b_inbound, &b_thread);
     servers_up = 1;
-    const b_endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{b_port});
+    const b_endpoint = try allocator.print("127.0.0.1:{d}", .{b_port});
     defer allocator.free(b_endpoint);
 
     a_impl.init(allocator, io, &a_raft);
@@ -2226,7 +2226,7 @@ test "real loopback snapshot catch-up: a follower that fell into the snapshot co
     impls_up = 1;
     const b_port = try startInbound(allocator, io, &b_raft, &b_impl.addresses, 19720, &b_inbound, &b_thread);
     servers_up = 1;
-    const b_endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{b_port});
+    const b_endpoint = try allocator.print("127.0.0.1:{d}", .{b_port});
     defer allocator.free(b_endpoint);
 
     a_impl.init(allocator, io, &a_raft);
@@ -2275,7 +2275,7 @@ test "real loopback snapshot catch-up: a follower that fell into the snapshot co
     // node-c joins the network now, one snapshot and three entries behind.
     const c_port = try startInbound(allocator, io, &c_raft, &c_impl.addresses, 19760, &c_inbound, &c_thread);
     servers_up = 2;
-    const c_endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{c_port});
+    const c_endpoint = try allocator.print("127.0.0.1:{d}", .{c_port});
     defer allocator.free(c_endpoint);
     try a_impl.addresses.addEndpoint("node-c", c_endpoint);
 
@@ -2384,7 +2384,7 @@ test "a peer that accepts and never replies costs rpc_timeout_ms, not the peer's
     raft = try RaftElection.init(allocator, "node-a", &.{}, .{ .rpc_timeout_ms = timeout_ms }, &impl.transport());
     defer raft.deinit();
 
-    const endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{server.port});
+    const endpoint = try allocator.print("127.0.0.1:{d}", .{server.port});
     defer allocator.free(endpoint);
 
     const started = Time.monotonicNowMilliseconds();
@@ -2632,7 +2632,7 @@ test "with a cluster_secret, a loopback AppendEntries round-trip is signed end t
     impls_up = 1;
     const b_port = try startInbound(allocator, io, &b_raft, &b_impl.addresses, 19740, &b_inbound, &b_thread);
     servers_up = 1;
-    const b_endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{b_port});
+    const b_endpoint = try allocator.print("127.0.0.1:{d}", .{b_port});
     defer allocator.free(b_endpoint);
 
     a_impl.init(allocator, io, &a_raft);
@@ -2829,11 +2829,11 @@ test "real loopback per-node election: three keyed nodes elect a leader and repl
     const a_port = try startInbound(allocator, io, &a_raft, &a_impl.addresses, c_port + 1, &a_inbound, &a_thread);
     servers_up = 3;
 
-    const b_endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{b_port});
+    const b_endpoint = try allocator.print("127.0.0.1:{d}", .{b_port});
     defer allocator.free(b_endpoint);
-    const c_endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{c_port});
+    const c_endpoint = try allocator.print("127.0.0.1:{d}", .{c_port});
     defer allocator.free(c_endpoint);
-    const a_endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{a_port});
+    const a_endpoint = try allocator.print("127.0.0.1:{d}", .{a_port});
     defer allocator.free(a_endpoint);
 
     // Same wiring as the shared-key election: node-a dials from its address book,
@@ -3234,7 +3234,7 @@ test "real loopback per-node snapshot catch-up: keyed InstallSnapshot converges"
     impls_up = 1;
     const b_port = try startInbound(allocator, io, &b_raft, &b_impl.addresses, 20040, &b_inbound, &b_thread);
     servers_up = 1;
-    const b_endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{b_port});
+    const b_endpoint = try allocator.print("127.0.0.1:{d}", .{b_port});
     defer allocator.free(b_endpoint);
 
     a_impl.init(allocator, io, &a_raft);
@@ -3287,7 +3287,7 @@ test "real loopback per-node snapshot catch-up: keyed InstallSnapshot converges"
     // node-c joins the network now, one snapshot and three entries behind.
     const c_port = try startInbound(allocator, io, &c_raft, &c_impl.addresses, 20090, &c_inbound, &c_thread);
     servers_up = 2;
-    const c_endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{c_port});
+    const c_endpoint = try allocator.print("127.0.0.1:{d}", .{c_port});
     defer allocator.free(c_endpoint);
     try a_impl.addresses.addEndpoint("node-c", c_endpoint);
 

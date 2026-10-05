@@ -8,7 +8,7 @@
 //!   client.query("SELECT * FROM users WHERE name = ?", &.{Value.string(name)});
 //!
 //!   // UNSAFE — SQL injection risk:
-//!   const sql = try std.fmt.allocPrint(alloc, "SELECT * FROM users WHERE name = '{s}'", .{name});
+//!   const sql = try alloc.print("SELECT * FROM users WHERE name = '{s}'", .{name});
 //!   client.query(sql, &.{}); // ← name may contain '; DROP TABLE users; --
 //!
 //! STRUCTURE (monolith — intentionally NOT split; see docs/PRODUCTION_ROADMAP.md):
@@ -87,7 +87,7 @@ fn bufPrintZ(buf: []u8, comptime fmt: []const u8, args: anytype) ![:0]u8 {
 
 /// Allocate a formatted null-terminated string.
 fn allocPrintZ(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ![:0]u8 {
-    const s = try std.fmt.allocPrint(allocator, fmt, args);
+    const s = try allocator.print(fmt, args);
     defer allocator.free(s);
     return try allocZ(allocator, s);
 }
@@ -1854,7 +1854,7 @@ fn pgDecodeBinary(allocator: std.mem.Allocator, oid: libpq_c.Oid, bytes: []const
         },
         PgOid.uuid => {
             if (bytes.len != 16) return error.DatabaseError;
-            const s = try std.fmt.allocPrint(allocator, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
+            const s = try allocator.print("{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
                 bytes[0],  bytes[1],  bytes[2],  bytes[3],
                 bytes[4],  bytes[5],  bytes[6],  bytes[7],
                 bytes[8],  bytes[9],  bytes[10], bytes[11],
@@ -2080,7 +2080,7 @@ fn pgFormatDate(allocator: std.mem.Allocator, days_since_2000: i32) ![]u8 {
     const d: u64 = doy - (153 * mp + 2) / 5 + 1;
     const m: u64 = if (mp < 10) mp + 3 else mp - 9;
     y += if (m <= 2) @as(i64, 1) else 0;
-    return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2}", .{
+    return allocator.print("{d:0>4}-{d:0>2}-{d:0>2}", .{
         @as(u32, @intCast(y)),
         @as(u32, @intCast(m)),
         @as(u32, @intCast(d)),
@@ -2102,7 +2102,7 @@ fn pgFormatTimestamp(allocator: std.mem.Allocator, us_since_2000: i64, is_tz: bo
     const mi = @divFloor(@mod(secs, 3600), 60);
     const s = @mod(secs, 60);
     if (is_tz) {
-        return std.fmt.allocPrint(allocator, "{s}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}+00", .{
+        return allocator.print("{s}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}+00", .{
             date,
             @as(u32, @intCast(h)),
             @as(u32, @intCast(mi)),
@@ -2110,7 +2110,7 @@ fn pgFormatTimestamp(allocator: std.mem.Allocator, us_since_2000: i64, is_tz: bo
             @as(u32, @intCast(frac)),
         });
     }
-    return std.fmt.allocPrint(allocator, "{s}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{
+    return allocator.print("{s}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{
         date,
         @as(u32, @intCast(h)),
         @as(u32, @intCast(mi)),
@@ -2129,12 +2129,12 @@ fn pgFormatInterval(allocator: std.mem.Allocator, months: i32, days: i32, us_tot
     if (months != 0 or days != 0) {
         try buf.append(allocator, 'P');
         if (months != 0) {
-            const s = try std.fmt.allocPrint(allocator, "{d}M", .{@abs(months)});
+            const s = try allocator.print("{d}M", .{@abs(months)});
             defer allocator.free(s);
             try buf.appendSlice(allocator, s);
         }
         if (days != 0) {
-            const s = try std.fmt.allocPrint(allocator, "{d}D", .{@abs(days)});
+            const s = try allocator.print("{d}D", .{@abs(days)});
             defer allocator.free(s);
             try buf.appendSlice(allocator, s);
         }
@@ -2159,7 +2159,7 @@ fn pgAppendTimePart(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), us_to
     us -= @as(u64, @intCast(mi)) * 60_000_000;
     const s = @divFloor(@as(i64, @intCast(us)), 1_000_000);
     const frac = us - @as(u64, @intCast(s)) * 1_000_000;
-    const time_str = try std.fmt.allocPrint(allocator, "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{
+    const time_str = try allocator.print("{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{
         @as(u32, @intCast(@abs(h))),
         @as(u32, @intCast(@abs(mi))),
         @as(u32, @intCast(@abs(s))),
@@ -2180,7 +2180,7 @@ fn pgFormatTime(allocator: std.mem.Allocator, us_since_midnight: i64, tz_offset_
         const tz_h = @divFloor(abs_offset, 3600);
         const tz_m = @divFloor(@mod(abs_offset, 3600), 60);
         const sign: u8 = if (tz_offset_secs >= 0) '+' else '-';
-        const tz_str = try std.fmt.allocPrint(allocator, "{c}{d:0>2}:{d:0>2}", .{ sign, tz_h, tz_m });
+        const tz_str = try allocator.print("{c}{d:0>2}:{d:0>2}", .{ sign, tz_h, tz_m });
         defer allocator.free(tz_str);
         try buf.appendSlice(allocator, tz_str);
     }
@@ -2204,7 +2204,7 @@ fn pgFormatInet(allocator: std.mem.Allocator, family: u8, prefix_len: u8, is_cid
                 std.mem.writeInt(u32, &masked, host_bits & mask, .big);
             }
         }
-        return std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}/{d}", .{
+        return allocator.print("{d}.{d}.{d}.{d}/{d}", .{
             masked[0], masked[1], masked[2], masked[3], prefix_len,
         });
     } else if (family == 3) {
@@ -2224,7 +2224,7 @@ fn pgFormatInet(allocator: std.mem.Allocator, family: u8, prefix_len: u8, is_cid
                 masked[byte_idx] &= m;
             }
         }
-        return std.fmt.allocPrint(allocator, "{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}/{d}", .{
+        return allocator.print("{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}/{d}", .{
             masked[0],  masked[1],  masked[2],  masked[3],
             masked[4],  masked[5],  masked[6],  masked[7],
             masked[8],  masked[9],  masked[10], masked[11],
@@ -2286,7 +2286,7 @@ pub const PostgresConn = struct {
     pub fn connectParams(allocator: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, pass: []const u8, db: []const u8, query_timeout_ms: u32) !PostgresConn {
         // Use PQconnectdb with conninfo string so we can set sslmode
         const sslmode = if (std.c.getenv("PGSSLMODE")) |v| std.mem.span(v) else "require";
-        const conninfo = try std.fmt.allocPrint(allocator, "host={s} port={d} dbname={s} user={s} password={s} sslmode={s} connect_timeout=10", .{ host, port, db, user, pass, sslmode });
+        const conninfo = try allocator.print("host={s} port={d} dbname={s} user={s} password={s} sslmode={s} connect_timeout=10", .{ host, port, db, user, pass, sslmode });
         defer allocator.free(conninfo);
         return connect(allocator, conninfo, query_timeout_ms);
     }
@@ -2893,13 +2893,13 @@ pub const PostgresConn = struct {
                     break :blk null;
                 },
                 .int => |v| blk: {
-                    const s = try std.fmt.allocPrint(allocator, "{d}", .{v});
+                    const s = try allocator.print("{d}", .{v});
                     paramAllocs[i] = s;
                     paramLengths[i] = @intCast(s.len);
                     break :blk @ptrCast(s.ptr);
                 },
                 .float => |v| blk: {
-                    const s = try std.fmt.allocPrint(allocator, "{d}", .{v});
+                    const s = try allocator.print("{d}", .{v});
                     paramAllocs[i] = s;
                     paramLengths[i] = @intCast(s.len);
                     break :blk @ptrCast(s.ptr);
@@ -3021,8 +3021,8 @@ pub const PostgresConn = struct {
                 if (c > 0) try buf.append(self.allocator, ',');
                 switch (val) {
                     .null => try buf.appendSlice(self.allocator, "\\N"),
-                    .int => |v| try buf.appendSlice(self.allocator, try std.fmt.allocPrint(scratch.allocator(), "{d}", .{v})),
-                    .float => |v| try buf.appendSlice(self.allocator, try std.fmt.allocPrint(scratch.allocator(), "{d}", .{v})),
+                    .int => |v| try buf.appendSlice(self.allocator, try scratch.allocator().print("{d}", .{v})),
+                    .float => |v| try buf.appendSlice(self.allocator, try scratch.allocator().print("{d}", .{v})),
                     .string => |v| try appendCsvCell(self.allocator, &buf, v),
                     .bool => |v| try buf.appendSlice(self.allocator, if (v) "t" else "f"),
                 }
@@ -5853,7 +5853,7 @@ pub const Client = struct {
     pub fn findOne(self: *Client, comptime T: type, table: []const u8, where_clause: []const u8, args: []const Value) !T {
         try validateIdentifier(table);
         try validateSqlFragment(where_clause);
-        const sql = try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s} LIMIT 1", .{ table, where_clause });
+        const sql = try self.allocator.print("SELECT * FROM {s} WHERE {s} LIMIT 1", .{ table, where_clause });
         defer self.allocator.free(sql);
         return self.queryRow(T, sql, args);
     }
@@ -5866,7 +5866,7 @@ pub const Client = struct {
     pub fn findOnePartial(self: *Client, comptime T: type, table: []const u8, where_clause: []const u8, args: []const Value) !T {
         try validateIdentifier(table);
         try validateSqlFragment(where_clause);
-        const sql = try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s} LIMIT 1", .{ table, where_clause });
+        const sql = try self.allocator.print("SELECT * FROM {s} WHERE {s} LIMIT 1", .{ table, where_clause });
         defer self.allocator.free(sql);
         return self.queryRowPartial(T, sql, args);
     }
@@ -5880,9 +5880,9 @@ pub const Client = struct {
         try validateIdentifier(table);
         if (where_clause) |w| try validateSqlFragment(w);
         const sql = if (where_clause) |w|
-            try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s}", .{ table, w })
+            try self.allocator.print("SELECT * FROM {s} WHERE {s}", .{ table, w })
         else
-            try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s}", .{table});
+            try self.allocator.print("SELECT * FROM {s}", .{table});
         defer self.allocator.free(sql);
         return self.queryRows(T, sql, args);
     }
@@ -5901,9 +5901,9 @@ pub const Client = struct {
         try validateIdentifier(table);
         if (where_clause) |w| try validateSqlFragment(w);
         const sql = if (where_clause) |w|
-            try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s}", .{ table, w })
+            try self.allocator.print("SELECT * FROM {s} WHERE {s}", .{ table, w })
         else
-            try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s}", .{table});
+            try self.allocator.print("SELECT * FROM {s}", .{table});
         defer self.allocator.free(sql);
         return self.queryRowsPartial(T, sql, args);
     }
@@ -5984,7 +5984,7 @@ pub const Transaction = struct {
     /// Create a savepoint with the given name.
     pub fn savepoint(self: *Transaction, name: []const u8) !void {
         validateIdentifier(name) catch return error.DatabaseError;
-        const sql = try std.fmt.allocPrint(self.allocator, "SAVEPOINT {s}", .{name});
+        const sql = try self.allocator.print("SAVEPOINT {s}", .{name});
         defer self.allocator.free(sql);
         _ = try self.exec(sql, &.{});
     }
@@ -5992,7 +5992,7 @@ pub const Transaction = struct {
     /// Rollback to a previously created savepoint.
     pub fn rollbackTo(self: *Transaction, name: []const u8) !void {
         validateIdentifier(name) catch return error.DatabaseError;
-        const sql = try std.fmt.allocPrint(self.allocator, "ROLLBACK TO {s}", .{name});
+        const sql = try self.allocator.print("ROLLBACK TO {s}", .{name});
         defer self.allocator.free(sql);
         _ = try self.exec(sql, &.{});
     }
@@ -6000,7 +6000,7 @@ pub const Transaction = struct {
     /// Release a savepoint.
     pub fn releaseSavepoint(self: *Transaction, name: []const u8) !void {
         validateIdentifier(name) catch return error.DatabaseError;
-        const sql = try std.fmt.allocPrint(self.allocator, "RELEASE SAVEPOINT {s}", .{name});
+        const sql = try self.allocator.print("RELEASE SAVEPOINT {s}", .{name});
         defer self.allocator.free(sql);
         _ = try self.exec(sql, &.{});
     }
@@ -6161,7 +6161,7 @@ pub const Transaction = struct {
     pub fn findOne(self: *Transaction, allocator: std.mem.Allocator, comptime T: type, table: []const u8, where_clause: []const u8, args: []const Value) !T {
         try validateIdentifier(table);
         try validateSqlFragment(where_clause);
-        const sql = try std.fmt.allocPrint(allocator, "SELECT * FROM {s} WHERE {s} LIMIT 1", .{ table, where_clause });
+        const sql = try allocator.print("SELECT * FROM {s} WHERE {s} LIMIT 1", .{ table, where_clause });
         defer allocator.free(sql);
         return self.queryRow(allocator, T, sql, args);
     }
@@ -6177,7 +6177,7 @@ pub const Transaction = struct {
     pub fn findOnePartial(self: *Transaction, allocator: std.mem.Allocator, comptime T: type, table: []const u8, where_clause: []const u8, args: []const Value) !T {
         try validateIdentifier(table);
         try validateSqlFragment(where_clause);
-        const sql = try std.fmt.allocPrint(allocator, "SELECT * FROM {s} WHERE {s} LIMIT 1", .{ table, where_clause });
+        const sql = try allocator.print("SELECT * FROM {s} WHERE {s} LIMIT 1", .{ table, where_clause });
         defer allocator.free(sql);
         return self.queryRowPartial(allocator, T, sql, args);
     }
@@ -6196,9 +6196,9 @@ pub const Transaction = struct {
         try validateIdentifier(table);
         if (where_clause) |w| try validateSqlFragment(w);
         const sql = if (where_clause) |w|
-            try std.fmt.allocPrint(allocator, "SELECT * FROM {s} WHERE {s}", .{ table, w })
+            try allocator.print("SELECT * FROM {s} WHERE {s}", .{ table, w })
         else
-            try std.fmt.allocPrint(allocator, "SELECT * FROM {s}", .{table});
+            try allocator.print("SELECT * FROM {s}", .{table});
         defer allocator.free(sql);
         return self.queryRows(allocator, T, sql, args);
     }
@@ -6215,9 +6215,9 @@ pub const Transaction = struct {
         try validateIdentifier(table);
         if (where_clause) |w| try validateSqlFragment(w);
         const sql = if (where_clause) |w|
-            try std.fmt.allocPrint(allocator, "SELECT * FROM {s} WHERE {s}", .{ table, w })
+            try allocator.print("SELECT * FROM {s} WHERE {s}", .{ table, w })
         else
-            try std.fmt.allocPrint(allocator, "SELECT * FROM {s}", .{table});
+            try allocator.print("SELECT * FROM {s}", .{table});
         defer allocator.free(sql);
         return self.queryRowsPartial(allocator, T, sql, args);
     }
@@ -6522,7 +6522,7 @@ pub const CachedConn = struct {
     pub fn findOne(self: *CachedConn, comptime T: type, cache_key: []const u8, table: []const u8, where_clause: []const u8, args: []const Value) !T {
         try validateIdentifier(table);
         try validateSqlFragment(where_clause);
-        const sql = try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s} LIMIT 1", .{ table, where_clause });
+        const sql = try self.allocator.print("SELECT * FROM {s} WHERE {s} LIMIT 1", .{ table, where_clause });
         defer self.allocator.free(sql);
         return self.queryRow(T, cache_key, sql, args);
     }
@@ -6530,7 +6530,7 @@ pub const CachedConn = struct {
     pub fn findOneNoCache(self: *CachedConn, comptime T: type, table: []const u8, where_clause: []const u8, args: []const Value) !T {
         try validateIdentifier(table);
         try validateSqlFragment(where_clause);
-        const sql = try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s} LIMIT 1", .{ table, where_clause });
+        const sql = try self.allocator.print("SELECT * FROM {s} WHERE {s} LIMIT 1", .{ table, where_clause });
         defer self.allocator.free(sql);
         return self.queryRowNoCache(T, sql, args);
     }
@@ -6549,9 +6549,9 @@ pub const CachedConn = struct {
         try validateIdentifier(table);
         if (where_clause) |w| try validateSqlFragment(w);
         const sql = if (where_clause) |w|
-            try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s}", .{ table, w })
+            try self.allocator.print("SELECT * FROM {s} WHERE {s}", .{ table, w })
         else
-            try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s}", .{table});
+            try self.allocator.print("SELECT * FROM {s}", .{table});
         defer self.allocator.free(sql);
         return self.queryRows(T, cache_key, sql, args);
     }
@@ -6560,9 +6560,9 @@ pub const CachedConn = struct {
         try validateIdentifier(table);
         if (where_clause) |w| try validateSqlFragment(w);
         const sql = if (where_clause) |w|
-            try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s}", .{ table, w })
+            try self.allocator.print("SELECT * FROM {s} WHERE {s}", .{ table, w })
         else
-            try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s}", .{table});
+            try self.allocator.print("SELECT * FROM {s}", .{table});
         defer self.allocator.free(sql);
         return self.queryRowsNoCache(T, sql, args);
     }
@@ -6916,16 +6916,16 @@ pub const Builder = struct {
 
     pub fn delete(self: *const Builder) ![]u8 {
         try self.checkTable();
-        return std.fmt.allocPrint(self.allocator, "DELETE FROM {s}", .{self.table});
+        return self.allocator.print("DELETE FROM {s}", .{self.table});
     }
 
     pub fn count(self: *const Builder, where_clause: ?[]const u8) ![]u8 {
         try self.checkTable();
         if (where_clause) |w| {
             try validateSqlFragment(w);
-            return std.fmt.allocPrint(self.allocator, "SELECT COUNT(*) FROM {s} WHERE {s}", .{ self.table, w });
+            return self.allocator.print("SELECT COUNT(*) FROM {s} WHERE {s}", .{ self.table, w });
         }
-        return std.fmt.allocPrint(self.allocator, "SELECT COUNT(*) FROM {s}", .{self.table});
+        return self.allocator.print("SELECT COUNT(*) FROM {s}", .{self.table});
     }
 };
 

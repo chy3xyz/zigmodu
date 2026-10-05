@@ -184,7 +184,7 @@ pub fn cors(config: CorsConfig) error{OutOfMemory}!api.Middleware {
                 }
                 try ctx.setHeader("Access-Control-Allow-Methods", c.allow_methods);
                 try ctx.setHeader("Access-Control-Allow-Headers", c.allow_headers);
-                const max_age_str = try std.fmt.allocPrint(ctx.allocator, "{d}", .{c.max_age});
+                const max_age_str = try ctx.allocator.print("{d}", .{c.max_age});
                 defer ctx.allocator.free(max_age_str);
                 try ctx.setHeader("Access-Control-Max-Age", max_age_str);
                 if (ctx.method == .OPTIONS) {
@@ -208,7 +208,7 @@ pub fn requestId() api.Middleware {
     return .{
         .func = struct {
             fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
-                const id = try std.fmt.allocPrint(ctx.allocator, "{x:0>16}", .{request_id_counter.fetchAdd(1, .monotonic)});
+                const id = try ctx.allocator.print("{x:0>16}", .{request_id_counter.fetchAdd(1, .monotonic)});
                 defer ctx.allocator.free(id);
                 try ctx.setHeader("X-Request-Id", id);
                 try next(ctx);
@@ -1368,7 +1368,7 @@ pub fn csrfMintSignedToken(allocator: std.mem.Allocator, io: std.Io, sign_key: [
     const nonce = std.fmt.bytesToHex(nonce_bytes, .lower);
     var mac: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
     std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, &nonce, sign_key);
-    return std.fmt.allocPrint(allocator, "{s}.{s}", .{ nonce, std.fmt.bytesToHex(mac, .lower) });
+    return allocator.print("{s}.{s}", .{ nonce, std.fmt.bytesToHex(mac, .lower) });
 }
 
 /// Is `token` a well-shaped signed token whose HMAC matches `sign_key`?
@@ -1940,7 +1940,7 @@ test "csrf with sign_key rejects tampered, unsigned and foreign-key tokens" {
         fn attempt(mw_: api.Middleware, cookie_value: []const u8, header_value: []const u8) !u16 {
             var ctx = try api.Context.init(std.testing.allocator, .POST, "/api/orders");
             defer ctx.deinit();
-            const cookie = try std.fmt.allocPrint(std.testing.allocator, "csrf_token={s}", .{cookie_value});
+            const cookie = try std.testing.allocator.print("csrf_token={s}", .{cookie_value});
             defer std.testing.allocator.free(cookie);
             try putRequestHeader(&ctx, "cookie", cookie);
             try putRequestHeader(&ctx, "x-csrf-token", header_value);
@@ -2017,7 +2017,7 @@ test "csrf signing holds through the dispatch path" {
     const key = "dispatch-sign-key";
     const token = try csrfMintSignedToken(allocator, std.testing.io, key);
     defer allocator.free(token);
-    const cookie = try std.fmt.allocPrint(allocator, "csrf_token={s}", .{token});
+    const cookie = try allocator.print("csrf_token={s}", .{token});
     defer allocator.free(cookie);
 
     var server = api.Server.init(std.testing.io, allocator, 0);
@@ -2272,7 +2272,7 @@ fn putRequestHeader(ctx: *api.Context, key: []const u8, value: []const u8) !void
 fn putBearerAuth(ctx: *api.Context, token: []const u8) !void {
     const k = try ctx.allocator.dupe(u8, "authorization");
     errdefer ctx.allocator.free(k);
-    const v = try std.fmt.allocPrint(ctx.allocator, "Bearer {s}", .{token});
+    const v = try ctx.allocator.print("Bearer {s}", .{token});
     errdefer ctx.allocator.free(v);
     try ctx.headers.put(k, v);
 }
@@ -2743,9 +2743,9 @@ test "one process, two servers: each gate enforces its own catalog" {
     defer allocator.free(reader_tok);
     const writer_tok = try sec.generateTokenWithTenant("writer-1", &.{"writer"}, "tenant-shop");
     defer allocator.free(writer_tok);
-    const reader_bearer = try std.fmt.allocPrint(allocator, "Bearer {s}", .{reader_tok});
+    const reader_bearer = try allocator.print("Bearer {s}", .{reader_tok});
     defer allocator.free(reader_bearer);
-    const writer_bearer = try std.fmt.allocPrint(allocator, "Bearer {s}", .{writer_tok});
+    const writer_bearer = try allocator.print("Bearer {s}", .{writer_tok});
     defer allocator.free(writer_bearer);
 
     const Hit = struct {
@@ -2901,7 +2901,7 @@ test "one process, two servers: each loader table feeds only its own app" {
 
     const reader_tok = try sec.generateTokenWithTenant("reader-1", &.{"reader"}, "tenant-a");
     defer allocator.free(reader_tok);
-    const bearer = try std.fmt.allocPrint(allocator, "Bearer {s}", .{reader_tok});
+    const bearer = try allocator.print("Bearer {s}", .{reader_tok});
     defer allocator.free(bearer);
 
     const Hit = struct {
@@ -3021,7 +3021,7 @@ test "jwtAuthFromCatalogWithPermissions loads permission CSV" {
 
     var ctx = try api.Context.init(alloc, .GET, "/api/v1/tenants");
     defer ctx.deinit();
-    const auth_hdr = try std.fmt.allocPrint(alloc, "Bearer {s}", .{token});
+    const auth_hdr = try alloc.print("Bearer {s}", .{token});
     defer alloc.free(auth_hdr);
     try ctx.headers.put(try alloc.dupe(u8, "authorization"), try alloc.dupe(u8, auth_hdr));
     try mw.func(&ctx, next, mw.user_data);
@@ -3057,7 +3057,7 @@ test "CatalogPermissionLoader receives sub and aud" {
             seen_sub = try allocator.dupe(u8, input.sub);
             seen_aud = try allocator.dupe(u8, input.aud);
             seen_role = if (input.roles.len > 0) try allocator.dupe(u8, input.roles[0]) else &.{};
-            return try std.fmt.allocPrint(allocator, "portal:shop,shop.product:write@{s}/{s}", .{ input.aud, input.sub });
+            return try allocator.print("portal:shop,shop.product:write@{s}/{s}", .{ input.aud, input.sub });
         }
     };
 
@@ -3072,7 +3072,7 @@ test "CatalogPermissionLoader receives sub and aud" {
 
     var ctx = try api.Context.init(alloc, .GET, "/shop/products");
     defer ctx.deinit();
-    const auth_hdr = try std.fmt.allocPrint(alloc, "Bearer {s}", .{token});
+    const auth_hdr = try alloc.print("Bearer {s}", .{token});
     defer alloc.free(auth_hdr);
     try ctx.headers.put(try alloc.dupe(u8, "authorization"), try alloc.dupe(u8, auth_hdr));
     try mw.func(&ctx, next, mw.user_data);
@@ -3294,7 +3294,7 @@ test "Auth.optional: identity when a token is valid, no 401 otherwise" {
 
     const token = try sec.generateTokenWithTenant("user-42", &.{"user"}, "tenant-9");
     defer allocator.free(token);
-    const bearer = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
+    const bearer = try allocator.print("Bearer {s}", .{token});
     defer allocator.free(bearer);
 
     // optional, no token → 200 with no identity
@@ -3374,7 +3374,7 @@ test "jwtBackend reports an unknown kid as a server error, not as an anonymous r
     defer allocator.free(header_b64);
     const payload_b64 = try child.b64(allocator, "{\"sub\":\"42\",\"iss\":\"zigmodu\",\"aud\":\"tenant-a\",\"exp\":4102444800,\"iat\":0,\"roles\":[],\"ver\":0}");
     defer allocator.free(payload_b64);
-    const token = try std.fmt.allocPrint(allocator, "{s}.{s}.bm90LWEtc2lnbmF0dXJl", .{ header_b64, payload_b64 });
+    const token = try allocator.print("{s}.{s}.bm90LWEtc2lnbmF0dXJl", .{ header_b64, payload_b64 });
     defer allocator.free(token);
 
     const backend = jwtBackend(&sec);

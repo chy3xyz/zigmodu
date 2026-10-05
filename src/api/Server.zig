@@ -147,7 +147,7 @@ pub const RouteGroup = struct {
         const rel = std.mem.trim(u8, path, "/");
         if (pfx.len == 0) return allocator.dupe(u8, rel);
         if (rel.len == 0) return allocator.dupe(u8, pfx);
-        return std.fmt.allocPrint(allocator, "{s}/{s}", .{ pfx, rel });
+        return allocator.print("{s}/{s}", .{ pfx, rel });
     }
 
     fn add(self: *RouteGroup, method: Method, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
@@ -786,7 +786,7 @@ pub const Context = struct {
     pub fn respondEnvelope(self: *Context, http_status: u16, code: i32, msg: []const u8, data_json: []const u8) !void {
         const msg_json = try std.json.Stringify.valueAlloc(self.allocator, msg, .{});
         defer self.allocator.free(msg_json);
-        const body = try std.fmt.allocPrint(self.allocator, "{{\"code\":{d},\"msg\":{s},\"data\":{s}}}", .{ code, msg_json, data_json });
+        const body = try self.allocator.print("{{\"code\":{d},\"msg\":{s},\"data\":{s}}}", .{ code, msg_json, data_json });
         defer self.allocator.free(body);
         try self.json(http_status, body);
     }
@@ -838,12 +838,12 @@ pub const Context = struct {
             .default, .thinkphp => {
                 const code: i32 = if (self.envelope == .thinkphp) 1 else 0;
                 const msg: []const u8 = if (self.envelope == .thinkphp) "success" else "ok";
-                const data = try std.fmt.allocPrint(self.allocator, "{{\"list\":{s},\"total\":{d}}}", .{ items_json, total });
+                const data = try self.allocator.print("{{\"list\":{s},\"total\":{d}}}", .{ items_json, total });
                 defer self.allocator.free(data);
                 try self.respondEnvelope(200, code, msg, data);
             },
             .ruoyi => {
-                const body = try std.fmt.allocPrint(self.allocator, "{{\"code\":0,\"msg\":\"success\",\"rows\":{s},\"total\":{d}}}", .{ items_json, total });
+                const body = try self.allocator.print("{{\"code\":0,\"msg\":\"success\",\"rows\":{s},\"total\":{d}}}", .{ items_json, total });
                 defer self.allocator.free(body);
                 try self.json(200, body);
             },
@@ -919,7 +919,7 @@ pub const Context = struct {
             try w.flush();
             return;
         }
-        const chunk_header = try std.fmt.allocPrint(self.allocator, "{x}\r\n", .{data.len});
+        const chunk_header = try self.allocator.print("{x}\r\n", .{data.len});
         defer self.allocator.free(chunk_header);
         try self.response_body.appendSlice(self.allocator, chunk_header);
         try self.response_body.appendSlice(self.allocator, data);
@@ -1003,7 +1003,7 @@ pub const Context = struct {
         try self.setHeader("Content-Type", "application/json");
         const msg_json = try std.json.Stringify.valueAlloc(self.allocator, message, .{});
         defer self.allocator.free(msg_json);
-        const err_json = try std.fmt.allocPrint(self.allocator, "{{\"code\":{d},\"msg\":{s},\"data\":null}}", .{ code, msg_json });
+        const err_json = try self.allocator.print("{{\"code\":{d},\"msg\":{s},\"data\":null}}", .{ code, msg_json });
         defer self.allocator.free(err_json);
         try self.response_body.appendSlice(self.allocator, err_json);
         self.responded = true;
@@ -1014,7 +1014,7 @@ pub const Context = struct {
     pub fn sendSuccess(self: *Context, data_json: []const u8) !void {
         self.status_code = 200;
         try self.setHeader("Content-Type", "application/json");
-        const wrapped = try std.fmt.allocPrint(self.allocator, "{{\"code\":0,\"msg\":\"\",\"data\":{s}}}", .{data_json});
+        const wrapped = try self.allocator.print("{{\"code\":0,\"msg\":\"\",\"data\":{s}}}", .{data_json});
         defer self.allocator.free(wrapped);
         try self.response_body.appendSlice(self.allocator, wrapped);
         self.responded = true;
@@ -1025,7 +1025,7 @@ pub const Context = struct {
     pub fn sendFail(self: *Context, code: u16, msg: []const u8) !void {
         self.status_code = 200;
         try self.setHeader("Content-Type", "application/json");
-        const wrapped = try std.fmt.allocPrint(self.allocator, "{{\"code\":{d},\"msg\":\"{s}\",\"data\":null}}", .{ code, msg });
+        const wrapped = try self.allocator.print("{{\"code\":{d},\"msg\":\"{s}\",\"data\":null}}", .{ code, msg });
         defer self.allocator.free(wrapped);
         try self.response_body.appendSlice(self.allocator, wrapped);
         self.responded = true;
@@ -1037,7 +1037,7 @@ pub const Context = struct {
     pub fn sendPageResult(self: *Context, items_json: []const u8, total: usize) !void {
         self.status_code = 200;
         try self.setHeader("Content-Type", "application/json");
-        const wrapped = try std.fmt.allocPrint(self.allocator, "{{\"code\":0,\"msg\":\"\",\"data\":{{\"list\":{s},\"total\":{d}}}}}", .{ items_json, total });
+        const wrapped = try self.allocator.print("{{\"code\":0,\"msg\":\"\",\"data\":{{\"list\":{s},\"total\":{d}}}}}", .{ items_json, total });
         defer self.allocator.free(wrapped);
         try self.response_body.appendSlice(self.allocator, wrapped);
         self.responded = true;
@@ -1046,7 +1046,7 @@ pub const Context = struct {
     /// Convenience: serialize any Zig value as JSON array and wrap in page result.
     /// Usage: try ctx.sendPageItems(vo_slice.items, total);
     pub fn sendPageItems(self: *Context, items: anytype, total: usize) !void {
-        const json_str = try std.fmt.allocPrint(self.allocator, "{any}", .{std.json.fmt(items, .{})});
+        const json_str = try self.allocator.print("{any}", .{std.json.fmt(items, .{})});
         defer self.allocator.free(json_str);
         try self.sendPageResult(json_str, total);
     }
@@ -1055,7 +1055,7 @@ pub const Context = struct {
     /// Usage: try ctx.sendJsonItems(vo_slice.items);
     /// DEPRECATED: use ctx.json(200, ...) instead.
     pub fn sendJsonItems(self: *Context, items: anytype) !void {
-        const json_str = try std.fmt.allocPrint(self.allocator, "{any}", .{std.json.fmt(items, .{})});
+        const json_str = try self.allocator.print("{any}", .{std.json.fmt(items, .{})});
         defer self.allocator.free(json_str);
         try self.sendSuccess(json_str);
     }
@@ -1944,7 +1944,7 @@ const TrieNode = struct {
 fn normalizeRoutePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const trimmed = std.mem.trimStart(u8, path, "/");
     if (trimmed.len == 0) return allocator.dupe(u8, "/");
-    return std.fmt.allocPrint(allocator, "/{s}", .{trimmed});
+    return allocator.print("/{s}", .{trimmed});
 }
 
 /// How many `{name}` segments a route path carries — the parameters a match
@@ -2153,13 +2153,13 @@ fn collectRoutes(
     result: *std.ArrayList(RouteInfo),
 ) !void {
     if (node.route) |_| {
-        const path = try std.fmt.allocPrint(alloc, "/{s}", .{prefix});
+        const path = try alloc.print("/{s}", .{prefix});
         defer alloc.free(path);
         try appendRouteInfo(alloc, result, method, path);
     }
     for (node.children.items) |child| {
         const sep = if (prefix.len > 0 and prefix[prefix.len - 1] != '/') "/" else "";
-        const full = try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ prefix, sep, child.segment });
+        const full = try alloc.print("{s}{s}{s}", .{ prefix, sep, child.segment });
         defer alloc.free(full);
         try collectRoutes(child, method, full, alloc, result);
     }
@@ -4829,7 +4829,7 @@ test "router scalability: 200 routes with O(1) child lookup" {
     // Register 200 routes across different methods and path depths
     var i: usize = 0;
     while (i < 100) : (i += 1) {
-        const path = try std.fmt.allocPrint(allocator, "/api/v1/users/{d}", .{i});
+        const path = try allocator.print("/api/v1/users/{d}", .{i});
         defer allocator.free(path);
         try router.addRoute(.{
             .method = .GET,
@@ -4842,7 +4842,7 @@ test "router scalability: 200 routes with O(1) child lookup" {
     // Add 50 more with different prefixes
     var j: usize = 0;
     while (j < 50) : (j += 1) {
-        const path = try std.fmt.allocPrint(allocator, "/api/v2/items/{d}/details", .{j});
+        const path = try allocator.print("/api/v2/items/{d}/details", .{j});
         defer allocator.free(path);
         try router.addRoute(.{
             .method = .GET,
@@ -4855,7 +4855,7 @@ test "router scalability: 200 routes with O(1) child lookup" {
     // 50 POST routes sharing prefixes
     var k: usize = 0;
     while (k < 50) : (k += 1) {
-        const path = try std.fmt.allocPrint(allocator, "/api/v1/users/{d}/posts", .{k});
+        const path = try allocator.print("/api/v1/users/{d}/posts", .{k});
         defer allocator.free(path);
         try router.addRoute(.{
             .method = .POST,
@@ -5097,7 +5097,7 @@ test "path rewriter changes route selection" {
             if (std.mem.startsWith(u8, ctx.path, "/old/")) {
                 // Allocate new path in arena — freed on request end
                 const suffix = ctx.path["/old/".len..];
-                ctx.path = std.fmt.allocPrint(ctx.allocator, "/rewritten/{s}", .{suffix}) catch return;
+                ctx.path = ctx.allocator.print("/rewritten/{s}", .{suffix}) catch return;
             }
         }
     }.rewrite);
@@ -6702,7 +6702,7 @@ test "request headers: OWS after the colon is optional, an unparsable line is a 
     // may be zero octets). The old parser only matched ": " and dropped the
     // line, leaving this body in the reader to be served as the next request.
     const smuggled = "GET /admin HTTP/1.1\r\nHost: y\r\n\r\n";
-    const payload = try std.fmt.allocPrint(a, "POST /upload HTTP/1.1\r\nHost:x\r\nContent-Length:{d}\r\n\r\n{s}", .{ smuggled.len, smuggled });
+    const payload = try a.print("POST /upload HTTP/1.1\r\nHost:x\r\nContent-Length:{d}\r\n\r\n{s}", .{ smuggled.len, smuggled });
 
     var probe = try ParserProbe.create(a, payload) orelse return error.SkipZigTest;
     defer probe.destroy();
@@ -6711,7 +6711,7 @@ test "request headers: OWS after the colon is optional, an unparsable line is a 
     defer request.deinit(a);
 
     try std.testing.expectEqualStrings("x", request.headers.get("host") orelse "<missing>");
-    const expected_len = try std.fmt.allocPrint(a, "{d}", .{smuggled.len});
+    const expected_len = try a.print("{d}", .{smuggled.len});
     try std.testing.expectEqualStrings(expected_len, request.headers.get("content-length") orelse "<missing>");
     try std.testing.expect(request.body != null);
     try std.testing.expectEqualStrings(smuggled, request.body.?);
@@ -7891,7 +7891,7 @@ test "a 300-byte Origin is echoed in a response that reaches the client" {
     const origin = try allocator.alloc(u8, 320);
     defer allocator.free(origin);
     @memset(origin, 'a');
-    const request = try std.fmt.allocPrint(allocator, "GET /ping HTTP/1.1\r\nHost: x\r\nOrigin: https://{s}.example.com\r\nConnection: close\r\n\r\n", .{origin});
+    const request = try allocator.print("GET /ping HTTP/1.1\r\nHost: x\r\nOrigin: https://{s}.example.com\r\nConnection: close\r\n\r\n", .{origin});
     defer allocator.free(request);
     _ = std.posix.system.write(client.socket.handle, request.ptr, request.len);
 
@@ -8344,7 +8344,7 @@ test "h2 adapter parity: the path rewriter runs before routing" {
     server.setPathRewriter(struct {
         fn rewrite(ctx: *Context) void {
             if (std.mem.startsWith(u8, ctx.path, "/v1/")) {
-                ctx.path = std.fmt.allocPrint(ctx.allocator, "/{s}", .{ctx.path["/v1/".len..]}) catch return;
+                ctx.path = ctx.allocator.print("/{s}", .{ctx.path["/v1/".len..]}) catch return;
             }
         }
     }.rewrite);
@@ -8712,8 +8712,7 @@ fn h2cUpgradeRequest(
     body: []const u8,
 ) ![]u8 {
     std.debug.assert(extra_lines.len == 0 or std.mem.endsWith(u8, extra_lines, "\r\n"));
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{s} {s} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade, HTTP2-Settings\r\n" ++
             "Upgrade: h2c\r\nHTTP2-Settings: {s}\r\n{s}\r\n{s}",
         .{ method, target, settings_value, extra_lines, body },
@@ -8815,7 +8814,7 @@ test "h2c upgrade: the request's query string and fields reach the handler" {
         fn h(ctx: *Context) anyerror!void {
             const q = ctx.requestParam("b") orelse "MISSING";
             const f = ctx.header("x-tenant") orelse "NOFIELD";
-            const out = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ q, f });
+            const out = try ctx.allocator.print("{s}/{s}", .{ q, f });
             try ctx.text(200, out);
         }
     }.h, null);
@@ -9012,7 +9011,7 @@ test "h2c upgrade: a POST carrying a body is stream 1, and OPTIONS upgrades too"
     try group.post("h2cpost", struct {
         fn h(ctx: *Context) anyerror!void {
             const body = ctx.body orelse "NOBODY";
-            const out = try std.fmt.allocPrint(ctx.allocator, "{s}:{s}", .{ ctx.method.toString(), body });
+            const out = try ctx.allocator.print("{s}:{s}", .{ ctx.method.toString(), body });
             try ctx.text(200, out);
         }
     }.h, null);
@@ -9524,7 +9523,7 @@ test "a HEAD request refused before routing carries no error body" {
     const bad = "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
 
     var get_out: [4096]u8 = undefined;
-    const get_bad = try std.fmt.allocPrint(allocator, "GET /never HTTP/1.1\r\nHost: x\r\n{s}", .{bad});
+    const get_bad = try allocator.print("GET /never HTTP/1.1\r\nHost: x\r\n{s}", .{bad});
     defer allocator.free(get_bad);
     const get_response = try h1RawExchange(running.port, get_bad, &get_out);
     try std.testing.expect(std.mem.startsWith(u8, get_response, "HTTP/1.1 400"));
@@ -9532,11 +9531,11 @@ test "a HEAD request refused before routing carries no error body" {
     try std.testing.expect(entity.len > 0);
     // The entity length a `HEAD` response has to describe, without being told
     // which number it is here: whatever the `GET` answer carried.
-    const expected_length = try std.fmt.allocPrint(allocator, "{d}", .{entity.len});
+    const expected_length = try allocator.print("{d}", .{entity.len});
     defer allocator.free(expected_length);
 
     var out: [4096]u8 = undefined;
-    const head_bad = try std.fmt.allocPrint(allocator, "HEAD /never HTTP/1.1\r\nHost: x\r\n{s}", .{bad});
+    const head_bad = try allocator.print("HEAD /never HTTP/1.1\r\nHost: x\r\n{s}", .{bad});
     defer allocator.free(head_bad);
     const response = try h1RawExchange(running.port, head_bad, &out);
     try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 400"));
@@ -9580,7 +9579,7 @@ test "a HEAD request whose response field the server refuses carries no error bo
     try std.testing.expect(std.mem.startsWith(u8, get_response, "HTTP/1.1 500"));
     const entity = h1Body(get_response);
     try std.testing.expect(entity.len > 0);
-    const expected_length = try std.fmt.allocPrint(allocator, "{d}", .{entity.len});
+    const expected_length = try allocator.print("{d}", .{entity.len});
     defer allocator.free(expected_length);
 
     var out: [4096]u8 = undefined;
