@@ -28,7 +28,16 @@
    contention, not a dropped token"）。
 4. **验证**：fmt 净 · §12.16（2/2）与 §12.17（6/6）过滤跑绿（本机
    sweep `push_failures=0`）· 全量 `zig build test` exit=0。
-   CI rerun 观察：该 macOS job 重跑以确认假红不复现。
+   **CI 结论**：修复版 `7a6299c5` 全 12 job 绿，macOS job 从连续两红
+   转为 success（run `37291448005`）。
+5. **同类排查（随修复一并做）**：全仓扫"把宿主读数当契约断言"的
+   其余候选，逐个核对后**无同类遗漏**——① §12.16 batch 的
+   `expectEqual(0, log.overflowed())` 是确定性不变量：生产者按
+   `(start+k)%W` **静态轮转**分发，per-worker 计数与宿主调度无关，日志
+   容量必然够；② `waitUntil` 系列预算是 60s（`observation_budget_ms`），
+   远宽于任何调度抖动；③ `recorder.zig` 的 `elapsed < 500` 是 3 条记录
+   重放对 501ms 记录跨度的比较（操作在微秒级，触底需进程冻结半秒，
+   那会先打死其他测试），保留。
 
 ## [0.39.6] - 2026-10-05
 
