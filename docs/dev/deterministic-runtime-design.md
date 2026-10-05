@@ -44,10 +44,11 @@
 
 1. **无进程级确定性**：`spawn`/`init` 副作用、socket、wall clock、drop-on-full
    投递不在回放内。
-2. **直读真实时间的代码在回放外**：`core/Time.zig` 直读分布 —— `runtime.zig` 6 处、
-   `recorder.zig` 2 处、`clock.zig` 3 处（real 分支本体，合法）；core 域更多
-   （`ClusterMembership` 9、`KafkaConnector` 8、`DistributedEventBus` 6 …），
-   一期不管 core 域。
+2. **直读真实时间的代码在回放外**：`core/Time.zig` 直读经审计（第 137 批）
+   全部是测试辅助与两个合法本体（`clock.zig` real 分支、`precision_timer.zig`
+   真实钟原语），runtime 域 production 已天然走注入 Clock —— 缺口从「收口」
+   收窄为「防回退」，已由 `check-production.sh` 的 `dettime` 扫描把守。
+   core 域直读仍多（`ClusterMembership` 9、`KafkaConnector` 8 …），一期不管。
 3. **随机源未接管**：runtime 域内无随机源（grep 零命中，干净）；core 域
    `RaftElection.zig:1413` 用 time-seeded `DefaultPrng`（集群域，一期不管）、
    `LoadBalancer` 已是注入 seed 形态（`:57`）。**runtime 域是张白纸，现在接管
@@ -127,8 +128,8 @@ send/timer arm，全部走同一受控链路）→ 下一条。**级联事件不
 
 | 期 | 内容 | 验收 |
 |----|------|------|
-| **A** | D1/D2 收敛：runtime 域 Time 直读收口到 Clock（runtime.zig 6 处 + recorder 2 处）、`Runtime.rng()`、两条 grep 门禁进 `check-production.sh` | 门禁绿 + `Clock` 注入覆盖审计表 |
-| **B** | det 配置面：`RuntimeOptions.deterministic`、单线程强制、dedicated/blocking 拒收、mailbox 满违规化、同 deadline 定时器序审计 + 测试 | §4.3-1/2/4 |
+| **A** ✅（第 137 批） | ~~D1/D2 收敛~~ → **审计 + 门禁**。审计结论：runtime 域 production 直读只有两处合法本体（`clock.zig` real 分支、`precision_timer.zig` 真实钟原语）；其余直读全是测试辅助（`waitUntil`/`awaitTrackLen`/`PoolSettled`/`runShape`/`LatencyLog`，真实预算防挂，本就在回放外）。D2 的 RNG 门禁**树级已在**（entropy 扫描禁 `DefaultPrng.init` 全家，`src/runtime` 零命中）；`Runtime.rng()` API **推迟到 B 期**（零消费者，且 seed 来源要等 det 配置面）。落地物：`zig-scan.awk` 新 `dettime` mode + `check-production.sh` 扫描块（12 条逐行豁免锚，覆盖全部合法直读；两条变异实测被抓：production 直读、豁免行改一字） | 门禁绿 + 变异双红 ✅ |
+| **B** | det 配置面：`RuntimeOptions.deterministic`、`Runtime.rng()`（seed 入配置）、单线程强制、dedicated/blocking 拒收、mailbox 满违规化、同 deadline 定时器序审计 + 测试 | §4.3-1/2/4 |
 | **C** | replay driver + `ZDL1` 的 seek/limit/filter CLI（§13.10 自列缺口顺带收） | §4.3-1/2/3 全量 |
 | **D** | 真实验证：`examples/quant-runtime`（或 zalpha 场景）同日志双跑 —— Live 录制 → det 回放 → 信号序列逐字节比对 | 事故级演示入 CHANGELOG |
 

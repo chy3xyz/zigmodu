@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+### 第 137 批：Deterministic Runtime Phase A（D1 防回退门禁）+ `allocPrint` 迁移第二批（**破坏性：否**）
+
+1. **Det Phase A 落地（设计稿 `docs/dev/deterministic-runtime-design.md` §5）**：
+   审计先行改写了 Phase A 的内容 —— runtime 域 production 的 `core/Time.zig`
+   直读**只有两处合法本体**（`clock.zig` real 分支即注入点本体、
+   `precision_timer.zig` 真实钟 µs 原语），其余直读全是测试辅助
+   （`waitUntil`/`awaitTrackLen`/`PoolSettled`/`runShape`/`LatencyLog` 的真实
+   预算，防挂用，本就在回放外）。D2 的 RNG 侧**树级门禁早已在**（entropy 扫描
+   禁 `DefaultPrng.init` 全家，`src/runtime` 零命中）；`Runtime.rng()` API 推迟
+   到 B 期（零消费者 + seed 来源依赖 det 配置面，不造无人用的 API）。因此
+   Phase A 的落地物是**防回退门禁**：`scripts/lib/zig-scan.awk` 新 `dettime`
+   mode（复用共享 lexer 的 test 块跳过 + 注释/字符串剥离）+
+   `check-production.sh` 新扫描块，12 条逐行豁免锚覆盖全部合法直读。
+   **变异实测双红**：① 往 `mailbox.zig` production 函数插一条直读 → 抓；
+   ② 豁免行改一个字（锚定失效）→ 抓。修了一个门禁自身的 bug：macOS awk
+   （BWK）不支持 `\b` 词界（静默永不匹配 —— 首轮变异没被抓才暴露）。
+2. **`allocPrint` → `Allocator.print` 第二批**（`12a01f6`）：六大文件 124 处
+   （sqlx 41 / Server 29 / redis 15 / RaftTransport 14 / Middleware 14 / Orm 11），
+   机械正则 + 编译验证零行为变化；`sqlx.zig:11` 文档里的 UNSAFE 反模式示例
+   同步新形态。src 内存量 216 → 92，零散分布在 38 个文件，第三批收。
+3. **门禁读数**：check-production OK（含新 dettime 块）· fmt 净 · 全量
+   `zig build test` exit=0（231s，第二批迁移后）；dettime 为脚本-only 变更，
+   测试计数不变（2163）。设计稿 §2/§5 同步审计结论。
+
 ### 第 136 批：A-5 收尾（sqlx 读超时永有界）+ CI 复杂度报告 + `allocPrint` 习语迁移第一批（**破坏性：窄**——`query_timeout_ms = 0` 语义变化 + `hasUnboundedPgReads` 删除）
 
 1. **A-5 收尾：同步驱动的 socket 读不再有「无界」档**（`src/sqlx/sqlx.zig`）。此前

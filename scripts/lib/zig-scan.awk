@@ -264,6 +264,27 @@ function entropy_exempt(file, s,   i, key, sep, f, anchor) {
   return 0
 }
 
+# mode=dettime (deterministic-runtime D1, docs/dev/deterministic-runtime-design.md):
+# production code under src/runtime/ must read time through the injected Clock
+# (src/runtime/clock.zig), never core/Time.zig directly. The two import aliases
+# in the tree are `Time` and `time_mod` (verified by greping the @import sites).
+# NOTE: no `\b` word boundary — macOS awk (BWK) does not support it (a `\b`
+# pattern silently never matches; the mutation test in this batch proves the
+# gate fires). A `myTime.` false positive is acceptable and none exists.
+function det_time(s) {
+  return s ~ /(Time|time_mod)\.(monotonicNow|wallClock|cachedNow)[A-Za-z]*\(/
+}
+function det_time_exempt(file, s,   i, key, sep, f, anchor) {
+  for (i = 1; i <= DET_TIME_OK_N; i++) {
+    key = DET_TIME_OK[i]
+    sep = index(key, "|")
+    f = substr(key, 1, sep - 1)
+    anchor = substr(key, sep + 1)
+    if (index(file, f) > 0 && rtrim(ltrim(s)) == anchor) return 1
+  }
+  return 0
+}
+
 BEGIN {
   # "path|anchor" pairs — see entropy_exempt for the 口径.
   ENTROPY_OK[1] = "src/util.zig|var rng = std.Random.DefaultPrng.init(seed);"
@@ -272,6 +293,23 @@ BEGIN {
   ENTROPY_OK[4] = "src/core/cluster/RaftElection.zig|var rng = std.Random.DefaultPrng.init(@bitCast(now));"
   ENTROPY_OK[5] = "src/test/IntegrationTest.zig|.rng = std.Random.DefaultPrng.init(seed),"
   ENTROPY_OK_N = 5
+
+  # dettime 豁免（锚定到行文本）：Clock union 的 real 分支本体、
+  # PrecisionTimer 真实钟原语本体、以及测试辅助里的真实时间预算
+  # （防挂等待 / 延迟测量），它们本就在回放外。
+  DET_TIME_OK[1] = "src/runtime/clock.zig|.monotonic => Time.monotonicNowMilliseconds(),"
+  DET_TIME_OK[2] = "src/runtime/clock.zig|.monotonic => Time.monotonicNowMilliseconds() * 1000,"
+  DET_TIME_OK[3] = "src/runtime/precision_timer.zig|return Time.monotonicNow();"
+  DET_TIME_OK[4] = "src/runtime/runtime.zig|const deadline = Time.monotonicNowMilliseconds() + timeout_ms;"
+  DET_TIME_OK[5] = "src/runtime/runtime.zig|if (Time.monotonicNowMilliseconds() > deadline) return error.WaitTimeout;"
+  DET_TIME_OK[6] = "src/runtime/runtime.zig|const now = time_mod.monotonicNowMilliseconds();"
+  DET_TIME_OK[7] = "src/runtime/runtime.zig|const deadline = Time.monotonicNowMilliseconds() + 5_000;"
+  DET_TIME_OK[8] = "src/runtime/runtime.zig|if (Time.monotonicNowMilliseconds() > deadline) return error.TrackNeverGrew;"
+  DET_TIME_OK[9] = "src/runtime/runtime.zig|const msg = TimedMessage{ .seq = start + k, .sent_ns = time_mod.monotonicNow() };"
+  DET_TIME_OK[10] = "src/runtime/runtime.zig|const start_ns = time_mod.monotonicNow();"
+  DET_TIME_OK[11] = "src/runtime/runtime.zig|const elapsed_ns = time_mod.monotonicNow() - start_ns;"
+  DET_TIME_OK[12] = "src/runtime/runtime.zig|if (i < self.samples.len) self.samples[i] = time_mod.monotonicNow() - sent_ns;"
+  DET_TIME_OK_N = 12
 }
 
 BEGIN { in_test = 0; depth = 0; kw = 0; open = 0; seen = 0 }
@@ -285,6 +323,10 @@ BEGIN { in_test = 0; depth = 0; kw = 0; open = 0; seen = 0 }
   if (zig_skip(raw)) next
   if (mode == "entropy") {
     if (weak_entropy(code) && !entropy_exempt(FILENAME, code)) print NR "\t" rtrim(ltrim(code))
+    next
+  }
+  if (mode == "dettime") {
+    if (det_time(code) && !det_time_exempt(FILENAME, code)) print NR "\t" rtrim(ltrim(code))
     next
   }
   if (mode == "inlinealloc") {

@@ -159,6 +159,30 @@ if [[ "$entropy_fail" -ne 0 ]]; then
   exit 1
 fi
 
+# Deterministic-runtime D1 gate (docs/dev/deterministic-runtime-design.md):
+# production code under src/runtime/ reads time through the injected Clock
+# (src/runtime/clock.zig), never core/Time.zig directly — a direct read is
+# outside any replay. Per-usage exemptions (the Clock union's real branch, the
+# PrecisionTimer real-clock primitive, and test helpers whose real-time
+# budgets only guard hung tests) live in the DET_TIME_OK table in
+# scripts/lib/zig-scan.awk. Test blocks are skipped by the shared lexer and
+# *_test.zig harnesses are out of scope by construction, so a hit here is
+# always production code.
+dettime_fail=0
+while IFS= read -r f; do
+  [[ -f "$f" ]] || continue
+  hits="$(awk -v mode=dettime -f "$LEX" "$f" || true)"
+  [[ -n "$hits" ]] || continue
+  echo "check-production: direct core/Time.zig read in runtime production code (D1: inject Clock) in ${f}:" >&2
+  printf '%s\n' "$hits" >&2
+  dettime_fail=1
+done < <(find src/runtime -name '*.zig' ! -name '*_test.zig' | sort)
+
+if [[ "$dettime_fail" -ne 0 ]]; then
+  echo "check-production: runtime production code must read time via the injected Clock (src/runtime/clock.zig) — deterministic-runtime D1, docs/dev/deterministic-runtime-design.md" >&2
+  exit 1
+fi
+
 # Inline allocation into a fallible append/put: `try list.append(allocator,
 # try allocator.dupe(u8, s))` / `try map.put(allocator, try allocator.dupe(u8,
 # k), …)`. When the outer call fails, the value the inner call just made has
