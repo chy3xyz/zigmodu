@@ -55,7 +55,7 @@ pub const DidKey = struct {
         const pk_b64_len = std.base64.standard.Encoder.calcSize(32);
         _ = std.base64.standard.Encoder.encode(pk_buf[0..pk_b64_len], &self.public_key);
 
-        return std.fmt.allocPrint(allocator,
+        return allocator.print(
             \\{{"@context":"https://www.w3.org/ns/did/v1","id":"{s}","verificationMethod":[{{"id":"{s}#keys-1","type":"Ed25519VerificationKey2020","controller":"{s}","publicKeyMultibase":"z{s}"}}],"authentication":["{s}#keys-1"]}}
         , .{ self.did, self.did, self.did, pk_buf[0..pk_b64_len], self.did });
     }
@@ -72,7 +72,7 @@ pub const DidKey = struct {
 
         const b58 = try encodeBase58Btc(allocator, mc_buf[0..35]);
         defer allocator.free(b58);
-        return std.fmt.allocPrint(allocator, "did:key:z{s}", .{b58});
+        return allocator.print("did:key:z{s}", .{b58});
     }
 };
 
@@ -179,7 +179,7 @@ pub fn issueCredential(allocator: std.mem.Allocator, issuer: *DidKey, vc: *Verif
     const sig = try issuer.sign(allocator, buf.items);
     vc.proof = .{
         .created = 0,
-        .verification_method = try std.fmt.allocPrint(allocator, "{s}#keys-1", .{vc.issuer}),
+        .verification_method = try allocator.print("{s}#keys-1", .{vc.issuer}),
         .signature = sig,
     };
 }

@@ -529,7 +529,7 @@ test "removed: docs/UPGRADING.md records the same removals this gate pins" {
     for (REMOVED) |removed| {
         // The exact spelling the gate pins, so a mention of the replacement
         // (`zigmodu.Application`) cannot satisfy a check for `zigmodu.App`.
-        const name = try std.fmt.allocPrint(allocator, "`zigmodu.{s}`", .{removed.root_name});
+        const name = try allocator.print("`zigmodu.{s}`", .{removed.root_name});
         defer allocator.free(name);
 
         if (std.mem.indexOf(u8, section, name) == null) {
@@ -797,7 +797,7 @@ test "banners: the validateStruct chain lives in validation/FieldValidation.zig,
 
     // (c) The spellings survive, one alias each.
     for (FIELD_VALIDATION_FORWARDED_NAMES) |name| {
-        const alias = try std.fmt.allocPrint(allocator, "pub const {s} = ", .{name});
+        const alias = try allocator.print("pub const {s} = ", .{name});
         defer allocator.free(alias);
         if (std.mem.indexOf(u8, deprecated_src, alias) == null) {
             std.debug.print("[api-freeze] {s} no longer contains `{s}` — consumers who wrote `Validator.{s}` lose the spelling at their next build\n", .{ FIELD_RULES_DEPRECATED_PATH, alias, name });

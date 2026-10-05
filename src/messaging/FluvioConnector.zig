@@ -76,7 +76,7 @@ pub const FluvioConnector = struct {
         }
 
         // Use shell pipe: echo "key\tvalue" | fluvio produce <topic>
-        const shell_cmd = try std.fmt.allocPrint(self.allocator, "echo \"{s}\\t{s}\" | fluvio produce {s}", .{ key, value, topic });
+        const shell_cmd = try self.allocator.print("echo \"{s}\\t{s}\" | fluvio produce {s}", .{ key, value, topic });
         defer self.allocator.free(shell_cmd);
 
         const result = try std.process.run(self.allocator, self.io, .{

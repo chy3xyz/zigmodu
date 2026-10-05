@@ -125,7 +125,7 @@ pub const AutoInstrumentation = struct {
         self.event_published_total.inc();
 
         // Create trace span
-        const span_name = try std.fmt.allocPrint(self.allocator, "event_publish:{s}", .{event_name});
+        const span_name = try self.allocator.print("event_publish:{s}", .{event_name});
         defer self.allocator.free(span_name);
         const span = try self.tracer.startTrace(span_name);
         errdefer {
@@ -151,7 +151,7 @@ pub const AutoInstrumentation = struct {
         self.event_consumed_total.inc();
 
         // Create trace span
-        const span_name = try std.fmt.allocPrint(self.allocator, "event_consume:{s}", .{event_name});
+        const span_name = try self.allocator.print("event_consume:{s}", .{event_name});
         defer self.allocator.free(span_name);
         const span = if (parent_span) |parent|
             try self.tracer.startSpan(parent, span_name)
@@ -202,7 +202,7 @@ pub const AutoInstrumentation = struct {
     pub fn recordApiRequestStart(self: *Self, api_name: []const u8, module_name: []const u8) !*DistributedTracer.Span {
         self.api_request_total.inc();
 
-        const span_name = try std.fmt.allocPrint(self.allocator, "api:{s}", .{api_name});
+        const span_name = try self.allocator.print("api:{s}", .{api_name});
         defer self.allocator.free(span_name);
         const span = try self.tracer.startTrace(span_name);
         errdefer {
@@ -417,7 +417,7 @@ pub const InstrumentedEventListener = struct {
         const span = try self.instrumentation.recordEventPublished(event_name, module_name);
         if (span) |s| {
             const allocator = self.event_processing_spans.allocator;
-            const key = try std.fmt.allocPrint(allocator, publish_key_prefix ++ "{s}:{s}", .{ event_name, module_name });
+            const key = try allocator.print(publish_key_prefix ++ "{s}:{s}", .{ event_name, module_name });
             errdefer allocator.free(key);
 
             self.instrumentation.tracer.endSpan(s);
@@ -460,14 +460,14 @@ pub const InstrumentedEventListener = struct {
         // Look up publish-time span as parent. That key is the publish-format
         // one; the consume entry below gets its own prefix, so `deinit` can tell
         // the two families apart by key alone.
-        const pub_key = try std.fmt.allocPrint(allocator, publish_key_prefix ++ "{s}:{s}", .{ event_name, module_name });
+        const pub_key = try allocator.print(publish_key_prefix ++ "{s}:{s}", .{ event_name, module_name });
         defer allocator.free(pub_key);
         const parent_span = self.event_processing_spans.get(pub_key);
 
         const span = try self.instrumentation.recordEventConsumed(event_name, module_name, parent_span);
 
         if (span) |s| {
-            const key = try std.fmt.allocPrint(allocator, consume_key_prefix ++ "{s}:{s}", .{ event_name, module_name });
+            const key = try allocator.print(consume_key_prefix ++ "{s}:{s}", .{ event_name, module_name });
             errdefer allocator.free(key);
             const start_key = try allocator.dupe(u8, key);
             errdefer allocator.free(start_key);
@@ -494,7 +494,7 @@ pub const InstrumentedEventListener = struct {
     pub fn onEventConsumeEnd(self: *Self, event_name: []const u8, module_name: []const u8, success: bool) void {
         const allocator = self.event_start_times.allocator;
 
-        const key = std.fmt.allocPrint(allocator, consume_key_prefix ++ "{s}:{s}", .{ event_name, module_name }) catch |err| {
+        const key = allocator.print(consume_key_prefix ++ "{s}:{s}", .{ event_name, module_name }) catch |err| {
             std.log.debug("[metrics] event consume end dropped ({s}); the span stays un-ended", .{@errorName(err)});
             return;
         };

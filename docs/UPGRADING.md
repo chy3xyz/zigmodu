@@ -139,8 +139,10 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 > 本节收 v0.39.5 之后、下一发布号之前的「会咬人」变更；发布时把标题改成版本号。
 > **3 处破坏性**：① 中间件工厂与槽位池函数返回错误（编译错）；② `Fx.Parallel` / `Fx.Map`
 > 真并发化、签名换血（编译错）；③ JWT 段改用 std 严格 base64url，带 `=` padding 的段被拒
-> （行为收紧）。另有 ④ 一条**非破坏性**行为变化（scheduler `push` 的预算语义）。逐条背景见
-> [`../CHANGELOG.md`](../CHANGELOG.md) `[Unreleased]` 段的第 135 / 134 / 133 / 130 批。
+> （行为收紧）。另有 ④⑤ 两条行为变化（④ scheduler `push` 的预算语义，非破坏性；
+> ⑤ sqlx `query_timeout_ms = 0` 从「无界 + 警告」改为「回落默认有界」+ 删
+> `hasUnboundedPgReads`）。逐条背景见
+> [`../CHANGELOG.md`](../CHANGELOG.md) `[Unreleased]` 段的第 136 / 135 / 134 / 133 / 130 批。
 
 ### ① 中间件工厂与槽位池函数返回错误（第 134 批，**编译错**）
 
@@ -212,6 +214,17 @@ base64url 本无 padding）。**影响面**：收过非标准实现的 token 的
 首次越预算时 stderr 多一段环取证 dump（每调度器一次）；以及 ReleaseFast/Small 下那条
 「计数后静默返回、worker 永久失联」的路径**不再存在**。背景与根因推导见
 [`RUNTIME.md` §12.18](RUNTIME.md)。
+
+### ⑤ sqlx `query_timeout_ms = 0`：从「无界 + 警告」改为「回落默认有界」（第 136 批，**行为变化 + 一处 API 删除**）
+
+**Breaking?** 两处都很窄：① 行为变化 —— postgres / mysql 的 `Config.query_timeout_ms = 0`
+不再表示「读无界」（PG 旧行为：不装 `SO_RCVTIMEO` 并在 `Client.connect` 打一条警告；
+MySQL 旧行为：无论配什么都硬编码 30s），现在统一为 **0 = 回落默认 30000ms**，读**总是有界**；
+维护工具想要接近无界就显式配一个大值（如 `86_400_000`）。② API 删除 ——
+`sqlx.hasUnboundedPgReads` 随之删除（无界路径不存在了，判定函数失去对象），树内零调用方；
+树外若有人调它会编译错，删掉该调用即可。配套新增 `sqlx.DEFAULT_QUERY_TIMEOUT_MS`（= 30000）
+与 `sqlx.effectiveQueryTimeoutMs`（0 → 默认值的解析点），MySQL 的
+`MYSQL_OPT_READ_TIMEOUT` 现在真正吃这个配置（按秒向上取整，亚秒也至少有 1s 界）。
 
 ---
 

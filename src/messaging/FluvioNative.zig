@@ -59,7 +59,7 @@ pub const NativeTransport = struct {
         try buf.appendSlice(self.allocator, "CONSUME ");
         try buf.appendSlice(self.allocator, topic);
         try buf.append(self.allocator, '\t');
-        const off = try std.fmt.allocPrint(self.allocator, "{d}", .{offset});
+        const off = try self.allocator.print("{d}", .{offset});
         defer self.allocator.free(off);
         try buf.appendSlice(self.allocator, off);
         try buf.append(self.allocator, '\n');
@@ -118,7 +118,7 @@ pub const NativeTransport = struct {
         try buf.appendSlice(self.allocator, "CREATE ");
         try buf.appendSlice(self.allocator, name);
         try buf.append(self.allocator, '\t');
-        const p = try std.fmt.allocPrint(self.allocator, "{d}", .{partitions});
+        const p = try self.allocator.print("{d}", .{partitions});
         defer self.allocator.free(p);
         try buf.appendSlice(self.allocator, p);
         try buf.append(self.allocator, '\n');

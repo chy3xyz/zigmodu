@@ -49,7 +49,7 @@ pub const Validator = struct {
     /// Fails when `value` is shorter than `min` characters.
     pub fn minLength(self: *Self, field_name: []const u8, value: []const u8, min: usize) !void {
         if (value.len < min) {
-            const msg = try std.fmt.allocPrint(self.allocator, "Minimum length is {d}, got {d}", .{ min, value.len });
+            const msg = try self.allocator.print("Minimum length is {d}, got {d}", .{ min, value.len });
             defer self.allocator.free(msg);
             try self.addError(field_name, msg, "MIN_LENGTH");
         }
@@ -58,7 +58,7 @@ pub const Validator = struct {
     /// Fails when `value` is longer than `max` characters.
     pub fn maxLength(self: *Self, field_name: []const u8, value: []const u8, max: usize) !void {
         if (value.len > max) {
-            const msg = try std.fmt.allocPrint(self.allocator, "Maximum length is {d}, got {d}", .{ max, value.len });
+            const msg = try self.allocator.print("Maximum length is {d}, got {d}", .{ max, value.len });
             defer self.allocator.free(msg);
             try self.addError(field_name, msg, "MAX_LENGTH");
         }
@@ -67,7 +67,7 @@ pub const Validator = struct {
     /// Fails when the integer `value` falls outside [`min`, `max`].
     pub fn range(self: *Self, field_name: []const u8, value: i64, min: i64, max: i64) !void {
         if (value < min or value > max) {
-            const msg = try std.fmt.allocPrint(self.allocator, "Value must be between {d} and {d}", .{ min, max });
+            const msg = try self.allocator.print("Value must be between {d} and {d}", .{ min, max });
             defer self.allocator.free(msg);
             try self.addError(field_name, msg, "RANGE");
         }
@@ -103,7 +103,7 @@ pub const Validator = struct {
                 }
             }
             if (!has_digit) {
-                const err_msg = try std.fmt.allocPrint(self.allocator, "Field '{s}' must contain at least one digit", .{field_name});
+                const err_msg = try self.allocator.print("Field '{s}' must contain at least one digit", .{field_name});
                 defer self.allocator.free(err_msg);
                 try self.addError(field_name, "Must contain at least one digit", "PATTERN");
             }

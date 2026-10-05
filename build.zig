@@ -271,6 +271,13 @@ pub fn build(b: *std.Build) void {
     const fmt_check_step = b.step("fmt-check", "Check formatting (zig fmt --check src tools examples)");
     fmt_check_step.dependOn(&fmt_check.step);
 
+    // Informational companion to fmt-check: `zig fmt --complexity` over the
+    // same paths. Never fails — CI prints the corpus total + largest files so
+    // complexity creep is visible in logs (deliberately not gated).
+    const fmt_complexity_cmd = b.addSystemCommand(&.{ "bash", "scripts/fmt-complexity.sh" });
+    const fmt_complexity_step = b.step("fmt-complexity", "Informational zig fmt --complexity report (never fails)");
+    fmt_complexity_step.dependOn(&fmt_complexity_cmd.step);
+
     const check_prod_cmd = b.addSystemCommand(&.{ "bash", "scripts/check-production.sh" });
     const check_step = b.step("check", "Production gates: no bare catch {} in hot paths");
     check_step.dependOn(&check_prod_cmd.step);

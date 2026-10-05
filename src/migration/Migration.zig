@@ -422,7 +422,7 @@ pub const MigrationRunner = struct {
             self.allocator.free(h.checksum);
         }
         self.history.clearRetainingCapacity();
-        const sql = try std.fmt.allocPrint(self.allocator, "SELECT version, description, applied_at, checksum, execution_time_ms, success FROM {s} ORDER BY version", .{self.history_table});
+        const sql = try self.allocator.print("SELECT version, description, applied_at, checksum, execution_time_ms, success FROM {s} ORDER BY version", .{self.history_table});
         defer self.allocator.free(sql);
         var result = try client.queryRows(AppliedMigration, sql, &.{});
         defer result.deinit(self.allocator);
@@ -445,7 +445,7 @@ pub const MigrationRunner = struct {
 
     /// Persist one applied-migration record so restarts skip it.
     fn insertHistoryRecord(self: *Self, client: anytype, version: i64, description: []const u8, checksum: []const u8, elapsed_ms: u64, success: bool) !void {
-        const sql = try std.fmt.allocPrint(self.allocator, "INSERT INTO {s} (version, description, applied_at, checksum, execution_time_ms, success) VALUES (?, ?, ?, ?, ?, ?)", .{self.history_table});
+        const sql = try self.allocator.print("INSERT INTO {s} (version, description, applied_at, checksum, execution_time_ms, success) VALUES (?, ?, ?, ?, ?, ?)", .{self.history_table});
         defer self.allocator.free(sql);
         _ = try client.exec(sql, &.{
             .{ .int = version },
@@ -459,7 +459,7 @@ pub const MigrationRunner = struct {
 
     /// Generate the migration history table creation SQL
     pub fn generateHistoryTableDDL(self: *Self) ![]const u8 {
-        return std.fmt.allocPrint(self.allocator,
+        return self.allocator.print(
             \\CREATE TABLE IF NOT EXISTS {s} (
             \\    version BIGINT PRIMARY KEY,
             \\    description VARCHAR(500) NOT NULL,

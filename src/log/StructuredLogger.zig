@@ -109,7 +109,7 @@ pub const StructuredLogger = struct {
         if (fields_info == .@"struct" and fields_info.@"struct".is_tuple == false) {
             inline for (fields_info.@"struct".field_names) |key| {
                 const value = @field(fields, key);
-                const value_str = try std.fmt.allocPrint(self.allocator, "{any}", .{value});
+                const value_str = try self.allocator.print("{any}", .{value});
                 // `key` is a comptime string literal (read-only memory) — dupe
                 // it before inserting: the defer above frees every map key.
                 const key_copy = try self.allocator.dupe(u8, key);
@@ -216,9 +216,9 @@ pub const LogRotator = struct {
         // is the normal state, and rotation must not block writes to the new log.
         var i: u32 = self.max_files - 1;
         while (i > 0) : (i -= 1) {
-            const old_name = try std.fmt.allocPrint(self.allocator, "{s}.{d}", .{ self.base_path, i - 1 });
+            const old_name = try self.allocator.print("{s}.{d}", .{ self.base_path, i - 1 });
             defer self.allocator.free(old_name);
-            const new_name = try std.fmt.allocPrint(self.allocator, "{s}.{d}", .{ self.base_path, i });
+            const new_name = try self.allocator.print("{s}.{d}", .{ self.base_path, i });
             defer self.allocator.free(new_name);
 
             std.Io.Dir.rename(self.dir, old_name, self.dir, new_name, self.io) catch |err| switch (err) {
@@ -228,7 +228,7 @@ pub const LogRotator = struct {
         }
 
         // Move the current file to .0
-        const backup_name = try std.fmt.allocPrint(self.allocator, "{s}.0", .{self.base_path});
+        const backup_name = try self.allocator.print("{s}.0", .{self.base_path});
         defer self.allocator.free(backup_name);
         std.Io.Dir.rename(self.dir, self.base_path, self.dir, backup_name, self.io) catch |err| switch (err) {
             error.FileNotFound => {},

@@ -462,6 +462,11 @@ jobs:
         # times across the matrix for one platform-independent check.
         run: zig build fmt-check
 
+      - name: Complexity report (informational)
+        # Never fails (the script exits 0) — surfaces corpus total + largest
+        # files by token count so complexity creep is visible in CI logs.
+        run: zig build fmt-complexity
+
       - name: Version consistency
         run: bash scripts/check-version.sh
 

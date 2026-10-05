@@ -29,8 +29,7 @@ pub const PersistentApprovalQueue = struct {
     /// Create the queue table (idempotent). Call once at startup.
     pub fn migrate(self: *Self) !void {
         try sqlx.validateIdentifier(self.table);
-        const sql = try std.fmt.allocPrint(
-            self.allocator,
+        const sql = try self.allocator.print(
             "CREATE TABLE IF NOT EXISTS {s} (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, subject TEXT NOT NULL, amount INTEGER NOT NULL, note TEXT NOT NULL DEFAULT '', step_name TEXT NOT NULL, tenant_id INTEGER, status INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)",
             .{self.table},
         );
@@ -42,8 +41,7 @@ pub const PersistentApprovalQueue = struct {
         try sqlx.validateIdentifier(self.table);
         const now = @import("../core/Time.zig").monotonicNowSeconds();
         if (item.tenant_id) |tid| {
-            const sql = try std.fmt.allocPrint(
-                self.allocator,
+            const sql = try self.allocator.print(
                 "INSERT INTO {s} (run_id, subject, amount, note, step_name, tenant_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
                 .{self.table},
             );
@@ -59,8 +57,7 @@ pub const PersistentApprovalQueue = struct {
                 .{ .int = now },
             });
         } else {
-            const sql = try std.fmt.allocPrint(
-                self.allocator,
+            const sql = try self.allocator.print(
                 "INSERT INTO {s} (run_id, subject, amount, note, step_name, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
                 .{self.table},
             );
@@ -81,12 +78,10 @@ pub const PersistentApprovalQueue = struct {
     /// the strings and must free them). Rows are ordered oldest first.
     pub fn listPending(self: *Self, allocator: std.mem.Allocator, out: *std.ArrayList(PendingApproval), tenant_id: ?i64) !void {
         try sqlx.validateIdentifier(self.table);
-        const sql = if (tenant_id) |tid| try std.fmt.allocPrint(
-            self.allocator,
+        const sql = if (tenant_id) |tid| try self.allocator.print(
             "SELECT run_id, subject, amount, note, step_name, tenant_id FROM {s} WHERE status = 0 AND tenant_id = {d} ORDER BY id ASC",
             .{ self.table, tid },
-        ) else try std.fmt.allocPrint(
-            self.allocator,
+        ) else try self.allocator.print(
             "SELECT run_id, subject, amount, note, step_name, tenant_id FROM {s} WHERE status = 0 ORDER BY id ASC",
             .{self.table},
         );
@@ -116,12 +111,10 @@ pub const PersistentApprovalQueue = struct {
     pub fn resolve(self: *Self, run_id: []const u8, tenant_id: ?i64) !bool {
         try sqlx.validateIdentifier(self.table);
         const now = @import("../core/Time.zig").monotonicNowSeconds();
-        const sql = if (tenant_id) |tid| try std.fmt.allocPrint(
-            self.allocator,
+        const sql = if (tenant_id) |tid| try self.allocator.print(
             "UPDATE {s} SET status = 1, updated_at = ? WHERE run_id = ? AND tenant_id = {d} AND status = 0",
             .{ self.table, tid },
-        ) else try std.fmt.allocPrint(
-            self.allocator,
+        ) else try self.allocator.print(
             "UPDATE {s} SET status = 1, updated_at = ? WHERE run_id = ? AND status = 0",
             .{self.table},
         );
@@ -132,11 +125,10 @@ pub const PersistentApprovalQueue = struct {
 
     pub fn count(self: *Self, tenant_id: ?i64) !usize {
         try sqlx.validateIdentifier(self.table);
-        const sql = if (tenant_id) |tid| try std.fmt.allocPrint(
-            self.allocator,
+        const sql = if (tenant_id) |tid| try self.allocator.print(
             "SELECT COUNT(*) AS n FROM {s} WHERE status = 0 AND tenant_id = {d}",
             .{ self.table, tid },
-        ) else try std.fmt.allocPrint(self.allocator, "SELECT COUNT(*) AS n FROM {s} WHERE status = 0", .{self.table});
+        ) else try self.allocator.print("SELECT COUNT(*) AS n FROM {s} WHERE status = 0", .{self.table});
         defer self.allocator.free(sql);
         var cursor = try self.backend.client.queryCursorEx(sql, &.{}, .{});
         defer cursor.deinit();

@@ -131,7 +131,7 @@ pub fn toOpenApi(registry: *SkillRegistry, allocator: std.mem.Allocator, opts: O
 
         var post = std.json.ObjectMap{};
         try post.put(a, try a.dupe(u8, "post"), .{ .object = op });
-        const path_key = try std.fmt.allocPrint(a, "{s}/{s}", .{ opts.base_path, tool.name });
+        const path_key = try a.print("{s}/{s}", .{ opts.base_path, tool.name });
         try paths.put(a, path_key, .{ .object = post });
     }
     try doc.put(a, try a.dupe(u8, "paths"), .{ .object = paths });

@@ -238,14 +238,12 @@ pub const OutboxConsumer = struct {
     /// caller supplies the argument — see `pendingArgs`.
     fn buildSelectPending(self: *Self) ![]const u8 {
         if (self.config.topic_filter != null) {
-            return std.fmt.allocPrint(
-                self.allocator,
+            return self.allocator.print(
                 "SELECT id, topic, payload, status, retry_count, max_retries, created_at, updated_at, error_message FROM event_outbox WHERE status IN (0, 1) AND retry_count < max_retries AND topic = ? ORDER BY created_at ASC LIMIT {d}",
                 .{self.config.batch_size},
             );
         }
-        return std.fmt.allocPrint(
-            self.allocator,
+        return self.allocator.print(
             "SELECT id, topic, payload, status, retry_count, max_retries, created_at, updated_at, error_message FROM event_outbox WHERE status IN (0, 1) AND retry_count < max_retries ORDER BY created_at ASC LIMIT {d}",
             .{self.config.batch_size},
         );

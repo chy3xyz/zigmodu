@@ -111,7 +111,7 @@ pub const ApprovalFlow = struct {
         amount: i64,
         steps: []const ApprovalStep,
     ) !ApprovalResult {
-        const run_id = try std.fmt.allocPrint(allocator, "ap-{x}", .{@intFromPtr(subject.ptr)});
+        const run_id = try allocator.print("ap-{x}", .{@intFromPtr(subject.ptr)});
         errdefer allocator.free(run_id);
 
         var context_block: []const u8 = "";

@@ -31,7 +31,7 @@ pub const DistributedTracer = struct {
         }
 
         pub fn toString(self: TraceId, allocator: std.mem.Allocator) ![]const u8 {
-            return std.fmt.allocPrint(allocator, "{x:016}{x:016}", .{ self.high, self.low });
+            return allocator.print("{x:016}{x:016}", .{ self.high, self.low });
         }
     };
 
@@ -46,7 +46,7 @@ pub const DistributedTracer = struct {
         }
 
         pub fn toString(self: SpanId, allocator: std.mem.Allocator) ![]const u8 {
-            return std.fmt.allocPrint(allocator, "{x:016}", .{self.id});
+            return allocator.print("{x:016}", .{self.id});
         }
     };
 

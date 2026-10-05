@@ -304,7 +304,7 @@ fn executeCommand(sctx: *SkillContext, cctx: *CommandCtx, args: std.json.Value) 
     }
     try payload_buf.appendSlice(sctx.allocator, "}");
 
-    const topic = try std.fmt.allocPrint(sctx.allocator, "{s}.{s}", .{ cctx.topic_prefix, name_v.string });
+    const topic = try sctx.allocator.print("{s}.{s}", .{ cctx.topic_prefix, name_v.string });
     defer sctx.allocator.free(topic);
     const insert = try cctx.outbox.buildInsert(topic, payload_buf.items);
     const result = try cctx.backend.exec(insert.sql, &.{
@@ -401,12 +401,12 @@ fn generateReport(sctx: *SkillContext, rctx: *ReportCtx, args: std.json.Value) a
                     .null => try buf.appendSlice(sctx.allocator, ""),
                     .bool => |b| try buf.appendSlice(sctx.allocator, if (b) "true" else "false"),
                     .int => |n| {
-                        const s = try std.fmt.allocPrint(sctx.allocator, "{d}", .{n});
+                        const s = try sctx.allocator.print("{d}", .{n});
                         defer sctx.allocator.free(s);
                         try buf.appendSlice(sctx.allocator, s);
                     },
                     .float => |f| {
-                        const s = try std.fmt.allocPrint(sctx.allocator, "{d}", .{f});
+                        const s = try sctx.allocator.print("{d}", .{f});
                         defer sctx.allocator.free(s);
                         try buf.appendSlice(sctx.allocator, s);
                     },

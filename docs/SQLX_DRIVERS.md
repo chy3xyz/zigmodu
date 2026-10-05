@@ -172,9 +172,11 @@ zent 使用自己的 SQLite / 驱动栈，与 `data.sqlx` **正交**（见 [ZENT
   fiber 池，fiber 内同步阻塞**不可被 io 取消**——单次挂起（网络抖动、服务器慢、
   连接被并发复用导致协议错乱）即永久卡死该 fiber。
 - **修复（v0.15.22）**：`SO_RCVTIMEO` socket 读超时（`Config.query_timeout_ms`，
-  默认 30s，0=禁用）——内核级 per-read 空闲超时，同步 `PQexec*` 不再能永久
+  默认 30s）——内核级 per-read 空闲超时，同步 `PQexec*` 不再能永久
   挂死；`connect_timeout=10` 覆盖连接阶段；超时后连接由池 ping / 单连接重连
   路径回收。完整非阻塞化（`PQsetnonblocking` + 轮询）列为后续优化。
+  **第 136 批起** `0` 不再是「禁用」：两驱动（PG/MySQL）统一为 `0 = 回落默认
+  30000ms`，读永有界（解析点 `effectiveQueryTimeoutMs`；要接近无界就显式配大值）。
 
 ### 11.2 ConnPool 等待 × Threaded Io worker 耗尽 → 间歇性 Timeout
 

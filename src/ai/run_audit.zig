@@ -40,8 +40,7 @@ pub const RunAuditStore = struct {
 
     pub fn migrate(self: *Self) !void {
         try sqlx.validateIdentifier(self.table);
-        const sql = try std.fmt.allocPrint(
-            self.allocator,
+        const sql = try self.allocator.print(
             "CREATE TABLE IF NOT EXISTS {s} (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, tenant_id INTEGER, steps INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, model TEXT)",
             .{self.table},
         );
@@ -50,12 +49,12 @@ pub const RunAuditStore = struct {
         // Existing installs predate the `model` column (CREATE IF NOT EXISTS
         // does not add columns). Probe first (fresh tables already have it),
         // then best-effort ALTER for legacy tables.
-        const probe = try std.fmt.allocPrint(self.allocator, "SELECT model FROM {s} LIMIT 0", .{self.table});
+        const probe = try self.allocator.print("SELECT model FROM {s} LIMIT 0", .{self.table});
         defer self.allocator.free(probe);
         if (self.backend.exec(probe, &.{})) |_| {
             // column already exists
         } else |_| {
-            const alter = try std.fmt.allocPrint(self.allocator, "ALTER TABLE {s} ADD COLUMN model TEXT", .{self.table});
+            const alter = try self.allocator.print("ALTER TABLE {s} ADD COLUMN model TEXT", .{self.table});
             defer self.allocator.free(alter);
             _ = self.backend.exec(alter, &.{}) catch |err| {
                 std.log.debug("[ai.run_audit] best-effort legacy column add failed ({s})", .{@errorName(err)});
@@ -66,8 +65,7 @@ pub const RunAuditStore = struct {
     pub fn record(self: *Self, entry: RunAuditEntry) !void {
         try sqlx.validateIdentifier(self.table);
         const now = Time.monotonicNowSeconds();
-        const sql = try std.fmt.allocPrint(
-            self.allocator,
+        const sql = try self.allocator.print(
             "INSERT INTO {s} (run_id, kind, status, tenant_id, steps, duration_ms, created_at, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             .{self.table},
         );
@@ -111,12 +109,10 @@ pub const RunAuditStore = struct {
             try args.append(allocator, .{ .int = tid });
         }
 
-        const sql = if (where.items.len > 0) try std.fmt.allocPrint(
-            allocator,
+        const sql = if (where.items.len > 0) try allocator.print(
             "SELECT run_id, kind, status, tenant_id, steps, duration_ms, model FROM {s} WHERE {s} ORDER BY id DESC LIMIT {d}",
             .{ self.table, where.items, limit },
-        ) else try std.fmt.allocPrint(
-            allocator,
+        ) else try allocator.print(
             "SELECT run_id, kind, status, tenant_id, steps, duration_ms, model FROM {s} ORDER BY id DESC LIMIT {d}",
             .{ self.table, limit },
         );
@@ -157,7 +153,7 @@ pub const RunAuditStore = struct {
 
     pub fn count(self: *Self) !usize {
         try sqlx.validateIdentifier(self.table);
-        const sql = try std.fmt.allocPrint(self.allocator, "SELECT COUNT(*) AS n FROM {s}", .{self.table});
+        const sql = try self.allocator.print("SELECT COUNT(*) AS n FROM {s}", .{self.table});
         defer self.allocator.free(sql);
         var cursor = try self.backend.client.queryCursorEx(sql, &.{}, .{});
         defer cursor.deinit();

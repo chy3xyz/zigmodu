@@ -80,7 +80,7 @@ pub const ConfigManager = struct {
                     const key = if (prefix.len == 0)
                         entry.key_ptr.*
                     else
-                        try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ prefix, entry.key_ptr.* });
+                        try self.allocator.print("{s}.{s}", .{ prefix, entry.key_ptr.* });
 
                     if (prefix.len > 0) {
                         defer self.allocator.free(key);

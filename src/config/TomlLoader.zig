@@ -44,7 +44,7 @@ pub const TomlLoader = struct {
                 const value = std.mem.trim(u8, trimmed[eq_pos + 1 ..], " \t");
 
                 const full_key = if (current_section) |section|
-                    try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ section, key })
+                    try self.allocator.print("{s}.{s}", .{ section, key })
                 else
                     try self.allocator.dupe(u8, key);
                 defer self.allocator.free(full_key);

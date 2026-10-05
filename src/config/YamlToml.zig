@@ -83,7 +83,7 @@ pub const YamlParser = struct {
                 const value = stripQuotes(raw_value);
 
                 const full_key = if (current_section) |section| blk: {
-                    const fk = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ section, key });
+                    const fk = try self.allocator.print("{s}.{s}", .{ section, key });
                     break :blk fk;
                 } else try self.allocator.dupe(u8, key);
 
@@ -211,7 +211,7 @@ pub const TomlParser = struct {
                 const raw_value = std.mem.trim(u8, line[eq_idx + 1 ..], " \t");
 
                 const full_key = if (current_section) |section| blk: {
-                    const fk = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ section, key });
+                    const fk = try self.allocator.print("{s}.{s}", .{ section, key });
                     break :blk fk;
                 } else try self.allocator.dupe(u8, key);
 

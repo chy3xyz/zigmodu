@@ -151,8 +151,8 @@ pub const ContractTestRunner = struct {
         if (actual_status != contract.response.status) {
             try failures.append(self.allocator, .{
                 .field = try self.allocator.dupe(u8, "status"),
-                .expected = try std.fmt.allocPrint(self.allocator, "{d}", .{contract.response.status}),
-                .actual = try std.fmt.allocPrint(self.allocator, "{d}", .{actual_status}),
+                .expected = try self.allocator.print("{d}", .{contract.response.status}),
+                .actual = try self.allocator.print("{d}", .{actual_status}),
                 .message = try self.allocator.dupe(u8, "HTTP status mismatch"),
             });
         }
@@ -176,7 +176,7 @@ pub const ContractTestRunner = struct {
                 if (std.mem.eql(u8, expected_header.key, actual_header.key)) {
                     if (!std.mem.eql(u8, expected_header.value, actual_header.value)) {
                         try failures.append(self.allocator, .{
-                            .field = try std.fmt.allocPrint(self.allocator, "header.{s}", .{expected_header.key}),
+                            .field = try self.allocator.print("header.{s}", .{expected_header.key}),
                             .expected = try self.allocator.dupe(u8, expected_header.value),
                             .actual = try self.allocator.dupe(u8, actual_header.value),
                             .message = try self.allocator.dupe(u8, "Response header value mismatch"),
@@ -188,7 +188,7 @@ pub const ContractTestRunner = struct {
             }
             if (!found) {
                 try failures.append(self.allocator, .{
-                    .field = try std.fmt.allocPrint(self.allocator, "header.{s}", .{expected_header.key}),
+                    .field = try self.allocator.print("header.{s}", .{expected_header.key}),
                     .expected = try self.allocator.dupe(u8, expected_header.value),
                     .actual = try self.allocator.dupe(u8, "<missing>"),
                     .message = try self.allocator.dupe(u8, "Expected response header not found"),
@@ -223,18 +223,17 @@ pub const ContractTestRunner = struct {
         for (self.verifications.items) |v| {
             if (v.passed) {
                 passed += 1;
-                const line = try std.fmt.allocPrint(self.allocator, "  ✓ {s}\n", .{v.contract_name});
+                const line = try self.allocator.print("  ✓ {s}\n", .{v.contract_name});
                 defer self.allocator.free(line);
                 try buf.appendSlice(self.allocator, line);
             } else {
                 failed += 1;
-                const line = try std.fmt.allocPrint(self.allocator, "  ✗ {s}\n", .{v.contract_name});
+                const line = try self.allocator.print("  ✗ {s}\n", .{v.contract_name});
                 defer self.allocator.free(line);
                 try buf.appendSlice(self.allocator, line);
 
                 for (v.failures) |f| {
-                    const detail = try std.fmt.allocPrint(
-                        self.allocator,
+                    const detail = try self.allocator.print(
                         "    - {s}: expected '{s}', got '{s}' ({s})\n",
                         .{ f.field, f.expected, f.actual, f.message },
                     );
@@ -244,8 +243,7 @@ pub const ContractTestRunner = struct {
             }
         }
 
-        const summary = try std.fmt.allocPrint(
-            self.allocator,
+        const summary = try self.allocator.print(
             "\n  Results: {d} passed, {d} failed, {d} total\n",
             .{ passed, failed, passed + failed },
         );

@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+### 第 136 批：A-5 收尾（sqlx 读超时永有界）+ CI 复杂度报告 + `allocPrint` 习语迁移第一批（**破坏性：窄**——`query_timeout_ms = 0` 语义变化 + `hasUnboundedPgReads` 删除）
+
+1. **A-5 收尾：同步驱动的 socket 读不再有「无界」档**（`src/sqlx/sqlx.zig`）。此前
+   `Config.query_timeout_ms = 0` 在 PG 是「不装 `SO_RCVTIMEO`，`Client.connect` 打一条
+   警告放行」（v1.0-readiness A-5 残留的唯一无界面），在 MySQL 则被无视（
+   `MYSQL_OPT_READ_TIMEOUT` 硬编码 30s）。现在两驱动统一：**0 = 回落默认
+   `DEFAULT_QUERY_TIMEOUT_MS`（30000ms），读总是有界**；维护工具要接近无界就显式配大值。
+   解析点抽成 `pub fn effectiveQueryTimeoutMs`；MySQL 的 `READ_TIMEOUT` 真正吃配置
+   （按秒向上取整，亚秒也有 1s 界），`MySqlConn.connect` 增末参 `query_timeout_ms`
+   （树内 9 处调用已同步）。`hasUnboundedPgReads` 删除（无界路径不存在了），
+   `Client.connect` 的一次性警告同删。测试换代：旧 `hasUnboundedPgReads` 用例 →
+   `effectiveQueryTimeoutMs`（0 解析/默认字段值）与 `mysql readTimeoutSecs`
+   （0 回落/亚秒取整/u32 ms 恒放得下 c_uint 秒，无钳位分支）两个聚焦用例。
+2. **`zig fmt --complexity` 接 CI 信息性指标**：新 `scripts/fmt-complexity.sh`
+   （只读 `--check` 模式跑报告，**永不失败**），新 build step `zig build fmt-complexity`，
+   ci.yml 在 fmt 门禁后加 `Complexity report (informational)` 步。语料总览：
+   tokens=4,641,322 / nodes=2,254,981；前三是 `sqlx.zig`(92.6K) /
+   `tools/zmodu/main.zig`(70.7K) / `Server.zig`(68.0K) —— 复杂度漂移从此在 CI 日志里
+   可见，而不是事后才发现。
+3. **`std.fmt.allocPrint` → `Allocator.print` 习语迁移第一批**（Zig 0.17 形态）：
+   15 个目录 48 文件 135 处（ai 37 / messaging 19 / test 17 / web4 12 / metrics 10 /
+   extensions 7 / validation 6 / kit 6 / secrets·log·config 各 4 / tracing·migration
+   各 3 / tenant 2 / scheduler 1），机械正则替换 + 编译验证，零行为变化。src 全域
+   存量从 369 处降到 234 处，剩余在 sqlx.zig(51) / Server.zig(29) / redis(15) /
+   RaftTransport(14) / Middleware(14) / Orm(11) 等大文件，后续分批。
+4. **sendTimeout doc 注核销**：全树无 `sendTimeout` 符号；`sendBlocking`/`recv` 的
+   `timeout_ms = 0 无限等待`语义在 `src/runtime/mailbox.zig:102/:198` 与实现一致 ——
+   核实后**无需改动**，直接核销。
+5. **门禁读数**：fmt 净 · check-production OK · check-test-collection **2163**（净 +1：
+   删 1 加 2）· 全量 `zig build test` exit=0（233s 量级）。A-5 行在
+   `docs/dev/v1.0-readiness-v0.35.md` 同步收口。
+
 ### 第 135 批：24h soak 第 13 小时的 scheduler abort —— `push` 预算耗尽从「断言」改为「永不放弃」（**破坏性：否**——行为变化，无 API 变化）
 
 1. **事故**：双 24h soak 期间 `runtime-stress` 在第 13 小时 abort，栈为

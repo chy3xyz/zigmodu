@@ -311,7 +311,7 @@ pub const Scheduler = struct {
                 job.task(job.context);
                 continue;
             };
-            const key = std.fmt.allocPrint(self.allocator, "cron:{s}", .{job.name}) catch {
+            const key = self.allocator.print("cron:{s}", .{job.name}) catch {
                 std.log.err("[cron] {s}: cannot build lock name; skipping this tick", .{job.name});
                 continue;
             };

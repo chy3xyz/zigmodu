@@ -634,8 +634,8 @@ test "doc snippets: the json detector flags the value form and clears the string
     // The working forms: a `[]const u8` body, a value through `jsonStruct`.
     try std.testing.expect(jsonGetsStructLiteral("try ctx.json(200, \"{\\\"ok\\\":true}\");") == null);
     try std.testing.expect(jsonGetsStructLiteral("try ctx.json(200, body);") == null);
-    try std.testing.expect(jsonGetsStructLiteral("const r = try std.fmt.allocPrint(ctx.allocator, \"{{\\\"id\\\":{d}}}\", .{id});") == null);
-    try std.testing.expect(jsonGetsStructLiteral("try ctx.json(200, try std.fmt.allocPrint(ctx.allocator, \"{{}}\", .{}));") == null);
+    try std.testing.expect(jsonGetsStructLiteral("const r = try ctx.allocator.print(\"{{\\\"id\\\":{d}}}\", .{id});") == null);
+    try std.testing.expect(jsonGetsStructLiteral("try ctx.json(200, try ctx.allocator.print(\"{{}}\", .{}));") == null);
     try std.testing.expect(jsonGetsStructLiteral("try ctx.jsonStruct(200, .{ .ok = true });") == null);
     try std.testing.expect(jsonGetsStructLiteral("try ctx.jsonValue(200, .{ .ok = true });") == null);
     // A status the fragment does not pin down is not judged.

@@ -269,7 +269,7 @@ pub const SecretsManager = struct {
         if (!std.mem.startsWith(u8, addr, "http://") and
             !std.mem.startsWith(u8, addr, "https://")) return error.InvalidVaultAddress;
 
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/v1/{s}/data/{s}", .{ addr, vc.mount_path, path });
+        const url = try self.allocator.print("{s}/v1/{s}/data/{s}", .{ addr, vc.mount_path, path });
         defer self.allocator.free(url);
 
         const client = try self.acquireVaultClient(io, vc.timeout_ms);
@@ -412,7 +412,7 @@ pub const SecretsManager = struct {
         defer buf.deinit(self.allocator);
         var iter = self.secrets.iterator();
         while (iter.next()) |entry| {
-            const line = try std.fmt.allocPrint(self.allocator, "{s}={s}\n", .{ entry.key_ptr.*, entry.value_ptr.value });
+            const line = try self.allocator.print("{s}={s}\n", .{ entry.key_ptr.*, entry.value_ptr.value });
             defer self.allocator.free(line);
             try buf.appendSlice(self.allocator, line);
         }
@@ -436,8 +436,8 @@ pub const SecretsManager = struct {
 fn jsonValueToString(allocator: std.mem.Allocator, v: std.json.Value) ![]u8 {
     return switch (v) {
         .string => |s| try allocator.dupe(u8, s),
-        .integer => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
-        .float => |f| try std.fmt.allocPrint(allocator, "{d}", .{f}),
+        .integer => |i| try allocator.print("{d}", .{i}),
+        .float => |f| try allocator.print("{d}", .{f}),
         .bool => |b| try allocator.dupe(u8, if (b) "true" else "false"),
         .null => try allocator.dupe(u8, ""),
         .number_string => |s| try allocator.dupe(u8, s),

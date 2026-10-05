@@ -50,7 +50,7 @@ pub const ChallengeStore = struct {
         var buf: [8]u8 = undefined;
         try std.Io.randomSecure(self.io, &buf);
         const n = std.mem.readInt(u64, &buf, .little);
-        const challenge = try std.fmt.allocPrint(allocator, "challenge-{x}", .{n});
+        const challenge = try allocator.print("challenge-{x}", .{n});
         errdefer allocator.free(challenge);
 
         try self.mutex.lock(self.io);

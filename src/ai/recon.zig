@@ -271,8 +271,7 @@ pub const ReconCheck = struct {
     }
 
     fn writeSummary(self: *ReconCheck, allocator: std.mem.Allocator, result: ReconResult) !void {
-        const payload = try std.fmt.allocPrint(
-            allocator,
+        const payload = try allocator.print(
             "RECON compared={d} missing={d} extra={d} mismatch={d} {s}",
             .{
                 result.compared,

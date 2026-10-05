@@ -141,9 +141,9 @@ fn ruleFailure(
     hook: ?MessageHook,
 ) ![]const u8 {
     if (field_rules.message) |override| return try allocator.dupe(u8, override);
-    const rule_text = try std.fmt.allocPrint(allocator, rule_fmt, rule_args);
+    const rule_text = try allocator.print(rule_fmt, rule_args);
     defer allocator.free(rule_text);
-    const default_msg = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ field_name, rule_text });
+    const default_msg = try allocator.print("{s}: {s}", .{ field_name, rule_text });
     if (hook) |h| {
         if (h(field_name, rule_name, default_msg)) |localized| {
             allocator.free(default_msg);

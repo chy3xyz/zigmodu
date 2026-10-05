@@ -59,7 +59,7 @@ pub const MemoryStore = struct {
     /// only — a lookup must not go through it (see `forget`, which cannot
     /// format a key at all: it has no error channel and no bounded buffer).
     fn storageKey(allocator: std.mem.Allocator, tenant_id: i64, user_id: i64, logical: []const u8) ![]u8 {
-        return std.fmt.allocPrint(allocator, "{d}\x1f{d}\x1f{s}", .{ tenant_id, user_id, logical });
+        return allocator.print("{d}\x1f{d}\x1f{s}", .{ tenant_id, user_id, logical });
     }
 
     /// Store a fact. Logical key format: "namespace:category:detail" (e.g. "user:pref:lang").

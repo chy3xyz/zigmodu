@@ -49,8 +49,7 @@ pub const BusinessAlert = struct {
             if ((try cursor.next()) == null) continue;
 
             alerts += 1;
-            const message = try std.fmt.allocPrint(
-                allocator,
+            const message = try allocator.print(
                 "ALERT [{s}]: {s}",
                 .{ rule.name, rule.message_template },
             );

@@ -115,8 +115,7 @@ pub const ShardRouter = struct {
     /// Build a connection string for a pool index.
     pub fn buildConnectionString(self: *Self, pool_index: u16) ![]const u8 {
         const pool = self.getPool(pool_index) orelse return error.InvalidShardIndex;
-        return std.fmt.allocPrint(
-            self.allocator,
+        return self.allocator.print(
             "{s}://{s}:{s}@{s}:{d}/{s}",
             .{ "mysql", pool.username, pool.password, pool.host, pool.port, pool.database },
         );

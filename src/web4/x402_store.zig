@@ -68,16 +68,14 @@ pub const X402Store = struct {
     /// dialect-aware, but only the SQLite arm has been exercised.
     pub fn migrate(self: *Self) !void {
         try sqlx.validateIdentifier(self.table);
-        const sql = try std.fmt.allocPrint(
-            self.allocator,
+        const sql = try self.allocator.print(
             "CREATE TABLE IF NOT EXISTS {s} (id INTEGER PRIMARY KEY AUTOINCREMENT, invoice_id TEXT NOT NULL UNIQUE, payee_did TEXT NOT NULL, payer_did TEXT, amount INTEGER NOT NULL, currency TEXT NOT NULL, chain_id INTEGER NOT NULL DEFAULT 1, deadline INTEGER NOT NULL, description TEXT NOT NULL DEFAULT '', status INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, redeemed_at INTEGER, tx_hash TEXT)",
             .{self.table},
         );
         defer self.allocator.free(sql);
         _ = try self.backend.exec(sql, &.{});
         if (!try self.hasColumn("payer_did")) {
-            const alter = try std.fmt.allocPrint(
-                self.allocator,
+            const alter = try self.allocator.print(
                 "ALTER TABLE {s} ADD COLUMN payer_did TEXT",
                 .{self.table},
             );
@@ -104,8 +102,7 @@ pub const X402Store = struct {
         try sqlx.validateIdentifier(column);
         switch (self.backend.dialect()) {
             .sqlite => {
-                const pragma = try std.fmt.allocPrint(
-                    self.allocator,
+                const pragma = try self.allocator.print(
                     "PRAGMA table_info({s})",
                     .{self.table},
                 );
@@ -167,8 +164,7 @@ pub const X402Store = struct {
         // neither of which belongs in the caller's payment flow.
         if (try self.exists(invoice.id)) return error.DuplicateInvoice;
         const now = Time.wallClockSeconds(self.io());
-        const sql = try std.fmt.allocPrint(
-            self.allocator,
+        const sql = try self.allocator.print(
             "INSERT INTO {s} (invoice_id, payee_did, payer_did, amount, currency, chain_id, deadline, description, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
             .{self.table},
         );
@@ -203,8 +199,7 @@ pub const X402Store = struct {
     /// cause, so a read that fails is the caller's problem too.
     fn exists(self: *Self, invoice_id: []const u8) !bool {
         try sqlx.validateIdentifier(self.table);
-        const select = try std.fmt.allocPrint(
-            self.allocator,
+        const select = try self.allocator.print(
             "SELECT 1 FROM {s} WHERE invoice_id = ?",
             .{self.table},
         );
@@ -231,8 +226,7 @@ pub const X402Store = struct {
     pub fn redeem(self: *Self, invoice_id: []const u8, tx_hash: []const u8, payer_did: ?[]const u8) !RedeemResult {
         try sqlx.validateIdentifier(self.table);
         const now = Time.wallClockSeconds(self.io());
-        const select = try std.fmt.allocPrint(
-            self.allocator,
+        const select = try self.allocator.print(
             "SELECT status, deadline, payer_did FROM {s} WHERE invoice_id = ?",
             .{self.table},
         );
@@ -257,8 +251,7 @@ pub const X402Store = struct {
         if (row.get("status").?.int != 0) return .already_used;
         if (row.get("deadline").?.int > 0 and row.get("deadline").?.int < now) return .expired;
 
-        const update = try std.fmt.allocPrint(
-            self.allocator,
+        const update = try self.allocator.print(
             "UPDATE {s} SET status = 1, redeemed_at = ?, tx_hash = ? WHERE invoice_id = ? AND status = 0",
             .{self.table},
         );

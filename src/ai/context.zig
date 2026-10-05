@@ -80,7 +80,7 @@ pub const ContextManager = struct {
                 const merged = blk: {
                     errdefer allocator.free(new_summary);
                     if (summary.*) |s| {
-                        const m = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ s, new_summary });
+                        const m = try allocator.print("{s}\n{s}", .{ s, new_summary });
                         allocator.free(new_summary);
                         allocator.free(s);
                         break :blk m;
@@ -112,7 +112,7 @@ test "ContextManager summarizes the older portion" {
     const allocator = std.testing.allocator;
     const T = struct {
         fn summarize(a: std.mem.Allocator, msgs: []const ChatMsg, out: *[]const u8) anyerror!void {
-            out.* = try std.fmt.allocPrint(a, "summary({d} msgs)", .{msgs.len});
+            out.* = try a.print("summary({d} msgs)", .{msgs.len});
         }
     };
 

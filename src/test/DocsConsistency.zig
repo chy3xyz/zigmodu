@@ -62,7 +62,7 @@ test "every symbol documented in docs/ exists in src/" {
 
             const name = try allocator.dupe(u8, rest[0..end]);
             errdefer allocator.free(name);
-            const where = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ doc_path, line_no });
+            const where = try allocator.print("{s}:{d}", .{ doc_path, line_no });
             try decls.append(allocator, .{
                 .name = name,
                 .kind = if (is_fn) .function else .constant,
@@ -179,14 +179,14 @@ fn scanDir(
                     // `pub fn TypeName(...)`; Zig has no such declaration, so an
                     // upper-case name is checked as a type as well.
                     const is_type = std.ascii.isUpper(d.name[0]);
-                    const fn_pattern = try std.fmt.allocPrint(allocator, "fn {s}(", .{d.name});
+                    const fn_pattern = try allocator.print("fn {s}(", .{d.name});
                     defer allocator.free(fn_pattern);
                     if (std.mem.indexOf(u8, content, fn_pattern) != null) {
                         found[i] = true;
                         continue;
                     }
                     if (d.kind == .constant or is_type) {
-                        const const_pattern = try std.fmt.allocPrint(allocator, "const {s}", .{d.name});
+                        const const_pattern = try allocator.print("const {s}", .{d.name});
                         defer allocator.free(const_pattern);
                         if (std.mem.indexOf(u8, content, const_pattern) != null) found[i] = true;
                     }

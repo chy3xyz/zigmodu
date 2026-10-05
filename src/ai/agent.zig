@@ -324,7 +324,7 @@ pub const Agent = struct {
                     const merged = try appendTakenString(
                         allocator,
                         &owned_strs,
-                        try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ self.system_prompt, ctx_block }),
+                        try allocator.print("{s}\n\n{s}", .{ self.system_prompt, ctx_block }),
                     );
                     system_content = merged;
                 }
@@ -351,7 +351,7 @@ pub const Agent = struct {
                 const merged = try appendTakenString(
                     allocator,
                     &owned_strs,
-                    try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ system_content, b }),
+                    try allocator.print("{s}\n\n{s}", .{ system_content, b }),
                 );
                 system_content = merged;
             }
@@ -499,8 +499,7 @@ pub const Agent = struct {
                             const err_s = try appendTakenString(
                                 allocator,
                                 &owned_strs,
-                                try std.fmt.allocPrint(
-                                    allocator,
+                                try allocator.print(
                                     "{{\"error\":\"ToolDenied\",\"reason\":\"{s}\"}}",
                                     .{@tagName(decision)},
                                 ),
@@ -561,7 +560,7 @@ pub const Agent = struct {
                     const err_s = try appendTakenString(
                         allocator,
                         &owned_strs,
-                        try std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}),
+                        try allocator.print("{{\"error\":\"{s}\"}}", .{@errorName(err)}),
                     );
                     const tid = try appendOwnedString(allocator, &owned_strs, tc.id);
                     try messages.append(allocator, .{
@@ -614,7 +613,7 @@ pub const Agent = struct {
         const store = self.audit_store orelse return;
         const now_ms = @import("../core/Time.zig").monotonicNowMilliseconds();
         const seq = run_id_seq.next();
-        const run_id = try std.fmt.allocPrint(allocator, "agent-{d}-{d}", .{ now_ms, seq });
+        const run_id = try allocator.print("agent-{d}-{d}", .{ now_ms, seq });
         defer allocator.free(run_id);
         try store.record(.{
             .run_id = run_id,

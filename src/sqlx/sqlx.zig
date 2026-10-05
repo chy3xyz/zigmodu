@@ -2261,11 +2261,12 @@ fn appendCsvCell(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), value: [
 pub const PostgresConn = struct {
     conn: ?*libpq_c.PGconn,
     allocator: std.mem.Allocator,
-    /// Socket read timeout (ms); 0 = disabled. Applied via SO_RCVTIMEO so
-    /// synchronous PQexec*/PQgetResult reads cannot hang forever. NOTE: this
-    /// is a per-read idle timeout (kernel), not a whole-query deadline — a
-    /// slow-but-progressing query is not cut off.
-    query_timeout_ms: u32 = 0,
+    /// Socket read timeout (ms), always > 0 after `connect` resolves it
+    /// (`effectiveQueryTimeoutMs` maps 0 → `DEFAULT_QUERY_TIMEOUT_MS`).
+    /// Applied via SO_RCVTIMEO so synchronous PQexec*/PQgetResult reads
+    /// cannot hang forever. NOTE: this is a per-read idle timeout (kernel),
+    /// not a whole-query deadline — a slow-but-progressing query is not cut off.
+    query_timeout_ms: u32 = DEFAULT_QUERY_TIMEOUT_MS,
     /// LRU-style prepared statement cache: SQL text → null-terminated statement name.
     /// Values MUST stay `[:0]u8` (from `allocZ`): coercing to `[]const u8` then `free`
     /// drops the sentinel and panics SafeAllocator with alloc=N+1 / free=N.
@@ -2303,14 +2304,17 @@ pub const PostgresConn = struct {
             libpq_c.PQfinish(conn);
             return error.DatabaseError;
         }
-        applySocketTimeout(conn.?, query_timeout_ms);
-        return .{ .conn = conn, .allocator = allocator, .query_timeout_ms = query_timeout_ms, .stmt_cache = std.StringHashMap(CachedStmt([:0]u8)).init(allocator) };
+        const effective_timeout_ms = effectiveQueryTimeoutMs(query_timeout_ms);
+        applySocketTimeout(conn.?, effective_timeout_ms);
+        return .{ .conn = conn, .allocator = allocator, .query_timeout_ms = effective_timeout_ms, .stmt_cache = std.StringHashMap(CachedStmt([:0]u8)).init(allocator) };
     }
 
     /// Apply SO_RCVTIMEO to the libpq socket so synchronous PQexec* reads
     /// cannot block a worker thread forever (Threaded Io M:N fibers). A
     /// timed-out read leaves the connection in an indeterminate state — the
     /// pool's ping / single-conn reconnect paths recover it on next use.
+    /// Callers resolve 0 through `effectiveQueryTimeoutMs` first — the
+    /// 0-guard below is defence for direct callers only.
     fn applySocketTimeout(conn: *libpq_c.PGconn, timeout_ms: u32) void {
         if (timeout_ms == 0) return;
         const fd = libpq_c.PQsocket(conn);
@@ -3690,13 +3694,22 @@ pub const MySqlConn = struct {
         self.magic = 0xDEADDEAD;
     }
 
-    pub fn connect(allocator: std.mem.Allocator, host: []const u8, user: []const u8, password: []const u8, db: []const u8, port: u32) !MySqlConn {
+    /// Whole-second `MYSQL_OPT_READ_TIMEOUT` value for a configured ms
+    /// timeout (0 resolves to the default bound first); rounds up so a
+    /// sub-second bound still bounds. u32 ms always fits c_uint secs.
+    fn readTimeoutSecs(query_timeout_ms: u32) c_uint {
+        const ms: u64 = effectiveQueryTimeoutMs(query_timeout_ms);
+        return @intCast((ms + 999) / 1000);
+    }
+
+    pub fn connect(allocator: std.mem.Allocator, host: []const u8, user: []const u8, password: []const u8, db: []const u8, port: u32, query_timeout_ms: u32) !MySqlConn {
         const mysql = libmysql_c.mysql_init(null);
         if (mysql == null) return error.DatabaseError;
 
         // Connection timeouts (P1-5)
+        const read_timeout_secs = readTimeoutSecs(query_timeout_ms);
         _ = libmysql_c.mysql_options(mysql, libmysql_c.MYSQL_OPT_CONNECT_TIMEOUT, @ptrCast(@constCast(&@as(c_uint, 10))));
-        _ = libmysql_c.mysql_options(mysql, libmysql_c.MYSQL_OPT_READ_TIMEOUT, @ptrCast(@constCast(&@as(c_uint, 30))));
+        _ = libmysql_c.mysql_options(mysql, libmysql_c.MYSQL_OPT_READ_TIMEOUT, @ptrCast(@constCast(&read_timeout_secs)));
 
         // SSL/TLS support (P0-3)
         const ssl_mode = if (std.c.getenv("MYSQL_SSL_MODE")) |v| std.mem.span(v) else "preferred";
@@ -4887,21 +4900,26 @@ pub const Config = struct {
     max_wait_ms: u32 = 5000,
     max_lifetime_secs: u32 = 3600,
     max_idle_time_secs: u32 = 300,
-    /// libpq socket read timeout (ms). 0 = disabled — an explicit choice the
-    /// caller owns: a hung synchronous read then holds its worker thread
-    /// forever, and `connect` says so once (loudly) at open. Guards against a
-    /// hung synchronous PQexec* permanently wedging a fiber/worker thread —
-    /// the query fails with error.Timeout and the connection is
-    /// re-established.
-    query_timeout_ms: u32 = 30000,
+    /// Sync-driver socket read timeout (ms) — postgres (SO_RCVTIMEO on the
+    /// libpq socket) and mysql (MYSQL_OPT_READ_TIMEOUT, rounded up to whole
+    /// seconds). Guards against a hung synchronous read permanently wedging a
+    /// fiber/worker thread: the query fails with error.Timeout and the
+    /// connection is re-established. `0` resolves to
+    /// `DEFAULT_QUERY_TIMEOUT_MS` — reads are ALWAYS bounded; a maintenance
+    /// tool that wants a near-unbounded read sets an explicit large value.
+    /// NOTE (postgres): per-read idle timeout, not a whole-query deadline.
+    query_timeout_ms: u32 = DEFAULT_QUERY_TIMEOUT_MS,
 };
 
-/// True when the config leaves synchronous PG reads unbounded (the field is
-/// PG-specific, so other drivers are never "unbounded" through it).
-/// `Client.connect` warns once when this holds — 0 stays allowed (maintenance
-/// tooling may want it), but never silently.
-pub fn hasUnboundedPgReads(cfg: Config) bool {
-    return cfg.driver == .postgres and cfg.query_timeout_ms == 0;
+/// Default sync-driver socket read timeout (ms) applied when
+/// `Config.query_timeout_ms == 0` — reads are never left unbounded.
+pub const DEFAULT_QUERY_TIMEOUT_MS: u32 = 30000;
+
+/// Resolve a configured sync-driver read timeout: 0 = "take the default
+/// bound" (never unbounded). Tooling that truly wants a near-unbounded read
+/// sets an explicit large value (e.g. 86_400_000 for a day).
+pub fn effectiveQueryTimeoutMs(ms: u32) u32 {
+    return if (ms == 0) DEFAULT_QUERY_TIMEOUT_MS else ms;
 }
 
 /// Transaction options aligned with Go's sql.TxOptions.
@@ -5190,7 +5208,7 @@ pub const Client = struct {
             .mysql => {
                 const mysql = try self.allocator.create(MySqlConn);
                 errdefer self.allocator.destroy(mysql);
-                mysql.* = try MySqlConn.connect(self.allocator, self.config.host, self.config.username, self.config.password, self.config.database, self.config.port);
+                mysql.* = try MySqlConn.connect(self.allocator, self.config.host, self.config.username, self.config.password, self.config.database, self.config.port, self.config.query_timeout_ms);
                 return mysql.toConn();
             },
         }
@@ -5198,9 +5216,6 @@ pub const Client = struct {
 
     pub fn connect(self: *Client) !void {
         if (self.conn != null) return;
-        if (hasUnboundedPgReads(self.config)) {
-            std.log.warn("[sqlx] postgres query_timeout_ms=0: a hung synchronous PQexec* read holds its worker thread forever. Set a bound (default 30000) unless this client is maintenance tooling that owns the risk", .{});
-        }
         self.conn = try self.newConn();
     }
 
@@ -9577,7 +9592,7 @@ test "mysql buffered read reports an allocation failure as OutOfMemory" {
     try skipUnlessDb("mysql");
     const allocator = std.testing.allocator;
     const cfg = mysqlLiveConfig();
-    var raw = try MySqlConn.connect(allocator, cfg.host, cfg.username, cfg.password, cfg.database, cfg.port);
+    var raw = try MySqlConn.connect(allocator, cfg.host, cfg.username, cfg.password, cfg.database, cfg.port, cfg.query_timeout_ms);
     defer {
         raw.stmt_cache.deinit();
         libmysql_c.mysql_close(raw.mysql);
@@ -10474,7 +10489,7 @@ fn pgTestConninfo() []const u8 {
 /// the handshake succeeds and the failure can be pinned afterwards.
 fn mysqlFailingConn(failing: *std.testing.FailingAllocator) !MySqlConn {
     const cfg = mysqlLiveConfig();
-    return MySqlConn.connect(failing.allocator(), cfg.host, cfg.username, cfg.password, cfg.database, cfg.port);
+    return MySqlConn.connect(failing.allocator(), cfg.host, cfg.username, cfg.password, cfg.database, cfg.port, cfg.query_timeout_ms);
 }
 
 /// Pin a `FailingAllocator` so that its next allocation fails.
@@ -10883,7 +10898,7 @@ test "mysql exec prepared path does not swallow an allocation failure" {
     var fail_at: usize = 0;
     while (fail_at < 2) : (fail_at += 1) {
         var once = FailOnceAllocator.init(allocator, fail_at);
-        var conn = try MySqlConn.connect(once.allocator(), cfg.host, cfg.username, cfg.password, cfg.database, cfg.port);
+        var conn = try MySqlConn.connect(once.allocator(), cfg.host, cfg.username, cfg.password, cfg.database, cfg.port, cfg.query_timeout_ms);
         defer closeStackMySqlConn(&conn);
 
         try std.testing.expectError(error.OutOfMemory, MySqlConn.execFn(&conn, "SELECT ? AS a", &.{.{ .int = 1 }}));
@@ -10898,7 +10913,7 @@ test "mysql query prepared path does not swallow an allocation failure" {
     var fail_at: usize = 0;
     while (fail_at < 2) : (fail_at += 1) {
         var once = FailOnceAllocator.init(allocator, fail_at);
-        var conn = try MySqlConn.connect(once.allocator(), cfg.host, cfg.username, cfg.password, cfg.database, cfg.port);
+        var conn = try MySqlConn.connect(once.allocator(), cfg.host, cfg.username, cfg.password, cfg.database, cfg.port, cfg.query_timeout_ms);
         defer closeStackMySqlConn(&conn);
 
         try std.testing.expectError(error.OutOfMemory, MySqlConn.queryFn(&conn, allocator, "SELECT ? AS a", &.{.{ .int = 1 }}));
@@ -10969,7 +10984,7 @@ test "mysql statement row scan reports allocation failures as OutOfMemory" {
     try skipUnlessDb("mysql");
     const allocator = std.testing.allocator;
     const cfg = mysqlLiveConfig();
-    var conn = try MySqlConn.connect(allocator, cfg.host, cfg.username, cfg.password, cfg.database, cfg.port);
+    var conn = try MySqlConn.connect(allocator, cfg.host, cfg.username, cfg.password, cfg.database, cfg.port, cfg.query_timeout_ms);
     defer closeStackMySqlConn(&conn);
 
     // Two rows on purpose: the short one is copied out of the fixed 4096-byte
@@ -11024,7 +11039,7 @@ test "mysql statement without a result set reads as zero rows, not an error" {
     try skipUnlessDb("mysql");
     const allocator = std.testing.allocator;
     const cfg = mysqlLiveConfig();
-    var conn = try MySqlConn.connect(allocator, cfg.host, cfg.username, cfg.password, cfg.database, cfg.port);
+    var conn = try MySqlConn.connect(allocator, cfg.host, cfg.username, cfg.password, cfg.database, cfg.port, cfg.query_timeout_ms);
     defer closeStackMySqlConn(&conn);
 
     // `DO 1` runs but produces no result set: `field_count == 0`, which is the
@@ -11051,7 +11066,7 @@ test "mysql prepared-statement cell allocation failure is OutOfMemory" {
     try skipUnlessDb("mysql");
     const allocator = std.testing.allocator;
     const cfg = mysqlLiveConfig();
-    var conn = try MySqlConn.connect(allocator, cfg.host, cfg.username, cfg.password, cfg.database, cfg.port);
+    var conn = try MySqlConn.connect(allocator, cfg.host, cfg.username, cfg.password, cfg.database, cfg.port, cfg.query_timeout_ms);
     defer closeStackMySqlConn(&conn);
 
     // `prepareFn` allocates the statement cell before it asks the library to
@@ -11106,7 +11121,7 @@ test "mysql streaming cursor reports column allocation failures as OutOfMemory" 
         // A fresh connection per attempt: a failure after `mysql_use_result`
         // leaves the result set on the wire, and this cursor never got to drain
         // it.
-        var conn = try MySqlConn.connect(allocator, cfg.host, cfg.username, cfg.password, cfg.database, cfg.port);
+        var conn = try MySqlConn.connect(allocator, cfg.host, cfg.username, cfg.password, cfg.database, cfg.port, cfg.query_timeout_ms);
         defer closeStackMySqlConn(&conn);
 
         var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = idx, .resize_fail_index = 0 });
@@ -11526,12 +11541,20 @@ test "postgres prepared-statement bind walk reports allocation failures as OutOf
     try std.testing.expect(failures > 0);
 }
 
-test "hasUnboundedPgReads: only postgres with a zero timeout leaves reads unbounded" {
-    // The field is PG-specific, so a zero timeout on other drivers is not an
-    // unbounded-reads choice through this knob.
-    try std.testing.expect(hasUnboundedPgReads(.{ .driver = .postgres, .query_timeout_ms = 0 }));
-    try std.testing.expect(!hasUnboundedPgReads(.{ .driver = .postgres, .query_timeout_ms = 30000 }));
-    try std.testing.expect(!hasUnboundedPgReads(.{ .driver = .postgres })); // default 30000
-    try std.testing.expect(!hasUnboundedPgReads(.{ .driver = .sqlite, .query_timeout_ms = 0 }));
-    try std.testing.expect(!hasUnboundedPgReads(.{ .driver = .mysql, .query_timeout_ms = 0 }));
+test "effectiveQueryTimeoutMs: zero resolves to the default bound (never unbounded)" {
+    try std.testing.expectEqual(DEFAULT_QUERY_TIMEOUT_MS, effectiveQueryTimeoutMs(0));
+    try std.testing.expectEqual(@as(u32, 5), effectiveQueryTimeoutMs(5));
+    try std.testing.expectEqual(@as(u32, 30000), effectiveQueryTimeoutMs(30000));
+    try std.testing.expectEqual(DEFAULT_QUERY_TIMEOUT_MS, (Config{ .driver = .postgres }).query_timeout_ms);
+    try std.testing.expectEqual(DEFAULT_QUERY_TIMEOUT_MS, (Config{ .driver = .mysql }).query_timeout_ms);
+}
+
+test "mysql readTimeoutSecs: zero takes the default bound, sub-second rounds up" {
+    try std.testing.expectEqual(@as(c_uint, 30), MySqlConn.readTimeoutSecs(0));
+    try std.testing.expectEqual(@as(c_uint, 1), MySqlConn.readTimeoutSecs(1));
+    try std.testing.expectEqual(@as(c_uint, 1), MySqlConn.readTimeoutSecs(1000));
+    try std.testing.expectEqual(@as(c_uint, 2), MySqlConn.readTimeoutSecs(1001));
+    try std.testing.expectEqual(@as(c_uint, 30), MySqlConn.readTimeoutSecs(29999));
+    // u32 ms always fits c_uint whole seconds — no clamp branch exists.
+    try std.testing.expectEqual(@as(c_uint, 4294968), MySqlConn.readTimeoutSecs(std.math.maxInt(u32)));
 }

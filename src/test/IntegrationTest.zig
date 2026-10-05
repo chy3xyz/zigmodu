@@ -247,7 +247,7 @@ pub const IntegrationTest = struct {
 
         var http_client: ?HttpTestClient = null;
         if (config.http_port > 0) {
-            const base_url = try std.fmt.allocPrint(allocator, "http://localhost:{d}", .{config.http_port});
+            const base_url = try allocator.print("http://localhost:{d}", .{config.http_port});
             defer allocator.free(base_url);
             http_client = try HttpTestClient.init(allocator, base_url);
         }

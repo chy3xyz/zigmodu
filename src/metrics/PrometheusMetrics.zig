@@ -1042,11 +1042,11 @@ pub const PrometheusMetrics = struct {
         active_connections: *Gauge,
 
         pub fn init(metrics: *PrometheusMetrics, module_name: []const u8) !ModuleMetricsCollector {
-            const req_count_name = try std.fmt.allocPrint(metrics.allocator, "{s}_requests_total", .{module_name});
+            const req_count_name = try metrics.allocator.print("{s}_requests_total", .{module_name});
             defer metrics.allocator.free(req_count_name);
-            const req_duration_name = try std.fmt.allocPrint(metrics.allocator, "{s}_request_duration_seconds", .{module_name});
+            const req_duration_name = try metrics.allocator.print("{s}_request_duration_seconds", .{module_name});
             defer metrics.allocator.free(req_duration_name);
-            const active_conn_name = try std.fmt.allocPrint(metrics.allocator, "{s}_active_connections", .{module_name});
+            const active_conn_name = try metrics.allocator.print("{s}_active_connections", .{module_name});
             defer metrics.allocator.free(active_conn_name);
 
             return .{

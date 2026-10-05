@@ -138,8 +138,7 @@ pub fn llmDiagnose(
 
     const rag_block = try buildContext(pc, allocator);
     defer if (rag_block.len > 0) allocator.free(rag_block);
-    const user = try std.fmt.allocPrint(
-        allocator,
+    const user = try allocator.print(
         "Anomaly: source={s} subject={s} severity={s} description={s}\n\n{s}Evidence:\n{s}\nRespond with JSON only: {{\"summary\":\"...\",\"causes\":[\"...\"],\"actions\":[\"...\"]}}",
         .{ case.source, case.subject, @tagName(case.severity), case.description, rag_block, evidence_buf.items },
     );
@@ -197,8 +196,7 @@ pub fn llmApprove(
     _ = _context_block;
     const rag_block = try buildContext(pc, allocator);
     defer if (rag_block.len > 0) allocator.free(rag_block);
-    const user = try std.fmt.allocPrint(
-        allocator,
+    const user = try allocator.print(
         "Approval request: subject={s} amount={d} step={d}:{s}\n{s}Respond with JSON only: {{\"decision\":\"approve|escalate|reject\",\"note\":\"...\"}}",
         .{ subject, amount, step_index, step_name, rag_block },
     );
@@ -236,8 +234,7 @@ pub fn llmRiskDecide(
     const pc: *LlmPolicyCtx = @ptrCast(@alignCast(ctx.userdata orelse return error.LlmNotConfigured));
     const context_block = try buildContext(pc, allocator);
     defer if (context_block.len > 0) allocator.free(context_block);
-    const user = try std.fmt.allocPrint(
-        allocator,
+    const user = try allocator.print(
         "Risk review: subject={s} score={d} level={s}\n{s}Respond with JSON only: {{\"decision\":\"approve|escalate|reject\"}}",
         .{ subject, score, @tagName(level), context_block },
     );
@@ -263,8 +260,7 @@ pub fn llmVerify(
     allocator: std.mem.Allocator,
 ) anyerror!bool {
     const pc: *LlmPolicyCtx = @ptrCast(@alignCast(ctx.userdata orelse return error.LlmNotConfigured));
-    const user = try std.fmt.allocPrint(
-        allocator,
+    const user = try allocator.print(
         "Goal: {s}\n\nOutput:\n{s}\n\nRespond with JSON only: {{\"pass\":true,\"reason\":\"...\"}}",
         .{ goal, output },
     );

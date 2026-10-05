@@ -39,8 +39,7 @@ pub const TenantInterceptor = struct {
     ) ![]const u8 {
         if (!ctx.isActive()) return sql;
 
-        return try std.fmt.allocPrint(
-            self.allocator,
+        return try self.allocator.print(
             "{s} AND {s} = ?",
             .{ sql, tc_mod.tenantColumn() },
         );

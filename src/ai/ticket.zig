@@ -129,7 +129,7 @@ test "TicketFlow triages with context and writes to outbox" {
             cat.* = try a.dupe(u8, "billing");
         }
         fn draft(a: std.mem.Allocator, _: *SkillContext, _: []const u8, _: []const u8, context: []const u8, d: *[]const u8) anyerror!void {
-            d.* = try std.fmt.allocPrint(a, "reply with context: {s}", .{context});
+            d.* = try a.print("reply with context: {s}", .{context});
         }
         fn send(a: std.mem.Allocator, _: *SkillContext, _: []const u8, _: []const u8, out: *TicketOutcome) anyerror!void {
             _ = a;

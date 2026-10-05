@@ -114,7 +114,7 @@ pub const OtlpExporter = struct {
             const st_ns: u64 = @as(u64, @intCast(@max(0, span.start_time))) *% 1_000_000;
             const et_ns: u64 = @as(u64, @intCast(@max(0, end_time_val))) *% 1_000_000;
 
-            const buf = try std.fmt.allocPrint(self.allocator, "{{\"traceId\":\"{s}\",\"spanId\":\"{s}\",\"name\":\"{s}\",\"kind\":1,\"startTimeUnixNano\":{d},\"endTimeUnixNano\":{d}}}", .{
+            const buf = try self.allocator.print("{{\"traceId\":\"{s}\",\"spanId\":\"{s}\",\"name\":\"{s}\",\"kind\":1,\"startTimeUnixNano\":{d},\"endTimeUnixNano\":{d}}}", .{
                 tid,
                 sid,
                 span.name,

@@ -71,7 +71,7 @@ pub const RefundFlow = struct {
     }
 
     fn writeCommand(self: *RefundFlow, allocator: std.mem.Allocator, topic: []const u8, order_id: i64, amount: i64) !void {
-        const payload = try std.fmt.allocPrint(allocator, "{{\"order_id\":{d},\"amount\":{d}}}", .{ order_id, amount });
+        const payload = try allocator.print("{{\"order_id\":{d},\"amount\":{d}}}", .{ order_id, amount });
         defer allocator.free(payload);
         const insert = try self.outbox.buildInsert(topic, payload);
         _ = try self.backend.exec(insert.sql, &.{

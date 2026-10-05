@@ -143,26 +143,26 @@ pub const NatsClient = struct {
         defer connect_json.deinit(self.allocator);
 
         // Build JSON using allocPrint + appendSlice (Zig 0.17 no writer() on ArrayList)
-        const open = try std.fmt.allocPrint(self.allocator, "{{\"name\":\"{s}\"", .{self.config.name});
+        const open = try self.allocator.print("{{\"name\":\"{s}\"", .{self.config.name});
         defer self.allocator.free(open);
         try connect_json.appendSlice(self.allocator, open);
 
-        const fixed = try std.fmt.allocPrint(self.allocator, ",\"verbose\":false,\"pedantic\":false,\"lang\":\"zig\",\"version\":\"0.9\"", .{});
+        const fixed = try self.allocator.print(",\"verbose\":false,\"pedantic\":false,\"lang\":\"zig\",\"version\":\"0.9\"", .{});
         defer self.allocator.free(fixed);
         try connect_json.appendSlice(self.allocator, fixed);
 
         if (self.config.username) |u| {
-            const user_part = try std.fmt.allocPrint(self.allocator, ",\"user\":\"{s}\"", .{u});
+            const user_part = try self.allocator.print(",\"user\":\"{s}\"", .{u});
             defer self.allocator.free(user_part);
             try connect_json.appendSlice(self.allocator, user_part);
         }
         if (self.config.password) |p| {
-            const pass_part = try std.fmt.allocPrint(self.allocator, ",\"pass\":\"{s}\"", .{p});
+            const pass_part = try self.allocator.print(",\"pass\":\"{s}\"", .{p});
             defer self.allocator.free(pass_part);
             try connect_json.appendSlice(self.allocator, pass_part);
         }
         if (self.config.token) |t| {
-            const token_part = try std.fmt.allocPrint(self.allocator, ",\"auth_token\":\"{s}\"", .{t});
+            const token_part = try self.allocator.print(",\"auth_token\":\"{s}\"", .{t});
             defer self.allocator.free(token_part);
             try connect_json.appendSlice(self.allocator, token_part);
         }
@@ -234,7 +234,7 @@ pub const NatsClient = struct {
         try w.interface.writeAll(sid_str);
         try w.interface.flush();
 
-        const key = try std.fmt.allocPrint(self.allocator, "{d}", .{sid});
+        const key = try self.allocator.print("{d}", .{sid});
         errdefer self.allocator.free(key);
         try self.subscriptions.put(key, .{
             .sid = sid,
@@ -251,7 +251,7 @@ pub const NatsClient = struct {
         self.unsubscribeRaw(sid) catch |err| std.log.warn("[Nats] unsubscribeRaw failed: {}", .{err});
 
         // Remove from local subscription map
-        const key = try std.fmt.allocPrint(self.allocator, "{d}", .{sid});
+        const key = try self.allocator.print("{d}", .{sid});
         defer self.allocator.free(key);
         if (self.subscriptions.fetchRemove(key)) |kv| {
             self.allocator.free(kv.key);
@@ -486,7 +486,7 @@ pub const NatsClient = struct {
                 const payload = data[pos .. pos + payload_len];
                 pos += payload_len + 2;
 
-                const sid_key = try std.fmt.allocPrint(self.allocator, "{d}", .{sid});
+                const sid_key = try self.allocator.print("{d}", .{sid});
                 defer self.allocator.free(sid_key);
                 if (self.subscriptions.get(sid_key)) |sub| {
                     sub.callback(.{

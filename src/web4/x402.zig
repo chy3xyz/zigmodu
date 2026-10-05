@@ -34,7 +34,7 @@ pub fn writePaymentRequired(ctx: anytype, allocator: std.mem.Allocator, invoice:
         .sol => "SOL",
         .btc => "BTC",
     };
-    const body = try std.fmt.allocPrint(allocator,
+    const body = try allocator.print(
         \\{{"code":402,"msg":"Payment Required","data":{{"invoice_id":"{s}","payee":"{s}","amount":{d},"currency":"{s}","deadline":{d},"description":"{s}"}}}}
     , .{ invoice.id, invoice.payee_did, invoice.amount, currency_str, invoice.deadline, invoice.description });
     defer allocator.free(body);

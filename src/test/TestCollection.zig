@@ -299,7 +299,7 @@ fn fqnPrefix(a: std.mem.Allocator, rel: []const u8) ![]const u8 {
     for (out) |*c| {
         if (c.* == '/' or c.* == '\\') c.* = '.';
     }
-    return std.fmt.allocPrint(a, "{s}.", .{out});
+    return a.print("{s}.", .{out});
 }
 
 /// Count the file's `test` declarations textually — see the module doc for the

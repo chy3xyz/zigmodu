@@ -292,7 +292,7 @@ pub const OutboxPublisher = struct {
             owned_topic = try self.allocator.dupe(u8, external_topic);
             external_topic = owned_topic.?;
         }
-        const envelope = try std.fmt.allocPrint(self.allocator, "{{\"event\":\"{s}\",\"data\":{s}}}", .{ external_topic, payload });
+        const envelope = try self.allocator.print("{{\"event\":\"{s}\",\"data\":{s}}}", .{ external_topic, payload });
         const insert = if (tenant_id) |t|
             try self.buildInsertForTenant(external_topic, envelope, t)
         else
@@ -332,8 +332,7 @@ pub const OutboxPoller = struct {
 
     /// Build the SELECT query to fetch pending outbox entries.
     pub fn buildSelectPending(self: *Self) ![]const u8 {
-        return std.fmt.allocPrint(
-            self.allocator,
+        return self.allocator.print(
             "SELECT id, topic, payload, tenant_id, status, retry_count, max_retries, created_at, updated_at, error_message FROM {s} WHERE status IN (0, 1) AND retry_count < max_retries ORDER BY created_at ASC LIMIT {d}",
             .{ self.outbox_table, self.config.batch_size },
         );
@@ -342,8 +341,7 @@ pub const OutboxPoller = struct {
     /// Build the UPDATE query to mark an entry as processing.
     pub fn buildMarkProcessing(self: *Self, entry_id: i64) ![]const u8 {
         const now = Time.monotonicNowSeconds();
-        return std.fmt.allocPrint(
-            self.allocator,
+        return self.allocator.print(
             "UPDATE {s} SET status = 1, updated_at = {d} WHERE id = {d}",
             .{ self.outbox_table, now, entry_id },
         );
@@ -352,8 +350,7 @@ pub const OutboxPoller = struct {
     /// Build the UPDATE query to mark an entry as delivered.
     pub fn buildMarkDelivered(self: *Self, entry_id: i64) ![]const u8 {
         const now = Time.monotonicNowSeconds();
-        return std.fmt.allocPrint(
-            self.allocator,
+        return self.allocator.print(
             "UPDATE {s} SET status = 2, updated_at = {d} WHERE id = {d}",
             .{ self.outbox_table, now, entry_id },
         );
@@ -362,8 +359,7 @@ pub const OutboxPoller = struct {
     /// Build the UPDATE query to record a retry failure.
     pub fn buildMarkRetry(self: *Self, entry_id: i64, retry_count: u32, error_msg: []const u8) ![]const u8 {
         const now = Time.monotonicNowSeconds();
-        return std.fmt.allocPrint(
-            self.allocator,
+        return self.allocator.print(
             "UPDATE {s} SET retry_count = {d}, error_message = '{s}', updated_at = {d} WHERE id = {d}",
             .{ self.outbox_table, retry_count, error_msg, now, entry_id },
         );
@@ -372,8 +368,7 @@ pub const OutboxPoller = struct {
     /// Build the UPDATE query to mark an entry as permanently failed.
     pub fn buildMarkFailed(self: *Self, entry_id: i64, error_msg: []const u8) ![]const u8 {
         const now = Time.monotonicNowSeconds();
-        return std.fmt.allocPrint(
-            self.allocator,
+        return self.allocator.print(
             "UPDATE {s} SET status = 3, error_message = '{s}', updated_at = {d} WHERE id = {d}",
             .{ self.outbox_table, error_msg, now, entry_id },
         );
