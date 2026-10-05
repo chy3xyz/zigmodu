@@ -2053,11 +2053,14 @@ pub const Runtime = struct {
     /// pushes, idle polls. Null when this runtime has no pool.
     ///
     /// `RuntimeStats` answers "how are the workers doing"; this answers "is the
-    /// scheduler keeping up" — and one number in it is a contract rather than a
-    /// metric: `ready_push_failures` must stay `0`. A refused token push does not
-    /// lose a message, it loses a *worker* (see the capacity invariant in
-    /// `scheduler.zig`), so a non-zero value here is a bug to fix, not a
-    /// backpressure reading to tune.
+    /// scheduler keeping up". One number reads as a contract on a quiet host —
+    /// `ready_push_failures` stays `0` — but know what it counts: a push that
+    /// outwaited its soft spin/yield budget and went to the 1 ms sleep-and-retry
+    /// path (`scheduler.zig` — the push itself is infallible, no token is ever
+    /// dropped). On a saturated mix a starved pool thread can trip that on host
+    /// contention alone, which the one-shot ring dump distinguishes from a stuck
+    /// ring; a *sustained* non-zero value with tokens not advancing is the bug
+    /// reading, not any single increment.
     ///
     /// This is the **`.cpu`** pool. A runtime that declared a blocking width has a
     /// second, independent set of the same readings — `blockingPoolStats` — and
@@ -2179,13 +2182,13 @@ pub const Runtime = struct {
                     .pool_ready_len = try metrics.createGauge("zigmodu_runtime_pool_ready_len", "Ready-ring occupancy: workers waiting for a pool thread, at most one token per worker"),
                     .pool_claimed = try metrics.createGauge("zigmodu_runtime_pool_claimed", "Pooled workers a pool thread is executing right now (never above pool_threads)"),
                     .pool_dispatches = try metrics.createGauge("zigmodu_runtime_pool_dispatches", "Batches the pool's threads ran (0 with pooled spawns means they never reached the pool)"),
-                    .pool_ready_push_failures = try metrics.createGauge("zigmodu_runtime_pool_ready_push_failures", "MUST stay 0: a refused token push strands a worker (scheduler desync, not backpressure)"),
+                    .pool_ready_push_failures = try metrics.createGauge("zigmodu_runtime_pool_ready_push_failures", "0 on a quiet host: a push that outwaited its soft retry budget (the push retries; host contention, not a dropped token)"),
                     .blocking_pool_declared = try metrics.createGauge("zigmodu_runtime_blocking_pool_declared", "Declared upper bound on .execution_class = .blocking workers (0 = no blocking pool: blocking spawns are refused)"),
                     .blocking_pool_threads = try metrics.createGauge("zigmodu_runtime_blocking_pool_threads", "Blocking pool threads running (0 before the first .blocking spawn); the ceiling on blocking_pool_claimed"),
                     .blocking_pool_ready_len = try metrics.createGauge("zigmodu_runtime_blocking_pool_ready_len", "Blocking ready-ring occupancy: workers waiting for a blocking thread, at most one token per worker"),
                     .blocking_pool_claimed = try metrics.createGauge("zigmodu_runtime_blocking_pool_claimed", "Blocking workers a blocking thread is executing right now (never above blocking_pool_threads)"),
                     .blocking_pool_dispatches = try metrics.createGauge("zigmodu_runtime_blocking_pool_dispatches", "Batches the blocking pool's threads ran (0 with .blocking spawns means they never reached that pool)"),
-                    .blocking_pool_ready_push_failures = try metrics.createGauge("zigmodu_runtime_blocking_pool_ready_push_failures", "MUST stay 0: a refused token push strands a blocking worker (scheduler desync, not backpressure)"),
+                    .blocking_pool_ready_push_failures = try metrics.createGauge("zigmodu_runtime_blocking_pool_ready_push_failures", "0 on a quiet host: a push that outwaited its soft retry budget (the push retries; host contention, not a dropped token)"),
                     .pool_ready_len_high = try metrics.createGauge("zigmodu_runtime_pool_ready_len_high", "High-priority ready-ring occupancy: .priority = .high pooled workers waiting for a pool thread"),
                     .pool_ready_len_normal = try metrics.createGauge("zigmodu_runtime_pool_ready_len_normal", "Normal-priority ready-ring occupancy: pooled workers waiting for a pool thread"),
                     .pool_ready_len_low = try metrics.createGauge("zigmodu_runtime_pool_ready_len_low", "Low-priority ready-ring occupancy: drained by the reservation slot (§12.17), so a persistent nonzero here is expected under load, not a bug"),
@@ -8216,9 +8219,12 @@ test "Pooled (§12.16): a continuously busy worker starves nobody — the wait i
     try std.testing.expect(b_ran_max <= bound);
     try std.testing.expect(c_ran_max <= bound);
     // The rest of the run's health, so a reading taken from a broken shape cannot
-    // pass as a reading: no token refused (that would stop a worker being
-    // scheduled), nothing left in the ring or claimed, and nothing lost.
-    try std.testing.expectEqual(@as(u64, 0), pool.ready_push_failures);
+    // pass as a reading: nothing left in the ring or claimed, and nothing lost.
+    // `ready_push_failures` is printed above but not asserted — since the push
+    // went infallible (soft budget, then 1 ms sleep-and-retry; scheduler.zig) the
+    // counter reads "a push outwaited the spin+yield budget", which a starved
+    // pool thread trips on host contention alone (macOS CI fired it on §12.17's
+    // mix with the ring plainly churning: capacity=2, len=1, tokens advancing).
     try std.testing.expectEqual(@as(usize, 0), pool.ready_len);
     try std.testing.expectEqual(@as(usize, 0), pool.claimed);
     try std.testing.expectEqual(@as(usize, 1), pool.pool_threads);
@@ -8259,6 +8265,12 @@ test "Pooled (§12.16): the batch sweep — throughput against latency, measured
     const batches = [_]usize{ 1, 4, 8, 16, 32, 64 };
     const rounds = 3;
     const cap = 64;
+    // Printed at the end, not asserted per run: since the push went infallible
+    // (soft budget, then 1 ms sleep-and-retry) a non-zero count reads "a push
+    // outwaited the spin+yield budget", which a starved pool thread trips on
+    // host contention alone. What makes a row trustworthy is checked per run
+    // below: total == handled, ring empty, dispatches advancing.
+    var sweep_push_failures: u64 = 0;
 
     std.debug.print(
         "[§12.16 batch] {d} rounds per point; msg/s is measured from the gate to the last handled message\n",
@@ -8299,7 +8311,7 @@ test "Pooled (§12.16): the batch sweep — throughput against latency, measured
                 // run that lost a token or a message would be a number about
                 // something else.
                 try std.testing.expectEqual(r.total, r.handled);
-                try std.testing.expectEqual(@as(u64, 0), r.ready_push_failures);
+                sweep_push_failures += r.ready_push_failures;
                 try std.testing.expectEqual(@as(usize, shape.width), r.pool_threads);
                 try std.testing.expectEqual(@as(usize, 0), r.ready_len);
                 try std.testing.expect(r.dispatches >= 1);
@@ -8326,6 +8338,10 @@ test "Pooled (§12.16): the batch sweep — throughput against latency, measured
             );
         }
     }
+    std.debug.print(
+        "[§12.16 batch] sweep push_failures={d} (host-contention reading, summed not asserted — see the declaration)\n",
+        .{sweep_push_failures},
+    );
 }
 
 // §12.17  Priority in a live mix, measured
@@ -8514,16 +8530,21 @@ test "Pooled (§12.17): a saturated high/normal/low mix — shares and the laten
     );
 
     // Health first, same as §12.16: a reading taken from a broken shape cannot
-    // pass as a reading. Nothing refused a token, nothing is left in any ring
-    // (the new per-class split is pinned at the same settled moment), and every
-    // accepted message was handled. The logs' overflow counts are printed, not
-    // asserted: "no class passes 400k handled while high reaches 50k" is an 8:1
+    // pass as a reading. Nothing is left in any ring (the per-class split is
+    // pinned at the same settled moment), nothing is claimed, and every accepted
+    // message was handled. `ready_push_failures` stays on the print line above:
+    // since the push went infallible (soft budget, then 1 ms sleep-and-retry —
+    // scheduler.zig) the counter reads "a push outwaited the spin+yield budget",
+    // which a starved single pool thread trips on host contention alone — the
+    // macOS CI runner proved exactly that on this mix (ring dump: capacity=2,
+    // len=1, high_water=2, tokens advancing — a busy window, not a stuck ring).
+    // The health it once proxied is what the assertions below pin directly.
+    // The logs' overflow counts are printed, not asserted: "no class passes 400k handled while high reaches 50k" is an 8:1
     // share bound in disguise — a reading of the host's thread scheduler, which
     // the postgres CI runner (a live database sharing its four vCPUs with this
     // test) falsified by inverting the shares past it. An overflowed log is a
     // truncated subsample of a steady-state stream, which is all the median
     // relation below needs.
-    try std.testing.expectEqual(@as(u64, 0), pool.ready_push_failures);
     try std.testing.expectEqual(@as(usize, 0), pool.ready_len);
     try std.testing.expectEqual(@as(usize, 0), pool.ready_len_by_class[0]);
     try std.testing.expectEqual(@as(usize, 0), pool.ready_len_by_class[1]);

@@ -1,5 +1,35 @@
 # Changelog
 
+## [Unreleased]
+
+### 第 144 批：`ready_push_failures` 断言口径对齐软预算设计（macOS CI 假红修复——宿主竞争读数，非调度器缺陷）（**破坏性：否**——测试与文案）
+
+**事故**：v0.39.6 tip CI（`df6259ac`）macos-latest 红，其余 12 job 全绿。
+失败于 §12.17 饱和混流测试的 `expectEqual(0, ready_push_failures)`。
+同轮日志的 precision-timer 探针显示该 runner **1ms deadline → p50 迟滞
+3.5ms**（3500×），ring dump 显示 `capacity=2 len=1 high_water=2`、token
+在前进——忙碌窗口，不是卡死环。
+
+1. **根因不是回归**：push 早已改为**不可失败**（软预算耗尽 → 1ms
+   sleep-and-retry，token 永不丢，`src/runtime/scheduler.zig` push 文档
+   明说"a consumer descheduled mid-window longer than the whole budget is
+   host contention to outwait, not a defect to die on"）。计数器语义 =
+   "有 push 等待超过 spin+yield 预算"，单 pool 线程 + 饱和混流在过载
+   宿主上必然触发——与份额排序同属"宿主调度读数"，而该类读数按文件
+   自身纪律本就不该在 live-traffic 测试里断言。
+2. **软化三处饱和混流断言**（`src/runtime/runtime.zig`）：§12.16
+   fairness、§12.16 batch sweep（改全 sweep 累加 + 收尾一行打印）、
+   §12.17——均改为打印 + 注释，健康判据由守恒断言直接承担
+   （`total==handled` / 环空 / `sent==received`）。短窗口功能性池测试
+   的 0 断言保留（那里触发才真指向卡环）。
+3. **陈旧文案同步**：`poolStats` doc（"non-zero = a bug to fix" → 说明
+   软预算语义与宿主竞争读法）、两条 metrics gauge 描述（"MUST stay 0:
+   a refused token push strands a worker" → "0 on a quiet host … host
+   contention, not a dropped token"）。
+4. **验证**：fmt 净 · §12.16（2/2）与 §12.17（6/6）过滤跑绿（本机
+   sweep `push_failures=0`）· 全量 `zig build test` exit=0。
+   CI rerun 观察：该 macOS job 重跑以确认假红不复现。
+
 ## [0.39.6] - 2026-10-05
 
 ### 第 143 批：zent 升级 v0.76.2 → v0.83.0（两示例改 pin + `insertMany` 双参适配 + 切换 `linkDrivers`）（**破坏性：否**——示例与文档）
