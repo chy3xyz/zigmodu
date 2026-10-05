@@ -2528,7 +2528,7 @@ exit 2 / 翻转字节 → corrupt 定位 + exit 3 / 空 log / 目录缺失是错
 跨进程/跨机、压缩加密、修复操作（`repair` 保持 API 级显式调用，不进 CLI —— 报告里指名它，
 是让运维决定，不是让工具替他决定）。
 
-## 15. Deterministic mode —— Phase C 已落地（v0.36 后批次 139）
+## 15. Deterministic mode —— Phase D 已落地（v0.36 后批次 140），S 级完整
 
 > 设计与分级（D/S/P 三级、六条不变式、四阶段路线）在
 > [`dev/deterministic-runtime-design.md`](dev/deterministic-runtime-design.md)；
@@ -2567,7 +2567,11 @@ HotBus 的 drop-on-full 在 det 下由「订阅者同线程 drain」约束覆盖
 production 不得直读 `core/Time.zig`（豁免仅 Clock real 分支 / PrecisionTimer 本体 /
 测试辅助，逐行锚定，变异实测被抓）。
 
-**仍未做（Phase D）**：quant 场景同日志双跑实演、P 级进程确定性（明确不做）。
+**仍未做**：P 级进程确定性（明确不做）。S 级四阶段（A 门禁 / B 配置面 / C
+replay driver + CLI / D quant 双跑实演）已全量落地 —— Phase D 的实演在
+`examples/quant-replay`：五 worker 级联 + mark 定时器 + handler 内 `rng()` 流，
+record → ZDL1 → driver 双回放，ledger 条目流逐条一致（digest
+`0xbcdc937106650c23`），seed 43 合法分叉；六断言门进 CI。
 
 ### 15.1 Replay driver（Phase C，批次 139）——把 ZDL1 日志开回 runtime
 

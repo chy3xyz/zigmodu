@@ -2,6 +2,40 @@
 
 ## [Unreleased]
 
+### 第 140 批：Deterministic Runtime Phase D（`examples/quant-replay` 同日志双跑实演）——S 级四阶段全量落地（**破坏性：否**——新增示例 + `runtime.delivery_log` 桶导出，既有行为一字未动）
+
+1. **Phase D 实演落地**（设计稿 §4.2/§5，`docs/RUNTIME.md` §15/§15.1；新示例
+   `examples/quant-replay/`）：五 worker 级联的量化交易日——`market → book →
+   alpha → risk → exec → ledger`，含 mark 定时器（book 上 wheel 再武装）与
+   handler 内 `rng()` 流（alpha 订单尺寸抖动）。单进程双跑：**record**（det
+   runtime seed 42 + 外部随机游走馈入——独立 Prng，域外随机源只经录制日志
+   进入域内）→ `ZDL1` 落盘 → **driver 双回放** + seed 43 双跑。产物比较在
+   **应用层**（ledger 条目流逐条相等：tag/a/b/c 四字段），不是
+   digest-of-delivery-log 的自证。
+2. **验收数字**（全确定性，跨机稳定常数）：240 trades / 249 记录
+   （240 message + 9 wheel mark）/ 0 洞；170 条 ledger 条目 record↔双回放
+   逐条一致，digest `0xbcdc937106650c23`；signals=161 / fills=109 /
+   rejects=52（notional 与 position 两路拒单）/ marks=9——**全路径非空**
+   是断言之一，空转演示即 FAIL；seed 43 合法分叉
+   `0x79db8e9f4f023dc5`（两 seed-43 跑自洽）；同一份日志
+   `replay-inspect --track md --limit` 直读闭环（批 139 的 CLI 项在真实
+   产物上收圆）。
+3. **六断言 CI 门**：日志完整干净 / ledger 字节级一致 / book 终态一致 /
+   计数器一致 / 全路径非空 / seed 合法分叉——任一 FAIL 退出非零。示例进
+   CI 两处 examples 构建环 + 独立 run step（`ci.yml`）；运行产物
+   `quant-replay-day/` 由示例本地 `.gitignore` 排除（README 指它给
+   replay-inspect 当演示输入）。
+4. **`runtime.delivery_log` 进 `src/runtime.zig` 桶**：消费者写/读自有
+   ZDL1 日志的公共面（replay driver 的文件格式）——批 139 落地 driver 时
+   只有框架内部可达，Phase D 的消费者示例把它补为公共 API。
+5. **门禁读数**：fmt 净 · check-production OK · check-test-collection
+   2172（不变——bucket 导出无新测试声明）· 全量 `zig build test` exit=0
+   （234s）；示例 `zig build run` 6/6 PASS（digest 跨跑复现同一值）。
+6. **文档同步**：RUNTIME.md §15 标题改 Phase D（S 级四阶段全量）、「仍未做」
+   收敛为 P 级（明确不做）；设计稿 §5 表 D 行标 ✅（含验收数字）；
+   readiness A-6 行标 Phase D ✅——deterministic runtime 四阶段全部关闭，
+   执行层仍开项只剩公平性加权与 Distributed Worker 统一。
+
 ### 第 139 批：Deterministic Runtime Phase C（replay.Driver + `replay-inspect --limit/--track`）——同一份日志开回 runtime，可证明（**破坏性：否**——`ReplayFromLog` 默认行为一字未动，CLI 纯增量）
 
 1. **Phase C-A：`replay.Driver` 落地**（设计稿 §4.2，`docs/RUNTIME.md` 新增 §15.1；

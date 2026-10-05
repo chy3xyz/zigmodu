@@ -35,6 +35,10 @@ pub const sequencer = @import("runtime/sequencer.zig");
 pub const hot_bus = @import("runtime/hot_bus.zig");
 /// Recorder module: bounded delivery log + replay against a manual clock.
 pub const recorder = @import("runtime/recorder.zig");
+/// Delivery log module: the `ZDL1` segment-file storage a recording drains to
+/// and a replay scans back (docs/RUNTIME.md §13.9–§13.12) — the replay driver's
+/// file format, public so consumers can write and read their own logs.
+pub const delivery_log = @import("runtime/delivery_log.zig");
 /// Replay driver module: the deterministic (S-level) playback of a delivery
 /// log through a det-mode runtime — tick + settle between steps
 /// (docs/RUNTIME.md §15, dev/deterministic-runtime-design.md §4.2).

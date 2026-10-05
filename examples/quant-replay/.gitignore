@@ -1,0 +1,3 @@
+# The recorded trading day `zig build run` leaves behind (README points
+# replay-inspect at it) — an artifact, never source.
+quant-replay-day/

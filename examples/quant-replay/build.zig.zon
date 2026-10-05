@@ -1,0 +1,1 @@
+.{ .name = .quant_replay, .version = "0.1.0", .fingerprint = 0x74b99358b40de65d, .minimum_zig_version = "0.17.0", .dependencies = .{ .zigmodu = .{ .path = "../.." } }, .paths = .{ "build.zig", "build.zig.zon", "src" } }

@@ -278,7 +278,7 @@ jobs:
           #   _shared           helper lib imported by path; its only step
           #                     (`test`) needs a sibling ../zent checkout
           #   zmsaas/frontend   SolidStart app — needs the node toolchain
-          for ex in ai-ops llm-policies mcp-server web4 basic distributed event-driven runtime-workers alpha-engine http-stress-test shopdemo tenant-mgmt tenant-shop zent-modulith metaverse-creative; do
+          for ex in ai-ops llm-policies mcp-server web4 basic distributed event-driven runtime-workers alpha-engine quant-replay http-stress-test shopdemo tenant-mgmt tenant-shop zent-modulith metaverse-creative; do
             echo "== building examples/$ex =="
             (cd "examples/$ex" && zig build)
           done
@@ -299,6 +299,11 @@ jobs:
 
       - name: Run the runtime pipeline example (workers + mailboxes + timers)
         run: (cd examples/runtime-workers && zig build run)
+
+      - name: Run the quant-replay example (det replay, six assertions)
+        # Phase D's acceptance gate: a recorded trading day replayed
+        # byte-identically; any FAIL assertion exits the process non-zero.
+        run: (cd examples/quant-replay && zig build run)
 
       - name: Smoke zent-modulith (real server, 43 assertions)
         # Compiling the zent example proves nothing about the integration: the
@@ -515,7 +520,7 @@ jobs:
           #   _shared           helper lib imported by path; its only step
           #                     (`test`) needs a sibling ../zent checkout
           #   zmsaas/frontend   SolidStart app — needs the node toolchain
-          for ex in ai-ops llm-policies mcp-server web4 basic distributed event-driven runtime-workers alpha-engine http-stress-test shopdemo tenant-mgmt tenant-shop zent-modulith metaverse-creative; do
+          for ex in ai-ops llm-policies mcp-server web4 basic distributed event-driven runtime-workers alpha-engine quant-replay http-stress-test shopdemo tenant-mgmt tenant-shop zent-modulith metaverse-creative; do
             echo "== building examples/$ex =="
             (cd "examples/$ex" && zig build)
           done
