@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### 第 145 批：双 24h soak 证据收口（soak-cluster v2 + runtime-stress 全绿；B-10 缺口补上数据点）（**破坏性：否**——文档与注释）
+
+1. **`soak-cluster` 24h v2 绿**（`.soak/soak-cluster-24h-v2.log`，exit 0）：
+   `reason=drained`（**非 `deadline-*`**，t=87403906ms）；18/18 条 delivery 全
+   345600/345600 零洞；三份日志收敛 753666 appends / 753665 log_len（差 1 =
+   截止时复制在途）；leader steady、transitions=2、leaderless=0、two_leader=0、
+   presence=100%；fds 23→23（max 25/预算 8，teardown 回 baseline 5）；rss 7–66 MiB
+   （预算 128）；threads 29 恒定；bus send_failures=0；0 leaked。
+   **同时是批 142 两阶段 deadline 修复的端到端证明**：旧公式在 t=86440s 触发，
+   v2 跑过该点直到 t=87450s 自然收敛（首跑假红时全部不变量健康）。
+2. **`runtime-stress` 24h 绿**（`/tmp/runtime-stress-24h-v2.log`，`RESULT: PASS`）：
+   cpu dispatches=1.2e11、**两池 `push_failures=0`**、无 ring dump；rss spread
+   1.06 MiB / 预算 25 MiB（24h 无增长）、threads 10 恒定、shutdown 58ms
+   （bound 5000）、supervision 3/3 如期、alloc probe 有界（132 调用 / 38820 字节）。
+3. **文档回写**：`docs/dev/v1.0-readiness-v0.35.md` 新增 B-10 跟进段（双 24h 结果 +
+   "为何这次没进 history 序列"及后续正确姿势）；`src/soak_cluster.zig` 文件头
+   的 "not a 24h longevity run" 更新为该数据点（保留 mixed-version 不在范围内的
+   既有界定）。
+
 ### 第 144 批：`ready_push_failures` 断言口径对齐软预算设计（macOS CI 假红修复——宿主竞争读数，非调度器缺陷）（**破坏性：否**——测试与文案）
 
 **事故**：v0.39.6 tip CI（`df6259ac`）macos-latest 红，其余 12 job 全绿。

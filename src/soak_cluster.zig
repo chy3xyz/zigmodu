@@ -14,8 +14,12 @@
 //! re-election. A unit test cannot reach those by construction (see
 //! `docs/dev/v1.0-readiness-v0.35.md` B-10).
 //!
-//! **Scope: this is a concurrency/correctness soak, not a 24h longevity run;
-//! mixed-version (rolling-upgrade) pairs are out of scope here** — the bus
+//! **Scope: this is a concurrency/correctness soak, and it now has a 24h data
+//! point** (2026-10-06, 345600 iterations × 250 ms × 6 writers, `reason=drained`
+//! at t=87450s: 18/18 delivery pairs 345600/345600 with zero holes, logs
+//! byte-convergent, fd/RSS/thread flat — see the B-10 follow-up in
+//! `docs/dev/v1.0-readiness-v0.35.md`); mixed-version (rolling-upgrade) pairs
+//! are still out of scope here — the bus
 //! wire format cuts over hard on purpose, so an old/new pair is a refused
 //! handshake by design, not a soak finding. That pair has its own harness:
 //! `src/cluster_node.zig` (one node per process, cross-compilable against
