@@ -326,7 +326,7 @@ test "FluvioConnector stub produce and consume" {
 }
 
 test "FluvioConnector list topics" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const fluvio_url = if (std.c.getenv("FLUVIO_URL")) |ptr| std.mem.span(ptr) else null;
     if (fluvio_url == null or fluvio_url.?.len == 0) return error.SkipZigTest;
 
@@ -344,7 +344,7 @@ test "FluvioConnector list topics" {
 }
 
 test "FluvioConnector produce and consume" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const fluvio_url = if (std.c.getenv("FLUVIO_URL")) |ptr| std.mem.span(ptr) else null;
     if (fluvio_url == null or fluvio_url.?.len == 0) return error.SkipZigTest;
 

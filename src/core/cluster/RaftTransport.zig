@@ -598,7 +598,7 @@ pub const ConnectTimeoutError = std.Io.net.IpAddress.ConnectError || error{Conne
 /// netdial on POSIX too: std's blocking connect panics when a signal
 /// interrupts it (EINTR retry → EISCONN → `errnoBug`; see `core/netdial.zig`).
 pub fn connectTimeout(io: std.Io, addr: std.Io.net.IpAddress, timeout_ms: u32) ConnectTimeoutError!std.Io.net.Stream {
-    if (builtin.os.tag == .windows or timeout_ms == 0) {
+    if (builtin.target.os.tag == .windows or timeout_ms == 0) {
         // The unbounded fallback still must not panic on EINTR→EISCONN (std's
         // posixConnect reads the retry's EISCONN as errnoBug — the batch-112
         // trap), so it dials through netdial rather than std. On Windows

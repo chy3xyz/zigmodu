@@ -711,7 +711,7 @@ const OsInfo = struct {
 };
 
 fn osInfo() OsInfo {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .macos => blk: {
             const task = macosTaskInfo();
             break :blk .{
@@ -1523,7 +1523,7 @@ test "soak: 3-node cluster — raft + event bus, leader/fd/RSS invariants" {
         if (baseline.rss_bytes != null) available += 1;
         if (baseline.threads != null) available += 1;
         std.log.warn("[soak-cluster] os samplers ({s}): {d}/3 readings present (fds={?d} rss={?d} threads={?d})", .{
-            @tagName(builtin.os.tag), available, baseline.fd_count, baseline.rss_bytes, baseline.threads,
+            @tagName(builtin.target.os.tag), available, baseline.fd_count, baseline.rss_bytes, baseline.threads,
         });
     }
 

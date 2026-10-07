@@ -599,7 +599,7 @@ fn natsTestConfig(url: []const u8) NatsConfig {
 }
 
 test "NATS connect and ping" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const nats_url = if (std.c.getenv("NATS_URL")) |ptr| std.mem.span(ptr) else null;
     if (nats_url == null or nats_url.?.len == 0) return error.SkipZigTest;
 
@@ -617,7 +617,7 @@ test "NATS connect and ping" {
 }
 
 test "NATS publish and subscribe" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const nats_url = if (std.c.getenv("NATS_URL")) |ptr| std.mem.span(ptr) else null;
     if (nats_url == null or nats_url.?.len == 0) return error.SkipZigTest;
 
@@ -643,7 +643,7 @@ test "NATS publish and subscribe" {
 }
 
 test "NATS request-reply" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const nats_url = if (std.c.getenv("NATS_URL")) |ptr| std.mem.span(ptr) else null;
     if (nats_url == null or nats_url.?.len == 0) return error.SkipZigTest;
 

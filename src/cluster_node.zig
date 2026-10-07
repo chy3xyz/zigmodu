@@ -911,7 +911,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
-    if (builtin.os.tag != .windows) {
+    if (builtin.target.os.tag != .windows) {
         const handler = std.posix.Sigaction{
             .handler = .{ .handler = onShutdownSignal },
             .mask = std.posix.sigemptyset(),

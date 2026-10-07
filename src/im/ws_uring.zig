@@ -6,7 +6,7 @@ const builtin = @import("builtin");
 const IORING_OP_READ: u8 = 22;
 const IORING_OP_WRITE: u8 = 23;
 
-const linux = if (builtin.os.tag == .linux) std.os.linux else struct {
+const linux = if (builtin.target.os.tag == .linux) std.os.linux else struct {
     pub const fd_t = i32;
     pub const io_uring_cqe = extern struct { user_data: u64 = 0, res: i32 = 0, flags: u32 = 0 };
     pub const io_uring_sqe = extern struct {
@@ -24,7 +24,7 @@ const linux = if (builtin.os.tag == .linux) std.os.linux else struct {
         return 0;
     }
 };
-const IoUring = if (builtin.os.tag == .linux) std.os.linux.IoUring else struct {
+const IoUring = if (builtin.target.os.tag == .linux) std.os.linux.IoUring else struct {
     pub fn init(_: u16, _: u32) !@This() {
         return error.SystemOutdated;
     }
@@ -96,7 +96,7 @@ pub const WsUring = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !Self {
-        if (builtin.os.tag != .linux) @compileError("io_uring requires Linux 5.1+");
+        if (builtin.target.os.tag != .linux) @compileError("io_uring requires Linux 5.1+");
 
         const ring_size: u16 = @intCast(std.math.ceilPowerOfTwo(u16, @intCast(@min(cfg.max_connections * 2, 32768))) catch 512);
         const ring = try IoUring.init(ring_size, 0);
@@ -844,7 +844,7 @@ test "WsUring.adopt: a refusal takes nothing, and the fd stays the caller's" {
     // `fds[0]` is handed over below, so on Linux the teardown closes it; off Linux
     // `linux.close` is a stub, so the test has to.
     defer {
-        if (builtin.os.tag != .linux) _ = std.posix.system.close(fds[0]);
+        if (builtin.target.os.tag != .linux) _ = std.posix.system.close(fds[0]);
     }
     defer _ = std.posix.system.close(fds[1]);
     var session: u32 = 0;
@@ -923,7 +923,7 @@ test "WsUring.teardown: on_close runs once per connection, and the slot comes ba
     try std.testing.expectEqual(@as(usize, 1), handoff_state.closes);
     try std.testing.expectEqual(@as(u32, 0), uring.active.load(.monotonic));
 
-    if (builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .linux) {
         // The teardown closed the fd it took — exactly once. This is the only
         // host where that can be asserted: off Linux `linux.close` is this
         // module's stub and does nothing, so an "open" answer below would say

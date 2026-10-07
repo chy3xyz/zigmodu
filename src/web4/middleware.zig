@@ -207,7 +207,7 @@ fn mintInvoiceId(buf: []u8, prefix: []const u8, io: ?std.Io) ![]const u8 {
 /// last started.
 fn nowSeconds(io: ?std.Io) !i64 {
     if (io) |handle| return Time.wallClockSeconds(handle);
-    switch (comptime builtin.os.tag) {
+    switch (comptime builtin.target.os.tag) {
         .windows, .freestanding, .other, .uefi => return error.WallClockUnavailable,
         else => {
             // Same libc read `Time.monotonicNow` uses, reached only from a

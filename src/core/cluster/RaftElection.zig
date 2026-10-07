@@ -146,7 +146,7 @@ pub const RaftLock = struct {
 /// Targets where `std.posix.poll` is usable. Windows is a `@compileError` there
 /// ("use std.Io instead"), and the freestanding-ish targets have no `poll` at
 /// all; on those the wait degrades to `std.Thread.yield`.
-const can_poll_sleep = switch (builtin.os.tag) {
+const can_poll_sleep = switch (builtin.target.os.tag) {
     .windows, .wasi, .uefi, .freestanding, .other => false,
     else => true,
 };

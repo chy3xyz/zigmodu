@@ -615,7 +615,7 @@ test "SecretsManager Vault offline mode" {
 }
 
 test "SecretsManager Vault live smoke" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const addr = if (std.c.getenv("VAULT_ADDR")) |p| std.mem.span(p) else null;
     const token = if (std.c.getenv("VAULT_TOKEN")) |p| std.mem.span(p) else null;
     if (addr == null or token == null or addr.?.len == 0 or token.?.len == 0) return error.SkipZigTest;

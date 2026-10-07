@@ -1123,7 +1123,7 @@ test "RedisConfig.fromUrl reads host and port from REDIS_URL" {
 
 test "redis client" {
     // Requires a running Redis server; set REDIS_URL to enable (e.g. redis://127.0.0.1:6379).
-    const redis_url = if (builtin.os.tag == .windows) @as(?[]const u8, null) else if (std.c.getenv("REDIS_URL")) |ptr| std.mem.span(ptr) else null;
+    const redis_url = if (builtin.target.os.tag == .windows) @as(?[]const u8, null) else if (std.c.getenv("REDIS_URL")) |ptr| std.mem.span(ptr) else null;
     if (redis_url == null or redis_url.?.len == 0) return error.SkipZigTest;
 
     // Host *and port* come from REDIS_URL: the client resolves a literal
@@ -1163,7 +1163,7 @@ test "redis concurrent incr" {
     // INCR the same key through the connection pool and asserts the final
     // value equals the thread count — i.e. no two commands ever interleave
     // on a shared socket, and the pool hands out exclusive connections.
-    const redis_url = if (builtin.os.tag == .windows) @as(?[]const u8, null) else if (std.c.getenv("REDIS_URL")) |ptr| std.mem.span(ptr) else null;
+    const redis_url = if (builtin.target.os.tag == .windows) @as(?[]const u8, null) else if (std.c.getenv("REDIS_URL")) |ptr| std.mem.span(ptr) else null;
     if (redis_url == null or redis_url.?.len == 0) return error.SkipZigTest;
 
     const raw = redis_url.?;
@@ -1241,7 +1241,7 @@ test "redis cluster init" {
 // which is only possible if the io reaches `Redis.new` intact. Skipped unless
 // REDIS_URL is set.
 test "redis cluster: addNode nodes carry the cluster io and work" {
-    const redis_url = if (builtin.os.tag == .windows) @as(?[]const u8, null) else if (std.c.getenv("REDIS_URL")) |ptr| std.mem.span(ptr) else null;
+    const redis_url = if (builtin.target.os.tag == .windows) @as(?[]const u8, null) else if (std.c.getenv("REDIS_URL")) |ptr| std.mem.span(ptr) else null;
     if (redis_url == null or redis_url.?.len == 0) return error.SkipZigTest;
 
     const cfg = RedisConfig.fromUrl(redis_url.?);
@@ -1542,7 +1542,7 @@ test "redis concurrent incr on a single shared stream (pool_size = 1)" {
     // interleaved: 11/60 requests got `RedisError`, then endpoints hung once the
     // byte stream desynchronised) and there was no read deadline to recover.
     // Requires a running Redis server; set REDIS_URL to enable.
-    const redis_url = if (builtin.os.tag == .windows) @as(?[]const u8, null) else if (std.c.getenv("REDIS_URL")) |ptr| std.mem.span(ptr) else null;
+    const redis_url = if (builtin.target.os.tag == .windows) @as(?[]const u8, null) else if (std.c.getenv("REDIS_URL")) |ptr| std.mem.span(ptr) else null;
     if (redis_url == null or redis_url.?.len == 0) return error.SkipZigTest;
 
     const raw = redis_url.?;
@@ -1809,7 +1809,7 @@ test "redis: real server answers arrive as data (TTL -1, SETNX false)" {
     // The other half of the distinction, against a live server: a genuine -1
     // from TTL must still be -1, and a genuine false from SETNX/SET NX must
     // still be false.
-    const redis_url = if (builtin.os.tag == .windows) @as(?[]const u8, null) else if (std.c.getenv("REDIS_URL")) |ptr| std.mem.span(ptr) else null;
+    const redis_url = if (builtin.target.os.tag == .windows) @as(?[]const u8, null) else if (std.c.getenv("REDIS_URL")) |ptr| std.mem.span(ptr) else null;
     if (redis_url == null or redis_url.?.len == 0) return error.SkipZigTest;
 
     var r = try Redis.new(std.testing.allocator, std.testing.io, RedisConfig.fromUrl(redis_url.?));

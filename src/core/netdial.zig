@@ -123,7 +123,7 @@ pub fn classifyConnectErrno(e: std.posix.E) ConnectVerdict {
 /// `RaftTransport.connectTimeout` (non-blocking connect + poll), which never
 /// retries a connect and so never had this trap.
 pub fn connectBlocking(io: std.Io, addr: std.Io.net.IpAddress) ConnectError!std.Io.net.Stream {
-    if (builtin.os.tag == .windows) {
+    if (builtin.target.os.tag == .windows) {
         // WSA blocking connect has no EINTR/EISCONN asymmetry, and the raw
         // posix layer below does not exist on the target — std's own path is
         // the right one there.

@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+### 第 148 批：0.17 弃用族第二批（`builtin.{cpu,os}` → `builtin.target.*` 48 处 + `std.builtin` → `std.lang`）+ zent v0.83.1 适配（**破坏性：否**）
+
+1. **`@import("builtin")` 冗余常量迁移（48 处，18 文件，全在 `src/`）**：0.17.0 release
+   notes 的《@import("builtin") Deprecations》写明 `cpu`/`os`/`abi`/`object_format`
+   已弃用、**0.18.0 移除**，改用 `builtin.target.*`。本仓实际只用了两种形态——
+   `builtin.os.tag` ×47、`builtin.cpu.arch` ×1——全部迁移；`builtin.abi` 与
+   `builtin.object_format` 无使用点（**注意后者的替代名是 `target.ofmt`**）。
+   与批 146 同一纪律：迁移前逐个确认 18 个文件都有正确的
+   `const builtin = @import("builtin")` 绑定，全仓核查无本地同名遮蔽。
+2. **`std.builtin.*` → `std.lang.*`（1 处）**：`examples/zent-modulith/src/zent_crud.zig`
+   的 `std.builtin.Type.Struct.FieldAttributes`。std 的标记是 "To be removed after
+   0.17.0"（`std.zig:68`）。**上游 zent v0.83.1 做的是同一件事**，所以这条顺带
+   与下面的 pin 升级同批落地。
+3. **zent pin v0.83.0 → v0.83.1**（tag `064649f4`/commit `baff74d5`，新 hash 已
+   `zig fetch` 校验）：该版本唯一实质改动就是上面那族 `std.builtin` 迁移，**无
+   API 破坏**；按文档记录的升级陷阱先删 `.zig-cache`/`zig-pkg` 再构建。
+   `docs/ZENT.md` 版本口径与 §14 表头、`AGENTS.md` zent 行同步。
+4. **文档**：`AGENTS.md` 弃用表补三行（`std.builtin`、`builtin.target.*`、
+   `object_format`→`ofmt` 的坑）。
+5. **验证**：fmt 净 · 框架 `zig build test` 通过 · 两示例（zent-modulith
+   smoke 43 checks 0 failed / metaverse-creative `demo_ok`）对 v0.83.1 重建通过 ·
+   check-deadcode（baseline 26 未动）· check-production · check-api ·
+   check-tenant-scope(3/3) · check-test-collection · `zmodu audit .` PASS。
+
 ### 第 147 批：修批 146 的 CI 回归——`identity/api.zig` 迁移后 `std` 导入成死声明（**破坏性：否**）
 
 批 146（`2edeb61`）在三个平台（macos-latest / ubuntu-latest / ubuntu-24.04-arm）

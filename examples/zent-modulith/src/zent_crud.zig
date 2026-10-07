@@ -62,7 +62,7 @@ pub fn CrudApi(
         }
         var names: [count][:0]const u8 = undefined;
         var types: [count]type = undefined;
-        var attrs: [count]std.builtin.Type.Struct.FieldAttributes = undefined;
+        var attrs: [count]std.lang.Type.Struct.FieldAttributes = undefined;
         var i: usize = 0;
         for (info.fields) |f| {
             if (f.is_id or std.mem.eql(u8, f.name, opts.tenant_col)) continue;

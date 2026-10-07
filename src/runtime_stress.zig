@@ -353,7 +353,7 @@ const OsInfo = struct {
 };
 
 fn osInfo() OsInfo {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .macos => macosInfo(),
         .linux => linuxInfo(),
         else => .{ .rss_bytes = null, .threads = null },
@@ -910,7 +910,7 @@ fn appendHistory(io: std.Io, path: []const u8, p: Params, report: *Report, rec: 
     // One print per object: fmt calls cap at 32 arguments, and splitting on the
     // object boundaries keeps each call readable.
     w.print("{{\"v\":1,\"ts\":{d},\"commit\":\"{s}\",\"os\":\"{s}\",\"arch\":\"{s}\",", .{
-        ts, p.commit, @tagName(builtin.os.tag), @tagName(builtin.cpu.arch),
+        ts, p.commit, @tagName(builtin.target.os.tag), @tagName(builtin.target.cpu.arch),
     }) catch return warnOverflow(report, buf.len);
     w.print("\"params\":{{\"duration_ms\":{d},\"sample_ms\":{d},\"cpu_workers\":{d},\"producers\":{d},\"pool_threads\":{d}," ++
         "\"blocking_workers\":{d},\"blocking_threads\":{d},\"restarts\":{d},\"timers\":{d}}},", .{
@@ -1690,7 +1690,7 @@ fn run(io: std.Io, backing: std.mem.Allocator, p: Params) !Report {
 
     if (rss_seen == 0) {
         report.warn("RSS is not readable on this platform ({s}): invariant 6 is only half covered, and this line is the " ++
-            "reason — not a green", .{@tagName(builtin.os.tag)});
+            "reason — not a green", .{@tagName(builtin.target.os.tag)});
     } else {
         const spread = rss_max - rss_min;
         if (spread > p.rss_budget_bytes) {
@@ -1707,7 +1707,7 @@ fn run(io: std.Io, backing: std.mem.Allocator, p: Params) !Report {
     }
     if (thr_seen == 0) {
         report.warn("the OS thread count is not readable on this platform ({s}): invariant 6 is only half covered", .{
-            @tagName(builtin.os.tag),
+            @tagName(builtin.target.os.tag),
         });
     } else {
         if (thr_max - thr_min > 2) {

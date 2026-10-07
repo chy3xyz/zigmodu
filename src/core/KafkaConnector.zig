@@ -2782,7 +2782,7 @@ test "parseBootstrap RobustMQ default form" {
 }
 
 test "RobustMQ live produce" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const url = if (std.c.getenv("ROBUSTMQ_URL")) |p| std.mem.span(p) else if (std.c.getenv("KAFKA_BOOTSTRAP")) |p| std.mem.span(p) else null;
     if (url == null or url.?.len == 0) return error.SkipZigTest;
 
@@ -3228,7 +3228,7 @@ test "parseFindCoordinatorResponse synthetic" {
 }
 
 test "RobustMQ live joinGroup" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const url = if (std.c.getenv("ROBUSTMQ_URL")) |p| std.mem.span(p) else if (std.c.getenv("KAFKA_BOOTSTRAP")) |p| std.mem.span(p) else null;
     if (url == null or url.?.len == 0) return error.SkipZigTest;
 

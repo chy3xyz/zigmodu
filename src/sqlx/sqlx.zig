@@ -6945,7 +6945,7 @@ fn skipUnlessDb(comptime db: []const u8) !void {
     } else if (comptime std.mem.eql(u8, db, "sqlite")) {
         if (!DriverFeatures.sqlite) return error.SkipZigTest;
     }
-    const db_env = if (builtin.os.tag == .windows) "" else if (std.c.getenv("DB")) |ptr| std.mem.span(ptr) else return error.SkipZigTest;
+    const db_env = if (builtin.target.os.tag == .windows) "" else if (std.c.getenv("DB")) |ptr| std.mem.span(ptr) else return error.SkipZigTest;
     if (db_env.len == 0 or !std.mem.eql(u8, db_env, db)) {
         return error.SkipZigTest;
     }
@@ -8446,7 +8446,7 @@ test "postgres live connection" {
 
     // Support env overrides for CI and local dev
     const conninfo_default = "host=localhost port=5432 dbname=postgres user=cborli";
-    const conninfo = if (builtin.os.tag == .windows) conninfo_default else if (std.c.getenv("PGconninfo")) |ptr| std.mem.span(ptr) else conninfo_default;
+    const conninfo = if (builtin.target.os.tag == .windows) conninfo_default else if (std.c.getenv("PGconninfo")) |ptr| std.mem.span(ptr) else conninfo_default;
 
     var client = Client.init(allocator, std.testing.io, .{
         .driver = .postgres,
@@ -8570,20 +8570,20 @@ test "mysql live connection" {
     const allocator = std.testing.allocator;
 
     const host_default = "127.0.0.1";
-    const host = if (builtin.os.tag == .windows) host_default else if (std.c.getenv("MYSQL_HOST")) |ptr| std.mem.span(ptr) else host_default;
+    const host = if (builtin.target.os.tag == .windows) host_default else if (std.c.getenv("MYSQL_HOST")) |ptr| std.mem.span(ptr) else host_default;
     const user_default = "root";
-    const user = if (builtin.os.tag == .windows) user_default else if (std.c.getenv("MYSQL_USER")) |ptr| std.mem.span(ptr) else user_default;
+    const user = if (builtin.target.os.tag == .windows) user_default else if (std.c.getenv("MYSQL_USER")) |ptr| std.mem.span(ptr) else user_default;
     const pass_default = "";
-    const pass = if (builtin.os.tag == .windows) pass_default else if (std.c.getenv("MYSQL_PASSWORD")) |ptr| std.mem.span(ptr) else pass_default;
+    const pass = if (builtin.target.os.tag == .windows) pass_default else if (std.c.getenv("MYSQL_PASSWORD")) |ptr| std.mem.span(ptr) else pass_default;
     const db_default = "zigzero_test";
-    const db = if (builtin.os.tag == .windows) db_default else if (std.c.getenv("MYSQL_DATABASE")) |ptr| std.mem.span(ptr) else db_default;
+    const db = if (builtin.target.os.tag == .windows) db_default else if (std.c.getenv("MYSQL_DATABASE")) |ptr| std.mem.span(ptr) else db_default;
     // The port is read for the same reason the other four are: a service reached
     // through a container's published port (or a second server next to a local
     // one) is the normal case, and a hardcoded 3306 makes the live suite
     // unrunnable there.
     const port_default: u16 = 3306;
     const port: u16 = blk: {
-        if (builtin.os.tag == .windows) break :blk port_default;
+        if (builtin.target.os.tag == .windows) break :blk port_default;
         const raw = std.c.getenv("MYSQL_PORT") orelse break :blk port_default;
         break :blk std.fmt.parseInt(u16, std.mem.span(raw), 10) catch port_default;
     };
@@ -9230,7 +9230,7 @@ test "streaming PG cursor reports a mid-stream server error instead of ending th
     if (!DriverFeatures.postgres) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const conninfo_default = "host=127.0.0.1 port=5432 dbname=postgres user=postgres";
-    const conninfo = if (builtin.os.tag == .windows) conninfo_default else if (std.c.getenv("PGconninfo")) |ptr| std.mem.span(ptr) else conninfo_default;
+    const conninfo = if (builtin.target.os.tag == .windows) conninfo_default else if (std.c.getenv("PGconninfo")) |ptr| std.mem.span(ptr) else conninfo_default;
     var db = Client.init(allocator, std.testing.io, .{ .driver = .postgres, .postgres_conninfo = conninfo });
     defer db.deinit();
     try db.connect();
@@ -9293,7 +9293,7 @@ test "pooled client stays usable after a streaming cursor fails mid-result" {
     if (!DriverFeatures.postgres) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const conninfo_default = "host=127.0.0.1 port=5432 dbname=postgres user=postgres";
-    const conninfo = if (builtin.os.tag == .windows) conninfo_default else if (std.c.getenv("PGconninfo")) |ptr| std.mem.span(ptr) else conninfo_default;
+    const conninfo = if (builtin.target.os.tag == .windows) conninfo_default else if (std.c.getenv("PGconninfo")) |ptr| std.mem.span(ptr) else conninfo_default;
     var db = Client.init(allocator, std.testing.io, .{
         .driver = .postgres,
         .postgres_conninfo = conninfo,
@@ -9377,7 +9377,7 @@ test "pooled client stays usable after a streaming cursor fails mid-result" {
 fn mysqlLiveConfig() Config {
     const Env = struct {
         fn get(comptime name: [:0]const u8) ?[]const u8 {
-            if (builtin.os.tag == .windows) return null;
+            if (builtin.target.os.tag == .windows) return null;
             const raw = std.c.getenv(name.ptr) orelse return null;
             return std.mem.span(raw);
         }
@@ -10034,7 +10034,7 @@ test "mysql batch insert failure closes the prepared statement exactly once" {
 
     const Env = struct {
         fn get(comptime name: [:0]const u8) ?[]const u8 {
-            if (builtin.os.tag == .windows) return null;
+            if (builtin.target.os.tag == .windows) return null;
             const raw = std.c.getenv(name.ptr) orelse return null;
             return std.mem.span(raw);
         }
@@ -10479,7 +10479,7 @@ fn skipUnlessLivePg() !void {
 /// same default as the streaming-cursor tests above.
 fn pgTestConninfo() []const u8 {
     const default = "host=127.0.0.1 port=5432 dbname=postgres user=postgres";
-    if (builtin.os.tag == .windows) return default;
+    if (builtin.target.os.tag == .windows) return default;
     if (std.c.getenv("PGconninfo")) |ptr| return std.mem.span(ptr);
     return default;
 }

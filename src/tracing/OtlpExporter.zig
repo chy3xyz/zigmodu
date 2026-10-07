@@ -421,7 +421,7 @@ test "OtlpExporter's first-use race publishes one client for every thread" {
 
 test "OtlpExporter live HTTP export" {
     const builtin = @import("builtin");
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const ep_c = std.c.getenv("OTLP_ENDPOINT") orelse return error.SkipZigTest;
     const ep = std.mem.span(ep_c);
     if (ep.len == 0) return error.SkipZigTest;

@@ -68,7 +68,7 @@ const builtin = @import("builtin");
 /// `false` is not a soft "probably won't work": it means the platform has no
 /// such API (see the module doc). It is comptime-known, so a caller that
 /// *requires* a pin can refuse to build instead of finding out at runtime.
-pub const supported: bool = switch (builtin.os.tag) {
+pub const supported: bool = switch (builtin.target.os.tag) {
     .linux => true,
     else => false,
 };
@@ -100,7 +100,7 @@ pub const PinError = error{
 /// Call it *inside* the thread you mean to pin: the parent cannot address a
 /// freshly created thread through this API.
 pub fn pinCurrentThread(cpu_index: usize) PinError!void {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .linux => {
             if (cpu_index >= std.os.linux.CPU_SETSIZE) return error.PinFailed;
             var set: std.os.linux.cpu_set_t = @splat(0);
@@ -117,7 +117,7 @@ pub fn pinCurrentThread(cpu_index: usize) PinError!void {
 test "affinity: pinCurrentThread pins where it can and refuses to pretend elsewhere" {
     // Comptime-dispatched on purpose: the untaken arm is not analysed, so the
     // Linux-only `std.posix.sched_getaffinity` never has to exist on macOS.
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .linux => {
             try std.testing.expect(supported);
             const linux = std.os.linux;

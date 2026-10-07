@@ -2257,7 +2257,7 @@ fn expectLiveThreadCount(want: usize) !void {
 /// only witness.
 fn liveThreadCount() ?usize {
     const builtin = @import("builtin");
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .macos => {
             var ports: std.c.mach_port_array_t = undefined;
             var count: std.c.mach_msg_type_number_t = 0;

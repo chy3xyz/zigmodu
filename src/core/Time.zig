@@ -24,7 +24,7 @@ var fallback_tick = std.atomic.Value(i64).init(1);
 /// Returns monotonic nanoseconds since an arbitrary epoch.
 /// Suitable for elapsed-time measurement, NOT wall-clock time.
 pub fn monotonicNow() i64 {
-    switch (comptime builtin.os.tag) {
+    switch (comptime builtin.target.os.tag) {
         .windows => {
             // QueryPerformanceCounter is monotonic; convert ticks → ns.
             // zig 0.17 removed std.os.windows.QueryPerformanceCounter — call
