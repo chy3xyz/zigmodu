@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### 第 147 批：修批 146 的 CI 回归——`identity/api.zig` 迁移后 `std` 导入成死声明（**破坏性：否**）
+
+批 146（`2edeb61`）在三个平台（macos-latest / ubuntu-latest / ubuntu-24.04-arm）
+同点红：**dead-code 门禁**，不是测试——`examples/metaverse-creative/src/modules/
+identity/api.zig` 的 `const std = @import("std")` 唯一用途就是那几个
+`std.fmt.allocPrint`，迁移成 `allocator.print` 后它成了死声明。删掉该行；
+顺手把门禁提示的 baseline 陈旧条目收缩（`src/core/Fx.zig` 的 `errors`：
+批 133 重写该文件后行号漂移导致不再匹配，**与本次迁移无关**）。
+验证：`check-deadcode` 全绿、fmt 净、metaverse-creative 构建 + `demo` 通过。
+
 ### 第 146 批：Zig 0.17.0 弃用 API 收口（`allocPrint` → `Allocator.print` 309 处 + `runtime_safety` 2 处 + audit b25 同步）（**破坏性：否**——工具与示例，框架 `src/` 本就干净）
 
 **扫描方法**：从 0.17.0 的 std 源码反查全部 `Deprecated` 标记，对仓逐项核对。结论：

@@ -36,13 +36,6 @@
       "parent": null
     },
     {
-      "file": "src/core/Fx.zig",
-      "line": 6,
-      "kind": "constant",
-      "name": "errors",
-      "parent": null
-    },
-    {
       "file": "src/core/Lifecycle.zig",
       "line": 3,
       "kind": "constant",
@@ -100,7 +93,7 @@
     },
     {
       "file": "src/http/Dashboard.zig",
-      "line": 5,
+      "line": 7,
       "kind": "constant",
       "name": "HandlerFn",
       "parent": null
