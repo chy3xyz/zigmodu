@@ -74,13 +74,10 @@ pub const Poller = struct {
         var result: PollResult = .{};
         const now: i64 = @intCast(zigmodu.time.monotonicNowSeconds());
 
-        const sql = try std.fmt.allocPrint(
-            self.allocator,
+        const sql = try self.allocator.print(
             \\SELECT id, tenant_id, topic, payload, status, retry_count, max_retries, last_error, created_at, updated_at
             \\FROM outbox WHERE status = 'pending' ORDER BY id ASC LIMIT {d}
-        ,
-            .{self.batch_size},
-        );
+        , .{self.batch_size});
         defer self.allocator.free(sql);
 
         const rows = try self.db.queryRowsPartial(Row, sql, &.{});
@@ -89,7 +86,7 @@ pub const Poller = struct {
         const force_fail = self.simulate_fail.load(.monotonic);
 
         for (rows.items) |row| {
-            const key_buf = try std.fmt.allocPrint(self.allocator, "{d}", .{row.tenant_id});
+            const key_buf = try self.allocator.print("{d}", .{row.tenant_id});
             defer self.allocator.free(key_buf);
 
             const pub_err: ?anyerror = blk: {
@@ -145,25 +142,19 @@ pub const Poller = struct {
     }
 
     pub fn listRecent(self: *Self, limit: u32) !data.sqlx.QueryResult(Row) {
-        const sql = try std.fmt.allocPrint(
-            self.allocator,
+        const sql = try self.allocator.print(
             \\SELECT id, tenant_id, topic, payload, status, retry_count, max_retries, last_error, created_at, updated_at
             \\FROM outbox ORDER BY id DESC LIMIT {d}
-        ,
-            .{limit},
-        );
+        , .{limit});
         defer self.allocator.free(sql);
         return try self.db.queryRowsPartial(Row, sql, &.{});
     }
 
     pub fn listByStatus(self: *Self, status: []const u8, limit: u32) !data.sqlx.QueryResult(Row) {
-        const sql = try std.fmt.allocPrint(
-            self.allocator,
+        const sql = try self.allocator.print(
             \\SELECT id, tenant_id, topic, payload, status, retry_count, max_retries, last_error, created_at, updated_at
             \\FROM outbox WHERE status = ? ORDER BY id DESC LIMIT {d}
-        ,
-            .{limit},
-        );
+        , .{limit});
         defer self.allocator.free(sql);
         return try self.db.queryRowsPartial(Row, sql, &.{.{ .string = status }});
     }

@@ -121,10 +121,10 @@ pub fn OrderApi(comptime Client: type) type {
 
             // Transaction-scoped events: enqueue inside the tx, deliver once
             // after commit via the after-commit hook.
-            const ev_order = try std.fmt.allocPrint(ctx.allocator, "{{\"type\":\"order.created\",\"order_id\":{d},\"product_id\":{d},\"qty\":{d},\"total_cents\":{d}}}", .{ order_id, q.product_id, q.qty, total_cents });
+            const ev_order = try ctx.allocator.print("{{\"type\":\"order.created\",\"order_id\":{d},\"product_id\":{d},\"qty\":{d},\"total_cents\":{d}}}", .{ order_id, q.product_id, q.qty, total_cents });
             defer ctx.allocator.free(ev_order);
             try tx.enqueueEvent(ev_order);
-            const ev_stock = try std.fmt.allocPrint(ctx.allocator, "{{\"type\":\"stock.decremented\",\"product_id\":{d},\"qty\":{d}}}", .{ q.product_id, q.qty });
+            const ev_stock = try ctx.allocator.print("{{\"type\":\"stock.decremented\",\"product_id\":{d},\"qty\":{d}}}", .{ q.product_id, q.qty });
             defer ctx.allocator.free(ev_stock);
             try tx.enqueueEvent(ev_stock);
 

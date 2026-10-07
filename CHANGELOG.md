@@ -2,6 +2,47 @@
 
 ## [Unreleased]
 
+### 第 146 批：Zig 0.17.0 弃用 API 收口（`allocPrint` → `Allocator.print` 309 处 + `runtime_safety` 2 处 + audit b25 同步）（**破坏性：否**——工具与示例，框架 `src/` 本就干净）
+
+**扫描方法**：从 0.17.0 的 std 源码反查全部 `Deprecated` 标记，对仓逐项核对。结论：
+框架 `src/` 已无 `std.fmt.allocPrint`；残留集中在 `tools/zmodu`（237）与
+`examples/`（67）。同时核过 `std.meta.hasDecl` / `std.mem.trimRight` /
+`std.time.milliTimestamp` / `std.Thread.sleep` / `std.fs.cwd` / `DynamicBitSet` /
+`std.os.getpid` 等族的实际使用——**均为 0**（仅 2 处解释性注释提及已删除的
+`std.Thread.sleep`），`checkAllAllocationFailures`（72 处）与
+`setEvalBranchQuota`（12 处）已在用。
+
+1. **`std.fmt.allocPrint(a, fmt, args)` → `a.print(fmt, args)`（304 处自动迁移，
+   37 文件）**：0.17.0 的原文是 "Deprecated in favor of `Allocator.print`"，
+   语义与错误集不变，是纯接收者搬移（首参变接收者）。迁移用一次性脚本做
+   （字符串/字符字面量、行/块注释、嵌套括号、需要加括号的复杂分配器表达式
+   都处理），随后 `zig fmt` 归一化。
+2. **5 处手工补齐**（脚本够不到的形态）：`tools/zmodu/src/main.zig` 的
+   多行字符串调用 1 处 + **scaffold 模板字符串 1 处**（它生成给用户的
+   `main.zig` 仍在用弃用 API——这条比本体更重要）、`templates/orm/sqlx/
+   test_tenant.zig.tpl` 2 处、`examples/zmsaas/scripts/reapply-custom.py`
+   内嵌的 Zig 片段 1 处。
+3. **`std.debug.runtime_safety` → `std.lang.Optimize.runtimeSafety(builtin.mode)`
+   （2 处，`src/runtime/timer_wheel.zig`）**：std 的标记是 "to be removed after
+   0.18.0"，且其注释点明调用方要问的通常是**自己模块**的模式——两处
+   （`assertOwner`、重复 id 校验）正是这个意图，故显式传 `builtin.mode`
+   并在注释里写清来源。
+4. **audit b25 同步**（`tools/zmodu/src/audit.zig`）：该规则的"分配调用"模式表
+   `{allocPrintSentinel(", allocPrint(", alloc(, dupeZ(, dupe(}` 在迁移后会漏掉新
+   拼写 `allocator.print(`，会让 b25 对新代码静默失效——已加入
+   `printSentinel(`/`print(`（旧名保留，未迁移的下游仍被拦）；测试 fixture 改用
+   新拼写并补一条**负例**钉住"接收者形状"（`try std.fmt.allocPrint(allocator, …)`
+   的 allocator 在参数位，不在该规则射程内，别误改成匹配它）。
+5. **文档**：`AGENTS.md` 新增「0.17.0 — deprecated（仍能编译，见即迁移）」
+   小表（含全仓扫描结论）。
+6. **验证**：`zig fmt` 全仓净 · `tools/zmodu` build + test（143 测试绿）·
+   框架 `zig build test` 19/19 步 ·
+   受影响 7 示例（ai-ops / metaverse-creative / tenant-mgmt / tenant-shop /
+   web4 / zent-modulith / zmsaas/backend）全构建 ·
+   `ai-ops`/`tenant-mgmt`/`web4` 测试步 + `zent-modulith` smoke（43 checks
+   0 failed）绿 · `zmodu audit .` PASS（0 violation）· check-production /
+   check-api / check-tenant-scope（3/3）/ check-test-collection 全绿。
+
 ### 第 145 批：双 24h soak 证据收口（soak-cluster v2 + runtime-stress 全绿；B-10 缺口补上数据点）（**破坏性：否**——文档与注释）
 
 1. **`soak-cluster` 24h v2 绿**（`.soak/soak-cluster-24h-v2.log`，exit 0）：

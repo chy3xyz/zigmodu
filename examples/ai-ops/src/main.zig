@@ -168,11 +168,7 @@ fn runDemo(allocator: std.mem.Allocator, io: std.Io, verbose: bool, serve: bool)
     hub.channels = &channels;
     hub.outbox = &outbox;
 
-    const notify_payload = try std.fmt.allocPrint(
-        allocator,
-        "{{\"summary\":\"{s}\",\"alerts\":{d},\"large_order\":\"{s}\",\"small_order\":\"{s}\"}}",
-        .{ diag.summary, alerts, @tagName(large.status), @tagName(small.status) },
-    );
+    const notify_payload = try allocator.print("{{\"summary\":\"{s}\",\"alerts\":{d},\"large_order\":\"{s}\",\"small_order\":\"{s}\"}}", .{ diag.summary, alerts, @tagName(large.status), @tagName(small.status) });
     defer allocator.free(notify_payload);
     const report = try hub.deliver(allocator, &ctx, notify_payload);
 

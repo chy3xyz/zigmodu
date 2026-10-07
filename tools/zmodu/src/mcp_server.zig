@@ -212,7 +212,7 @@ fn callScaffold(io: Io, allocator: std.mem.Allocator, arguments: ?std.json.Value
     }
 
     main_mod.cmdScaffold(io, allocator, args.items) catch |err| {
-        return std.fmt.allocPrint(allocator, "{{\"error\":\"scaffold failed: {}\"}}", .{err});
+        return allocator.print("{{\"error\":\"scaffold failed: {}\"}}", .{err});
     };
     return allocator.dupe(u8, "{\"success\":true,\"message\":\"Scaffold completed\"}");
 }
@@ -227,9 +227,9 @@ fn callModuleCmd(io: Io, allocator: std.mem.Allocator, arguments: ?std.json.Valu
     try args.append(allocator, name.string);
 
     main_mod.cmdModule(io, allocator, args.items) catch |err| {
-        return std.fmt.allocPrint(allocator, "{{\"error\":\"module failed: {}\"}}", .{err});
+        return allocator.print("{{\"error\":\"module failed: {}\"}}", .{err});
     };
-    return std.fmt.allocPrint(allocator, "{{\"success\":true,\"module\":\"{s}\"}}", .{name.string});
+    return allocator.print("{{\"success\":true,\"module\":\"{s}\"}}", .{name.string});
 }
 
 fn callVerify(io: Io, allocator: std.mem.Allocator, arguments: ?std.json.Value) ![]const u8 {
@@ -241,7 +241,7 @@ fn callVerify(io: Io, allocator: std.mem.Allocator, arguments: ?std.json.Value) 
     }
 
     const report = verify_mod.verifyProject(allocator, io, project_dir) catch |err| {
-        return std.fmt.allocPrint(allocator, "{{\"error\":\"verify failed: {}\"}}", .{err});
+        return allocator.print("{{\"error\":\"verify failed: {}\"}}", .{err});
     };
     defer {
         for (report.checks) |c| {
@@ -280,11 +280,11 @@ fn callVerify(io: Io, allocator: std.mem.Allocator, arguments: ?std.json.Value) 
         if (c.details) |d| {
             const esc_details = try jsonEscape(allocator, d);
             defer allocator.free(esc_details);
-            const entry = try std.fmt.allocPrint(allocator, "{{\"name\":\"{s}\",\"status\":\"{s}\",\"details\":\"{s}\"}}", .{ esc_name, status_str, esc_details });
+            const entry = try allocator.print("{{\"name\":\"{s}\",\"status\":\"{s}\",\"details\":\"{s}\"}}", .{ esc_name, status_str, esc_details });
             defer allocator.free(entry);
             try parts.appendSlice(allocator, entry);
         } else {
-            const entry = try std.fmt.allocPrint(allocator, "{{\"name\":\"{s}\",\"status\":\"{s}\"}}", .{ esc_name, status_str });
+            const entry = try allocator.print("{{\"name\":\"{s}\",\"status\":\"{s}\"}}", .{ esc_name, status_str });
             defer allocator.free(entry);
             try parts.appendSlice(allocator, entry);
         }
@@ -320,7 +320,7 @@ fn callAudit(io: Io, allocator: std.mem.Allocator, arguments: ?std.json.Value) !
         }
     }
     return audit_mod.auditJsonFor(io, allocator, project_dir) catch |err| {
-        return std.fmt.allocPrint(allocator, "{{\"error\":\"audit failed: {}\"}}", .{err});
+        return allocator.print("{{\"error\":\"audit failed: {}\"}}", .{err});
     };
 }
 
@@ -332,12 +332,12 @@ fn callGraph(io: Io, allocator: std.mem.Allocator, arguments: ?std.json.Value) !
         }
     }
     const mermaid = audit_mod.renderMermaid(io, allocator, project_dir) catch |err| {
-        return std.fmt.allocPrint(allocator, "{{\"error\":\"graph failed: {}\"}}", .{err});
+        return allocator.print("{{\"error\":\"graph failed: {}\"}}", .{err});
     };
     defer allocator.free(mermaid);
     const esc = try jsonEscape(allocator, mermaid);
     defer allocator.free(esc);
-    return std.fmt.allocPrint(allocator, "{{\"mermaid\":\"{s}\"}}", .{esc});
+    return allocator.print("{{\"mermaid\":\"{s}\"}}", .{esc});
 }
 
 fn callDiff(io: Io, allocator: std.mem.Allocator, arguments: ?std.json.Value) ![]const u8 {
@@ -347,25 +347,25 @@ fn callDiff(io: Io, allocator: std.mem.Allocator, arguments: ?std.json.Value) ![
     const new_sql_path = a.get("new_sql") orelse return callStub(allocator, "Missing new_sql");
 
     const old_sql = Io.Dir.cwd().readFileAlloc(io, old_sql_path.string, allocator, Io.Limit.limited(10 * 1024 * 1024)) catch |err| {
-        return std.fmt.allocPrint(allocator, "{{\"error\":\"cannot read old_sql: {}\"}}", .{err});
+        return allocator.print("{{\"error\":\"cannot read old_sql: {}\"}}", .{err});
     };
     defer allocator.free(old_sql);
     const new_sql = Io.Dir.cwd().readFileAlloc(io, new_sql_path.string, allocator, Io.Limit.limited(10 * 1024 * 1024)) catch |err| {
-        return std.fmt.allocPrint(allocator, "{{\"error\":\"cannot read new_sql: {}\"}}", .{err});
+        return allocator.print("{{\"error\":\"cannot read new_sql: {}\"}}", .{err});
     };
     defer allocator.free(new_sql);
 
     const old_tables = main_mod.parseSqlSchema(allocator, old_sql) catch |err| {
-        return std.fmt.allocPrint(allocator, "{{\"error\":\"parse old SQL failed: {}\"}}", .{err});
+        return allocator.print("{{\"error\":\"parse old SQL failed: {}\"}}", .{err});
     };
     defer main_mod.freeTableDefs(allocator, old_tables);
     const new_tables = main_mod.parseSqlSchema(allocator, new_sql) catch |err| {
-        return std.fmt.allocPrint(allocator, "{{\"error\":\"parse new SQL failed: {}\"}}", .{err});
+        return allocator.print("{{\"error\":\"parse new SQL failed: {}\"}}", .{err});
     };
     defer main_mod.freeTableDefs(allocator, new_tables);
 
     const diffs = sql_diff.diffTables(allocator, old_tables, new_tables) catch |err| {
-        return std.fmt.allocPrint(allocator, "{{\"error\":\"diff failed: {}\"}}", .{err});
+        return allocator.print("{{\"error\":\"diff failed: {}\"}}", .{err});
     };
     defer {
         for (diffs) |d| if (d.column_changes.len > 0) allocator.free(d.column_changes);
@@ -380,7 +380,7 @@ fn callDiff(io: Io, allocator: std.mem.Allocator, arguments: ?std.json.Value) ![
     var parts = std.ArrayList(u8).empty;
     defer parts.deinit(allocator);
     try parts.appendSlice(allocator, "{\"changed_tables\":");
-    const count_str = try std.fmt.allocPrint(allocator, "{d}", .{diffs.len});
+    const count_str = try allocator.print("{d}", .{diffs.len});
     defer allocator.free(count_str);
     try parts.appendSlice(allocator, count_str);
     try parts.appendSlice(allocator, ",\"diffs\":[");
@@ -393,7 +393,7 @@ fn callDiff(io: Io, allocator: std.mem.Allocator, arguments: ?std.json.Value) ![
         };
         const esc_table = try jsonEscape(allocator, d.table_name);
         defer allocator.free(esc_table);
-        const entry = try std.fmt.allocPrint(allocator, "{{\"table\":\"{s}\",\"change\":\"{s}\"", .{ esc_table, change_str });
+        const entry = try allocator.print("{{\"table\":\"{s}\",\"change\":\"{s}\"", .{ esc_table, change_str });
         defer allocator.free(entry);
         try parts.appendSlice(allocator, entry);
 
@@ -416,11 +416,11 @@ fn callDiff(io: Io, allocator: std.mem.Allocator, arguments: ?std.json.Value) ![
                     defer allocator.free(esc_ot);
                     const esc_nt = try jsonEscape(allocator, cc.new_type orelse "");
                     defer allocator.free(esc_nt);
-                    const cc_entry = try std.fmt.allocPrint(allocator, "{{\"column\":\"{s}\",\"change\":\"{s}\",\"old_type\":\"{s}\",\"new_type\":\"{s}\"}}", .{ esc_col, cc_type, esc_ot, esc_nt });
+                    const cc_entry = try allocator.print("{{\"column\":\"{s}\",\"change\":\"{s}\",\"old_type\":\"{s}\",\"new_type\":\"{s}\"}}", .{ esc_col, cc_type, esc_ot, esc_nt });
                     defer allocator.free(cc_entry);
                     try parts.appendSlice(allocator, cc_entry);
                 } else {
-                    const cc_entry = try std.fmt.allocPrint(allocator, "{{\"column\":\"{s}\",\"change\":\"{s}\"}}", .{ esc_col, cc_type });
+                    const cc_entry = try allocator.print("{{\"column\":\"{s}\",\"change\":\"{s}\"}}", .{ esc_col, cc_type });
                     defer allocator.free(cc_entry);
                     try parts.appendSlice(allocator, cc_entry);
                 }
@@ -476,7 +476,7 @@ fn jsonEscape(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
             '\r' => try buf.appendSlice(allocator, "\\r"),
             '\t' => try buf.appendSlice(allocator, "\\t"),
             0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f => {
-                const esc = try std.fmt.allocPrint(allocator, "\\u{x:0>4}", .{c});
+                const esc = try allocator.print("\\u{x:0>4}", .{c});
                 defer allocator.free(esc);
                 try buf.appendSlice(allocator, esc);
             },

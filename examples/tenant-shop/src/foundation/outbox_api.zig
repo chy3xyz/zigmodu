@@ -31,7 +31,7 @@ pub fn OutboxApi(comptime Poller: type) type {
             for (rows, 0..) |r, i| {
                 if (i > 0) try buf.appendSlice(ctx.allocator, ",");
                 const err_s = r.last_error orelse "";
-                const entry = try std.fmt.allocPrint(ctx.allocator,
+                const entry = try ctx.allocator.print(
                     \\{{"id":{d},"tenant_id":{d},"topic":"{s}","status":"{s}","retry_count":{d},"max_retries":{d},"last_error":"{s}"}}
                 , .{ r.id, r.tenant_id, r.topic, r.status, r.retry_count, r.max_retries, err_s });
                 defer ctx.allocator.free(entry);
@@ -51,7 +51,7 @@ pub fn OutboxApi(comptime Poller: type) type {
                 try ctx.sendErrorResponse(500, 0, "outbox drain failed");
                 return;
             };
-            const resp = try std.fmt.allocPrint(ctx.allocator,
+            const resp = try ctx.allocator.print(
                 \\{{"published":{d},"retried":{d},"dlq":{d}}}
             , .{ res.published, res.retried, res.dlq });
             defer ctx.allocator.free(resp);

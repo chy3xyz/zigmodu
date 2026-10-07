@@ -35,10 +35,10 @@ pub fn SettlementApi(comptime Service: type) type {
                 .buyer_did = buyer,
                 .license = license,
             }) catch |err| {
-                try ctx.json(400, try std.fmt.allocPrint(ctx.allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}));
+                try ctx.json(400, try ctx.allocator.print("{{\"error\":\"{s}\"}}", .{@errorName(err)}));
                 return;
             };
-            const body = try std.fmt.allocPrint(ctx.allocator,
+            const body = try ctx.allocator.print(
                 \\{{"payment_id":{d},"transfer_id":{d},"sale_id":{d},"amount_cents":{d},"platform_fee_cents":{d},"seller_net_cents":{d},"replay":{s}}}
             , .{ r.payment_id, r.transfer_id, r.sale_id, r.amount_cents, r.platform_fee_cents, r.seller_net_cents, if (r.idempotent_replay) "true" else "false" });
             defer ctx.allocator.free(body);
@@ -48,7 +48,7 @@ pub fn SettlementApi(comptime Service: type) type {
         fn reconcile(ctx: *http.Context) !void {
             const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
             const r = try self.svc.reconcile();
-            const body = try std.fmt.allocPrint(ctx.allocator,
+            const body = try ctx.allocator.print(
                 \\{{"ledger_sum_cents":{d},"succeeded_payments":{d},"transfers":{d},"pending_outbox":{d},"balanced":{s}}}
             , .{ r.ledger_sum_cents, r.succeeded_payments, r.transfers, r.pending_outbox, if (r.balanced) "true" else "false" });
             defer ctx.allocator.free(body);
@@ -58,7 +58,7 @@ pub fn SettlementApi(comptime Service: type) type {
         fn drain(ctx: *http.Context) !void {
             const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
             const n = try self.svc.drainOutbox();
-            const body = try std.fmt.allocPrint(ctx.allocator, "{{\"published\":{d}}}", .{n});
+            const body = try ctx.allocator.print("{{\"published\":{d}}}", .{n});
             defer ctx.allocator.free(body);
             try ctx.json(200, body);
         }

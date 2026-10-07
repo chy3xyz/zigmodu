@@ -85,7 +85,7 @@ test "<<MODULE_NAME>>: one tenant cannot read or write another tenant's rows" {
     // not-found envelope — not the row.
     var get_buf: [256]u8 = undefined;
     const get_path = try routePath(&get_buf, comptime routeIndexNth(.GET, 1));
-    const probe = try std.fmt.allocPrint(allocator, "{s}?id={d}", .{ get_path, b_id });
+    const probe = try allocator.print("{s}?id={d}", .{ get_path, b_id });
     defer allocator.free(probe);
 
     var guessed = try http.Testkit.dispatchOpts(&server, .GET, probe, .{ .attrs = &.{.{ "tenant_id", "1" }} });
@@ -129,7 +129,7 @@ test "<<MODULE_NAME>>: one tenant cannot read or write another tenant's rows" {
     try std.testing.expectEqual(@as(i64, 404), stolen_update_json.value.object.get("code").?.integer);
 
     var delete_buf: [256]u8 = undefined;
-    const stolen_delete_path = try std.fmt.allocPrint(allocator, "{s}?id={d}", .{
+    const stolen_delete_path = try allocator.print("{s}?id={d}", .{
         try routePath(&delete_buf, comptime routeIndexNth(.DELETE, 0)),
         b_id,
     });

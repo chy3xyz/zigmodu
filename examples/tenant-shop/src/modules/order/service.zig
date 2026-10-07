@@ -80,7 +80,7 @@ pub const OrderService = struct {
             try order_persist.Tx.insertItem(&tx, cmd.tenant_id, order_id, p.product_id, p.qty, p.price_cents);
         }
 
-        const payload = try std.fmt.allocPrint(self.allocator,
+        const payload = try self.allocator.print(
             \\{{"order_id":{d},"tenant_id":{d},"user_id":{d},"total_cents":{d}}}
         , .{ order_id, cmd.tenant_id, cmd.user_id, total });
         defer self.allocator.free(payload);

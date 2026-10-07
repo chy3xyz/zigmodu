@@ -53,6 +53,7 @@
 //! keeps a directly-held wheel usable.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const slot_ms: i64 = 10;
 pub const spokes: u32 = 64;
@@ -179,8 +180,13 @@ pub fn Wheel(comptime Payload: type) type {
 
         /// Owner-only in Debug/ReleaseSafe. Compiled out of ReleaseFast, where it
         /// would show up in the benchmark's `advance` loop.
+        ///
+        /// `std.debug.runtime_safety` is deprecated in 0.17.0 ("to be removed
+        /// after 0.18.0") in favour of `std.lang.Optimize.runtimeSafety`. The
+        /// mode asked about is this module's own — std's note says a caller
+        /// nearly always wants that, not the std library's.
         inline fn assertOwner(self: *const Self) void {
-            if (!std.debug.runtime_safety) return;
+            if (!std.lang.Optimize.runtimeSafety(builtin.mode)) return;
             const owner = self.owner.load(.acquire);
             if (owner == 0 or owner == std.Thread.getCurrentId()) return;
             @panic("timer wheel: touched from a thread that does not own it");
@@ -226,7 +232,7 @@ pub fn Wheel(comptime Payload: type) type {
             // safety on this is a hard failure rather than a slow leak. The whole
             // check is gone in ReleaseFast — the benchmark's 100k-insert loop
             // must not pay for a hash lookup per timer.
-            if (std.debug.runtime_safety) {
+            if (std.lang.Optimize.runtimeSafety(builtin.mode)) {
                 if (self.nodes.contains(id)) @panic("timer wheel: id handed out twice");
             }
             try self.nodes.put(self.allocator, node.id, node);

@@ -38,7 +38,7 @@ pub fn SubscriptionApi(comptime Sv: type) type {
             try buf.appendSlice(ctx.allocator, "{\"plans\":[");
             for (plans, 0..) |p, i| {
                 if (i > 0) try buf.appendSlice(ctx.allocator, ",");
-                const entry = try std.fmt.allocPrint(ctx.allocator,
+                const entry = try ctx.allocator.print(
                     \\{{"id":{d},"name":"{s}","max_users":{d},"price":{d:.2}}}
                 , .{ p.id, p.name, p.max_users, p.price });
                 defer ctx.allocator.free(entry);
@@ -62,7 +62,7 @@ pub fn SubscriptionApi(comptime Sv: type) type {
                 try ctx.sendErrorResponse(500, 0, @errorName(err));
                 return;
             };
-            const resp = try std.fmt.allocPrint(ctx.allocator,
+            const resp = try ctx.allocator.print(
                 \\{{"id":{d},"tenant_id":{d},"plan_id":{d},"status":"{s}"}}
             , .{ sub.id, sub.tenant_id, sub.plan_id, sub.status });
             defer ctx.allocator.free(resp);
@@ -88,7 +88,7 @@ pub fn SubscriptionApi(comptime Sv: type) type {
                 try ctx.sendErrorResponse(404, 0, "No subscription found");
                 return;
             };
-            const resp = try std.fmt.allocPrint(ctx.allocator,
+            const resp = try ctx.allocator.print(
                 \\{{"id":{d},"tenant_id":{d},"plan_id":{d},"status":"{s}","expires_at":{d}}}
             , .{ sub.id, sub.tenant_id, sub.plan_id, sub.status, sub.expires_at });
             defer ctx.allocator.free(resp);

@@ -46,7 +46,7 @@ pub fn OrderApi(comptime Service: type) type {
             try buf.appendSlice(ctx.allocator, "{\"orders\":[");
             for (orders, 0..) |o, i| {
                 if (i > 0) try buf.appendSlice(ctx.allocator, ",");
-                const entry = try std.fmt.allocPrint(ctx.allocator,
+                const entry = try ctx.allocator.print(
                     \\{{"id":{d},"user_id":{d},"status":"{s}","total_cents":{d}}}
                 , .{ o.id, o.user_id, o.status, o.total_cents });
                 defer ctx.allocator.free(entry);
@@ -73,7 +73,7 @@ pub fn OrderApi(comptime Service: type) type {
                 try ctx.sendErrorResponse(400, 0, msg);
                 return;
             };
-            const resp = try std.fmt.allocPrint(ctx.allocator,
+            const resp = try ctx.allocator.print(
                 \\{{"order_id":{d},"status":"pending"}}
             , .{result.order_id});
             defer ctx.allocator.free(resp);

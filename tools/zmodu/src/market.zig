@@ -157,7 +157,7 @@ pub fn fetchIndex(io: Io, allocator: std.mem.Allocator, url: []const u8) !void {
     };
     var client = std.http.Client{ .allocator = allocator, .io = io };
     defer client.deinit();
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{cache_path_const});
+    const tmp_path = try allocator.print("{s}.tmp", .{cache_path_const});
     defer allocator.free(tmp_path);
     const file = try Dir.cwd().createFile(io, tmp_path, .{});
     defer file.close(io);

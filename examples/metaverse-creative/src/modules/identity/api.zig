@@ -31,7 +31,7 @@ pub fn IdentityApi(comptime Service: type) type {
                 return;
             };
             self.svc.registerCreator(did, name, wallet) catch |err| {
-                try ctx.json(400, try std.fmt.allocPrint(ctx.allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}));
+                try ctx.json(400, try ctx.allocator.print("{{\"error\":\"{s}\"}}", .{@errorName(err)}));
                 return;
             };
             try ctx.json(201, "{\"ok\":true}");
@@ -48,7 +48,7 @@ pub fn IdentityApi(comptime Service: type) type {
                 return;
             };
             defer self.svc.freeCreator(c);
-            const body = try std.fmt.allocPrint(ctx.allocator,
+            const body = try ctx.allocator.print(
                 \\{{"did":"{s}","display_name":"{s}","reputation":{d},"verified":{s}}}
             , .{ c.did, c.display_name, c.reputation, if (c.verified) "true" else "false" });
             defer ctx.allocator.free(body);

@@ -42,7 +42,7 @@ pub const OrdersService = struct {
 
     pub fn fulfill(self: *@This(), allocator: std.mem.Allocator, org_id: i64, id: i64) !void {
         const now = zigmodu.Time.monotonicNowSeconds();
-        const payload = try std.fmt.allocPrint(allocator, "{{\"order_id\":{d},\"action\":\"fulfilled\"}}", .{id});
+        const payload = try allocator.print("{{\"order_id\":{d},\"action\":\"fulfilled\"}}", .{id});
         defer allocator.free(payload);
         const ok = try self.transactWith(bool, FulfillCtx, FulfillCtx{ .allocator = allocator, .org_id = org_id, .id = id, .now = now, .payload = payload }, struct {
             fn f(tx: *zigmodu.data.sqlx.Transaction, c: FulfillCtx) zigmodu.ZigModuError!bool {

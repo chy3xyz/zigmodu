@@ -137,7 +137,7 @@ pub fn FeedApi(comptime Client: type) type {
             defer self.client.author.deinitRows(&rows); // page + list, one call
             const arr = try maskedArrayJson(self.client.allocator, persist.infos, persist.AuthorInfo, rows.items);
             defer self.client.allocator.free(arr);
-            const body = try std.fmt.allocPrint(self.client.allocator, "{{\"authors\":{s}}}", .{arr});
+            const body = try self.client.allocator.print("{{\"authors\":{s}}}", .{arr});
             defer self.client.allocator.free(body);
             try ctx.json(200, body);
         }
@@ -175,7 +175,7 @@ pub fn FeedApi(comptime Client: type) type {
             const last: ?CommentEntity = if (rows.items.len > 0) rows.items[rows.items.len - 1] else null;
             const arr = try maskedArrayJson(self.client.allocator, persist.infos, persist.CommentInfo, rows.items);
             defer self.client.allocator.free(arr);
-            const body = try std.fmt.allocPrint(self.client.allocator, "{{\"items\":{s},\"next_cursor_ts\":{d},\"next_cursor_id\":{d}}}", .{
+            const body = try self.client.allocator.print("{{\"items\":{s},\"next_cursor_ts\":{d},\"next_cursor_id\":{d}}}", .{
                 arr,
                 if (last) |l| l.created_at else q.cursor_ts,
                 if (last) |l| l.id else q.cursor_id,
@@ -227,7 +227,7 @@ pub fn FeedApi(comptime Client: type) type {
             defer self.client.post.deinitRows(&rows);
             const arr = try maskedArrayJson(self.client.allocator, persist.infos, persist.PostInfo, rows.items);
             defer self.client.allocator.free(arr);
-            const body = try std.fmt.allocPrint(self.client.allocator, "{{\"trashed\":{s}}}", .{arr});
+            const body = try self.client.allocator.print("{{\"trashed\":{s}}}", .{arr});
             defer self.client.allocator.free(body);
             try ctx.json(200, body);
         }
@@ -265,7 +265,7 @@ pub fn SummaryApi(comptime Client: type) type {
             }
             const arr = try maskedArrayJson(self.client.allocator, persist.infos, persist.ProductInfo, rows.items);
             defer self.client.allocator.free(arr);
-            const body = try std.fmt.allocPrint(self.client.allocator, "{{\"summaries\":{s}}}", .{arr});
+            const body = try self.client.allocator.print("{{\"summaries\":{s}}}", .{arr});
             defer self.client.allocator.free(body);
             try ctx.json(200, body);
         }
@@ -439,7 +439,7 @@ pub fn FeedModernApi(comptime Client: type) type {
             }
 
             const arr = try maskedArrayJson(arena, persist.infos, persist.AuthorInfo, copies);
-            const body = try std.fmt.allocPrint(arena, "{{\"authors\":{s}}}", .{arr});
+            const body = try arena.print("{{\"authors\":{s}}}", .{arr});
             try ctx.json(200, body);
         }
     };
@@ -522,7 +522,7 @@ pub fn InterceptorApi(comptime Client: type) type {
             }
             const arr = try maskedArrayJson(self.client.allocator, persist.infos, persist.ProductInfo, rows.items);
             defer self.client.allocator.free(arr);
-            const body = try std.fmt.allocPrint(self.client.allocator, "{{\"tenant\":{d},\"items\":{s}}}", .{ sentinel_tenant, arr });
+            const body = try self.client.allocator.print("{{\"tenant\":{d},\"items\":{s}}}", .{ sentinel_tenant, arr });
             defer self.client.allocator.free(body);
             try ctx.json(200, body);
         }

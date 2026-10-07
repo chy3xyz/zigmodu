@@ -19,7 +19,7 @@ pub const AuthApi = struct {
         // demo 多角色：login?role=user&uid=42 签发 user 角色（数据权限演示用）。
         const role = ctx.queryStr("role", "admin");
         const uid = ctx.queryInt(i64, "uid", 1);
-        const sub_buf = try std.fmt.allocPrint(ctx.allocator, "{d}", .{uid});
+        const sub_buf = try ctx.allocator.print("{d}", .{uid});
         defer ctx.allocator.free(sub_buf);
         const is_admin = std.mem.eql(u8, role, "admin");
         const roles: []const []const u8 = if (is_admin) &.{"admin"} else &.{"user"};

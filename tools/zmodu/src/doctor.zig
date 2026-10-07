@@ -244,7 +244,7 @@ fn scanEntanglements(
                 if (!isKnownModule(modules, target_module)) continue; // relative import out of the module tree
 
                 // `--allow from->to` acknowledges one direction.
-                const pair = try std.fmt.allocPrint(allocator, "{s}->{s}", .{ mod.name, target_module });
+                const pair = try allocator.print("{s}->{s}", .{ mod.name, target_module });
                 defer allocator.free(pair);
                 var skip = false;
                 for (allowed) |a| {

@@ -34,7 +34,7 @@ pub fn TenantApi(comptime Service: type) type {
             try buf.appendSlice(ctx.allocator, "{\"tenants\":[");
             for (tenants, 0..) |t, i| {
                 if (i > 0) try buf.appendSlice(ctx.allocator, ",");
-                const entry = try std.fmt.allocPrint(ctx.allocator,
+                const entry = try ctx.allocator.print(
                     \\{{"id":{d},"name":"{s}","domain":"{s}","tier":"{s}"}}
                 , .{ t.id, t.name, t.domain, t.tier });
                 defer ctx.allocator.free(entry);
@@ -58,7 +58,7 @@ pub fn TenantApi(comptime Service: type) type {
                 try ctx.sendErrorResponse(400, 0, @errorName(err));
                 return;
             };
-            const resp = try std.fmt.allocPrint(ctx.allocator,
+            const resp = try ctx.allocator.print(
                 \\{{"id":{d},"name":"{s}","domain":"{s}","tier":"{s}"}}
             , .{ tenant.id, tenant.name, tenant.domain, tenant.tier });
             defer ctx.allocator.free(resp);
@@ -71,7 +71,7 @@ pub fn TenantApi(comptime Service: type) type {
                 try ctx.sendErrorResponse(404, 0, "Tenant not found");
                 return;
             };
-            const resp = try std.fmt.allocPrint(ctx.allocator,
+            const resp = try ctx.allocator.print(
                 \\{{"id":{d},"name":"{s}","domain":"{s}","tier":"{s}","status":{d}}}
             , .{ tenant.id, tenant.name, tenant.domain, tenant.tier, tenant.status });
             defer ctx.allocator.free(resp);

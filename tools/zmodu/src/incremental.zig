@@ -46,7 +46,7 @@ pub fn saveManifest(allocator: std.mem.Allocator, io: Io, project_dir: []const u
         if (err != error.PathAlreadyExists) return err;
     };
 
-    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ project_dir, HASH_FILE_NAME });
+    const path = try allocator.print("{s}/{s}", .{ project_dir, HASH_FILE_NAME });
     defer allocator.free(path);
 
     // Build JSON manually

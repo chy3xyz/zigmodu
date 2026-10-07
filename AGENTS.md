@@ -185,6 +185,19 @@ const zigmodu_dep = b.dependency("zigmodu", .{
 | `buf.writer(allocator)` | `allocPrint + appendSlice` pattern |
 | `std.hash.crc.Crc32Iscsi` | `std.hash.crc.@"CRC-32/ISCSI"` (0.17-dev≈1422+); use `@hasDecl` shim if supporting both |
 
+### Zig 0.17.0 — deprecated (still compiles; migrate on sight, removed after 0.18)
+| Deprecated | Replacement |
+|------------|-------------|
+| `std.fmt.allocPrint(a, fmt, args)` | `a.print(fmt, args)` — receiver move, same error set |
+| `std.fmt.allocPrintSentinel(a, fmt, args, s)` | `a.printSentinel(fmt, args, s)` |
+| `std.debug.runtime_safety` | `std.lang.Optimize.runtimeSafety(builtin.mode)` — ask about **your** module's mode |
+| `std.heap.DebugAllocator` | `std.heap.SafeAllocator`（批 141 已迁移两处 harness 根） |
+| `std.meta.hasDecl` / `std.mem.trimRight`/`trimLeft` | `@hasDecl` / `std.mem.trimEnd`/`trimStart` |
+
+> 全仓扫描结论（批 146）：框架 `src/` 已无 `allocPrint`；残留只在 `tools/zmodu`（239）与
+> `examples/`（67）——已一次性迁移 304 处 + 2 处 `runtime_safety`，`zmodu audit` b25 的
+> "分配调用"模式表同步加了 `print(`/`printSentinel(`，否则新拼写会从该规则下漏过。
+
 ### Zig 0.17.0 — patterns to USE
 ```zig
 // ArrayList: .empty + explicit allocator

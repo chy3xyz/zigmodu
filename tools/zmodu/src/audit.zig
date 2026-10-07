@@ -1624,7 +1624,10 @@ fn isAllocatingTryArg(arg: []const u8) bool {
         const after = rest[name.len..];
         if (after.len == 0 or after[0] != '.') continue;
         const call = after[1..];
-        const allocating = [_][]const u8{ "allocPrintSentinel(", "allocPrint(", "alloc(", "dupeZ(", "dupe(" };
+        // `print`/`printSentinel` are the 0.17 spelling of the allocPrint pair
+        // (`Allocator.print`); the legacy names stay listed so un-migrated
+        // downstream code is still caught.
+        const allocating = [_][]const u8{ "allocPrintSentinel(", "allocPrint(", "printSentinel(", "print(", "alloc(", "dupeZ(", "dupe(" };
         for (allocating) |n| {
             if (std.mem.startsWith(u8, call, n)) return true;
         }
@@ -1959,7 +1962,7 @@ fn pushViolation(
         .rule = rule,
         .file = try allocator.dupe(u8, file),
         .line = line,
-        .message = try std.fmt.allocPrint(allocator, fmt, args),
+        .message = try allocator.print(fmt, args),
     });
 }
 
@@ -2174,7 +2177,7 @@ pub fn buildJsonString(
 }
 
 fn appendPrint(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
-    const s = try std.fmt.allocPrint(allocator, fmt, args);
+    const s = try allocator.print(fmt, args);
     defer allocator.free(s);
     try buf.appendSlice(allocator, s);
 }
@@ -2687,10 +2690,10 @@ test "audit b3 covers CTE/pragma/truncate without flagging constant comparisons"
     }
 
     // WITH (CTE) was never checked before.
-    try lintFile(allocator, "persistence.zig", "const q = std.fmt.allocPrint(a, \"WITH t AS (SELECT 1) SELECT * FROM t WHERE n = '{s}'\", .{n});\n", "src/modules/x/persistence.zig", &cfg, &violations);
+    try lintFile(allocator, "persistence.zig", "const q = a.print( \"WITH t AS (SELECT 1) SELECT * FROM t WHERE n = '{s}'\", .{n});\n", "src/modules/x/persistence.zig", &cfg, &violations);
     // PRAGMA and TRUNCATE likewise.
-    try lintFile(allocator, "persistence.zig", "const q = std.fmt.allocPrint(a, \"PRAGMA table_info('{s}')\", .{t});\n", "src/modules/x/persistence.zig", &cfg, &violations);
-    try lintFile(allocator, "persistence.zig", "const q = std.fmt.allocPrint(a, \"TRUNCATE TABLE t WHERE k = '{s}'\", .{k});\n", "src/modules/x/persistence.zig", &cfg, &violations);
+    try lintFile(allocator, "persistence.zig", "const q = a.print( \"PRAGMA table_info('{s}')\", .{t});\n", "src/modules/x/persistence.zig", &cfg, &violations);
+    try lintFile(allocator, "persistence.zig", "const q = a.print( \"TRUNCATE TABLE t WHERE k = '{s}'\", .{k});\n", "src/modules/x/persistence.zig", &cfg, &violations);
     // Positive — a concatenated literal is injectable.
     try lintFile(allocator, "persistence.zig", "const q = \"SELECT * FROM t WHERE a = '\" ++ a ++ \"'\";\n", "src/modules/x/persistence.zig", &cfg, &violations);
     // Negative — `withContext` is not a CTE (word-boundary match).
@@ -2754,8 +2757,15 @@ test "audit b25 flags inline allocations handed to a fallible append/put" {
 
     // b25 — the dupe is built inside the fallible call's argument list.
     try lintFile(allocator, "service.zig", "pub fn f(self: *@This(), allocator: std.mem.Allocator, s: []const u8) !void {\n    try self.items.append(allocator, try allocator.dupe(u8, s));\n}\n", "src/modules/x/service.zig", &cfg, &violations);
-    // b25 — same shape for a map put (self.allocator spelling, allocPrint).
-    try lintFile(allocator, "service.zig", "pub fn g(self: *@This(), k: []const u8, v: V) !void {\n    try self.map.put(self.allocator, try self.allocator.allocPrint(u8, \"{s}\", .{k}), v);\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b25 — same shape for a map put (self.allocator spelling, current
+    // `Allocator.print` — the 0.17 spelling of the pair this rule watches).
+    try lintFile(allocator, "service.zig", "pub fn g(self: *@This(), k: []const u8, v: V) !void {\n    try self.map.put(self.allocator, try self.allocator.print(\"{s}\", .{k}), v);\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b25 negative — the deprecated `std.fmt.allocPrint(allocator, …)` spelling
+    // in argument position is deliberately *not* this needle: the rule keys on
+    // `try <allocator>.<call>(`, and there the allocator is the receiver, not
+    // an argument. Kept as a case so nobody "fixes" the rule into matching the
+    // receiver-less shape by accident.
+    try lintFile(allocator, "service.zig", "pub fn g2(self: *@This(), k: []const u8, v: V) !void {\n    try self.map.put(self.allocator, try std.fmt.allocPrint(self.allocator, \"{s}\", .{k}), v);\n}\n", "src/modules/x/service.zig", &cfg, &violations);
     // b25 negative — the fixed form: a local with its own guard, append last.
     try lintFile(allocator, "service.zig", "pub fn h(self: *@This(), allocator: std.mem.Allocator, s: []const u8) !void {\n    const copy = try allocator.dupe(u8, s);\n    errdefer allocator.free(copy);\n    try self.items.append(allocator, copy);\n}\n", "src/modules/x/service.zig", &cfg, &violations);
     // b25 negative — the consuming helpers are not spelled `.append(` / `.put(`,

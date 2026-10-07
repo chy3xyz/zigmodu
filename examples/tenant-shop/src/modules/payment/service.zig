@@ -105,7 +105,7 @@ pub const PaymentService = struct {
             }
         }
 
-        const payload = try std.fmt.allocPrint(self.allocator,
+        const payload = try self.allocator.print(
             \\{{"payment_id":{d},"order_id":{d},"tenant_id":{d},"amount_cents":{d},"status":"{s}"}}
         , .{ payment_id, cmd.order_id, cmd.tenant_id, order.total_cents, pay_status });
         defer self.allocator.free(payload);

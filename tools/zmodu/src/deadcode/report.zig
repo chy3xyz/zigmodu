@@ -21,7 +21,7 @@ const Buf = struct {
     }
 
     fn print(self: Buf, comptime fmt: []const u8, args: anytype) !void {
-        const s = try std.fmt.allocPrint(self.alloc, fmt, args);
+        const s = try self.alloc.print(fmt, args);
         try self.list.appendSlice(self.alloc, s);
     }
 };

@@ -31,10 +31,10 @@ pub fn WorldApi(comptime Service: type) type {
             const symbol = ctx.queryParam("symbol") orelse "MV";
             const fee = std.fmt.parseInt(i64, ctx.queryParam("entry_fee_cents") orelse "100", 10) catch 100;
             const id = self.svc.create(owner, name, symbol, fee) catch |err| {
-                try ctx.json(400, try std.fmt.allocPrint(ctx.allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}));
+                try ctx.json(400, try ctx.allocator.print("{{\"error\":\"{s}\"}}", .{@errorName(err)}));
                 return;
             };
-            const body = try std.fmt.allocPrint(ctx.allocator, "{{\"id\":{d}}}", .{id});
+            const body = try ctx.allocator.print("{{\"id\":{d}}}", .{id});
             defer ctx.allocator.free(body);
             try ctx.json(201, body);
         }
@@ -55,10 +55,10 @@ pub fn WorldApi(comptime Service: type) type {
                 return;
             };
             const fee = self.svc.visitWorld(wid, did) catch |err| {
-                try ctx.json(400, try std.fmt.allocPrint(ctx.allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}));
+                try ctx.json(400, try ctx.allocator.print("{{\"error\":\"{s}\"}}", .{@errorName(err)}));
                 return;
             };
-            const body = try std.fmt.allocPrint(ctx.allocator, "{{\"fee_cents\":{d}}}", .{fee});
+            const body = try ctx.allocator.print("{{\"fee_cents\":{d}}}", .{fee});
             defer ctx.allocator.free(body);
             try ctx.json(200, body);
         }
@@ -71,7 +71,7 @@ pub fn WorldApi(comptime Service: type) type {
                 return;
             };
             defer self.svc.free(w);
-            const body = try std.fmt.allocPrint(ctx.allocator,
+            const body = try ctx.allocator.print(
                 \\{{"id":{d},"name":"{s}","owner_did":"{s}","visitors":{d},"revenue_cents":{d},"featured_creative_id":{d}}}
             , .{ w.id, w.name, w.owner_did, w.visitor_count, w.revenue_cents, w.featured_creative_id });
             defer ctx.allocator.free(body);

@@ -47,7 +47,7 @@ pub fn UserApi(comptime Service: type) type {
             try buf.appendSlice(ctx.allocator, "{\"users\":[");
             for (users, 0..) |u, i| {
                 if (i > 0) try buf.appendSlice(ctx.allocator, ",");
-                const entry = try std.fmt.allocPrint(ctx.allocator,
+                const entry = try ctx.allocator.print(
                     \\{{"id":{d},"tenant_id":{d},"username":"{s}","email":"{s}","role":"{s}"}}
                 , .{ u.id, u.tenant_id, u.username, u.email, u.role });
                 defer ctx.allocator.free(entry);
@@ -73,7 +73,7 @@ pub fn UserApi(comptime Service: type) type {
                 try ctx.sendErrorResponse(400, 0, @errorName(err));
                 return;
             };
-            const resp = try std.fmt.allocPrint(ctx.allocator,
+            const resp = try ctx.allocator.print(
                 \\{{"id":{d},"tenant_id":{d},"username":"{s}","role":"{s}"}}
             , .{ user.id, user.tenant_id, user.username, user.role });
             defer ctx.allocator.free(resp);
@@ -101,7 +101,7 @@ pub fn UserApi(comptime Service: type) type {
             // must be freed with that one — `ctx.allocator` is the per-request
             // arena, where `free` is a no-op and the row would leak for good.
             defer zigmodu.data.sqlx.freeScanned(self.service.persistence.db.allocator, @TypeOf(user), user);
-            const resp = try std.fmt.allocPrint(ctx.allocator,
+            const resp = try ctx.allocator.print(
                 \\{{"id":{d},"tenant_id":{d},"username":"{s}","email":"{s}","role":"{s}","status":{d}}}
             , .{ user.id, user.tenant_id, user.username, user.email, user.role, user.status });
             defer ctx.allocator.free(resp);

@@ -44,7 +44,7 @@ pub fn InventoryApi(comptime Service: type) type {
             try buf.appendSlice(ctx.allocator, "{\"inventory\":[");
             for (rows, 0..) |r, i| {
                 if (i > 0) try buf.appendSlice(ctx.allocator, ",");
-                const entry = try std.fmt.allocPrint(ctx.allocator,
+                const entry = try ctx.allocator.print(
                     \\{{"product_id":{d},"qty":{d},"reserved":{d}}}
                 , .{ r.product_id, r.qty, r.reserved });
                 defer ctx.allocator.free(entry);

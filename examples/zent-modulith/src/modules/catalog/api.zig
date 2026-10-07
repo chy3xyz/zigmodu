@@ -44,7 +44,7 @@ pub fn CatalogApi(comptime Service: type) type {
         fn createTenant(ctx: *http.Context, self: *State) !void {
             const q = http.extractQuery(ctx, CreateTenantQ) catch |err| return http.respondErr(ctx, err);
             const id = self.svc.createTenant(q.name, q.domain) catch |err| return http.respondErr(ctx, err);
-            const resp = try std.fmt.allocPrint(ctx.allocator, "{{\"id\":{d}}}", .{id});
+            const resp = try ctx.allocator.print("{{\"id\":{d}}}", .{id});
             defer ctx.allocator.free(resp);
             try ctx.json(201, resp);
         }
@@ -55,7 +55,7 @@ pub fn CatalogApi(comptime Service: type) type {
             try buf.appendSlice(ctx.allocator, "{\"products\":[");
             for (rows, 0..) |r, i| {
                 if (i > 0) try buf.appendSlice(ctx.allocator, ",");
-                const entry = try std.fmt.allocPrint(ctx.allocator,
+                const entry = try ctx.allocator.print(
                     \\{{"id":{d},"tenant_id":{d},"name":"{s}","price_cents":{d}}}
                 , .{ r.id, r.tenant_id, r.name, r.price_cents });
                 defer ctx.allocator.free(entry);
@@ -73,7 +73,7 @@ pub fn CatalogApi(comptime Service: type) type {
             try buf.appendSlice(ctx.allocator, "{\"counts\":[");
             for (rows, 0..) |r, i| {
                 if (i > 0) try buf.appendSlice(ctx.allocator, ",");
-                const entry = try std.fmt.allocPrint(ctx.allocator, "{{\"tenant_id\":{d},\"count\":{d}}}", .{ r.tenant_id, r.count });
+                const entry = try ctx.allocator.print("{{\"tenant_id\":{d},\"count\":{d}}}", .{ r.tenant_id, r.count });
                 defer ctx.allocator.free(entry);
                 try buf.appendSlice(ctx.allocator, entry);
             }

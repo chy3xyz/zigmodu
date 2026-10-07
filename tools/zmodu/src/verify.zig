@@ -66,7 +66,7 @@ pub fn verifyProject(allocator: std.mem.Allocator, io: Io, project_dir: []const 
     const integrity = checkModuleIntegrity(allocator, io, project_dir) catch |err| CheckResult{
         .name = "module_integrity",
         .status = .fail,
-        .details = try std.fmt.allocPrint(allocator, "check error: {}", .{err}),
+        .details = try allocator.print("check error: {}", .{err}),
     };
     try checks.append(allocator, integrity);
     if (integrity.status == .warn) {
@@ -80,7 +80,7 @@ pub fn verifyProject(allocator: std.mem.Allocator, io: Io, project_dir: []const 
     const imports = checkImportConsistency(allocator, io, project_dir) catch |err| CheckResult{
         .name = "import_consistency",
         .status = .fail,
-        .details = try std.fmt.allocPrint(allocator, "check error: {}", .{err}),
+        .details = try allocator.print("check error: {}", .{err}),
     };
     try checks.append(allocator, imports);
     if (imports.status == .warn) {
@@ -94,7 +94,7 @@ pub fn verifyProject(allocator: std.mem.Allocator, io: Io, project_dir: []const 
     const compile = checkCompile(allocator, io, project_dir) catch |err| CheckResult{
         .name = "compile",
         .status = .fail,
-        .details = try std.fmt.allocPrint(allocator, "check error: {}", .{err}),
+        .details = try allocator.print("check error: {}", .{err}),
     };
     try checks.append(allocator, compile);
     if (compile.status == .fail) {
@@ -197,13 +197,9 @@ fn checkModuleIntegrity(allocator: std.mem.Allocator, io: Io, project_dir: []con
     }
 
     const details = if (tableless_count == 0)
-        try std.fmt.allocPrint(allocator, "{d} modules found, all complete", .{module_count})
+        try allocator.print("{d} modules found, all complete", .{module_count})
     else
-        try std.fmt.allocPrint(
-            allocator,
-            "{d} modules found, all complete (loose rule: {d} table-less module(s) accepted without persistence.zig: {s})",
-            .{ module_count, tableless_count, tableless_names.items },
-        );
+        try allocator.print("{d} modules found, all complete (loose rule: {d} table-less module(s) accepted without persistence.zig: {s})", .{ module_count, tableless_count, tableless_names.items });
     return CheckResult{
         .name = "module_integrity",
         .status = .pass,
@@ -344,9 +340,9 @@ fn checkCompileWith(
         .cwd = .{ .path = project_dir },
     }) catch |err| {
         const msg = if (err == error.FileNotFound)
-            try std.fmt.allocPrint(allocator, "zig compiler not found in PATH (or project dir {s} missing): {s}", .{ project_dir, @errorName(err) })
+            try allocator.print("zig compiler not found in PATH (or project dir {s} missing): {s}", .{ project_dir, @errorName(err) })
         else
-            try std.fmt.allocPrint(allocator, "failed to run zig build in {s}: {}", .{ project_dir, err });
+            try allocator.print("failed to run zig build in {s}: {}", .{ project_dir, err });
         return CheckResult{
             .name = "compile",
             .status = .fail,
@@ -375,7 +371,7 @@ fn checkCompileWith(
     return CheckResult{
         .name = "compile",
         .status = .fail,
-        .details = try std.fmt.allocPrint(allocator, "zig build failed: {s}", .{first_line}),
+        .details = try allocator.print("zig build failed: {s}", .{first_line}),
     };
 }
 

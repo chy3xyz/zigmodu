@@ -84,7 +84,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, serve: bool) !void {
         .handler = struct {
             fn h(ctx: *http.Context) anyerror!void {
                 const did = ctx.getAttr("did") orelse "?";
-                const body = try std.fmt.allocPrint(ctx.allocator, "{{\"authenticated\":true,\"did\":\"{s}\"}}", .{did});
+                const body = try ctx.allocator.print("{{\"authenticated\":true,\"did\":\"{s}\"}}", .{did});
                 defer ctx.allocator.free(body);
                 try ctx.json(200, body);
             }

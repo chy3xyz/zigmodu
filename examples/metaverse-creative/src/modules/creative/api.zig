@@ -25,7 +25,7 @@ pub fn CreativeApi(comptime Service: type) type {
                 try ctx.json(400, try errJson(ctx, err));
                 return;
             };
-            const body = try std.fmt.allocPrint(ctx.allocator, "{{\"id\":{d}}}", .{id});
+            const body = try ctx.allocator.print("{{\"id\":{d}}}", .{id});
             defer ctx.allocator.free(body);
             try ctx.json(201, body);
         }
@@ -50,7 +50,7 @@ pub fn CreativeApi(comptime Service: type) type {
             try buf.appendSlice(ctx.allocator, "{\"creatives\":[");
             for (rows, 0..) |r, i| {
                 if (i > 0) try buf.appendSlice(ctx.allocator, ",");
-                const entry = try std.fmt.allocPrint(ctx.allocator,
+                const entry = try ctx.allocator.print(
                     \\{{"id":{d},"title":"{s}","owner_did":"{s}","price_cents":{d}}}
                 , .{ r.id, r.title, r.owner_did, r.price_cents });
                 defer ctx.allocator.free(entry);
@@ -73,7 +73,7 @@ pub fn CreativeApi(comptime Service: type) type {
         }
 
         fn errJson(ctx: *http.Context, err: anyerror) ![]const u8 {
-            return try std.fmt.allocPrint(ctx.allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
+            return try ctx.allocator.print("{{\"error\":\"{s}\"}}", .{@errorName(err)});
         }
     };
 }

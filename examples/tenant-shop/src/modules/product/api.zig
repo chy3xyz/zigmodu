@@ -44,7 +44,7 @@ pub fn ProductApi(comptime Service: type) type {
             try buf.appendSlice(ctx.allocator, "{\"products\":[");
             for (products, 0..) |p, i| {
                 if (i > 0) try buf.appendSlice(ctx.allocator, ",");
-                const entry = try std.fmt.allocPrint(ctx.allocator,
+                const entry = try ctx.allocator.print(
                     \\{{"id":{d},"tenant_id":{d},"name":"{s}","price_cents":{d}}}
                 , .{ p.id, p.tenant_id, p.name, p.price_cents });
                 defer ctx.allocator.free(entry);
@@ -66,7 +66,7 @@ pub fn ProductApi(comptime Service: type) type {
                 try ctx.sendErrorResponse(400, 0, @errorName(err));
                 return;
             };
-            const resp = try std.fmt.allocPrint(ctx.allocator,
+            const resp = try ctx.allocator.print(
                 \\{{"id":{d},"tenant_id":{d},"name":"{s}","price_cents":{d}}}
             , .{ p.id, p.tenant_id, p.name, p.price_cents });
             defer ctx.allocator.free(resp);

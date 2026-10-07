@@ -50,7 +50,7 @@ pub fn CartApi(comptime Service: type) type {
             try buf.appendSlice(ctx.allocator, "{\"items\":[");
             for (items, 0..) |it, i| {
                 if (i > 0) try buf.appendSlice(ctx.allocator, ",");
-                const entry = try std.fmt.allocPrint(ctx.allocator,
+                const entry = try ctx.allocator.print(
                     \\{{"product_id":{d},"qty":{d}}}
                 , .{ it.product_id, it.qty });
                 defer ctx.allocator.free(entry);

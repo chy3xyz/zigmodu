@@ -178,7 +178,7 @@ fn renderOpenApi(allocator: std.mem.Allocator, catalog_json: []const u8) ![]u8 {
 
         var post = std.json.ObjectMap{};
         try post.put(a, try a.dupe(u8, "post"), .{ .object = op });
-        const path_key = try std.fmt.allocPrint(a, "/skills/{s}", .{name});
+        const path_key = try a.print("/skills/{s}", .{name});
         try paths.put(a, path_key, .{ .object = post });
     }
     try doc.put(a, try a.dupe(u8, "paths"), .{ .object = paths });

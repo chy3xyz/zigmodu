@@ -51,7 +51,7 @@ pub fn PaymentApi(comptime Service: type) type {
             try buf.appendSlice(ctx.allocator, "{\"payments\":[");
             for (rows, 0..) |p, i| {
                 if (i > 0) try buf.appendSlice(ctx.allocator, ",");
-                const entry = try std.fmt.allocPrint(ctx.allocator,
+                const entry = try ctx.allocator.print(
                     \\{{"id":{d},"order_id":{d},"status":"{s}","amount_cents":{d},"idempotency_key":"{s}"}}
                 , .{ p.id, p.order_id, p.status, p.amount_cents, p.idempotency_key });
                 defer ctx.allocator.free(entry);
@@ -93,7 +93,7 @@ pub fn PaymentApi(comptime Service: type) type {
                 try ctx.sendErrorResponse(400, 0, msg);
                 return;
             };
-            const resp = try std.fmt.allocPrint(ctx.allocator,
+            const resp = try ctx.allocator.print(
                 \\{{"id":{d},"order_id":{d},"status":"{s}","amount_cents":{d}}}
             , .{ payment.id, payment.order_id, payment.status, payment.amount_cents });
             defer ctx.allocator.free(resp);

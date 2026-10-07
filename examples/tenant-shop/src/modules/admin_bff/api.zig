@@ -71,7 +71,7 @@ pub fn AdminBffApi(
             try buf.appendSlice(ctx.allocator, "{\"products\":[");
             for (products, 0..) |p, i| {
                 if (i > 0) try buf.appendSlice(ctx.allocator, ",");
-                const entry = try std.fmt.allocPrint(ctx.allocator,
+                const entry = try ctx.allocator.print(
                     \\{{"id":{d},"name":"{s}","price_cents":{d}}}
                 , .{ p.id, p.name, p.price_cents });
                 defer ctx.allocator.free(entry);
@@ -93,7 +93,7 @@ pub fn AdminBffApi(
                 try ctx.sendErrorResponse(400, 0, @errorName(err));
                 return;
             };
-            const resp = try std.fmt.allocPrint(ctx.allocator,
+            const resp = try ctx.allocator.print(
                 \\{{"id":{d},"tenant_id":{d},"name":"{s}","price_cents":{d}}}
             , .{ p.id, p.tenant_id, p.name, p.price_cents });
             defer ctx.allocator.free(resp);
@@ -113,7 +113,7 @@ pub fn AdminBffApi(
             try buf.appendSlice(ctx.allocator, "{\"inventory\":[");
             for (rows, 0..) |r, i| {
                 if (i > 0) try buf.appendSlice(ctx.allocator, ",");
-                const entry = try std.fmt.allocPrint(ctx.allocator,
+                const entry = try ctx.allocator.print(
                     \\{{"product_id":{d},"qty":{d},"reserved":{d}}}
                 , .{ r.product_id, r.qty, r.reserved });
                 defer ctx.allocator.free(entry);
@@ -155,7 +155,7 @@ pub fn AdminBffApi(
             try buf.appendSlice(ctx.allocator, "{\"orders\":[");
             for (orders, 0..) |o, i| {
                 if (i > 0) try buf.appendSlice(ctx.allocator, ",");
-                const entry = try std.fmt.allocPrint(ctx.allocator,
+                const entry = try ctx.allocator.print(
                     \\{{"id":{d},"user_id":{d},"status":"{s}","total_cents":{d}}}
                 , .{ o.id, o.user_id, o.status, o.total_cents });
                 defer ctx.allocator.free(entry);
@@ -192,7 +192,7 @@ pub fn AdminBffApi(
                 try ctx.sendErrorResponse(500, 0, "drain failed");
                 return;
             };
-            const resp = try std.fmt.allocPrint(ctx.allocator,
+            const resp = try ctx.allocator.print(
                 \\{{"published":{d},"retried":{d},"dlq":{d}}}
             , .{ res.published, res.retried, res.dlq });
             defer ctx.allocator.free(resp);
@@ -223,7 +223,7 @@ pub fn AdminBffApi(
             for (rows, 0..) |r, i| {
                 if (i > 0) try buf.appendSlice(ctx.allocator, ",");
                 const err_s = r.last_error orelse "";
-                const entry = try std.fmt.allocPrint(ctx.allocator,
+                const entry = try ctx.allocator.print(
                     \\{{"id":{d},"topic":"{s}","status":"{s}","retry_count":{d},"max_retries":{d},"last_error":"{s}"}}
                 , .{ r.id, r.topic, r.status, r.retry_count, r.max_retries, err_s });
                 defer ctx.allocator.free(entry);

@@ -44,7 +44,7 @@ pub fn UserApi(comptime Service: type) type {
             try buf.appendSlice(ctx.allocator, "{\"users\":[");
             for (users, 0..) |u, i| {
                 if (i > 0) try buf.appendSlice(ctx.allocator, ",");
-                const entry = try std.fmt.allocPrint(ctx.allocator,
+                const entry = try ctx.allocator.print(
                     \\{{"id":{d},"tenant_id":{d},"username":"{s}","role":"{s}"}}
                 , .{ u.id, u.tenant_id, u.username, u.role });
                 defer ctx.allocator.free(entry);
@@ -69,7 +69,7 @@ pub fn UserApi(comptime Service: type) type {
                 try ctx.sendErrorResponse(400, 0, @errorName(err));
                 return;
             };
-            const resp = try std.fmt.allocPrint(ctx.allocator,
+            const resp = try ctx.allocator.print(
                 \\{{"id":{d},"tenant_id":{d},"username":"{s}","role":"{s}"}}
             , .{ user.id, user.tenant_id, user.username, user.role });
             defer ctx.allocator.free(resp);

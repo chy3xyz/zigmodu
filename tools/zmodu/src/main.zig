@@ -634,8 +634,8 @@ fn cmdUpgrade(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8
             "src/zmodu",
         };
         for (candidates) |c| {
-            const p = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, c });
-            const git_head = try std.fmt.allocPrint(allocator, "{s}/.git/HEAD", .{p});
+            const p = try allocator.print("{s}/{s}", .{ home, c });
+            const git_head = try allocator.print("{s}/.git/HEAD", .{p});
             defer allocator.free(git_head);
             const found = std.Io.Dir.cwd().readFileAlloc(io, git_head, allocator, std.Io.Limit.limited(64));
             if (found) |content| {
@@ -680,7 +680,7 @@ fn cmdUpgrade(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8
         return error.UpgradeFailed;
     }
 
-    const bin = try std.fmt.allocPrint(allocator, "{s}/zig-out/bin/zmodu", .{src_dir.?});
+    const bin = try allocator.print("{s}/zig-out/bin/zmodu", .{src_dir.?});
     defer allocator.free(bin);
     std.log.info("zmodu upgraded. Install: cp {s} ~/.local/bin/zmodu", .{bin});
 }
@@ -1177,7 +1177,7 @@ fn cmdDiff(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !
         }
         try std.Io.Dir.cwd().createDirPath(io, migrations_dir);
         const stamp = migrationStamp(wallClockSeconds());
-        const filename = try std.fmt.allocPrint(allocator, "V{d:0>4}{d:0>2}{d:0>2}{d:0>2}{d:0>2}{d:0>2}__{s}.sql", .{
+        const filename = try allocator.print("V{d:0>4}{d:0>2}{d:0>2}{d:0>2}{d:0>2}{d:0>2}__{s}.sql", .{
             stamp[0], stamp[1], stamp[2], stamp[3], stamp[4], stamp[5], name,
         });
         defer allocator.free(filename);
@@ -1207,7 +1207,7 @@ fn cmdNew(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
     }
 
     // Refuse to overwrite existing projects
-    const existing_zon = try std.fmt.allocPrint(allocator, "{s}/build.zig.zon", .{project_name});
+    const existing_zon = try allocator.print("{s}/build.zig.zon", .{project_name});
     defer allocator.free(existing_zon);
     if (std.Io.Dir.cwd().openFile(io, existing_zon, .{})) |f| {
         f.close(io);
@@ -1228,7 +1228,7 @@ fn cmdNew(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
     };
 
     for (dirs) |dir| {
-        const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ project_name, dir });
+        const full_path = try allocator.print("{s}/{s}", .{ project_name, dir });
         defer allocator.free(full_path);
         try std.Io.Dir.cwd().createDirPath(io, full_path);
     }
@@ -1237,7 +1237,7 @@ fn cmdNew(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
     const build_zig = try generateBuildZig(allocator, project_name, "sqlite");
     defer allocator.free(build_zig);
 
-    const build_path = try std.fmt.allocPrint(allocator, "{s}/build.zig", .{project_name});
+    const build_path = try allocator.print("{s}/build.zig", .{project_name});
     defer allocator.free(build_path);
 
     try writeFile(io, build_path, build_zig);
@@ -1246,7 +1246,7 @@ fn cmdNew(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
     const build_zon = try generateBuildZonImpl(allocator, project_name, null);
     defer allocator.free(build_zon);
 
-    const zon_path = try std.fmt.allocPrint(allocator, "{s}/build.zig.zon", .{project_name});
+    const zon_path = try allocator.print("{s}/build.zig.zon", .{project_name});
     defer allocator.free(zon_path);
 
     try writeFile(io, zon_path, build_zon);
@@ -1257,7 +1257,7 @@ fn cmdNew(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
     const main_zig = try generateMainZig(allocator, project_name);
     defer allocator.free(main_zig);
 
-    const main_path = try std.fmt.allocPrint(allocator, "{s}/src/main.zig", .{project_name});
+    const main_path = try allocator.print("{s}/src/main.zig", .{project_name});
     defer allocator.free(main_path);
 
     try writeFile(io, main_path, main_zig);
@@ -1270,19 +1270,19 @@ fn cmdNew(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
         \\}
         \\
     ;
-    const tests_path = try std.fmt.allocPrint(allocator, "{s}/src/tests.zig", .{project_name});
+    const tests_path = try allocator.print("{s}/src/tests.zig", .{project_name});
     defer allocator.free(tests_path);
     try writeFile(io, tests_path, tests_zig);
 
     // Generate AGENTS.md — AI development guide
     const agents_md = try generateAgentsMd(allocator, project_name);
     defer allocator.free(agents_md);
-    const agents_path = try std.fmt.allocPrint(allocator, "{s}/AGENTS.md", .{project_name});
+    const agents_path = try allocator.print("{s}/AGENTS.md", .{project_name});
     defer allocator.free(agents_path);
     try writeFile(io, agents_path, agents_md);
 
     // Generate .claude/prompts/ directory with AI prompt templates
-    const ai_prompts_dir = try std.fmt.allocPrint(allocator, "{s}/.claude/prompts", .{project_name});
+    const ai_prompts_dir = try allocator.print("{s}/.claude/prompts", .{project_name});
     defer allocator.free(ai_prompts_dir);
     try std.Io.Dir.cwd().createDirPath(io, ai_prompts_dir);
 
@@ -1371,7 +1371,7 @@ fn cmdNew(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
     };
 
     for (prompts) |p| {
-        const p_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ ai_prompts_dir, p.file });
+        const p_path = try allocator.print("{s}/{s}", .{ ai_prompts_dir, p.file });
         defer allocator.free(p_path);
         try writeFile(io, p_path, p.content);
     }
@@ -1425,11 +1425,11 @@ pub fn cmdModule(io: std.Io, allocator: std.mem.Allocator, args: []const []const
     const module_code = try generateModule(allocator, module_name);
     defer allocator.free(module_code);
 
-    const module_dir = try std.fmt.allocPrint(allocator, "src/modules/{s}", .{module_name});
+    const module_dir = try allocator.print("src/modules/{s}", .{module_name});
     defer allocator.free(module_dir);
     try ensureDirGen(io, module_dir, opts);
 
-    const module_path = try std.fmt.allocPrint(allocator, "{s}/module.zig", .{module_dir});
+    const module_path = try allocator.print("{s}/module.zig", .{module_dir});
     defer allocator.free(module_path);
 
     try safeWrite(io, allocator, module_path, module_code, opts);
@@ -1461,7 +1461,7 @@ fn cmdEvent(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) 
     const event_code = try generateEvent(allocator, event_name);
     defer allocator.free(event_code);
 
-    const event_path = try std.fmt.allocPrint(allocator, "src/events/{s}.zig", .{event_name});
+    const event_path = try allocator.print("src/events/{s}.zig", .{event_name});
     defer allocator.free(event_path);
 
     try writeFile(io, event_path, event_code);
@@ -1506,14 +1506,14 @@ fn cmdApi(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
     defer allocator.free(api_code);
 
     const api_path = if (target_module) |mod_name|
-        try std.fmt.allocPrint(allocator, "src/modules/{s}/api_{s}.zig", .{ mod_name, api_name })
+        try allocator.print("src/modules/{s}/api_{s}.zig", .{ mod_name, api_name })
     else
-        try std.fmt.allocPrint(allocator, "src/api/{s}.zig", .{api_name});
+        try allocator.print("src/api/{s}.zig", .{api_name});
     defer allocator.free(api_path);
 
     // Ensure directory exists
     if (target_module) |mod_name| {
-        const dir_path = try std.fmt.allocPrint(allocator, "src/modules/{s}", .{mod_name});
+        const dir_path = try allocator.print("src/modules/{s}", .{mod_name});
         defer allocator.free(dir_path);
         try std.Io.Dir.cwd().createDirPath(io, dir_path);
     }
@@ -1621,7 +1621,7 @@ fn generateBuildZonImpl(allocator: std.mem.Allocator, project_name: []const u8, 
     // The fingerprint is over the *sanitized* `.name` this file actually
     // carries, not the raw `--name`: Zig validates it against the parsed name.
     const fp = fingerprint orelse derivedFingerprintForPackage(pkg);
-    return try std.fmt.allocPrint(allocator,
+    return try allocator.print(
         \\.{{
         \\    .name = .{s},
         \\    .version = "0.1.0",
@@ -2095,7 +2095,7 @@ fn writeModuleSkeleton(
         .{ .name = "module_test.zig", .body = module_test_tpl },
     };
     for (files) |f| {
-        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ module_dir, f.name });
+        const path = try allocator.print("{s}/{s}", .{ module_dir, f.name });
         defer allocator.free(path);
         const body = try orm_tpl.expandTemplate(
             allocator,
@@ -2275,7 +2275,7 @@ fn safeWrite(io: std.Io, allocator: std.mem.Allocator, path: []const u8, content
 
     var new_path_buf: ?[]const u8 = null;
     const target = if (exists and !in_place) blk: {
-        new_path_buf = try std.fmt.allocPrint(allocator, "{s}.gen.new", .{path});
+        new_path_buf = try allocator.print("{s}.gen.new", .{path});
         std.log.info("File exists: generated update at {s}", .{new_path_buf.?});
         break :blk new_path_buf.?;
     } else path;
@@ -2925,7 +2925,7 @@ fn importSqlToDatabaseWith(io: std.Io, allocator: std.mem.Allocator, dsn: []cons
         // same defect class `buildMysqlArgv` was extracted for, one the
         // inline-alloc gate cannot see (it only watches append/put arguments,
         // not `&.{...}` literals).
-        const shell_cmd = try std.fmt.allocPrint(allocator, "sqlite3 '{s}' < '{s}'", .{ db.sqlite_path, tmp_file });
+        const shell_cmd = try allocator.print("sqlite3 '{s}' < '{s}'", .{ db.sqlite_path, tmp_file });
         defer allocator.free(shell_cmd);
         const result = try std.process.run(allocator, io, .{
             .argv = &.{ "sh", "-c", shell_cmd },
@@ -2938,7 +2938,7 @@ fn importSqlToDatabaseWith(io: std.Io, allocator: std.mem.Allocator, dsn: []cons
         }
         std.log.info("SQL imported to SQLite: {s}", .{db.sqlite_path});
     } else if (std.mem.eql(u8, db.driver, "postgresql")) {
-        const port_str = try std.fmt.allocPrint(allocator, "{d}", .{db.port});
+        const port_str = try allocator.print("{d}", .{db.port});
         defer allocator.free(port_str);
         const result = try std.process.run(allocator, io, .{
             .argv = &.{ psql_program, "-h", db.host, "-p", port_str, "-U", db.user, "-d", db.database, "-f", tmp_file },
@@ -2959,9 +2959,9 @@ fn importSqlToDatabaseWith(io: std.Io, allocator: std.mem.Allocator, dsn: []cons
         // the file was sent as `-e source <file>` — `source` is a client builtin
         // and does not exist under `-e`. `--database=` keeps every element an
         // option, and the script goes in on **stdin** instead.
-        const port_str = try std.fmt.allocPrint(allocator, "{d}", .{db.port});
+        const port_str = try allocator.print("{d}", .{db.port});
         defer allocator.free(port_str);
-        const db_arg = try std.fmt.allocPrint(allocator, "--database={s}", .{db.database});
+        const db_arg = try allocator.print("--database={s}", .{db.database});
         defer allocator.free(db_arg);
         try runCliWithStdin(allocator, io, &.{ mysql_program, "-h", db.host, "-P", port_str, "-u", db.user, db_arg }, sql);
         std.log.info("SQL imported to MySQL: {s}/{s}", .{ db.host, db.database });
@@ -3175,7 +3175,7 @@ fn introspectDatabasePostgres(io: std.Io, allocator: std.mem.Allocator, host: []
         tables.deinit(allocator);
     }
 
-    const port_str = try std.fmt.allocPrint(allocator, "{d}", .{port});
+    const port_str = try allocator.print("{d}", .{port});
     defer allocator.free(port_str);
 
     // Query columns from information_schema
@@ -3410,7 +3410,7 @@ fn buildMysqlArgv(allocator: std.mem.Allocator, program: []const u8, host: []con
     try argv.push(allocator, "-h");
     try argv.push(allocator, host);
     try argv.push(allocator, "-P");
-    const port_str = try std.fmt.allocPrint(allocator, "{d}", .{port});
+    const port_str = try allocator.print("{d}", .{port});
     try argv.pushOwned(allocator, port_str);
     try argv.push(allocator, "-u");
     try argv.push(allocator, user);
@@ -3420,7 +3420,7 @@ fn buildMysqlArgv(allocator: std.mem.Allocator, program: []const u8, host: []con
         // Built as an `append` argument this leaked on *every* call, not just on
         // OOM: the list frees only its own backing array, so nothing ever
         // released the formatted `-p<pass>` string.
-        const pass_arg = try std.fmt.allocPrint(allocator, "-p{s}", .{pass});
+        const pass_arg = try allocator.print("-p{s}", .{pass});
         try argv.pushOwned(allocator, pass_arg);
     }
     // The database goes in as an option, never as the one positional argument:
@@ -3431,7 +3431,7 @@ fn buildMysqlArgv(allocator: std.mem.Allocator, program: []const u8, host: []con
     // reproduced here with an extra positional on the 9.3 client, which prints the
     // same banner+usage block). `--database=<name>` leaves every element an
     // option, which is what makes the callers' trailing `-e` order-independent.
-    const db_arg = try std.fmt.allocPrint(allocator, "--database={s}", .{database});
+    const db_arg = try allocator.print("--database={s}", .{database});
     try argv.pushOwned(allocator, db_arg);
     try argv.push(allocator, "-e");
     return argv;
@@ -3484,7 +3484,7 @@ fn introspectDatabaseMysql(io: std.Io, allocator: std.mem.Allocator, host: []con
         // SHOW COLUMNS
         var argv_col = try argv.clone(allocator);
         defer argv_col.deinit(allocator);
-        const col_query = try std.fmt.allocPrint(allocator, "SHOW COLUMNS FROM `{s}`", .{tname});
+        const col_query = try allocator.print("SHOW COLUMNS FROM `{s}`", .{tname});
         try argv_col.pushOwned(allocator, col_query);
         const col_result = try std.process.run(allocator, io, .{ .argv = argv_col.args.items });
         defer allocator.free(col_result.stdout);
@@ -3530,7 +3530,7 @@ fn introspectDatabaseMysql(io: std.Io, allocator: std.mem.Allocator, host: []con
         // FK query
         var argv_fk = try argv.clone(allocator);
         defer argv_fk.deinit(allocator);
-        const fk_query = try std.fmt.allocPrint(allocator,
+        const fk_query = try allocator.print(
             \\SELECT kcu.column_name, kcu.referenced_table_name, kcu.referenced_column_name
             \\FROM information_schema.key_column_usage kcu
             \\WHERE kcu.table_schema = DATABASE() AND kcu.table_name = '{s}' AND kcu.referenced_table_name IS NOT NULL
@@ -4023,7 +4023,7 @@ fn detectSubsystems(allocator: std.mem.Allocator, module_map: *std.StringHashMap
                         // table list the caller lent us.
                         var moved = removed.value;
                         errdefer moved.deinit(allocator);
-                        const new_key = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, remainder });
+                        const new_key = try allocator.print("{s}/{s}", .{ prefix, remainder });
                         errdefer allocator.free(new_key);
                         try module_map.put(new_key, moved);
                     }
@@ -4064,7 +4064,7 @@ fn detectSubsystems(allocator: std.mem.Allocator, module_map: *std.StringHashMap
                     const sub = key[0..slash];
                     const gop = blk: {
                         // Same guard scoping as the prefix key above.
-                        const merge_key = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ sub, parent });
+                        const merge_key = try allocator.print("{s}/{s}", .{ sub, parent });
                         errdefer allocator.free(merge_key);
                         const g = try merge_candidates.getOrPut(merge_key);
                         if (g.found_existing) {
@@ -4277,7 +4277,7 @@ fn generateModuleService(allocator: std.mem.Allocator, module_name: []const u8, 
         const method_name = try toCamelCase(allocator, effective_name);
         defer allocator.free(method_name);
         const list_sfx = if (std.mem.endsWith(u8, model_name, "s") or std.mem.endsWith(u8, model_name, "S")) "" else "s";
-        const list_method = try std.fmt.allocPrint(allocator, "list{s}{s}", .{ model_name, list_sfx });
+        const list_method = try allocator.print("list{s}{s}", .{ model_name, list_sfx });
         defer allocator.free(list_method);
 
         // Tables carrying the tenant column produce models that declare
@@ -4482,16 +4482,16 @@ fn pluralizeRoute(allocator: std.mem.Allocator, singular: []const u8) ![]const u
     if (singular.len == 0) return try allocator.dupe(u8, singular);
     const last = singular[singular.len - 1];
     if (last == 's') return try allocator.dupe(u8, singular); // already plural
-    if (last == 'x' or last == 'z') return try std.fmt.allocPrint(allocator, "{s}es", .{singular});
-    if (std.mem.endsWith(u8, singular, "ch") or std.mem.endsWith(u8, singular, "sh")) return try std.fmt.allocPrint(allocator, "{s}es", .{singular});
+    if (last == 'x' or last == 'z') return try allocator.print("{s}es", .{singular});
+    if (std.mem.endsWith(u8, singular, "ch") or std.mem.endsWith(u8, singular, "sh")) return try allocator.print("{s}es", .{singular});
     if (last == 'y' and singular.len > 1) {
         const prev = singular[singular.len - 2];
         if (prev != 'a' and prev != 'e' and prev != 'i' and prev != 'o' and prev != 'u') {
             const stem = singular[0 .. singular.len - 1];
-            return try std.fmt.allocPrint(allocator, "{s}ies", .{stem});
+            return try allocator.print("{s}ies", .{stem});
         }
     }
-    return try std.fmt.allocPrint(allocator, "{s}s", .{singular});
+    return try allocator.print("{s}s", .{singular});
 }
 
 fn formatNestTuple(allocator: std.mem.Allocator, module_name: []const u8) ![]u8 {
@@ -4586,7 +4586,7 @@ fn generateModuleApi(allocator: std.mem.Allocator, module_name: []const u8, tabl
         defer allocator.free(model_name);
         const pl_sfx = if (std.mem.endsWith(u8, model_name, "s") or std.mem.endsWith(u8, model_name, "S")) "" else "s";
         const path_prefix = if (tables.len == 1) "" else blk: {
-            break :blk try std.fmt.allocPrint(allocator, "{s}/", .{effective_name});
+            break :blk try allocator.print("{s}/", .{effective_name});
         };
         defer if (tables.len > 1) allocator.free(path_prefix);
 
@@ -4786,32 +4786,32 @@ fn replaceChar(allocator: std.mem.Allocator, s: []const u8, from: u8, to: u8) ![
 /// Generate AI context index file (_ai.zig) for a module.
 /// Provides machine-readable metadata: dependencies, tables, API surface, extension points.
 fn writeModuleFiles(io: std.Io, allocator: std.mem.Allocator, out_dir: []const u8, module_name: []const u8, tables: []const TableDef, opts: GenOptions, strip_prefix_len: usize) !void {
-    const module_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ out_dir, module_name });
+    const module_dir = try allocator.print("{s}/{s}", .{ out_dir, module_name });
     defer allocator.free(module_dir);
     try ensureDirGen(io, module_dir, opts);
 
     const model_code = try generateModuleModel(allocator, module_name, tables, strip_prefix_len, opts.json_style, opts.tenant_column);
     defer allocator.free(model_code);
-    const model_path = try std.fmt.allocPrint(allocator, "{s}/model.zig", .{module_dir});
+    const model_path = try allocator.print("{s}/model.zig", .{module_dir});
     defer allocator.free(model_path);
     try safeWrite(io, allocator, model_path, model_code, opts);
 
     const persistence_code = try generateModulePersistence(allocator, module_name, tables, strip_prefix_len);
     defer allocator.free(persistence_code);
-    const persistence_path = try std.fmt.allocPrint(allocator, "{s}/persistence.zig", .{module_dir});
+    const persistence_path = try allocator.print("{s}/persistence.zig", .{module_dir});
     defer allocator.free(persistence_path);
     try safeWrite(io, allocator, persistence_path, persistence_code, opts);
 
     if (!opts.data_only) {
         const service_code = try generateModuleService(allocator, module_name, tables, strip_prefix_len, opts.enable_events, opts.with_transactions, opts.tenant_column);
         defer allocator.free(service_code);
-        const service_path = try std.fmt.allocPrint(allocator, "{s}/service.zig", .{module_dir});
+        const service_path = try allocator.print("{s}/service.zig", .{module_dir});
         defer allocator.free(service_path);
         try safeWrite(io, allocator, service_path, service_code, opts);
 
         const api_code = try generateModuleApi(allocator, module_name, tables, strip_prefix_len, opts.tenant_column);
         defer allocator.free(api_code);
-        const api_path = try std.fmt.allocPrint(allocator, "{s}/api.zig", .{module_dir});
+        const api_path = try allocator.print("{s}/api.zig", .{module_dir});
         defer allocator.free(api_path);
         try safeWrite(io, allocator, api_path, api_code, opts);
 
@@ -4856,7 +4856,7 @@ fn writeModuleFiles(io: std.Io, allocator: std.mem.Allocator, out_dir: []const u
             };
             const test_code = try orm_tpl.expandTemplate(allocator, named, &keys, &vals);
             defer allocator.free(test_code);
-            const test_path = try std.fmt.allocPrint(allocator, "{s}/test.zig", .{module_dir});
+            const test_path = try allocator.print("{s}/test.zig", .{module_dir});
             defer allocator.free(test_path);
             try safeWrite(io, allocator, test_path, test_code, opts);
         }
@@ -4866,7 +4866,7 @@ fn writeModuleFiles(io: std.Io, allocator: std.mem.Allocator, out_dir: []const u
 
         const module_code = try generateModuleZig(allocator, module_name, dependencies_str);
         defer allocator.free(module_code);
-        const module_path = try std.fmt.allocPrint(allocator, "{s}/module.zig", .{module_dir});
+        const module_path = try allocator.print("{s}/module.zig", .{module_dir});
         defer allocator.free(module_path);
         try safeWrite(io, allocator, module_path, module_code, opts);
     }
@@ -5008,21 +5008,21 @@ fn generateZentClient(allocator: std.mem.Allocator, module_name: []const u8, tab
 }
 
 fn writeModuleFilesZent(io: std.Io, allocator: std.mem.Allocator, out_dir: []const u8, module_name: []const u8, tables: []const TableDef, opts: GenOptions) !void {
-    const module_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ out_dir, module_name });
+    const module_dir = try allocator.print("{s}/{s}", .{ out_dir, module_name });
     defer allocator.free(module_dir);
     try ensureDirGen(io, module_dir, opts);
 
     // Generate schema.zig
     const schema_code = try generateZentSchema(allocator, module_name, tables);
     defer allocator.free(schema_code);
-    const schema_path = try std.fmt.allocPrint(allocator, "{s}/schema.zig", .{module_dir});
+    const schema_path = try allocator.print("{s}/schema.zig", .{module_dir});
     defer allocator.free(schema_path);
     try safeWrite(io, allocator, schema_path, schema_code, opts);
 
     // Generate client.zig
     const client_code = try generateZentClient(allocator, module_name, tables);
     defer allocator.free(client_code);
-    const client_path = try std.fmt.allocPrint(allocator, "{s}/client.zig", .{module_dir});
+    const client_path = try allocator.print("{s}/client.zig", .{module_dir});
     defer allocator.free(client_path);
     try safeWrite(io, allocator, client_path, client_code, opts);
 
@@ -5030,7 +5030,7 @@ fn writeModuleFilesZent(io: std.Io, allocator: std.mem.Allocator, out_dir: []con
     defer allocator.free(pascal_mod);
     const module_code = try orm_tpl.expandOrm(allocator, orm_tpl.zent_module_zig, module_name, pascal_mod);
     defer allocator.free(module_code);
-    const module_path = try std.fmt.allocPrint(allocator, "{s}/module.zig", .{module_dir});
+    const module_path = try allocator.print("{s}/module.zig", .{module_dir});
     defer allocator.free(module_path);
     try safeWrite(io, allocator, module_path, module_code, opts);
 
@@ -5249,7 +5249,7 @@ fn cmdLife(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !
     if (std.mem.eql(u8, args[0], "evolve")) {
         const version = if (args.len > 1) args[1] else "v0.2.0";
         const msg = if (args.len > 2) args[2] else "evolution step";
-        const tree_path = try std.fmt.allocPrint(allocator, ".life/tree/{s}.md", .{version});
+        const tree_path = try allocator.print(".life/tree/{s}.md", .{version});
         defer allocator.free(tree_path);
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(allocator);
@@ -5257,7 +5257,7 @@ fn cmdLife(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !
         try writeFile(io, tree_path, buf.items);
         // Update fingerprint file
         const fp_path = ".life/fingerprint.sha256";
-        const fp_val = try std.fmt.allocPrint(allocator, "{s}-{s}\n", .{ version, msg });
+        const fp_val = try allocator.print("{s}-{s}\n", .{ version, msg });
         defer allocator.free(fp_val);
         try writeFile(io, fp_path, fp_val);
         std.log.info("evolved: {s} → .life/tree/{s}.md", .{ msg, version });
@@ -5332,7 +5332,7 @@ fn cmdMigration(io: std.Io, allocator: std.mem.Allocator, args: []const []const 
         }
     }
 
-    const filename = try std.fmt.allocPrint(allocator, "V{d:0>4}{d:0>2}{d:0>2}{d:0>2}{d:0>2}{d:0>2}__{s}.sql", .{
+    const filename = try allocator.print("V{d:0>4}{d:0>2}{d:0>2}{d:0>2}{d:0>2}{d:0>2}__{s}.sql", .{
         stamp[0], stamp[1], stamp[2], stamp[3], stamp[4], stamp[5], safe_name.items,
     });
     defer allocator.free(filename);
@@ -5348,7 +5348,7 @@ fn cmdMigration(io: std.Io, allocator: std.mem.Allocator, args: []const []const 
         }
         return err;
     };
-    const content = try std.fmt.allocPrint(allocator,
+    const content = try allocator.print(
         \\-- version: {d:0>4}{d:0>2}{d:0>2}{d:0>2}{d:0>2}{d:0>2}
         \\-- description: {s}
         \\-- rollback: (define rollback SQL)
@@ -5797,7 +5797,7 @@ fn cmdTest(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !
     const module_name = parsed.module_name;
     const out_dir = parsed.out_dir;
 
-    const mod_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ out_dir, module_name });
+    const mod_dir = try allocator.print("{s}/{s}", .{ out_dir, module_name });
     defer allocator.free(mod_dir);
     // A failed mkdir is the writer's problem, not a warning to swallow: without
     // the directory the write below fails anyway, just with a worse message.
@@ -5805,7 +5805,7 @@ fn cmdTest(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !
         std.log.err("Cannot create {s}: {s}", .{ mod_dir, @errorName(err) });
         return err;
     };
-    const fp = try std.fmt.allocPrint(allocator, "{s}/test.zig", .{mod_dir});
+    const fp = try allocator.print("{s}/test.zig", .{mod_dir});
     defer allocator.free(fp);
 
     if (std.Io.Dir.cwd().openFile(io, fp, .{})) |_| {
@@ -6153,7 +6153,7 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
     }
 
     // 3. Create project directory structure
-    const project_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ sopts.out_dir, sopts.project_name });
+    const project_dir = try allocator.print("{s}/{s}", .{ sopts.out_dir, sopts.project_name });
     defer allocator.free(project_dir);
 
     if (sopts.dry_run) {
@@ -6163,7 +6163,7 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
     }
 
     // 4. Generate modules under src/modules/
-    const modules_dir = try std.fmt.allocPrint(allocator, "{s}/src/modules", .{project_dir});
+    const modules_dir = try allocator.print("{s}/src/modules", .{project_dir});
     defer allocator.free(modules_dir);
     // The manifest is loaded once here; `safeWrite` consults it per file to tell
     // a file we generated (and nobody touched) from one the user edited.
@@ -6181,7 +6181,7 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
 
         // ext/ removed — AI modifies generated files directly.
         if (false) {
-            const ext_dir = try std.fmt.allocPrint(allocator, "{s}/{s}/ext", .{ modules_dir, mod_name });
+            const ext_dir = try allocator.print("{s}/{s}/ext", .{ modules_dir, mod_name });
             defer allocator.free(ext_dir);
             try ensureDirGen(io, ext_dir, gen_opts);
 
@@ -6189,7 +6189,7 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
             defer allocator.free(var_name);
             const pascal_mod = try toPascalCase(allocator, mod_name);
             defer allocator.free(pascal_mod);
-            const ext_svc = try std.fmt.allocPrint(allocator,
+            const ext_svc = try allocator.print(
                 \\// {s} service extension — add custom business logic here.
                 \\// @initialized — AI may modify freely.
                 \\const std = @import("std");
@@ -6209,7 +6209,7 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
                 \\
             , .{ mod_name, pascal_mod, pascal_mod, pascal_mod, pascal_mod });
             defer allocator.free(ext_svc);
-            const ext_svc_path = try std.fmt.allocPrint(allocator, "{s}/service.zig", .{ext_dir});
+            const ext_svc_path = try allocator.print("{s}/service.zig", .{ext_dir});
             defer allocator.free(ext_svc_path);
             if (!fileExists(io, ext_svc_path)) try safeWrite(io, allocator, ext_svc_path, ext_svc, gen_opts);
 
@@ -6228,7 +6228,7 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
             try ext_path_buf.appendSlice(allocator, "shared/response.zig");
             const shared_ext_import = ext_path_buf.items;
 
-            const ext_api = try std.fmt.allocPrint(allocator,
+            const ext_api = try allocator.print(
                 \\// {s} custom API endpoints — add business routes here.
                 \\// @initialized — AI may modify freely.
                 \\const std = @import("std");
@@ -6293,7 +6293,7 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
                 \\
             , .{ mod_name, shared_ext_import, pascal_mod, pascal_mod, pascal_mod, pascal_mod, pascal_mod, mod_name, pascal_mod, pascal_mod, pascal_mod, pascal_mod, pascal_mod });
             defer allocator.free(ext_api);
-            const ext_api_path = try std.fmt.allocPrint(allocator, "{s}/api.zig", .{ext_dir});
+            const ext_api_path = try allocator.print("{s}/api.zig", .{ext_dir});
             defer allocator.free(ext_api_path);
             if (!fileExists(io, ext_api_path)) try safeWrite(io, allocator, ext_api_path, ext_api, gen_opts);
         } // if (false) — ext/ removed
@@ -6301,17 +6301,17 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
 
     // 4.5 Generate marketing module group (--with-marketing)
     if (sopts.with_marketing) {
-        const marketing_dir = try std.fmt.allocPrint(allocator, "{s}/marketing", .{modules_dir});
+        const marketing_dir = try allocator.print("{s}/marketing", .{modules_dir});
         defer allocator.free(marketing_dir);
         try ensureDirGen(io, marketing_dir, gen_opts);
 
         const marketing_subs = [_][]const u8{ "coupon", "promotion", "points", "affiliate", "recommendation" };
         for (marketing_subs) |sub| {
-            const sub_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ marketing_dir, sub });
+            const sub_dir = try allocator.print("{s}/{s}", .{ marketing_dir, sub });
             defer allocator.free(sub_dir);
             try ensureDirGen(io, sub_dir, gen_opts);
 
-            const sub_mod = try std.fmt.allocPrint(allocator,
+            const sub_mod = try allocator.print(
                 \\const std = @import("std");
                 \\const zigmodu = @import("zigmodu");
                 \\
@@ -6327,19 +6327,19 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
                 \\
             , .{ sub, sub, sub, sub });
             defer allocator.free(sub_mod);
-            const sub_path = try std.fmt.allocPrint(allocator, "{s}/module.zig", .{sub_dir});
+            const sub_path = try allocator.print("{s}/module.zig", .{sub_dir});
             defer allocator.free(sub_path);
             try safeWrite(io, allocator, sub_path, sub_mod, gen_opts);
         }
 
         // Generate hot_reload/targets/ for marketing rules
-        const hot_dir = try std.fmt.allocPrint(allocator, "{s}/hot_reload/targets", .{project_dir});
+        const hot_dir = try allocator.print("{s}/hot_reload/targets", .{project_dir});
         defer allocator.free(hot_dir);
         try ensureDirGen(io, hot_dir, gen_opts);
 
         const hot_rules = [_][]const u8{ "coupon_rules.zig", "promotion_rules.zig", "ab_test_config.zig" };
         for (hot_rules) |rule_file| {
-            const rule_content = try std.fmt.allocPrint(allocator,
+            const rule_content = try allocator.print(
                 \\// Hot-reloadable {s} — edit without restarting the server.
                 \\// Watched by: zigmodu.HotReloader
                 \\pub const Rules = struct {{
@@ -6348,7 +6348,7 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
                 \\
             , .{rule_file});
             defer allocator.free(rule_content);
-            const rule_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ hot_dir, rule_file });
+            const rule_path = try allocator.print("{s}/{s}", .{ hot_dir, rule_file });
             defer allocator.free(rule_path);
             try safeWrite(io, allocator, rule_path, rule_content, gen_opts);
         }
@@ -6370,20 +6370,20 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
             \\}
             \\
         ;
-        const watcher_path = try std.fmt.allocPrint(allocator, "{s}/hot_reload/watcher.zig", .{project_dir});
+        const watcher_path = try allocator.print("{s}/hot_reload/watcher.zig", .{project_dir});
         defer allocator.free(watcher_path);
         try safeWrite(io, allocator, watcher_path, watcher_content, gen_opts);
 
         // Generate plugins/ directory
-        const plugins_dir = try std.fmt.allocPrint(allocator, "{s}/plugins", .{project_dir});
+        const plugins_dir = try allocator.print("{s}/plugins", .{project_dir});
         defer allocator.free(plugins_dir);
         try ensureDirGen(io, plugins_dir, gen_opts);
 
-        const premium_dir = try std.fmt.allocPrint(allocator, "{s}/premium", .{plugins_dir});
+        const premium_dir = try allocator.print("{s}/premium", .{plugins_dir});
         defer allocator.free(premium_dir);
         try ensureDirGen(io, premium_dir, gen_opts);
 
-        const community_dir = try std.fmt.allocPrint(allocator, "{s}/community", .{plugins_dir});
+        const community_dir = try allocator.print("{s}/community", .{plugins_dir});
         defer allocator.free(community_dir);
         try ensureDirGen(io, community_dir, gen_opts);
 
@@ -6411,7 +6411,7 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
             \\}
             \\
         ;
-        const manifest_path = try std.fmt.allocPrint(allocator, "{s}/manifest.zig", .{plugins_dir});
+        const manifest_path = try allocator.print("{s}/manifest.zig", .{plugins_dir});
         defer allocator.free(manifest_path);
         try safeWrite(io, allocator, manifest_path, manifest_content, gen_opts);
 
@@ -6421,28 +6421,28 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
     // 5. Generate build.zig
     const build_zig = try generateBuildZig(allocator, sopts.project_name, scaffoldDbLinkOption(sopts.db_dsn));
     defer allocator.free(build_zig);
-    const build_path = try std.fmt.allocPrint(allocator, "{s}/build.zig", .{project_dir});
+    const build_path = try allocator.print("{s}/build.zig", .{project_dir});
     defer allocator.free(build_path);
     try safeWrite(io, allocator, build_path, build_zig, gen_opts);
 
     // 6. Generate build.zig.zon
     const build_zon = try generateBuildZonImpl(allocator, sopts.project_name, null);
     defer allocator.free(build_zon);
-    const zon_path = try std.fmt.allocPrint(allocator, "{s}/build.zig.zon", .{project_dir});
+    const zon_path = try allocator.print("{s}/build.zig.zon", .{project_dir});
     defer allocator.free(zon_path);
     try safeWrite(io, allocator, zon_path, build_zon, gen_opts);
 
     // 7. Generate src/main.zig with all module wiring
     const main_zig = try generateScaffoldMainZig(allocator, sopts.project_name, module_names.items, sopts);
     defer allocator.free(main_zig);
-    const main_path = try std.fmt.allocPrint(allocator, "{s}/src/main.zig", .{project_dir});
+    const main_path = try allocator.print("{s}/src/main.zig", .{project_dir});
     defer allocator.free(main_path);
     try safeWrite(io, allocator, main_path, main_zig, gen_opts);
 
     // 8. Generate src/tests.zig
     const tests_zig = try generateScaffoldTestsZig(allocator, module_names.items, &module_map, scaffold_prefix_len);
     defer allocator.free(tests_zig);
-    const tests_path = try std.fmt.allocPrint(allocator, "{s}/src/tests.zig", .{project_dir});
+    const tests_path = try allocator.print("{s}/src/tests.zig", .{project_dir});
     defer allocator.free(tests_path);
     try safeWrite(io, allocator, tests_path, tests_zig, gen_opts);
 
@@ -6460,12 +6460,12 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
         try sh_buf.print(allocator, "echo \"=== {s} ===\"\necho \"  POST /{s}\"\nR=$(curl -sf -X POST $BASE/{s} -H 'Content-Type: application/json' -d '{{\"name\":\"test_{s}\"}}' 2>&1)\necho \"  $R\"\ncurl -sf $BASE/{s} | head -c 80 && echo \"\"\necho \"  PASS: {s}\"\n\n", .{ mod_name, plural, plural, var_name, plural, mod_name });
     }
     try sh_buf.appendSlice(allocator, "echo \"=== ALL PASS ===\"\n");
-    const sh_path = try std.fmt.allocPrint(allocator, "{s}/test_api.sh", .{project_dir});
+    const sh_path = try allocator.print("{s}/test_api.sh", .{project_dir});
     defer allocator.free(sh_path);
     try safeWrite(io, allocator, sh_path, sh_buf.items, gen_opts);
 
     // 9. Generate src/business/module.zig (skeleton)
-    const biz_dir = try std.fmt.allocPrint(allocator, "{s}/src/business", .{project_dir});
+    const biz_dir = try allocator.print("{s}/src/business", .{project_dir});
     defer allocator.free(biz_dir);
     try ensureDirGen(io, biz_dir, gen_opts);
 
@@ -6476,17 +6476,17 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
     try biz_root_buf.appendSlice(allocator, "// Example: pub const order_flow = @import(\"order_flow.zig\");\n");
     const biz_root = try biz_root_buf.toOwnedSlice(allocator);
     defer allocator.free(biz_root);
-    const biz_root_path = try std.fmt.allocPrint(allocator, "{s}/root.zig", .{biz_dir});
+    const biz_root_path = try allocator.print("{s}/root.zig", .{biz_dir});
     defer allocator.free(biz_root_path);
     try safeWrite(io, allocator, biz_root_path, biz_root, gen_opts);
 
     // 10. Generate src/shared/ (shared kernel)
-    const shared_dir = try std.fmt.allocPrint(allocator, "{s}/src/shared", .{project_dir});
+    const shared_dir = try allocator.print("{s}/src/shared", .{project_dir});
     defer allocator.free(shared_dir);
     try ensureDirGen(io, shared_dir, gen_opts);
 
     // shared/types.zig — cross-module shared types
-    const shared_types = try std.fmt.allocPrint(allocator,
+    const shared_types = try allocator.print(
         \\//! Shared types — used across modules.
         \\
         \\pub const SortDir = enum {{ asc, desc }};
@@ -6503,12 +6503,12 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
         \\
     , .{});
     defer allocator.free(shared_types);
-    const shared_types_path = try std.fmt.allocPrint(allocator, "{s}/types.zig", .{shared_dir});
+    const shared_types_path = try allocator.print("{s}/types.zig", .{shared_dir});
     defer allocator.free(shared_types_path);
     try safeWrite(io, allocator, shared_types_path, shared_types, gen_opts);
 
     // shared/errors.zig — unified error types
-    const shared_errors = try std.fmt.allocPrint(allocator,
+    const shared_errors = try allocator.print(
         \\//! Unified error types — used across modules.
         \\pub const AppError = error{{
         \\    NotFound,
@@ -6532,7 +6532,7 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
         \\
     , .{});
     defer allocator.free(shared_errors);
-    const shared_errors_path = try std.fmt.allocPrint(allocator, "{s}/errors.zig", .{shared_dir});
+    const shared_errors_path = try allocator.print("{s}/errors.zig", .{shared_dir});
     defer allocator.free(shared_errors_path);
     try safeWrite(io, allocator, shared_errors_path, shared_errors, gen_opts);
 
@@ -6540,16 +6540,16 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
     var shared_buf: std.ArrayList(u8) = .empty;
     defer shared_buf.deinit(allocator);
     try shared_buf.appendSlice(allocator, "//! RuoYi-style API response helpers\nconst std = @import(\"std\");\nconst http = @import(\"zigmodu\").http;\nconst BizCode = @import(\"errors.zig\").BizCode;\n\n");
-    try shared_buf.appendSlice(allocator, "pub fn wrapOk(ctx: *http.Context, value: anytype) !void {\n    const inner = try std.json.Stringify.valueAlloc(ctx.allocator, value, .{});\n    defer ctx.allocator.free(inner);\n    const json = try std.fmt.allocPrint(ctx.allocator, \"{{\\\"code\\\":0,\\\"msg\\\":\\\"\\\",\\\"data\\\":{s}}}\", .{inner});\n    defer ctx.allocator.free(json);\n    try ctx.json(200, json);\n}\n\n");
-    try shared_buf.appendSlice(allocator, "pub fn wrapList(ctx: *http.Context, result: anytype) !void {\n    const inner = try std.json.Stringify.valueAlloc(ctx.allocator, result.items, .{});\n    defer ctx.allocator.free(inner);\n    const json = try std.fmt.allocPrint(ctx.allocator, \"{{\\\"code\\\":0,\\\"msg\\\":\\\"\\\",\\\"data\\\":{{\\\"list\\\":{s},\\\"total\\\":{d}}}}}\", .{ inner, result.total });\n    defer ctx.allocator.free(json);\n    try ctx.json(200, json);\n}\n\n");
+    try shared_buf.appendSlice(allocator, "pub fn wrapOk(ctx: *http.Context, value: anytype) !void {\n    const inner = try std.json.Stringify.valueAlloc(ctx.allocator, value, .{});\n    defer ctx.allocator.free(inner);\n    const json = try ctx.allocator.print( \"{{\\\"code\\\":0,\\\"msg\\\":\\\"\\\",\\\"data\\\":{s}}}\", .{inner});\n    defer ctx.allocator.free(json);\n    try ctx.json(200, json);\n}\n\n");
+    try shared_buf.appendSlice(allocator, "pub fn wrapList(ctx: *http.Context, result: anytype) !void {\n    const inner = try std.json.Stringify.valueAlloc(ctx.allocator, result.items, .{});\n    defer ctx.allocator.free(inner);\n    const json = try ctx.allocator.print( \"{{\\\"code\\\":0,\\\"msg\\\":\\\"\\\",\\\"data\\\":{{\\\"list\\\":{s},\\\"total\\\":{d}}}}}\", .{ inner, result.total });\n    defer ctx.allocator.free(json);\n    try ctx.json(200, json);\n}\n\n");
     // A plain string literal, not a format string: `{{`/`}}` would reach the
     // response body verbatim and produce JSON no parser accepts (the three
     // helpers above escape them because they *are* format strings).
     try shared_buf.appendSlice(allocator, "pub fn wrapSuccess(ctx: *http.Context) !void {\n    try ctx.json(200, \"{\\\"code\\\":0,\\\"msg\\\":\\\"\\\",\\\"data\\\":null}\");\n}\n\n");
-    try shared_buf.appendSlice(allocator, "pub fn wrapErr(ctx: *http.Context, code: BizCode, errmsg: []const u8) !void {\n    const json = try std.fmt.allocPrint(ctx.allocator, \"{{\\\"code\\\":{d},\\\"msg\\\":\\\"{s}\\\",\\\"data\\\":null}}\", .{ @backingInt(code), errmsg });\n    defer ctx.allocator.free(json);\n    try ctx.json(200, json);\n}\n");
+    try shared_buf.appendSlice(allocator, "pub fn wrapErr(ctx: *http.Context, code: BizCode, errmsg: []const u8) !void {\n    const json = try ctx.allocator.print( \"{{\\\"code\\\":{d},\\\"msg\\\":\\\"{s}\\\",\\\"data\\\":null}}\", .{ @backingInt(code), errmsg });\n    defer ctx.allocator.free(json);\n    try ctx.json(200, json);\n}\n");
     const shared_response = try shared_buf.toOwnedSlice(allocator);
     defer allocator.free(shared_response);
-    const shared_response_path = try std.fmt.allocPrint(allocator, "{s}/response.zig", .{shared_dir});
+    const shared_response_path = try allocator.print("{s}/response.zig", .{shared_dir});
     defer allocator.free(shared_response_path);
     try safeWrite(io, allocator, shared_response_path, shared_response, gen_opts);
 
@@ -6573,7 +6573,7 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
         try evt_buf.appendSlice(allocator, "};\n");
         const shared_events = try evt_buf.toOwnedSlice(allocator);
         defer allocator.free(shared_events);
-        const shared_events_path = try std.fmt.allocPrint(allocator, "{s}/events.zig", .{shared_dir});
+        const shared_events_path = try allocator.print("{s}/events.zig", .{shared_dir});
         defer allocator.free(shared_events_path);
         try safeWrite(io, allocator, shared_events_path, shared_events, gen_opts);
     }
@@ -6605,19 +6605,19 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
         \\ORDER_REFUND_DAYS=7
         \\
     ;
-    const env_path = try std.fmt.allocPrint(allocator, "{s}/.env.example", .{project_dir});
+    const env_path = try allocator.print("{s}/.env.example", .{project_dir});
     defer allocator.free(env_path);
     try safeWrite(io, allocator, env_path, env_example, gen_opts);
 
     // 11. Generate AGENTS.md — AI development guide
     const agents_md = try generateAgentsMd(allocator, sopts.project_name);
     defer allocator.free(agents_md);
-    const agents_path = try std.fmt.allocPrint(allocator, "{s}/AGENTS.md", .{project_dir});
+    const agents_path = try allocator.print("{s}/AGENTS.md", .{project_dir});
     defer allocator.free(agents_path);
     try safeWrite(io, allocator, agents_path, agents_md, gen_opts);
 
     // 12. Generate .claude/prompts/ directory with AI task templates
-    const ai_dir = try std.fmt.allocPrint(allocator, "{s}/.claude/prompts", .{project_dir});
+    const ai_dir = try allocator.print("{s}/.claude/prompts", .{project_dir});
     defer allocator.free(ai_dir);
     try ensureDirGen(io, ai_dir, gen_opts);
 
@@ -6640,7 +6640,7 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
         \\- Lifecycle: .build(.{ ..., <name>, ... })
         \\
     ;
-    const amp_path = try std.fmt.allocPrint(allocator, "{s}/add_module.md", .{ai_dir});
+    const amp_path = try allocator.print("{s}/add_module.md", .{ai_dir});
     defer allocator.free(amp_path);
     try safeWrite(io, allocator, amp_path, add_mod_prompt, gen_opts);
 
@@ -6660,7 +6660,7 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
         \\- Health: registerHealthChecks() + HealthEndpoint in main.zig
         \\
     , .{ZMODU_VERSION});
-    const ctx_path = try std.fmt.allocPrint(allocator, "{s}/context.md", .{ai_dir});
+    const ctx_path = try allocator.print("{s}/context.md", .{ai_dir});
     defer allocator.free(ctx_path);
     try safeWrite(io, allocator, ctx_path, ctx_prompt, gen_opts);
 
@@ -6668,18 +6668,18 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
     try generateLifeDir(io, allocator, project_dir, sopts.project_name, tables.len, module_names.items.len, gen_opts);
 
     // 12c. Generate src/plugins/ — stub plugin directory + manifest
-    const plugins_dir = try std.fmt.allocPrint(allocator, "{s}/src/plugins", .{project_dir});
+    const plugins_dir = try allocator.print("{s}/src/plugins", .{project_dir});
     defer allocator.free(plugins_dir);
     try ensureDirGen(io, plugins_dir, gen_opts);
-    const pmf_path = try std.fmt.allocPrint(allocator, "{s}/manifest.json", .{plugins_dir});
+    const pmf_path = try allocator.print("{s}/manifest.json", .{plugins_dir});
     defer allocator.free(pmf_path);
     try safeWrite(io, allocator, pmf_path, "{\n  \"stubs\": []\n}\n", gen_opts);
 
     if (sopts.with_redis) {
-        const rd_dir = try std.fmt.allocPrint(allocator, "{s}/redis", .{plugins_dir});
+        const rd_dir = try allocator.print("{s}/redis", .{plugins_dir});
         defer allocator.free(rd_dir);
         try ensureDirGen(io, rd_dir, gen_opts);
-        const rd_path = try std.fmt.allocPrint(allocator, "{s}/stub.zig", .{rd_dir});
+        const rd_path = try allocator.print("{s}/stub.zig", .{rd_dir});
         defer allocator.free(rd_path);
         try safeWrite(io, allocator, rd_path,
             \\// Redis plugin — STUB | Priority: P2
@@ -6779,15 +6779,15 @@ fn saveGeneratedHashes(
 }
 
 fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []const u8, gen_opts: GenOptions) !void {
-    const dir = try std.fmt.allocPrint(allocator, "{s}/src/modules/ai/chat", .{project_dir});
+    const dir = try allocator.print("{s}/src/modules/ai/chat", .{project_dir});
     defer allocator.free(dir);
     try ensureDirGen(io, dir, gen_opts);
-    const ext_dir = try std.fmt.allocPrint(allocator, "{s}/ext", .{dir});
+    const ext_dir = try allocator.print("{s}/ext", .{dir});
     defer allocator.free(ext_dir);
     try ensureDirGen(io, ext_dir, gen_opts);
 
     // ── module.zig ──
-    const mod_path = try std.fmt.allocPrint(allocator, "{s}/module.zig", .{dir});
+    const mod_path = try allocator.print("{s}/module.zig", .{dir});
     defer allocator.free(mod_path);
     try safeWrite(io, allocator, mod_path,
         \\//! AI Chat module — LLM-powered conversations
@@ -6811,7 +6811,7 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     , gen_opts);
 
     // ── model.zig ──
-    const model_path = try std.fmt.allocPrint(allocator, "{s}/model.zig", .{dir});
+    const model_path = try allocator.print("{s}/model.zig", .{dir});
     defer allocator.free(model_path);
     try safeWrite(io, allocator, model_path,
         \\pub const AiConversation = struct {
@@ -6828,7 +6828,7 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     , gen_opts);
 
     // ── persistence.zig ──
-    const pers_path = try std.fmt.allocPrint(allocator, "{s}/persistence.zig", .{dir});
+    const pers_path = try allocator.print("{s}/persistence.zig", .{dir});
     defer allocator.free(pers_path);
     try safeWrite(io, allocator, pers_path,
         \\const std = @import("std");
@@ -6843,7 +6843,7 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     , gen_opts);
 
     // ── provider.zig ──
-    const prov_path = try std.fmt.allocPrint(allocator, "{s}/provider.zig", .{dir});
+    const prov_path = try allocator.print("{s}/provider.zig", .{dir});
     defer allocator.free(prov_path);
     try safeWrite(io, allocator, prov_path,
         \\//! @initialized by zmodu — AI may modify freely
@@ -6854,7 +6854,7 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     , gen_opts);
 
     // ── sse.zig ──
-    const sse_path = try std.fmt.allocPrint(allocator, "{s}/sse.zig", .{dir});
+    const sse_path = try allocator.print("{s}/sse.zig", .{dir});
     defer allocator.free(sse_path);
     try safeWrite(io, allocator, sse_path,
         \\//! @initialized by zmodu — AI may modify freely
@@ -6863,7 +6863,7 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     , gen_opts);
 
     // ── service.zig ──
-    const svc_path = try std.fmt.allocPrint(allocator, "{s}/service.zig", .{dir});
+    const svc_path = try allocator.print("{s}/service.zig", .{dir});
     defer allocator.free(svc_path);
     try safeWrite(io, allocator, svc_path,
         \\const std = @import("std");
@@ -6925,7 +6925,7 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
         \\        if (!prov.fitsBudget(msgs, self.context_limit)) {
         \\            const summary = try self.summarizeHistory(conv_id);
         \\            defer self.allocator.free(summary);
-        \\            const summary_prefix = try std.fmt.allocPrint(self.allocator, "Previous conversation: {s}", .{summary});
+        \\            const summary_prefix = try self.allocator.print( "Previous conversation: {s}", .{summary});
         \\            defer self.allocator.free(summary_prefix);
         \\            const slim_history = &[_]provider_mod.ChatMsg{
         \\                .{ .role = "system", .content = summary_prefix },
@@ -7004,7 +7004,7 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     , gen_opts);
 
     // ── api.zig ──
-    const api_path = try std.fmt.allocPrint(allocator, "{s}/api.zig", .{dir});
+    const api_path = try allocator.print("{s}/api.zig", .{dir});
     defer allocator.free(api_path);
     try safeWrite(io, allocator, api_path,
         \\const std = @import("std");
@@ -7063,7 +7063,7 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     , gen_opts);
 
     // ── ext/service.zig ──
-    const esvc_path = try std.fmt.allocPrint(allocator, "{s}/ext/service.zig", .{dir});
+    const esvc_path = try allocator.print("{s}/ext/service.zig", .{dir});
     defer allocator.free(esvc_path);
     if (false) {
         if (!fileExists(io, esvc_path)) try safeWrite(io, allocator, esvc_path,
@@ -7078,7 +7078,7 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     } // if(false) — ext/ removed
 
     // ── ext/api.zig ──
-    const eapi_path = try std.fmt.allocPrint(allocator, "{s}/ext/api.zig", .{dir});
+    const eapi_path = try allocator.print("{s}/ext/api.zig", .{dir});
     defer allocator.free(eapi_path);
     if (false) {
         if (!fileExists(io, eapi_path)) try safeWrite(io, allocator, eapi_path,
@@ -7096,7 +7096,7 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     } // if(false) — ext/ removed
 
     // ── tests.zig ──
-    const test_path = try std.fmt.allocPrint(allocator, "{s}/tests.zig", .{dir});
+    const test_path = try allocator.print("{s}/tests.zig", .{dir});
     defer allocator.free(test_path);
     if (!fileExists(io, test_path)) try safeWrite(io, allocator, test_path,
         \\const std = @import("std"); const testing = std.testing; const zigmodu = @import("zigmodu"); const model = @import("model.zig"); const provider = @import("provider.zig");
@@ -7108,7 +7108,7 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     , gen_opts);
 
     // ── README.md ──
-    const rm_path = try std.fmt.allocPrint(allocator, "{s}/README.md", .{dir});
+    const rm_path = try allocator.print("{s}/README.md", .{dir});
     defer allocator.free(rm_path);
     if (!fileExists(io, rm_path)) try safeWrite(io, allocator, rm_path,
         \\# AI Chat Module
@@ -7147,15 +7147,15 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
 }
 
 fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []const u8, gen_opts: GenOptions) !void {
-    const dir = try std.fmt.allocPrint(allocator, "{s}/src/modules/ai/agent", .{project_dir});
+    const dir = try allocator.print("{s}/src/modules/ai/agent", .{project_dir});
     defer allocator.free(dir);
     try ensureDirGen(io, dir, gen_opts);
-    const ext_dir = try std.fmt.allocPrint(allocator, "{s}/ext", .{dir});
+    const ext_dir = try allocator.print("{s}/ext", .{dir});
     defer allocator.free(ext_dir);
     try ensureDirGen(io, ext_dir, gen_opts);
 
     // ── module.zig ──
-    const mod_path = try std.fmt.allocPrint(allocator, "{s}/module.zig", .{dir});
+    const mod_path = try allocator.print("{s}/module.zig", .{dir});
     defer allocator.free(mod_path);
     try safeWrite(io, allocator, mod_path,
         \\const std = @import("std"); const zigmodu = @import("zigmodu");
@@ -7168,7 +7168,7 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
     , gen_opts);
 
     // ── model.zig ──
-    const model_path = try std.fmt.allocPrint(allocator, "{s}/model.zig", .{dir});
+    const model_path = try allocator.print("{s}/model.zig", .{dir});
     defer allocator.free(model_path);
     try safeWrite(io, allocator, model_path,
         \\pub const AgentRun = struct { pub const sql_table_name: []const u8 = "ai_agent_run";
@@ -7183,7 +7183,7 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
     , gen_opts);
 
     // ── persistence.zig ──
-    const pers_path = try std.fmt.allocPrint(allocator, "{s}/persistence.zig", .{dir});
+    const pers_path = try allocator.print("{s}/persistence.zig", .{dir});
     defer allocator.free(pers_path);
     try safeWrite(io, allocator, pers_path,
         \\const std = @import("std"); const data = @import("zigmodu").data; const model = @import("model.zig");
@@ -7195,7 +7195,7 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
     , gen_opts);
 
     // ── agent.zig ──
-    const ag_path = try std.fmt.allocPrint(allocator, "{s}/agent.zig", .{dir});
+    const ag_path = try allocator.print("{s}/agent.zig", .{dir});
     defer allocator.free(ag_path);
     try safeWrite(io, allocator, ag_path,
         \\//! Thin re-export of first-class zigmodu.ai.Agent (ReAct + tool_calls).
@@ -7207,7 +7207,7 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
     , gen_opts);
 
     // ── service.zig ──
-    const svc_path = try std.fmt.allocPrint(allocator, "{s}/service.zig", .{dir});
+    const svc_path = try allocator.print("{s}/service.zig", .{dir});
     defer allocator.free(svc_path);
     try safeWrite(io, allocator, svc_path,
         \\const std = @import("std");
@@ -7302,7 +7302,7 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
     , gen_opts);
 
     // ── api.zig ──
-    const api_path = try std.fmt.allocPrint(allocator, "{s}/api.zig", .{dir});
+    const api_path = try allocator.print("{s}/api.zig", .{dir});
     defer allocator.free(api_path);
     try safeWrite(io, allocator, api_path,
         \\const std = @import("std");
@@ -7364,7 +7364,7 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
     , gen_opts);
 
     // ── ext/service.zig ──
-    const esvc_path = try std.fmt.allocPrint(allocator, "{s}/ext/service.zig", .{dir});
+    const esvc_path = try allocator.print("{s}/ext/service.zig", .{dir});
     defer allocator.free(esvc_path);
     if (false) {
         if (!fileExists(io, esvc_path)) try safeWrite(io, allocator, esvc_path,
@@ -7376,7 +7376,7 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
     } // if(false) — ext/ removed
 
     // ── ext/api.zig ──
-    const eapi_path = try std.fmt.allocPrint(allocator, "{s}/ext/api.zig", .{dir});
+    const eapi_path = try allocator.print("{s}/ext/api.zig", .{dir});
     defer allocator.free(eapi_path);
     if (false) {
         if (!fileExists(io, eapi_path)) try safeWrite(io, allocator, eapi_path,
@@ -7389,7 +7389,7 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
     } // if(false) — ext/ removed
 
     // ── tests.zig ──
-    const test_path = try std.fmt.allocPrint(allocator, "{s}/tests.zig", .{dir});
+    const test_path = try allocator.print("{s}/tests.zig", .{dir});
     defer allocator.free(test_path);
     if (!fileExists(io, test_path)) try safeWrite(io, allocator, test_path,
         \\const std = @import("std");
@@ -7422,7 +7422,7 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
     , gen_opts);
 
     // ── README.md ──
-    const rm_path = try std.fmt.allocPrint(allocator, "{s}/README.md", .{dir});
+    const rm_path = try allocator.print("{s}/README.md", .{dir});
     defer allocator.free(rm_path);
     if (!fileExists(io, rm_path)) try safeWrite(io, allocator, rm_path,
         \\# AI Agent Module
@@ -7434,15 +7434,15 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
 }
 
 fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []const u8, gen_opts: GenOptions) !void {
-    const dir = try std.fmt.allocPrint(allocator, "{s}/src/modules/web4", .{project_dir});
+    const dir = try allocator.print("{s}/src/modules/web4", .{project_dir});
     defer allocator.free(dir);
     try ensureDirGen(io, dir, gen_opts);
-    const ext_dir = try std.fmt.allocPrint(allocator, "{s}/ext", .{dir});
+    const ext_dir = try allocator.print("{s}/ext", .{dir});
     defer allocator.free(ext_dir);
     try ensureDirGen(io, ext_dir, gen_opts);
 
     // ── module.zig ──
-    const m = try std.fmt.allocPrint(allocator, "{s}/module.zig", .{dir});
+    const m = try allocator.print("{s}/module.zig", .{dir});
     defer allocator.free(m);
     try safeWrite(io, allocator, m,
         \\const std = @import("std"); const zigmodu = @import("zigmodu");
@@ -7455,7 +7455,7 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
     , gen_opts);
 
     // ── model.zig ──
-    const mp = try std.fmt.allocPrint(allocator, "{s}/model.zig", .{dir});
+    const mp = try allocator.print("{s}/model.zig", .{dir});
     defer allocator.free(mp);
     try safeWrite(io, allocator, mp,
         \\pub const Web4Identity = struct { pub const sql_table_name: []const u8 = "web4_identity";
@@ -7470,7 +7470,7 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
     , gen_opts);
 
     // ── persistence.zig ──
-    const pp = try std.fmt.allocPrint(allocator, "{s}/persistence.zig", .{dir});
+    const pp = try allocator.print("{s}/persistence.zig", .{dir});
     defer allocator.free(pp);
     try safeWrite(io, allocator, pp,
         \\const std = @import("std"); const data = @import("zigmodu").data; const model = @import("model.zig");
@@ -7482,7 +7482,7 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
     , gen_opts);
 
     // ── service.zig ──
-    const sp = try std.fmt.allocPrint(allocator, "{s}/service.zig", .{dir});
+    const sp = try allocator.print("{s}/service.zig", .{dir});
     defer allocator.free(sp);
     try safeWrite(io, allocator, sp,
         \\const std = @import("std"); const zigmodu = @import("zigmodu"); const model = @import("model.zig"); const persistence = @import("persistence.zig");
@@ -7496,7 +7496,7 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
         \\    }
         \\    pub fn createInvoice(self: *Web4Service, tenant_id: i64, amount: i64, currency: []const u8, payee_did: []const u8) !model.Web4Invoice {
         \\        var repo = self.persistence.invoiceRepo();
-        \\        const inv_id = try std.fmt.allocPrint(self.allocator, "inv-{d}", .{@as(i64, @intCast(@intFromPtr(self)))}); defer self.allocator.free(inv_id);
+        \\        const inv_id = try self.allocator.print( "inv-{d}", .{@as(i64, @intCast(@intFromPtr(self)))}); defer self.allocator.free(inv_id);
         \\        return try repo.insert(.{ .id = null, .tenant_id = tenant_id, .invoice_id = inv_id, .payee_did = payee_did, .amount = amount, .currency = currency, .created_at = 0 });
         \\    }
         \\    pub fn getIdentity(self: *Web4Service, tenant_id: i64, user_id: i64) !?model.Web4Identity { var repo = self.persistence.identityRepo(); _ = tenant_id; return try repo.findById(user_id); }
@@ -7505,7 +7505,7 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
     , gen_opts);
 
     // ── api.zig ──
-    const ap = try std.fmt.allocPrint(allocator, "{s}/api.zig", .{dir});
+    const ap = try allocator.print("{s}/api.zig", .{dir});
     defer allocator.free(ap);
     try safeWrite(io, allocator, ap,
         \\const std = @import("std");
@@ -7563,7 +7563,7 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
     , gen_opts);
 
     // ── ext/service.zig ──
-    const es = try std.fmt.allocPrint(allocator, "{s}/ext/service.zig", .{dir});
+    const es = try allocator.print("{s}/ext/service.zig", .{dir});
     defer allocator.free(es);
     if (false) {
         if (!fileExists(io, es)) try safeWrite(io, allocator, es,
@@ -7575,7 +7575,7 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
     } // if(false) — ext/ removed
 
     // ── ext/api.zig ──
-    const ea = try std.fmt.allocPrint(allocator, "{s}/ext/api.zig", .{dir});
+    const ea = try allocator.print("{s}/ext/api.zig", .{dir});
     defer allocator.free(ea);
     if (false) {
         if (!fileExists(io, ea)) try safeWrite(io, allocator, ea,
@@ -7588,7 +7588,7 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
     } // if(false) — ext/ removed
 
     // ── tests.zig ──
-    const wt = try std.fmt.allocPrint(allocator, "{s}/tests.zig", .{dir});
+    const wt = try allocator.print("{s}/tests.zig", .{dir});
     defer allocator.free(wt);
     if (!fileExists(io, wt)) try safeWrite(io, allocator, wt,
         \\const std = @import("std"); const testing = std.testing; const zigmodu = @import("zigmodu"); const model = @import("model.zig");
@@ -7601,7 +7601,7 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
     , gen_opts);
 
     // ── README.md ──
-    const wr = try std.fmt.allocPrint(allocator, "{s}/README.md", .{dir});
+    const wr = try allocator.print("{s}/README.md", .{dir});
     defer allocator.free(wr);
     if (!fileExists(io, wr)) try safeWrite(io, allocator, wr,
         \\# Web4 Module — DID + x402
@@ -7627,16 +7627,16 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
 }
 
 fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []const u8, gen_opts: GenOptions) !void {
-    const im_dir = try std.fmt.allocPrint(allocator, "{s}/src/modules/im", .{project_dir});
+    const im_dir = try allocator.print("{s}/src/modules/im", .{project_dir});
     defer allocator.free(im_dir);
     try ensureDirGen(io, im_dir, gen_opts);
 
-    const ext_dir = try std.fmt.allocPrint(allocator, "{s}/ext", .{im_dir});
+    const ext_dir = try allocator.print("{s}/ext", .{im_dir});
     defer allocator.free(ext_dir);
     try ensureDirGen(io, ext_dir, gen_opts);
 
     // ── module.zig ──
-    const mod_path = try std.fmt.allocPrint(allocator, "{s}/module.zig", .{im_dir});
+    const mod_path = try allocator.print("{s}/module.zig", .{im_dir});
     defer allocator.free(mod_path);
     try safeWrite(io, allocator, mod_path,
         \\//! @initialized by zmodu — AI may modify
@@ -7667,7 +7667,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
     , gen_opts);
 
     // ── README.md ──
-    const readme_path = try std.fmt.allocPrint(allocator, "{s}/README.md", .{im_dir});
+    const readme_path = try allocator.print("{s}/README.md", .{im_dir});
     defer allocator.free(readme_path);
     if (!fileExists(io, readme_path)) {
         try safeWrite(io, allocator, readme_path,
@@ -7865,7 +7865,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
     }
 
     // ── PERF.md ──
-    const perf_path = try std.fmt.allocPrint(allocator, "{s}/PERF.md", .{im_dir});
+    const perf_path = try allocator.print("{s}/PERF.md", .{im_dir});
     defer allocator.free(perf_path);
     if (!fileExists(io, perf_path)) {
         try safeWrite(io, allocator, perf_path,
@@ -8002,7 +8002,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
     }
 
     // ── model.zig ──
-    const model_path = try std.fmt.allocPrint(allocator, "{s}/model.zig", .{im_dir});
+    const model_path = try allocator.print("{s}/model.zig", .{im_dir});
     defer allocator.free(model_path);
     try safeWrite(io, allocator, model_path,
         \\//! @initialized by zmodu — AI may modify
@@ -8043,7 +8043,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
     , gen_opts);
 
     // ── persistence.zig ──
-    const pers_path = try std.fmt.allocPrint(allocator, "{s}/persistence.zig", .{im_dir});
+    const pers_path = try allocator.print("{s}/persistence.zig", .{im_dir});
     defer allocator.free(pers_path);
     try safeWrite(io, allocator, pers_path,
         \\//! @initialized by zmodu — AI may modify
@@ -8072,7 +8072,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
     , gen_opts);
 
     // ── service.zig ──
-    const svc_path = try std.fmt.allocPrint(allocator, "{s}/service.zig", .{im_dir});
+    const svc_path = try allocator.print("{s}/service.zig", .{im_dir});
     defer allocator.free(svc_path);
     try safeWrite(io, allocator, svc_path,
         \\//! @initialized by zmodu — AI may modify
@@ -8130,7 +8130,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
     , gen_opts);
 
     // ── api.zig ──
-    const api_path = try std.fmt.allocPrint(allocator, "{s}/api.zig", .{im_dir});
+    const api_path = try allocator.print("{s}/api.zig", .{im_dir});
     defer allocator.free(api_path);
     try safeWrite(io, allocator, api_path,
         \\//! @initialized by zmodu — AI may modify
@@ -8215,7 +8215,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
     , gen_opts);
 
     // ── relay.zig ──
-    const relay_path = try std.fmt.allocPrint(allocator, "{s}/relay.zig", .{im_dir});
+    const relay_path = try allocator.print("{s}/relay.zig", .{im_dir});
     defer allocator.free(relay_path);
     try safeWrite(io, allocator, relay_path,
         \\//! @initialized by zmodu — AI may modify
@@ -8243,7 +8243,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
     , gen_opts);
 
     // ── gateway.zig ──
-    const gw_path = try std.fmt.allocPrint(allocator, "{s}/gateway.zig", .{im_dir});
+    const gw_path = try allocator.print("{s}/gateway.zig", .{im_dir});
     defer allocator.free(gw_path);
     try safeWrite(io, allocator, gw_path,
         \\//! @initialized by zmodu — AI may modify
@@ -8385,7 +8385,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
     , gen_opts);
 
     // ── ext/service.zig ──
-    const ext_svc_path = try std.fmt.allocPrint(allocator, "{s}/ext/service.zig", .{im_dir});
+    const ext_svc_path = try allocator.print("{s}/ext/service.zig", .{im_dir});
     defer allocator.free(ext_svc_path);
     if (false) {
         if (!fileExists(io, ext_svc_path)) {
@@ -8410,7 +8410,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
     }
 
     // ── ext/api.zig ──
-    const ext_api_path = try std.fmt.allocPrint(allocator, "{s}/ext/api.zig", .{im_dir});
+    const ext_api_path = try allocator.print("{s}/ext/api.zig", .{im_dir});
     defer allocator.free(ext_api_path);
     if (false) {
         if (!fileExists(io, ext_api_path)) {
@@ -8442,7 +8442,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
     }
 
     // ── tests.zig ──
-    const tests_path = try std.fmt.allocPrint(allocator, "{s}/tests.zig", .{im_dir});
+    const tests_path = try allocator.print("{s}/tests.zig", .{im_dir});
     defer allocator.free(tests_path);
     if (!fileExists(io, tests_path)) {
         try safeWrite(io, allocator, tests_path,
@@ -8701,18 +8701,18 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
 }
 
 fn generateLifeDir(io: std.Io, allocator: std.mem.Allocator, out_dir: []const u8, project_name: []const u8, table_count: usize, module_count: usize, gen_opts: GenOptions) !void {
-    const life_dir = try std.fmt.allocPrint(allocator, "{s}/.life", .{out_dir});
+    const life_dir = try allocator.print("{s}/.life", .{out_dir});
     defer allocator.free(life_dir);
     try ensureDirGen(io, life_dir, gen_opts);
-    const td = try std.fmt.allocPrint(allocator, "{s}/tree", .{life_dir});
+    const td = try allocator.print("{s}/tree", .{life_dir});
     defer allocator.free(td);
     try ensureDirGen(io, td, gen_opts);
-    const md = try std.fmt.allocPrint(allocator, "{s}/memory", .{life_dir});
+    const md = try allocator.print("{s}/memory", .{life_dir});
     defer allocator.free(md);
     try ensureDirGen(io, md, gen_opts);
 
     // DNA.md — minimal birth record
-    const dp = try std.fmt.allocPrint(allocator, "{s}/DNA.md", .{life_dir});
+    const dp = try allocator.print("{s}/DNA.md", .{life_dir});
     defer allocator.free(dp);
     var dna: std.ArrayList(u8) = .empty;
     defer dna.deinit(allocator);
@@ -8720,14 +8720,14 @@ fn generateLifeDir(io: std.Io, allocator: std.mem.Allocator, out_dir: []const u8
     try safeWrite(io, allocator, dp, dna.items, gen_opts);
 
     // manifest.json — compact
-    const mp = try std.fmt.allocPrint(allocator, "{s}/manifest.json", .{life_dir});
+    const mp = try allocator.print("{s}/manifest.json", .{life_dir});
     defer allocator.free(mp);
-    const mf_json = try std.fmt.allocPrint(allocator, "{{\"name\":\"{s}\",\"modules\":{d},\"tables\":{d},\"v\":\"0.1.0\"}}\n", .{ project_name, module_count, table_count });
+    const mf_json = try allocator.print("{{\"name\":\"{s}\",\"modules\":{d},\"tables\":{d},\"v\":\"0.1.0\"}}\n", .{ project_name, module_count, table_count });
     defer allocator.free(mf_json);
     try safeWrite(io, allocator, mp, mf_json, gen_opts);
 
     // tree/v0.1.0.md — genesis node
-    const tpath = try std.fmt.allocPrint(allocator, "{s}/v0.1.0.md", .{td});
+    const tpath = try allocator.print("{s}/v0.1.0.md", .{td});
     defer allocator.free(tpath);
     var tree_buf: std.ArrayList(u8) = .empty;
     defer tree_buf.deinit(allocator);
@@ -8735,30 +8735,30 @@ fn generateLifeDir(io: std.Io, allocator: std.mem.Allocator, out_dir: []const u8
     try safeWrite(io, allocator, tpath, tree_buf.items, gen_opts);
 
     // memory/decisions.jsonl — seed
-    const dpath = try std.fmt.allocPrint(allocator, "{s}/decisions.jsonl", .{md});
+    const dpath = try allocator.print("{s}/decisions.jsonl", .{md});
     defer allocator.free(dpath);
     try safeWrite(io, allocator, dpath, "{\"t\":\"genesis\",\"d\":\"zmodu scaffold\",\"v\":\"0.1.0\"}\n", gen_opts);
 
     // fingerprint
-    const fp = try std.fmt.allocPrint(allocator, "{s}/fingerprint.sha256", .{life_dir});
+    const fp = try allocator.print("{s}/fingerprint.sha256", .{life_dir});
     defer allocator.free(fp);
     try safeWrite(io, allocator, fp, "genesis-v0.1.0\n", gen_opts);
 }
 
 fn generateClaudeSkills(io: std.Io, allocator: std.mem.Allocator, out_dir: []const u8, gen_opts: GenOptions) !void {
-    const skills_dir = try std.fmt.allocPrint(allocator, "{s}/.claude/skills", .{out_dir});
+    const skills_dir = try allocator.print("{s}/.claude/skills", .{out_dir});
     defer allocator.free(skills_dir);
     try ensureDirGen(io, skills_dir, gen_opts);
 
     const skill_dirs = [_][]const u8{ "zigmodu-build", "zigmodu-life", "zigmodu-project", "zigmodu-module", "zigmodu-api", "zigmodu-orm", "zigmodu-analyze", "zigmodu-translate", "zigmodu-harness", "zigmodu-plugin" };
     for (skill_dirs) |sd| {
-        const d = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ skills_dir, sd });
+        const d = try allocator.print("{s}/{s}", .{ skills_dir, sd });
         defer allocator.free(d);
         try ensureDirGen(io, d, gen_opts);
     }
 
     // zigmodu-build (master skill — always start here)
-    const sb = try std.fmt.allocPrint(allocator, "{s}/zigmodu-build/SKILL.md", .{skills_dir});
+    const sb = try allocator.print("{s}/zigmodu-build/SKILL.md", .{skills_dir});
     defer allocator.free(sb);
     try safeWrite(io, allocator, sb,
         \\---
@@ -8818,7 +8818,7 @@ fn generateClaudeSkills(io: std.Io, allocator: std.mem.Allocator, out_dir: []con
     , gen_opts);
 
     // zigmodu-life
-    const sl = try std.fmt.allocPrint(allocator, "{s}/zigmodu-life/SKILL.md", .{skills_dir});
+    const sl = try allocator.print("{s}/zigmodu-life/SKILL.md", .{skills_dir});
     defer allocator.free(sl);
     try safeWrite(io, allocator, sl,
         \\---
@@ -8853,7 +8853,7 @@ fn generateClaudeSkills(io: std.Io, allocator: std.mem.Allocator, out_dir: []con
     , gen_opts);
 
     // zigmodu-project
-    const sp = try std.fmt.allocPrint(allocator, "{s}/zigmodu-project/SKILL.md", .{skills_dir});
+    const sp = try allocator.print("{s}/zigmodu-project/SKILL.md", .{skills_dir});
     defer allocator.free(sp);
     try safeWrite(io, allocator, sp,
         \\---
@@ -8897,7 +8897,7 @@ fn generateClaudeSkills(io: std.Io, allocator: std.mem.Allocator, out_dir: []con
     , gen_opts);
 
     // zigmodu-module
-    const sm = try std.fmt.allocPrint(allocator, "{s}/zigmodu-module/SKILL.md", .{skills_dir});
+    const sm = try allocator.print("{s}/zigmodu-module/SKILL.md", .{skills_dir});
     defer allocator.free(sm);
     try safeWrite(io, allocator, sm,
         \\---
@@ -8943,7 +8943,7 @@ fn generateClaudeSkills(io: std.Io, allocator: std.mem.Allocator, out_dir: []con
     , gen_opts);
 
     // zigmodu-api
-    const sa = try std.fmt.allocPrint(allocator, "{s}/zigmodu-api/SKILL.md", .{skills_dir});
+    const sa = try allocator.print("{s}/zigmodu-api/SKILL.md", .{skills_dir});
     defer allocator.free(sa);
     try safeWrite(io, allocator, sa,
         \\---
@@ -8986,7 +8986,7 @@ fn generateClaudeSkills(io: std.Io, allocator: std.mem.Allocator, out_dir: []con
     , gen_opts);
 
     // zigmodu-orm
-    const so = try std.fmt.allocPrint(allocator, "{s}/zigmodu-orm/SKILL.md", .{skills_dir});
+    const so = try allocator.print("{s}/zigmodu-orm/SKILL.md", .{skills_dir});
     defer allocator.free(so);
     try safeWrite(io, allocator, so,
         \\---
@@ -9026,7 +9026,7 @@ fn generateClaudeSkills(io: std.Io, allocator: std.mem.Allocator, out_dir: []con
     , gen_opts);
 
     // zigmodu-analyze
-    const san = try std.fmt.allocPrint(allocator, "{s}/zigmodu-analyze/SKILL.md", .{skills_dir});
+    const san = try allocator.print("{s}/zigmodu-analyze/SKILL.md", .{skills_dir});
     defer allocator.free(san);
     try safeWrite(io, allocator, san,
         \\---
@@ -9059,7 +9059,7 @@ fn generateClaudeSkills(io: std.Io, allocator: std.mem.Allocator, out_dir: []con
     , gen_opts);
 
     // zigmodu-translate
-    const stn = try std.fmt.allocPrint(allocator, "{s}/zigmodu-translate/SKILL.md", .{skills_dir});
+    const stn = try allocator.print("{s}/zigmodu-translate/SKILL.md", .{skills_dir});
     defer allocator.free(stn);
     try safeWrite(io, allocator, stn,
         \\---
@@ -9104,7 +9104,7 @@ fn generateClaudeSkills(io: std.Io, allocator: std.mem.Allocator, out_dir: []con
     , gen_opts);
 
     // zigmodu-harness
-    const sha = try std.fmt.allocPrint(allocator, "{s}/zigmodu-harness/SKILL.md", .{skills_dir});
+    const sha = try allocator.print("{s}/zigmodu-harness/SKILL.md", .{skills_dir});
     defer allocator.free(sha);
     try safeWrite(io, allocator, sha,
         \\---
@@ -9146,7 +9146,7 @@ fn generateClaudeSkills(io: std.Io, allocator: std.mem.Allocator, out_dir: []con
     , gen_opts);
 
     // zigmodu-plugin
-    const spl = try std.fmt.allocPrint(allocator, "{s}/zigmodu-plugin/SKILL.md", .{skills_dir});
+    const spl = try allocator.print("{s}/zigmodu-plugin/SKILL.md", .{skills_dir});
     defer allocator.free(spl);
     try safeWrite(io, allocator, spl,
         \\---
@@ -9188,11 +9188,11 @@ fn generateClaudeSkills(io: std.Io, allocator: std.mem.Allocator, out_dir: []con
     , gen_opts);
 
     // 14. Generate .opencode/ — OpenCode AI compatibility
-    const opencode_dir = try std.fmt.allocPrint(allocator, "{s}/.opencode", .{out_dir});
+    const opencode_dir = try allocator.print("{s}/.opencode", .{out_dir});
     defer allocator.free(opencode_dir);
     try ensureDirGen(io, opencode_dir, gen_opts);
 
-    const opencode_readme = try std.fmt.allocPrint(allocator,
+    const opencode_readme = try allocator.print(
         \\# OpenCode AI Support
         \\
         \\This project uses the Claude Code agent skills format (agentskills.io spec).
@@ -9204,7 +9204,7 @@ fn generateClaudeSkills(io: std.Io, allocator: std.mem.Allocator, out_dir: []con
         \\
     , .{});
     defer allocator.free(opencode_readme);
-    const opencode_rm_path = try std.fmt.allocPrint(allocator, "{s}/README.md", .{opencode_dir});
+    const opencode_rm_path = try allocator.print("{s}/README.md", .{opencode_dir});
     defer allocator.free(opencode_rm_path);
     try safeWrite(io, allocator, opencode_rm_path, opencode_readme, gen_opts);
 }
@@ -9333,7 +9333,7 @@ fn cmdAdd(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
         try writeModuleFiles(io, allocator, modules_dir, mod_name, tables_for_mod.items, gen_opts, scaffold_prefix_len);
 
         // ext/ directory
-        const ext_dir = try std.fmt.allocPrint(allocator, "{s}/{s}/ext", .{ modules_dir, mod_name });
+        const ext_dir = try allocator.print("{s}/{s}/ext", .{ modules_dir, mod_name });
         defer allocator.free(ext_dir);
         try ensureDirGen(io, ext_dir, gen_opts);
 
@@ -9342,7 +9342,7 @@ fn cmdAdd(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
         const pascal_mod = try toPascalCase(allocator, var_name_tmp);
         defer allocator.free(pascal_mod);
 
-        const ext_svc = try std.fmt.allocPrint(allocator,
+        const ext_svc = try allocator.print(
             \\// {s} service extension — survives zmodu regeneration.
             \\const std = @import("std");
             \\const zigmodu = @import("zigmodu");
@@ -9353,11 +9353,11 @@ fn cmdAdd(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
             \\}};
         , .{ mod_name, pascal_mod, pascal_mod, pascal_mod });
         defer allocator.free(ext_svc);
-        const ext_svc_path = try std.fmt.allocPrint(allocator, "{s}/service.zig", .{ext_dir});
+        const ext_svc_path = try allocator.print("{s}/service.zig", .{ext_dir});
         defer allocator.free(ext_svc_path);
         try safeWrite(io, allocator, ext_svc_path, ext_svc, gen_opts);
 
-        const ext_api = try std.fmt.allocPrint(allocator,
+        const ext_api = try allocator.print(
             \\// {s} custom API endpoints — survives zmodu regeneration.
             \\const std = @import("std");
             \\const zigmodu = @import("zigmodu");
@@ -9369,7 +9369,7 @@ fn cmdAdd(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
             \\}};
         , .{ mod_name, pascal_mod, pascal_mod, pascal_mod });
         defer allocator.free(ext_api);
-        const ext_api_path = try std.fmt.allocPrint(allocator, "{s}/api.zig", .{ext_dir});
+        const ext_api_path = try allocator.print("{s}/api.zig", .{ext_dir});
         defer allocator.free(ext_api_path);
         if (!fileExists(io, ext_api_path)) try safeWrite(io, allocator, ext_api_path, ext_api, gen_opts);
 
@@ -9411,7 +9411,7 @@ fn wireModulesIntoMainZig(io: std.Io, allocator: std.mem.Allocator, new_modules:
         const var_name = try replaceChar(allocator, mod_name, '/', '_');
         defer allocator.free(var_name);
         // Check if already wired
-        const import_line = try std.fmt.allocPrint(allocator, "modules/{s}/module.zig", .{mod_name});
+        const import_line = try allocator.print("modules/{s}/module.zig", .{mod_name});
         defer allocator.free(import_line);
         if (std.mem.indexOf(u8, main_content, import_line) == null) {
             try to_wire.append(allocator, mod_name);
@@ -9932,7 +9932,7 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
     }
 
     if (sopts.with_cluster) {
-        try buf.appendSlice(allocator, "\n    // -- Cluster --\n    const node_id = try std.fmt.allocPrint(allocator, \"node-{d}\", .{@as(u64, @intCast(std.time.epoch.unix))});\n    var dist_bus = try zigmodu.DistributedEventBus.init(allocator, init.io, node_id);\n    defer dist_bus.deinit();\n    try dist_bus.start(9091);\n");
+        try buf.appendSlice(allocator, "\n    // -- Cluster --\n    const node_id = try allocator.print(\"node-{d}\", .{@as(u64, @intCast(std.time.epoch.unix))});\n    var dist_bus = try zigmodu.DistributedEventBus.init(allocator, init.io, node_id);\n    defer dist_bus.deinit();\n    try dist_bus.start(9091);\n");
     }
     if (sopts.with_metrics) {
         try buf.appendSlice(allocator, "\n    // -- Prometheus /metrics --\n    var metrics = zigmodu.observability.PrometheusMetrics.init(allocator);\n    defer metrics.deinit();\n    try metrics.registerMetricsRoute(&server);\n");
@@ -10088,7 +10088,7 @@ fn generateScaffoldTestsZig(
 /// Import binding for a module inside the generated tests: a Zig keyword can
 /// not be a `const` name, so it gets the same `_mod` suffix main.zig uses.
 fn testVarName(allocator: std.mem.Allocator, module_var: []const u8) ![]const u8 {
-    if (isZigReserved(module_var)) return std.fmt.allocPrint(allocator, "{s}_mod", .{module_var});
+    if (isZigReserved(module_var)) return allocator.print("{s}_mod", .{module_var});
     return allocator.dupe(u8, module_var);
 }
 
@@ -10814,18 +10814,18 @@ fn liveIntrospectionRoundTrip(allocator: std.mem.Allocator, io: std.Io, dsn: []c
     defer db.deinit(allocator);
     const is_mysql = std.mem.eql(u8, db.driver, "mysql");
 
-    const drop_sql = try std.fmt.allocPrint(allocator, "DROP TABLE IF EXISTS {s}", .{probe});
+    const drop_sql = try allocator.print("DROP TABLE IF EXISTS {s}", .{probe});
     defer allocator.free(drop_sql);
     // MySQL wants the FK declared separately; PostgreSQL takes the inline form.
     const ddl = if (is_mysql)
-        try std.fmt.allocPrint(allocator, "CREATE TABLE {s} (id INT PRIMARY KEY, parent_id INT, FOREIGN KEY (parent_id) REFERENCES {s}(id))", .{ probe, probe })
+        try allocator.print("CREATE TABLE {s} (id INT PRIMARY KEY, parent_id INT, FOREIGN KEY (parent_id) REFERENCES {s}(id))", .{ probe, probe })
     else
-        try std.fmt.allocPrint(allocator, "CREATE TABLE {s} (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES {s}(id))", .{ probe, probe });
+        try allocator.print("CREATE TABLE {s} (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES {s}(id))", .{ probe, probe });
     defer allocator.free(ddl);
 
     const run_postgres = struct {
         fn run(a: std.mem.Allocator, io_: std.Io, conn: DbConnection, sql: []const u8) !void {
-            const port_str = try std.fmt.allocPrint(a, "{d}", .{conn.port});
+            const port_str = try a.print("{d}", .{conn.port});
             defer a.free(port_str);
             try runDbCli(a, io_, &.{ "psql", "-h", conn.host, "-p", port_str, "-U", conn.user, "-d", conn.database, "-c", sql });
         }
@@ -10913,7 +10913,7 @@ test "introspectDatabaseSqlite: real database round-trip (sqlite3 CLI)" {
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path_len = try tmp.dir.realPath(io, &path_buf);
-    const db_path = try std.fmt.allocPrint(allocator, "{s}/schema.db", .{path_buf[0..path_len]});
+    const db_path = try allocator.print("{s}/schema.db", .{path_buf[0..path_len]});
     defer allocator.free(db_path);
 
     try runDbCli(allocator, io, &.{ "sqlite3", db_path, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);" ++
@@ -10950,15 +10950,15 @@ test "importSqlToDatabase: mysql gets --database= on argv and the SQL on stdin" 
     const dir_len = try tmp.dir.realPath(io, &path_buf);
     const dir_path = path_buf[0..dir_len];
 
-    const argv_out = try std.fmt.allocPrint(allocator, "{s}/argv.txt", .{dir_path});
+    const argv_out = try allocator.print("{s}/argv.txt", .{dir_path});
     defer allocator.free(argv_out);
-    const stdin_out = try std.fmt.allocPrint(allocator, "{s}/stdin.sql", .{dir_path});
+    const stdin_out = try allocator.print("{s}/stdin.sql", .{dir_path});
     defer allocator.free(stdin_out);
-    const stub = try std.fmt.allocPrint(allocator, "{s}/mysql", .{dir_path});
+    const stub = try allocator.print("{s}/mysql", .{dir_path});
     defer allocator.free(stub);
 
     // The output paths come from the temp dir, so no shell quoting is required.
-    const script = try std.fmt.allocPrint(allocator,
+    const script = try allocator.print(
         \\#!/bin/sh
         \\printf '%s\n' "$@" > '{s}'
         \\cat > '{s}'
@@ -10998,13 +10998,13 @@ test "importSqlToDatabase: psql gets the script via -f and leaks nothing" {
     const dir_len = try tmp.dir.realPath(io, &path_buf);
     const dir_path = path_buf[0..dir_len];
 
-    const argv_out = try std.fmt.allocPrint(allocator, "{s}/argv.txt", .{dir_path});
+    const argv_out = try allocator.print("{s}/argv.txt", .{dir_path});
     defer allocator.free(argv_out);
-    const stub = try std.fmt.allocPrint(allocator, "{s}/psql", .{dir_path});
+    const stub = try allocator.print("{s}/psql", .{dir_path});
     defer allocator.free(stub);
 
     // The output path comes from the temp dir, so no shell quoting is required.
-    const script = try std.fmt.allocPrint(allocator,
+    const script = try allocator.print(
         \\#!/bin/sh
         \\printf '%s\n' "$@" > '{s}'
         \\
@@ -11054,12 +11054,12 @@ test "runMysqlQueryWith: exactly one -e, and the query is its argument" {
     const dir_len = try tmp.dir.realPath(io, &path_buf);
     const dir_path = path_buf[0..dir_len];
 
-    const argv_out = try std.fmt.allocPrint(allocator, "{s}/argv.txt", .{dir_path});
+    const argv_out = try allocator.print("{s}/argv.txt", .{dir_path});
     defer allocator.free(argv_out);
-    const stub = try std.fmt.allocPrint(allocator, "{s}/mysql", .{dir_path});
+    const stub = try allocator.print("{s}/mysql", .{dir_path});
     defer allocator.free(stub);
 
-    const script = try std.fmt.allocPrint(allocator,
+    const script = try allocator.print(
         \\#!/bin/sh
         \\printf '%s\n' "$@" > '{s}'
         \\

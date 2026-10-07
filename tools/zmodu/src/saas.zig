@@ -68,7 +68,7 @@ pub fn emitSchemaSql(allocator: std.mem.Allocator, model_json: []const u8) ![]co
 }
 
 fn appendPrint(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), comptime fmt: []const u8, args: anytype) !void {
-    const s = try std.fmt.allocPrint(allocator, fmt, args);
+    const s = try allocator.print(fmt, args);
     defer allocator.free(s);
     try buf.appendSlice(allocator, s);
 }

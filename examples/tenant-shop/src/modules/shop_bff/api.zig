@@ -51,7 +51,7 @@ pub fn ShopBffApi(comptime OrderService: type, comptime PaymentService: type) ty
                 try ctx.sendErrorResponse(400, 0, msg);
                 return;
             };
-            const resp = try std.fmt.allocPrint(ctx.allocator,
+            const resp = try ctx.allocator.print(
                 \\{{"order_id":{d},"status":"pending"}}
             , .{result.order_id});
             defer ctx.allocator.free(resp);
@@ -90,7 +90,7 @@ pub fn ShopBffApi(comptime OrderService: type, comptime PaymentService: type) ty
                 try ctx.sendErrorResponse(400, 0, msg);
                 return;
             };
-            const resp = try std.fmt.allocPrint(ctx.allocator,
+            const resp = try ctx.allocator.print(
                 \\{{"payment_id":{d},"order_id":{d},"status":"{s}","amount_cents":{d}}}
             , .{ payment.id, payment.order_id, payment.status, payment.amount_cents });
             defer ctx.allocator.free(resp);
