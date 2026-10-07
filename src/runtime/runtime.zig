@@ -8568,12 +8568,16 @@ test "Pooled (§12.17): a saturated high/normal/low mix — shares and the laten
     //    rather than on a constructed ring. The floor is an order of magnitude
     //    under the share the slot delivered on every host observed (9.7k–27k),
     //    so a scheduler regression (not a slow host) is what trips it.
-    // 2. The tail follows the mechanism: high is drained first whenever its
-    //    token is present, so its mailbox stays shallow and its median
-    //    queued→handled latency sits below low's — whose token waits for the
-    //    reserved turn whenever a busier class holds one. A relation between
-    //    two medians of the same run, not a µs budget (held 6–70× on all four
-    //    hosts).
+    // 2. The tail ordering (`low.p50 > high.p50`) is **printed, not asserted**
+    //    — and this is the second time a macOS CI runner has shown why. The
+    //    relation needs three medians from a genuinely saturated mix; when an
+    //    oversubscribed host lets the mailboxes run dry, all three medians
+    //    collapse onto the same value (measured: high 53.0 / normal 54.0 / low
+    //    53.0 µs — a tie; the same run's mechanism readings were all healthy:
+    //    push_failures=0, both rings empty, conservation exact). The ordering
+    //    the mechanism owns is pinned thread-free in `scheduler.zig` (§12.17's
+    //    strict-order and reservation tests), which is where a regression has
+    //    to be caught; what a live run can assert is the reservation floor
+    //    above.
     try std.testing.expect(handled[2] >= 1_000);
-    try std.testing.expect(lat[2].p50 > lat[0].p50);
 }
