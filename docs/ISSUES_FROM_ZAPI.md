@@ -8,7 +8,7 @@
 
 Suggested landing order: **M1 → M2 → M4 → M5 → M3 → …**.
 
-> **v0.15.31 落地**：M1–M9、M11、M12、M14 已进框架（见 `ROUTE_TABLE.md` §7.2/§7.3）；M10 deferred、M13 declined（理由见追踪表）。
+> **v0.15.31 落地**：M1–M9、M11、M12、M14 已进框架（见 `ROUTE_TABLE.md` §7.2/§7.3）；M10 官方 wrapper 后落地（`http.resultHandler`，§7.5），M13 declined（理由见追踪表）。
 
 ---
 
@@ -122,7 +122,7 @@ Already partial; document reject dialect + public routes in generated OpenAPI.
 | M7 | Tenant middleware | P1 | **Landed v0.15.31** (`tenantResolver`) |
 | M8 | RouteMeta.roles | P1 | **Landed v0.15.31** (gate 先于 permission 检查) |
 | M9 | Resilience profile wiring | P1 | **Landed v0.15.31** (docs: ROUTE_TABLE §7.3) |
-| M10 | ApiResult auto-render | P1 | Deferred — dispatch 层改动大；M6 helpers 已覆盖主要瘦身诉求 |
+| M10 | ApiResult auto-render | P1 | 官方 wrapper 落地：`http.resultHandler`（ROUTE_TABLE §7.5）；dispatch 层 `!ApiResult(T)` auto-render 仍 deferred（要动路由分发签名，留给破坏性窗口） |
 | M11 | Typed attr getters | P2 | **Landed v0.15.31** (`getAttrInt` / `getAttrEnum`) |
 | M12 | Token extractors | P2 | **Landed v0.15.31** (`TokenSource` / `extractTokenAny`) |
 | M13 | State pool at mount | P2 | Declined — 审美性样板消减，收益不抵复杂度 |

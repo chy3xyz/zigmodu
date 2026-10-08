@@ -472,6 +472,7 @@ fn verifyJwtLoadPermsAndNext(
 
 const comptime_router = @import("ComptimeRouter.zig");
 const Rbac = @import("../security/Rbac.zig");
+const SlotPool = @import("../core/SlotPool.zig").SlotPool;
 
 pub const JwtFromCatalogConfig = struct {
     skip_prefixes: []const []const u8 = &.{ "health", "dashboard", "openapi.json" },
@@ -569,20 +570,11 @@ pub fn jwtAuthFromCatalogWithPermissions(
 /// Returns `error.SlotPoolExhausted` when the comptime-sized pool is full —
 /// raise `max_table_loader_slots`.
 pub fn catalogLoaderFromTable(table: *const Rbac.RolePermissionTable) error{SlotPoolExhausted}!CatalogPermissionLoader {
-    const claimed = TableLoaderSlots.tables_claimed.load(.seq_cst);
-    for (0..claimed) |i| {
-        if (TableLoaderSlots.tables[i]) |existing| {
-            // Same table → same loader. Apps sharing one RBAC table must not
-            // eat a slot each, and the tables are immutable (`*const`).
-            if (existing == table) return table_loader_trampolines[i];
-        }
-    }
-    const slot = TableLoaderSlots.tables_claimed.fetchAdd(1, .seq_cst);
-    if (slot >= max_table_loader_slots) {
-        return error.SlotPoolExhausted;
-    }
-    TableLoaderSlots.tables[slot] = table;
-    return table_loader_trampolines[slot];
+    return table_loader_trampolines[try TableLoaderSlots.pool.claimOrReuse(table, sameTable)];
+}
+
+fn sameTable(a: *const Rbac.RolePermissionTable, b: *const Rbac.RolePermissionTable) bool {
+    return a == b;
 }
 
 /// Number of independently-bound table loaders one process may build.
@@ -605,17 +597,22 @@ pub fn catalogLoaderFromTable(table: *const Rbac.RolePermissionTable) error{Slot
 /// Slots are claimed at wiring time and never released, so this bounds how many
 /// loaders an application *builds*, not how many requests it serves. Past the
 /// bound, `catalogLoaderFromTable` fails with `error.SlotPoolExhausted` —
-/// raise this constant if an application legitimately builds more.
+/// raise this constant if an application legitimately builds more. Introspect
+/// with `tableLoaderSlotsClaimed()`.
 pub const max_table_loader_slots = 64;
 
 const TableLoaderSlots = struct {
     /// One table per claimed slot; unclaimed slots stay `null` and are not
     /// reachable — their trampolines are never handed out.
-    var tables: [max_table_loader_slots]?*const Rbac.RolePermissionTable = @splat(null);
-    /// Atomic so two threads wiring loaders concurrently cannot claim one slot
-    /// (which would put two loaders on one table again).
-    var tables_claimed: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+    var pool: SlotPool(*const Rbac.RolePermissionTable, max_table_loader_slots) = .{};
 };
+
+/// Wiring-time budget introspection: how many of `max_table_loader_slots` are
+/// already claimed (monotonic; slots are never released). Assert headroom
+/// after wiring, e.g. `std.debug.assert(http.tableLoaderSlotsClaimed() <= n)`.
+pub fn tableLoaderSlotsClaimed() usize {
+    return TableLoaderSlots.pool.count();
+}
 
 fn TableLoaderTrampoline(comptime slot: usize) type {
     return struct {
@@ -623,7 +620,7 @@ fn TableLoaderTrampoline(comptime slot: usize) type {
             // Fail closed rather than guess: reaching this means the pointer was
             // used without claiming a slot. The caller
             // (`verifyJwtLoadPermsAndNext`) turns a loader error into a 500.
-            const table = TableLoaderSlots.tables[slot] orelse return error.LoaderSlotEmpty;
+            const table = TableLoaderSlots.pool.get(slot) orelse return error.LoaderSlotEmpty;
             return table.permissionsCsv(allocator, input.roles);
         }
     };

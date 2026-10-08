@@ -27,7 +27,7 @@
 | 改 `src/ai/**` 前（它只能依赖领域缝） | `docs/AI_BOUNDARY.md` + `src/test/AiBoundary.zig`（驱动层 import 数只减不增） |
 | Agent 能做什么（默认不能执行） | `docs/AGENT_RUNTIME.md` + `ai.Guard` / `ai.AgentSpec` / `ai.ProposalPipeline` / `ai.AgentWorker`（闸门已接进 `Agent.run`；Agent 可跑成运行时 worker） |
 | 观测 / 告警 / Grafana | `docs/OBSERVABILITY.md`（黄金信号 + 阈值 + dashboard JSON；夜间 `zig build soak` 见 CI `soak` job） |
-| 部署拓扑（TLS 边车/探针/守护） | `examples/production-deploy/`（nginx · Envoy · k8s · systemd） |
+| 部署拓扑（TLS 边车/探针/守护；集群 mTLS 边车） | `examples/production-deploy/`（nginx · Envoy · k8s · systemd · **cluster-sidecar**） |
 | Extract / SSE / Testkit / Outbox | `docs/FRAMEWORK_BACKLOG.md` |
 | 故障注入 / 契约门禁模板 | `src/test/FaultInjection.zig` · `src/test/ContractGate.zig` |
 | 升级注意事项（breaking / 影响面 / 改法） | `docs/UPGRADING.md` |
@@ -458,7 +458,9 @@ filter 是**测试全限定名的子串**（形如 `core.cluster.RaftElection.te
   （`build.zig.zon` / `src/ai/mcp.zig` / README* / CLAUDE.md / AGENTS.md /
   AI_METHODOLOGY.md）、promote CHANGELOG `[Unreleased]`、跑门禁
   （fmt + 全量测试 + deadcode）、commit + annotated tag，收尾断言 tag 与
-  包内 version 一致。
+  包内 version 一致。同时把 `docs/UPGRADING.md` 的 `## v<旧版> 之后（未发布批次）`
+  节自动改名为 `## v<新版>`（残留该标题直接判失败），并打印本版的行为变化摘要
+  （`破坏性:` / `行为变化` / `行为收紧` 行）供发布者过目。
 - 推 tag 前本地先过 `bash scripts/check-release-tag.sh`；CI 的 `release-verify`
   job 会在任何 `v*` tag push 时复核（tag == `build.zig.zon` version，且
   CHANGELOG 有条目）。两者任一失败 = 发布无效。

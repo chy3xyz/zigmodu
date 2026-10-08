@@ -1,0 +1,17 @@
+# Sidecar image: nginx stream module (mTLS) + iptables (plaintext lockdown) +
+# openssl CLI (used by the probe containers in run.sh, not by the proxy path).
+FROM nginx:1.27-alpine
+
+# apk's CDN fetch can be flaky behind a fresh base-image re-pull; retry
+# a few times before giving up (build-layer cache keeps retries cheap).
+RUN ok=0; for i in 1 2 3 4 5; do \
+      if apk add --no-cache iptables openssl; then ok=1; break; fi; \
+      echo "apk attempt $i failed; retrying in 5s" >&2; sleep 5; \
+    done; [ "$ok" = 1 ]
+
+COPY sidecar-entrypoint.sh /sidecar-entrypoint.sh
+RUN chmod +x /sidecar-entrypoint.sh
+
+# Runs as root (iptables + nginx master need it); nginx workers drop to the
+# nginx user per the generated config's `user nginx;`.
+ENTRYPOINT ["/sidecar-entrypoint.sh"]

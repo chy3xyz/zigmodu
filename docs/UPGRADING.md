@@ -134,15 +134,15 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 
 ---
 
-## v0.39.5 之后（未发布批次）
+## v0.39.6
 
-> 本节收 v0.39.5 之后、下一发布号之前的「会咬人」变更；发布时把标题改成版本号。
+> 本节收 v0.39.6 的「会咬人」变更。
 > **3 处破坏性**：① 中间件工厂与槽位池函数返回错误（编译错）；② `Fx.Parallel` / `Fx.Map`
 > 真并发化、签名换血（编译错）；③ JWT 段改用 std 严格 base64url，带 `=` padding 的段被拒
-> （行为收紧）。另有 ④⑤ 两条行为变化（④ scheduler `push` 的预算语义，非破坏性；
+> （行为收紧）。另有 ④⑤⑥ 三条行为变化（④ scheduler `push` 的预算语义，非破坏性；
 > ⑤ sqlx `query_timeout_ms = 0` 从「无界 + 警告」改为「回落默认有界」+ 删
-> `hasUnboundedPgReads`）。逐条背景见
-> [`../CHANGELOG.md`](../CHANGELOG.md) `[Unreleased]` 段的第 136 / 135 / 134 / 133 / 130 批。
+> `hasUnboundedPgReads`；⑥ TimerWheel 同 deadline 触发序从 LIFO 反转为 FIFO）。逐条背景见
+> [`../CHANGELOG.md`](../CHANGELOG.md) `[0.39.6]` 段的第 138 / 136 / 135 / 134 / 133 / 130 批。
 
 ### ① 中间件工厂与槽位池函数返回错误（第 134 批，**编译错**）
 
@@ -225,6 +225,14 @@ MySQL 旧行为：无论配什么都硬编码 30s），现在统一为 **0 = 回
 树外若有人调它会编译错，删掉该调用即可。配套新增 `sqlx.DEFAULT_QUERY_TIMEOUT_MS`（= 30000）
 与 `sqlx.effectiveQueryTimeoutMs`（0 → 默认值的解析点），MySQL 的
 `MYSQL_OPT_READ_TIMEOUT` 现在真正吃这个配置（按秒向上取整，亚秒也至少有 1s 界）。
+
+### ⑥ TimerWheel 同 deadline 触发序：LIFO → FIFO（第 138 批，**行为变化，窄**）
+
+**Breaking?** 无 API 变化，纯行为 —— 多个定时器落在**同一 deadline** 时，触发顺序从
+「后 arm 的先触发」（槽内 prepend）反转为「先 arm 的先触发」（= arm 命令到达命令环的
+顺序 = 因果序）。**影响面**：只有对同槽触发序有依赖的代码才感知得到；该序此前从未写进
+契约，树内零依赖。**一行改法**：若确实依赖旧方向，把 arm 顺序倒过来；更好的做法是不依赖
+同 deadline 的相对序（不同 deadline 的先后从来都有保证）。
 
 ---
 
@@ -818,7 +826,7 @@ if (try rt.cancelTimerSync(id)) { ... }  // true = 调用那一刻它还在 pend
 （`clock.nowMs() + delay`），所以 `after(50)` 仍是相对调用时刻 +50，不是相对 ticker 收到 +50。
 命令队列满时 `after` 返回 `error.Full`，不静默丢。
 
-## v0.26.0+（未发布批次）
+## v0.27.0
 
 ### `zmodu audit` / `zmodu ci` 现在会审计嵌套模块
 
@@ -1265,6 +1273,12 @@ const lim = registry.get("key").?;            // 或 getOrCreate("key")
 ---
 
 ## 模板
+
+发布周期中，新条目写在**当前周期节**：标题形如 `## v<上一发布号> 之后（未发布批次）`，
+正文引用 CHANGELOG 的 `[Unreleased]` 段。发布时 `scripts/release.sh` 会把该节标题
+自动改名为新版本号（`## v<新版本>`），并在仍有任何 `（未发布批次）` 标题残留时**硬失败**
+——所以正文里对 `[Unreleased]` 的引用也要在发布前一并改成新版本段名（脚本只改标题，
+不改正文）。周期内没有「会咬人」变更时不开该节。
 
 ```markdown
 ## vX.Y.Z

@@ -13,6 +13,7 @@
 const std = @import("std");
 const sqlx = @import("../sqlx/sqlx.zig");
 const http_middleware = @import("../api/Middleware.zig");
+const SlotPool = @import("../core/SlotPool.zig").SlotPool;
 
 pub const SCHEMA =
     \\CREATE TABLE IF NOT EXISTS role_permission (
@@ -95,15 +96,18 @@ pub fn permissionsCsv(allocator: std.mem.Allocator, client: *sqlx.Client, roles:
 /// (two permission databases) read their own table and never each other's.
 /// See `max_loader_slots` for how that is possible for a bare function pointer.
 ///
+/// Re-binding the **same** client reuses its slot (same loader, no extra
+/// claim) — a rewire must not eat the process-wide ceiling.
+///
 /// Returns `error.SlotPoolExhausted` when the comptime-sized pool is full —
 /// raise `max_loader_slots`.
 pub fn loaderFromClient(client: *sqlx.Client) error{SlotPoolExhausted}!http_middleware.CatalogPermissionLoader {
-    const slot = LoaderSlots.claimed.fetchAdd(1, .seq_cst);
-    if (slot >= max_loader_slots) {
-        return error.SlotPoolExhausted;
-    }
-    LoaderSlots.clients[slot] = client;
+    const slot = try LoaderSlots.pool.claimOrReuse(client, sameClient);
     return loader_trampolines[slot];
+}
+
+fn sameClient(a: *sqlx.Client, b: *sqlx.Client) bool {
+    return a == b;
 }
 
 /// Number of independently bound loaders one process may build.
@@ -125,17 +129,21 @@ pub fn loaderFromClient(client: *sqlx.Client) error{SlotPoolExhausted}!http_midd
 /// Slots are claimed at wiring time and never released, so this bounds how many
 /// loaders an application *builds*, not how many requests it serves. Past the
 /// bound, `loaderFromClient` fails with `error.SlotPoolExhausted` — raise this
-/// constant if an application legitimately builds more.
+/// constant if an application legitimately builds more. Introspect with
+/// `loaderSlotsClaimed()`.
 pub const max_loader_slots = 64;
 
 const LoaderSlots = struct {
     /// One client per claimed slot; unclaimed slots stay `null` and are not
     /// reachable — their trampolines are never handed out.
-    var clients: [max_loader_slots]?*sqlx.Client = @splat(null);
-    /// Atomic so two threads wiring loaders concurrently cannot claim one slot
-    /// (which would put two loaders on one client again).
-    var claimed: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+    var pool: SlotPool(*sqlx.Client, max_loader_slots) = .{};
 };
+
+/// Wiring-time budget introspection: how many of `max_loader_slots` are
+/// already claimed (monotonic; slots are never released).
+pub fn loaderSlotsClaimed() usize {
+    return LoaderSlots.pool.count();
+}
 
 fn LoaderTrampoline(comptime slot: usize) type {
     return struct {
@@ -143,7 +151,7 @@ fn LoaderTrampoline(comptime slot: usize) type {
             // Fail closed rather than guess: reaching this means the pointer was
             // used without claiming a slot. The caller
             // (`verifyJwtLoadPermsAndNext`) turns a loader error into a 500.
-            const client = LoaderSlots.clients[slot] orelse return error.LoaderSlotEmpty;
+            const client = LoaderSlots.pool.get(slot) orelse return error.LoaderSlotEmpty;
             return permissionsCsv(allocator, client, input.roles);
         }
     };
@@ -221,4 +229,24 @@ test "each loaderFromClient reads its own database" {
     defer allocator.free(csv_b);
     try std.testing.expect(std.mem.indexOf(u8, csv_b, "tenant:b-only") != null);
     try std.testing.expect(std.mem.indexOf(u8, csv_b, "tenant:a-only") == null);
+}
+
+test "loaderFromClient re-binds the same client without eating a slot" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var client = try sqlx.Client.open(allocator, io, .{
+        .driver = .sqlite,
+        .sqlite_path = ":memory:",
+        .max_open_conns = 1,
+    });
+    defer client.deinit();
+
+    const before = loaderSlotsClaimed();
+    const first = try loaderFromClient(&client);
+    const second = try loaderFromClient(&client);
+    // Same client → same trampoline, and the ceiling did not move: a rewire
+    // (tests, hot re-setup) must not burn the process-wide budget.
+    try std.testing.expectEqual(first, second);
+    try std.testing.expectEqual(before + 1, loaderSlotsClaimed());
+    try std.testing.expect(loaderSlotsClaimed() <= max_loader_slots);
 }

@@ -1,5 +1,70 @@
 # Changelog
 
+## [Unreleased]
+
+### 第 150 批：外部评审收尾——槽位池收敛（SlotPool）+ 发布流程门禁 + M10 wrapper + B-14 复现文档 + A-2 可跑边车（**破坏性：否**；CatalogPermDb 一处行为微调）
+
+来源：zweq 消费方评审（P0×2 / P1×3 + 一条重审建议），逐条核实全部属实后修复。
+
+1. **槽位池收敛（P0-1）**：新建 `src/core/SlotPool.zig`——`SlotPool(T, max)` 泛型
+   （`count`/`get`/`claim`/`claimOrReuse`），四个进程级"只增不回收"池全部迁移：
+   `ApiKeyAuth` Instances(64)、`catalogLoaderFromTable` TableLoaderSlots(64)、
+   `CatalogPermDb` LoaderSlots(64)、`openApiFromCatalog` OpenApiBindings(16)。
+   **顺手修了一个真缺陷**：`catalogLoaderFromTable` 与 `claimOpenApiBinding` 的
+   复用扫描循环 `for (0..claimed)` 未钳制——一次失败 claim 使计数器 > max 后，
+   下次调用的复用扫描会数组越界读（safe 模式 panic / ReleaseFast UB）；
+   `SlotPool` 把复用扫描钳到 `@min(claimed, max)`，结构性消除。
+   每池导出占用计数（`security.apiKeyAuthInstancesClaimed()`、
+   `http.tableLoaderSlotsClaimed()`、`http.openApiBindingsClaimed()`、
+   `CatalogPermDb.loaderSlotsClaimed()`），耗尽/越界/并发（12 线程争 8 槽）
+   均有测试。配套行为微调：**`CatalogPermDb.loaderFromClient` 现在按 client
+   指针去重**——同一 client 重复绑定复用既有槽并刷新 loader，不再吃新槽
+   （doc 已注明；loader 语义不变）。槽位回收（TTL/LRU）仍不做：计数导出让
+   "接线期预算断言"成为可能（64 槽对六门户+OpenAPI 的真实天花板可见了），
+   回收语义等出现真实诉求再定。
+2. **UPGRADING.md stale 节 + release.sh 门禁（P0-2 + P1-4）**：`## v0.39.5 之后
+   （未发布批次）`里的批 130/133/134/135/136 实际已随 **0.39.6** 发布——节标题
+   与 `[Unreleased]` 指针未随发布更新（消费方升级最容易漏看的正是这类窄破坏）；
+   补收漏掉的批 138（TimerWheel 同 deadline LIFO→FIFO 反转）。同病还有
+   `## v0.26.0+（未发布批次）`（内容全部随 0.27.0 发布）——两节均已改名归位。
+   防再犯：`release.sh` 现在①promote 时自动把 `## v<旧版> 之后（未发布批次）`
+   改名为 `## v<新版>`，②改名后仍有 `（未发布批次）` 残留标题则**硬失败**，
+   ③发布时打印本版行为变化摘要（`破坏性:`/`行为变化`/`行为收紧` 行）供过目。
+   UPGRADING.md 模板节同步写明该约定。
+3. **M10 官方 wrapper（P1-3）**：`http.resultHandler(State, T, f)`——把
+   `fn(*Context,*State) !T` 包成 TypedHandler（`try ctx.okValue(try f(...))`；
+   handler 自渲染失败信封后 `return error` 时 dispatch 不覆盖）。测试两条
+   （成功渲染 / 自渲染不被覆盖）。文档：`docs/ROUTE_TABLE.md` §7.5
+   「Handler 瘦身」；`docs/ISSUES_FROM_ZAPI.md` M10 关闭。
+4. **B-14 低成本半程（P1-5）**：新建 `docs/dev/reproducing-evidence.md`——
+   每类证据（soak / runtime-stress 序列 / mixed-version / smuggling-e2e /
+   fuzz / bench）给出本地一条命令、夜间 CI artifact（`nightly-soak-<sha>`，
+   30 天）与 `gh run download` 取法、通过信号与复现口径陷阱。
+   `docs/dev/v1.0-readiness-v0.35.md` 加 B-14 跟进注：复现入口公开 ≠ 已被
+   独立验证，判定维持"未关"直到出现第一个非本批 AI 的复现记录。
+5. **A-2 可跑边车示例**：新建 `examples/production-deploy/cluster-sidecar/`——
+   3 节点 `cluster-node` + nginx stream 边车（共享 netns、静态 IP、入向 mTLS
+   终结 + 出向 loopback 封装、iptable 把框架 0.0.0.0 明文端口收成 loopback-only
+   且失败拒启）、`gen-certs.sh`（demo CA + 节点证书 + cluster.env 密钥）、
+   `run.sh`（选主唯一/mesh 全连/明文绕过被拒/无证书握手被拒/持证握手成功/
+   SIGTERM 干净退出，六组断言全部可证伪）。`docs/DISTRIBUTED.md` A-2 节挂指针。
+   **门禁在调试期真的抓到了两个自身 bug**：① compose 把 node3 的
+   `--own-key-hex` 错接成 `KEY_N1`（n3 的帧在 n1/n2 全部 HMAC 拒收、永远
+   选不上 leader）——旧断言只数"历史 leader id"而漏报，已修并强化为
+   "三节点最新 RAFT_STATE 同 leader 同 term + 恰一个 leader + 零认证失败帧"；
+   ② `set -o pipefail` 下 `compose logs | grep -q` 的 SIGPIPE 假阴性
+   （grep 命中即退、producer 被杀、管道返回 141 → 条件为假）——改文件快照
+   再 grep；无证书探针同步改为双信号（客户端 `timeout` 不得触发 + 服务端
+   拒收日志）。顺手修：`examples/production-deploy/Dockerfile` 的 Zig pin
+   还指着已 404 的 dev 构建——改走 0.17.0 稳定版 URL（dev/稳定双分支，同 CI）。
+6. **AGENTS.md**：Release 流程节补 release.sh 的 UPGRADING 联动与摘要行为；
+   文档地图部署拓扑行挂 cluster-sidecar。
+
+验证：fmt 净 · `zig build test` 全绿（SlotPool +4 / resultHandler +1 /
+池计数 +3 等新用例在内）· check-deadcode / check-production / check-api /
+check-version / check-tenant-scope 全过 · cluster-sidecar `./run.sh --require`
+真跑六组断言全过（docker 29.4.0）。
+
 ## [0.39.7] - 2026-10-07
 
 ### 第 149 批：§12.17 延迟中位数序关系改为打印（macOS CI 第二次宿主读数假红，与批 144 同类）（**破坏性：否**——测试）

@@ -75,6 +75,8 @@ pub const CatalogSlot = comptime_router.CatalogSlot;
 pub const pathHasSkipPrefix = comptime_router.pathHasSkipPrefix;
 /// Generates an OpenAPI document from the route catalog.
 pub const openApiFromCatalog = comptime_router.openApiFromCatalog;
+/// Wiring-time slot budget of the OpenAPI binding pool (of 16).
+pub const openApiBindingsClaimed = comptime_router.openApiBindingsClaimed;
 /// OpenAPI generation options (title, version, servers).
 pub const OpenApiFromCatalogConfig = comptime_router.OpenApiFromCatalogConfig;
 /// Serves the bundled Swagger UI for a spec URL.
@@ -85,6 +87,8 @@ pub const scalarUiHandler = comptime_router.scalarUiHandler;
 pub const openApiRoutes = comptime_router.openApiRoutes;
 /// Binds a plain `HandlerFn` to `State` as a `TypedHandler` (inverse of `wrap`).
 pub const wrapHandler = comptime_router.wrapHandler;
+/// M10 thin-handler adapter: `fn(*Context,*State) !T` → renders `ctx.okValue`.
+pub const resultHandler = comptime_router.resultHandler;
 
 /// Middleware barrel: auth, gates, extractors, error renderers.
 pub const http_middleware = @import("api/Middleware.zig");
@@ -94,6 +98,8 @@ pub const jwtAuthFromCatalog = http_middleware.jwtAuthFromCatalog;
 pub const jwtAuthFromCatalogWithPermissions = http_middleware.jwtAuthFromCatalogWithPermissions;
 /// Builds a loader that reads role → permission rows from a SQL table.
 pub const catalogLoaderFromTable = http_middleware.catalogLoaderFromTable;
+/// Wiring-time slot budget of the table-loader pool (of 64).
+pub const tableLoaderSlotsClaimed = http_middleware.tableLoaderSlotsClaimed;
 /// Loader interface the catalog middleware calls to resolve permissions.
 pub const CatalogPermissionLoader = http_middleware.CatalogPermissionLoader;
 /// Input to a loader: `sub`, `aud` (tenant) and the caller's roles.

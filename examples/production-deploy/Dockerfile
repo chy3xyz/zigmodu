@@ -11,7 +11,7 @@
 
 FROM debian:bookworm-slim AS build
 
-ARG ZIG_VERSION=0.17.0-dev.1970+67f39b551
+ARG ZIG_VERSION=0.17.0
 ARG APP=examples/basic
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -25,7 +25,11 @@ RUN set -eux; \
       arm64) zarch=aarch64 ;; \
       *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
     esac; \
-    curl -fsSL "https://ziglang.org/builds/zig-${zarch}-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz; \
+    case "$ZIG_VERSION" in \
+      *dev*) base="https://ziglang.org/builds" ;; \
+      *)     base="https://ziglang.org/download/${ZIG_VERSION}" ;; \
+    esac; \
+    curl -fsSL "${base}/zig-${zarch}-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz; \
     mkdir -p /opt/zig; \
     tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1; \
     ln -s /opt/zig/zig /usr/local/bin/zig

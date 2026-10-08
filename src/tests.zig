@@ -40,6 +40,7 @@ test "compile all source files" {
     _ = @import("core/Event.zig");
     _ = @import("core/EventBus.zig");
     _ = @import("core/FrozenMap.zig");
+    _ = @import("core/SlotPool.zig");
     _ = @import("api/PanicHook.zig");
     _ = @import("core/EventRegistry.zig");
     _ = @import("core/ModuleContext.zig");

@@ -1,4 +1,5 @@
 const std = @import("std");
+const SlotPool = @import("../core/SlotPool.zig").SlotPool;
 
 /// API key authentication configuration
 pub const ApiKeyConfig = struct {
@@ -35,7 +36,7 @@ pub const ApiKeyConfig = struct {
 /// Returns `error.SlotPoolExhausted` when the comptime-sized pool is full —
 /// raise `max_key_auth_instances`.
 pub fn apiKeyAuth(config: ApiKeyAuthConfig) error{SlotPoolExhausted}!api.MiddlewareFn {
-    return key_auth_middlewares[try Instances.claim(.{ .static_keys = config })];
+    return key_auth_middlewares[try Instances.pool.claim(.{ .static_keys = config })];
 }
 
 /// API key authentication configuration (with a static key list)
@@ -53,7 +54,7 @@ pub const ApiKeyAuthConfig = struct {
 /// Returns `error.SlotPoolExhausted` when the comptime-sized pool is full —
 /// raise `max_key_auth_instances`.
 pub fn apiKeyAuthWithLoader(config: ApiKeyLoaderConfig) error{SlotPoolExhausted}!api.MiddlewareFn {
-    return key_auth_middlewares[try Instances.claim(.{ .loader = config })];
+    return key_auth_middlewares[try Instances.pool.claim(.{ .loader = config })];
 }
 
 /// Number of independently configured key-auth middlewares one process may build.
@@ -75,7 +76,7 @@ pub fn apiKeyAuthWithLoader(config: ApiKeyLoaderConfig) error{SlotPoolExhausted}
 /// middlewares an application *builds*, not how many requests it serves. Past
 /// the bound, `apiKeyAuth` / `apiKeyAuthWithLoader` fail with
 /// `error.SlotPoolExhausted` — raise this constant if an application
-/// legitimately builds more.
+/// legitimately builds more. Introspect with `instancesClaimed()`.
 pub const max_key_auth_instances = 64;
 
 /// Per-call store of one key-auth middleware (one kind per factory).
@@ -85,29 +86,29 @@ const KeyAuthStore = union(enum) {
 };
 
 const Instances = struct {
-    /// Unclaimed slots stay `null` and are not reachable — their trampolines are
-    /// never handed out; they answer 401 rather than fall through.
-    var slots: [max_key_auth_instances]?KeyAuthStore = @splat(null);
-    /// Atomic so two threads wiring middlewares concurrently cannot claim one
-    /// slot (which would put two middlewares on one configuration again).
-    var claimed: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
-
-    fn claim(store: KeyAuthStore) error{SlotPoolExhausted}!usize {
-        const slot = claimed.fetchAdd(1, .seq_cst);
-        if (slot >= max_key_auth_instances) {
-            return error.SlotPoolExhausted;
-        }
-        slots[slot] = store;
-        return slot;
-    }
+    /// Unclaimed slots stay `null` and are not reachable — their trampolines
+    /// are never handed out; they answer 401 rather than fall through.
+    /// No dedupe on purpose: two middlewares built from equal-looking key
+    /// lists are still two wiring decisions (the lists are slices of
+    /// slices, so "equal" has no cheap canonical form), and each gets its
+    /// own slot.
+    var pool: SlotPool(KeyAuthStore, max_key_auth_instances) = .{};
 };
+
+/// Wiring-time budget introspection: how many of `max_key_auth_instances`
+/// slots are already claimed (monotonic; slots are never released). Assert
+/// headroom after wiring, e.g.
+/// `std.debug.assert(ApiKeyAuth.instancesClaimed() <= expected)`.
+pub fn instancesClaimed() usize {
+    return Instances.pool.count();
+}
 
 fn KeyAuthTrampoline(comptime slot: usize) type {
     return struct {
         fn handler(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
             _ = user_data;
 
-            const store = Instances.slots[slot] orelse {
+            const store = Instances.pool.get(slot) orelse {
                 // Fail closed rather than fall through to `next`. Reaching this
                 // means the pointer was used without claiming a slot, so there
                 // is no per-instance policy to judge the request by.
@@ -332,6 +333,17 @@ test "constantTimeEql agrees with std.mem.eql on every byte position" {
         probe[i] = base[i];
     }
     try std.testing.expect(constantTimeEql(base, base));
+}
+
+test "instancesClaimed tracks wiring" {
+    // Delta assertion, order-independent: other tests in this binary claim
+    // slots from the same process-wide pool.
+    const before = instancesClaimed();
+    _ = try apiKeyAuth(.{ .keys = &.{"sk-budget"} });
+    try std.testing.expectEqual(before + 1, instancesClaimed());
+    // The suite-wide budget itself: the whole test binary must stay far below
+    // the ceiling — a runaway loop here would starve the embedding app.
+    try std.testing.expect(instancesClaimed() <= max_key_auth_instances);
 }
 
 test "ApiKeyGenerator generate" {

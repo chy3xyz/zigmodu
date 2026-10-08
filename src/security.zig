@@ -19,6 +19,8 @@ pub const PasswordEncoder = @import("security/PasswordEncoder.zig").PasswordEnco
 pub const ApiKeyAuth = @import("security/ApiKeyAuth.zig").apiKeyAuth;
 /// API-key middleware whose key→identity lookup comes from your loader/DB.
 pub const ApiKeyAuthWithLoader = @import("security/ApiKeyAuth.zig").apiKeyAuthWithLoader;
+/// Wiring-time slot budget of the API-key middleware pool (of 64).
+pub const apiKeyAuthInstancesClaimed = @import("security/ApiKeyAuth.zig").instancesClaimed;
 /// Creates API keys: prefixed public id plus hashed secret.
 pub const ApiKeyGenerator = @import("security/ApiKeyAuth.zig").ApiKeyGenerator;
 /// API-key auth settings (header name, hashing, scopes).

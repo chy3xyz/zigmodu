@@ -1,0 +1,49 @@
+# Build the framework's single-node cluster harness into a minimal image.
+#
+# Build CONTEXT must be the repository root (cluster-node compiles against the
+# framework as `.path = "../.."` — same convention as ../Dockerfile):
+#
+#   docker build -f examples/production-deploy/cluster-sidecar/Dockerfile.node \
+#                -t zigmodu-cluster-node .
+#
+# `-Ddb=none`: the harness links no SQL driver (docs/SQLX_DRIVERS.md).
+# Pinned to the same Zig the framework CI locks (.github/workflows/ci.yml).
+
+FROM debian:bookworm-slim AS build
+
+ARG ZIG_VERSION=0.17.0
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl xz-utils ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) zarch=x86_64 ;; \
+      arm64) zarch=aarch64 ;; \
+      *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    case "$ZIG_VERSION" in \
+      *dev*) base="https://ziglang.org/builds" ;; \
+      *)     base="https://ziglang.org/download/${ZIG_VERSION}" ;; \
+    esac; \
+    curl -fsSL "${base}/zig-${zarch}-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz; \
+    mkdir -p /opt/zig; \
+    tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1; \
+    ln -s /opt/zig/zig /usr/local/bin/zig
+
+WORKDIR /src
+COPY . .
+
+ENV ZIG_GLOBAL_CACHE_DIR=/tmp/zig-global-cache
+RUN zig build cluster-node -Doptimize=ReleaseSafe -Ddb=none
+
+FROM debian:bookworm-slim AS runtime
+
+RUN useradd --system --uid 10001 --no-create-home zigmodu
+COPY --from=build /src/zig-out/bin/cluster-node /app/bin/cluster-node
+USER zigmodu
+
+# No ENTRYPOINT: docker-compose supplies `/bin/sh -c 'exec ...'` per node so
+# the HMAC keys can be interpolated from certs/cluster.env at container start.

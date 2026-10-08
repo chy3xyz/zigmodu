@@ -75,12 +75,33 @@ if grep -q "^## \[Unreleased\]" CHANGELOG.md; then
         exit 1
     fi
     perl -0pi -e "s/## \[Unreleased\]/## [$VERSION] - $(date +%F)/" CHANGELOG.md
+
+    # UPGRADING.md cycle section: `## v$OLD 之后（未发布批次）` becomes the
+    # released version. Missed once (0.39.6 shipped with the heading still
+    # saying "v0.39.5 之后"), and the in-section pointer kept aiming at
+    # CHANGELOG's [Unreleased] — so the rename is mechanical here, and any
+    # leftover "（未发布批次）" heading is a hard failure below.
+    perl -0pi -e "s/## v\Q$OLD\E 之后（未发布批次）/## v$VERSION/" docs/UPGRADING.md
 elif [ "$SKIP_BUMP" = "1" ]; then
     echo "CHANGELOG already promoted to [$VERSION]"
 else
     echo "FAIL: CHANGELOG.md has no [Unreleased] section"
     exit 1
 fi
+
+# The template section mentions the in-cycle heading shape inline; only a
+# heading at line start is a leftover.
+if grep -n "^## .*（未发布批次）" docs/UPGRADING.md; then
+    echo "FAIL: docs/UPGRADING.md still has an （未发布批次） section heading."
+    echo "Rename it to v$VERSION and repoint in-body [Unreleased] references to [$VERSION]."
+    exit 1
+fi
+
+# Behavior-change digest: every release prints the batch headings that bite,
+# so the "silent bite" class is visible in the release output itself.
+echo "-- behavior changes in v$VERSION --"
+sed -n "/^## \[$VERSION\]/,/^## \[/p" CHANGELOG.md \
+    | grep -E "破坏性：(是|窄)|行为变化|行为收紧" | sed 's/^/  /' | head -40 || true
 
 # 1b. Verify every version reference actually bumped — perl -pi silently
 #     no-ops when the old value doesn't match, which left README stuck at an

@@ -193,6 +193,9 @@ loopback）；跨域、跨云、过公网的集群面流量必须走**边车或�
 最后一跳（边车 → 节点本体）仍是明文+HMAC，所以边车必须与节点**同主机/同 Pod**
 （localhost 或 Pod 内网），那一段不在任何网络上。同一哲学在 HTTP 入口面的决策记录与
 拓扑参考见 `examples/production-deploy/`（TLS 一律边车终结，后端明文/h2c）。
+**可跑的集群面参考实现见 `examples/production-deploy/cluster-sidecar/`**：3 节点
+cluster-node + nginx stream 边车（mTLS 双向验证 + iptables 明文锁口），`./run.sh`
+一条命令起全套并断言"明文绕过被拒 / 无证书被拒 / 选主与 mesh 正常"。
 
 **fail-closed 门的准确含义**：`ClusterBootstrap.start()` 的 `ClusterAuthRequired` 门
 保证的是**认证**（多节点无凭证拒绝启动），**不保证机密性** —— 过了门，帧照样明文。

@@ -534,6 +534,36 @@ Extractors → `src/api/Extract.zig` · Testkit → `http.Testkit.dispatch`
 
 `dispatch` 的 `DispatchOptions.query` 收**percent-encoded 原样串**（`"pageNo=2&name=%E5%BC%A0%E4%B8%89"`），与 `path` 里自带的 `?…` 同时生效、同名 key 以 `opts.query` 为准 —— 用来测 `ctx.queryInt` / `ctx.queryParam` / `queryArray` 驱动的路由（含脚手架生成的 `list*`）：
 
+### 7.5 Handler 瘦身：`resultHandler`（M10 官方模式）
+
+「parse → service → renderJson」胖 handler 的官方瘦身形态：handler 函数
+**返回值**，渲染交给适配器。成功路径只有业务：
+
+```zig
+const http = zigmodu.http;
+
+fn getUser(ctx: *http.Context, self: *State) !UserDto {
+    const id = try ctx.paramInt(i64, "id");
+    return self.svc.findUser(id);           // 返回值即 200 的 data
+}
+
+pub const routes = [_]http.RouteSpec(State){
+    .{ .method = .GET, .path = "{id}", .handler = http.resultHandler(State, UserDto, getUser) },
+};
+```
+
+- 成功：适配器调 `ctx.okValue(value)`，走 `ctx` 当前的信封方言
+  （`setEnvelope(.ruoyi)` 等照常生效）。
+- **失败侧保持显式**：函数仍持有 `ctx`，业务失败就地 `ctx.failCode(...)` /
+  `http.respondErr(...)` 后 `return error.Xxx` —— dispatch 只在
+  `ctx.responded == false` 时补 500，已渲染的回答不会被覆盖。
+- 未渲染就返回的错误走既有错误路径（recover / `setErrorMap` / 500），
+  一个字节的行为都没改。
+
+它**不是** dispatch 层的 `!ApiResult(T)` auto-render（那要动路由分发签名，
+仍是 deferred 的 M10 完整版）；它覆盖的是胖 handler 的最大公约数，且零
+迁移成本——逐条路由改用，不用的路由不受影响。
+
 ---
 
 ## 8. Scaffold / zmodu

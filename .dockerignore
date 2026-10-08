@@ -15,3 +15,5 @@ wal_test*
 zsaas
 *.md
 !README.md
+# demo PKI / key material (regenerate with gen-certs.sh; never sent to builders)
+examples/production-deploy/cluster-sidecar/certs

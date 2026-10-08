@@ -8,6 +8,7 @@
 const std = @import("std");
 const server_mod = @import("Server.zig");
 const OpenApi = @import("../http/OpenApi.zig");
+const SlotPool = @import("../core/SlotPool.zig").SlotPool;
 
 pub const Method = server_mod.Method;
 pub const HandlerFn = server_mod.HandlerFn;
@@ -343,17 +344,25 @@ const OpenApiBinding = struct {
 /// Slots are claimed at wiring time and never released, so this bounds how many
 /// OpenAPI endpoints an application *builds*, not how many requests it serves.
 /// Past the bound, `openApiFromCatalog` fails with `error.SlotPoolExhausted` —
-/// raise this constant if an application legitimately builds more.
+/// raise this constant if an application legitimately builds more. Introspect
+/// with `openApiBindingsClaimed()`.
 pub const max_openapi_bindings = 16;
 
 const OpenApiBindings = struct {
     /// One binding per claimed slot; unclaimed slots stay `null` and are not
     /// reachable — their trampolines are never handed out.
-    var bindings: [max_openapi_bindings]?OpenApiBinding = @splat(null);
-    /// Atomic so two threads wiring apps concurrently cannot claim one slot
-    /// (which would put two apps on one binding again).
-    var claimed: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+    var pool: SlotPool(OpenApiBinding, max_openapi_bindings) = .{};
 };
+
+/// Wiring-time budget introspection: how many of `max_openapi_bindings` are
+/// already claimed (monotonic; slots are never released).
+pub fn openApiBindingsClaimed() usize {
+    return OpenApiBindings.pool.count();
+}
+
+fn sameBindingSlot(a: OpenApiBinding, b: OpenApiBinding) bool {
+    return a.catalog_slot == b.catalog_slot;
+}
 
 /// Claim the binding for `slot`, reusing the existing slot when the same
 /// `CatalogSlot` registers twice: a re-registration updates that app's config,
@@ -368,21 +377,7 @@ fn claimOpenApiBinding(slot: *CatalogSlot, config: OpenApiFromCatalogConfig) err
         .description = config.description,
         .bearer_auth = config.bearer_auth,
     };
-    const claimed = OpenApiBindings.claimed.load(.seq_cst);
-    for (0..claimed) |i| {
-        if (OpenApiBindings.bindings[i]) |existing| {
-            if (existing.catalog_slot == slot) {
-                OpenApiBindings.bindings[i] = binding;
-                return i;
-            }
-        }
-    }
-    const index = OpenApiBindings.claimed.fetchAdd(1, .seq_cst);
-    if (index >= max_openapi_bindings) {
-        return error.SlotPoolExhausted;
-    }
-    OpenApiBindings.bindings[index] = binding;
-    return index;
+    return OpenApiBindings.pool.claimOrReuse(binding, sameBindingSlot);
 }
 
 fn OpenApiHandler(comptime index: usize) type {
@@ -390,7 +385,7 @@ fn OpenApiHandler(comptime index: usize) type {
         fn handle(ctx: *Context) anyerror!void {
             // Fail closed rather than guess: `null` or an unready slot is not a
             // document we know anything about.
-            const binding = OpenApiBindings.bindings[index] orelse {
+            const binding = OpenApiBindings.pool.get(index) orelse {
                 try ctx.sendError(503, "Route catalog not ready");
                 return;
             };
@@ -497,6 +492,36 @@ pub fn wrapHandler(comptime State: type, comptime handler: HandlerFn) TypedHandl
     return struct {
         fn adapter(ctx: *Context, _: *State) anyerror!void {
             return handler(ctx);
+        }
+    }.adapter;
+}
+
+/// M10 — the official thin-handler pattern: adapt a **value-returning**
+/// function `fn(*Context, *State) !T` into a `TypedHandler`; the adapter
+/// renders the value through the context's envelope dialect (`ctx.okValue`).
+///
+/// The function keeps `ctx`, so the failure side stays explicit and local:
+/// render the envelope yourself (`ctx.failCode` / `http.respondErr`) and
+/// return an error — dispatch sends a 500 only when nothing was answered
+/// (`ctx.responded == false`), so an already-rendered failure is left alone.
+/// Errors returned *without* rendering keep today's behavior (recover /
+/// `setErrorMap` / 500) — nothing about the error path changes.
+///
+/// ```zig
+/// fn getUser(ctx: *http.Context, self: *State) !UserDto {
+///     const id = try ctx.paramInt(i64, "id");
+///     return self.svc.findUser(id);
+/// }
+/// // routes: .{ .method = .GET, .path = "{id}", .handler = resultHandler(State, UserDto, getUser) }
+/// ```
+pub fn resultHandler(
+    comptime State: type,
+    comptime T: type,
+    comptime f: *const fn (*Context, *State) anyerror!T,
+) TypedHandler(State) {
+    return struct {
+        fn adapter(ctx: *Context, state: *State) anyerror!void {
+            try ctx.okValue(try f(ctx, state));
         }
     }.adapter;
 }
@@ -1204,6 +1229,25 @@ test "openApiRoutes generates 3 public UI and spec routes" {
     try std.testing.expect(routes[2].meta.auth == .public);
 }
 
+test "openApiBindingsClaimed tracks wiring and re-registration reuses the slot" {
+    const State = struct {};
+    var slot = CatalogSlot{};
+    defer slot.deinit();
+    const before = openApiBindingsClaimed();
+    _ = try openApiFromCatalog(&slot, .{ .title = "Budget App" });
+    try std.testing.expectEqual(before + 1, openApiBindingsClaimed());
+    // Re-registering the same CatalogSlot refreshes the config in place —
+    // it must not burn another slot (rewire is a normal control-plane act).
+    _ = try openApiFromCatalog(&slot, .{ .title = "Budget App v2" });
+    try std.testing.expectEqual(before + 1, openApiBindingsClaimed());
+    try std.testing.expect(openApiBindingsClaimed() <= max_openapi_bindings);
+
+    var slot2 = CatalogSlot{};
+    defer slot2.deinit();
+    _ = try openApiRoutes(State, &slot2, .{ .title = "Budget App 2" });
+    try std.testing.expectEqual(before + 2, openApiBindingsClaimed());
+}
+
 test "one process, two servers: each /openapi.json serves its own catalog" {
     const allocator = std.testing.allocator;
     const Testkit = @import("../http/Testkit.zig");
@@ -1333,6 +1377,39 @@ test "wrapHandler captures each handler independently (no shared store)" {
     try std.testing.expectEqual(@as(u8, 2), S.called);
     try a1(undefined, &state);
     try std.testing.expectEqual(@as(u8, 1), S.called);
+}
+
+test "resultHandler renders the returned value through the envelope dialect" {
+    const State = struct { base: u32 };
+    const Dto = struct { id: u32, name: []const u8 };
+    const H = struct {
+        fn show(ctx: *Context, state: *State) !Dto {
+            // The function still owns ctx for the failure side.
+            _ = ctx;
+            return .{ .id = state.base + 1, .name = "ada" };
+        }
+        fn missing(ctx: *Context, _: *State) !Dto {
+            // Rendered failure: dispatch must not overwrite it with a 500.
+            try ctx.failCode(40404, "user not found");
+            return error.NotFound;
+        }
+    };
+
+    var state = State{ .base = 41 };
+    var ctx = try Context.init(std.testing.allocator, .GET, "/users/42");
+    defer ctx.deinit();
+    try resultHandler(State, Dto, H.show)(&ctx, &state);
+    try std.testing.expect(ctx.responded);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.response_body.items, "\"id\":42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.response_body.items, "\"name\":\"ada\"") != null);
+
+    var ctx2 = try Context.init(std.testing.allocator, .GET, "/users/0");
+    defer ctx2.deinit();
+    try std.testing.expectError(error.NotFound, resultHandler(State, Dto, H.missing)(&ctx2, &state));
+    // The failure envelope the function rendered is what the client gets.
+    try std.testing.expect(ctx2.responded);
+    try std.testing.expect(std.mem.indexOf(u8, ctx2.response_body.items, "user not found") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ctx2.response_body.items, "NotFound") == null);
 }
 
 test "catalog exportOpenApi: RouteMeta annotations replace the permission/auth fallbacks" {
