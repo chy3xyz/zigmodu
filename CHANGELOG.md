@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.39.8] - 2026-10-08
 
 ### 第 150 批：外部评审收尾——槽位池收敛（SlotPool）+ 发布流程门禁 + M10 wrapper + B-14 复现文档 + A-2 可跑边车（**破坏性：否**；CatalogPermDb 一处行为微调）
 
