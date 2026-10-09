@@ -1,0 +1,70 @@
+# Envoy in front of the smuggling probe — the second front-end parser this
+# topology is asserted against (the nginx one lives in ../smuggling-e2e).
+#
+# One listener, not two: nginx's framing behaviour depends on
+# `proxy_request_buffering`, a toggle Envoy does not have — Envoy always
+# streams the body upstream and, by default, preserves a well-formed
+# `Transfer-Encoding: chunked` end to end. That is exactly why the backend's
+# own TE refusal (control 2/4 in run.sh) is load-bearing in this topology and
+# asserted on the wire for every TE-shaped payload, not just assumed.
+#
+# The access log prints `METHOD PATH STATUS RESPONSE_CODE_DETAILS` per request
+# so the harness can diff what Envoy forwarded against what the backend says
+# it served. A request the backend served but the gateway never forwarded
+# **is** a smuggling primitive, by definition. Requests Envoy's own HTTP/1
+# codec rejects log as `- - 400 http1.content_length_and_chunked_not_allowed`
+# (no method/path — the forward-count grep deliberately does not match those),
+# and the harness asserts those rejection lines separately per payload.
+#
+# `@APP_PORT@` is substituted by run.sh into a rendered copy under its temp
+# dir and *that* is what gets mounted — envoy.yaml has no environment
+# expansion either (same lesson as the nginx template, see
+# ../smuggling-e2e/nginx.conf.template).
+
+static_resources:
+  listeners:
+    - name: ingress
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 18081 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                codec_type: HTTP1
+                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /dev/stdout
+                      log_format:
+                        text_format_source:
+                          inline_string: "%REQ(:METHOD)% %REQ(:PATH)% %RESPONSE_CODE% %RESPONSE_CODE_DETAILS%\n"
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: probe
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: probe, timeout: 5s }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: probe
+      # STRICT_DNS + V4_ONLY: host.docker.internal is a name, and a localhost
+      # AAAA record would make Envoy prefer an IPv6 the probe does not bind.
+      type: STRICT_DNS
+      dns_lookup_family: V4_ONLY
+      connect_timeout: 3s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: probe
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: host.docker.internal, port_value: "@APP_PORT@" }

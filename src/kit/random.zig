@@ -33,7 +33,7 @@ pub fn uuid(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
 /// Entropy comes from `io` (the OS source) on every call — there is no
 /// process-wide CSPRNG whose seed could be recovered from one observed output.
 /// A failing entropy source is reported as `error.EntropyUnavailable`.
-pub fn bytes(io: std.Io, len: usize) ![len]u8 {
+pub fn bytes(io: std.Io, comptime len: usize) ![len]u8 {
     var buf: [len]u8 = undefined;
     if (test_source) |ts| {
         ts.bytes(&buf);

@@ -358,6 +358,9 @@ test "compile all source files" {
 
     // Util
     _ = @import("util/csv.zig");
+
+    // CSPRNG × Io-backend coverage (Dispatch/Uring real-run gates)
+    _ = @import("test/CsprngIoBackends.zig");
 }
 
 // ========================================

@@ -1,0 +1,21 @@
+# CL/TE request-smuggling e2e with Envoy as the front gateway — driven by
+# ./run.sh, which renders envoy.yaml.template (the upstream port is a
+# placeholder) and exports RENDERED_CONF / GW_PORT. Not meant to be run
+# standalone.
+#
+# The probe backend runs ON THE HOST (zig build in ../smuggling-e2e, shared
+# with the nginx topology so both gateways face byte-identical backend
+# behaviour); Envoy reaches it through host.docker.internal.
+
+services:
+  envoy:
+    image: ${ENVOY_IMAGE:-envoyproxy/envoy:v1.31.10}
+    extra_hosts:
+      # Linux maps the name to the host gateway; Docker Desktop / OrbStack
+      # provide it natively. Same mechanism as ../smuggling-e2e/run.sh.
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${GW_PORT:?set by run.sh}:18081"
+    volumes:
+      - "${RENDERED_CONF:?set by run.sh}:/etc/envoy/envoy.yaml:ro"
+    command: ["-c", "/etc/envoy/envoy.yaml"]

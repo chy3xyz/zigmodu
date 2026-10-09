@@ -1,5 +1,94 @@
 # Changelog
 
+## [Unreleased]
+
+### 第 151 批：Raft 出站 IO 移出锁（锁范围债落地）+ Windows 出站有界化 + CI 跨宿主 bench 证据 + CSPRNG 矩阵 + Envoy 拓扑（**破坏性：否**）
+
+来源：外部评审"刻意不做"清单复核 + 架构评估的锁范围债，六线并行收口。
+
+1. **Raft 出站 IO 移出 `RaftLock`（锁范围债落地）**：`tick()` 的出站轮次从"整段持锁"拆成
+   三段（`flushOutgoing`：第一段持锁判定并**自足暂存** `stageLeaderRoundLocked`、第二段
+   **锁外** IO `deliverStagedRound`、第三段持锁校验应用 `applyStagedRoundLocked`），
+   `flush_active` 原子门单飞（tick 线程与 `handleVoteResponse` 的选后补发互跳）、
+   `becomeLeader` 改登记 `heartbeat_owed`（不再锁内发心跳）、暂存走 `outbound_arena`
+   （`reset(.retain_capacity)`，心跳轮零分配）+ `staged_peers` 快照（`addPeer` 并发安全）。
+   **`rpc_timeout_ms` 语义变化**：从"锁的活命界"退为"一轮为死对等多久的锁外等待"——不再界定
+   持锁时长。快照发送同走三段拆（快照字节整份拷入 arena；**收紧点**：中间帧应答只记 term，
+   `done` 帧才推进 `match_index`——旧模型每个中间帧都推进）。护栏红测试两条（变异均验红）：
+   `a round in flight reads staged bytes while the log is truncated under it`（义务 1：锁外
+   发送期间日志被截断，线上字节仍是暂存拷贝）、`a reply that lands after the term moved is
+   dropped, not applied`（义务 2：任期已变的应答整批丢弃，不进 `next_index`）。
+   **评审复查又抓到一个实现 bug 并已修**：第一段只清 `staged_vote` 未清 `staged_items`——
+   无 round 的 tick（心跳间隔中的 leader tick、被降级后的全部 follower tick）会把上一轮残留
+   以 **term=0** 重发（每 tick 一条垃圾帧直到首个 peer 应答才 break）；修复=第一段开头两个
+   缓冲一起清，回归测试 `a tick that stages no round sends nothing on the wire`（变异验红：
+   `expected 1, found 2`）。`docs/DISTRIBUTED.md`「出站 IO 与锁」节从"设计已定、尚未落地"
+   改写为落地记录；`ClusterBootstrap.tick` 注释同步。
+2. **Windows 出站 connect 有界化**：`RaftTransport.connectTimeout` 三段分发
+   （`timeout_ms=0` → `netdial` 无界出口 / Windows → `connectTimeoutWindows` / 其余 POSIX）；
+   std 0.17 的 `ws2_32` 只有常量没有函数声明，9 个符号走 extern（WSAStartup/socket/
+   ioctlsocket/connect/WSAPoll/getsockopt/closesocket/WSAGetLastError/WSACleanup），WSADATA
+   按 ABI 完整声明。非阻塞 `connect` + `WSAPoll(POLLWRNORM)` + `SO_ERROR` 判定，与 POSIX 半
+   同形；无忙等无线程。`netdial.zig` 的 `ConnectError` 补 `Canceled`/`OptionUnsupported`
+   （修 pre-existing Windows 编译错）。收口时把 `wVersion` 从"声明未读"升级为真实的授予版本
+   检查（WSAPoll 需 ≥2.2，不足即 `error.NetworkDown`）；其余 6 个 ABI 输出字段登记 deadcode
+   基线（`--force`，26→32，唯一允许的增长类）。验证：x86_64-windows-gnu 编译+链接过（运行
+   失败是宿主无法执行 Windows 二进制，预期）；macOS focused RaftTransport 31/31 + netdial
+   6/6。**残留风险如实记**：无 Windows 真机，仅验到 ABI；返回的 SOCKET 若未来进 Windows
+   数据面须用 ws2_32 recv/send（`CloseHandle` 会绕 `closesocket` 簿记）。
+3. **CI x86_64 bench 证据（A2 跟进）**：`ci.yml` 新增 `bench-x86_64` job——schedule/
+   workflow_dispatch 触发、ubuntu-latest、跑完整 `check-bench.sh` 对 aarch64 基线、
+   `exit 0` 兜底**非门禁**、artifact `bench-x86_64-<sha>` 留存 30 天；
+   `docs/dev/reproducing-evidence.md` 加取法行。首个 schedule 夜才见真章（30 分钟超时若紧
+   可提 45）；`docs/dev/v1.0-gap.md` A2 挂跟进注（"零数据"降为"数据积累中"，判定不变）。
+4. **UPGRADING 旧名删除政策**：统一口径段加"删除前一版本双重点名预告"；新增「不在表上的
+   近义名」小节（澄清 `param`→`paramPath`→`nestedParam` 实为一次改名+一次同义名，`param`
+   不弃用）；模板节加"改名三件事规则"。顺手修 `docs/API_FREEZE.md` 对 UPGRADING 的 5 处
+   行号漂移。
+5. **CSPRNG 验证矩阵**：新建 `src/test/CsprngIoBackends.zig` 四条——Threaded vtable 同一性
+   钉约、显式 Threaded battery 真跑、Dispatch/Uring 各一条 **comptime 门控** battery。
+   **重要发现（纠正外部报告口径）**："Uring/Dispatch 未验"的根因是 **std 0.17.0 上游缺陷**——
+   `Io.Uring`/`Io.Dispatch` 的 vtable 字面量赋值了不存在的 `processReplacePath` 字段
+   （`lib/std/Io/Uring.zig:759`、`Dispatch.zig:439`），两个后端在任何 OS 都编不过（探针实证）；
+   门控开关待工具链修复后翻开即真跑。`DistributedLock.zig` 加 MySQL gated SqlLock 用例
+   （CI `test-mysql` job 真跑）；顺手修 `kit/random.zig` 的 `bytes` 从未实例化的编译错。
+6. **CL/TE Envoy 拓扑 e2e**：新建 `examples/production-deploy/smuggling-envoy/`——compose
+   固定 `envoy:v1.31.10`，5 载荷全过、红路径验证过（改期望即 EXIT=1），CI 挂
+   integration-full（端口 18190/18191）。坑已解：Envoy access log 异步刷盘 1–10s，barrier +
+   `await_gw` 有界等待。残留如实记：`await` 上限 40s 在更慢 CI 可能红（调大轮询即可）；
+   H2 前端/TLS 终结层仍未覆盖（README 已声明）。readiness §六 的 B-15/Windows dial 两行
+   已挂跟进注（判定不回改）。
+
+验证：fmt 净 · focused RaftElection **48/48**（含 3 条新护栏/回归，变异均验红）·
+RaftTransport 31/31 · ClusterBootstrap 14/14 · **全量 `zig build test` EXIT=0** ·
+check-deadcode（基线 26→32：WSADATA ABI 输出字段）/ check-production / check-api /
+check-version / check-tenant-scope 全过 · Windows 交叉编译链接过 · Envoy e2e 本地真跑
+EXIT=0。
+
+### 第 152 批：zent v0.83.1 → v0.86.0 适配（**破坏性：否**）
+
+来源：上游 zent 连续三版（0.84 / 0.85 / 0.86，2026-10-08）。
+
+1. **pin 更新**：`examples/zent-modulith/build.zig.zon` 与
+   `examples/metaverse-creative/build.zig.zon` 换 v0.86.0 tarball +
+   新 hash（`zig fetch` 取得）；`examples/_shared` 为 path 依赖无需动。
+2. **破坏面评估（逐版核实上游 CHANGELOG + 本仓库 grep 实证）**：
+   - **0.84（行为变）**：EntQL 标识符改按**字段名优先**寻址（`StorageKey` 感知）；
+     `Has{Edge}With` 校验谓词列存在（`error.UnknownField`）；修复边外键 DDL 恒指
+     `id`（新库首插 `foreign key mismatch`）与 prepared-cache 命中后失败永久占槽。
+     本仓库示例不用 EntQL 谓词 / `Has{Edge}With`，零适配。
+   - **0.85（所有权 BREAKING）**：`ShardSet` 改**借用** `ShardRouter`；grep 实证
+     本仓库示例不用 `ShardSet`（`ShardRouter` 命中均为 zigmodu 自有
+     `src/tenant/ShardRouter.zig`），零适配。同版修 MySQL `bool`/`float` 假 drift。
+   - **0.86（additive）**：`field.String.VarChar(n)`（写路径各方言统一拒绝超长）
+     与 `client.<entity>.AllOwned(allocator)`；MySQL prepared `exec` 的 `SELECT`
+     报行数。零适配。
+3. **验证**：`zent-modulith` 清缓存重建 EXIT=0 + `smoke.sh` **43 checks 0 failed、
+   clean shutdown no leaks**；`metaverse-creative` `zig build demo` EXIT=0
+   （`demo_ok … balanced=true outbox=1`）。旧 `zig-pkg/zent-0.83.1-*` 已删。
+4. **文档同步**：`docs/ZENT.md` 版本口径行 / §11 依赖接入 / §14 表格加
+   v0.84–0.86 汇总行；`AGENTS.md` zent 版本行同步。
+
 ## [0.39.8] - 2026-10-08
 
 ### 第 150 批：外部评审收尾——槽位池收敛（SlotPool）+ 发布流程门禁 + M10 wrapper + B-14 复现文档 + A-2 可跑边车（**破坏性：否**；CatalogPermDb 一处行为微调）

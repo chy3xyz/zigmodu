@@ -591,21 +591,31 @@ pub const ConnectTimeoutError = std.Io.net.IpAddress.ConnectError || error{Conne
 /// a non-blocking socket would come back `EAGAIN` — which the WebSocket write
 /// path, for one, treats as a programmer bug and panics on in debug builds.
 ///
-/// POSIX only: on Windows, where `std.posix.system` has no `poll`, this falls
-/// back to the unbounded dial — `netdial.connectBlocking`, which delegates to
-/// `IpAddress.connect` there. The raw-syscall layer it is built on
-/// (`sockread`) is POSIX-only already. The unbounded branch goes through
-/// netdial on POSIX too: std's blocking connect panics when a signal
-/// interrupts it (EINTR retry → EISCONN → `errnoBug`; see `core/netdial.zig`).
+/// Windows dials the same bounded shape over ws2_32 (`connectTimeoutWindows`:
+/// non-blocking `connect` + `WSAPoll` + `SO_ERROR`), because std's Windows
+/// dial has the same unimplemented-timeout trap as the POSIX one and std
+/// exposes no poll there — its own Windows networking talks to the AFD driver
+/// directly, so the handful of ws2_32 symbols the dial needs is declared in
+/// the `wsa` block below.
+///
+/// The unbounded `timeout_ms == 0` escape goes through netdial on every
+/// target: std's blocking connect panics when a signal interrupts it (EINTR
+/// retry → EISCONN → `errnoBug`; see `core/netdial.zig`). On Windows netdial
+/// delegates back to std, which is fine there — a blocking WSA connect has no
+/// EINTR/EISCONN asymmetry.
 pub fn connectTimeout(io: std.Io, addr: std.Io.net.IpAddress, timeout_ms: u32) ConnectTimeoutError!std.Io.net.Stream {
-    if (builtin.target.os.tag == .windows or timeout_ms == 0) {
-        // The unbounded fallback still must not panic on EINTR→EISCONN (std's
-        // posixConnect reads the retry's EISCONN as errnoBug — the batch-112
-        // trap), so it dials through netdial rather than std. On Windows
-        // netdial delegates back to std, which is fine there.
-        return netdial.connectBlocking(io, addr);
-    }
+    if (timeout_ms == 0) return netdial.connectBlocking(io, addr);
+    if (builtin.target.os.tag == .windows) return connectTimeoutWindows(addr, timeout_ms);
+    return connectTimeoutPosix(addr, timeout_ms);
+}
 
+/// The POSIX half of `connectTimeout`: non-blocking `connect(2)` + `poll` +
+/// `SO_ERROR` over raw syscalls. Kept behind its own function — not just an
+/// early `return` above — so a Windows-targeted compile never analyzes it:
+/// Zig skips the not-taken branch of a comptime condition but still analyzes
+/// the code that *follows* it, and this half's `std.posix` surface (`pollfd`,
+/// `fcntl`, raw `socket`) does not exist on Windows.
+fn connectTimeoutPosix(addr: std.Io.net.IpAddress, timeout_ms: u32) ConnectTimeoutError!std.Io.net.Stream {
     var storage: std.Io.Threaded.PosixAddress = undefined;
     const addr_len = std.Io.Threaded.addressToPosix(&addr, &storage);
 
@@ -714,6 +724,225 @@ fn awaitConnect(fd: std.posix.socket_t, timeout_ms: u32) ConnectTimeoutError!voi
             log.debug("[raft] connect failed with errno {d}", .{e});
             return error.Unexpected;
         },
+    }
+}
+
+// ── Windows bounded dial (ws2_32) ───────────────────────────────────────────
+//
+// The Windows half of `connectTimeout`. std's own Windows dial neither
+// implements `ConnectOptions.timeout` (`std/Io/Threaded.zig`'s
+// `netConnectIpWindows` is the same `@panic("TODO … with timeout")` as the
+// POSIX line quoted above) nor exposes `WSAPoll` (`std.c.pollfd` aliases a
+// `ws2_32.pollfd` the std module does not define — referencing `std.c.poll` on
+// a Windows target is a compile error), and `std.os.windows.ws2_32` carries
+// constants but no function declarations, because std does its Windows
+// networking over raw AFD IOCTLs instead of Winsock. So the handful of ws2_32
+// symbols the dial needs is declared below; Zig's bundled import libraries
+// resolve them on both Windows ABIs (measured: a probe exe referencing all of
+// them links for `-target x86_64-windows` and `x86_64-windows-gnu`), so no
+// `linkSystemLibrary` is asked of a consumer.
+
+/// The ws2_32 surface `connectTimeoutWindows` needs, as one block so the
+/// extern count stays reviewable at a glance.
+const wsa = struct {
+    const INVALID_SOCKET = ~@as(usize, 0); // (SOCKET)(~0)
+    const SOCKET_ERROR = -1;
+    const FIONBIO: i32 = @bitCast(@as(u32, 0x8004667E)); // ioctlsocket command
+
+    const POLLWRNORM = 0x0010;
+    const POLLNVAL = 0x0004;
+
+    const SOL_SOCKET = std.os.windows.ws2_32.SOL.SOCKET;
+    const SO_ERROR = std.os.windows.ws2_32.SO.ERROR;
+
+    // The WSA error codes the tables below read (MSDN numeric values; std
+    // carries no names for them).
+    const EINTR = 10004;
+    const EACCES = 10013;
+    const EMFILE = 10024;
+    const EWOULDBLOCK = 10035;
+    const EALREADY = 10037;
+    const EPROTOTYPE = 10041;
+    const EPROTONOSUPPORT = 10043;
+    const EAFNOSUPPORT = 10047;
+    const EADDRNOTAVAIL = 10049;
+    const ENETDOWN = 10050;
+    const ENETUNREACH = 10051;
+    const ECONNRESET = 10054;
+    const ENOBUFS = 10055;
+    const EISCONN = 10056;
+    const ETIMEDOUT = 10060;
+    const ECONNREFUSED = 10061;
+    const EHOSTUNREACH = 10065;
+
+    /// WSADATA: the field order is fixed by the Win32 ABI, and the alignment
+    /// Zig computes for this extern struct matches it on both word sizes.
+    const InitData = extern struct {
+        wVersion: u16,
+        wHighVersion: u16,
+        szDescription: [257]u8,
+        szSystemStatus: [129]u8,
+        iMaxSockets: u16,
+        iMaxUdpDg: u16,
+        lpVendorInfo: ?[*]u8,
+    };
+
+    /// WSAPOLLFD.
+    const PollFd = extern struct { fd: usize, events: i16, revents: i16 };
+
+    extern "ws2_32" fn WSAStartup(wVersionRequired: u16, lpWSAData: *InitData) i32;
+    extern "ws2_32" fn WSAGetLastError() i32;
+    extern "ws2_32" fn socket(af: i32, type_: i32, protocol: i32) usize;
+    extern "ws2_32" fn closesocket(s: usize) i32;
+    extern "ws2_32" fn ioctlsocket(s: usize, cmd: i32, argp: *u32) i32;
+    extern "ws2_32" fn connect(s: usize, name: *const anyopaque, namelen: i32) i32;
+    extern "ws2_32" fn WSAPoll(fds: [*]PollFd, nfds: u32, timeout: i32) i32;
+    extern "ws2_32" fn getsockopt(s: usize, level: i32, optname: i32, optval: *anyopaque, optlen: *i32) i32;
+    extern "ws2_32" fn getsockname(s: usize, name: *anyopaque, namelen: *i32) i32;
+};
+
+/// What one WSA error code from `connect` means for a bounded dial. Pure data —
+/// the error policy of the Windows half in one table, unit-tested per arm
+/// (netdial's `classifyConnectErrno` is the same idea for POSIX errnos).
+const WsaConnectVerdict = union(enum) {
+    /// WSAEISCONN: the attempt had already completed (a repeated connect).
+    connected,
+    /// WSAEWOULDBLOCK / WSAEINTR / WSAEALREADY: the attempt is in flight —
+    /// wait it out with WSAPoll, never retry the connect.
+    in_progress,
+    /// Terminal failure, mapped onto the same error names the POSIX half uses.
+    failed: ConnectTimeoutError,
+};
+
+fn classifyWsaConnect(code: i32) WsaConnectVerdict {
+    return switch (code) {
+        wsa.EWOULDBLOCK, wsa.EINTR, wsa.EALREADY => .in_progress,
+        wsa.EISCONN => .connected,
+        else => .{ .failed = wsaFailure(code) },
+    };
+}
+
+/// Map a terminal WSA failure code onto the POSIX half's error names, so a
+/// caller cannot tell which of the two dialled. Codes with no named
+/// counterpart — WSAECONNABORTED among them, the same reading `awaitConnect`
+/// gives ECONNABORTED — fold into `error.Unexpected`: a dial reports, it never
+/// panics.
+fn wsaFailure(code: i32) ConnectTimeoutError {
+    return switch (code) {
+        wsa.ETIMEDOUT => error.Timeout,
+        wsa.ECONNREFUSED => error.ConnectionRefused,
+        wsa.ECONNRESET => error.ConnectionResetByPeer,
+        wsa.EHOSTUNREACH => error.HostUnreachable,
+        wsa.ENETUNREACH => error.NetworkUnreachable,
+        wsa.EACCES => error.AccessDenied,
+        wsa.ENETDOWN => error.NetworkDown,
+        wsa.EADDRNOTAVAIL => error.AddressUnavailable,
+        wsa.EAFNOSUPPORT => error.AddressFamilyUnsupported,
+        wsa.ENOBUFS => error.SystemResources,
+        wsa.EMFILE => error.ProcessFdQuotaExceeded,
+        wsa.EPROTONOSUPPORT => error.ProtocolUnsupportedByAddressFamily,
+        wsa.EPROTOTYPE => error.SocketModeUnsupported,
+        else => error.Unexpected,
+    };
+}
+
+/// The Windows half of `connectTimeout`, reached only when `timeout_ms != 0`:
+/// non-blocking `connect` + `WSAPoll` + `SO_ERROR`, the POSIX half's exact
+/// shape over Winsock.
+///
+/// WSAStartup runs on every call: it is refcounted and cheap, nothing else in
+/// the process is guaranteed to have started Winsock (std's own Windows
+/// networking never touches ws2_32), and the matching WSACleanup is
+/// deliberately never called — the reference stays held until process exit,
+/// which is the documented way to keep the catalog valid.
+fn connectTimeoutWindows(addr: std.Io.net.IpAddress, timeout_ms: u32) ConnectTimeoutError!std.Io.net.Stream {
+    var init_data: wsa.InitData = undefined;
+    if (wsa.WSAStartup(0x0202, &init_data) != 0) return error.NetworkDown;
+    // The grant comes back in `wVersion`: less than the 2.2 requested means no
+    // WSAPoll (2.2 / Vista+), which is what `awaitConnectWindows` waits on.
+    if (init_data.wVersion < 0x0202) return error.NetworkDown;
+
+    var storage: std.Io.Threaded.PosixAddress = undefined;
+    const addr_len = std.Io.Threaded.addressToPosix(&addr, &storage);
+
+    const w32 = std.os.windows.ws2_32;
+    const sock = wsa.socket(@intCast(std.Io.Threaded.posixAddressFamily(&addr)), w32.SOCK.STREAM, w32.IPPROTO.TCP);
+    if (sock == wsa.INVALID_SOCKET) return wsaFailure(wsa.WSAGetLastError());
+    errdefer _ = wsa.closesocket(sock);
+
+    // Non-blocking for the duration of the dial; the socket is put back to
+    // blocking before it is handed out, for the same reason the POSIX half
+    // restores O_NONBLOCK (its comment names the sockread contract).
+    var nonblocking: u32 = 1;
+    if (wsa.ioctlsocket(sock, wsa.FIONBIO, &nonblocking) != 0) return wsaFailure(wsa.WSAGetLastError());
+
+    if (wsa.connect(sock, &storage.any, @intCast(addr_len)) != 0) {
+        switch (classifyWsaConnect(wsa.WSAGetLastError())) {
+            .connected => {},
+            .in_progress => try awaitConnectWindows(sock, timeout_ms),
+            .failed => |err| return err,
+        }
+    }
+
+    var blocking: u32 = 0;
+    if (wsa.ioctlsocket(sock, wsa.FIONBIO, &blocking) != 0) return wsaFailure(wsa.WSAGetLastError());
+
+    // Hand back the same state the POSIX half does: a blocking socket whose
+    // `address` is the local endpoint `getsockname` reports. The name is
+    // best-effort there and here — a failure leaves a perfectly usable stream.
+    var local: std.Io.Threaded.PosixAddress = undefined;
+    var local_len: i32 = @sizeOf(std.Io.Threaded.PosixAddress);
+    const local_addr = if (wsa.getsockname(sock, &local, &local_len) == 0)
+        std.Io.Threaded.addressFromPosix(&local)
+    else
+        addr;
+    return .{ .socket = .{ .handle = @ptrFromInt(sock), .address = local_addr } };
+}
+
+/// Wait out an in-flight WSA `connect` (`WSAEWOULDBLOCK`), up to `timeout_ms`
+/// from *now* — `awaitConnect`'s counterpart. `WSAPoll(POLLWRNORM)` means "the
+/// attempt settled", not "it worked": `SO_ERROR` carries the verdict, and a
+/// refused connection arrives exactly that way.
+fn awaitConnectWindows(sock: usize, timeout_ms: u32) ConnectTimeoutError!void {
+    const started = Time.monotonicNowMilliseconds();
+    var pfd = wsa.PollFd{ .fd = sock, .events = wsa.POLLWRNORM, .revents = 0 };
+    while (true) {
+        const elapsed = Time.monotonicNowMilliseconds() - started;
+        if (elapsed >= timeout_ms) return error.ConnectTimeout;
+        // elapsed < timeout_ms above, so the subtraction cannot underflow.
+        // WSAPoll's timeout is a signed int of milliseconds; clamp rather than
+        // `@intCast` an absurdly large `timeout_ms` into a panic.
+        const left_ms = timeout_ms - @as(u32, @intCast(elapsed));
+        const remaining: i32 = @intCast(@min(left_ms, @as(u32, std.math.maxInt(i32))));
+        const rc = wsa.WSAPoll(@ptrCast(&pfd), 1, remaining);
+        if (rc == 0) return error.ConnectTimeout;
+        if (rc == wsa.SOCKET_ERROR) {
+            switch (wsa.WSAGetLastError()) {
+                // Interrupted, not answered: recompute what is left and wait again.
+                wsa.EINTR => continue,
+                else => |e| return wsaFailure(e),
+            }
+        }
+        if (pfd.revents & wsa.POLLNVAL != 0) return error.Unexpected;
+        break;
+    }
+
+    var so_error: i32 = 0;
+    var len: i32 = @sizeOf(i32);
+    if (wsa.getsockopt(sock, wsa.SOL_SOCKET, wsa.SO_ERROR, &so_error, &len) != 0)
+        return wsaFailure(wsa.WSAGetLastError());
+    if (so_error != 0) return wsaFailure(so_error);
+}
+
+comptime {
+    if (builtin.target.os.tag == .windows) {
+        // Force analysis of the Windows dial in every Windows-targeted compile
+        // of this file: nothing in the default install set calls the raft
+        // transport, so Zig's lazy analysis would otherwise let a broken
+        // ws2_32 declaration through the `windows-cross` CI job until the
+        // first consumer actually dialled.
+        _ = connectTimeoutWindows;
+        _ = awaitConnectWindows;
     }
 }
 
@@ -3424,6 +3653,42 @@ test "connectTimeout hands back a blocking stream the sockread helpers can use" 
     const gone_port = gone.socket.address.getPort();
     gone.deinit(io);
     try testing.expectError(error.ConnectionRefused, connectTimeout(io, try std.Io.net.IpAddress.parse("127.0.0.1", gone_port), test_dial_timeout_ms));
+}
+
+// The Windows half's error policy is pure data, so it is verified here on
+// every host — the dial itself can only run on Windows, where the CI
+// cross-compile (`zig build -Ddb=none -Dtarget=x86_64-windows`) plus the
+// comptime reference next to `connectTimeoutWindows` are the gate.
+
+test "WSA connect classification: in-progress vs connected vs failed" {
+    try testing.expectEqual(WsaConnectVerdict.in_progress, classifyWsaConnect(wsa.EWOULDBLOCK));
+    try testing.expectEqual(WsaConnectVerdict.in_progress, classifyWsaConnect(wsa.EINTR));
+    try testing.expectEqual(WsaConnectVerdict.in_progress, classifyWsaConnect(wsa.EALREADY));
+    try testing.expectEqual(WsaConnectVerdict.connected, classifyWsaConnect(wsa.EISCONN));
+    switch (classifyWsaConnect(wsa.ECONNREFUSED)) {
+        .failed => |err| try testing.expectEqual(error.ConnectionRefused, err),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "WSA failure codes keep the POSIX dial's error names" {
+    try testing.expectEqual(error.Timeout, wsaFailure(wsa.ETIMEDOUT));
+    try testing.expectEqual(error.ConnectionRefused, wsaFailure(wsa.ECONNREFUSED));
+    try testing.expectEqual(error.ConnectionResetByPeer, wsaFailure(wsa.ECONNRESET));
+    try testing.expectEqual(error.HostUnreachable, wsaFailure(wsa.EHOSTUNREACH));
+    try testing.expectEqual(error.NetworkUnreachable, wsaFailure(wsa.ENETUNREACH));
+    try testing.expectEqual(error.AccessDenied, wsaFailure(wsa.EACCES));
+    try testing.expectEqual(error.NetworkDown, wsaFailure(wsa.ENETDOWN));
+    try testing.expectEqual(error.AddressUnavailable, wsaFailure(wsa.EADDRNOTAVAIL));
+    try testing.expectEqual(error.AddressFamilyUnsupported, wsaFailure(wsa.EAFNOSUPPORT));
+    try testing.expectEqual(error.SystemResources, wsaFailure(wsa.ENOBUFS));
+    try testing.expectEqual(error.ProcessFdQuotaExceeded, wsaFailure(wsa.EMFILE));
+    try testing.expectEqual(error.ProtocolUnsupportedByAddressFamily, wsaFailure(wsa.EPROTONOSUPPORT));
+    try testing.expectEqual(error.SocketModeUnsupported, wsaFailure(wsa.EPROTOTYPE));
+    // No named counterpart: report, never panic. WSAECONNABORTED (10053) is
+    // folded the same way the POSIX half folds ECONNABORTED into `Unexpected`.
+    try testing.expectEqual(error.Unexpected, wsaFailure(10053));
+    try testing.expectEqual(error.Unexpected, wsaFailure(-1));
 }
 
 // ── A-3: rotation window & revocation on the wire ───────────────────────────

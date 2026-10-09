@@ -386,8 +386,9 @@ defer allocator.free(json);               // 挂到 /cluster/health 或 metrics 
   所以这把锁**在 `RaftElection` 自己身上**（`RaftElection.RaftLock`，快路径 `cmpxchgWeak` +
   有界自旋 + `poll` 睡眠的三档，与 `scheduler.zig` 协调池线程同口径）：每个碰共享状态的公开入口（`tick` / `handleVoteRequest` / `handleAppendEntries` /
   `handleVoteResponse` / `handleInstallSnapshot` / `handleInstallSnapshotResponse` / `appendEntry` / `addPeer` / `compactLog` 以及状态
-  访问器）自己取放一次，私有的步骤函数（`startElection` / `sendHeartbeats` / `becomeLeader` / …）
-  假设锁已在手。**门面不再持锁**（`ClusterBootstrap.raft_lock` 已删）：`ClusterBootstrap` 直接驱动、
+  访问器）自己取放（`tick` 是两段：判定与响应应用在锁内、出站 IO 在锁外，见下「出站 IO 与锁」），私有的步骤函数（`startElection` / `becomeLeader` /
+  `stageLeaderRoundLocked` / `applyStagedRoundLocked` / …）
+  假设锁已在手（`deliverStagedRound` 相反，假设锁不在手）。**门面不再持锁**（`ClusterBootstrap.raft_lock` 已删）：`ClusterBootstrap` 直接驱动、
   `RaftTransport.InboundServer` 单独用、或应用自己调 `raft.tick()` / 在其它线程读它，都被同一把锁串起来，
   不再取决于调用方记得住哪两处不能重叠。
   锁的窗口是入站那一帧的 **decode → dispatch → encode** 里那次 `handle*`（dispatch 本身即窗口）；
@@ -395,11 +396,13 @@ defer allocator.free(json);               // 挂到 /cluster/health 或 metrics 
   （对端 connect 超时不该卡住 `tick()`）。不给 `.transport` 的节点没有 accept 线程，锁是零成本的一条取指。
   **但这条原则在出站方向曾经是反的**，而且这里必须写清是哪一半修了、哪一半没有：
 
-  * `tick()` 的出站轮次（`sendHeartbeats` → `transport.sendAppendEntries`、`startElection` 的
-    `sendVoteRequest`）**整段在锁内**跑，而 `RaftLock` 曾经是**无界自旋**锁 —— 一个不响应的对端
+  * `tick()` 的出站轮次（当时的 `sendHeartbeats` → `transport.sendAppendEntries`、`startElection` 的
+    `sendVoteRequest`）**曾经整段在锁内**跑，而 `RaftLock` 曾经是**无界自旋**锁 —— 一个不响应的对端
     不是"慢一轮"，是让每个想碰状态的线程（accept 线程的入站 RPC、`appendEntry`、所有访问器）
     在 `spinLoopHint` 上**烧核**，时间为这一次 RPC 的等待时间。
-    现在 `RaftLock.acquire` 是三档：`cmpxchgWeak` 快路径（无竞争不写）→ 32 轮 `spinLoopHint`
+    出站轮次现已三段拆挪出锁（见下「出站 IO 与锁」），这段数字是该债存在时驱动
+    `RaftLock.acquire` 改成三档的实测，留下来是因为它仍是等待形状的权威记录：
+    `cmpxchgWeak` 快路径（无竞争不写）→ 32 轮 `spinLoopHint`
     → 128 轮 `Thread.yield` → 每轮 1 ms 的 `std.posix.poll(&.{}, 1)` 睡眠（该文件拿不到 `io`，
     所以不能用 `std.Io.sleep`；Windows/WASI 无 `poll` 时退化为 `yield`）。实测：持锁者睡
     120 ms 时，等待者自身 CPU 从 **120 ms → 0 ms**；代价是等待超过 ~160 轮后引入 ≤1 ms 的
@@ -423,9 +426,9 @@ defer allocator.free(json);               // 挂到 /cluster/health 或 metrics 
     三处生产 dial 都走它。实测：SYN 被丢的对端（`169.254.255.254`，本机 OS 默认 ≥25 s 不返回）现在
     **702 ms 返回 `error.ConnectTimeout`**；回落约定是 `timeout_ms = 0` → 无界，老配置 `rpc_timeout_ms = 0` 行为不变。
     界只覆盖 POSIX（Windows 回落无界，`poll` 在那里不存在）。
-  * **锁范围本身仍未收窄**（见下面"出站 IO 与锁"一节的设计）：上面两条只是把代价**有界化**，
-    没有把 IO 挪出锁 —— 而且这一条对 dial 同样成立：**有界的** IO 在 spin lock 下仍是有界 IO 在 spin lock 下，
-    `rpc_timeout_ms` 照样能被持锁烧满。
+  * **锁范围本身现已收窄**（见下面「出站 IO 与锁」一节，已落地）：上面两条只是把代价**有界化**；
+    三段拆把出站 IO 真正挪出了锁 —— `rpc_timeout_ms` 只剩"一轮为死对头等多久"的语义，
+    不再界定持锁时长，也不再能被持锁烧满。
   不这么做的实际症状是**进程级 ABRT**（`voted_for` 的 read-then-free 交错 →
   `double free of [addr: …]`，两边都是 `RaftElection.zig` 的 `handleVoteRequest` / `startElection`），
   另一种交错顺序只是漏掉那一小段（`SafeAllocator` 报 leaked）—— 两种都在 12 次里各撞到过。
@@ -458,44 +461,58 @@ defer allocator.free(json);               // 挂到 /cluster/health 或 metrics 
   **必然**等到第二个（`overlapped` 为真是确定性的）；第二半各自持锁进门，`overlapped` 保持 false
   且**有理由**（第一半改成串行化即变红 —— 验过的红）。
 
-### 出站 IO 与锁 —— 设计已定，**尚未落地**
+### 出站 IO 与锁 —— 已落地（三段拆）
 
-`tick()` 的出站轮次在锁内跑（见上）。把它收窄到"算法状态转移在锁内、IO 在锁外"是本文件写下这条
-原则时就该有的一半，设计已经定死，但**没有实现** —— 这里写的是契约与三条义务，不是"已完成"。
+`tick()` 的出站轮次曾经在锁内跑（见上）。现已收窄到"算法状态转移在锁内、IO 在锁外"：
+`tick()` 就是一个 `flushOutgoing()`，其内部是"取锁 → 第一段 → 放锁 → 第二段 → 取锁 → 第三段 → 放锁"，
+`flush_active` 原子门保证单飞（tick 线程与 `handleVoteResponse` 的选后补发可能同时到，后到者直接返回，
+被欠下的心跳由 `heartbeat_owed` 记到下一轮）。`rpc_timeout_ms` 因此只剩"一轮为死对头等多久"的语义。
 
-**形状**：`tick()` 拆三段。
+**形状**：三段，逐段对应代码。
 
 ```
-第一段（持锁）：判定 + 把这一轮要发的东西**做成自足的请求**放进本节点的暂存
-第二段（不持锁）：做 IO，收响应
-第三段（持锁）：应用响应，带校验
+第一段（持锁，`stageLeaderRoundLocked`）：判定 + 把这一轮要发的东西**做成自足的请求**放进暂存
+（两个暂存缓冲在第一段开头先清空 —— `staged_vote = null` + `staged_items.clearRetainingCapacity()`；
+第二段无条件跑，所以"本轮什么都没暂存"的 tick 必须什么都发不出去，而不是把上一轮残留以 term 0
+重发 —— 回归测试 `a tick that stages no round sends nothing on the wire`）
+第二段（不持锁，`deliverStagedRound`）：做 IO，收响应（写回暂存项内嵌的应答槽）
+第三段（持锁，`applyStagedRoundLocked`）：应用响应，带校验
 ```
 
-**三条义务**（缺一条都会引入比它修掉的那个更糟的 bug）：
+**三条义务**（缺一条都会引入比它修掉的那个更糟的 bug）及各自落点：
 
 1. **第二段的请求必须自足。** `AppendEntriesRequest.entries` 借的是 `self.log`，而
    `LogEntry.command` 是堆内存、**由 `truncateLog` 释放**（`RaftElection.zig` 的 `truncateLog`）。
    锁一放，入站的 `handleAppendEntries` 就可能截断日志、把那批字节还给分配器 —— 于是传输层
-   在读一段已释放的内存。这正是当初加锁要禁的那类交错。所以第一段必须把 entries（含 command 字节）
-   **拷进本节点自己的暂存**，且该暂存**稳态不分配**（`clearRetainingCapacity` 复用；心跳轮
-   entries 为空，零拷贝 —— 出账只在追日志那条路上，且拷的就是本来要序列化出去的字节）。
+   在读一段已释放的内存。这正是当初加锁要禁的那类交错。所以第一段把 entries（含 command 字节）
+   **拷进本节点自己的暂存**（落点：`stageLeaderRoundLocked` 里逐条 `arena.dupe(u8, entry.command)`；
+   快照字节同样整份拷入，一轮一份、多 peer 共享），暂存是 `outbound_arena`
+   （`reset(.retain_capacity)`，稳态零分配；心跳轮 entries 为空，零拷贝 —— 出账只在追日志那条路上，
+   且拷的就是本来要序列化出去的字节）。
 2. **第三段必须校验响应是不是这一轮的。** 两段之间另一个线程可能已经：把 `current_term` 抬上去
-   （入站更高任期）、把我们降成 follower、或者让我们重新当选。所以第一段要记下
-   `(state, current_term)`，第三段要求 `state == .leader and current_term == 等于建轮时的任期`，
-   否则**整批丢弃**，不做"尽力而为地应用"。
-3. **`next_index` / `match_index` 在第三段读，不跨段携带。** 有义务 2 的守卫时它们不可能变
-   （单驱动线程 + 任期未变），但"在第三段读"是把这件事变成**构造上证成**，而不是靠论证。
+   （入站更高任期）、把我们降成 follower、或者让我们重新当选。所以第一段记下 `round_term`，
+   第三段（`applyStagedRoundLocked`）对每项要求 `state == .leader and current_term == round_term`，
+   否则**整批丢弃**，不做"尽力而为地应用"。更高任期的应答是例外：term 半步**永远生效**
+   （当场退成 follower，本轮其余丢弃）——这不是"应用旧一轮"，是 Raft 本身的退位规则。
+3. **`next_index` / `match_index` 只在持锁段读写，不跨段携带。** 有义务 2 的守卫时它们不可能变
+   （单驱动线程 + 任期未变），但"第二段不碰"是把这件事变成**构造上证成**，而不是靠论证。
+   落点：生产路径对这两张表的写全部在锁内 —— `becomeLeader`（当选重置）、`stageLeaderRoundLocked`
+   （缺省初始化）、`applyStagedRoundLocked`（第三段应用）与 `processInstallSnapshotResponse`
+   （由第三段、或由同样持锁的异步公共入口 `handleInstallSnapshotResponse` 调入）；第二段不读不写。
 
-**顺带必须一起改的**：`becomeLeader` 现在直接 `sendHeartbeats()`（真发），而它从 `startElection`
-（`tick` 第一段内）和 `handleVoteResponse`（入站路径、同样持锁）两处被调到。所以它要改成**只登记
-"欠一次心跳"**，由 `flushOutgoing()` 这个新入口来做"取锁→快照→放锁→发→取锁→应用"，`tick()` 与
-`handleVoteResponse` 各自在放锁之后调它。这样入站路径不必改 `RaftTransport` 的 dispatch。
+**跟着一起改的**（设计期列的"顺带必须一起改"，均已完成）：`becomeLeader` 不再直接发心跳，只登记
+`heartbeat_owed = true`；`startElection` 末尾不再直接 `sendVoteRequest`，而是暂存
+`staged_vote` + `staged_peers`；统一由 `flushOutgoing()` 做"取锁→暂存→放锁→发→取锁→应用"，
+`tick()` 与 `handleVoteResponse` 各自在放锁之后调它（后者的失败只记 `std.log.err`，下一轮 tick
+兜底）。入站路径因此不必改 `RaftTransport` 的 dispatch。
 
-**护栏**：上面那条阳性对照（`the window rendezvous fires iff nothing serializes the entry`）只管
-"窗口有没有被串行化"，**管不到义务 1 和 2** —— 现有测试用的传输层全是立即返回的假实现，
-撞不出"锁放开期间日志被截断"和"响应过期"。所以落地时必须**另配两条红测试**：一条让
-`sendAppendEntries` 阻塞住、另一个线程同时截断日志，断言发出去的请求仍读到有效字节；
-一条让响应在"任期已变"之后才回，断言它被丢弃而不是写进 `next_index`。没有这两条就不要动这段代码。
+**护栏**（设计期要求的两条红测试，均已落地且变异验红）：
+`a round in flight reads staged bytes while the log is truncated under it` —— `sendAppendEntries`
+阻塞住、另一个线程同时截断日志（毒化后的槽位再被回收重写），断言发出去的请求仍读到有效字节；
+变异（第一段去掉 command 深拷贝）验红：读到的是毒化字节而非 "cmd-one"。
+`a reply that lands after the term moved is dropped, not applied` —— 响应在任期已变之后才回，
+断言它被丢弃而不是写进 `next_index`；变异（第三段删掉 term/state 守卫）验红：`next_index`
+被过期应答推进（expected 1, found 4）。
 
 ### 日志压缩（§7 InstallSnapshot，Unreleased 起为可用闭环）
 
@@ -535,9 +552,11 @@ prev 在边界**外**→ 活条目比对，冲突照常截断（截不到快照�
   恰好落在已组装长度上，错位即丢弃等 leader 重传（幂等）；`done` 帧才应用。应用时**保留延续快照的
   日志后缀**（§7 原文语义：边界条目在日志里存在且 term 一致 → 只丢被覆盖的前缀；否则全清）。
   `commit_index` / `last_applied` 取 `@max` 推进。
-- **已知坑**：快照发送沿用上节记录的既有模型——出站 IO（含逐帧 chunk）在 `RaftLock` 内同步跑，
-  受 `rpc_timeout_ms` 界定但**没有收窄锁范围**；大快照 × 多落后 follower 时这一债会被放大，
-  「出站 IO 与锁」一节落地前，巨型快照应调大 `snapshot_chunk_bytes`（少几帧）而不是调小。
+- **已知坑**：快照发送与 AppendEntries 走同一个三段拆（「出站 IO 与锁」已落地）——快照字节在第一段
+  整份拷进 `outbound_arena`，逐帧 chunk 在锁外发；`snapshot_chunk_bytes` 仍是帧数/单帧线格式旋钮，
+  但不再是"锁内占用时长"的权衡。中间帧的应答只记 term，**整传完成（`done`）那一帧**才在第三段推进
+  `match_index` —— 比旧模型收紧：旧模型每个中间帧应答都推进。大快照 × 多落后 follower 的成本现在是
+  内存里每轮一份快照拷贝，不再是锁内 IO。
   follower 侧主动压缩（非 leader 触发）不在当前闭环内。
 
 ## Production Deployment Checklist

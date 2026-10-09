@@ -7,7 +7,7 @@
 
 **统一口径：弃用别名**不早于 1.0** 删除。** 依据是本仓库的兼容性原则（破坏性变更保留给 1.0），
 所以在那之前**任何小版本升级都不需要为下面这些名字动代码**；1.0 那次会一次性删掉，并在
-本节的表格里逐条标出来。
+本节的表格里逐条标出来。**删除执行的前一个版本**会在本节与当版本条目里同时点名预告，不做无声删除。
 
 | 弃用名 | 现在的名字 | 计划删除 |
 |---|---|---|
@@ -20,6 +20,27 @@
 | `ctx.sendPageResult` | `ctx.json`(200, body)，分页结构自己拼 | 不早于 1.0 |
 | `ctx.sendJsonItems` | `ctx.json`(200, body) | 不早于 1.0 |
 | `RateLimiter.acquire` | `RateLimiter.tryAcquire`（同义；它从来没等过） | 不早于 1.0 |
+
+### 不在表上的近义名（没有删除计划）
+
+「`param` → `paramPath` → `nestedParam` 改名三次、旧名都不删」是这类反馈里最典型的一条，
+逐条对上后其实是**一次改名 + 一次澄清性同义名**：
+
+- `ctx.param` —— **现行名，不删**。读路由占位符（`/orders/{id}`）；`ctx.pathParam` 是
+  v0.15.38 为消掉"路径参数 vs 任意参数"的误读**新增的同义名**，两者都是正式 API，谁也不弃用谁。
+- `ctx.paramPath` —— 这条链上**唯一的真弃用名**：v0.15.46 改名 `nestedParam`（它读 form/query
+  里的点号路径，从来就不是路由参数），见上表 `ctx.paramPath` 行，**不早于 1.0** 删除。
+- 同类"新增同义名、旧名不弃用"的还有 `ctx.jsonValue`（= `jsonStruct`，v0.15.38）与
+  `http.csrf()`（= `csrfWith(.{})`，v0.33.3）。判别规则只有一条：**弃用名一定在上表里、且代码里
+  带 `DEPRECATED` 标记**（门禁 `src/test/ApiFreeze.zig` 两处都查）；两条都不占的近义名没有删除计划。
+
+**例外：0.x 就删掉的，都是"留着比删掉更坏"的那类** —— `ScheduledTask.TaskScheduler`
+（0.15.0 标注 "for removal in v1.0"，0.15.1 即删：从未工作过的占位实现）、
+`Runtime.cancelTimer(id) bool`（v0.28.0：ticker 化之后 `bool` 再也无法诚实表达
+"它确实还挂着"，留着等于静默改义）、`sqlx.hasUnboundedPgReads`（v0.39.6：判定对象本身没了）、
+`TransactionalEvent` / `src/persistence/Database.zig`（从未从 `root.zig` 导出）。
+规律：**能正常工作的消费方旧名等 1.0；从未工作、从未导出、或保留必然说谎的，发现即删**，
+删除当版在本文记一条。
 
 ### 整模块级弃用横幅（既不进表，也不进「已移除」）
 
@@ -1127,6 +1148,10 @@ try zigmodu.http.UploadGuard.checkForm(&form, .{
 | `ctx.requestParam`（新增） | **form 优先，回退 query**（"客户端放哪都行"） |
 | `ctx.nestedParam`（原 `paramPath`） | form/query 里的点号路径（`filter.tags`） |
 
+顺带澄清一条常见误读（"`param` → `paramPath` → `nestedParam` 改名三次"）：`ctx.param` 与
+`ctx.pathParam` 都**不在**弃用表上 —— `param` 是现行名，`pathParam` 是 v0.15.38 新增的同义名，
+两者都没有删除计划；这条链上被弃用的只有 `paramPath` 一个。
+
 ### `ctx.route_template` 统一带前导斜杠（**标签值变化**）
 
 **Breaking?** 对指标标签是——同一路由的 label 取值会变。
@@ -1279,6 +1304,11 @@ const lim = registry.get("key").?;            // 或 getOrCreate("key")
 自动改名为新版本号（`## v<新版本>`），并在仍有任何 `（未发布批次）` 标题残留时**硬失败**
 ——所以正文里对 `[Unreleased]` 的引用也要在发布前一并改成新版本段名（脚本只改标题，
 不改正文）。周期内没有「会咬人」变更时不开该节。
+
+改名/弃用类条目的额外约定：**凡公开名字改名且旧名保留（别名/兼容拼写），同一批必须完成
+「§ 弃用别名与删除计划」的三件事规则** —— 代码注释带 `DEPRECATED` 并指向新名、表内加一行且
+**删除列不留空**、本版条目回指该节（`src/test/ApiFreeze.zig` 逐行对账：表外弃用、删除列留空、
+行与门禁失同步都是红）。**删除执行的前一个版本**，还要在本节与当版本条目里同时点名预告。
 
 ```markdown
 ## vX.Y.Z

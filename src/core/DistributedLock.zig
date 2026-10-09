@@ -401,3 +401,74 @@ test "SqlLock claims and reaps locks on a real PostgreSQL" {
     try std.testing.expect(try a.lock().tryAcquire("cron:nightly", 0));
     try std.testing.expect(try b.lock().tryAcquire("cron:nightly", 60_000));
 }
+
+// Real-database coverage for the `.mysql` dialect (`INSERT IGNORE`). Opt-in
+// via `DB=mysql` (CI's `test-mysql` job sets it — note `DB=mysql bash
+// scripts/test-fast.sh` does NOT work, the script owns that variable; run
+// `DB=mysql zig build test -Ddb=all -Dtest-filter=…` directly) plus the usual
+// `MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_USER` / `MYSQL_PASSWORD` /
+// `MYSQL_DATABASE` overrides, the same conventions as sqlx's live tests.
+//
+// The owner id (a `randomSecure` draw in `init`) is driver-independent, so the
+// CSPRNG itself needs no per-driver proof; what a live server adds here is
+// that the mysql claim statement really behaves as "exactly one racer wins".
+test "SqlLock claims and reaps locks on a real MySQL" {
+    const sqlx = @import("../sqlx/sqlx.zig");
+    if (!sqlx.DriverFeatures.mysql) return error.SkipZigTest;
+    const gate = std.c.getenv("DB") orelse return error.SkipZigTest;
+    if (!std.mem.eql(u8, std.mem.span(gate), "mysql")) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const envVar = struct {
+        fn get(comptime name: [:0]const u8, default: []const u8) []const u8 {
+            const raw = std.c.getenv(name) orelse return default;
+            return std.mem.span(raw);
+        }
+    };
+
+    const SqlClient = sqlx.Client;
+    var db = SqlClient.init(allocator, std.testing.io, .{
+        .driver = .mysql,
+        .host = envVar.get("MYSQL_HOST", "127.0.0.1"),
+        .port = std.fmt.parseInt(u16, envVar.get("MYSQL_PORT", "3306"), 10) catch 3306,
+        .username = envVar.get("MYSQL_USER", "root"),
+        .password = envVar.get("MYSQL_PASSWORD", ""),
+        .database = envVar.get("MYSQL_DATABASE", "zigzero_test"),
+        .max_open_conns = 2,
+        .max_idle_conns = 1,
+    });
+    defer db.deinit();
+    try db.connect();
+
+    // Unique table per run so parallel/repeat runs never collide.
+    var table_buf: [64]u8 = undefined;
+    var seed: [8]u8 = undefined;
+    try std.Io.randomSecure(std.testing.io, &seed);
+    const table = try std.fmt.bufPrint(&table_buf, "zmodu_lock_mysql_{s}", .{std.fmt.bytesToHex(seed, .lower)});
+    defer {
+        var drop_buf: [96]u8 = undefined;
+        const drop = std.fmt.bufPrint(&drop_buf, "DROP TABLE IF EXISTS {s}", .{table}) catch "";
+        // Best-effort teardown: a failed drop only leaves a throwaway table
+        // behind, and the next run's name is random anyway — but say so.
+        if (drop.len > 0) _ = db.exec(drop, &.{}) catch |err|
+            std.log.debug("[lock] mysql test teardown drop failed ({s})", .{@errorName(err)});
+    }
+
+    var a = try SqlLock(@TypeOf(db)).init(allocator, std.testing.io, &db, table, .mysql);
+    defer a.deinit();
+    var b = try SqlLock(@TypeOf(db)).init(allocator, std.testing.io, &db, table, .mysql);
+    defer b.deinit();
+
+    // Two replicas race for the same name: exactly one wins.
+    try std.testing.expect(try a.lock().tryAcquire("cron:nightly", 60_000));
+    try std.testing.expect(!try b.lock().tryAcquire("cron:nightly", 60_000));
+
+    // Release hands it over.
+    a.lock().release("cron:nightly");
+    try std.testing.expect(try b.lock().tryAcquire("cron:nightly", 60_000));
+
+    // An expired holder (crashed replica) is reaped.
+    b.lock().release("cron:nightly");
+    try std.testing.expect(try a.lock().tryAcquire("cron:nightly", 0));
+    try std.testing.expect(try b.lock().tryAcquire("cron:nightly", 60_000));
+}

@@ -603,6 +603,23 @@ jobs:
           path: ${{ runner.temp }}/smuggling.log
           retention-days: 7
 
+      - name: CL/TE smuggling through a real gateway (envoy)
+        # Same wire invariant, second front-end parser. Ports distinct from the
+        # nginx step above. The script skips cleanly without docker (this job
+        # always has it) — same opt-in shape as the nginx step.
+        run: |
+          APP_PORT=18190 GW_PORT=18191 \
+            bash scripts/ci-run-logged.sh "$RUNNER_TEMP/smuggling-envoy.log" \
+            bash examples/production-deploy/smuggling-envoy/run.sh
+
+      - name: Upload envoy smuggling log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smuggling-envoy-log
+          path: ${{ runner.temp }}/smuggling-envoy.log
+          retention-days: 7
+
       - name: Upload integration log on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -1113,6 +1130,88 @@ jobs:
         with:
           name: bench-baseline-ci-updated
           path: ${{ runner.temp }}/bench-baseline.ci.updated.json
+          retention-days: 30
+
+  # ── x86_64 bench: cross-host evidence, never a gate ──
+  bench-x86_64:
+    name: Bench x86_64 (cross-host evidence, non-gating)
+    runs-on: ubuntu-latest
+    # Same trigger as the nightly `soak` job. What A2 (docs/dev/v1.0-gap.md)
+    # asks for is a *series* — the same commit's numbers on two host classes —
+    # so it runs on the schedule, not per push (per-push x86_64 gating is the
+    # `benchmark` job below, against the runner-recorded
+    # `bench-baseline.ci.json`). ubuntu-latest is the x86_64 leg;
+    # ubuntu-24.04-arm in the matrix above is the aarch64 one.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux) case "$(uname -m)" in aarch64|arm64) ART="zig-aarch64-linux" ;; *) ART="zig-x86_64-linux" ;; esac ;;
+            macOS) ART="zig-aarch64-macos" ;;
+            *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
+          esac
+          case "$ZIG_VERSION" in
+            *dev*) ZIG_URL="https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" ;;
+            *) ZIG_URL="https://ziglang.org/download/$ZIG_VERSION/$ART-$ZIG_VERSION.tar.xz" ;;
+          esac
+          curl -fsSL "$ZIG_URL" -o "$RUNNER_TEMP/zig.tar.xz"
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig"
+          echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
+
+      - name: Install deps
+        run: sudo apt-get install -y libpq-dev libmariadb-dev libmariadb-dev-compat libsqlite3-dev
+
+      - name: Run the bench gate against the aarch64 baseline (evidence only)
+        # A2: every performance number the repo quotes was recorded on one
+        # aarch64 laptop (`scripts/bench-baseline.json`, the default
+        # BENCH_BASELINE — named explicitly here so the comparison target is
+        # visible in the workflow). This step produces the cross-host half of
+        # that evidence: the *same* gate script, against that *same aarch64
+        # baseline*, on the x86_64 runner. One run records everything the
+        # comparison needs — the machine line (region/CPU/cores/load, from
+        # Azure IMDS on the runner), every metric's [med3] samples including
+        # the ungated references `atomic RMW x10M` and `StoreForward x10M`
+        # (the two candidate RingBuffer denominators whose cross-host spread
+        # is exactly what A2 says a single machine cannot settle), and the
+        # verdict itself. `scripts/check-bench.sh --ratios` reads these logs
+        # together with the laptop's.
+        #
+        # Deliberately NOT a gate, and the exit code is the mechanism: the
+        # baseline is aarch64-tuned, so a breach on this runner can be the
+        # host class speaking (the runner measures ~1.3x the laptop on
+        # absolute metrics; the ring's *ratio* differs ~9x between classes —
+        # see the RingBuffer SPSC note in scripts/check-bench.sh), and gating
+        # on it would false-red. The script's status is captured into `rc`,
+        # printed for the log, and the step always exits 0 — the verdict lives
+        # in the artifact, never in the night's status.
+        env:
+          BENCH_BASELINE: scripts/bench-baseline.json
+        run: |
+          mkdir -p "$RUNNER_TEMP/bench-x86_64"
+          rc=0
+          bash scripts/check-bench.sh 2>&1 | tee "$RUNNER_TEMP/bench-x86_64/bench-x86_64.log" || rc=$?
+          echo "check-bench.sh exited $rc against the aarch64 baseline ($BENCH_BASELINE) —"
+          echo "evidence only. A breach here is the host class (or runner load), not a red"
+          echo "night: the gate lives in the push-time 'benchmark' job against"
+          echo "scripts/bench-baseline.ci.json. Cross-host read: scripts/check-bench.sh --ratios."
+          exit 0
+
+      - name: Upload x86_64 bench evidence
+        # Sibling of nightly-soak-<sha>: one artifact per night, named by
+        # commit, same 30-day retention — together they are the commit ->
+        # cross-host bench series. `always()`: a breach night is exactly the
+        # one whose numbers are worth keeping.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-x86_64-${{ github.sha }}
+          path: ${{ runner.temp }}/bench-x86_64/
           retention-days: 30
 
   # ── Docker Build ──────────────────────────────

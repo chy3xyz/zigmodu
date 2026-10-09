@@ -575,8 +575,9 @@ pub const ClusterBootstrap = struct {
     ///
     /// No lock is taken here: with a `.transport`, `start()` has an accept thread
     /// dispatching peers' RPCs into the same `RaftElection`, and both sides are
-    /// serialized by the raft's own lock (`raft.tick()` takes it for its body,
-    /// as does every `handle*` the inbound dispatch calls — see
+    /// serialized by the raft's own lock (`raft.tick()` takes it around the
+    /// decide/apply phases — the outbound IO between them runs unlocked — as
+    /// does every `handle*` the inbound dispatch calls — see
     /// `RaftElection.RaftLock` and `RaftTransport.handleConnection`).
     pub fn tick(self: *Self) !void {
         const member = self.membership orelse return;

@@ -50,6 +50,48 @@
       "parent": null
     },
     {
+      "file": "src/core/cluster/RaftTransport.zig",
+      "line": 782,
+      "kind": "field",
+      "name": "wHighVersion",
+      "parent": "InitData"
+    },
+    {
+      "file": "src/core/cluster/RaftTransport.zig",
+      "line": 783,
+      "kind": "field",
+      "name": "szDescription",
+      "parent": "InitData"
+    },
+    {
+      "file": "src/core/cluster/RaftTransport.zig",
+      "line": 784,
+      "kind": "field",
+      "name": "szSystemStatus",
+      "parent": "InitData"
+    },
+    {
+      "file": "src/core/cluster/RaftTransport.zig",
+      "line": 785,
+      "kind": "field",
+      "name": "iMaxSockets",
+      "parent": "InitData"
+    },
+    {
+      "file": "src/core/cluster/RaftTransport.zig",
+      "line": 786,
+      "kind": "field",
+      "name": "iMaxUdpDg",
+      "parent": "InitData"
+    },
+    {
+      "file": "src/core/cluster/RaftTransport.zig",
+      "line": 787,
+      "kind": "field",
+      "name": "lpVendorInfo",
+      "parent": "InitData"
+    },
+    {
       "file": "src/core/eventbus/WAL.zig",
       "line": 13,
       "kind": "constant",

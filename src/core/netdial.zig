@@ -40,7 +40,10 @@ const builtin = @import("builtin");
 /// Exactly the error names `std.Io.Threaded.posixConnect` (plus the `socket(2)`
 /// table `netConnectIpPosix` applies around it) can produce — a subset of
 /// `std.Io.net.IpAddress.ConnectError`, so any function that returned the
-/// std dial's result can return this one unchanged.
+/// std dial's result can return this one unchanged. The last two members are
+/// not produced by the raw-syscall POSIX path; they exist because the Windows
+/// branch delegates to `IpAddress.connect`, whose set includes both — without
+/// them that delegation itself does not compile for a Windows target.
 pub const ConnectError = error{
     AddressUnavailable,
     AddressFamilyUnsupported,
@@ -60,6 +63,8 @@ pub const ConnectError = error{
     WouldBlock,
     NetworkDown,
     Unexpected,
+    Canceled,
+    OptionUnsupported,
 };
 
 /// What one `connect(2)` errno means for a blocking dial. Pure data — the

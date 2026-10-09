@@ -72,14 +72,17 @@ pub const RaftLock = struct {
 
     /// Take the lock, waiting in an escalating shape rather than spinning flat.
     ///
-    /// **Why the wait shape matters here at all.** The holder is not a short
-    /// critical section: `tick()` keeps this lock for its whole outbound round,
-    /// and a black-holed peer is written off only after `ElectionConfig.rpc_timeout_ms`
-    /// (100 ms by default) — *per peer*. Every waiter is therefore parked for a
-    /// long-but-bounded time by design, and a waiter that spins for that long is
-    /// one burned core per waiter. That was the cost of the loop this replaces
-    /// (`while (self.flag.swap(true, .acquire)) spinLoopHint()`), measured at a
-    /// full core for the whole hold.
+    /// **Why the wait shape matters here at all.** When this wait was built, the
+    /// holder could be asleep in an RPC for `ElectionConfig.rpc_timeout_ms` (100 ms
+    /// by default) — *per peer* — because `tick()` ran its whole outbound round
+    /// under this lock, and every waiter spun a core for the whole hold. That was
+    /// the cost of the loop this replaced (`while (self.flag.swap(true, .acquire))
+    /// spinLoopHint()`), measured at a full core for the whole hold. The outbound
+    /// round has since moved out of the lock (`flushOutgoing`'s phase 2 does the IO
+    /// unlocked), so the remaining holds are the phase-1 staging copy (bounded by
+    /// `max_append_entries` commands, or one snapshot memcpy), the phase-3 map
+    /// writes, and the inbound handler bodies — shorter, but still long enough
+    /// that a flat spin would be the wrong shape to leave in place.
     ///
     /// Three stages, chosen by round count:
     ///
@@ -89,13 +92,13 @@ pub const RaftLock = struct {
     ///   3. `sleepWithoutIo`, `sleep_ms` per round.
     ///
     /// The third stage is the one that does the work, and the second is not a
-    /// substitute for it: the holder here is normally *asleep in a syscall*
-    /// waiting out an RPC, i.e. not runnable at all, so `yield` returns
-    /// immediately and the core keeps burning (measured: `yield` alone costs
-    /// ~116 ms of CPU for a 120 ms hold, against ~0 ms with the sleep). The first
-    /// two stages exist so that the sleep — which can delay noticing a release by
-    /// up to `sleep_ms` — is only reached once the wait has stopped looking like
-    /// a short critical section.
+    /// substitute for it: a holder that is *asleep in a syscall* (the snapshotter
+    /// hook, a page fault mid-memcpy) is not runnable at all, so `yield` returns
+    /// immediately and the core keeps burning (measured back when the holder was
+    /// an RPC wait: `yield` alone cost ~116 ms of CPU for a 120 ms hold, against
+    /// ~0 ms with the sleep). The first two stages exist so that the sleep — which
+    /// can delay noticing a release by up to `sleep_ms` — is only reached once the
+    /// wait has stopped looking like a short critical section.
     ///
     /// The **fast path** is a compare-exchange rather than a `swap`: `swap` wrote
     /// the flag on every attempt, so N waiters kept dirtying the one cache line
@@ -223,29 +226,24 @@ pub const ElectionConfig = struct {
     /// message (which Raft re-sends — see `RaftTransport`: every failure mode is
     /// the same "lost message" answer, never a panic).
     ///
-    /// This is a **liveness bound, not a tuning knob**, and the reason is the
-    /// shape of the driver: `tick()` performs its outbound round while holding
-    /// `RaftLock`, so a peer that never answers does not merely delay the round —
-    /// it holds off every other thread that wants the state (the accept thread's
-    /// inbound RPCs, `appendEntry`, the accessors) for as long as the RPC waits.
+    /// This used to be a **liveness bound on the lock**, and the reason was the
+    /// shape of the driver: `tick()` performed its outbound round while holding
+    /// `RaftLock`, so a peer that never answered did not merely delay the round —
+    /// it held off every other thread that wanted the state (the accept thread's
+    /// inbound RPCs, `appendEntry`, the accessors) for as long as the RPC waited.
     /// Before this field existed the wait was the OS default: a black-holed peer
     /// (SYN dropped, or a connection accepted and never answered) cost the node
     /// *minutes*.
     ///
-    /// What those waiters spend while they wait is no longer a burned core —
-    /// `RaftLock.acquire` sleeps once it has spun and yielded its budget — so what
-    /// this number bounds is how long the state stays unavailable, i.e. the
-    /// latency floor a round imposes on every other user of this raft. That is
-    /// still the number to keep small: it is subtracted from every inbound RPC's
-    /// budget and added to every `appendEntry` and accessor call on the way in.
-    ///
-    /// With it, the cost of an unreachable peer is this number **per peer per
-    /// round**. Keep it comfortably under `election_timeout_min_ms`: past that
-    /// point the round has already missed its own heartbeat, so a larger value
-    /// buys nothing but a longer stall. Raise it for a WAN whose RTTs approach
-    /// the default — a slow-but-reachable peer now gets its reply written off as
-    /// lost instead of being waited for. 0 disables the bound (the pre-fix
-    /// behaviour).
+    /// The outbound round has since moved out of the lock (`flushOutgoing` stages
+    /// under the lock, delivers unlocked, applies under the lock), so what this
+    /// number bounds now is the round itself: an unreachable peer costs this
+    /// number **per peer per round**, and nobody else's access to the state. Keep
+    /// it comfortably under `election_timeout_min_ms`: past that point the round
+    /// has already missed its own heartbeat, so a larger value buys nothing but a
+    /// longer stall. Raise it for a WAN whose RTTs approach the default — a
+    /// slow-but-reachable peer now gets its reply written off as lost instead of
+    /// being waited for. 0 disables the bound (the pre-fix behaviour).
     rpc_timeout_ms: u32 = 100,
 
     /// Pre-shared key for the cluster port (docs/dev/cluster-auth-design.md).
@@ -433,9 +431,12 @@ pub const RaftElection = struct {
 
     /// Serializes every entry point that touches the fields below — see
     /// `RaftLock` for why this lives here rather than in the caller. Held for
-    /// the body of `tick` / `handle*` / `appendEntry` / `addPeer` /
-    /// `compactLog` and by the state accessors; the private helpers they call
-    /// (`startElection`, `sendHeartbeats`, …) assume it is already held.
+    /// the body of `handle*` / `appendEntry` / `addPeer` / `compactLog`, by the
+    /// state accessors, and for phases 1 and 3 of `flushOutgoing` (which is what
+    /// `tick` runs) — phase 2, the outbound IO itself, runs with the lock
+    /// released. The private helpers called from locked bodies (`startElection`,
+    /// `stageLeaderRoundLocked`, `applyStagedRoundLocked`, …) assume it is
+    /// already held; `deliverStagedRound` assumes the opposite.
     lock: RaftLock = .{},
 
     /// A-3: guards **only** the key material — `config.own_key` and
@@ -506,6 +507,43 @@ pub const RaftElection = struct {
     // Transport interface for sending messages
     transport: *const ElectionTransport,
 
+    // ── Outbound staging (the three-phase flush — see `flushOutgoing`) ──
+
+    /// Set by `becomeLeader`, which runs under `lock` and therefore cannot do
+    /// IO: the next flush sends the initial heartbeat even when the regular
+    /// interval has not elapsed. Cleared by the flush that stages it.
+    heartbeat_owed: bool = false,
+
+    /// One flush in flight at a time. The staging buffers below are per-node
+    /// and reused, so a second `flushOutgoing` (the accept thread's post-vote
+    /// flush meeting the tick thread mid-round) skips instead of racing them;
+    /// whatever it would have sent is either redundant (heartbeats repeat every
+    /// interval) or stays owed (`heartbeat_owed` is only cleared by the flush
+    /// that stages it).
+    flush_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    /// Phase-1 scratch: entry commands and snapshot bytes are deep-copied here
+    /// so phase 2's IO touches nothing the log owns. `reset(.retain_capacity)`
+    /// per leader round — steady state (heartbeats carry no entries) does not
+    /// allocate; a catch-up round reuses the retained buffer.
+    outbound_arena: std.heap.ArenaAllocator,
+
+    /// The peer snapshot a staged vote fan-out is delivered to — `peers` itself
+    /// may be regrown by `addPeer` while phase 2 is mid-iteration, so phase 2
+    /// never reads it. `clearRetainingCapacity` per election: no allocation in
+    /// the steady state.
+    staged_peers: std.ArrayList(Peer),
+
+    /// One leader round, per peer, made self-contained in phase 1. Cleared at
+    /// the top of every flush's phase 1 (not only when a round is staged), so
+    /// a tick with nothing due delivers nothing — see `flushOutgoing`.
+    staged_items: std.ArrayList(StagedOutbound),
+
+    /// The staged election broadcast (values only; `candidate_id` borrows
+    /// `local_id`, which outlives every round). Consumed by
+    /// `deliverStagedRound`.
+    staged_vote: ?VoteRequest = null,
+
     /// Transport interface for network communication
     pub const ElectionTransport = *const struct {
         sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
@@ -518,6 +556,37 @@ pub const RaftElection = struct {
         /// transport is supplied. **Note for `@ptrCast` vtables**: a hand-rolled
         /// struct must declare this field too — the cast shares the layout.
         sendInstallSnapshot: *const fn (?[]const u8, []const u8, InstallSnapshotRequest) InstallSnapshotResponse = &lostInstallSnapshot,
+    };
+
+    /// One peer's share of a leader round, staged self-contained in phase 1 of
+    /// `flushOutgoing` (the obligations are on its doc): everything phase 2's IO
+    /// reads is a value, a borrow of memory that outlives the round (`local_id`,
+    /// the peers' stored ids), or an `outbound_arena` copy — so the log or the
+    /// snapshot being truncated/replaced mid-send cannot reach the wire.
+    const StagedOutbound = struct {
+        /// Struct copy; `id`/`address` borrow the raft-owned strings (freed only
+        /// in `deinit`).
+        peer: Peer,
+        kind: enum { append_entries, install_snapshot },
+
+        // append_entries
+        prev_log_index: u64 = 0,
+        prev_log_term: u64 = 0,
+        /// Arena-owned deep copies — phase 2 reads these, never `log`.
+        entries: []const LogEntry = &.{},
+        leader_commit: u64 = 0,
+        /// Phase 2's answer, consumed by phase 3.
+        resp: ?AppendEntriesResponse = null,
+
+        // install_snapshot (chunked in phase 2 over one arena-owned copy)
+        snapshot_index: u64 = 0,
+        snapshot_term: u64 = 0,
+        snapshot_bytes: []const u8 = &.{},
+        /// The last reply's term, and whether the `done` frame was acked in
+        /// term. A transfer cut short leaves the peer at the boundary and is
+        /// retried next round.
+        snapshot_resp_term: ?u64 = null,
+        snapshot_completed: bool = false,
     };
 
     /// Initialize Raft module
@@ -568,6 +637,9 @@ pub const RaftElection = struct {
             .local_id = local_id_copy,
             .peers = peers_copy,
             .transport = transport,
+            .outbound_arena = std.heap.ArenaAllocator.init(allocator),
+            .staged_peers = std.ArrayList(Peer).empty,
+            .staged_items = std.ArrayList(StagedOutbound).empty,
             .last_heartbeat_ms = now_ms,
             .election_deadline_ms = now_ms + @as(i64, @intCast(config.election_timeout_max_ms)),
         };
@@ -613,33 +685,99 @@ pub const RaftElection = struct {
                 self.allocator.free(l);
             }
         }
+        // The outbound staging: the arena owns its buffers, the lists their
+        // element storage (the staged contents borrow, they do not own).
+        self.outbound_arena.deinit();
+        self.staged_peers.deinit(self.allocator);
+        self.staged_items.deinit(self.allocator);
         self.* = undefined;
     }
 
     /// Main tick function - called periodically.
     ///
-    /// Holds `lock` for the whole step: this is one of the two entry points
-    /// into the shared state (the other is the inbound RPC dispatch), and both
-    /// branches reach a read-then-free of an owned string — `voted_for` via
-    /// `startElection`, `leader_id` via `sendHeartbeats` — with no safe point
-    /// in between.
+    /// One tick is one `flushOutgoing`: decide under `lock` (election timeout →
+    /// stage the ballots; leader round due → stage it), deliver with the lock
+    /// released, then re-acquire and apply the replies. The lock is never held
+    /// across IO — the contract is on `flushOutgoing`.
     pub fn tick(self: *Self) !void {
-        self.lock.acquire();
-        defer self.lock.release();
+        try self.flushOutgoing();
+    }
 
-        const now_ms = Time.monotonicNowMilliseconds();
+    /// The node's outbound pump, and the answer to "the outbound round used to
+    /// run under `lock` for its whole length" (docs/DISTRIBUTED.md 「出站 IO 与
+    /// 锁」). `tick()` is one call to this; `handleVoteResponse` calls it after
+    /// releasing its own lock, so a won election's first heartbeat goes out
+    /// immediately rather than at the next due interval.
+    ///
+    /// Three phases, with the obligations that keep the split safe:
+    ///
+    ///   1. **Stage self-contained requests (locked).** Everything phase 2 puts
+    ///      on the wire is decided and deep-copied here: entry commands and
+    ///      snapshot bytes into `outbound_arena`, the peer list into
+    ///      `staged_peers`. Once the lock is released, an inbound
+    ///      `handleAppendEntries` may truncate the log and free exactly those
+    ///      bytes — the wire must never read memory the raft still owns. The
+    ///      steady state (heartbeats with empty entries) copies nothing.
+    ///   2. **Deliver (unlocked).** Pure IO: the staged ballots and per-peer
+    ///      rounds go out, replies are recorded on the staged items. Reads only
+    ///      the staging buffers (single-tenant under `flush_active`) and fields
+    ///      that are immutable after `init` (`local_id`, `config`, `transport`).
+    ///   3. **Apply (locked, validated).** A reply's higher term always steps
+    ///      the node down. Everything else applies only if the round is still
+    ///      ours — `state == .leader` and `current_term` unchanged since
+    ///      staging — otherwise the whole batch is dropped: between the phases
+    ///      an inbound RPC may have moved the term, demoted us, or re-elected
+    ///      us, and a stale round's bookkeeping is worse than none.
+    ///      `next_index` / `match_index` are read and written only in this
+    ///      phase, never carried across.
+    fn flushOutgoing(self: *Self) !void {
+        // The staging buffers are reused, so two flushes may not overlap: the
+        // accept thread's post-vote flush can meet the tick thread mid-round.
+        // Skipping loses nothing — heartbeats repeat every interval, and an owed
+        // one stays owed until a flush actually stages it.
+        if (self.flush_active.cmpxchgStrong(false, true, .acq_rel, .monotonic) != null) return;
+        defer self.flush_active.store(false, .release);
 
-        switch (self.state) {
-            .follower, .candidate => {
-                if (now_ms >= self.election_deadline_ms) {
-                    try self.startElection();
-                }
-            },
-            .leader => {
-                const time_since_last = now_ms - self.last_heartbeat_ms;
-                if (time_since_last >= self.config.heartbeat_interval_ms) {
-                    try self.sendHeartbeats();
+        // ── Phase 1: decide, and stage this round self-contained ──
+        var leader_round = false;
+        var round_term: u64 = 0;
+        {
+            self.lock.acquire();
+            defer self.lock.release();
+
+            const now_ms = Time.monotonicNowMilliseconds();
+            // Both staging buffers reset up front: phase 2 runs on every flush
+            // (there is nothing to skip — a vote, a round, or nothing at all),
+            // so a tick that stages nothing must carry nothing — never the
+            // previous round's leftover items, re-sent under a zero term.
+            self.staged_vote = null;
+            self.staged_items.clearRetainingCapacity();
+
+            switch (self.state) {
+                .follower, .candidate => {
+                    if (now_ms >= self.election_deadline_ms) {
+                        try self.startElection();
+                    }
+                },
+                .leader => {},
+            }
+
+            // A won single-node election lands here in the same flush:
+            // `startElection` → `becomeLeader` left a heartbeat owed.
+            if (self.state == .leader) {
+                const heartbeat_due = now_ms - self.last_heartbeat_ms >= @as(i64, @intCast(self.config.heartbeat_interval_ms));
+                if (heartbeat_due or self.heartbeat_owed) {
+                    self.heartbeat_owed = false;
                     self.last_heartbeat_ms = now_ms;
+                    if (self.stageLeaderRoundLocked()) |term| {
+                        round_term = term;
+                        leader_round = true;
+                    } else |err| {
+                        // The round is skipped, not half-sent; the next due
+                        // tick retries.
+                        self.staged_items.clearRetainingCapacity();
+                        std.log.err("[RaftElection] staging the leader round failed, skipping this round: {}", .{err});
+                    }
                 }
                 // §7 housekeeping on the leader: bounded log growth. Off by
                 // default (`snapshot_threshold_entries = 0`); when on, a skipped
@@ -648,7 +786,17 @@ pub const RaftElection = struct {
                 self.maybeCompactLog() catch |err| {
                     std.log.err("[RaftElection] auto-compaction skipped this tick: {}", .{err});
                 };
-            },
+            }
+        }
+
+        // ── Phase 2: deliver (no lock held) ──
+        self.deliverStagedRound(round_term);
+
+        // ── Phase 3: apply, with the round's validity re-checked ──
+        if (leader_round) {
+            self.lock.acquire();
+            defer self.lock.release();
+            self.applyStagedRoundLocked(round_term);
         }
     }
 
@@ -955,13 +1103,15 @@ pub const RaftElection = struct {
 
     // ── Private helpers ─────────────────────────────────────────────────────
     //
-    // Everything from here down (`sendAppendEntries`, `advanceCommitIndex`,
-    // `truncateLog`, `startElection`, `becomeLeader`, `sendHeartbeats`,
-    // `randomElectionTimeout`, the index helpers, the snapshot send/apply
-    // halves) is reachable only from the locked entry points above and assumes
-    // `lock` is already held: they are steps *within* one state transition, so
-    // taking it here would self-deadlock the lock rather than add a safety
-    // margin.
+    // Everything from here down falls under one of two locking disciplines.
+    // The steps *within* one state transition (`startElection`, `becomeLeader`,
+    // `stageLeaderRoundLocked`, `applyStagedRoundLocked`, `advanceCommitIndex`,
+    // `truncateLog`, `randomElectionTimeout`, the index helpers,
+    // `processInstallSnapshotResponse`) assume `lock` is already held — taking
+    // it there would self-deadlock the lock rather than add a safety margin.
+    // `deliverStagedRound` is the opposite: it is phase 2 of `flushOutgoing`
+    // and assumes the lock is **not** held, touching only the staging buffers
+    // and init-time-immutable fields.
     //
     // ── Absolute index ⇄ position ───────────────────────────────────────────
     //
@@ -998,8 +1148,38 @@ pub const RaftElection = struct {
         return self.log.items[pos - 1].term;
     }
 
-    /// Leader sends AppendEntries to all peers with new log entries.
+    /// Drive one leader round synchronously: stage (locked) → deliver
+    /// (unlocked) → apply (locked) — the same pieces `flushOutgoing`'s leader
+    /// half runs, minus the due/owed check and the `flush_active`
+    /// single-flight. The tests below call it directly to drive rounds by hand;
+    /// production reaches the pieces through `flushOutgoing` only.
     fn sendAppendEntries(self: *Self) !void {
+        const round_term = blk: {
+            self.lock.acquire();
+            defer self.lock.release();
+            break :blk try self.stageLeaderRoundLocked();
+        };
+        self.deliverStagedRound(round_term);
+        self.lock.acquire();
+        defer self.lock.release();
+        self.applyStagedRoundLocked(round_term);
+    }
+
+    /// Phase 1 for a leader round (lock held): decide each peer's next frame
+    /// and stage it self-contained — entry commands as arena copies, and for a
+    /// follower lagging into the snapshot, one shared copy of the snapshot
+    /// bytes. Returns the term the round is built on; phase 3 re-checks it
+    /// before applying anything.
+    fn stageLeaderRoundLocked(self: *Self) !u64 {
+        _ = self.outbound_arena.reset(.retain_capacity);
+        self.staged_items.clearRetainingCapacity();
+        const arena = self.outbound_arena.allocator();
+
+        // One copy per round, shared by every snapshot-bound peer: phase 2 must
+        // not send `snapshot_data` itself — an inbound InstallSnapshot (or a
+        // local compaction) can free and replace it while frames are in flight.
+        var snapshot_copy: ?[]const u8 = null;
+
         for (self.peers.items) |peer| {
             const next_idx = self.next_index.get(peer.id) orelse blk: {
                 // Initialize if missing
@@ -1014,9 +1194,16 @@ pub const RaftElection = struct {
             // the next round resumes AppendEntries at `last_included_index + 1`
             // once the follower has installed it.
             if (next_idx <= self.last_included_index) {
-                self.sendSnapshotToPeer(peer);
-                // A higher term in the reply stepped us down mid-round: stop.
-                if (self.state != .leader) return;
+                if (snapshot_copy == null) {
+                    snapshot_copy = try arena.dupe(u8, self.snapshot_data orelse "");
+                }
+                try self.staged_items.append(self.allocator, .{
+                    .peer = peer,
+                    .kind = .install_snapshot,
+                    .snapshot_index = self.last_included_index,
+                    .snapshot_term = self.last_included_term,
+                    .snapshot_bytes = snapshot_copy.?,
+                });
                 continue;
             }
 
@@ -1024,19 +1211,31 @@ pub const RaftElection = struct {
             // missing to the end of the log, capped so a lagging follower is
             // fed in `max_append_entries` chunks instead of one RPC carrying
             // everything. The following round picks up where this one stopped
-            // (`next_index` = last entry sent + 1).
+            // (`next_index` = last entry sent + 1). A cap of 0 would ship empty
+            // rounds forever and never advance `next_index`, so it is read as
+            // "one entry per round".
             const start: usize = @intCast(next_idx - self.last_included_index); // 1-based position of the first entry to send
             const pending: []const LogEntry = if (start <= self.log.items.len)
                 self.log.items[start - 1 ..]
             else
                 &.{};
-            // A cap of 0 would ship empty rounds forever and never advance
-            // `next_index`, so it is read as "one entry per round".
             const batch_max = @max(@as(usize, 1), self.config.max_append_entries);
-            const entries: []const LogEntry = if (pending.len > batch_max)
+            const batch: []const LogEntry = if (pending.len > batch_max)
                 pending[0..batch_max]
             else
                 pending;
+
+            // Deep-copy the batch: phase 2 runs with the lock released, and an
+            // inbound AppendEntries may truncate exactly these entries and free
+            // their commands while the frame is on the wire.
+            const entries = try arena.alloc(LogEntry, batch.len);
+            for (batch, 0..) |entry, i| {
+                entries[i] = .{
+                    .term = entry.term,
+                    .index = entry.index,
+                    .command = try arena.dupe(u8, entry.command),
+                };
+            }
 
             var prev_log_idx: u64 = 0;
             var prev_log_term: u64 = 0;
@@ -1047,62 +1246,156 @@ pub const RaftElection = struct {
                 // live entry → its own term. `next_idx > last_included_index`
                 // in this branch, so `termAt` misses only when `next_index`
                 // outran the tail — the follower then rejects and the
-                // backtracking below repairs the map.
+                // backtracking in phase 3 repairs the map.
                 prev_log_term = self.termAt(prev_log_idx) orelse 0;
             }
 
-            const req = AppendEntriesRequest{
-                .term = self.current_term,
-                .leader_id = self.local_id,
+            try self.staged_items.append(self.allocator, .{
+                .peer = peer,
+                .kind = .append_entries,
                 .prev_log_index = prev_log_idx,
                 .prev_log_term = prev_log_term,
                 .entries = entries,
                 .leader_commit = self.commit_index,
-            };
+            });
+        }
+        return self.current_term;
+    }
 
-            const resp = self.transport.*.sendAppendEntries(peer.id, peer.address, req);
-
-            if (resp.term > self.current_term) {
-                self.current_term = resp.term;
-                self.state = .follower;
-                return;
+    /// Phase 2: deliver everything phase 1 staged, **without the lock**. Reads
+    /// only the staging buffers (single-tenant under `flush_active`) and fields
+    /// that are immutable after `init` (`local_id`, `config`, `transport`) —
+    /// `peers` is *not* read here: the vote fan-out iterates `staged_peers`, the
+    /// per-peer rounds carry their own `Peer` copy. A reply with a higher term
+    /// ends the round early: everything after it would be stale on arrival.
+    fn deliverStagedRound(self: *Self, round_term: u64) void {
+        if (self.staged_vote) |vr| {
+            self.staged_vote = null;
+            for (self.staged_peers.items) |p| {
+                self.transport.*.sendVoteRequest(p.id, p.address, vr);
             }
+        }
+        round: for (self.staged_items.items) |*item| {
+            switch (item.kind) {
+                .append_entries => {
+                    const resp = self.transport.*.sendAppendEntries(item.peer.id, item.peer.address, .{
+                        .term = round_term,
+                        .leader_id = self.local_id,
+                        .prev_log_index = item.prev_log_index,
+                        .prev_log_term = item.prev_log_term,
+                        .entries = item.entries,
+                        .leader_commit = item.leader_commit,
+                    });
+                    item.resp = resp;
+                    if (resp.term > round_term) break :round;
+                },
+                .install_snapshot => {
+                    // The chunk loop, over the staged copy. A reply in another
+                    // term (stale or higher) cuts the transfer; the next round
+                    // restarts it from `offset = 0`.
+                    const snap = item.snapshot_bytes;
+                    // u16 length prefix on the wire (`RaftTransport.putStr`) —
+                    // the clamp is the wire format's, not a tuning choice.
+                    const chunk = @min(@max(@as(usize, 1), self.config.snapshot_chunk_bytes), std.math.maxInt(u16));
+                    var offset: usize = 0;
+                    while (true) {
+                        const end = @min(snap.len, offset + chunk);
+                        const done = end == snap.len;
+                        const resp = self.transport.*.sendInstallSnapshot(item.peer.id, item.peer.address, .{
+                            .term = round_term,
+                            .leader_id = self.local_id,
+                            .last_included_index = item.snapshot_index,
+                            .last_included_term = item.snapshot_term,
+                            .offset = @intCast(offset),
+                            .data = snap[offset..end],
+                            .done = done,
+                        });
+                        item.snapshot_resp_term = resp.term;
+                        if (resp.term != round_term) break;
+                        if (done) {
+                            item.snapshot_completed = true;
+                            break;
+                        }
+                        offset = end;
+                    }
+                    if ((item.snapshot_resp_term orelse round_term) > round_term) break :round;
+                },
+            }
+        }
+    }
 
-            if (resp.success) {
-                // Update match_index and next_index. The follower's own
-                // `match_index` is the floor: it applies at most
-                // `max_append_entries` of what it was sent (see
-                // `handleAppendEntries`), so trusting "what we sent" over "what it
-                // acknowledged" would record entries as replicated that the
-                // follower never appended — and `advanceCommitIndex` commits on
-                // `match_index`. `@min` is a no-op whenever the follower took the
-                // whole batch, and an empty batch acknowledges `prev_log_idx`
-                // (a follower that accepted `prev_log_index` has at least that).
-                const sent_last: u64 = if (entries.len > 0)
-                    entries[entries.len - 1].index
-                else
-                    prev_log_idx;
-                const matched: u64 = @min(sent_last, resp.match_index);
-                self.next_index.put(peer.id, matched + 1) catch |err| std.log.err("[RaftElection] next_index update failed: {}", .{err});
-                self.match_index.put(peer.id, matched) catch |err| std.log.err("[RaftElection] match_index update failed: {}", .{err});
-            } else {
-                // Decrement next_index for fast backtracking, with the
-                // follower's `match_index` as a hint. Floor is 1: a next_index
-                // that lands at/below the snapshot boundary is the snapshot
-                // branch above, not a wedge.
-                if (next_idx > 1) {
-                    const back = if (resp.match_index > 0)
-                        @min(next_idx - 1, resp.match_index + 1)
-                    else
-                        next_idx - 1;
-                    self.next_index.put(peer.id, back) catch |err| std.log.err("[RaftElection] next_index backtrack failed: {}", .{err});
-                }
+    /// Phase 3 (lock held): apply what phase 2 collected. The term half of a
+    /// reply always applies — a higher term steps the node down wherever it
+    /// came from. The bookkeeping half applies only while the round is still
+    /// ours (`state == .leader` and `current_term == round_term`); otherwise
+    /// the rest of the batch is dropped wholesale — between the phases an
+    /// inbound RPC may have moved the term, demoted us, or re-elected us, and a
+    /// stale round's bookkeeping is worse than none. `next_index` /
+    /// `match_index` are read and written only here: nothing about them crosses
+    /// the phases, so with the guard there is nothing left to argue about.
+    fn applyStagedRoundLocked(self: *Self, round_term: u64) void {
+        for (self.staged_items.items) |*item| {
+            const resp_term: u64 = switch (item.kind) {
+                .append_entries => (item.resp orelse continue).term,
+                .install_snapshot => item.snapshot_resp_term orelse continue,
+            };
+            if (resp_term > self.current_term) {
+                self.current_term = resp_term;
+                self.state = .follower;
+                break; // the rest of the round died with it
+            }
+            if (self.state != .leader or self.current_term != round_term) break;
+
+            const peer_id = self.peerId(item.peer.id) orelse continue;
+            switch (item.kind) {
+                .append_entries => {
+                    const resp = item.resp.?;
+                    if (resp.success) {
+                        // Update match_index and next_index. The follower's own
+                        // `match_index` is the floor: it applies at most
+                        // `max_append_entries` of what it was sent (see
+                        // `handleAppendEntries`), so trusting "what we sent" over
+                        // "what it acknowledged" would record entries as
+                        // replicated that the follower never appended — and
+                        // `advanceCommitIndex` commits on `match_index`. `@min`
+                        // is a no-op whenever the follower took the whole batch,
+                        // and an empty batch acknowledges `prev_log_index` (a
+                        // follower that accepted it has at least that).
+                        const sent_last: u64 = if (item.entries.len > 0)
+                            item.entries[item.entries.len - 1].index
+                        else
+                            item.prev_log_index;
+                        const matched: u64 = @min(sent_last, resp.match_index);
+                        self.next_index.put(peer_id, matched + 1) catch |err| std.log.err("[RaftElection] next_index update failed: {}", .{err});
+                        self.match_index.put(peer_id, matched) catch |err| std.log.err("[RaftElection] match_index update failed: {}", .{err});
+                    } else if (item.prev_log_index > 0) {
+                        // Fast backtracking with the follower's hint.
+                        // `prev_log_index + 1` is the `next_idx` the request was
+                        // built from; a backtrack that lands at/below the
+                        // snapshot boundary is the snapshot branch next round,
+                        // not a wedge.
+                        const next_idx = item.prev_log_index + 1;
+                        const back = if (resp.match_index > 0)
+                            @min(next_idx - 1, resp.match_index + 1)
+                        else
+                            next_idx - 1;
+                        self.next_index.put(peer_id, back) catch |err| std.log.err("[RaftElection] next_index backtrack failed: {}", .{err});
+                    }
+                },
+                .install_snapshot => {
+                    if (!item.snapshot_completed) continue;
+                    // The boundary moved while the transfer was out (a local
+                    // compaction, or an inbound snapshot): the reply is stale —
+                    // its term half above was its only effect.
+                    if (item.snapshot_index != self.last_included_index) continue;
+                    self.processInstallSnapshotResponse(.{ .term = resp_term }, item.peer.id);
+                },
             }
         }
 
         // Entries held by a quorum are committed (§5.3/§5.4); the next round
         // carries the new leader_commit to the followers.
-        self.advanceCommitIndex();
+        if (self.state == .leader and self.current_term == round_term) self.advanceCommitIndex();
     }
 
     /// Advance commit_index if a majority of peers have replicated an entry
@@ -1178,16 +1471,22 @@ pub const RaftElection = struct {
         const last_idx: u64 = self.lastLogIndex();
         const last_term = self.lastLogTerm();
 
-        const vote_req = VoteRequest{
+        // The ballots go out in `flushOutgoing`'s phase 2, with the lock
+        // released — this only stages them. The request is values plus
+        // `local_id` (which outlives the round); the peer list is copied because
+        // `addPeer` may regrow `peers` while the fan-out is on the wire.
+        self.staged_vote = .{
             .term = self.current_term,
             .candidate_id = self.local_id,
             .last_log_index = last_idx,
             .last_log_term = last_term,
         };
-
-        for (self.peers.items) |peer| {
-            self.transport.*.sendVoteRequest(peer.id, peer.address, vote_req);
-        }
+        self.staged_peers.clearRetainingCapacity();
+        self.staged_peers.appendSlice(self.allocator, self.peers.items) catch |err| {
+            // A short staging loses ballots, not the election: the deadline is
+            // already reset, so the next expiry re-stages from scratch.
+            std.log.err("[RaftElection] vote fan-out staging failed, partial ballots this round: {}", .{err});
+        };
     }
 
     /// Become leader (we've won the election)
@@ -1224,59 +1523,18 @@ pub const RaftElection = struct {
             self.current_term,
         });
 
-        // Send initial heartbeat immediately (as AppendEntries with empty entries)
-        self.sendHeartbeats() catch |err| std.log.err("[RaftElection] initial heartbeat failed: {}", .{err});
-    }
-
-    /// Send heartbeats to all peers. A heartbeat is the same per-peer
-    /// AppendEntries round as replication: a caught-up follower receives empty
-    /// entries with a `prev_log_*` it actually has, while a lagging follower
-    /// rejects the probe and gets its `next_index` backed off one step per
-    /// round until the logs line up and the missing entries flow —
-    /// `config.max_append_entries` of them per round.
-    fn sendHeartbeats(self: *Self) !void {
-        try self.sendAppendEntries();
-    }
-
-    /// §7 leader side: send the snapshot to a follower whose `next_index` has
-    /// fallen to or below `last_included_index` (the entries it needs are gone
-    /// from the log). Payload goes in `snapshot_chunk_bytes` frames — a small
-    /// snapshot is one frame (`offset = 0, done = true`) — and each reply is
-    /// processed inline, like `sendAppendEntries` does.
-    ///
-    /// Assumes `lock` is held (called from `sendAppendEntries`' round), which
-    /// is also what keeps `last_included_*` stable between chunks: compaction
-    /// runs on this same locked path.
-    fn sendSnapshotToPeer(self: *Self, peer: Peer) void {
-        const snap = self.snapshot_data orelse "";
-        // u16 length prefix on the wire (`RaftTransport.putStr`) — the clamp is
-        // the wire format's, not a tuning choice.
-        const chunk = @min(@max(@as(usize, 1), self.config.snapshot_chunk_bytes), std.math.maxInt(u16));
-        var offset: usize = 0;
-        while (true) {
-            const end = @min(snap.len, offset + chunk);
-            const done = end == snap.len;
-            const resp = self.transport.*.sendInstallSnapshot(peer.id, peer.address, .{
-                .term = self.current_term,
-                .leader_id = self.local_id,
-                .last_included_index = self.last_included_index,
-                .last_included_term = self.last_included_term,
-                .offset = @intCast(offset),
-                .data = snap[offset..end],
-                .done = done,
-            });
-            self.processInstallSnapshotResponse(resp, peer.id);
-            // Stepped down (higher term): the round is over. A stale answer
-            // (below our term — e.g. the "lost message" `term = 0`) leaves
-            // `next_index` at the boundary and the next round retries.
-            if (self.state != .leader or resp.term != self.current_term) return;
-            if (done) return;
-            offset = end;
-        }
+        // The initial heartbeat is owed, not sent: this runs under `lock` (via
+        // `startElection` or `handleVoteResponse`), and outbound IO no longer
+        // happens under it. Whoever promoted us flushes after releasing the
+        // lock (`tick` is a `flushOutgoing`; `handleVoteResponse` calls it on
+        // the way out).
+        self.heartbeat_owed = true;
     }
 
     /// The bookkeeping half of an InstallSnapshot reply. Assumes `lock` held;
-    /// the public `handleInstallSnapshotResponse` is the locking entry point.
+    /// the locking entry points are the public `handleInstallSnapshotResponse`
+    /// (a reply arriving out of band) and `applyStagedRoundLocked` (the
+    /// synchronous send path's phase 3).
     fn processInstallSnapshotResponse(self: *Self, resp: InstallSnapshotResponse, from_peer: []const u8) void {
         if (resp.term > self.current_term) {
             self.current_term = resp.term;
@@ -1331,45 +1589,56 @@ pub const RaftElection = struct {
     /// `hasQuorum(votes_received)` documents). A cluster of one never gets here
     /// — `startElection` elects it on the self-vote alone.
     ///
-    /// Holds `lock`: a tally that reaches quorum promotes the node mid-call
-    /// (`becomeLeader` frees `leader_id` and resets the per-peer maps), and the
-    /// term check it starts with is the same field the ticker writes.
+    /// Holds `lock` for the tally only: a tally that reaches quorum promotes
+    /// the node mid-call (`becomeLeader` frees `leader_id`, resets the per-peer
+    /// maps, and registers the owed initial heartbeat), and the term check it
+    /// starts with is the same field the ticker writes. The flush after the
+    /// locked section is what actually sends that heartbeat — outbound IO stays
+    /// off the lock.
     pub fn handleVoteResponse(self: *Self, resp: VoteResponse, from_peer: []const u8) !void {
-        self.lock.acquire();
-        defer self.lock.release();
+        locked: {
+            self.lock.acquire();
+            defer self.lock.release();
 
-        if (resp.term > self.current_term) {
-            self.current_term = resp.term;
-            self.state = .follower;
-            self.votes_received.clearRetainingCapacity();
-            return;
+            if (resp.term > self.current_term) {
+                self.current_term = resp.term;
+                self.state = .follower;
+                self.votes_received.clearRetainingCapacity();
+                break :locked;
+            }
+
+            if (self.state != .candidate) break :locked;
+            if (resp.term < self.current_term) break :locked; // ballot from a past election
+            if (!resp.vote_granted) break :locked;
+
+            // Only configured cluster members count. The map key borrows the
+            // peer's stored id, which outlives the (often arena-owned) `from_peer`.
+            const peer_id = self.peerId(from_peer) orelse break :locked;
+            try self.votes_received.put(peer_id, {});
+
+            // `+ 1` is the candidate's **own** vote: `startElection` set
+            // `voted_for = local_id` before asking anyone, and `quorumSize()` counts the
+            // whole cluster (it is `clusterSize() / 2 + 1`, and `clusterSize()` includes
+            // self). Without it the tally demanded `quorumSize()` *peers* on top of self,
+            // i.e. one vote more than a Raft majority — which made N=2 unreachable
+            // outright (quorumSize 2, one peer) and cost every larger cluster a node of
+            // fault tolerance. `hasQuorum` below carries the same `+ 1`.
+            if (@as(usize, self.votes_received.count()) + 1 >= self.quorumSize()) {
+                self.becomeLeader();
+            }
         }
 
-        if (self.state != .candidate) return;
-        if (resp.term < self.current_term) return; // ballot from a past election
-        if (!resp.vote_granted) return;
-
-        // Only configured cluster members count. The map key borrows the
-        // peer's stored id, which outlives the (often arena-owned) `from_peer`.
-        const peer_id = self.peerId(from_peer) orelse return;
-        try self.votes_received.put(peer_id, {});
-
-        // `+ 1` is the candidate's **own** vote: `startElection` set
-        // `voted_for = local_id` before asking anyone, and `quorumSize()` counts the
-        // whole cluster (it is `clusterSize() / 2 + 1`, and `clusterSize()` includes
-        // self). Without it the tally demanded `quorumSize()` *peers* on top of self,
-        // i.e. one vote more than a Raft majority — which made N=2 unreachable
-        // outright (quorumSize 2, one peer) and cost every larger cluster a node of
-        // fault tolerance. `hasQuorum` below carries the same `+ 1`.
-        if (@as(usize, self.votes_received.count()) + 1 >= self.quorumSize()) {
-            self.becomeLeader();
-        }
+        // Push out whatever the tally made pending — a won election's first
+        // heartbeat — without holding the lock across IO. A failure loses the
+        // *immediate* push only: the next due tick flushes the rest.
+        self.flushOutgoing() catch |err| std.log.err("[RaftElection] post-vote flush failed: {}", .{err});
     }
 
     /// Leader consumes an InstallSnapshot reply (§7). The synchronous send path
-    /// (`sendSnapshotToPeer`) feeds replies through `processInstallSnapshotResponse`
-    /// directly; this is the entry point for a reply that arrives out of band
-    /// (e.g. an async transport). The reply itself carries only a term, so the
+    /// (`flushOutgoing` phase 2/3) feeds replies through
+    /// `processInstallSnapshotResponse` directly; this is the entry point for a
+    /// reply that arrives out of band (e.g. an async transport). The reply itself
+    /// carries only a term, so the
     /// caller names the snapshot it belongs to: `last_included_index` that does
     /// not match the snapshot this node currently holds is a stale answer — only
     /// the term half of it still applies.
@@ -3540,9 +3809,10 @@ const AppendEntriesCapture = struct {
     }
 };
 
-/// Answers with a higher term, which makes the leader step down inside
-/// `sendAppendEntries` before it can touch `next_index` / `match_index` — so
-/// whatever `becomeLeader` wrote into those maps stays observable.
+/// Answers with a higher term, which makes the leader step down when the
+/// round's replies are applied (phase 3) before it can touch `next_index` /
+/// `match_index` — so whatever `becomeLeader` wrote into those maps stays
+/// observable.
 fn higherTermAppendEntries(_: ?[]const u8, _: []const u8, req: AppendEntriesRequest) AppendEntriesResponse {
     return .{ .term = req.term +| 1, .success = false, .match_index = 0 };
 }
@@ -3838,6 +4108,9 @@ test "RaftElection becomeLeader reinitializes per-peer next_index and match_inde
     _ = try raft.appendEntry("c");
 
     raft.becomeLeader();
+    // The promotion's first heartbeat is owed, not sent (`becomeLeader` runs
+    // where the lock is held, and IO moved out of it) — the flush delivers it.
+    try raft.flushOutgoing();
 
     // The probe answered with a higher term, so the new leader stepped back down
     // before its heartbeat could rewrite the maps — which is what makes
@@ -4225,12 +4498,15 @@ fn threadCpuNanoseconds() u64 {
 
 // The reading the lock's wait shape exists for.
 //
-// `tick()` keeps this lock for its whole outbound round, and a black-holed peer
-// is written off only after `rpc_timeout_ms` (100 ms by default) — *per peer*.
-// So the wait is long by design rather than by accident, and "the waiter is
-// waiting" has to mean it is *off* the CPU: a core burned per waiter is the cost
-// the old `swap` + unbounded `spinLoopHint` loop paid, for as long as the round
-// took.
+// When this wait was built, `tick()` kept this lock for its whole outbound
+// round, and a black-holed peer was written off only after `rpc_timeout_ms`
+// (100 ms by default) — *per peer*. The outbound round has since moved out of
+// the lock (`flushOutgoing` phase 2), so the long holds are gone by
+// construction; what remains — the phase-1 staging copy (up to one snapshot
+// memcpy), the inbound handler bodies — can still outlast a scheduling
+// quantum, and "the waiter is waiting" has to keep meaning it is *off* the
+// CPU. A core burned per waiter is the cost the old `swap` + unbounded
+// `spinLoopHint` loop paid, for as long as the hold took.
 //
 // Verified red, measured three ways on this toolchain (macOS, 120 ms hold
 // driving the same waiter, whose own `CLOCK.THREAD_CPUTIME_ID` delta is the
@@ -4241,8 +4517,8 @@ fn threadCpuNanoseconds() u64 {
 //   … + the sleep stage below                   0 ms CPU
 //
 // The middle row is the whole reason the sleep stage exists: `yield` is not
-// enough. The holder in this shape is *asleep in a syscall* — not runnable — so
-// there is no thread to hand the core to and `sched_yield` returns immediately.
+// enough. A holder asleep in a syscall is *not runnable* — so there is no
+// thread to hand the core to and `sched_yield` returns immediately.
 // The threshold is deliberately half the hold: what is being asserted is the
 // order of magnitude, a core versus nothing, not the reading. This test's own
 // numbers, the ones the assertion below sees at `hold_ms = 200`: **200 ms**
@@ -4267,8 +4543,9 @@ test "RaftLock: a wait across a slow RPC costs the waiter sleep, not CPU" {
     const waiter = try std.Thread.spawn(.{}, Waiter.run, .{ &lock, &waiter_cpu_ns });
 
     // The holder's half of the pattern, not an artefact of the test: the lock is
-    // held while the holder is off the CPU, which is what `sendAppendEntries`
-    // waiting out a black-holed peer looks like from inside.
+    // held while the holder is off the CPU — what a phase-1 staging copy of a
+    // large snapshot looks like from inside now that the RPC wait itself has
+    // moved out of the lock.
     sleepWithoutIo(hold_ms);
     lock.release();
 
@@ -4540,4 +4817,303 @@ test "runtime key table ops: rotate opens a window, close/revoke settle it" {
     try testing.expect(try election.revokePeerKey("node-d"));
     try testing.expect(try election.revokePeerKey("node-e"));
     try testing.expectEqual(@as(usize, 0), election.config.peer_keys.len);
+}
+
+// ── Outbound IO off the lock: the three-phase flush's guardrails ────────────
+//
+// The rendezvous tests above ("a tick and an inbound RPC cannot both free
+// voted_for" and its positive control) prove the lock serializes what must be
+// serialized. They cannot reach the *other* half of the contract — that the
+// outbound round no longer needs the lock, and is safe without it — because
+// every transport above answers immediately. The two tests below park the
+// transport mid-send (phase 2, lock released) and let the test thread mutate
+// the raft underneath it. Both were verified red by mutation; their comments
+// say what was removed and what failed.
+
+/// One `tick()` on its own thread, for the guardrail tests below. A leader
+/// tick cannot error (staging failures are logged, not propagated), so a panic
+/// is the honest report.
+fn driveOneTick(raft: *RaftElection) void {
+    raft.tick() catch |err| std.debug.panic("[raft test] tick: {s}", .{@errorName(err)});
+}
+
+/// The transport behind both guardrail tests: `sendAppendEntries` parks the
+/// leader round *inside the send* until the test thread has mutated the raft,
+/// then copies out the bytes the request still claims to carry, and answers
+/// with a preloaded response. File-scope statics, like the other test
+/// transports above.
+const BlockingAppend = struct {
+    var entered: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+    var release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+    var response: AppendEntriesResponse = .{ .term = 0, .success = false, .match_index = 0 };
+    var cmd_count: usize = 0;
+    var cmds: [4][64]u8 = undefined;
+    var cmd_lens: [4]usize = .{ 0, 0, 0, 0 };
+
+    fn reset(resp: AppendEntriesResponse) void {
+        entered.store(false, .monotonic);
+        release.store(false, .monotonic);
+        response = resp;
+        cmd_count = 0;
+        cmd_lens = .{ 0, 0, 0, 0 };
+    }
+
+    fn waitEntered() void {
+        while (!entered.load(.acquire)) std.atomic.spinLoopHint();
+    }
+
+    fn accept(_: ?[]const u8, _: []const u8, req: AppendEntriesRequest) AppendEntriesResponse {
+        entered.store(true, .release);
+        while (!release.load(.acquire)) std.atomic.spinLoopHint();
+        // The test thread's mutation is already visible at this point — read
+        // what the request *still* claims to carry.
+        const n = @min(req.entries.len, cmds.len);
+        for (0..n) |i| {
+            const cmd = req.entries[i].command;
+            if (cmd.len > cmds[i].len) continue;
+            @memcpy(cmds[i][0..cmd.len], cmd);
+            cmd_lens[i] = cmd.len;
+        }
+        cmd_count = n;
+        return response;
+    }
+};
+
+// Obligation 1 of the three-phase flush: the request on the wire is a **staged
+// copy**, so a truncation that frees the log's command buffers mid-send cannot
+// reach the bytes the peer receives.
+//
+// Verified red: making `stageLeaderRoundLocked` borrow (`command = entry.command`
+// instead of the arena dupe) fails this on the "cmd-one"/"cmd-two" assertions —
+// the testing allocator poisons the freed buffers, so the parked send reads
+// garbage where the commands were. And a build with the IO back under the lock
+// never gets that far: the truncating `handleAppendEntries` would block on
+// `lock` while the send waits for `release` — a deadlock, which is why the test
+// asserts `!lock.isHeld()` (and unwinds the parked thread) before mutating.
+test "RaftElection: a round in flight reads staged bytes while the log is truncated under it" {
+    const allocator = testing.allocator;
+    BlockingAppend.reset(.{ .term = 1, .success = true, .match_index = 2 });
+
+    var impl = TestTransportVTable{
+        .sendVoteRequest = noopVoteRequest,
+        .sendAppendEntries = BlockingAppend.accept,
+        .sendInstallSnapshot = noopInstallSnapshot,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
+
+    var peers = [_]Peer{.{ .id = "n2", .address = "" }};
+    var raft = try RaftElection.init(allocator, "n1", &peers, .{}, &transport);
+    defer raft.deinit();
+    raft.state = .leader;
+    raft.current_term = 1;
+    _ = try raft.appendEntry("cmd-one");
+    _ = try raft.appendEntry("cmd-two");
+
+    // A lagging follower: the round carries both entries, and the send parks
+    // with the lock released.
+    try raft.next_index.put(raft.peers.items[0].id, 1);
+    raft.last_heartbeat_ms = 0; // heartbeat due on the first tick
+
+    const t = try std.Thread.spawn(.{}, driveOneTick, .{&raft});
+    BlockingAppend.waitEntered();
+
+    // The send is parked. If the IO ran under the lock (the old shape), the
+    // mutation below would deadlock against it — fail on the state instead.
+    if (raft.lock.isHeld()) {
+        BlockingAppend.release.store(true, .release);
+        t.join();
+        return error.TestUnexpectedResult; // outbound IO ran under the lock again
+    }
+
+    // A higher-term AppendEntries from the (configured) peer walks in and
+    // truncates the log — freeing the very command bytes the in-flight request
+    // used to borrow.
+    const conflict = [_]LogEntry{
+        .{ .term = 2, .index = 1, .command = "replaced-1" },
+        .{ .term = 2, .index = 2, .command = "replaced-2" },
+    };
+    const resp = try raft.handleAppendEntries(.{
+        .term = 2,
+        .leader_id = "n2",
+        .prev_log_index = 0,
+        .prev_log_term = 0,
+        .entries = &conflict,
+        .leader_commit = 0,
+    });
+    try testing.expect(resp.success);
+
+    // Reclaim the freed slots, so a borrowing implementation reads filler, not
+    // stale luck (the testing allocator also poisons freed bytes).
+    var fillers = std.ArrayList([]u8).empty;
+    defer {
+        for (fillers.items) |f| allocator.free(f);
+        fillers.deinit(allocator);
+    }
+    for (0..32) |_| {
+        const f = try allocator.dupe(u8, "filler!!");
+        try fillers.append(allocator, f);
+    }
+
+    BlockingAppend.release.store(true, .release);
+    t.join();
+
+    // The staged copies, not the freed originals, are what went out.
+    try testing.expectEqual(@as(usize, 2), BlockingAppend.cmd_count);
+    try testing.expectEqualStrings("cmd-one", BlockingAppend.cmds[0][0..BlockingAppend.cmd_lens[0]]);
+    try testing.expectEqualStrings("cmd-two", BlockingAppend.cmds[1][0..BlockingAppend.cmd_lens[1]]);
+
+    // …and the term-2 world the tick's phase 3 met is intact: the stale round's
+    // success was dropped, not written into the maps.
+    try testing.expectEqual(@as(u64, 2), raft.getTerm());
+    try testing.expectEqual(RaftState.follower, raft.getState());
+    try testing.expectEqualStrings("replaced-1", raft.getLogEntry(1).?.command);
+    try testing.expectEqual(@as(u64, 1), raft.next_index.get(raft.peers.items[0].id).?);
+}
+
+// Obligation 2: a reply that lands after the world moved on is dropped, not
+// applied. While the send is parked, a higher-term vote request turns the node
+// back into a follower; the parked round's success (term 1) then arrives in
+// phase 3 to a node that is no longer the term-1 leader.
+//
+// Verified red: removing the `state != .leader or current_term != round_term`
+// guard from `applyStagedRoundLocked` fails this on the `next_index` assertion
+// (`expected 1, found 4`) — the stale success rewrote the maps of a raft that
+// had already moved on.
+test "RaftElection: a reply that lands after the term moved is dropped, not applied" {
+    const allocator = testing.allocator;
+    BlockingAppend.reset(.{ .term = 1, .success = true, .match_index = 3 });
+
+    var impl = TestTransportVTable{
+        .sendVoteRequest = noopVoteRequest,
+        .sendAppendEntries = BlockingAppend.accept,
+        .sendInstallSnapshot = noopInstallSnapshot,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
+
+    var peers = [_]Peer{.{ .id = "n2", .address = "" }};
+    var raft = try RaftElection.init(allocator, "n1", &peers, .{}, &transport);
+    defer raft.deinit();
+    raft.state = .leader;
+    raft.current_term = 1;
+    _ = try raft.appendEntry("e1");
+    _ = try raft.appendEntry("e2");
+    _ = try raft.appendEntry("e3");
+
+    const peer_key = raft.peers.items[0].id;
+    try raft.next_index.put(peer_key, 1); // lagging: the round carries 1..3
+    try raft.match_index.put(peer_key, 0);
+    raft.last_heartbeat_ms = 0;
+
+    const t = try std.Thread.spawn(.{}, driveOneTick, .{&raft});
+    BlockingAppend.waitEntered();
+    if (raft.lock.isHeld()) {
+        BlockingAppend.release.store(true, .release);
+        t.join();
+        return error.TestUnexpectedResult; // outbound IO ran under the lock again
+    }
+
+    // The world moves on while the send is parked: a higher-term candidate (a
+    // configured member) takes the node back to follower.
+    const vr = try raft.handleVoteRequest(.{
+        .term = 5,
+        .candidate_id = "n2",
+        .last_log_index = 3,
+        .last_log_term = 1,
+    });
+    try testing.expect(vr.vote_granted);
+    try testing.expectEqual(@as(u64, 5), raft.getTerm());
+
+    BlockingAppend.release.store(true, .release);
+    t.join();
+
+    // The parked round's answer (success, match_index = 3, term 1) must have
+    // been dropped wholesale: the maps keep what they had before the round.
+    try testing.expectEqual(@as(u64, 1), raft.next_index.get(peer_key).?);
+    try testing.expectEqual(@as(u64, 0), raft.match_index.get(peer_key).?);
+    try testing.expectEqual(RaftState.follower, raft.getState());
+    try testing.expectEqual(@as(u64, 5), raft.getTerm());
+    try testing.expectEqual(@as(u64, 0), raft.getCommitIndex());
+}
+
+/// Counts every frame handed to the transport — the assertion surface for
+/// "a tick that staged nothing sent nothing".
+const WireCount = struct {
+    var votes: usize = 0;
+    var appends: usize = 0;
+    var snapshots: usize = 0;
+
+    fn reset() void {
+        votes = 0;
+        appends = 0;
+        snapshots = 0;
+    }
+
+    fn vote(_: ?[]const u8, _: []const u8, _: VoteRequest) void {
+        votes += 1;
+    }
+
+    fn append(_: ?[]const u8, _: []const u8, req: AppendEntriesRequest) AppendEntriesResponse {
+        appends += 1;
+        return .{ .term = req.term, .success = true, .match_index = req.prev_log_index };
+    }
+
+    fn snapshot(_: ?[]const u8, _: []const u8, _: InstallSnapshotRequest) InstallSnapshotResponse {
+        snapshots += 1;
+        return .{ .term = 0 };
+    }
+};
+
+// Phase 2 runs on every flush, so phase 1 owes it clean staging buffers: a
+// tick that staged nothing must deliver nothing. Without the phase-1 reset,
+// the *previous* round's staged items are re-sent under `round_term = 0` — on
+// every between-heartbeats leader tick, and on every follower tick after a
+// demotion — one spurious term-0 AppendEntries per tick forever.
+//
+// Verified red: removing the `staged_items.clearRetainingCapacity()` from
+// `flushOutgoing`'s phase 1 fails both assertions below (the counter moves to
+// 2 on the first quiet tick, and again after the demotion).
+test "RaftElection: a tick that stages no round sends nothing on the wire" {
+    const allocator = testing.allocator;
+    WireCount.reset();
+
+    var impl = TestTransportVTable{
+        .sendVoteRequest = WireCount.vote,
+        .sendAppendEntries = WireCount.append,
+        .sendInstallSnapshot = WireCount.snapshot,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
+
+    var peers = [_]Peer{.{ .id = "n2", .address = "" }};
+    var raft = try RaftElection.init(allocator, "n1", &peers, .{}, &transport);
+    defer raft.deinit();
+    raft.state = .leader;
+    raft.current_term = 1;
+    _ = try raft.appendEntry("cmd");
+    raft.last_heartbeat_ms = 0; // heartbeat due on the first tick
+
+    try raft.tick();
+    try testing.expectEqual(@as(usize, 1), WireCount.appends); // the round went out
+
+    // The heartbeat is no longer due, so this tick stages nothing — and must
+    // send nothing (it used to re-deliver the just-applied round at term 0).
+    try raft.tick();
+    try testing.expectEqual(@as(usize, 1), WireCount.appends);
+
+    // Demoted by a higher-term heartbeat from the configured peer: the stale
+    // round must not leak onto the wire from follower ticks either.
+    const demote = try raft.handleAppendEntries(.{
+        .term = 2,
+        .leader_id = "n2",
+        .prev_log_index = 0,
+        .prev_log_term = 0,
+        .entries = &.{},
+        .leader_commit = 0,
+    });
+    try testing.expect(demote.success);
+    try testing.expectEqual(RaftState.follower, raft.getState());
+
+    try raft.tick(); // election not due — handleAppendEntries reset the deadline
+    try testing.expectEqual(@as(usize, 1), WireCount.appends);
+    try testing.expectEqual(@as(usize, 0), WireCount.votes);
+    try testing.expectEqual(@as(usize, 0), WireCount.snapshots);
 }
