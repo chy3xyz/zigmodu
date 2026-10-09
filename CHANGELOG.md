@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.39.9] - 2026-10-09
 
 ### 第 151 批：Raft 出站 IO 移出锁（锁范围债落地）+ Windows 出站有界化 + CI 跨宿主 bench 证据 + CSPRNG 矩阵 + Envoy 拓扑（**破坏性：否**）
 
