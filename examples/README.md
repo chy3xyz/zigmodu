@@ -140,6 +140,7 @@ step is stated per row — that is the command CI runs for it.
 | [`mcp-server`](mcp-server/) | AI skills exposed over MCP stdio | `zig build run` |
 | [`metaverse-creative`](metaverse-creative/) | Creative domain demo (zent + DID) | `zig build run` |
 | [`production-deploy`](production-deploy/) | Deploy topology reference: nginx/Envoy TLS sidecar, k8s, systemd — no app | `docker compose up --build` |
+| [`quant-replay`](quant-replay/) | Deterministic Runtime Phase D: one recorded trading day replayed byte-identically (six assertions) | `zig build run` |
 | [`runtime-workers`](runtime-workers/) | Runtime workers: mailbox, backpressure, supervisor, HotBus | `zig build run` |
 | [`shopdemo`](shopdemo/) | Generated `order` module + full 152-table e-commerce schema on sqlx | `zig build run` · `zig build test` |
 | [`tenant-mgmt`](tenant-mgmt/) | Flagship: multi-tenant SaaS on `http.productionProfile` (CI integration demo) | `zig build run` · `zig build test` |
