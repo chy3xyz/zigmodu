@@ -310,6 +310,47 @@ wake-up, so an exhausted pool … budget that had never elapsed"*）。同一个
 含两条断言的核实结论；投票制的门槛改为"有**合并记录**的外部贡献者 ≥ 5"）·
 `EVALUATION_2026-10.md` §3.2 档位与 S4 状态 · `v1.0-roadmap-1.0.md` 接触面清单与停止线分数。
 
+### 第 161 批：第一个外部 PR 的评审意见（PR #3 修复正确 / 测试无效）（**破坏性：否；纯文档**）
+
+对 `@knot3bot` 的 PR #3 做完整评审，结论落成 [`PR3_REVIEW.md`](PR3_REVIEW.md)。
+**本批未合并任何 PR，未改动任何代码。**
+
+**修复本身正确，建议合并**：`acquire` 从切片计数改成真实 deadline，与
+`src/pool/Pool.zig` 的既有修复同构（那边 `Pool.acquire` 早就修过同一种假账，
+`Pool.zig:152` 留着病历 *"assumed* 10 ms per wake-up, so an exhausted pool …
+budget that had never elapsed"*）。缺陷真实：spurious wakeup 使切片提前返回，
+预算被高估而提前放弃。CI 全绿（10 成功 / 0 失败，含 postgres + mysql +
+Redis/NATS/Kafka 三平台腿）。
+
+**但它新增的测试抓不住它声称要抓的 bug** —— 变异验证：把修复改回原样
+（恢复 `waited_ms += 50`）后跑全量，**2320/2383 passed，零失败**。
+
+**根因是数学必然，不是调参不当**。循环条件在**切片开头**求值，故：
+
+- 修复前实耗 = `ceil(max_wait_ms/50) × 50`
+- 修复后实耗 = `[max_wait_ms, max_wait_ms + 50)`
+
+**两个区间对任何 `max_wait_ms` 都重叠**—— 切片真睡满时每轮都是 +50，
+两条路径同步推进，任何时序断言都同时满足两边。PR 选的 `120` 恰是最坏取值
+（50 的整数倍，两边都落在 100–150ms，断言 `>= 100` 通过）。
+实测校准：`max_wait_ms=130` 时修复版实际耗时 **156ms**。
+
+另两条路也已实测排除：
+
+1. **多 waiter 制造提前唤醒不可行** —— `release()` 只signal 队首
+   （`orderedRemove(0)`，`:4718`），其余 waiter 各等自己的 cond，不会被唤醒；
+   池级 `self.cond.signal`（`:4746`）**全仓无任何 `wait`**（`signal`/`broadcast`
+   各 1 处，`wait` 0 处），纯冗余。唯一真源是 spurious wakeup，不可复现。
+2. **多线程调`acquire` 实测 `signal ABRT`** —— `std.testing.io` 语义下不安全，
+   需注入 IO 或改签名，超出本 PR 范围。
+
+**处置建议（方案 A）**：合并修复，**删掉那个无效测试**，在修复处留一段
+「为什么写不出来」的注释——含区间重叠的推导、以及"要可测需把切片预算改成可注入
+（`src/runtime/scheduler.zig` 的确定性 `Clock` 是现成路线）"。
+**留一个抓不住的测试比没有测试更危险**，它给的是虚假安全感。
+
+本批同时确认PR #4（`ci-integration-on-pr`）三处改动全部核实无误，建议合并。
+
 ## [0.39.10] - 2026-10-10
 
 ### 第 153 批：集群安全四审计项（A-1/A-3/A-4/B-11）残留收尾（**破坏性：否；一处行为变化**）
