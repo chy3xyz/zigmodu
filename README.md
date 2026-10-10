@@ -197,6 +197,29 @@ rather than half-built; the list is in [RUNTIME.md](docs/RUNTIME.md) §12.7.
 
 ## 🚧 What it is not (price these in before adopting)
 
+### Maturity status — read this first
+
+**This is `pre-1.0` (feature-frozen stage).** The engineering is mature; the **trust** structure is not.
+
+| | |
+|---|---|
+| Version | `0.39.x` — **all 99 releases so far are 0.x.** No LTS, no backport commitment |
+| Feature surface | **Frozen** until 1.0 — defects, evidence, docs only ([AGENTS.md §发布节奏](AGENTS.md)) |
+| Breaking changes | **None accepted** before 1.0 (historically 6 / 99 releases) |
+| Audit | **None.** Every "done" here came from the same maintainers and their AI agents (see "Self-assessed" below) |
+| Contributors | Single owner; **0 outside PRs** — see [GOVERNANCE.md](GOVERNANCE.md) for the honest current numbers |
+| Real-world use | **Yes** — e.g. [zasdoor](https://github.com/chy3xyz/zasdoor) (an IAM system, 79 backend tests) runs on it |
+
+**What this means for you**: use it if your team can carry its own risk and read the
+boundaries below. **Do not** put it under an SLA you cannot afford to break, and do not
+assume a response time — [`GOVERNANCE.md`](GOVERNANCE.md) commits to none.
+
+Two paths in, both legitimate:
+
+- **Adopting it** — read the boundaries below and [SECURITY.md](SECURITY.md) first.
+- **Helping** — the highest-value contribution needs no context on 185k lines:
+  [report a doc number that no longer matches the code](.github/ISSUE_TEMPLATE/docs_drift.yml).
+
 A feature list is the least useful half of a README. These boundaries decide deployment shape:
 
 - **Cluster upgrades are a hard cut.** The Raft frame format and the bus handshake changed, and an old

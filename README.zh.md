@@ -80,6 +80,29 @@ comptime 轨道类型、手写队列、热路径上的分配是被**测试钉住
 
 ## 🚧 它不是什么（采用前先定价）
 
+### 成熟度状态 —— 请先读这一段
+
+**当前处于 `pre-1.0`（功能面冻结期）。** 工程侧成熟，但**信任结构**还不成熟。
+
+| | |
+|---|---|
+| 版本 | `0.39.x` —— **至今 99 个发布全在 0.x**，无 LTS、无 backport 承诺 |
+| 功能面 | 1.0 前**冻结**：只做修缺陷、补证据、改文档（见 [AGENTS.md「发布节奏」](AGENTS.md)） |
+| 破坏性变更 | 1.0 前**不再接受**（历史 99 版里破坏性仅 6 次） |
+| 独立审计 | **无**。每一个"已完成"都出自同一批维护者与其 AI agent（见下方「自评」） |
+| 贡献者 | 单一所有者，**外部 PR 为 0** —— 真实数字见 [GOVERNANCE.md](GOVERNANCE.md) |
+| 真实使用 | **有** —— e.g. [zasdoor](https://github.com/chy3xyz/zasdoor)（IAM 系统，79 个后端测试）跑在它上面 |
+
+**这对你意味着什么**：如果你的团队能自己承担风险、并且愿意读下面的边界，**可以用**。
+但**不要**把它放进你承受不起的 SLA 里，也**不要**指望响应时间 ——
+[`GOVERNANCE.md`](GOVERNANCE.md) 明确不承诺任何响应时限。
+
+两条路都正当：
+
+- **采用它** —— 先读下面的边界与 [SECURITY.md](SECURITY.md)。
+- **帮它** —— 价值最高的贡献**不需要**理解 18 万行代码：
+  [报告一个与实现不符的文档数字](.github/ISSUE_TEMPLATE/docs_drift.yml)。
+
 - **集群升级是硬切**：Raft 帧格式与总线握手都变过，新旧二进制**两个方向都听不懂**（刻意如此，不留"降级到不认证"的路）。混合版本互联仍不支持，但拒绝行为已门禁化：`scripts/ci-mixed-version.sh`（夜间 CI）拿 v0.32.0 节点对跑当前树，断言新侧拒掉旧节点的裸帧且保住可用 quorum。
 - **线上不加密**：集群帧是明文 + 逐帧 HMAC-SHA256（认证/完整性，**不是机密性**）；集群端口只放受信二层（VPC/专线/localhost），跨域走边车/网格终结 mTLS —— 定界见 [docs/DISTRIBUTED.md](docs/DISTRIBUTED.md)「传输加密边界（A-2 定界）」，拓扑参考 [examples/production-deploy](examples/production-deploy/)；PSK 认证 helpers 在 `src/core/cluster/ClusterAuth.zig`。
 - **集群身份是可选配置，不是默认**：配上 `own_key`/`peer_keys` 后，只有持有节点 X 的 key 才能以 X 的身份出现 —— 总线靠挑战-应答握手绑定，Raft 端口靠每帧自述 id 落在 MAC 覆盖内 —— 且两面都支持运行时轮换（双 key 窗口）与撤销。只配 `cluster_secret` 则逐字节保持旧行为：帧有认证，但任何持 PSK 者都能自称任何节点。

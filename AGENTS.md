@@ -451,7 +451,7 @@ filter 是**测试全限定名的子串**（形如 `core.cluster.RaftElection.te
   `zig build test -Dnet-tests=false`（沙箱里跳过全部 socket 用例）·
   `bash scripts/test-fast.sh [--filter …]`（聚焦单测/强制重跑；见 §Testing）
 - 质量现状：以 `CHANGELOG.md` 与 `docs/dev/v1.0-readiness-v0.35.md` 为准（`docs/EVALUATION_REPORT.md` 是 2026-09 加固批次之前的旧快照，勿引其分数）
-- Roadmap: `docs/PRODUCTION_ROADMAP.md`（phases 1–9 ✅）
+- Roadmap: `docs/PRODUCTION_ROADMAP.md`（阶段 1–8 ✅；**阶段 9「高阶演进」是滚动项，非一次性完成**——其子项 1–4 已落地，子项 5「协议传输层高阶演进（gRPC Streaming / HTTP/2 深化）」仍在演进中，标题里的「（演进中）」是实时的，不是客套话）
 
 ### Release 流程（强制）
 - 发布一律走 `bash scripts/release.sh <x.y.z> [--push]`：自动 bump 全部版本引用
@@ -465,6 +465,27 @@ filter 是**测试全限定名的子串**（形如 `core.cluster.RaftElection.te
   job 会在任何 `v*` tag push 时复核（tag == `build.zig.zon` version，且
   CHANGELOG 有条目）。两者任一失败 = 发布无效。
 - 业务项目发布前置门禁：`zmodu ci`（build + fmt + verify + audit + deadcode + **doctor**，共 **6 步**）。
+
+### 发布节奏（第 158 批起强制）
+
+> **为什么**：2026-08 发 33 版、2026-09 发 48 版、2026-10 前 10 天发 10 版，99 个发布**全在 0.x**。
+> 这个节奏本身在否决 1.0——没人会把一天发两次的 0.x 当生产依赖；而且从 v0.32 升到 v0.39
+> 要跨 60+ 个版本，**等于把破坏性摊平成"随时会坏"**。
+
+- **每周至多一版**（周一发）。日常改动攒批次，不为单个 patch 单独发版本。
+  紧急修复（安全 / 数据损坏 / 阻塞性缺陷）可例外，但要在 CHANGELOG 里写明为何紧急。
+- **功能面冻结**：进入 1.0-alpha 候选期后**只做三件事**——修缺陷、补证据、改文档。
+  新增 `pub` 导出、扩 API 面、扩模块，**一律推到 1.1**。
+  已冻结的面：`src/` 现有公开 API 签名 + 18 个 `examples` 的用法。
+- **破坏性变更清零**：1.0 前不接受新的破坏性变更。确需破坏的，
+  先在 CHANGELOG 写"下一个大版本移除"并提供弃用期，**不即删**。
+  历史 99 版里破坏性仅 6次，这条记录要守住。
+- **例外机制**：为了赶节奏而破坏上述三条，等于用节奏换信任——
+  **节奏本来就是为信任服务的**。真需要加速时，改的是节奏约定本身，
+  并在 CHANGELOG 说明理由。
+
+**判定"连续 4 周节奏稳定"**（1.0-alpha 停止线之一）：连续 4 个自然周内，
+每周**至多 1 个发布**，且期间无新增功能面。达成后才进入 `scripts/release.sh` 流程发版。
 
 ## Learned User Preferences
 
