@@ -1,5 +1,39 @@
 # Changelog
 
+## [Unreleased]
+
+### 第 153 批：集群安全四审计项（A-1/A-3/A-4/B-11）残留收尾（**破坏性：否；一处行为变化**）
+
+来源：v1.0 剩余清单复核——四条主体已在前序批次落地（A-1 批 109、A-3 批 110、A-4 批 107、
+B-11 批 105+106+126），本批逐条核实后关掉各自记录的"仍开"残留。
+
+1. **A-1 残留（配置面半认证洞）**：`BootstrapConfig.own_key`/`peer_keys` 此前只转发给 Raft
+   端口——只配 per-node key（门禁认可的更强方案）的应用，事件总线端口实际跑**裸帧**，
+   与 `ClusterAuthRequired` 门禁的判定依据不一致。现在无 `cluster_secret` 时同一份 key
+   材料一并转发总线（`bus.setOwnKey` + 逐条 `bus.setPeerKey`）；配了 `cluster_secret` 时
+   总线保持用它，**既有部署零变化**。批 109 钉死"刻意不转发"的旧测试改写为钉新语义。
+   **行为变化**（per-node 配置滚动升级窗口内新旧节点的总线 mesh 短暂断开；零中断升法见
+   `docs/UPGRADING.md` 本周期节）。
+2. **A-4 残留（follower 日志无界增长）**：`maybeCompactLog` 从 `tick()` 的 leader 分支内
+   移到**全角色**执行——follower 的 `commit_index` 由 leader 的 `leader_commit` 推进，
+   压缩边界同样永不越过它；`snapshot_threshold_entries` 默认 0=关不变。回归测试
+   `RaftElection follower tick compacts the committed prefix …`（种子 5 条 → follower tick
+   压缩到边界 → 边界后复制在绝对坐标上继续）。批 107 注记里"出站 IO 在 RaftLock 内的
+   既有债"已由批 151 关闭，readiness 注记同步。
+3. **B-11 残留（滚动升级形状不进 CI）**：`MIXED_EXPECT=interop`（v0.38.0 × master）从
+   "脚本支持、CI 未接"补成夜间 CI 常态步骤（artifact `mixed-version-interop.log`）。
+   两种模式至此都在夜间跑：refuse 证"旧帧被拒"、interop 证"同 wire 版本互通"。
+   本地复跑真跑通过：一个 mesh、一个 leader、一份日志、零拒绝。
+4. **A-3 残留（机制齐、缺操作层）**：`docs/DISTRIBUTED.md`「密钥轮换与撤销」补**运维
+   runbook**——三阶段轮换的逐节点调用顺序 + 验证点 + 回退路径、key 泄露撤销清单
+   （含"不要只删配置不撤销"）、进程重启的 key 表不持久化注意事项。三条明示"不做"
+   （kid / 自动下发 / 持久化）维持原判。
+
+验证：fmt 净 · focused RaftElection **49/49**（+1 新回归）· ClusterBootstrap 14/14 ·
+**全量 `zig build test` EXIT=0** · check-deadcode / check-production / check-api /
+check-version / check-tenant-scope 全过 · soak-cluster 小预算（400×2×3）绿 ·
+ci-mixed-version interop（v0.38.0 × master）本地真跑 EXIT=0。
+
 ## [0.39.9] - 2026-10-09
 
 ### 第 151 批：Raft 出站 IO 移出锁（锁范围债落地）+ Windows 出站有界化 + CI 跨宿主 bench 证据 + CSPRNG 矩阵 + Envoy 拓扑（**破坏性：否**）

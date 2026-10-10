@@ -105,9 +105,11 @@ var cluster = try ClusterBootstrap.init(allocator, io, .{
   裸帧）；对端没配 key → dial **之前**就丢（`TransportImpl.outboundKeys`），Raft 按丢消息重发。
 - **重放**：Raft 不需要总线那样的 seq —— term/index 单调 + AppendEntries/InstallSnapshot 幂等已拒旧
   （`docs/dev/cluster-auth-design.md` §3.6）；总线要 seq 是因为它没有 term 的等价物。
-- **作用域**：这套 key 只管 **Raft 端口**。总线是另一个监听面、另一套握手机制，仍需自己的
-  `setOwnKey` / `setPeerKey`（`ClusterBootstrap` 只把 `cluster_secret` 传给总线，per-node key 不进
-  总线）。
+- **作用域**：这套 key 管 **Raft 端口**；总线是另一个监听面、另一套握手机制（`setOwnKey` /
+  `setPeerKey` 挑战-应答）。**第 153 批起 `ClusterBootstrap` 在无 `cluster_secret` 时把
+  `own_key`/`peer_keys` 一并转发给总线** —— 否则只配 per-node key 的应用会出现"Raft 端口有认证、
+  事件端口跑裸帧"的半认证集群，而门禁却已放行。配了 `cluster_secret` 时总线保持用它（既有部署
+  零变化）；需要两面不同凭证的，init 后用 `getEventBus().?.setOwnKey`/`setPeerKey` 自行覆盖。
 
 ## 密钥轮换与撤销（A-3，两面同 API）
 
@@ -142,6 +144,21 @@ per-node key 的运行时运维钩子。**源真相仍是 SecretsManager**（框
 
 **fail-closed 不变**：无 key 对端仍 dial 前丢（`error.PeerKeyMissing`）；无 `own_key` 仍拒发拒答；
 删掉最后一把 peer key **不会**把端口降回裸帧（`credentials_configured` 是粘性的）。
+
+**运维 runbook**（把上面的机制落成操作清单）：
+
+- **轮换某节点 B 的 key（K1→K2，无分区）**：① 先从 SecretsManager 取出 K2，在**其余每个节点**上
+  `bootstrap.rotatePeerKey("B", K2)`（开窗：B 的旧签仍收、新签已认）；② 在 B 上
+  `bootstrap.rotateOwnKey(K2)`（B 改签）；③ 确认集群收敛后，各节点 `dropPreviousPeerKey("B")`
+  或 `setPeerKey("B", K2)` 关窗。**验证点**：每阶段后日志无新增验签拒绝；②之前 B 的新签帧
+  应已被各节点按 current 收。**回退**：②出错就把 B 改回 `rotateOwnKey(K1)`，各节点
+  `rotatePeerKey("B", K1)` 后关窗。
+- **节点 key 泄露（撤销）**：其余节点 `bootstrap.revokePeerKey("B")`（总线删表+断连，Raft 帧/RPC
+  fail-closed），再把 B 从 `peers` 配置里去掉重启。**不要**只删配置不撤销——运行中的 key 表
+  以运行时调用为准。
+- **进程重启**：key 表**不持久化**——重启后以来源配置（SecretsManager/启动配置）为准。轮换进行到
+  一半重启 = 回到重启前配置的那把 key；把「关窗」放在所有节点都确认收敛之后做，重启才不会
+  带回一把对端已删的旧 key。
 
 **同步纪律**（为什么要一把新锁）：Raft 入站读侧（`RaftTransport.handleConnection`，accept 线程）
 在 dispatch 之前验签，**有意不持 `RaftLock`**；出站由 `tick()` 在 `RaftLock` 内查 key。所以轮换/撤销
@@ -531,9 +548,11 @@ prev 在边界**外**→ 活条目比对，冲突照常截断（截不到快照�
 - **手动**：`raft.compactLog(up_to_index, snapshot_bytes)`。边界**必须已提交**：
   `up_to_index > commit_index` 返 `error.NotCommitted`——把未提交条目折进快照会让少数派的未提交
   状态变得可存活，正是 §7 禁止的。`up_to_index <= last_included_index` 是 no-op。
-- **自动**：`ElectionConfig.snapshot_threshold_entries`（**默认 0 = 关**，存量集群行为不变）。leader 的
-  每次 `tick()` 在心跳之后检查 `log.items.len > threshold`，触发时压缩到 `commit_index` 为止
-  （`maybeCompactLog`；hook/OOM 错误只记 `std.log.err`，不打断心跳循环）。`BootstrapConfig` 同名透传
+- **自动**：`ElectionConfig.snapshot_threshold_entries`（**默认 0 = 关**，存量集群行为不变）。每次
+  `tick()` 检查 `log.items.len > threshold`，触发时压缩到 `commit_index` 为止（`maybeCompactLog`；
+  hook/OOM 错误只记 `std.log.err`，不打断心跳/选举循环）。**第 153 批起全角色生效**——此前只在
+  leader 分支触发，follower 的 log 会随复制无界增长；follower 的 `commit_index` 由 leader 的
+  `leader_commit` 推进，压缩边界同样永不越过它。`BootstrapConfig` 同名透传
   （`snapshot_threshold_entries` / `snapshotter` / `snapshotter_ctx` / `snapshot_chunk_bytes`）。
 - **快照字节从哪来**：`ElectionConfig.snapshotter`
   （`Snapshotter = *const fn (ctx: ?*anyopaque, up_to_index: u64, allocator) anyerror![]u8`；在**锁内**

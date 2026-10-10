@@ -959,6 +959,17 @@ jobs:
           mkdir -p "$RUNNER_TEMP/nightly-logs"
           bash scripts/ci-mixed-version.sh 2>&1 | tee "$RUNNER_TEMP/nightly-logs/mixed-version.log"
 
+      - name: Mixed-version cluster gate — interop (v0.38.0 node vs master nodes)
+        # B-11 follow-up: the rolling-upgrade mirror of the refuse gate above.
+        # A-1 (v0.39.0) and A-3 (rotation window) changed no wire bytes, so a
+        # v0.38.0 node under the same cluster_secret + bus key must JOIN the
+        # mesh: one leader across versions, replication into the old node,
+        # zero refusal lines. This is the shape a production rolling upgrade
+        # actually takes; refuse-only coverage would leave it unproven.
+        run: |
+          mkdir -p "$RUNNER_TEMP/nightly-logs"
+          MIXED_OLD_REF=v0.38.0 MIXED_EXPECT=interop bash scripts/ci-mixed-version.sh 2>&1 | tee "$RUNNER_TEMP/nightly-logs/mixed-version-interop.log"
+
       - name: Fuzz (bounded)
         # `--fuzz` with no limit opens the webui and never exits, so the bound is
         # mandatory. It is also incompatible with `-Dtest-filter` (the filter

@@ -99,7 +99,9 @@ pub const BootstrapConfig = struct {
     cluster_secret: ?[32]u8 = null,
     /// A-1 per-node identity: this node's own signing key (frames it sends are
     /// keyed with it; peers verify them against the `peer_keys` entry for this
-    /// node's id). Forwarded to `ElectionConfig.own_key`. Every node of a
+    /// node's id). Forwarded to `ElectionConfig.own_key` — and, when no
+    /// `cluster_secret` is set, also to the event bus (`setOwnKey`), so the
+    /// stronger scheme does not leave the event port bare. Every node of a
     /// per-node cluster sets its own; a node without one refuses to serve or
     /// send rather than drift onto the unauthenticated wire.
     own_key: ?[32]u8 = null,
@@ -107,14 +109,15 @@ pub const BootstrapConfig = struct {
     /// id (the same string `peers` declares), `key` that node's own key. This is
     /// a symmetric pre-shared-key scheme, so the "peer key" for node B is the
     /// same secret B sets as its `own_key`. Forwarded to
-    /// `ElectionConfig.peer_keys` (which deep-copies). Setting either this or
-    /// `own_key` switches the port to per-node mode and satisfies the
-    /// `ClusterAuthRequired` gate in `start()`.
+    /// `ElectionConfig.peer_keys` (which deep-copies) — and, when no
+    /// `cluster_secret` is set, also to the event bus (`setPeerKey` per entry).
+    /// Setting either this or `own_key` switches the port to per-node mode and
+    /// satisfies the `ClusterAuthRequired` gate in `start()`.
     peer_keys: []const PeerKey = &.{},
     /// Loud acknowledgement that a multi-node cluster runs **unauthenticated**.
     /// Same idiom as `allow_stub_raft_transport`: refuse unless set.
     allow_unauthenticated_cluster: bool = false,
-    /// §7 log compaction, leader-side automatic trigger — forwarded to
+    /// §7 log compaction, automatic trigger on every role — forwarded to
     /// `ElectionConfig.snapshot_threshold_entries`. `0` (the default) keeps the
     /// pre-feature behaviour: the log grows until the app calls
     /// `getRaft().?.compactLog(...)` itself.
@@ -205,6 +208,18 @@ pub const ClusterBootstrap = struct {
         // **one** secret source here (`config.cluster_secret`, the one the gate
         // above judged), never a second one.
         if (self.config.cluster_secret) |key| bus.setClusterSecret(key);
+        // The same argument covers the A-1 per-node scheme: when the gate was
+        // satisfied by `own_key`/`peer_keys` alone (no `cluster_secret`),
+        // forwarding nothing here would leave the bus on the bare-frame path
+        // while the raft port authenticates — the stronger scheme downgrading
+        // the other surface. Forward the same material to the bus in exactly
+        // that case. When `cluster_secret` IS set the bus keeps it untouched
+        // (existing deployments change zero behaviour); per-face overrides stay
+        // possible with `getEventBus().?.setOwnKey` / `setPeerKey` after init.
+        if (self.config.cluster_secret == null) {
+            if (self.config.own_key) |key| bus.setOwnKey(key);
+            for (self.config.peer_keys) |pk| try bus.setPeerKey(pk.id, pk.key);
+        }
 
         // 3. Create cluster membership (gossip + health)
         const addr = try std.Io.net.IpAddress.parseIp4("0.0.0.0", self.config.port);
@@ -810,9 +825,17 @@ test "ClusterBootstrap starts a multi-node cluster on per-node keys without a cl
     // The raft deep-copies (the caller's slice may die with the config it came
     // from), so the stored id must not alias the test's literal-backed entry.
     try std.testing.expect(raft_cfg.peer_keys[0].id.ptr != peer_keys[0].id.ptr);
-    // The bus is a separate surface: raft's per-node keys deliberately do not
-    // reach it (it has its own `setOwnKey`/`setPeerKey` handshake scheme).
-    try std.testing.expect(keyed.getEventBus().?.cluster_secret == null);
+    // The bus is a separate surface, but with no `cluster_secret` configured
+    // the same per-node material is now forwarded to it — otherwise the event
+    // port would run the bare-frame path next to an authenticated raft port.
+    // (With a `cluster_secret` set, the bus keeps that instead: existing
+    // deployments change zero behaviour.)
+    const bus = keyed.getEventBus().?;
+    try std.testing.expect(bus.cluster_secret == null);
+    try std.testing.expectEqual(own, bus.own_key.?);
+    try std.testing.expectEqual(@as(usize, 1), bus.peer_keys.count());
+    try std.testing.expect(bus.peer_keys.get("peer-node") != null);
+    try std.testing.expectEqual(peer, bus.peer_keys.get("peer-node").?.current);
 }
 
 test "ClusterBootstrap refuses a multi-node cluster whose peers carry no id" {

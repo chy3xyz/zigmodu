@@ -293,12 +293,14 @@ pub const ElectionConfig = struct {
     /// `PeerKey.previous` is the rotation window those calls manage.
     peer_keys: []const PeerKey = &.{},
 
-    /// §7 log compaction, leader-side automatic trigger: once the **live** log
-    /// (`log.items.len`, i.e. entries past the snapshot boundary) exceeds this
-    /// many entries, the leader's `tick()` compacts the committed prefix into a
-    /// snapshot. `0` disables it — the default, so an existing cluster's
-    /// behaviour does not change. Compaction never crosses `commit_index`: an
-    /// uncommitted entry is never folded into a snapshot.
+    /// §7 log compaction, automatic trigger on **every** role: once the **live**
+    /// log (`log.items.len`, i.e. entries past the snapshot boundary) exceeds
+    /// this many entries, `tick()` compacts the committed prefix into a
+    /// snapshot — the leader folds what it commits, a follower folds what the
+    /// leader's `leader_commit` advanced it to. `0` disables it — the default,
+    /// so an existing cluster's behaviour does not change. Compaction never
+    /// crosses `commit_index`: an uncommitted entry is never folded into a
+    /// snapshot.
     snapshot_threshold_entries: usize = 0,
 
     /// One InstallSnapshot frame carries at most this many bytes of snapshot
@@ -310,7 +312,8 @@ pub const ElectionConfig = struct {
 
     /// §7: where snapshot bytes come from when `snapshot_threshold_entries`
     /// fires (or when an app drives `compactLog` itself it passes the bytes
-    /// directly). Called on the leader with the lock held — keep it cheap. The
+    /// directly). Called from `tick()` with the lock held, on whichever role
+    /// is compacting — keep it cheap. The
     /// returned slice must be allocated with the passed allocator and becomes
     /// the raft's to free (it is released right after `compactLog` copies it).
     ///
@@ -779,14 +782,19 @@ pub const RaftElection = struct {
                         std.log.err("[RaftElection] staging the leader round failed, skipping this round: {}", .{err});
                     }
                 }
-                // §7 housekeeping on the leader: bounded log growth. Off by
-                // default (`snapshot_threshold_entries = 0`); when on, a skipped
-                // compaction (e.g. an OOM in the snapshotter) must not stop the
-                // heartbeat loop, so the error is logged instead of propagated.
-                self.maybeCompactLog() catch |err| {
-                    std.log.err("[RaftElection] auto-compaction skipped this tick: {}", .{err});
-                };
             }
+
+            // §7 housekeeping on **every** role: bounded log growth. The leader
+            // compacts what it commits; followers learn the same commit index
+            // via `leader_commit` and would otherwise grow their logs without
+            // bound (A-4 follow-up — this used to run only in the leader
+            // branch above). Off by default (`snapshot_threshold_entries = 0`);
+            // when on, a skipped compaction (e.g. an OOM in the snapshotter)
+            // must not stop the election/heartbeat loop, so the error is
+            // logged instead of propagated.
+            self.maybeCompactLog() catch |err| {
+                std.log.err("[RaftElection] auto-compaction skipped this tick: {}", .{err});
+            };
         }
 
         // ── Phase 2: deliver (no lock held) ──
@@ -1552,8 +1560,9 @@ pub const RaftElection = struct {
     }
 
     /// §7: compact the committed prefix once the live log outgrows
-    /// `snapshot_threshold_entries`. Called from `tick()` on the leader with
-    /// `lock` held. Never crosses `commit_index`.
+    /// `snapshot_threshold_entries`. Called from `tick()` on **every** role —
+    /// the leader folds what it commits, a follower folds what the leader's
+    /// `leader_commit` advanced it to. Never crosses `commit_index`.
     fn maybeCompactLog(self: *Self) !void {
         const threshold = self.config.snapshot_threshold_entries;
         if (threshold == 0) return;
@@ -3666,6 +3675,64 @@ test "RaftElection leader tick compacts the committed prefix once the log outgro
 
     // Appends continue in absolute coordinates across the auto-compaction.
     try testing.expectEqual(@as(u64, 6), try raft.appendEntry("cmd-5"));
+}
+
+test "RaftElection follower tick compacts the committed prefix once the log outgrows snapshot_threshold_entries" {
+    const allocator = testing.allocator;
+
+    var impl = TestTransportVTable{
+        .sendVoteRequest = noopVoteRequest,
+        .sendAppendEntries = rejectAppendEntries,
+        .sendInstallSnapshot = noopInstallSnapshot,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
+
+    var peers = [_]Peer{.{ .id = "leader", .address = "" }};
+    var raft = try RaftElection.init(allocator, "f1", &peers, .{ .snapshot_threshold_entries = 3 }, &transport);
+    defer raft.deinit();
+
+    // A follower learns five entries and the leader's commit point through 5.
+    // Before the A-4 follow-up, `maybeCompactLog` ran only in the leader
+    // branch of `tick()` — this log would have grown without bound.
+    const seed_entries = [_]LogEntry{
+        .{ .term = 1, .index = 1, .command = "e1" },
+        .{ .term = 1, .index = 2, .command = "e2" },
+        .{ .term = 1, .index = 3, .command = "e3" },
+        .{ .term = 1, .index = 4, .command = "e4" },
+        .{ .term = 1, .index = 5, .command = "e5" },
+    };
+    const seed = try raft.handleAppendEntries(.{
+        .term = 1,
+        .leader_id = "leader",
+        .prev_log_index = 0,
+        .prev_log_term = 0,
+        .entries = &seed_entries,
+        .leader_commit = 5,
+    });
+    try testing.expect(seed.success);
+    try testing.expectEqual(@as(u64, 5), raft.getCommitIndex());
+    try testing.expectEqual(@as(usize, 5), raft.logLen());
+
+    try raft.tick();
+    try testing.expectEqual(@as(u64, 5), raft.last_included_index);
+    try testing.expectEqual(@as(u64, 1), raft.last_included_term);
+    try testing.expectEqual(@as(usize, 0), raft.logLen());
+
+    // Replication continues across the follower's auto-compaction boundary:
+    // the boundary prev matches `last_included_term`, the tail appends at
+    // absolute coordinates.
+    const tail = [_]LogEntry{.{ .term = 1, .index = 6, .command = "e6" }};
+    const ok = try raft.handleAppendEntries(.{
+        .term = 1,
+        .leader_id = "leader",
+        .prev_log_index = 5,
+        .prev_log_term = 1,
+        .entries = &tail,
+        .leader_commit = 6,
+    });
+    try testing.expect(ok.success);
+    try testing.expectEqual(@as(usize, 1), raft.logLen());
+    try testing.expectEqualStrings("e6", raft.getLogEntry(6).?.command);
 }
 
 test "RaftElection snapshotter hook supplies the bytes, and the uncommitted tail is never compacted" {
