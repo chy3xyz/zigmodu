@@ -274,6 +274,42 @@ interop 也会过（它的旧节点全程都在），而 wave 2 永远选不出�
 `check-production: OK` · `check-deadcode: OK (32/0)` · `check-test-collection: 9/2193 OK`；
 `zig fmt` clean；`ci.yml` / 两个 issue 模板 YAML 均经解析器验证；rolling 形状本地实跑 + 变异变红各一次。
 
+### 第 160 批：记录第一个外部贡献者（2 个 PR 待评审）（**破坏性：否；纯文档**）
+
+**S4（外部 PR）从 0推进到"已提出、待合并"**，评分 84.9 → **85.6**（+0.7）。
+本批只更新文档口径，**未合并任何 PR**。
+
+**`@knot3bot` 提出两个外部 PR（2026-10-10）**，本仓库**第一个外部贡献账号**
+（账号建于 2026-02，5 个公开仓库；此前 PR 数与外部 issue 数均为 0）：
+
+| PR | 范围 | 核心断言（已核实属实） |
+|---|---|---|
+| [#3`fix(sqlx): ConnPool acquire 的 deadline 改用单调时钟`](https://github.com/chy3xyz/zigmodu/pull/3) | `src/sqlx/sqlx.zig` +43 −3 | `sqlx.zig:4677` 的 `waited_ms += 50` 每轮固定记 50ms，切片提前返回（spurious wakeup / 只唤醒队首）会让预算被高估而**提前放弃** |
+| [#4 `ci: integration-full 覆盖 pull_request，并修复 examples 索引漂移`](https://github.com/chy3xyz/zigmodu/pull/4) | `ci.yml` · `examples/README.md` +18 −1 | `integration-full` 仅在 push-to-master 触发（走私 e2e 合并后才验）；`examples/README.md` 索引漏了 `quant-replay`（目录存在、CI 真跑） |
+
+**#3 最有价值的一点**：它指出`sqlx.ConnPool` 的假账与 `src/pool/Pool.zig:150-154`
+**是同一处缺陷模式**——那里已有一段几乎同文的修复记录（*"assumed 10 ms per
+wake-up, so an exhausted pool … budget that had never elapsed"*）。同一个坑，
+一个已修、一个漏了。**这类"同源缺陷的第二处"是最难自己发现的**，而外部视角找到了。
+
+**#4 附带澄清了一件我们没问的事**：doctor 清单为何不需要补 `basic`——
+`collectModules` 只发现目录式模块（`src/modules/<name>/module.zig`），
+而 basic 用单文件布局，实跑报 `modules: 0`，加入只会得到一个**不检查任何东西的假绿灯**。
+**主动挡住后人重复误判**，比单纯提 PR 更有分量。
+
+**读数口径（必须说清）**：外部信任 75 → **80（档 2 上沿，条件性）**，
+**不是更高**，因为：
+
+- 治理文件与披露渠道：✅ 第 158 批已建立
+- 外部贡献者：**2 个 PR 待评审**（此前 0）
+- **合并记录：0**——真正的结构验证要等合并走完评审
+
+**proposed ≠ accepted。机制已被使用，结构尚未被验证。** 合并后该轴 → 85，总分 **86.4**。
+
+文档同步：README 中英双版贡献者行 · `GOVERNANCE.md`（新增「第一个外部 PR」节，
+含两条断言的核实结论；投票制的门槛改为"有**合并记录**的外部贡献者 ≥ 5"）·
+`EVALUATION_2026-10.md` §3.2 档位与 S4 状态 · `v1.0-roadmap-1.0.md` 接触面清单与停止线分数。
+
 ## [0.39.10] - 2026-10-10
 
 ### 第 153 批：集群安全四审计项（A-1/A-3/A-4/B-11）残留收尾（**破坏性：否；一处行为变化**）

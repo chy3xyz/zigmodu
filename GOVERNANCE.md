@@ -13,12 +13,34 @@
 |---|---|
 | 仓库所有者 | `chy3xyz`（`CHANGELOG` 署名 `Antigravity Agent`） |
 | 提交构成 | 1008 提交：`Antigravity Agent` 758 / `neox33` 220 / `ZigModu Developer` 29 / 所有者 1 |
-| 外部贡献者 | 0 PR（`neox33` 的 220 提交为共同维护者身份，非外部） |
+| 外部贡献者 | **2 个 PR 未合并**（`@knot3bot`，见下）；`neox33` 的 220 提交为共同维护者身份，非外部 |
 | stars / forks | 3 / 0 |
 | 第三方审计 | **无**——见 [`docs/EVALUATION_2026-10.md`](docs/EVALUATION_2026-10.md) §3.2 |
 
 **这意味着什么**：**决策实际上是单点的**。本文件不是为了让现状好看，
 而是把"谁说了算"写明，好让外部知道往哪里推。
+
+### 第一个外部 PR（2026-10-10）
+
+| PR | 作者 | 范围 |
+|---|---|---|
+| [#3 `fix(sqlx): ConnPool acquire 的 deadline 改用单调时钟`](https://github.com/chy3xyz/zigmodu/pull/3) | `@knot3bot` | `src/sqlx/sqlx.zig` +43 −3 |
+| [#4 `ci: integration-full 覆盖 pull_request，并修复 examples 索引漂移`](https://github.com/chy3xyz/zigmodu/pull/4) | `@knot3bot` | `ci.yml` · `examples/README.md` |
+
+`@knot3bot` 是本仓库**第一个外部贡献账号**（账号建于 2026-02，5 个公开仓库，
+此前 PR 数与外部 issue 数均为 0）。
+
+两条断言都经核实成立：#3 指出的 `src/sqlx/sqlx.zig:4677` `waited_ms += 50`
+（切片提前返回会让预算被高估）与 `src/pool/Pool.zig:150-154` 那次同类修复确为
+同源缺陷；#4 指出的 `integration-full` 仅在 push-to-master 触发、以及
+`examples/README.md` 索引漏了 `quant-replay`，均属实。
+
+**但要诚实说明两点**：
+
+1. **它们尚未合并**，所以"外部贡献结构"这件事**正在被检验，而不是已经成立**——
+   真正的验证要等合并走完评审。
+2. **机制可用 ≠ 社区成熟**。2 个 PR、0 外部 issue、3 stars 的规模说明这个项目
+   仍处于"有门禁、有流程，但外部参与度极低"的阶段。
 
 ---
 
@@ -40,8 +62,8 @@
 
 **这份文件现在不做的事**（为什么）：
 
-- **不设投票制**：单一维护者 + 0 外部贡献者的情况下，投票制是形式主义。
-  等外部贡献者达到 5 人以上再引入（§五路线）。
+- **不设投票制**：决策仍是单点（单一维护者，外部贡献者 1 人且尚无合并记录），
+  投票制在这种情况下是形式主义。等**有合并记录**的外部贡献者达到 5 人以上再引入（§五路线）。
 - **不设CLA / DCO 强制**：本仓库已有 [`CONTRIBUTING.md`](CONTRIBUTING.md) 的约定，
   重复加一层只会增加摩擦。
 - **不承诺 SLA**：见 `SECURITY.md` 末节。
