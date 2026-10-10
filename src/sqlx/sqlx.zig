@@ -4629,8 +4629,14 @@ const ConnPool = struct {
                 self.mutex.unlock(self.io);
                 return error.ConnectionFailed;
             };
-            var waited_ms: u64 = 0;
-            while (waited_ms < self.max_wait_ms) {
+            // Deadline is measured on the monotonic clock, not by counting
+            // slices. Counting assumed each iteration consumed a full 50ms,
+            // but a slice can return early (spurious wakeup, or `release`
+            // signalling one waiter while another stays parked), which made
+            // the budget over-count and abandon an acquire that still had
+            // time left. Same fix as `pool.Pool.acquire`.
+            const start_ms = Time.monotonicNowMilliseconds();
+            while (Time.monotonicNowMilliseconds() - start_ms < @as(i64, self.max_wait_ms)) {
                 const slice_woken = waiter.cond.waitTimeout(self.io, &self.mutex, .{
                     .duration = .{ .raw = .{ .nanoseconds = slice_ns }, .clock = .awake },
                 });
@@ -4674,7 +4680,6 @@ const ConnPool = struct {
                     self.mutex.unlock(self.io);
                     return error.ConnectionFailed;
                 }
-                waited_ms += 50;
             }
             self.removeWaiter(&waiter);
             self.mutex.unlock(self.io);
@@ -9050,6 +9055,41 @@ test "conn pool release hands off to waiters in FIFO order" {
     // pool's active count and the test allocator stay consistent.
     waiters[0].conn.close();
     waiters[1].conn.close();
+}
+
+test "an exhausted conn pool honours max_wait_ms instead of counting slices" {
+    const allocator = std.testing.allocator;
+
+    // `ensurePool` only creates a pool when max_open_conns > 1, so the pool
+    // under test needs at least two connection slots to be exhausted at all.
+    var db = try Client.open(allocator, std.testing.io, .{
+        .driver = .sqlite,
+        .sqlite_path = ":memory:",
+        .max_open_conns = 2,
+        .max_idle_conns = 0,
+        .max_wait_ms = 120,
+    });
+    defer db.deinit();
+    db.warmPool();
+
+    const pool = &db.pool.?;
+    const held_a = try pool.acquire();
+    const held_b = try pool.acquire();
+
+    const started_ms = Time.monotonicNowMilliseconds();
+    try std.testing.expectError(error.Timeout, pool.acquire());
+    const elapsed_ms = Time.monotonicNowMilliseconds() - started_ms;
+
+    // The deadline used to be `waited_ms += 50` per slice, i.e. the budget was
+    // a slice counter rather than elapsed time: a slice returning early (a
+    // spurious wakeup, or another waiter's release) spent budget that had not
+    // actually elapsed, so the pool could give up while time remained. Assert
+    // the real deadline both ways — honoured as a floor, and not wildly over.
+    try std.testing.expect(elapsed_ms >= 100);
+    try std.testing.expect(elapsed_ms < 2000);
+
+    pool.release(held_a);
+    pool.release(held_b);
 }
 
 test "acquire stays usable after a release hands a connection to a waiter" {
