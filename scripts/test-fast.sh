@@ -37,7 +37,7 @@
 #
 # A test run in this repository has **two** legitimate numbers, and calling them
 # by one name is how a baseline got recorded wrong: `zig build test`'s main suite
-# alone, and the total over all five test binaries. So every run now prints both,
+# alone, and the total over all eight test binaries. So every run now prints both,
 # each on its own line, each with the label that says which it is:
 #
 #   zm-test-count: aggregate ...    <- the reading. Quote this one.
@@ -49,7 +49,7 @@
 # places and they are not the same mechanism: `source=build-summary` (zig's own
 # runner, no filter) or `source=zm-test-runner` (the runtime filter in
 # `scripts/test-runner.zig`, which skips the aggregate `test { … }` blocks). Both
-# report the same denominator today — 1450 tests, 5 binaries, `-Ddb=all` — and the
+# report the same denominator today — 2382 tests, 8 binaries, `-Ddb=all` — and the
 # two sources are cross-checked against each other when both are present.
 #
 # `--count` prints that one aggregate line and nothing else on stdout (the zig

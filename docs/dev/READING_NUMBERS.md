@@ -38,7 +38,7 @@ zm-test-count: binary 97/97 passed skipped=0
   - `source=zm-test-runner`：带 `--filter`，跑的是 `scripts/test-runner.zig` 的运行期
     filter（唯一能按名字聚焦的方式，见 `docs/BEST_PRACTICES.md`「只跑匹配的测试」）。
     它**跳过无名的 `test { … }` 聚合块**，所以 `selected/total` 会与自带 runner 的
-    `passed/total` 差那么几块 —— 两种模式的 **分母今天一致**（1450 用例、5 个二进制、
+    `passed/total` 差那么几块 —— 两种模式的 **分母今天一致**（2382 用例、8 个二进制、
     `-Ddb=all`），这也是 aggregate 可以跨模式引用的前提。两种来源同时出现时，
     `test-fast.sh` 会把 summary 与逐二进制的和**互相对账**，不一致直接 exit 3。
 - 引数时必须**连同 `db=` 与 `filter=` 一起引**（`-Ddb=sqlite` 是另一个套件的另一个数）。

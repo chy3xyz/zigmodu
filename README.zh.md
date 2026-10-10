@@ -74,7 +74,7 @@ comptime 轨道类型、手写队列、热路径上的分配是被**测试钉住
 - **定时器** - `TimerWheel`（ms 级、分层 O(1)）与 `PrecisionTimer`（µs 级、min-heap + spin window，实测 p50 0 ns / p99 1 µs）
 - **监督** - 每 worker 的失败策略（fail-fast 或窗口内错误预算）+ `onError` 钩子 + 停机策略
 - **回放** - `Recorder`（零分配投递日志）→ `DeliveryLog` 段文件（`ZDL1`）→ `ReplayFromLog`（从字节回放，自带 `Codec(E)`）
-- **可观测** - `RuntimeStats` + `MetricsBridge` 发布 25 条 `zigmodu_runtime_*`（13 通用 + 6 CPU 池 + 6 阻塞池）
+- **可观测** - `RuntimeStats` + `MetricsBridge` 发布 31 条 `zigmodu_runtime_*`（13 通用 + 9 CPU 池 + 9 阻塞池）
 - **零分配契约** - `src/runtime/alloc_contract_test.zig` 用会失败的分配器断言热路径**精确 0**
 - **affinity 原语** - `runtime.affinity.pinCurrentThread(cpu)` 在 Linux 真的 pin；macOS / Windows 返回 `error.Unsupported`，不假报成功
 
@@ -94,11 +94,11 @@ comptime 轨道类型、手写队列、热路径上的分配是被**测试钉住
 
 | 门禁 | 证明什么 | 命令 |
 |------|----------|------|
-| 全量套件（`-Ddb=all`） | 6 个 artifact、2000+ 条测试 | `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test` |
+| 全量套件（`-Ddb=all`） | 8 个 artifact、2000+ 条测试 | `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test` |
 | **分配契约** | mailbox / ring / HotBus / `send` / 定时器热路径**精确 0 分配** | `src/runtime/alloc_contract_test.zig` |
 | 生产门禁 | 热路径无裸 `catch {}`、CSPRNG 来源、fuzz 声明与树一致 | `zig build check` |
 | API 门禁 | 示例必须走 `zigmodu.http` 规范入口 | `zig build check-api` |
-| 死代码 ratchet | `src`+`tools` 基线 28、`examples` 基线 0 | `bash scripts/check-deadcode.sh` |
+| 死代码 ratchet | `src`+`tools` 基线 32（30 + 2）、`examples` 基线 0 | `bash scripts/check-deadcode.sh` |
 | 性能 ratchet | 32 条指标对 CI 基线 + 32 条分配预算 | `bash scripts/check-bench.sh` |
 | Soak（HTTP + 租户） | 跨租户泄漏、FrozenMap 并发、fd/slot 增长 | `zig build soak` |
 | Soak（集群） | 3 节点 raft + 总线：seq 连续、leader 稳定、日志收敛、fd/RSS | `zig build soak-cluster` |

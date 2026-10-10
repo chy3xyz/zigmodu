@@ -2201,7 +2201,7 @@ test "订单模块 - 异常路径" {
 | 命中 0 个 | 自带机制打印 `All 0 tests passed.` 并 **exit 0**：和"跑完并通过"长得一模一样 |
 
 所以本仓库的 filter 走**运行期**：`-Dtest-filter=` 会把 `scripts/test-runner.zig`（`mode = .simple`）装到
-`test` step 的 5 个 test artifact 上，整套先编译、只执行命中的；脚本汇总各二进制的
+`test` step 的 8 个 test artifact 上，整套先编译、只执行命中的；脚本汇总各二进制的
 `zm-test-runner: selected N of M tests` 行，总数 0 就 **exit 2** 并写明"没有验证任何东西"。
 
 ```bash
@@ -2221,7 +2221,7 @@ filter 是**全限定名的子串**（形如 `core.cluster.RaftElection.test.<�
 要一份能引用的证据，用 `--force-run`（带 filter 的运行本来就强制重跑，因为缓存回放会吃掉计数）。
 源码一改（哪怕一个字节）编译缓存即失效，运行随之重跑；这条用"插一个必失败断言 → 必红"实测验证过。
 
-> 每个 test artifact 单独命中 0 个时 runner **不**报错：5 个二进制里通常只有一个含目标用例，
+> 每个 test artifact 单独命中 0 个时 runner **不**报错：8 个二进制里通常只有一个含目标用例，
 > 逐个失败会否掉所有正常的聚焦运行。判定权在脚本的汇总。
 
 ### 覆盖率要求
@@ -3136,10 +3136,10 @@ macOS 腿 `100 checks x10K` 42.9ms vs 基线 19.9ms，同 commit 原样重跑 28
 
 | 维度 | 现状 | 怎么复核 |
 |---|---|---|
-| 测试 | `-Ddb=all` 全量 2000+ 条 / 6 个 artifact，0 失败 | `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test` |
+| 测试 | `-Ddb=all` 全量 2000+ 条 / 8 个 artifact，0 失败 | `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test` |
 | 热路径分配 | 有**契约测试**（断言精确 0）；bench 侧另有 32 条 `max_alloc_per_op` 预算 | `src/runtime/alloc_contract_test.zig` · `bash scripts/check-bench.sh` |
 | 性能 | 32 条指标对 CI 基线（阈值 2.0×），双峰指标降级为"候选回归 + 诊断" | `bash scripts/check-bench.sh` |
-| 死代码 | ratchet：`src`+`tools` 基线 28、`examples` 基线 0 | `bash scripts/check-deadcode.sh` |
+| 死代码 | ratchet：`src`+`tools` 基线 32（30 + 2）、`examples` 基线 0 | `bash scripts/check-deadcode.sh` |
 | 热路径纪律 | 禁裸 `catch {}`、CSPRNG 来源、fuzz 声明与树一致 | `zig build check` |
 | API 纪律 | examples 必须走 `zigmodu.http` 规范入口 | `zig build check-api` |
 | 长跑 | 三套 harness：HTTP+租户 / 3 节点集群 / runtime 交织 | `zig build soak` · `soak-cluster` · `runtime-stress` |

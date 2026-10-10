@@ -170,8 +170,8 @@ Opt-in via `app.runtime()`. Spec: [docs/RUNTIME.md](docs/RUNTIME.md) · runnable
   (`ZDL1`, per-track cursors, holes counted), and `ReplayFromLog` replays *from those
   bytes* through a caller-supplied `Codec(E)`. Still out of scope, on purpose: a CLI,
   retention/compaction, encryption, cross-process transport
-- **Runtime metrics** — `RuntimeStats` + `MetricsBridge` publishes **25**
-  `zigmodu_runtime_*` gauges (13 general + 6 CPU pool + 6 blocking pool); drops, timer lag
+- **Runtime metrics** — `RuntimeStats` + `MetricsBridge` publishes **31**
+  `zigmodu_runtime_*` gauges (13 general + 9 CPU pool + 9 blocking pool); drops, timer lag
   and pool depth are invisible from the HTTP side
 - **Worker trace context** — `sendTraced` / `sendBlockingTraced` carry a 16-byte
   `TraceId` **in the mailbox slot** (no allocation, no shared producer state); the
@@ -232,11 +232,11 @@ The gates are the reason to trust any of the above, and all of them run locally:
 
 | Gate | What it proves | Command |
 |------|----------------|---------|
-| Full suite (`-Ddb=all`) | 2000+ tests over 6 artifacts | `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test` |
+| Full suite (`-Ddb=all`) | 2000+ tests over 8 artifacts | `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test` |
 | Allocation **contract** | exact zero allocations on the mailbox / ring / HotBus / `send` / timer hot paths | `src/runtime/alloc_contract_test.zig` |
 | Production gate | no bare `catch {}` in hot modules, CSPRNG source, fuzz declarations match the tree | `zig build check` |
 | API import gate | examples go through the canonical `zigmodu.http` | `zig build check-api` |
-| Dead-code ratchet | baseline 28 in `src`+`tools`, 0 in `examples` | `bash scripts/check-deadcode.sh` |
+| Dead-code ratchet | baseline 32 in `src`+`tools` (30 + 2), 0 in `examples` | `bash scripts/check-deadcode.sh` |
 | Benchmark ratchet | 32 metrics against a CI baseline + 32 allocation budgets | `bash scripts/check-bench.sh` |
 | Soak (HTTP + tenants) | cross-tenant leaks, FrozenMap concurrency, fd/slot growth | `zig build soak` |
 | Soak (cluster) | 3-node raft + bus: seq continuity, leader stability, log convergence, fd/RSS | `zig build soak-cluster` |

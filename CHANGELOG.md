@@ -1,5 +1,32 @@
 # Changelog
 
+## [Unreleased]
+
+### 第 154 批：文档数字漂移修正（死代码基线 / test artifact 数 / runtime gauge 数）（**破坏性：否**）
+
+来源：项目品质评估中逐项复核 README 与门禁脚本的自述数字，发现三处与实测值不符——
+均为**文档落后于代码**，代码本身无缺陷。全部按实测值改写，中英双语口径同步。
+
+1. **死代码基线 28 → 32**：`scripts/deadcode-baseline.json` 实为 32 条（`src` 30 + `tools` 2，
+   `examples` 0）。此前多批新增死声明时 ratchet 门禁正常拦过，但文档数字没跟着走。
+   改 README.md / README.zh.md / AGENTS.md / `docs/BEST_PRACTICES.md` 四处。
+   实测 `bash scripts/check-deadcode.sh` → `OK: src+tools within baseline (32)`。
+2. **test artifact 数 6 → 8**：`build.zig` 里挂在 `test` step 上的 `addTest` 实为 8 个，
+   与 `zig build test` 输出的 8 行 `run test` 明细一一对应（`2130+3+143+11+3+3+20+8`）。
+   同批改掉 `5 个 test artifact` 的旧说法与 `scripts/test-fast.sh` 头注释。
+3. **runtime gauge 数 25 → 31**：`grep` 唯一 gauge 名实为 31 条（13 通用 + 9 CPU 池 +
+   9 阻塞池）。批47 已把阻塞池那 9 条接上（`CHANGELOG` 里「从 25 条变 31 条」记的就是这件事），
+   但 README 与 `docs/RUNTIME.md` §8 一直停在 25。一并修正 `6 条 pool_*` → 9 条
+   （分档那 3 条 `pool_ready_len_{low,normal,high}` 在 §8 表里原本就没列，现补明）。
+4. **`1450 用例 / 5 个二进制` → `2382 用例 / 8 个二进制`**：`scripts/test-fast.sh` 头注释与
+   `docs/dev/READING_NUMBERS.md`（"数字怎么读"的权威口径）。这个文件错了会被当基准引用。
+
+实测（`--force-run`，缓存重放不产生计数）：
+`bash scripts/test-fast.sh --db all` → `aggregate 2319/2382 passed skipped=63 binaries=8`。
+
+**刻意没改**：`CHANGELOG.md` 历史条目与 `docs/dev/v1.0-readiness-v0.35.md:127`——
+后者是v0.35 时期的审计快照，记录的是**当时**的实测值25，改它反而破坏"当时这么写"的事实。
+
 ## [0.39.10] - 2026-10-10
 
 ### 第 153 批：集群安全四审计项（A-1/A-3/A-4/B-11）残留收尾（**破坏性：否；一处行为变化**）

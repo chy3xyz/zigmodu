@@ -422,9 +422,11 @@ metrics.setScrapeHook(@TypeOf(bridge).sample, &bridge);
 `messages_received` / **`messages_dropped`** / **`messages_discarded_on_stop`** / `handler_errors` /
 `timer_fires` / **`timers_discarded`** / **`timer_deliveries_dropped`** / **`timer_lag_ms`** /
 **`supervised_stops`** / **`group_restarts`**（后两条是 §14 的监督读数）），
-加上池化执行（§12）的 6 条：
+加上池化执行（§12）的 9 条：
 `pool_declared` / `pool_threads` / `pool_ready_len` / `pool_claimed` / `pool_dispatches` /
-`pool_ready_push_failures`，再加上**阻塞池**那 6 条（同名加 `blocking_` 前缀；
+`pool_ready_push_failures`（上表 6 条）+ 就绪环分档那 3 条
+`pool_ready_len_low` / `pool_ready_len_normal` / `pool_ready_len_high`，
+再加上**阻塞池**那 9 条（同名加 `blocking_` 前缀；
 没声明阻塞池时读 0，见 §12）。计数口径 = 唯一 gauge 名字（`grep -o '"zigmodu_runtime_[a-z_0-9]*"' src/runtime/*.zig | sort -u | wc -l`）。名字里没有 `_total` 后缀是刻意的：这些是**抓取时采样**的快照，
 所以走 gauge 而不是 counter（`PrometheusMetrics.Counter` 没有 `set`）。
 
@@ -445,7 +447,7 @@ metrics.setScrapeHook(@TypeOf(bridge).sample, &bridge);
 worker 先停（邮箱关闭）、定时器随后到点，于是它跳一次 —— 而 `messages_dropped` 不动，因为没有任何
 生产者在挨背压。持续增长则是另一回事：目标邮箱长期满着，定时器在往一个跟不上的 worker 上投活儿。
 
-**池的 6 条读什么**（§12.10 那句"`zmodu_runtime_*` 里没有池的指标"已经作废）：
+**池的 9 条读什么**（下表列主 6 条，分档那 3 条 `pool_ready_len_{low,normal,high}` 是就绪环深度的健康分位；§12.10 那句"`zigmodu_runtime_*` 里没有池的指标"已经作废）：
 
 | 指标 | 含义 | 怎么读 |
 |------|------|--------|
@@ -456,7 +458,7 @@ worker 先停（邮箱关闭）、定时器随后到点，于是它跳一次 —
 | `pool_dispatches` | 池线程跑过的批次总数 | **有 `.pooled` spawn 却是 0 = 那些 worker 从没到过池线程** |
 | `pool_ready_push_failures` | 等过整个自旋/让出预算的 push 数（每次调用计一次；token **未丢**，随后睡眠重试到落地） | **必须恒为 0**。见 §5 第 4 条与 §12.18：这不是背压也不是丢 token，是宿主把出队窗口持有者抢占了 ~100ms 以上 |
 
-没有池的 runtime 这 6 条**报 0 而不是缺行**：`pool_declared=0` 本身就是"这里没人声明过池"的答案，
+没有池的 runtime 这 9 条**报 0 而不是缺行**：`pool_declared=0` 本身就是"这里没人声明过池"的答案，
 仪表盘不必为它写特例。
 
 **为什么必须有这一步**：`messages_dropped` 与 `timer_lag_ms` 只在这里出现 —— 邮箱打满、定时器被饿死
@@ -542,7 +544,7 @@ fn traceFromHeader(id: []const u8) zigmodu.runtime.TraceId {
 | **v0.28.0** | `shutdown()` 释放**已进轮**的待触发 payload（`Wheel.drainAll`，在 owner 线程上 drain）+ `RuntimeStats.timers_discarded` / `zigmodu_runtime_timers_discarded` | ✅ 本文档 §3/§4/§8（**非 Breaking**：补上 ticker-owned 那批的"未附带"项） |
 | **v0.28.0** | `shutdown()` 顺序改为**先停 ticker 再拆 worker**（关掉 "ticker 向已 destroy 的 handle 投递" 的 use-after-free 窗口）+ `onTimerFire` 在 `alive = false` 时只 drop 不 post | ✅ 本文档 §3（**非 Breaking**：签名不变，只多一次 `alive` 读） |
 | **未发版** | WorkerPool **Phase 1**：`spawn(..., .{ .mode = .pooled })` + `queued`/`claimed` 两位 + 就绪环 + **一条**池线程（`src/runtime/scheduler.zig`）；池在 `Runtime.initWithOptions` / `builder.withMaxPooledWorkers` 声明的上界内 | ✅ 本文档 §12.10（**Breaking：否** —— 第三参同时接受 `256` 与 `.{ .capacity = 256, .mode = .pooled }`；`run` 型 worker 用 `.pooled` 是编译期报错，见 `scripts/check-pool-guard.sh`） |
-| **未发版** | 池的**可观测性与示例**：6 条 `zigmodu_runtime_pool_*`（§8）+ `examples/runtime-workers` 的 audit 环真的以 `.pooled` 跑（`[pool] dispatched>0` 才算过）+ `zmodu runtime` 报池声明 | ✅ 本文档 §12.10 末节（**Breaking：否**；顺带修掉 `Application.Config.max_pooled_workers` 没被 `Application.init` 拷贝的接线缺口） |
+| **未发版** | 池的**可观测性与示例**：9 条 `zigmodu_runtime_pool_*`（§8）+ `examples/runtime-workers` 的 audit 环真的以 `.pooled` 跑（`[pool] dispatched>0` 才算过）+ `zmodu runtime` 报池声明 | ✅ 本文档 §12.10 末节（**Breaking：否**；顺带修掉 `Application.Config.max_pooled_workers` 没被 `Application.init` 拷贝的接线缺口） |
 | **未发版** | **监督停机丢弃可见**：`WorkerStats.discarded_on_stop` / `RuntimeStats.messages_discarded_on_stop` + 第 16 条 gauge `zigmodu_runtime_messages_discarded_on_stop` —— dedicated 的 `break` 与"池先停、邮箱非空"两档都计数 | ✅ 本文档 §5 第 2 条 / §8 / §12.10（**Breaking：否**；`RuntimeStats` 只加字段，停机行为一字未改） |
 | **未发版** | **Runtime Replay v1（投递轨）**：spawn 点 `.record = .{ .id, .capacity }` 声明**每 worker 一条同类型轨**（复用 §11 的环 + log 的一个 `Sequencer` 打**全局** seq），取点在 `Handle` 的投递漏斗（`send*` + `after` 的定时器投递）；`Runtime.deliveryLog()` + `Replayer.step()`（`replayAll()` 附带）按 seq 归并、驱动 `Clock.Manual`、调用方给"标识 → 新 handle"映射回投 | ✅ 本文档 §13.7（**Breaking：否** —— `SpawnConfig` 多一个可选 `.record`，`Handle` 多一个默认 `null` 的 `track`；没声明就是一次空判断 + 零分配不变。**未做**：落盘/codec、跨进程） |
 | **v0.31.0** | **监督树**：`rt.spawnGroup(policy)` + 四种策略（`one_for_one` / `one_for_all` / `rest_for_one` / `stop_group`）+ 重启强度（`Intensity`）+ 组嵌套（强度用尽即升级到父组）+ **原地重建**（`deinit` + `init` 在同一线程、同一循环里；不换 handle、不关邮箱）+ `supervised_stops` / `group_restarts` 两个累计量与两条指标 | ✅ 本文档 §14（**Breaking：否** —— `Supervision` 多一个默认 `null` 的 `.group`，`spawn*` 签名一字未改；`Mailbox` 多一个 `wake`/`recvWakeable`，`recv` 行为不变） |
@@ -1135,7 +1137,7 @@ dedicated 加"抽干后再停"，两者都是会动到 D5 那条回执出口的�
    并在 `dispatched == 0` / `push_failures != 0` 时**以非零退出码失败** —— 也就是说这一环不再是
    "编译过就算数"，而是每次 `zig build run` 都验证一遍：单测过 ≠ 真跑过。
    （`audit.state.kept` 在池化后仍是**运行中**的瞬时读数，不要当全量。）
-2. **池进了 Prometheus**：§8 的那 6 条 `zigmodu_runtime_pool_*`。`pool_dispatches` 是"池真的被用了"
+2. **池进了 Prometheus**：§8 的那 9 条 `zigmodu_runtime_pool_*`。`pool_dispatches` 是"池真的被用了"
    的远程可读证据，`pool_ready_push_failures` 是"必须恒 0"的契约读数。
 3. **`zmodu runtime` 认识了池的两种写法**：`.max_pooled_workers = N` 与 `withMaxPooledWorkers(N)`
    各报一条带 `file:line` 的事实，外加"有几条 spawn 写了 `.mode = .pooled`"。仍然只报看得见的事实：

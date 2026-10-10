@@ -139,7 +139,7 @@ CI、`scripts/ci-*.sh`、本文件都用那个。`cd tools/zmodu && zig build` �
 | 启动跑 `zigmodu.Preflight.run(...)`（env/secret/DB/迁移/时钟） | 用占位 JWT secret 或默认配置上线（预检会拦，别绕过） |
 | 生产接线的参考实现看 `examples/tenant-mgmt`（`productionProfile`）与 `examples/zmsaas`（Preflight + 池/积压指标） | 让示例停在上古手工接线（文档承诺、旗舰不用） |
 | 换 JWT 密钥走 `JwksKeyRing` + `setKeyring`（带 kid，新旧双验） | 直接改 secret 重启（全员强制重登；或留下无法验证的旧 token） |
-| outbox 用 `consumer.setMetrics` + `startPolling`；池/积压用 `metrics.setScrapeHook`；**运行时用 `Runtime.MetricsBridge` + `setScrapeHook`**（`messages_dropped` / `timer_lag_ms` 只在这里看得见，HTTP 侧完全无感；池化后还有 6 条 `zigmodu_runtime_pool_*`，其中 `pool_claimed` / `pool_ready_push_failures` 是 `RuntimeStats` 里根本没有的读数） | 只盯 HTTP 指标（outbox 停投、池打满、邮箱打满、ticker 饿死在 HTTP 层完全看不见） |
+| outbox 用 `consumer.setMetrics` + `startPolling`；池/积压用 `metrics.setScrapeHook`；**运行时用 `Runtime.MetricsBridge` + `setScrapeHook`**（`messages_dropped` / `timer_lag_ms` 只在这里看得见，HTTP 侧完全无感；池化后还有 9 条 `zigmodu_runtime_pool_*`（阻塞池另有 9 条 `blocking_pool_*`，runtime 指标共 31 条），其中 `pool_claimed` / `pool_ready_push_failures` 是 `RuntimeStats` 里根本没有的读数） | 只盯 HTTP 指标（outbox 停投、池打满、邮箱打满、ticker 饿死在 HTTP 层完全看不见） |
 | 新增 `pub` 导出的组件时，**同时**写一条真正实例化它的测试（调用链要打通，不只是 `@import`） | 只导出、没调用者 —— Zig 惰性分析函数体，签名过期/编译不过要等用户真正调用才炸（`LogRotator` 就这么烂了很久） |
 | 租户模型上声明 `pub const sql_tenant_column: ?[]const u8 = "tenant_id"`（`zmodu scaffold` 已默认生成）——隔离变成编译期强制 | 靠"记得调 `*ForTenant`"：无作用域变体在租户模型上照样跨租户返回 |
 | 跨租户是合法需求时写 `*Unscoped`（`findByIdUnscoped` …），让危险操作在代码里一眼可见 | 为了绕过守卫而删掉 `sql_tenant_column` 声明 |
@@ -433,10 +433,10 @@ filter 是**测试全限定名的子串**（形如 `core.cluster.RaftElection.te
 | `zig build test -- --test-filter X` | build runner 把 `--` 之后的参数**整体丢弃**：filter 无效，全套照跑（~47s），**exit 0** |
 | `zig test src/root.zig --test-filter X` | 缺 `build_options` 模块与 SQL 驱动链接；就算用 `-Mroot=` 拼出来，产物二进制在**运行期拒绝** `--test-filter`（该 flag 是编译期的） |
 | Zig 自带 `--test-filter`（`Compile.filters`） | **编译期**过滤：被排除的 test 连函数体都不分析，它 body 里的 `@import` 不会发生 → 被导入文件的测试**根本不在编译里**。本仓库整套挂在一个聚合测试下（`src/tests.zig` → `test "compile all source files"`），所以实测 `-Dtest-filter=RaftElection` 编出的二进制只有 1 个测试（`root.test_0`，无名 `test { … }` 块，任何 filter 都匹配不到）且 **exit 0**；只有 `-Dtest-filter=.`（匹配一切）能跑满全集（当前计数以 `check-test-collection` 门禁为准，勿抄数字） |
-| 命中 0 个 | 自带机制打印 `All 0 tests passed.` 且 **exit 0**。`scripts/test-fast.sh` 汇总 5 个 test 二进制的 `zm-test-runner:` 行，总数 0 时 **exit 2** 并明确说"没有验证任何东西" |
+| 命中 0 个 | 自带机制打印 `All 0 tests passed.` 且 **exit 0**。`scripts/test-fast.sh` 汇总 8 个 test 二进制的 `zm-test-runner:` 行，总数 0 时 **exit 2** 并明确说"没有验证任何东西" |
 | 第二次 `zig build test`（缓存热） | Zig 连 test **运行**结果一起缓存：输出 `run test cached`，测试**没有执行**、也没有计数。要能引用的证据就加 `--force-run` |
 
-> 一个二进制里若 filter 命中 0 个，runner **不会**单独失败（5 个 test artifact 里通常只有一个含目标用例，
+> 一个二进制里若 filter 命中 0 个，runner **不会**单独失败（8 个 test artifact 里通常只有一个含目标用例，
 > 逐个失败会否掉所有正常的聚焦运行）；判定权在脚本的汇总。旧脚本 `bash scripts/test-fast.sh <name>` 的裸参数形式仍可用。
 
 ## Version
