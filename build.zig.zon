@@ -4,11 +4,23 @@
     .fingerprint = 0x7aa42d07b32f8d53,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{},
+    // What a downstream `zig build` actually needs. Three of these were missing
+    // and the package did not build on its own:
+    //   · `scripts` — build.zig:150/:155 use `b.path("scripts/test-runner.zig")`
+    //     as a module root, so `zig build test` cannot even compile without it.
+    //   · `docs` — `zig build docs`, the DocSnippets test, and the 门禁 scripts
+    //     all read from it.
+    //   · `examples/basic` — the minimal example referenced by README quick start
+    //     and by `scripts/` gates. (The other examples are standalone packages
+    //     with their own `build.zig.zon` and are fetched from source, not shipped.)
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
         "tools",
+        "scripts",
+        "docs",
         "examples/_shared",
+        "examples/basic",
     },
 }

@@ -28,11 +28,19 @@
 #
 # Env knobs:
 #   MIXED_OLD_REF   git ref for the old side (default: v0.32.0)
-#   MIXED_EXPECT    refuse (default) | interop — the mixed phase's verdict for
-#                   the pair. `refuse` is the hard wire cutover (v0.32.0);
-#                   `interop` is the rolling-upgrade shape (e.g. v0.38.0 ×
-#                   master, where A-1/A-3 changed no wire bytes): one mesh,
-#                   one leader, replication into the old node, zero refusals.
+#   MIXED_EXPECT    refuse (default) | interop | rolling — the mixed phase's
+#                   verdict for the pair:
+#                     refuse   the hard wire cutover (v0.32.0): the new side must
+#                              visibly refuse the old one while keeping a quorum
+#                     interop  a pair whose wire did not cut over (e.g. v0.38.0 ×
+#                              master, where A-1/A-3 changed no wire bytes): one
+#                              mesh, one leader, replication into the old node,
+#                              zero refusals
+#                     rolling  the two-wave deploy a real upgrade takes: (1 old +
+#                              2 new) reach quorum, the old node is drained, the
+#                              two survivors must still hold a leader, then 3 new
+#                              nodes elect among themselves. The only shape that
+#                              can catch new nodes leaning on the old node's vote
 #   ZIG             zig binary (default: zig)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -41,8 +49,8 @@ ZIG="${ZIG:-zig}"
 OLD_REF="${MIXED_OLD_REF:-v0.32.0}"
 MIXED_EXPECT="${MIXED_EXPECT:-refuse}"
 case "$MIXED_EXPECT" in
-  refuse|interop) ;;
-  *) echo "mixed-version: MIXED_EXPECT must be refuse or interop, got '$MIXED_EXPECT'" >&2; exit 2 ;;
+  refuse|interop|rolling) ;;
+  *) echo "mixed-version: MIXED_EXPECT must be refuse, interop or rolling, got '$MIXED_EXPECT'" >&2; exit 2 ;;
 esac
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/zm-mixed-version.XXXXXX")"
@@ -50,9 +58,10 @@ LOGS="$WORK/logs"
 mkdir -p "$LOGS"
 # Ports carry pid jitter: the framework's listener does not set SO_REUSEADDR,
 # so a re-run right after a failure would otherwise trip over TIME_WAIT. The
-# step is 20 because one run spans two blocks: same-version at PB+0..+7, mixed
-# at PB+10..+17.
-PB=$(( 20000 + ($$ % 125) * 20 ))
+# step is 30 because one run spans up to three blocks: same-version at
+# PB+0..+7, mixed at PB+10..+17, and the rolling shape's second wave at
+# PB+20..+27.
+PB=$(( 20000 + ($$ % 125) * 30 ))
 
 # Fixed TEST keys (64 hex chars = 32 bytes): every node of a phase shares them,
 # which is the shape a rolling deploy has (one cluster secret, one bus key).
@@ -399,6 +408,180 @@ if [ "$MIXED_EXPECT" = "interop" ]; then
   echo "  interop leader:             $MV_LEADER (old + new agreed)"
   echo "  interop raft refusals:      $(count_grep "$LOGS/mv-old.log" 'inbound frame not authenticated')+$(count_grep "$LOGS/mv-b.log" 'inbound frame not authenticated')+$(count_grep "$LOGS/mv-c.log" 'inbound frame not authenticated') line(s) (want 0)"
   echo "mixed-version: OK — interop: $OLD_REF and master shared one mesh, one leader and one log, with zero refusals"
+  exit 0
+fi
+
+# ── rolling mode: the two-wave upgrade a production deploy actually takes ─────
+#
+# refuse proves "the cut is clean"; interop proves "these two versions mesh".
+# Neither proves the thing a rolling deploy needs: **that the cluster keeps a
+# quorum across the transition**. A real upgrade is two waves —
+#
+#   wave 1: 1 × old + 2 × master   (the old node is still there, being drained)
+#   wave 2: 3 × master             (old gone; the cluster never lost majority)
+#
+# The failure this shape is the only one that can catch: a change that leaves the
+# *new* nodes unable to form a quorum on their own. Both existing shapes would
+# miss it — refuse never gets past the mixed mesh, and interop's old node is what
+# keeps the vote count at3 for the whole run. Here wave 1 has to reach majority
+# with the old node present, and wave 2 has to reach it with the old node
+# **gone**; if the new nodes only ever leaned on the old one's vote, wave 2 never
+# elects and this run fails.
+#
+# The old reference is $OLD_REF, chosen by the caller so the pair matches the
+# window's actual compatibility (v0.32.0 would cut over and belongs to `refuse`).
+
+if [ "$MIXED_EXPECT" = "rolling" ]; then
+  echo "mixed-version: rolling mode — two waves: (1 old + 2 new) then (3 new), quorum must survive both"
+
+  RV_A_R=$((PB+10)); RV_B_R=$((PB+11)); RV_C_R=$((PB+12))
+  RV_A_U=$((PB+15)); RV_B_U=$((PB+16)); RV_C_U=$((PB+17))
+  # Wave 2 reuses the same ids on different ports: the cluster identity is the id,
+  # the topology is the ports, so a restart on a fresh port is exactly what a
+  # replaced pod looks like from the outside.
+  W2_A_R=$((PB+20)); W2_B_R=$((PB+21)); W2_C_R=$((PB+22))
+  W2_A_U=$((PB+25)); W2_B_U=$((PB+26)); W2_C_U=$((PB+27))
+  COMMON_MV="--secret-hex $SECRET_HEX --bus-key-hex $BUSKEY_HEX --cluster-size 3 --bus-idle-ms 3000"
+
+  # ---- wave 1: the old node plus two new ones -----------------------------
+  launch mva "$OLD_BIN" mv-old.log --id mv-old --raft-port $RV_A_R --bus-port $RV_A_U \
+    --peer-raft mv-b@127.0.0.1:$RV_B_R --peer-raft mv-c@127.0.0.1:$RV_C_R \
+    --peer-bus mv-b@127.0.0.1:$RV_B_U --peer-bus mv-c@127.0.0.1:$RV_C_U $COMMON_MV
+  launch mvb "$NEW_BIN" mv-b.log --id mv-b --raft-port $RV_B_R --bus-port $RV_B_U \
+    --peer-raft mv-old@127.0.0.1:$RV_A_R --peer-raft mv-c@127.0.0.1:$RV_C_R \
+    --peer-bus mv-old@127.0.0.1:$RV_A_U --peer-bus mv-c@127.0.0.1:$RV_C_U $COMMON_MV
+  launch mvc "$NEW_BIN" mv-c.log --id mv-c --raft-port $RV_C_R --bus-port $RV_C_U \
+    --peer-raft mv-old@127.0.0.1:$RV_A_R --peer-raft mv-b@127.0.0.1:$RV_B_R \
+    --peer-bus mv-old@127.0.0.1:$RV_A_U --peer-bus mv-b@127.0.0.1:$RV_B_U $COMMON_MV
+
+  no_boot_fail() {
+    if grep -q "CN BOOT_FAIL" "$LOGS"/*.log 2>/dev/null; then
+      fail "a node printed CN BOOT_FAIL"
+    fi
+  }
+
+  wave1_boot() {
+    grep -q "CN BOOT id=mv-old .* auth=on" "$LOGS/mv-old.log" && \
+    grep -q "CN BOOT id=mv-b .* auth=on" "$LOGS/mv-b.log" && \
+    grep -q "CN BOOT id=mv-c .* auth=on" "$LOGS/mv-c.log" && \
+    grep -q "CN LISTEN" "$LOGS/mv-old.log" && \
+    grep -q "CN LISTEN" "$LOGS/mv-b.log" && \
+    grep -q "CN LISTEN" "$LOGS/mv-c.log"
+  }
+  no_boot_fail
+  wait_until 20 "rolling wave 1: all three boot with auth=on and listen" wave1_boot
+
+  wave1_quorum() {
+    # Full membership across versions — the same property interop asserts, but
+    # here it is a waypoint rather than the destination: the cluster must reach
+    # it *before* the old node is taken away.
+    grep -q "CN VIEW members=3" "$LOGS/mv-old.log" && \
+    grep -q "CN VIEW members=3" "$LOGS/mv-b.log" && \
+    grep -q "CN VIEW members=3" "$LOGS/mv-c.log"
+  }
+  no_boot_fail
+  wait_until 40 "rolling wave 1: members=3 across versions (quorum before the drain)" wave1_quorum
+
+  wave1_one_leader() {
+    [ "$(leader_line_count "$LOGS"/mv-*.log)" = "1" ] || return 1
+    local la lb lc
+    la="$(last_leader_id "$LOGS/mv-old.log")"; lb="$(last_leader_id "$LOGS/mv-b.log")"; lc="$(last_leader_id "$LOGS/mv-c.log")"
+    [ -n "$la" ] && [ -n "$lb" ] && [ -n "$lc" ] && [ "$la" = "$lb" ] && [ "$lb" = "$lc" ]
+  }
+  no_boot_fail
+  wait_until 40 "rolling wave 1: exactly one leader, agreed across old and new" wave1_one_leader
+
+  # Zero refusals in wave 1, for the same reason interop asserts it: a silent
+  # drop would pass the mesh checks while the wire is actually broken.
+  if grep -q "inbound frame not authenticated" "$LOGS"/mv-*.log; then
+    fail "rolling wave 1: a raft frame was refused: $(grep -h 'inbound frame not authenticated' "$LOGS"/mv-*.log | head -1)"
+  fi
+  if grep -qE "dropping connection|refused the handshake" "$LOGS"/mv-*.log; then
+    fail "rolling wave 1: a bus handshake was refused: $(grep -hE 'dropping connection|refused the handshake' "$LOGS"/mv-*.log | head -1)"
+  fi
+
+  W1_LEADER="$(last_leader_id "$LOGS/mv-old.log")"
+  W1_LOGLEN="$(max_log_len "$LOGS/mv-b.log")"
+  no_panics "$LOGS"/mv-*.log
+
+  # ---- the drain: stop the old node cleanly, then take it out of the view ----
+  # SIGTERM, not SIGKILL: a rolling upgrade replaces pods, and the difference
+  # between a graceful leave and a crash is exactly what a drain must prove.
+  stop_node mva mv-old.log
+  no_panics "$LOGS"/mv-*.log
+
+  # The two survivors must still agree on a leader with the old node gone. If
+  # they had been leaning on its vote, this is where that shows.
+  wave1_survivors() {
+    local lb lc
+    lb="$(last_leader_id "$LOGS/mv-b.log")"; lc="$(last_leader_id "$LOGS/mv-c.log")"
+    [ -n "$lb" ] && [ -n "$lc" ] && [ "$lb" = "$lc" ]
+  }
+  no_boot_fail
+  wait_until 40 "rolling: the two new nodes keep a leader after the old one leaves" wave1_survivors
+  W1_AFTER_LEADER="$(last_leader_id "$LOGS/mv-b.log")"
+
+  stop_node mvb mv-b.log
+  stop_node mvc mv-c.log
+  no_panics "$LOGS"/mv-*.log
+
+  # ---- wave 2: all three on master, old reference gone ---------------------
+  # Fresh logs, so a grep cannot be satisfied by wave 1's output.
+  launch mv2a "$NEW_BIN" mv2-a.log --id mv-a --raft-port $W2_A_R --bus-port $W2_A_U \
+    --peer-raft mv-b@127.0.0.1:$W2_B_R --peer-raft mv-c@127.0.0.1:$W2_C_R \
+    --peer-bus mv-b@127.0.0.1:$W2_B_U --peer-bus mv-c@127.0.0.1:$W2_C_U $COMMON_MV
+  launch mv2b "$NEW_BIN" mv2-b.log --id mv-b --raft-port $W2_B_R --bus-port $W2_B_U \
+    --peer-raft mv-a@127.0.0.1:$W2_A_R --peer-raft mv-c@127.0.0.1:$W2_C_R \
+    --peer-bus mv-a@127.0.0.1:$W2_A_U --peer-bus mv-c@127.0.0.1:$W2_C_U $COMMON_MV
+  launch mv2c "$NEW_BIN" mv2-c.log --id mv-c --raft-port $W2_C_R --bus-port $W2_C_U \
+    --peer-raft mv-a@127.0.0.1:$W2_A_R --peer-raft mv-b@127.0.0.1:$W2_B_R \
+    --peer-bus mv-a@127.0.0.1:$W2_A_U --peer-bus mv-b@127.0.0.1:$W2_B_U $COMMON_MV
+
+  wave2_up() {
+    grep -q "CN LISTEN" "$LOGS/mv2-a.log" && \
+    grep -q "CN LISTEN" "$LOGS/mv2-b.log" && \
+    grep -q "CN LISTEN" "$LOGS/mv2-c.log" && \
+    grep -q "CN VIEW members=3" "$LOGS/mv2-a.log" && \
+    grep -q "CN VIEW members=3" "$LOGS/mv2-b.log" && \
+    grep -q "CN VIEW members=3" "$LOGS/mv2-c.log"
+  }
+  no_boot_fail
+  wait_until 40 "rolling wave 2: three master-only nodes reach members=3" wave2_up
+
+  wave2_one_leader() {
+    [ "$(leader_line_count "$LOGS"/mv2-*.log)" = "1" ] || return 1
+    local la lb lc
+    la="$(last_leader_id "$LOGS/mv2-a.log")"; lb="$(last_leader_id "$LOGS/mv2-b.log")"; lc="$(last_leader_id "$LOGS/mv2-c.log")"
+    [ -n "$la" ] && [ -n "$lb" ] && [ -n "$lc" ] && [ "$la" = "$lb" ] && [ "$lb" = "$lc" ]
+  }
+  no_boot_fail
+  wait_until 40 "rolling wave 2: exactly one leader among the new nodes" wave2_one_leader
+
+  wave2_replicates() {
+    local a b c
+    a="$(max_log_len "$LOGS/mv2-a.log")"; b="$(max_log_len "$LOGS/mv2-b.log")"; c="$(max_log_len "$LOGS/mv2-c.log")"
+    [ -n "$a" ] && [ -n "$b" ] && [ -n "$c" ] && [ "$a" -ge 2 ] && [ "$b" -ge 2 ] && [ "$c" -ge 2 ]
+  }
+  no_boot_fail
+  wait_until 30 "rolling wave 2: the all-new cluster replicates (len >= 2)" wave2_replicates
+
+  if grep -q "inbound frame not authenticated" "$LOGS"/mv2-*.log; then
+    fail "rolling wave 2: a raft frame was refused among the new nodes"
+  fi
+
+  no_panics "$LOGS"/mv2-*.log
+  W2_LEADER="$(last_leader_id "$LOGS/mv2-a.log")"
+  stop_node mv2a mv2-a.log
+  stop_node mv2b mv2-b.log
+  stop_node mv2c mv2-c.log
+  no_panics "$LOGS"/mv2-*.log
+
+  echo "mixed-version: evidence summary"
+  echo "  wave 1 leader:               $W1_LEADER (1 old + 2 new agreed)"
+  echo "  after the old node left:     $W1_AFTER_LEADER (2 new still agreed — quorum survived the drain)"
+  echo "  wave 1 replicated log len:   $W1_LOGLEN"
+  echo "  wave 2 leader:               $W2_LEADER (3 new, old reference absent)"
+  echo "mixed-version: OK — rolling: quorum survived both waves; $OLD_REF drained and was replaced without losing the majority"
   exit 0
 fi
 

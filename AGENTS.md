@@ -139,7 +139,7 @@ CI、`scripts/ci-*.sh`、本文件都用那个。`cd tools/zmodu && zig build` �
 | 启动跑 `zigmodu.Preflight.run(...)`（env/secret/DB/迁移/时钟） | 用占位 JWT secret 或默认配置上线（预检会拦，别绕过） |
 | 生产接线的参考实现看 `examples/tenant-mgmt`（`productionProfile`）与 `examples/zmsaas`（Preflight + 池/积压指标） | 让示例停在上古手工接线（文档承诺、旗舰不用） |
 | 换 JWT 密钥走 `JwksKeyRing` + `setKeyring`（带 kid，新旧双验） | 直接改 secret 重启（全员强制重登；或留下无法验证的旧 token） |
-| outbox 用 `consumer.setMetrics` + `startPolling`；池/积压用 `metrics.setScrapeHook`；**运行时用 `Runtime.MetricsBridge` + `setScrapeHook`**（`messages_dropped` / `timer_lag_ms` 只在这里看得见，HTTP 侧完全无感；池化后还有 9 条 `zigmodu_runtime_pool_*`（阻塞池另有 9 条 `blocking_pool_*`，runtime 指标共 31 条），其中 `pool_claimed` / `pool_ready_push_failures` 是 `RuntimeStats` 里根本没有的读数） | 只盯 HTTP 指标（outbox 停投、池打满、邮箱打满、ticker 饿死在 HTTP 层完全看不见） |
+| outbox 用 `consumer.setMetrics` + `startPolling`；池/积压用 `metrics.setScrapeHook`；**运行时用 `Runtime.MetricsBridge` + `setScrapeHook`**（`messages_dropped` / `timer_lag_ms` 只在这里看得见，HTTP 侧完全无感；池化后还有 9 条 `zigmodu_runtime_pool_*`（阻塞池另有 9 条 `blocking_pool_*`），其中 `pool_claimed` / `pool_ready_push_failures` 是 `RuntimeStats` 里根本没有的读数；**公平性另有 6 条 `pool_wait_max_ms_*` / `pool_starvation_events_*`**（§12.17 的实测，`starvation_events` 必须恒0），runtime 指标共 **37 条**） | 只盯 HTTP 指标（outbox 停投、池打满、邮箱打满、ticker 饿死在 HTTP 层完全看不见） |
 | 新增 `pub` 导出的组件时，**同时**写一条真正实例化它的测试（调用链要打通，不只是 `@import`） | 只导出、没调用者 —— Zig 惰性分析函数体，签名过期/编译不过要等用户真正调用才炸（`LogRotator` 就这么烂了很久） |
 | 租户模型上声明 `pub const sql_tenant_column: ?[]const u8 = "tenant_id"`（`zmodu scaffold` 已默认生成）——隔离变成编译期强制 | 靠"记得调 `*ForTenant`"：无作用域变体在租户模型上照样跨租户返回 |
 | 跨租户是合法需求时写 `*Unscoped`（`findByIdUnscoped` …），让危险操作在代码里一眼可见 | 为了绕过守卫而删掉 `sql_tenant_column` 声明 |

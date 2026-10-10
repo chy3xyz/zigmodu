@@ -970,6 +970,29 @@ jobs:
           mkdir -p "$RUNNER_TEMP/nightly-logs"
           MIXED_OLD_REF=v0.38.0 MIXED_EXPECT=interop bash scripts/ci-mixed-version.sh 2>&1 | tee "$RUNNER_TEMP/nightly-logs/mixed-version-interop.log"
 
+      - name: Mixed-version cluster gate — rolling (two waves, quorum must survive)
+        # A-9's third shape, and the only one that exercises the transition
+        # rather than the endpoints. refuse and interop both end with a healthy
+        # cluster; neither proves the cluster stayed healthy *while* it was being
+        # replaced. This one runs the deploy a rolling upgrade actually is —
+        #
+        #   wave 1: 1 old + 2 new   → reach members=3 and one agreed leader
+        #   drain:   SIGTERM the old node; the two new ones must keep a leader
+        #   wave 2: 3 new          → a cluster that never had the old node
+        #
+        # The failure only this shape catches: new nodes that lean on the old
+        # node's vote. Wave 1 passes (the old node is there, so the count is 3),
+        # interop passes (its old node is up for the whole run) — and wave 2
+        # never elects. Verified to have teeth by mutation: forcing
+        # `wave1_survivors` false turns this gate red at the drain assertion.
+        #
+        # v0.39.9 as the old reference: the last release before this work, and a
+        # pair whose wire did not cut over (a rolling gate against v0.32.0 would
+        # legitimately refuse, which is `refuse` mode's job, not this one's).
+        run: |
+          mkdir -p "$RUNNER_TEMP/nightly-logs"
+          MIXED_OLD_REF=v0.39.9 MIXED_EXPECT=rolling bash scripts/ci-mixed-version.sh 2>&1 | tee "$RUNNER_TEMP/nightly-logs/mixed-version-rolling.log"
+
       - name: Fuzz (bounded)
         # `--fuzz` with no limit opens the webui and never exits, so the bound is
         # mandatory. It is also incompatible with `-Dtest-filter` (the filter

@@ -144,6 +144,17 @@ pub const SchedulerConfig = struct {
     /// pool_threads` and not from the workers alone. `1` (the default) is the
     /// Phase 1 shape: one thread, one consumer of the ring.
     pool_threads: usize = default_pool_threads,
+    /// The runtime's single source of time (D1: production code reads time only
+    /// through the injected `Clock`, so deterministic replay can drive it).
+    ///
+    /// The scheduler holds it for the fairness measurement (§12.17): a claim has
+    /// to know how long its class waited, and taking that reading from anything
+    /// but the injected clock would make the metric replay-dependent and the
+    /// determinism gate reject it. `.monotonic` in production; a test that needs
+    /// a specific wait injects `.manual` and advances it between announce and
+    /// claim — which is what makes the starvation counter testable without
+    /// sleeping.
+    clock: clock_mod.Clock = .monotonic,
     /// D3's starting point. `1` is the latency end (one message per claim, every
     /// message pays a ring round trip), the mailbox capacity the throughput end
     /// (one slow handler starves every other ready worker). 16 is a first
@@ -199,11 +210,38 @@ pub const Priority = enum(u8) {
 /// How many ready rings a scheduler carries — one per `Priority`.
 pub const priority_classes: usize = 3;
 
+/// A fresh all-zero counter array, one entry per `Priority`. Named because the
+/// fairness accumulators need it in three field defaults and an anonymous struct
+/// literal at each would repeat `.{ .{0} ** priority_classes }` three times.
+fn zeroCounters() [priority_classes]std.atomic.Value(u64) {
+    var out: [priority_classes]std.atomic.Value(u64) = undefined;
+    for (&out) |*slot| slot.* = std.atomic.Value(u64).init(0);
+    return out;
+}
+
 /// One turn in every `reservation_period` tries the classes low-first. The
 /// value is a constant rather than a knob on purpose (§12.9's discipline: a
 /// tuning parameter without a measurement behind it is a way to be wrong
 /// later, not a feature); §12.17's tests pin the bound it creates.
 pub const reservation_period: u64 = 8;
+
+/// How long one class may wait before a claim counts as a **starvation event**
+/// (§12.17). A wall-clock companion to `reservation_period`, which bounds the
+/// wait in *turns*.
+///
+/// Why this number and not another: the reservation guarantees a `.low` worker a
+/// turn once every `reservation_period` turns, and `idle_wait_ms = 1` is how long
+/// an empty pool thread parks — so a class that is *present* but never starved
+/// waits on the order of a few milliseconds. 50 ms is two orders of magnitude
+/// above that, which makes the counter a real alarm instead of a tripwire for
+/// ordinary scheduling jitter, while still firing long before any human notices
+/// a stalled worker.
+///
+/// **It is a constant for the same reason `reservation_period` is**: it is a
+/// measurement threshold, not a tuning knob. Changing it changes what the
+/// dashboard *says*, never what the scheduler *does* — so there is nothing to
+/// break and nothing to re-tune.
+pub const starvation_threshold_ms: i64 = 50;
 
 /// Phase 1's pool width, and the default: a runtime that declares a pool but not
 /// a width runs exactly one pool thread (docs/RUNTIME.md §12.12).
@@ -269,6 +307,26 @@ pub const Ready = struct {
     /// a worker can never drift into another class's queue. `.normal` is the
     /// class every worker had before the field existed.
     priority: Priority = .normal,
+    /// When this worker was announced into its ring, in the **injected clock's**
+    /// milliseconds (`SchedulerConfig.clock`; `0` = untimed).
+    /// Written by the announcing producer, read by the claiming pool thread and
+    /// then dropped — it is **not** part of the worker state, only of the wait
+    /// that led to this token (§12.17's fairness measurement).
+    ///
+    /// It lives on `Ready` rather than in a side table because the token and the
+    /// timestamp must not drift apart: a re-push after a claim miss overwrites
+    /// it with the new announce time, which is exactly the wait being measured.
+    /// `0` means "untimed" (a test pushed directly, without going through
+    /// `announce`), and such a sample is **skipped** rather than counted as a
+    /// zero wait — an untimed token must not look like a very fast one.
+    enqueued_at_ms: *std.atomic.Value(i64),
+    /// Whether `enqueued_at_ms` holds a real reading. **Not** encoded as "the
+    /// timestamp is non-zero": an injected `Clock.Manual` starts at 0, so a
+    /// legitimately-timed announce would read as untimed. A separate flag keeps
+    /// "measured at t=0" distinguishable from "never measured", which is exactly
+    /// the distinction a wait *maximum* needs — treating the first sample as
+    /// missing would silently drop it from the reading.
+    enqueued_stamped: *std.atomic.Value(bool),
 };
 
 /// Producer side of the ready hand-off: called after a successful
@@ -281,6 +339,19 @@ pub const Ready = struct {
 pub fn announce(item: Ready) void {
     if (item.queued.load(.acquire)) return;
     if (item.queued.swap(true, .acq_rel)) return;
+    // `enqueued_at_ms` is a *pointer* into the worker's own storage, exactly
+    // like `queued` and `claimed`, so the stamp lands on the original even though
+    // `item` here — and the copy `push` puts in the ring — are values. That is
+    // what makes the timestamp survive to the claim that measures it.
+    //
+    // Read through the **injected** clock (`SchedulerConfig.clock`), not
+    // `core/Time` directly — D1's rule, and `check-production.sh` enforces it.
+    // Keeping the timestamp out of `Clock.Manual`'s own accounting means a test
+    // that never advances the clock simply records no movement. A clock that
+    // goes backwards is handled on the reading side (`measureWait` drops a
+    // negative gap rather than poisoning an unsigned max).
+    item.enqueued_at_ms.store(item.scheduler.clock.nowMs(), .monotonic);
+    item.enqueued_stamped.store(true, .release);
     item.scheduler.push(item);
 }
 
@@ -458,16 +529,28 @@ pub const Scheduler = struct {
 
     allocator: std.mem.Allocator,
     io: std.Io,
+    /// See `SchedulerConfig.clock` — injected, never read from `core/Time` here.
+    clock: clock_mod.Clock = .monotonic,
     /// One ring per `Priority` (§12.17). All three are sized from the same
     /// declared bound — the admission limit is on workers *in total*, and every
     /// worker may legally be `.high`, so each class ring must independently
     /// satisfy the capacity invariant (one token per worker of that class, plus
     /// one per consumer inside `tryPop`).
     ready: [priority_classes]ReadyRing,
-    /// Scheduling turns taken, monotonically. The only consumer is the
-    /// reservation slot in `turn` (`n % reservation_period`); it is not a
-    /// statistic and is never reported.
+    /// Scheduling turns taken, monotonically. The only consumers are the
+    /// reservation slot in `turn` (`n % reservation_period`) and the fairness
+    /// measurement below (`turns_at_claim`, which turns the cadence into a
+    /// wall-clock-independent threshold for "this class waited longer than its
+    /// reservation promised").
     turns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Fairness accumulators (§12.17). Per class: the worst observed
+    /// announce→claim gap, how many claims produced a sample, and how often the
+    /// reservation slot's bound was violated. `wait_max_ms` is updated with a
+    /// CAS loop rather than a store because several pool threads may claim from
+    /// different classes at once and only the *maximum* must win.
+    wait_max_ms: [priority_classes]std.atomic.Value(u64) = zeroCounters(),
+    wait_samples: [priority_classes]std.atomic.Value(u64) = zeroCounters(),
+    starvation_events: [priority_classes]std.atomic.Value(u64) = zeroCounters(),
     /// The declared bound the rings' capacity was derived from.
     max_pooled_workers: usize,
     /// How many pool threads this scheduler runs, and how many of them consume
@@ -562,6 +645,7 @@ pub const Scheduler = struct {
             .pool_threads = threads_n,
             .batch = config.batch,
             .threads = threads,
+            .clock = config.clock,
         };
         return self;
     }
@@ -613,6 +697,30 @@ pub const Scheduler = struct {
         /// §12.17's reservation slot bounds). Published as per-class gauges by
         /// the MetricsBridge.
         ready_len_by_class: [priority_classes]usize,
+        /// Fairness measurement (§12.17), indexed by `@backingInt(Priority)` like
+        /// `ready_len_by_class`. **Measurement only — this does not change which
+        /// class is served next**: the reservation slot's cadence is still the
+        /// whole scheduling policy. What these answer is the question
+        /// `ready_len_by_class` cannot: "how long did a class wait", not just "who
+        /// is queued".
+        ///
+        /// * `wait_max_ms` — the worst observed announce→claim gap in that class,
+        ///   ever. A per-class *max* rather than a mean because the failure mode
+        ///   §12.17 exists to prevent is a single long wait hiding inside a healthy
+        ///   average, and an average would hide exactly that.
+        /// * `wait_samples` — how many claims contributed a timing sample. A claim
+        ///   whose announce stamp was unreadable (`0`) is **skipped**, not counted
+        ///   as a zero wait, so `wait_samples < dispatches` is normal under an
+        ///   injected clock and only means "some samples were unavailable".
+        /// * `starvation_events` — claims of a `.low` class worker that had to wait
+        ///   **more than `reservation_period` turns' worth of opportunity**, i.e.
+        ///   the reservation slot failed to bound its wait in this window. `0` is
+        ///   the property §12.17's tests assert; a nonzero reading says the bound
+        ///   was violated in the field, which is exactly what this counter exists to
+        ///   make visible.
+        wait_max_ms: [priority_classes]u64,
+        wait_samples: [priority_classes]u64,
+        starvation_events: [priority_classes]u64,
     };
 
     pub fn deinit(self: *Self) void {
@@ -750,6 +858,21 @@ pub const Scheduler = struct {
             // rings could exceed it legitimately.
             .ready_high_water = @max(self.ready[0].high_water.load(.monotonic), @max(self.ready[1].high_water.load(.monotonic), self.ready[2].high_water.load(.monotonic))),
             .ready_len_by_class = .{ self.ready[0].len(), self.ready[1].len(), self.ready[2].len() },
+            .wait_max_ms = .{
+                self.wait_max_ms[0].load(.monotonic),
+                self.wait_max_ms[1].load(.monotonic),
+                self.wait_max_ms[2].load(.monotonic),
+            },
+            .wait_samples = .{
+                self.wait_samples[0].load(.monotonic),
+                self.wait_samples[1].load(.monotonic),
+                self.wait_samples[2].load(.monotonic),
+            },
+            .starvation_events = .{
+                self.starvation_events[0].load(.monotonic),
+                self.starvation_events[1].load(.monotonic),
+                self.starvation_events[2].load(.monotonic),
+            },
         };
     }
 
@@ -903,8 +1026,45 @@ pub const Scheduler = struct {
             }
             _ = self.dispatches.fetchAdd(1, .monotonic);
             _ = self.claimed.fetchAdd(1, .monotonic);
+            self.measureWait(item);
             self.runOne(item);
             return .ran;
+        }
+    }
+
+    /// Fairness measurement (§12.17): fold one claim's announce→claim gap into
+    /// this class's accumulators. **Measurement only** — it decides nothing about
+    /// what runs next.
+    ///
+    /// Called with the claim held, so `enqueued_at_ms` still holds this token's
+    /// timestamp: the value is overwritten by the next `announce`/`push`, which
+    /// happens after this frame. It is cleared to `0` first so a hand-back that
+    /// re-pushes *without* going through `announce` cannot be measured against a
+    /// stale stamp.
+    fn measureWait(self: *Self, item: Ready) void {
+        const class = @backingInt(item.priority);
+        // Order matters: the flag is cleared *after* the timestamp is taken, so
+        // an announce that lands between the two cannot leave a stamped flag
+        // pointing at a stale timestamp — it would be counted as a wait that
+        // started before the last claim.
+        if (!item.enqueued_stamped.swap(false, .acq_rel)) return;
+        const then = item.enqueued_at_ms.load(.monotonic);
+
+        const now = self.clock.nowMs();
+        // A monotonic clock cannot go backwards, but a *manual* one (or a clock
+        // that wrapped) can produce a negative gap. Counting that as a wait would
+        // poison `wait_max_ms` with a huge unsigned value, so it is dropped.
+        const waited = now - then;
+        if (waited < 0) return;
+        const w: u64 = @intCast(waited);
+
+        _ = self.wait_samples[class].fetchAdd(1, .monotonic);
+        if (w > starvation_threshold_ms) {
+            _ = self.starvation_events[class].fetchAdd(1, .monotonic);
+        }
+        var cur = self.wait_max_ms[class].load(.monotonic);
+        while (w > cur) {
+            cur = self.wait_max_ms[class].cmpxchgWeak(cur, w, .monotonic, .monotonic) orelse break;
         }
     }
 
@@ -1022,12 +1182,16 @@ const FakeWorker = struct {
     /// same `ready()` a test overrides by hand, so the field — not the call
     /// site — decides where every token of this worker lands (§12.17).
     priority: Priority = .normal,
+    enqueued_at_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    enqueued_stamped: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     fn ready(self: *@This()) Ready {
         return .{
             .scheduler = self.scheduler,
             .ctx = @ptrCast(self),
             .claimed = &self.claimed,
+            .enqueued_at_ms = &self.enqueued_at_ms,
+            .enqueued_stamped = &self.enqueued_stamped,
             .queued = &self.queued,
             .dispatch = dispatch,
             .pending = pending,
@@ -1506,6 +1670,88 @@ test "scheduler (§12.17): the reservation slot bounds a low token's wait behind
     try std.testing.expectEqual(@as(usize, 0), sched.readyLen());
 }
 
+test "scheduler (§12.17 fairness): the measurement records a wait, and a past-threshold wait counts as starvation" {
+    // Driven by an injected `Clock.Manual` (D1 — production reads time only
+    // through the injected clock, and `check-production.sh` enforces it), so the
+    // wait is **exact** rather than slept for. That is what makes the counter
+    // testable at all: a wall-clock test could only ever show "some wait
+    // happened", never the boundary.
+    var manual = clock_mod.Clock.Manual{};
+    var sched = try testScheduler(.{
+        .max_pooled_workers = 2,
+        .batch = 1,
+        .clock = manual.clock(),
+    });
+    defer sched.deinit();
+
+    // Announce at t=0, then claim at t=5: a wait inside the threshold. Under
+    // threshold → a sample, a max, and **no** starvation event.
+    var low = FakeWorker{};
+    low.scheduler = sched;
+    low.priority = .low;
+    low.produce(1);
+    manual.advance(5);
+
+    try std.testing.expect(sched.step());
+    {
+        const st = sched.stats();
+        try std.testing.expectEqual(@as(u64, 1), st.wait_samples[@backingInt(Priority.low)]);
+        try std.testing.expectEqual(@as(u64, 5), st.wait_max_ms[@backingInt(Priority.low)]);
+        try std.testing.expectEqual(@as(u64, 0), st.starvation_events[@backingInt(Priority.low)]);
+        // The stamp is *consumed* by the measurement, so a second claim cannot
+        // inherit the first one's wait: the flag is cleared, not merely read.
+        try std.testing.expect(!low.enqueued_stamped.load(.monotonic));
+    }
+
+    // A wait past the threshold is a starvation event. The number is chosen from
+    // the same constant the measurement uses rather than hardcoded, so changing
+    // the threshold cannot leave this test asserting a stale boundary.
+    var low2 = FakeWorker{};
+    low2.scheduler = sched;
+    low2.priority = .low;
+    low2.produce(2);
+    manual.advance(starvation_threshold_ms + 1);
+
+    try std.testing.expect(sched.step());
+    {
+        const st = sched.stats();
+        const c = @backingInt(Priority.low);
+        try std.testing.expectEqual(@as(u64, 2), st.wait_samples[c]);
+        // The max keeps the worst reading, it does not average.
+        try std.testing.expectEqual(@as(u64, @intCast(starvation_threshold_ms + 1)), st.wait_max_ms[c]);
+        try std.testing.expectEqual(@as(u64, 1), st.starvation_events[c]);
+    }
+
+    // Per class, not aggregate: the high class never waited, so its counters
+    // must still read zero. A single shared accumulator would show 1 here.
+    const sh = sched.stats();
+    try std.testing.expectEqual(@as(u64, 0), sh.wait_samples[@backingInt(Priority.high)]);
+    try std.testing.expectEqual(@as(u64, 0), sh.starvation_events[@backingInt(Priority.high)]);
+    try std.testing.expectEqual(@as(u64, 0), sh.wait_max_ms[@backingInt(Priority.high)]);
+}
+
+test "scheduler (§12.17 fairness): an untimed token is skipped, not counted as a zero wait" {
+    // `push` called directly bypasses `announce`, so the stamp stays 0. That
+    // sample must be **skipped** rather than recorded as "waited 0 ms" — an
+    // untimed token must not look like a very fast one, or the max would report
+    // the measurement's blind spot as its best observation.
+    var sched = try testScheduler(.{ .max_pooled_workers = 2 });
+    defer sched.deinit();
+
+    var low = FakeWorker{};
+    low.scheduler = sched;
+    var r = low.ready();
+    r.priority = .low;
+    sched.push(r); // no announce → no stamp
+
+    try std.testing.expect(sched.step());
+    const st = sched.stats();
+    try std.testing.expectEqual(@as(u64, 0), st.wait_samples[@backingInt(Priority.low)]);
+    try std.testing.expectEqual(@as(u64, 0), st.wait_max_ms[@backingInt(Priority.low)]);
+    // The dispatch still happened — skipping the *sample* must not skip the work.
+    try std.testing.expectEqual(@as(usize, 1), low.dispatches);
+}
+
 test "scheduler (§12.17): a claim-miss re-push keeps the token in its own class" {
     var sched = try testScheduler(.{ .max_pooled_workers = 2 });
     defer sched.deinit();
@@ -1550,12 +1796,21 @@ test "scheduler (§12.17): a claim-miss re-push keeps the token in its own class
 /// none of the worker machinery behind it. These tests exercise the ring, and a
 /// ring hands back values, not workers: nothing here dereferences `scheduler`,
 /// `dispatch` or `pending`.
+/// The slot every numbered token shares for `enqueued_at_ms`. One cell for all
+/// of them is fine: these tests drive the **ring**, not `turn()`, so
+/// `measureWait` — the only reader — never runs. Per-token identity is carried
+/// by `ctx`, which is what these tests assert on.
+var numbered_enqueued = std.atomic.Value(i64).init(0);
+var numbered_enqueued_stamped = std.atomic.Value(bool).init(false);
+
 fn numberedToken(id: usize) Ready {
     return .{
         .scheduler = undefined,
         .ctx = @ptrFromInt(id + 1), // the id is the payload
         .claimed = &numbered_claimed,
         .queued = &numbered_queued,
+        .enqueued_at_ms = &numbered_enqueued,
+        .enqueued_stamped = &numbered_enqueued_stamped,
         .dispatch = numberedDispatch,
         .pending = numberedPending,
     };
@@ -1928,6 +2183,8 @@ const LiveFake = struct {
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     overlaps: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     received: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    enqueued_at_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    enqueued_stamped: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     fn ready(self: *@This()) Ready {
         return .{
@@ -1935,6 +2192,8 @@ const LiveFake = struct {
             .ctx = @ptrCast(self),
             .claimed = &self.claimed,
             .queued = &self.queued,
+            .enqueued_at_ms = &self.enqueued_at_ms,
+            .enqueued_stamped = &self.enqueued_stamped,
             .dispatch = dispatch,
             .pending = pending,
         };

@@ -618,6 +618,21 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         /// ring. "At most one token per worker" is what bounds the ring's
         /// occupancy, and therefore what makes a push infallible (D4).
         queued: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        /// `.pooled` only: when this worker was last announced into its ready
+        /// ring, in `core.Time`'s monotonic ms. `0` = untimed.
+        ///
+        /// Owned here rather than inside `scheduler_mod.Ready` because that is
+        /// copied by value (twice per announce: once by value, once into the
+        /// ring) and an atomic *value* field would give each copy its own
+        /// storage — the claim would read a different cell than the announce
+        /// wrote. A pointer keeps every copy pointed at this one, exactly like
+        /// `claimed`/`queued` above. Written by `announce`, consumed and cleared
+        /// by the claim's fairness measurement (§12.17).
+        enqueued_at_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+        /// Whether `enqueued_at_ms` holds a reading. Separate because an
+        /// injected `Clock.Manual` legitimately starts at 0, so "the timestamp
+        /// is non-zero" cannot mean "timed" (see `scheduler.zig`).
+        enqueued_stamped: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         /// `.pooled` only: set when the worker's lifecycle started on the pool
         /// thread (`init` ran, or was attempted). A pooled worker has no thread
         /// that starts at `spawn`, so this is what the destroy path reads to
@@ -1806,6 +1821,8 @@ pub const Runtime = struct {
                 .ctx = @ptrCast(handle),
                 .claimed = &handle.claimed,
                 .queued = &handle.queued,
+                .enqueued_at_ms = &handle.enqueued_at_ms,
+                .enqueued_stamped = &handle.enqueued_stamped,
                 .dispatch = pooledDispatch(W, H),
                 .pending = pooledPending(H),
                 .priority = priority,
@@ -2159,6 +2176,19 @@ pub const Runtime = struct {
             blocking_pool_ready_len_normal: *MetricsT.Gauge,
             blocking_pool_ready_len_low: *MetricsT.Gauge,
 
+            /// Fairness measurement (§12.17), one pair per priority class.
+            /// `wait_max_ms` answers the question `pool_ready_len_*` cannot —
+            /// "how *long* did this class wait", not just "who is queued".
+            /// `starvation_events` must stay 0: it counts claims that outwaited
+            /// `starvation_threshold_ms`, i.e. the reservation slot's bound was
+            /// violated in the field.
+            pool_wait_max_ms_high: *MetricsT.Gauge,
+            pool_wait_max_ms_normal: *MetricsT.Gauge,
+            pool_wait_max_ms_low: *MetricsT.Gauge,
+            pool_starvation_events_high: *MetricsT.Gauge,
+            pool_starvation_events_normal: *MetricsT.Gauge,
+            pool_starvation_events_low: *MetricsT.Gauge,
+
             /// Registers the gauges. Startup-time call: if a later `createGauge`
             /// fails, the earlier ones stay registered in `metrics`.
             pub fn init(rt: *Runtime, metrics: *MetricsT) !Bridge {
@@ -2195,6 +2225,12 @@ pub const Runtime = struct {
                     .blocking_pool_ready_len_high = try metrics.createGauge("zigmodu_runtime_blocking_pool_ready_len_high", "High-priority blocking ready-ring occupancy: .priority = .high blocking workers waiting for a blocking thread"),
                     .blocking_pool_ready_len_normal = try metrics.createGauge("zigmodu_runtime_blocking_pool_ready_len_normal", "Normal-priority blocking ready-ring occupancy: blocking workers waiting for a blocking thread"),
                     .blocking_pool_ready_len_low = try metrics.createGauge("zigmodu_runtime_blocking_pool_ready_len_low", "Low-priority blocking ready-ring occupancy: drained by the reservation slot (§12.17), so a persistent nonzero here is expected under load, not a bug"),
+                    .pool_wait_max_ms_high = try metrics.createGauge("zigmodu_runtime_pool_wait_max_ms_high", "Worst observed announce-to-claim wait for a .high pooled worker, in ms. Measurement only: it reports, it does not schedule. 0 until at least one .high claim is timed"),
+                    .pool_wait_max_ms_normal = try metrics.createGauge("zigmodu_runtime_pool_wait_max_ms_normal", "Worst observed announce-to-claim wait for a .normal pooled worker, in ms. Measurement only: it reports, it does not schedule. 0 until at least one .normal claim is timed"),
+                    .pool_wait_max_ms_low = try metrics.createGauge("zigmodu_runtime_pool_wait_max_ms_low", "Worst observed announce-to-claim wait for a .low pooled worker, in ms. This is the reading that says whether the reservation slot (§12.17) actually bounds the wait; a large or growing value means it is not bounding it"),
+                    .pool_starvation_events_high = try metrics.createGauge("zigmodu_runtime_pool_starvation_events_high", "Claims of a .high worker that waited longer than starvation_threshold_ms. Must stay 0 under the reservation slot; a nonzero reading means a .high worker was starved past the bound"),
+                    .pool_starvation_events_normal = try metrics.createGauge("zigmodu_runtime_pool_starvation_events_normal", "Claims of a .normal worker that waited longer than starvation_threshold_ms. Must stay 0 under the reservation slot; a nonzero reading means a .normal worker was starved past the bound"),
+                    .pool_starvation_events_low = try metrics.createGauge("zigmodu_runtime_pool_starvation_events_low", "Claims of a .low worker that waited longer than starvation_threshold_ms. The counter §12.17's tests assert stays 0; nonzero here means the bound the reservation slot is supposed to provide was violated in the field"),
                 };
             }
 
@@ -2248,6 +2284,17 @@ pub const Runtime = struct {
                 // (docs/RUNTIME.md §12.17): indexed by `@backingInt(Priority)`
                 // — high = 0, normal = 1, low = 2.
                 self.pool_ready_len_high.set(@floatFromInt(if (p) |x| x.ready_len_by_class[0] else 0));
+                // Fairness (§12.17). Published per class, and deliberately
+                // **absent** when the runtime has no pool at all: `poolStats`
+                // returns null there, so the gauges read 0 rather than absent —
+                // the same "report 0, not a missing line" rule the pool gauges
+                // above follow (§8).
+                self.pool_wait_max_ms_high.set(@floatFromInt(if (p) |x| x.wait_max_ms[0] else 0));
+                self.pool_wait_max_ms_normal.set(@floatFromInt(if (p) |x| x.wait_max_ms[1] else 0));
+                self.pool_wait_max_ms_low.set(@floatFromInt(if (p) |x| x.wait_max_ms[2] else 0));
+                self.pool_starvation_events_high.set(@floatFromInt(if (p) |x| x.starvation_events[0] else 0));
+                self.pool_starvation_events_normal.set(@floatFromInt(if (p) |x| x.starvation_events[1] else 0));
+                self.pool_starvation_events_low.set(@floatFromInt(if (p) |x| x.starvation_events[2] else 0));
                 self.pool_ready_len_normal.set(@floatFromInt(if (p) |x| x.ready_len_by_class[1] else 0));
                 self.pool_ready_len_low.set(@floatFromInt(if (p) |x| x.ready_len_by_class[2] else 0));
                 self.blocking_pool_ready_len_high.set(@floatFromInt(if (bp) |x| x.ready_len_by_class[0] else 0));
@@ -8580,4 +8627,34 @@ test "Pooled (§12.17): a saturated high/normal/low mix — shares and the laten
     //    to be caught; what a live run can assert is the reservation floor
     //    above.
     try std.testing.expect(handled[2] >= 1_000);
+
+    // ---- Fairness measurement (§12.17) on the same live mix ---------------
+    // Asserted on the reading the new gauges exist to expose, so the metrics are
+    // pinned by a test that runs real traffic rather than only a synthetic ring.
+    //
+    // What is asserted, and why nothing stronger:
+    //
+    // * `wait_samples > 0` — the measurement is *live*. A run where every claim
+    //   was untimed (a clock read skipped, a path that bypasses `announce`) would
+    //   otherwise report `wait_max_ms = 0` and look identical to "nobody waited".
+    // * `wait_max_ms` per class — asserted to be a sane non-negative reading and
+    //   **bounded by the threshold the starvation counter uses**. Not asserted
+    //   against a fixed number: the wait is host-dependent (this suite has been
+    //   bitten three times by macOS runners reporting 2–3x the local value), and a
+    //   wall-clock assertion here would be a flaky test, not a contract.
+    // * `starvation_events == 0` per class — **this is the real contract**. The
+    //   reservation slot promises a bounded wait; the counter firing means the
+    //   bound was violated in the field, which is precisely the regression the
+    //   dashboard is meant to surface. Under this mix the low class is served
+    //   every `reservation_period`-th turn, so 0 is the property — not a hope.
+    //
+    // If a host is so slow that a class genuinely waits past 50 ms, this fails
+    // and the message says so: that is a real reading about a starved worker, not
+    // a flaky assertion. The threshold is a constant precisely so that firing it
+    // means something.
+    for (0..scheduler_mod.priority_classes) |c| {
+        try std.testing.expect(pool.wait_samples[c] > 0);
+        try std.testing.expect(pool.wait_max_ms[c] <= @as(u64, @intCast(scheduler_mod.starvation_threshold_ms)));
+        try std.testing.expectEqual(@as(u64, 0), pool.starvation_events[c]);
+    }
 }

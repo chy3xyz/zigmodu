@@ -171,7 +171,7 @@ Opt-in via `app.runtime()`. Spec: [docs/RUNTIME.md](docs/RUNTIME.md) · runnable
   bytes* through a caller-supplied `Codec(E)`. Still out of scope, on purpose: a CLI,
   retention/compaction, encryption, cross-process transport
 - **Runtime metrics** — `RuntimeStats` + `MetricsBridge` publishes **31**
-  `zigmodu_runtime_*` gauges (13 general + 9 CPU pool + 9 blocking pool); drops, timer lag
+  `zigmodu_runtime_*` gauges (13 general + 9 CPU pool + 9 blocking pool + 6 fairness); drops, timer lag
   and pool depth are invisible from the HTTP side
 - **Worker trace context** — `sendTraced` / `sendBlockingTraced` carry a 16-byte
   `TraceId` **in the mailbox slot** (no allocation, no shared producer state); the
@@ -204,7 +204,7 @@ rather than half-built; the list is in [RUNTIME.md](docs/RUNTIME.md) §12.7.
 | | |
 |---|---|
 | Version | `0.39.x` — **all 99 releases so far are 0.x.** No LTS, no backport commitment |
-| Feature surface | **Frozen** until 1.0 — defects, evidence, docs only ([AGENTS.md §发布节奏](AGENTS.md)) |
+| Feature surface | **Frozen** until 1.0 — defects, evidence, docs only (see AGENTS.md "Release cadence") |
 | Breaking changes | **None accepted** before 1.0 (historically 6 / 99 releases) |
 | Audit | **None.** Every "done" here came from the same maintainers and their AI agents (see "Self-assessed" below) |
 | Contributors | Single owner; **0 outside PRs** — see [GOVERNANCE.md](GOVERNANCE.md) for the honest current numbers |

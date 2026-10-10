@@ -707,7 +707,20 @@ rec.replay(&manual, &harness, Harness.sink);         // 按 seq 推进 clock，�
 > 12.1–12.9 是设计原文，原样保留作为决策记录；**12.10 记 Phase 1 的落地结果**，
 > **12.11 记 Phase 1 发出去之后修掉的四处缺陷**，**12.12 记 Phase 2**（多消费者环、线程集合、
 > 宽度声明、以及实测数字）。
-> **仍未做**：公平性加权（**加权**没做；"会不会饿死"已在 §12.16 实测并钉住：等待 = 一个 batch）、
+> **仍未做**：公平性加权（**加权旋钮没做**，第 158 批只做了"测量"那半，见下）；"会不会饿死"已在 §12.16 实测并钉住：等待 = 一个 batch。
+>
+> **第158 批补上的正是这个"没有测量就不加旋钮"所缺的那一半**：`pool_wait_max_ms_{high,normal,low}`
+> 与 `pool_starvation_events_{high,normal,low}` 六条 gauge（`MetricsBridge`，runtime 指标 31 → 37），
+> 读的是 announce→claim 的等待，按 `Priority` 分三类。三个口径值得记：
+>
+> - **`wait_max_ms` 是per-class 的最大值，不是均值** —— 要防的失效正是"一次长等待藏在健康的平均里"。
+> - **`wait_samples` 记录样本数**，未打时间戳的 token（直接 `push`、绕过 `announce`）被**跳过而非记为 0**：
+>   未计时不能看起来像"跑得很快"。判定靠独立的 `enqueued_stamped` 标志位，
+>   因为注入的 `Clock.Manual` 从 0 开始，用"非零"表示"已计时"会丢掉第一个样本。
+> - **`starvation_events` 必须恒0** —— 它数的是"等待超过 `starvation_threshold_ms`（50）的 claim"，
+>   即保留槽承诺的界被**在野外**违反。这是 §12.17 那批测试钉的性质，现在被仪表盘照到了。
+>
+> **旋钮仍不做** —— 但理由变了：不再是"没有测量"，而是"先看真实读数再决定要不要调"。
 > `batch` 的实测调优（**已在 §12.16 收口：结论是保持 16**）、affinity 的**声明**（`spawn` 上的字段；
 > §12.7 的复核记了为什么它卡在"dedicated 路径没有启动握手"，以及原语 `runtime.pinCurrentThread` 已落地）。
 

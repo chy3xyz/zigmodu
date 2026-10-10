@@ -205,6 +205,75 @@ star 是许愿，承载是使用。但**总分 68 不变**（新增"真实承载
 新增 issue 模板已用 YAML 解析器验证为**单文档**且字段完整；
 全部新增相对链接已脚本校验可达。
 
+### 第 159 批：A-6 公平性测量落地 + A-9 混合版本第三形状（rolling）+ 上游 .paths 补全（**破坏性：否；新增 6 条 gauge + 2 条测试**）
+
+执行 `docs/EVALUATION_2026-10.md` §七的 S5，并顺手补上第 158 批末尾发现的 `build.zig.zon`
+`.paths` 缺失。**未做 S6（affinity 到 `spawn` / NUMA）—— 理由见下第3 条，本批明确判定为不可做。**
+
+**1. A-6 公平性：只加测量，不动调度（→ 运行时 85 → 92）**
+
+`reservation_period` 当初被刻意设为常数，理由是「**没有测量支撑的调参参数是以后变错的方式**」。
+本批补上正缺的这一半—— 六条新gauge（`MetricsBridge`，runtime 指标 **31 → 37**）：
+
+- `pool_wait_max_ms_{high,normal,low}` —— announce→claim 等待的**per-class 最大值**
+- `pool_starvation_events_{high,normal,low}` —— 等待超过 `starvation_threshold_ms`（50ms）的 claim 数，
+  **必须恒 0**：它数的是保留槽承诺的界**在野外**被违反
+
+三个刻意的口径：
+
+- **max 而非均值** —— 要防的失效正是"一次长等待藏在健康的平均里"。
+- **未计时样本被跳过，不记为 0** —— 直接 `push`（绕过 `announce`）的 token 没有时间戳，
+  未计时不能看起来像"跑得很快"。这靠独立的 `enqueued_stamped` 标志位判定：
+  **第一版用"时间戳非零"当已计时是错的**，因为注入的 `Clock.Manual` 从 0 开始，
+  会把第一个样本误判为未计时（实测 `wait_samples` 得 0 而非 1 才暴露出来）。
+- **时钟走注入而非直读 `core/Time`** —— D1 门禁（`check-production.sh`）当场拦下了直读，
+  于是 `SchedulerConfig` 新增 `clock: Clock`（默认 `.monotonic`）。
+  副作用是好的：Manual 时钟让阈值**可确定性地测**，不用 sleep。
+
+**旋钮仍不做**，但理由变了：不再是"没有测量"，而是"先看真实读数再决定"。
+
+**2. A-9 混合版本第三形状：rolling（两波滚动升级）**
+
+`scripts/ci-mixed-version.sh` 新增 `MIXED_EXPECT=rolling`，已挂进夜间 CI
+（`ci.yml`，对 v0.39.9）。**前两种形状都无法证伪的失效，它能抓**：
+
+- wave 1：1 旧 + 2 新 → 到 `members=3`、三方同意一个 leader
+- **drain：SIGTERM 旧节点（不是 SIGKILL）→ 两个幸存者必须仍能保住 leader**
+- wave 2：全新 3 新节点 → 独立选主 + 复制
+
+只有它能抓的是"**新节点一直在靠旧节点的票数**"：wave 1 会过（旧节点在，票数就是 3），
+interop 也会过（它的旧节点全程都在），而 wave 2 永远选不出主。
+
+**变异验证**（断言有牙齿）：把 `wave1_survivors` 改成恒假 → 门禁在drain 断言处变红
+（`FAIL — timeout (40s) waiting for: rolling: the two new nodes keep a leader after the old node leaves`）。
+**正向实跑通过**：wave 1 leader `mv-b`、旧节点离开后仍为 `mv-b`、log len 4、wave 2 leader `mv-b`。
+
+**3. S6（affinity 到 `spawn` / NUMA）判定为不可做，本批不做**
+
+子代理实测Zig 0.17 pinned stdlib：`SetThreadAffinityMask` / `thread_policy_set` /
+`cpuset_setaffinity` / `pthread_setaffinity_np` **零命中**——std 只有 `KAFFINITY` 这个**形状**、
+没有函数。而 `src/runtime/affinity.zig:9` 已实测记录：本机 Darwin 上连Mach 的
+`THREAD_AFFINITY_POLICY` hint 都被内核拒绝（`46 = KERN_NOT_SUPPORTED`）。
+加上「pin 失败要大声失败」需要父子启动握手（`runtime.zig:33-41` 已论证该阻塞）——
+**在没有binding 的平台上接线一个只会返回 `error.Unsupported` 的字段，是新增一个不工作的旋钮**。
+故S6 保持在路线图上但**标为不可做**，而不是假装能做。
+
+**4. 上游 `build.zig.zon` `.paths` 补全（下游可构建性）**
+
+`.paths` 此前只有 5 项，**拉下来的包跑不了自己的 `zig build`**：
+
+- `scripts` 是**硬依赖** —— `build.zig:150`用 `b.path("scripts/test-runner.zig")` 作module root，
+  缺了它连 `zig build test` 都编译不了
+- `docs` —— `zig build docs`、DocSnippets 测试与门禁脚本都要读
+- `examples/basic` —— README 快速开始引用的最小示例（其余示例各自独立打包，从源码取）
+
+本仓作为库依赖时不受影响（`addModule` 不编译那些 target），但**任何 clone 这个包来构建的人
+都会踩到**。已补齐并逐项校验存在性。
+
+**验证**：`--force-run` 全量 **2321/2384 passed, skipped=63, binaries=8**（+3 测试）；
+`check-production: OK` · `check-deadcode: OK (32/0)` · `check-test-collection: 9/2193 OK`；
+`zig fmt` clean；`ci.yml` / 两个 issue 模板 YAML 均经解析器验证；rolling 形状本地实跑 + 变异变红各一次。
+
 ## [0.39.10] - 2026-10-10
 
 ### 第 153 批：集群安全四审计项（A-1/A-3/A-4/B-11）残留收尾（**破坏性：否；一处行为变化**）
