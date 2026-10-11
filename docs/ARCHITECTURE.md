@@ -33,6 +33,47 @@ A module in ZigModu is:
 
 ## System Architecture
 
+### 源码子系统和文档的对应（`src/` → 文档）
+
+`src/` 下有 30+ 个目录，但本文原先只提到 3 个。下面这张表把**每个子系统**
+指到**该读哪份文档**，免得读者在 44 份文档里猜。
+
+| `src/` 子系统 | 读这份 |
+|---------------|--------|
+| `runtime/` `scheduler/` `pool/` | [RUNTIME.md](RUNTIME.md) —— 执行面：worker / 邮箱 / 池 / 优先级 / 监督 / 公平性 / 37 条指标 |
+| `api/` `http/` | [ROUTE_TABLE.md](ROUTE_TABLE.md) · [ARCHITECTURE.md](ARCHITECTURE.md) · 背压与超时默认值见 [RUNTIME.md](RUNTIME.md) |
+| `core/` | 基础设施原语（Time / EventBus / WAL / 分代工具）；契约散见 [RUNTIME.md](RUNTIME.md) 与 [DISTRIBUTED.md](DISTRIBUTED.md) |
+| `cluster/` `im/` `security/`（传输层） | [DISTRIBUTED.md](DISTRIBUTED.md) —— Raft / 总线 / 成员 / 传输加密边界 |
+| `data/` `sqlx/` `persistence/` | [SQLX_DRIVERS.md](SQLX_DRIVERS.md) · [MODULE_LAYERS.md](MODULE_LAYERS.md) |
+| `migration/` | **文档缺失**：见下方 §未成文的子系统 |
+| `tenant/` `datapermission/` | 本文 §Multi-Tenancy（`ShardRouter` 分片见该节） |
+| `observability/` `metrics/` `tracing/` `log/` | [OBSERVABILITY.md](OBSERVABILITY.md) · [LOGGING.md](LOGGING.md) |
+| `resilience/` | [BEST_PRACTICES.md](BEST_PRACTICES.md) §韧性原语（断路器/限流/隔离舱/**自适应卸压**） |
+| `ai/` | [AI_DEV_GUIDE.md](AI_DEV_GUIDE.md) · [AI_ORCHESTRATION.md](AI_ORCHESTRATION.md) · [MCP.md](MCP.md) · [AI_BOUNDARY.md](AI_BOUNDARY.md) |
+| `extensions/` | [FRAMEWORK_BACKLOG.md](FRAMEWORK_BACKLOG.md)（多数仍在计划中） |
+| `secrets/` `cache/` `kit/` `validation/` `config/` `di/` | **文档缺失**：见下方 §未成文的子系统 |
+| `web4/` | [WEB4.md](WEB4.md) —— DID 身份 + x402 |
+| `messaging/` | [AI_ORCHESTRATION.md](AI_ORCHESTRATION.md)（outbox 消费端接线见 AGENTS.md） |
+| `test/` | 各文档的测试约定；`examples/` 见 [QUICK-START.md](QUICK-START.md) |
+
+#### 未成文的子系统
+
+下列目录**有实现、有导出、但没有任何文档描述它们**。这里先记下事实，
+避免读者以为"没文档 = 没有"：
+
+| 子系统 | 已导出的主要类型 | 备注 |
+|--------|-----------------|------|
+| `src/migration/` | `MigrationRunner` `MigrationEntry` `AppliedMigration` `MigrationStatus` `MigrationStatusEntry` `MigrationLoader` | **命名冲突**：仓库里的 `API-MIGRATION.md` / `MIGRATION_v04_to_v07.md` 说的是**API** 迁移，不是数据库迁移，容易搜不到 |
+| `src/secrets/` | `SecretsManager` `SecretsSourcePriority` | 未成文 |
+| `src/cache/` | `CacheManager` `CacheAside` | 未成文 |
+| `src/config/` | `ConfigLoader` `ConfigManager` `ModuleConfig` `ExternalizedConfig` `TomlLoader` `TomlParser` | 未成文；配置键散落在各文档 |
+| `src/validation/` | `Validator` `FieldRules` `Violations` `Violation` `Result` | 未成文 |
+| `src/di/` | `Container` `ScopedContainer` | [EVENTS_DI.md](EVENTS_DI.md) 只覆盖 EventBus 侧 |
+| `src/kit/` | 格式化辅助（`formatDuration` / `formatFileSize` / `formatNumber` / `validateDepth`） | 未成文；均为内部辅助函数 |
+
+> 这一节是**缺口清单，不是接口文档**——照着 `src/` 读签名之前，
+> 请以代码为准；上表只告诉你"这里有东西"。
+
 ### High-Level Design
 
 ```
@@ -487,10 +528,40 @@ CLI（报告+可选失败）跨模块直接 import 的纠缠     → doctor 的 
 |------|------|----------|
 | `TenantContext` | `src/tenant/TenantContext.zig` | 请求级租户 ID；`setTenantColumn("app_id")` 可改 SQL 列名（默认 `tenant_id`） |
 | `TenantInterceptor` | `src/tenant/TenantInterceptor.zig` | ORM/SQL 自动追加 `{tenant_column} = ?` |
-| `ShardRouter` | `src/tenant/ShardRouter.zig` | 按租户路由到不同 DB 分片 |
+| `ShardRouter` | `src/tenant/ShardRouter.zig` | 按租户路由到不同 DB 分片（见下） |
 | `DataPermission` | `src/datapermission/` | 行级数据权限（与 RBAC 配合） |
 | JWT `aud` 租户声明 | `http.jwtAuthFromCatalogWithPermissions` | 用 `generateTokenWithTenant`；attr `tenant_id`←`aud` |
 | Catalog RBAC gate | `permissionGateWith(.rbac)` | `RouteMeta.permission` ⊆ `permissions` CSV |
+
+#### 分片（`ShardRouter`）
+
+`ShardRouter` 把 `tenant_id` 映射到分片池索引。**三条 API**：
+
+- `ShardConfig{ .shard_count, .default_pool }` —— `shard_count` 默认 1（即不路由），
+  `default_pool` 默认 `"default"`；
+- `ShardPool{ .name, .host, .port, .database, .username, .password, .max_conns }`
+  —— 单个分片池的连接定义；
+- `ShardRouter` —— `setPools` / `assignTenant` / `route` / `getPool` /
+  `getPoolForTenant` / `buildConnectionString` / `buildSqlxConfig` /
+  `poolCount` / `assignedCount`。
+
+路由规则（`route`，`src/tenant/ShardRouter.zig:88`）：
+
+1. `ctx` 非 active → `null`（不路由）；
+2. `pools` 为空 → `null`；
+3. **`tenant_map` 有显式绑定** → 用绑定值（`assignTenant` 写入）；
+4. 否则**按 `tenant_id % pools.len` 哈希**兜底。
+
+> **⚠️ 哈希兜底不跨分片数稳定。** 它直接对 `pools.len` 取模，所以
+> **增删分片会让几乎所有租户换库**。依赖数据亲和性的场景（大租户独立库、
+> 本地时延、合规隔离）**必须用 `assignTenant` 显式绑定**；哈希只适合
+> "随便哪台都行"的均衡负载。
+>
+> 迁移分片数时没有内建再平衡——`assignedCount` 只能告诉你绑了多少，
+> 重新分配要自己写迁移。
+
+`buildConnectionString` 只拼 **MySQL** DSN（`mysql://user:pass@host:port/db`），
+固定 `max_idle_conns = max_conns / 2`；越界索引返回 `error.InvalidShardIndex`。
 
 **典型组合：**
 

@@ -615,9 +615,14 @@ fn traceFromHeader(id: []const u8) zigmodu.runtime.TraceId {
 
 ### 11.4 v1 建议范围
 
+> **下面是落地前的草案 sketch，保留是为了记录取舍。**
+> 其中 `Runtime.enableRecording(cfg)` **没有成为最终 API**：取点最终落在 bus 上，
+> 实际用法是 `bus.attachRecorder(&rec)`（必须在 `freeze()` 之前），
+> 权威描述见 §11.6 与 §13.6。按本节写代码会编译不过。
+
 ```
 src/runtime/Recorder.zig          // 新文件，opt-in
-  Runtime.enableRecording(cfg)    // 开着才有开销；关着只是一次 ?*Recorder 判断
+  Runtime.enableRecording(cfg)    // ← 草案写法，未落地；实为 HotBus.attachRecorder
   Recorder.record(...)            // 取点调用：零分配，写预分配环
   Recorder.replay(runtime, clk)   // 按 seq 重放，驱动 Clock.manual
 ```
@@ -1869,7 +1874,7 @@ while (try rp.step()) |step| {                       // step.id / step.seq / ste
 |------|------|--------|
 | "复用 `Recorder(W.Message, capacity)` 那套机制" | `Recorder` 的存储半边抽成 `Slots`（`capacity` 槽 + per-slot ready + 连续 published 前缀），`Recorder` 与 `Track` 共用；`Recorder` 的 slot == seq 语义一字未动 | 两条轨的差别只在"槽位从哪来"，把它留在环外，环就只剩一份 |
 | 取点写 `Handle.send*` | `Handle` 的漏斗 `enqueue`/`enqueueBlocking`（`send*` + 定时器投递） | 见上：定时器投递不经过 `send*`，只挂 `send*` 就漏掉 §13.1 要的那半 |
-| `Runtime.enableRecording(cfg)` 式全局开关 | spawn 点 `.record = …` + `Runtime.deliveryLog()`（**懒创建**：首个 `.record` spawn 才分配） | §13.6 · 1：按声明计的内存；没声明就没有 log、没有环 |
+| `Runtime.enableRecording(cfg)` 式全局开关 | spawn 点 `.record = …` + `Runtime.deliveryLog()`（**懒创建**：首个 `.record` spawn 才分配） | §13.6 · 1：按声明计的内存；没声明就没有 log、没有环。§11.4 仍写 `enableRecording`，那是没有落地的草案写法 |
 | `(seq, clock_ms, target, kind, len)` + 载荷字节 | `Entry{ seq, clock_ms, event }`（值拷贝，零分配）+ 轨自己的 `id`/`message_type` | v1 不引入 codec：轨内部同类型，payload 就是那个值 |
 | 落盘（Q4 第 2 档） | **未做**。`TrackRef.payload_codec` 是预留位，v1 恒为 `null`；`bind` 会拒绝声明了 codec 的轨 | 接口不翻：接 codec 时"载荷是指针"这件事本来就要变，让它在同一个判据上暴露 |
 

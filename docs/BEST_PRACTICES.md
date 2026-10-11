@@ -798,7 +798,7 @@ try bus.publish("order.created", event_data);
 | 断路器 | `zigmodu.CircuitBreaker` | 5 次失败，30 秒半开 |
 | 限流 | `zigmodu.RateLimiter` | 令牌桶 1000/s |
 | 隔离舱 | `zigmodu.Bulkhead` | 每组并发上限，一个失败不拖垮全部 |
-| 自适应卸压 | `zigmodu.load_shedder` | 超载时拒绝，而不是无限排队 |
+| 自适应卸压 | `zigmodu.load_shedder` | 超载时拒绝，而不是无限排队（见下 §自适应卸压） |
 | 分布式限流 | `zigmodu.data.redis_rate_limit.RateLimiter` | Redis INCR+EXPIRE 固定窗口（跨实例，fail-closed）|
 | 分布式追踪 | `zigmodu.observability.DistributedTracer` | 采样 + `OtlpExporter` 导出 |
 | 指标收集 | `zigmodu.observability.PrometheusMetrics` | /metrics 端点 |
@@ -811,11 +811,54 @@ try bus.publish("order.created", event_data);
 
 **配置示例**：
 
+#### 自适应卸压（`AdaptiveShedder`）
+
+断路器防**下游**已经坏了，限流防**请求太多**；卸压防的是**这个进程自己**已经过载
+——它不限速，而是**直接拒**，因为排到队列里的请求只会让延迟更差。
+
+它与连接级背压（`productionProfile` 的 `max_connections`）不是一回事：
+那个管的是**连接数**，这个管的是**在途请求**。`allow()` 要**你自己在请求路径上调用**。
+
+```zig
+const shedder = zigmodu.load_shedder;
+
+var s = try shedder.newAdaptiveShedder(allocator, io, .{});
+defer s.deinit();
+
+fn handle(req: *Request) !Response {
+    const lease = try s.allow();      // 超载 → error.ServiceOverloaded
+    // 成功走 pass()，异常走 fail()，**必须二选一**，否则在途计数泄漏
+    // 且延迟样本缺失（pass() 才会把 RT 记进 rt_counter）
+    // ...真正干活...
+    lease.pass();
+    return resp;
+}
+```
+
+**`Promise` 必须交还**：`pass()` 记 RT 样本并放行 `pass_counter`；
+`fail()` 只放行在途计数。**两个都不调 = 在途计数永久泄漏**，之后所有请求都会被卸。
+
+**默认值**（`ShedderOptions`，全部来自 `src/resilience/LoadShedder.zig`）：
+
+| 字段 | 默认 | 含义 |
+|------|------|------|
+| `window_ms` | `5000` | 滚动统计窗口 |
+| `buckets` | `50` | 窗口分桶数（桶宽 = `window_ms / buckets` = 100ms）|
+| `cpu_threshold` | `900` | 毫核记法的 90%，超过即视为系统过载 |
+| `cpu_overloaded_fn` | 恒 `false` | **自定义 CPU 判据**；默认不接任何 CPU 采样源 |
+
+**判定链**（`shouldDrop`）：系统过载**或**仍在冷却期，且当前吞吐够高 → 丢弃。
+在途请求用 EWMA 跟踪（`flying_beta = 0.9`），冷却期 `cool_off_duration_ms = 1000`。
+
+> **默认的 `cpu_overloaded_fn` 恒返回 `false`**，也就是**只按在途量和吞吐卸压，
+> 不读真实 CPU**。要按 CPU 卸压必须自己传函数进去——框架不替你采样。
+
+不需要卸压时用 `NopShedder`：`allow()` 永远通过，返回一个空 `Promise`。
+
 ```zig
 const CircuitBreaker = zigmodu.CircuitBreaker;
 const RateLimiter = zigmodu.RateLimiter;
 
-// 断路器：init(allocator, name, Config) —— Config 四个字段都要给全
 var cb = try CircuitBreaker.init(allocator, "order-service", .{
     .failure_threshold = 5,   // 连续 5 次失败 → OPEN
     .success_threshold = 2,   // HALF_OPEN 期间 2 次成功 → CLOSED

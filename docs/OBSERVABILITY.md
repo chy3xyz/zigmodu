@@ -58,6 +58,73 @@ histogram_quantile(0.95, sum(rate(http_request_duration_milliseconds_bucket[5m])
 topk(5, sum(rate(http_responses_5xx_total[5m])) by (route))
 ```
 
+## 2.5 运行时指标（37 条，`MetricsBridge`）
+
+**HTTP 指标看不见运行时。** outbox 停投、邮箱打满、池打满、ticker 饿死，
+在请求侧全部无感——`timer_lag_ms` 尤其如此：它比任何 timer 计数都更能说明问题。
+
+这 37 条**全部是 gauge**，不是 counter：它们是**采样值**而非累计值，
+因此**不带 `_total` 后缀**（`PrometheusMetrics.Counter` 只有 `inc`/`add`，
+没有 `set`，采样值没法用 counter 表达）。
+
+接线（`MetricsT` 是鸭子类型，只要 `createGauge` + `Gauge.set`）：
+
+```zig
+// 启动期调用：注册 37 个 gauge。
+// 若后续 createGauge 失败，已注册的会留在 metrics 里，不会回滚。
+var bridge = try Runtime.MetricsBridge(PrometheusMetrics).init(&rt, &metrics);
+metrics.setScrapeHook(bridge.publish);   // scrape 时把采样值推出去
+```
+
+> `MetricsT` 只要求 `createGauge` + `Gauge.set`，所以这一层**不依赖 observability 包**。
+> bridge 比进程活得久，别把它放在你随后就返回的栈帧里。
+
+未声明池的运行时，池相关指标**报 0 而不是不导出**——
+"0 = 没声明池"是 dashboard 的第一个问题，少了序列就得靠猜。
+
+### 池与阻塞池（各 9 条，`_high`/`_normal`/`_low` 是优先级）
+
+| 指标 | 含义 |
+|------|------|
+| `zigmodu_runtime_pool_{declared,threads,claimed,dispatches}` | 池规模与吞吐 |
+| `zigmodu_runtime_pool_ready_len` | 就绪队列长度（三种优先级各一条） |
+| `zigmodu_runtime_pool_ready_push_failures` | **契约读数，必须恒 0** |
+| `zigmodu_runtime_pool_wait_max_ms` | claim 等待高水位 |
+| `zigmodu_runtime_pool_starvation_events` | **契约读数，必须恒 0** |
+| `zigmodu_runtime_blocking_pool_*` | 阻塞池的同名 9 条 |
+
+**`pool_claimed` / `pool_ready_push_failures` 是 `RuntimeStats` 里根本没有的读数**：
+池化之后"有多少 worker"不再回答"有多少在途工作"，`pool_claimed` 才回答。
+
+**两条"必须恒 0"的契约读数**：
+
+- **`ready_push_failures`** —— 越过整个软预算的等待**每次调用计一次**。
+  能交还 claim 的线程就是唯一能再 pop 的线程，等它再 pop 时槽位必然已出现，
+  所以宽度 1 时这是可证的恒 0。
+- **`starvation_events`** —— 数的是"等待超过 `starvation_threshold_ms`（50）的 claim"。
+  非 0 即调度器 fairness 被破坏（§12.17 实测；详见 [RUNTIME.md](RUNTIME.md) §12）。
+
+无池的运行时这 18 条全为 0；**非 0 说明公平性坏了，不要当成噪声忽略**。
+
+### 邮箱、定时器与监督
+
+| 指标 | 含义 |
+|------|------|
+| `zigmodu_runtime_{workers,running}` | 声明数 / 在跑数（差额 = 已停止） |
+| `zigmodu_runtime_messages_{received,sent}` | 邮箱吞吐 |
+| `zigmodu_runtime_messages_dropped` | 邮箱满被丢弃 |
+| `zigmodu_runtime_messages_discarded_on_stop` | 停机时**放弃**的待处理消息 |
+| `zigmodu_runtime_handler_errors` | worker 处理抛错 |
+| `zigmodu_runtime_group_restarts` | supervisor 重启组 |
+| `zigmodu_runtime_supervised_stops` | 被监督停掉的成员 |
+| `zigmodu_runtime_timer_fires` | 定时器触发数 |
+| `zigmodu_runtime_timer_lag_ms` | **ticker 饿死的读数**，比 timer 计数更能说明问题 |
+| `zigmodu_runtime_timer_deliveries_dropped` | 定时投递被丢弃 |
+| `zigmodu_runtime_timers_discarded` | 停机时丢弃的 timer |
+
+`messages_dropped` 与 `messages_discarded_on_stop` **是两条独立 counter，不是一个**：
+后者是"停机时主动放弃"，前者是"运行中邮箱满"。混用会掩盖真实故障。
+
 **基数纪律（多租户场景必须守）**：`route` 之外的维度**一律不要**直接打标签——
 `tenant_id`/`user_id`/`order_id` 这类高基数值会把 Prometheus 打死（每个租户一条序列，
 几千租户 = 几十万条）。需要分租户看时：
