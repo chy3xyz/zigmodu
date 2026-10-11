@@ -45,6 +45,39 @@ for f in README.md README.zh.md; do
   fi
 done
 
+# ── docs/: self-declared version footers ─────────────────────────────────────
+# A document footer that states which version it describes ("最后更新 …
+# ZigModu v0.26.0") is a claim about the present, so a stale one is a defect:
+# BEST_PRACTICES.md sat at v0.26.0 for nine releases, reading as current
+# guidance while describing a framework four major versions behind.
+#
+# The scan is deliberately narrow, because a *mention* of an old version is
+# usually correct history and checking those would make the gate useless:
+#
+#   - Only docs/, never README/AGENTS (already covered above).
+#   - Only a "ZigModu vX.Y.Z" self-description, not every 0.x.y on the page.
+#     RUNTIME.md §2 and UPGRADING.md are full of accurate historical versions.
+#   - Only in a trailing footer — the last 10 lines. A version quoted in the
+#     body is describing something, not claiming currency.
+#   - docs/archive/ and docs/dev/ are excluded. A stale version there is the
+#     point of the file: it is a snapshot of the tree at that release.
+footer_re='ZigModu \*?\*?v[0-9]+\.[0-9]+\.[0-9]+'
+while IFS= read -r doc; do
+  [[ -n "$doc" ]] || continue
+  while IFS= read -r hit; do
+    [[ -n "$hit" ]] || continue
+    for dv in $(printf '%s\n' "$hit" | grep -oE "$footer_re" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+'); do
+      if [[ "$dv" != "$VERSION" ]]; then
+        echo "check-version: $doc declares itself as v$dv, expected v$VERSION -> $hit" >&2
+        echo "check-version: update the footer, or delete it — a version that cannot be kept current is worse than none" >&2
+        fail=1
+      fi
+    done
+  done <<<"$(tail -10 "$doc" | grep -nE "$footer_re" | sed 's/^/  /')"
+done <<EOF
+$(find docs -name '*.md' -not -path 'docs/archive/*' -not -path 'docs/dev/*' 2>/dev/null | sort)
+EOF
+
 # ── tools/ (the released `zmodu` CLI) ────────────────────────────────────────
 # Versions there are *shipped*, not documentation: the CLI writes them into the
 # projects it generates. `zmodu scaffold` once embedded "v0.13.9" plus a

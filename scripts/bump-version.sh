@@ -28,7 +28,11 @@ echo "bump-version: $OLD -> $NEW"
 sed -i '' "s/\.version = \"$OLD\"/.version = \"$NEW\"/" build.zig.zon
 
 # 2) Derived doc/readme references (CHANGELOG handled below).
-for f in README.md README.zh.md AGENTS.md CLAUDE.md docs/dev/AI_METHODOLOGY.md docs/archive/status/ZIGMODU_NOTES.md; do
+#
+# docs/guide/BEST_PRACTICES.md is here because it carries a self-declared
+# version footer, and check-version.sh fails the build when that drifts. A gate
+# with no corresponding bump step is a gate that goes red on every release.
+for f in README.md README.zh.md AGENTS.md CLAUDE.md docs/dev/AI_METHODOLOGY.md docs/archive/status/ZIGMODU_NOTES.md docs/guide/BEST_PRACTICES.md; do
   sed -i '' "s/$OLD/$NEW/g" "$f"
 done
 
