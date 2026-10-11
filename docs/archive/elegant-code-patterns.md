@@ -1,8 +1,8 @@
 # Writing Elegant ZigModu Code — Patterns & Conventions
 
 > Companion to `best-practices-heysen-lessons.md`. Concrete code patterns, not just bug reports.
-> **Modulith day-one + concurrency playbook**: [MODULITH.md](MODULITH.md).
-> **Layering (model / persistence.Tx / service Cmd)**: [MODULE_LAYERS.md](MODULE_LAYERS.md).
+> **Modulith day-one + concurrency playbook**: [MODULITH.md](../guide/MODULITH.md).
+> **Layering (model / persistence.Tx / service Cmd)**: [MODULE_LAYERS.md](../guide/MODULE_LAYERS.md).
 
 ## 1. Module Structure — One Pattern to Rule Them All
 
@@ -86,7 +86,7 @@ pub const Tx = struct {
 - Every tenant query includes `tenant_id`
 - `find*` → `!?T`; list/get → `![]T` / `!T`
 - `Tx.*` is SQL-only; business branching stays in service
-- Workflow services may `import` sibling `persistence.Tx` (see [MODULE_LAYERS.md](MODULE_LAYERS.md))
+- Workflow services may `import` sibling `persistence.Tx` (see [MODULE_LAYERS.md](../guide/MODULE_LAYERS.md))
 - `catch {}` is banned — always propagate or log
 
 ### service.zig — Business Logic Hub

@@ -19,12 +19,12 @@
 | [BEST_PRACTICES.md](BEST_PRACTICES.md) | 按 DAU 阶段演进（1K → 1M+）+ JWT 可执行清单 |
 | [ROUTE_TABLE.md](../reference/ROUTE_TABLE.md) | ComptimeRouter + catalog JWT / RBAC |
 | [AGENTS.md](../../AGENTS.md) | **AI 操作手册**（DO/DON'T） |
-| [elegant-code-patterns.md](elegant-code-patterns.md) | 五文件布局与代码样例 |
+| [elegant-code-patterns.md](../archive/elegant-code-patterns.md) | 五文件布局与代码样例 |
 | [DISTRIBUTED.md](../reference/DISTRIBUTED.md) | 多实例 / RobustMQ / 集群注意点 |
 | [MODULITH_TENANT_SHOP.md](MODULITH_TENANT_SHOP.md) | **蓝图**：多租户店依赖图 + 目录清单 |
 | [ZENT.md](../reference/ZENT.md) | **zent**：schema-as-code ORM 与 ZigModu 正交集成 |
 | [SQLX_DRIVERS.md](SQLX_DRIVERS.md) | **sqlx**：`-Ddb=` / `.db=` 选择性驱动链接 |
-| [best-practices-heysen-lessons.md](best-practices-heysen-lessons.md) | 生产踩坑（sqlx / ORM） |
+| [best-practices-heysen-lessons.md](../archive/best-practices-heysen-lessons.md) | 生产踩坑（sqlx / ORM） |
 
 ---
 
@@ -73,7 +73,7 @@ modules/<domain>/
 | `module` | `info`、生命周期、依赖名 | 业务逻辑 |
 | `model` | 纯数据 | 业务方法 |
 
-完整样例见 [elegant-code-patterns.md](elegant-code-patterns.md)；**Tx / Cmd / Outbox 细则**见 [MODULE_LAYERS.md](MODULE_LAYERS.md)。
+完整样例见 [elegant-code-patterns.md](../archive/elegant-code-patterns.md)；**Tx / Cmd / Outbox 细则**见 [MODULE_LAYERS.md](MODULE_LAYERS.md)。
 
 ### 2.2 模块契约
 
@@ -120,7 +120,7 @@ pub fn deinit() void {}
 |--------|------|
 | 自研 Cluster / Raft 当主路径 | 先用多实例 + LB + Redis / RobustMQ |
 | 模块间同步 RPC / 服务网格 | 同进程直接调；跨实例用消息 |
-| 物理拆分 `Server.zig` / `sqlx.zig` | 用 § 分区维护；见 [PRODUCTION_ROADMAP.md](../meta/PRODUCTION_ROADMAP.md) |
+| 物理拆分 `Server.zig` / `sqlx.zig` | 用 § 分区维护；见 [PRODUCTION_ROADMAP.md](../archive/status/PRODUCTION_ROADMAP.md) |
 
 ### 3.3 规模阶梯
 

@@ -1,7 +1,7 @@
 # CLAUDE.md — ZigModu Framework for Claude Code
 
 ## Project
-ZigModu **v0.39.10** — modular app framework for Zig **0.17.0**. ~98/100 (`docs/meta/EVALUATION_REPORT.md`).
+ZigModu **v0.39.10** — modular app framework for Zig **0.17.0**. ~98/100 (`docs/archive/status/EVALUATION_REPORT.md`).
 
 **AI 权威指南：[`AGENTS.md`](AGENTS.md)**（文档地图 + 近期栈 DO/DON'T）。冲突时以 AGENTS 为准。
 
@@ -54,7 +54,7 @@ src/root.zig          → Application, EventBus, outbox
 src/api/Server.zig / Middleware.zig — HTTP + catalog JWT
 src/sqlx/sqlx.zig / Application.zig — DB + lifecycle
 docs/reference/ROUTE_TABLE.md · BEST_PRACTICES.md · MODULE_LAYERS.md · MODULITH.md · ZENT.md
-docs/meta/PRODUCTION_ROADMAP.md — monolith boundaries（勿无故拆 sqlx/Server）
+docs/archive/status/PRODUCTION_ROADMAP.md — monolith boundaries（勿无故拆 sqlx/Server）
 ```
 
 ## Examples

@@ -114,7 +114,7 @@ zigmodu.http.useRfc7807Errors();
 **仍属实**的是签名差异；**已不属实**的是"方法不存在"：
 
 - `Transaction.queryRowPartial`（`sqlx.zig:5122`）与 `Transaction.queryRows`（`:5131`）自 **v0.15.11**（commit `3fcc2b8`，2026-08-06）起已存在。反馈方若仍报"不存在"，是在更早的版本或未同步的 pin 上。
-- 签名差异保留：Client `queryRow(T, sql, args)` 无 allocator，Transaction `queryRow(allocator, T, sql, args)` 需要 —— `Transaction` 不持有 allocator（它借连接），必须由调用方给。这是类型决定的事实，不是笔误，已在 [`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md) 写清两套签名与 `Rows.deinit` / `ManagedRows.deinit` 的生命周期归属。
+- 签名差异保留：Client `queryRow(T, sql, args)` 无 allocator，Transaction `queryRow(allocator, T, sql, args)` 需要 —— `Transaction` 不持有 allocator（它借连接），必须由调用方给。这是类型决定的事实，不是笔误，已在 [`BEST_PRACTICES.md`](../../guide/BEST_PRACTICES.md) 写清两套签名与 `Rows.deinit` / `ManagedRows.deinit` 的生命周期归属。
 
 ### #2 匿名 struct 跨层类型不匹配 —— 不属实（语言语义）
 
@@ -166,8 +166,8 @@ Zig 里同名内联 struct 是**不同类型**，`expected A, found B` 是正确
 
 ## 相关文档
 
-- 升级注意事项（含本版 breaking 项与影响面）→ [`UPGRADING.md`](../reference/UPGRADING.md)
-- 错误形状表 / anytype 契约 / 线程安全级别 → [`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)
+- 升级注意事项（含本版 breaking 项与影响面）→ [`UPGRADING.md`](../../reference/UPGRADING.md)
+- 错误形状表 / anytype 契约 / 线程安全级别 → [`BEST_PRACTICES.md`](../../guide/BEST_PRACTICES.md)
 - 代码 ↔ 文档一致性门禁 → `src/test/DocsConsistency.zig`
 
 ---

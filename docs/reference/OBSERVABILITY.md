@@ -1,7 +1,7 @@
 # 可观测性与告警（生产接入）
 
 > 目标：把"服务活着吗、它现在好不好"变成**一屏可见 + 可告警**，而不是等用户报障。
-> 相关：[`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「韧性」· [`PRODUCTION_ROADMAP.md`](../meta/PRODUCTION_ROADMAP.md)
+> 相关：[`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「韧性」· [`PRODUCTION_ROADMAP.md`](../archive/status/PRODUCTION_ROADMAP.md)
 
 ## 1. 一行接入
 

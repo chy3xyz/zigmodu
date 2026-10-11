@@ -7,7 +7,7 @@
 > 最佳实践。写于 09-18，此后到 v0.35.0 之间又过了九个版本，抽样数字大多已过时。
 >
 > 留在原地会让人把采样值读成现行结论，所以整段移到这里。
-> **要看"现在该怎么写代码"，请读 [`BEST_PRACTICES.md`](../../BEST_PRACTICES.md)。**
+> **要看"现在该怎么写代码"，请读 [`BEST_PRACTICES.md`](../../guide/BEST_PRACTICES.md)。**
 >
 > 原文位置：`docs/BEST_PRACTICES.md` §「🔄 现状复核（v0.26.0 快照）」。
 

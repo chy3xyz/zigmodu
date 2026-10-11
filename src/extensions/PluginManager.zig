@@ -3,7 +3,7 @@
 //! `dynamicLoadingSupported()` returns `false` and no shared library is loaded.
 //!
 //! Positioning: user-facing primitive; no in-tree consumer — and kept exported
-//! deliberately (`docs/reference/UPGRADING.md`, `docs/meta/ISSUES_FROM_ZIGSHOP.md`). Callers are
+//! deliberately (`docs/reference/UPGRADING.md`, `docs/archive/status/ISSUES_FROM_ZIGSHOP.md`). Callers are
 //! expected to branch on `dynamicLoadingSupported()`; apps that need a real
 //! extension point should use modules + `Application` wiring instead.
 //!

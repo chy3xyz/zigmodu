@@ -3,7 +3,7 @@
 ZigModu 默认链接 **sqlite + postgres + mysql**（`-Ddb=all`），保证旧项目与框架自测兼容。小系统 / 单驱动部署应收窄链接，减少系统库依赖与部署面。`-Ddb=none` 全不链驱动（sqlx 走 stub，`DriverNotEnabled` 守卫运行时生效）——用于无 DB 的二进制（如 Windows 交叉编译 agent）或纯测试桩。
 
 **实现**：`examples/_shared/db_link.zig` · `build_options.enable_*` · `src/sqlx/*_c_stub.zig` · `sqlx.DriverFeatures`  
-**相关**：[`data.sqlx`](../../src/data.zig) · [PRODUCTION_ROADMAP.md](../meta/PRODUCTION_ROADMAP.md)（sqlx 维护边界）· [ZENT.md](../reference/ZENT.md)（正交 ORM，仍可能链 libsqlite3）  
+**相关**：[`data.sqlx`](../../src/data.zig) · [PRODUCTION_ROADMAP.md](../archive/status/PRODUCTION_ROADMAP.md)（sqlx 维护边界）· [ZENT.md](../reference/ZENT.md)（正交 ORM，仍可能链 libsqlite3）  
 **跨平台编译**：见 §12（带驱动要提供**目标平台**的库：`XCOMPILE_ROOT`（或 `ZENT_XROOT`）指向 sysroot / 发行版 rootfs，或按驱动用 `SQLITE_*` / `PQ_*` / `MYSQL_*` 覆盖；主机路径只在目标就是构建机时才用，附实测内存表）
 
 ---
@@ -143,7 +143,7 @@ zent 使用自己的 SQLite / 驱动栈，与 `data.sqlx` **正交**（见 [ZENT
 
 ## 9. 维护边界（贡献者）
 
-- **不要**为「选择性链接」物理拆分 `sqlx.zig`；stub + `DriverFeatures` 即可（[PRODUCTION_ROADMAP.md](../meta/PRODUCTION_ROADMAP.md)）。
+- **不要**为「选择性链接」物理拆分 `sqlx.zig`；stub + `DriverFeatures` 即可（[PRODUCTION_ROADMAP.md](../archive/status/PRODUCTION_ROADMAP.md)）。
 - 新驱动：新 `sqlx/<name>_c.zig` + stub + `db_link` / `build_options` / `DriverFeatures` 登记；默认仍建议 `all` 包含或显式文档说明。
 - 默认保持 **`all`**：收窄默认会破坏依赖「三库全链」的下游。
 

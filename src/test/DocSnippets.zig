@@ -62,7 +62,7 @@
 //! without offering it, and judging it would punish the warning itself.
 //!
 //! A block that shows an older signature on purpose — the v0.4
-//! `Application.init` in `docs/meta/MIGRATION_v04_to_v07.md` — is tagged `text`, not
+//! `Application.init` in `docs/archive/status/MIGRATION_v04_to_v07.md` — is tagged `text`, not
 //! `zig`: only `zig` and untagged fences are judged, so history stays readable
 //! without tripping the gate.
 

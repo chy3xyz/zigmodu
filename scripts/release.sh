@@ -53,11 +53,11 @@ perl -0pi -e "s/\.version = \"$OLD\"/.version = \"$VERSION\"/" build.zig.zon
 perl -0pi -e "s/\.version = \"$OLD\"/.version = \"$VERSION\"/" tools/zmodu/build.zig.zon
 perl -0pi -e "s/\"version\", \"$OLD\"/\"version\", \"$VERSION\"/" src/ai/mcp.zig
 perl -0pi -e "s/# ZigModu v$OLD/# ZigModu v$VERSION/" README.md README.zh.md
-perl -0pi -e "s/ZigModu \*\*v$OLD\*\*/ZigModu **v$VERSION**/" CLAUDE.md docs/ai/AI_METHODOLOGY.md
+perl -0pi -e "s/ZigModu \*\*v$OLD\*\*/ZigModu **v$VERSION**/" CLAUDE.md docs/dev/AI_METHODOLOGY.md
 perl -0pi -e "s/\*\*v$OLD\*\*/**v$VERSION**/g" AGENTS.md
-perl -0pi -e "s/\*\*框架版本\*\*: v$OLD/**框架版本**: v$VERSION/" docs/meta/EVALUATION_REPORT.md
-perl -0pi -e "s/ZigModu \*\*v$OLD\*\*/ZigModu **v$VERSION**/" docs/meta/EVALUATION_REPORT.md
-perl -0pi -e "s/\*\*版本口径\*\*: v$OLD/**版本口径**: v$VERSION/" docs/meta/PRODUCTION_ROADMAP.md
+perl -0pi -e "s/\*\*框架版本\*\*: v$OLD/**框架版本**: v$VERSION/" docs/archive/status/EVALUATION_REPORT.md
+perl -0pi -e "s/ZigModu \*\*v$OLD\*\*/ZigModu **v$VERSION**/" docs/archive/status/EVALUATION_REPORT.md
+perl -0pi -e "s/\*\*版本口径\*\*: v$OLD/**版本口径**: v$VERSION/" docs/archive/status/PRODUCTION_ROADMAP.md
 fi
 
 # 2. CHANGELOG: promote Unreleased to the new version.
@@ -118,7 +118,7 @@ if ! grep -q "v$VERSION" CLAUDE.md || ! grep -q "v$VERSION" AGENTS.md; then
 fi
 # These two docs were historically missed by the bump; their top "版本口径"
 # line must track the release or the evaluation report drifts (820 vs 990 tests).
-if ! grep -q "v$VERSION" docs/meta/EVALUATION_REPORT.md || ! grep -q "v$VERSION" docs/meta/PRODUCTION_ROADMAP.md; then
+if ! grep -q "v$VERSION" docs/archive/status/EVALUATION_REPORT.md || ! grep -q "v$VERSION" docs/archive/status/PRODUCTION_ROADMAP.md; then
     echo "FAIL: EVALUATION_REPORT / PRODUCTION_ROADMAP version not updated to v$VERSION"
     exit 1
 fi

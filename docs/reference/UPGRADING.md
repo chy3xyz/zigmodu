@@ -84,7 +84,7 @@
 `Simplified` 整块入口**已经不在了**，所以它不在上面的表里：`不早于 1.0` 是对**还在**的别名做的承诺，
 对一个已经删掉的名字继续承诺删除时点，只会让读者以为 `zigmodu.App` 今天还能用。
 
-- **移除的名字**：`zigmodu.App` / `zigmodu.ModuleImpl`（旧写法长什么样见 [`API-MIGRATION.md`](../meta/API-MIGRATION.md)
+- **移除的名字**：`zigmodu.App` / `zigmodu.ModuleImpl`（旧写法长什么样见 [`API-MIGRATION.md`](../archive/status/API-MIGRATION.md)
   的 Before 段 —— 那段今天**照抄编译不过**，它的价值只剩"看懂旧代码在写什么"）。
 - **何时移除的**：commit `557190a`（2026-05-12，标题 `…+ Simplified removal`）已把它从 `src/root.zig` 移除，
   此后顶层不再有这些名字。
@@ -143,7 +143,7 @@
 > 每条变更标注 **Breaking?** / **影响面** / **一行改法**。
 > 只记"会咬人"的：行为变化、公开签名变化、默认值变化、需要动手删代码的地方。
 > 完整变更列表见 [`../CHANGELOG.md`](../../CHANGELOG.md)；框架级迁移（Simplified → Application）
-> 见 [`API-MIGRATION.md`](../meta/API-MIGRATION.md)。
+> 见 [`API-MIGRATION.md`](../archive/status/API-MIGRATION.md)。
 
 自查命令（升级后先跑这两条）：
 

@@ -3,7 +3,7 @@
 //! Provides HTTP server with routing, middleware, and handlers.
 //! Aligned with go-zero's rest package.
 //!
-//! STRUCTURE (monolith — intentionally NOT split; see docs/meta/PRODUCTION_ROADMAP.md):
+//! STRUCTURE (monolith — intentionally NOT split; see docs/archive/status/PRODUCTION_ROADMAP.md):
 //!   §1  Method / Route / RouteGroup / WS callbacks —— routing declarations, middleware and listener types
 //!   §2  Process-wide error renderers —— setErrorRenderer / setTransportErrorRenderer and the transport body
 //!   §3  Context —— request/response, arena, bindJson, streaming and parameter helpers

@@ -96,7 +96,6 @@ export default defineConfig({
           { text: 'LLM Policies', link: '/ai/LLM_POLICIES' },
           { text: 'MCP bridge', link: '/ai/MCP' },
           { text: 'Agent Runtime', link: '/reference/AGENT_RUNTIME' },
-          { text: 'AI Methodology', link: '/ai/AI_METHODOLOGY' },
           { text: 'AI Boundary', link: '/reference/AI_BOUNDARY' },
         ],
       },
@@ -105,29 +104,16 @@ export default defineConfig({
         items: [
           { text: 'Observability', link: '/reference/OBSERVABILITY' },
           { text: 'Logging', link: '/guide/LOGGING' },
-          { text: 'Production Roadmap', link: '/meta/PRODUCTION_ROADMAP' },
-          { text: 'Framework Backlog', link: '/meta/FRAMEWORK_BACKLOG' },
         ],
       },
       {
         text: 'Patterns',
         items: [
           { text: 'Best Practices', link: '/guide/BEST_PRACTICES' },
-          { text: 'Elegant Code Patterns', link: '/guide/elegant-code-patterns' },
-          { text: 'Heysen Lessons', link: '/guide/best-practices-heysen-lessons' },
           { text: 'ZigModu × zent', link: '/reference/ZENT' },
           { text: 'Tenant Shop Blueprint', link: '/guide/MODULITH_TENANT_SHOP' },
           { text: 'Web4', link: '/reference/WEB4' },
           { text: 'Upgrading', link: '/reference/UPGRADING' },
-        ],
-      },
-      {
-        text: 'Status & history',
-        items: [
-          { text: 'Evaluation (current)', link: '/meta/EVALUATION_2026-10' },
-          { text: 'Field Notes', link: '/meta/ZIGMODU_NOTES' },
-          { text: 'Issues from zapi', link: '/meta/ISSUES_FROM_ZAPI' },
-          { text: 'Issues from zigshop', link: '/meta/ISSUES_FROM_ZIGSHOP' },
         ],
       },
     ],

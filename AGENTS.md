@@ -2,7 +2,7 @@
 
 > **面向 AI 的权威入口。** 写代码前先读本节「文档地图」与「近期栈 DO/DON'T」。  
 > 人类长文：`docs/guide/BEST_PRACTICES.md` · 路由/鉴权细则：`docs/reference/ROUTE_TABLE.md` §7。  
-> 哲学长文（可后读）：`docs/ai/AI_METHODOLOGY.md`（以本文为准若冲突）。
+> 哲学长文（可后读）：`docs/dev/AI_METHODOLOGY.md`（以本文为准若冲突）。
 
 ## 文档地图（按任务选读）
 
@@ -28,10 +28,10 @@
 | Agent 能做什么（默认不能执行） | `docs/reference/AGENT_RUNTIME.md` + `ai.Guard` / `ai.AgentSpec` / `ai.ProposalPipeline` / `ai.AgentWorker`（闸门已接进 `Agent.run`；Agent 可跑成运行时 worker） |
 | 观测 / 告警 / Grafana | `docs/reference/OBSERVABILITY.md`（黄金信号 + 阈值 + dashboard JSON；夜间 `zig build soak` 见 CI `soak` job） |
 | 部署拓扑（TLS 边车/探针/守护；集群 mTLS 边车） | `examples/production-deploy/`（nginx · Envoy · k8s · systemd · **cluster-sidecar**） |
-| Extract / SSE / Testkit / Outbox | `docs/meta/FRAMEWORK_BACKLOG.md` |
+| Extract / SSE / Testkit / Outbox | `docs/archive/status/FRAMEWORK_BACKLOG.md` |
 | 故障注入 / 契约门禁模板 | `src/test/FaultInjection.zig` · `src/test/ContractGate.zig` |
 | 升级注意事项（breaking / 影响面 / 改法） | `docs/reference/UPGRADING.md` |
-| 外部反馈核实与处置 | `docs/meta/ISSUES_FROM_ZAPI.md` · `docs/meta/ISSUES_FROM_ZIGSHOP.md` |
+| 外部反馈核实与处置 | `docs/archive/status/ISSUES_FROM_ZAPI.md` · `docs/archive/status/ISSUES_FROM_ZIGSHOP.md` |
 | CLI 生成 | `docs/guide/ZMODU_CLI_INTEGRATION.md` · `zig build zmodu -- scaffold …`（0.17.0 `addPassthruArgs` 透传，**必须从仓库根跑**）或装好后跑 `zig-out/bin/zmodu scaffold …`（脚本推荐；见下方"两个 zmodu 入口"） |
 | 只跑一个/一组测试、filter 为什么不能瞎用 | 本文 §Testing「只跑匹配的测试」+ `scripts/test-fast.sh --help` |
 | 「某个文件的测试根本没被收集」（绿着跑了个空） | `src/test/TestCollection.zig`（闸门本体，按 `builtin.test_functions` 对账）+ `scripts/check-test-collection.sh`（排除项是否真是别的 build step 的编译根 + 强制重跑；`zig build test` 缓存重放不会执行它） |
@@ -249,7 +249,7 @@ const now_ms = Time.monotonicNowMilliseconds();
 - **Profiles**: `applyHttpDefaults` + `applyResilienceDefaults`
 - **OpenAPI**: `openApiParamsFromStruct` + `RouteMeta.openapi_params`；`openApiRoutes` / `swaggerUiHandler` / `scalarUiHandler` HTML 零配置一键挂载 UI
 - **Outbox**: `zigmodu.outbox.*`；幂等 `idempotencyMiddleware`（header `idempotency-key`）
-- Guide: `docs/reference/ROUTE_TABLE.md` · recipes: `docs/meta/FRAMEWORK_BACKLOG.md`
+- Guide: `docs/reference/ROUTE_TABLE.md` · recipes: `docs/archive/status/FRAMEWORK_BACKLOG.md`
 
 ### Imports
 - NEVER use `zigmodu.http_server` — use `zigmodu.http.Context`
@@ -450,8 +450,8 @@ filter 是**测试全限定名的子串**（形如 `core.cluster.RaftElection.te
 - 其它测试入口：`zig build soak`（N 并发 × M 租户，默认 16×50；CI 夜间 64×200）·
   `zig build test -Dnet-tests=false`（沙箱里跳过全部 socket 用例）·
   `bash scripts/test-fast.sh [--filter …]`（聚焦单测/强制重跑；见 §Testing）
-- 质量现状：以 `CHANGELOG.md` 与 `docs/dev/v1.0-readiness-v0.35.md` 为准（`docs/meta/EVALUATION_REPORT.md` 是 2026-09 加固批次之前的旧快照，勿引其分数）
-- Roadmap: `docs/meta/PRODUCTION_ROADMAP.md`（阶段 1–8 ✅；**阶段 9「高阶演进」是滚动项，非一次性完成**——其子项 1–4 已落地，子项 5「协议传输层高阶演进（gRPC Streaming / HTTP/2 深化）」仍在演进中，标题里的「（演进中）」是实时的，不是客套话）
+- 质量现状：以 `CHANGELOG.md` 与 `docs/dev/v1.0-readiness-v0.35.md` 为准（`docs/archive/status/EVALUATION_REPORT.md` 是 2026-09 加固批次之前的旧快照，勿引其分数）
+- Roadmap: `docs/archive/status/PRODUCTION_ROADMAP.md`（阶段 1–8 ✅；**阶段 9「高阶演进」是滚动项，非一次性完成**——其子项 1–4 已落地，子项 5「协议传输层高阶演进（gRPC Streaming / HTTP/2 深化）」仍在演进中，标题里的「（演进中）」是实时的，不是客套话）
 
 ### Release 流程（强制）
 - 发布一律走 `bash scripts/release.sh <x.y.z> [--push]`：自动 bump 全部版本引用
@@ -491,7 +491,7 @@ filter 是**测试全限定名的子串**（形如 `core.cluster.RaftElection.te
 
 - Respond in 中文 for user-facing communication.
 - Do not create git commits unless the user explicitly asks.
-- Prefer the production-readiness plan without physically splitting `sqlx.zig` or `Server.zig`; use section comments plus `docs/meta/PRODUCTION_ROADMAP.md` maintenance boundaries instead.
+- Prefer the production-readiness plan without physically splitting `sqlx.zig` or `Server.zig`; use section comments plus `docs/archive/status/PRODUCTION_ROADMAP.md` maintenance boundaries instead.
 - When generating framework code from SQL scripts (zmodu), follow zigmodu best practices for complete module output and place reusable templates in a dedicated templates folder.
 - When refining architecture or best practices, land them in docs (`docs/reference/ZENT.md`, `MODULITH.md`, `MODULE_LAYERS.md`, `BEST_PRACTICES.md`, `ROUTE_TABLE.md`, `SQLX_DRIVERS.md`, **`AGENTS.md`**) rather than chat-only advice.
 - When restructuring examples, preserve existing domain/business logic unless explicitly asked to change it.

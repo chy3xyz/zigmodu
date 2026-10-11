@@ -50,7 +50,7 @@ A module in ZigModu is:
 | `observability/` `metrics/` `tracing/` `log/` | [OBSERVABILITY.md](OBSERVABILITY.md) · [LOGGING.md](../guide/LOGGING.md) |
 | `resilience/` | [BEST_PRACTICES.md](../guide/BEST_PRACTICES.md) §韧性原语（断路器/限流/隔离舱/**自适应卸压**） |
 | `ai/` | [AI_DEV_GUIDE.md](../ai/AI_DEV_GUIDE.md) · [AI_ORCHESTRATION.md](../ai/AI_ORCHESTRATION.md) · [MCP.md](../ai/MCP.md) · [AI_BOUNDARY.md](AI_BOUNDARY.md) |
-| `extensions/` | [FRAMEWORK_BACKLOG.md](../meta/FRAMEWORK_BACKLOG.md)（多数仍在计划中） |
+| `extensions/` | [FRAMEWORK_BACKLOG.md](../archive/status/FRAMEWORK_BACKLOG.md)（多数仍在计划中） |
 | `secrets/` `cache/` `kit/` `validation/` `config/` `di/` | **文档缺失**：见下方 §未成文的子系统 |
 | `web4/` | [WEB4.md](WEB4.md) —— DID 身份 + x402 |
 | `messaging/` | [AI_ORCHESTRATION.md](../ai/AI_ORCHESTRATION.md)（outbox 消费端接线见 AGENTS.md） |

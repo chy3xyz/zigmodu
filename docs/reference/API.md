@@ -828,7 +828,7 @@ pub const panic = zmodu.panicHook;
 A panic still aborts the process — the hook is the *diagnosis* half. Recovery
 comes from a supervisor (`Restart=always`, k8s `restartPolicy: Always`); see
 [`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「韧性」and
-[`PRODUCTION_ROADMAP.md`](../meta/PRODUCTION_ROADMAP.md) for the prefork boundary.
+[`PRODUCTION_ROADMAP.md`](../archive/status/PRODUCTION_ROADMAP.md) for the prefork boundary.
 
 ### `zigmodu.Params` (multi-value query/form)
 
@@ -1908,7 +1908,7 @@ pub const ClusterMembership = struct {
 
 Leader election lives in `src/core/cluster/RaftElection.zig` (plus
 `ClusterMembership` / `ClusterHealth`). It is marked **experimental** — see
-[`PRODUCTION_ROADMAP.md`](../meta/PRODUCTION_ROADMAP.md) for the position on using it
+[`PRODUCTION_ROADMAP.md`](../archive/status/PRODUCTION_ROADMAP.md) for the position on using it
 in production. The older `PasRaftAdapter` documented here never existed in this
 repository.
 

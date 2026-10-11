@@ -8,7 +8,7 @@
 | 文档 | 关系 |
 |------|------|
 | [MODULITH.md](MODULITH.md) | 模块边界与并发 |
-| [elegant-code-patterns.md](elegant-code-patterns.md) | 五文件样例 |
+| [elegant-code-patterns.md](../archive/elegant-code-patterns.md) | 五文件样例 |
 | [MODULITH_TENANT_SHOP.md](MODULITH_TENANT_SHOP.md) | 多租户店蓝图 |
 | [ZENT.md](../reference/ZENT.md) | zent ORM 正交接入（schema / Client / migrate） |
 | [BEST_PRACTICES.md](BEST_PRACTICES.md) | DAU 演进 + JWT / 多端身份 |

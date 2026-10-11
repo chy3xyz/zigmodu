@@ -12,7 +12,7 @@
 > **ZigModu × zent（schema / Client / privacy / 模块级选型）**：见专文 [ZENT.md](../reference/ZENT.md)（参考实现 `examples/zent-modulith`）。  
 > **SQLx 选择性驱动链接（`-Ddb=` / `.db=`）**：见专文 [SQLX_DRIVERS.md](SQLX_DRIVERS.md)。  
 > **HTTP 路由 + catalog JWT / RBAC**：见专文 [ROUTE_TABLE.md](../reference/ROUTE_TABLE.md) §7；可执行清单见下文「JWT / 多端身份」。  
-> **AI / Agent 写代码**：先读仓库根目录 [AGENTS.md](../../AGENTS.md)（文档地图 + DO/DON'T）；方法论见 [AI_METHODOLOGY.md](../ai/AI_METHODOLOGY.md)。  
+> **AI / Agent 写代码**：先读仓库根目录 [AGENTS.md](../../AGENTS.md)（文档地图 + DO/DON'T）；方法论见 [AI_METHODOLOGY.md](../dev/AI_METHODOLOGY.md)。  
 > **代码片段基线**：**ZigModu v0.35.0 · Zig 0.17.0**（CI 钉 `0.17.0` **正式版**，见 `.github/workflows/ci.yml` 的 `ZIG_VERSION`）。跨版本升级看 [UPGRADING.md](../reference/UPGRADING.md)；"哪些是证明过的、哪些不是"看 [v1.0 差距评估](../dev/v1.0-readiness-v0.35.md)。  
 > **片段口径**：本文的代码围栏分两类 —— **可照抄的完整示例**，和**示意用的片段/伪码**（含 `...`、`// ...`、
 > 或引用了上下文里没给的标识符）。伪码**不保证可直接编译**，只表达结构与契约；可编译的完整示例看
@@ -1194,7 +1194,7 @@ Server 在 dispatch 前写入 threadlocal 请求上下文、结束后清除，�
 panic 钩子管诊断，不管存活。进程存活靠 supervisor：`systemd`
 `Restart=always`、k8s `restartPolicy: Always` 或容器编排的重启策略。
 多进程隔离（prefork）的边界与前置条件见
-[`PRODUCTION_ROADMAP.md`](../meta/PRODUCTION_ROADMAP.md)「单进程单点与原位隔离」。
+[`PRODUCTION_ROADMAP.md`](../archive/status/PRODUCTION_ROADMAP.md)「单进程单点与原位隔离」。
 
 ### 持锁纪律：临界区里允许出现什么（v0.35.0 逐处复核）
 
