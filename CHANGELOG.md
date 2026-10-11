@@ -422,6 +422,23 @@ PR #3 修订版 head 上复跑 `2319/2382` 全绿（少2 = 删掉的测试及其
 **自动随包分发，无需改 `.paths`**。已同步更新 `docs/ZMODU_CLI_INTEGRATION.md`、
 `examples/zmsaas/README.md`（3 处路径）、`tools/zsaas/README.md` 自引用。
 
+**5. 清掉测试运行残留（未跟踪，但把根目录撑到 2,652 个条目）**——
+`wal_test_*` 2,240 个 + `wal_test2_*` 372 个目录（每个只含一个 `0000….wal`）；
+另有 `tmp/`（2.5M 运行日志）、`.code-review-graph/`（428K sqlite 索引）、
+`.remember/`（52K 运行日志）、`.superpowers/`（624K评审 diff 暂存）、`.claude/`
+（本地权限配置）、`.reasonix/`（32K 任务快照，**删完又自行重建**，印证它是工具活动目录）。
+全部 `git ls-files` = 0，即从未进过版本库。删除前逐个核对了跟踪状态与内容类型。
+
+**6. 补 `.gitignore` 的四条缺失规则**（`.claude/` · `.remember/` · `.superpowers/` ·
+`.code-review-graph/`）—— 这些工具都会自行重建，规则防它们被误提交。
+已逐条用 `git check-ignore` 验证 8 个路径全部生效。
+
+**根目录从 2,649 个条目收到 35 个**（`ls -1a` 实测）——其中 2,619 个是残留：
+`wal_test*` 2,612 个目录 + `tmp` 与 7 个工具状态目录。现存的自建目录：
+`docs/` · `examples/` · `scripts/` · `src/` · `tools/`（+ `.github/`）——
+全部有名可指。
+
+
 **顺带记录一个既有缺陷（不是本次引入，未修）**：
 `tools/zsaas/scripts/check-gen.mjs` 自检报 `MISSING src/libs/zmoduApi.ts`。
 已用 `git worktree` 在移动前的版本对照跑过—— **移动前同样报此错**，
