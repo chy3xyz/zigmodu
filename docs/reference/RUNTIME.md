@@ -528,124 +528,22 @@ fn traceFromHeader(id: []const u8) zigmodu.runtime.TraceId {
 解析失败（上游给的是非 16 进制串）就退回 `TraceId.generate()`：**宁可换一个新 id，也不要让 worker 的日志
 挂上一条张冠李戴的 trace**。OTLP 侧同理 —— span 上的 `trace_id` 就是同一种 `TraceId`（`docs/OBSERVABILITY.md`）。
 
-## 9. 路线图（本文件随之更新）
-
-| 版本 | 内容 | 状态 |
-|------|------|------|
-| **v0.16.0** | `RingBuffer` / `MpscRing` / `Mailbox` / `ObjectPool` / `Clock` / `Wheel` / `Runtime` + `Worker` + `app.runtime()` | ✅ 本文档 |
-| **v0.17.0** | Actor 监督（`spawnActor` + 错误预算 + `onError` 现场决策）、`HotBus`（L0 扇出，freeze 后无锁、drop-on-full）、`Sequencer` | ✅ 本文档 §3b/§3c |
-| **v0.18** | 编译期架构引擎：依赖图（`ModuleGraph` 编译期报环）、`zmodu graph`（Mermaid）、`zmodu doctor` | ✅ 已发布（doctor 清单仍未覆盖"未解析服务/事件拓扑/消费者计数"，见 `docs/dev/todo3.md` 评估） |
-| **v0.19** | Cluster / Shard / Service Discovery | ⚠ 部分：`ClusterView`（读侧快照/rendezvous）、`ShardRouter` 落地；**v0.25.0 起 `ClusterBootstrap` 已是门面** —— `tick()` 一次做完 `membership.runOnce()` → `view.sync()` → `raft.tick()`（此前从没人驱动选举）、配 `.transport` 时 `start()` 自动起入站监听、`pick(key)` 与 `healthJson()` 都在它上面；集群组件从 `root.zig` 正面导出。集群传输仍是自造 TCP（未按本节原意"适配 QUIC"）；`LoadBalancer` 是**有意不接**（数据源与读侧是两份事实，见 `docs/DISTRIBUTED.md`）。剩余缺口见 `docs/DISTRIBUTED.md` |
-| **v0.20** | Workflow（状态机 + Saga + 补偿 + 检查点 + 恢复） | ⚠ 部分：Saga 补偿 + WAL 检查点 + 崩溃续跑 ✅（`SagaOrchestrator.resumeInstance` / `restoreFromWal`）；**`SagaStep.timeout_seconds` 已于 v0.25.0 真正生效**（超预算即补偿含该步、终态 `.timed_out`、返回 `error.SagaStepTimeout`）；**状态机仍未做**，`.step().compensate()` DSL 明确不做（`docs/WORKFLOW.md`） |
-| **v0.21** | Agent Runtime（Identity / Memory / Skills / Permissions / Budget 一等化） | ✅ 已发布：`ai.AgentSpec` + `ai.Guard`（已接进 `Agent.run`）+ `ai.ProposalPipeline` —— 见 `docs/AGENT_RUNTIME.md`；**Agent 的 State / Event subscriptions / Lifecycle 仍未做** |
-| **v0.22.0** | Agent 跑成 worker（`Agent → Worker → Event`） | ✅ `ai.AgentWorker`：`rt.spawn(ai.AgentWorker, …)` + `ai.agent_worker.post(...)`，有界邮箱 / 生命周期 / 监督 / 指标跟着来 —— 见 `docs/AGENT_RUNTIME.md` §六 |
-| **v0.28.0** | EventRecorder v1：`Recorder(E, C)` + `HotBus.attachRecorder`（运行时投递流录制、按 seq 重放并驱动 `Clock.Manual`） | ✅ 本文档 §11.6（落盘、多事件类型、`Handle.send`/定时器投递不在 v1） |
-| **v0.28.0** | 定时器时间轮改为 **ticker-owned**：`Runtime` 命令队列（`arm`/`cancel` 同一条 FIFO）+ 生产者侧 id/deadline；`cancelTimer` 拆成 `requestCancelTimer`（请求）/ `cancelTimerSync`（要结果） | ✅ 本文档 §3/§4（**Breaking**：旧的 `cancelTimer(id) bool` 已删 —— 第 2 节第 10 条那条分层契约的先例） |
-| **v0.28.0** | `shutdown()` 释放**已进轮**的待触发 payload（`Wheel.drainAll`，在 owner 线程上 drain）+ `RuntimeStats.timers_discarded` / `zigmodu_runtime_timers_discarded` | ✅ 本文档 §3/§4/§8（**非 Breaking**：补上 ticker-owned 那批的"未附带"项） |
-| **v0.28.0** | `shutdown()` 顺序改为**先停 ticker 再拆 worker**（关掉 "ticker 向已 destroy 的 handle 投递" 的 use-after-free 窗口）+ `onTimerFire` 在 `alive = false` 时只 drop 不 post | ✅ 本文档 §3（**非 Breaking**：签名不变，只多一次 `alive` 读） |
-| **未发版** | WorkerPool **Phase 1**：`spawn(..., .{ .mode = .pooled })` + `queued`/`claimed` 两位 + 就绪环 + **一条**池线程（`src/runtime/scheduler.zig`）；池在 `Runtime.initWithOptions` / `builder.withMaxPooledWorkers` 声明的上界内 | ✅ 本文档 §12.10（**Breaking：否** —— 第三参同时接受 `256` 与 `.{ .capacity = 256, .mode = .pooled }`；`run` 型 worker 用 `.pooled` 是编译期报错，见 `scripts/check-pool-guard.sh`） |
-| **未发版** | 池的**可观测性与示例**：9 条 `zigmodu_runtime_pool_*`（§8）+ `examples/runtime-workers` 的 audit 环真的以 `.pooled` 跑（`[pool] dispatched>0` 才算过）+ `zmodu runtime` 报池声明 | ✅ 本文档 §12.10 末节（**Breaking：否**；顺带修掉 `Application.Config.max_pooled_workers` 没被 `Application.init` 拷贝的接线缺口） |
-| **未发版** | **监督停机丢弃可见**：`WorkerStats.discarded_on_stop` / `RuntimeStats.messages_discarded_on_stop` + 第 16 条 gauge `zigmodu_runtime_messages_discarded_on_stop` —— dedicated 的 `break` 与"池先停、邮箱非空"两档都计数 | ✅ 本文档 §5 第 2 条 / §8 / §12.10（**Breaking：否**；`RuntimeStats` 只加字段，停机行为一字未改） |
-| **未发版** | **Runtime Replay v1（投递轨）**：spawn 点 `.record = .{ .id, .capacity }` 声明**每 worker 一条同类型轨**（复用 §11 的环 + log 的一个 `Sequencer` 打**全局** seq），取点在 `Handle` 的投递漏斗（`send*` + `after` 的定时器投递）；`Runtime.deliveryLog()` + `Replayer.step()`（`replayAll()` 附带）按 seq 归并、驱动 `Clock.Manual`、调用方给"标识 → 新 handle"映射回投 | ✅ 本文档 §13.7（**Breaking：否** —— `SpawnConfig` 多一个可选 `.record`，`Handle` 多一个默认 `null` 的 `track`；没声明就是一次空判断 + 零分配不变。**未做**：落盘/codec、跨进程） |
-| **v0.31.0** | **监督树**：`rt.spawnGroup(policy)` + 四种策略（`one_for_one` / `one_for_all` / `rest_for_one` / `stop_group`）+ 重启强度（`Intensity`）+ 组嵌套（强度用尽即升级到父组）+ **原地重建**（`deinit` + `init` 在同一线程、同一循环里；不换 handle、不关邮箱）+ `supervised_stops` / `group_restarts` 两个累计量与两条指标 | ✅ 本文档 §14（**Breaking：否** —— `Supervision` 多一个默认 `null` 的 `.group`，`spawn*` 签名一字未改；`Mailbox` 多一个 `wake`/`recvWakeable`，`recv` 行为不变） |
-| 之后 | 跨进程 / 跨节点监督 | 未承诺 |
-| 1.0 | API 收敛、命名统一、deprecated 清理 | 计划 |
-
 ## 10. 最小示例
 
 见 `examples/runtime-workers/`：一条"行情源 → 订单簿 worker → 风控 worker → 快照定时器"的流水线，
 既演示 worker/邮箱/定时器，也演示背压（`error.Full` 时的合并策略）与优雅停机。
 
-## 11. EventRecorder —— 设计草案（v1 已实现：见 §11.6）
+## 11. EventRecorder —— 投递流录制与重放（已实现）
 
-> 状态：**本节是决策记录（设计草案），别再当成"未实现"读**。落地形状、与草案的差异、
-> 以及明确未做的边界见 **§11.6**；代码在 `src/runtime/recorder.zig`。
-> 这一节存在的理由是先把契约定下来 —— 录什么、按什么顺序、存哪里、怎么和 `Clock.manual` 对齐。
-> 四问答错任何一个，写出来的东西要么不可重放，要么在热路径上不可接受。
 
-### 11.1 先说已经有什么（别重造）
-
-| 已有 | 是什么 | 为什么不能直接当 EventRecorder |
-|------|--------|------------------------------|
-| `core/EventStore.zig`（`append` / `readStream` / `replay` / `getVersion`）+ `SnapshotStore` + `EventReplay.replayFromSnapshot` | **领域事件溯源**：按 `stream_id` 记业务事件、版本、快照，可持久 | 它记的是**应用主动 append 的领域事件**，不是运行时的投递流；流/版本/快照那套机制也不适合 1M/s 的 tick |
-| `core/eventbus/WAL.zig`（`WALConfig` / `SyncMode{fsync,segment_sync,none}` / 64MB 分段 / `append`·`readFrom`·`markCommitted`·`cleanup`） | 通用 WAL，**尚未接进 runtime** | 可以做落地层，但 `append` 会分配并返回 `!u64`，不能直接放热路径 |
-| `examples/alpha-engine`（`market/service.zig` 的 `Replay(BookInbox)` + drain marker） | **重放驱动跑通了**：非 worker 的驱动线程按确定序列喂邮箱 | 它读的是内嵌序列，不是录下来的运行流 |
-| `SagaOrchestrator.resumeInstance` / `restoreFromWal` | 记录 + 崩溃续跑在 **Saga 这一层**已成立 | 只覆盖 saga 步骤，不是通用投递流 |
-| `runtime.Sequencer` / `runtime.Clock`（`.monotonic` / `.manual`） | 全局序号 + 可注入时间 | 正是本设计要复用的两块地基 |
-
-**所以缺的不是"记录事件"或"重放"本身，而是**：把运行时**实际投递了什么、按什么顺序、在哪个运行时时刻**录成一份可重放的日志。
-
-### 11.2 缺口的确切形状
-
-`HotBus` 是**有意有损**的 —— `publish` 逐个 sink 调 `deliver`，返回 false（满/关闭）就计一次
-`dropped` 然后**继续**，事件不保留（`hot_bus.zig:118`）。因此：
-
-- 从 `HotBus` **读不回**一次运行；
-- `Handle.send` 的直达投递、`after` 的定时器投递、以及 `MpscRing` 的跨生产者顺序，`HotBus` 都不覆盖。
-
-而 `HotBus` 一旦 `freeze()` 订阅者表就固定，所以"记录"必须在 freeze 前接上。
-
-### 11.3 四个契约问题
-
-**Q1 在哪里取？**
-
-| 取点 | 拿到什么 | 代价 |
-|------|---------|------|
-| `HotBus.publish` 挂一个 sink | 只有 L0 扇出的那一份 | ❌ **不能选**：sink 是竞争者，`max_subscribers` 是 comptime，满时 `deliver` 返回 false → **记录会被丢掉**。而"丢过的记录"比没有记录更危险：你会以为重放是完整的 |
-| `Handle.send` / `sendBlocking` / `sendTraced` + 定时器投递 | **实际进邮箱的每一条**，含直达发送与 `after` | 热路径：每条 send 多一次判断，必须零分配 |
-| `Runtime` 内部、扇出之前 | 同上，且能同时看见 bus 与直达两条来路 | 改动落在 `Runtime`，比改 `Handle` 集中 |
-
-→ 倾向**第三个**，退一步是第二个。
-
-**Q2 顺序怎么定义？** 运行时**没有全局顺序**（每邮箱 FIFO；`MpscRing` 明确不保证跨生产者顺序）。
-所以顺序必须被**定义**：在取点用 `Sequencer.next()` 打一个单调序号，**日志的顺序就是重放的顺序**。
-诚实边界：这是取点处的**某一个**合法交错，不等于某次运行被观察到的那个交错 ——
-重放是确定性的，但不是"时间倒流"。
-
-**Q3 时间。** 每条记录带 `Clock.nowMs()`；重放用 `Clock.manual` 按这些时刻推进，于是定时器按相对次序触发、不 sleep。
-**限制**：这只对**读注入 `Clock` 的代码**成立。runtime 内部全部走 `Clock`，但应用代码若直接调
-`core/Time.zig` 就读到了真实时间 —— 那条路径不参与重放，必须在文档里写明。
-
-**Q4 存哪里？** 三档：
-
-1. **v1：内存有界环**（复用 `RingBuffer`/`MpscRing`）。**溢出是错误而不是静默丢弃** ——
-   与 `HotBus` 相反，这是刻意的：记录器丢一条，重放就不再是那次运行。
-2. 落盘：接 `core/eventbus/WAL.zig`（分段 + `SyncMode`），后台线程刷。
-3. **不**用 `EventStore`：它的流/版本/快照是给领域事件用的，套在 tick 上属于误用。
-
-### 11.4 v1 建议范围
-
-> **下面是落地前的草案 sketch，保留是为了记录取舍。**
-> 其中 `Runtime.enableRecording(cfg)` **没有成为最终 API**：取点最终落在 bus 上，
-> 实际用法是 `bus.attachRecorder(&rec)`（必须在 `freeze()` 之前），
-> 权威描述见 §11.6 与 §13.6。按本节写代码会编译不过。
-
-```
-src/runtime/Recorder.zig          // 新文件，opt-in
-  Runtime.enableRecording(cfg)    // ← 草案写法，未落地；实为 HotBus.attachRecorder
-  Recorder.record(...)            // 取点调用：零分配，写预分配环
-  Recorder.replay(runtime, clk)   // 按 seq 重放，驱动 Clock.manual
-```
-
-复用：`Sequencer`（顺序）、`Clock`（时间）、`RingBuffer`（存储）、`WAL`（可选落地）。
-
-**明确不做**（否则它会长成一个平行框架）：
-
-- 不做领域事件溯源 —— 那是 `EventStore` 的活；
-- 不做 `HotBus` 的订阅者 —— 见 Q1，会丢；
-- 不承诺"进程级完全确定性"：`spawn`/`init` 的副作用、网络、墙钟、以及**丢弃模式**都不重放。
-  丢不丢是时序的函数；重放的是"投递成功的那部分"。
-
-### 11.5 待定（定完再动手）
-
-1. **取点选哪个**（`Runtime` 内部 / `Handle`）—— 决定改动面，以及能否覆盖定时器投递。
-2. **v1 要不要落盘**：只做内存环（小，够测试与短事故窗口）还是同时接 WAL。
-3. **记录粒度**：存 `(seq, clock_ms, target, kind, len)` + 载荷字节，还是只存载荷哈希
-   （省内存，但重放时得重建载荷 —— 对一个"重放"特性来说通常是错的选择）。
+> 实现形状、与设计草案的差异、以及明确未做的边界见 **§11.6**；
+> 代码在 `src/runtime/recorder.zig`。这一节记录的是契约：录什么、按什么顺序、
+> 存哪里、怎么和 `Clock.manual` 对齐——四问答错任何一个，写出来的东西要么不可重放，
+> 要么在热路径上不可接受。
 
 ### 11.6 v1 已实现（`src/runtime/recorder.zig`）
 
-上面的草案保持原样（它是决策记录）；这里是实际落地的形状，以及和草案的差异。
+这里是实际落地的形状。设计阶段的取舍记在 `docs/archive/`，本节只写实现。
 
 ```zig
 const runtime = @import("zigmodu").runtime;
