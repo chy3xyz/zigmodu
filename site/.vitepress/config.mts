@@ -97,6 +97,7 @@ export default defineConfig({
           { text: 'MCP bridge', link: '/MCP' },
           { text: 'Agent Runtime', link: '/AGENT_RUNTIME' },
           { text: 'AI Methodology', link: '/AI_METHODOLOGY' },
+          { text: 'AI Boundary', link: '/AI_BOUNDARY' },
         ],
       },
       {
