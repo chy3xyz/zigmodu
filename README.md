@@ -207,7 +207,7 @@ rather than half-built; the list is in [RUNTIME.md](docs/RUNTIME.md) §12.7.
 | Feature surface | **Frozen** until 1.0 — defects, evidence, docs only (see AGENTS.md "Release cadence") |
 | Breaking changes | **None accepted** before 1.0 (historically 6 / 99 releases) |
 | Audit | **None.** Every "done" here came from the same maintainers and their AI agents (see "Self-assessed" below) |
-| Contributors | Single owner; **2 outside PRs open** (`@knot3bot`, unmerged) — see [GOVERNANCE.md](GOVERNANCE.md) |
+| Contributors | Single owner; **2 outside PRs merged** (`@knot3bot`) — see [GOVERNANCE.md](GOVERNANCE.md) |
 | Real-world use | **Yes** — e.g. [zasdoor](https://github.com/chy3xyz/zasdoor) (an IAM system, 79 backend tests) runs on it |
 
 **What this means for you**: use it if your team can carry its own risk and read the

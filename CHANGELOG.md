@@ -351,6 +351,45 @@ Redis/NATS/Kafka 三平台腿）。
 
 本批同时确认PR #4（`ci-integration-on-pr`）三处改动全部核实无误，建议合并。
 
+### 第 162 批：第一个外部贡献者达成（S4·合并记录 0 → 2）（**破坏性：否；含两个外部 PR 的合并**）
+
+`@knot3bot` 的两个外部 PR **已评审并合并**（2026-10-11 03:38），
+**外部信任档 2 完整达成**，评分 85.6 → **86.4**（+0.8，S4 达成的部分）。
+
+| PR | 内容 | 结果 |
+|---|---|---|
+| [#3 `fix(sqlx): ConnPool acquire 的 deadline 改用单调时钟`](https://github.com/chy3xyz/zigmodu/pull/3) | `waited_ms += 50` 的切片计数假账 → 真实 deadline | 合并（2 commits，含一次修订） |
+| [#4 `ci: integration-full 覆盖 pull_request`](https://github.com/chy3xyz/zigmodu/pull/4) | 该 job 原本只在 push-to-master 跑 + `examples/README.md` 索引漂移 | 合并（1 commit） |
+
+**#3 的修订值得单独记**：它新增的测试**抓不住它声称要抓的缺陷**——
+变异验证（放回 bug 后重跑）显示 2320/2383 全绿。评审指出根因是数学必然：
+循环条件在切片**开头**求值，故「计切片」停在 `ceil(max_wait_ms/50)*50`、
+「计时间」停在 `[max_wait_ms, max_wait_ms+50)`，**两区间对任何取值都重叠**。
+作者据此删掉该测试，改为在 `src/sqlx/sqlx.zig:4632` 留一段解释
+**为什么写不出确定性回归测试**的注释（含区间推导与出路：让slice 预算可注入，
+`src/runtime/scheduler.zig` 的确定性 `Clock` 是现成路线）。
+
+**两处由作者纠正了评审的错误，值得记**：
+
+1. `ConnPool.acquire` 的注释里，评审原写 "`release` signalling one waiter
+   while another stays parked" ——不准确，其他 waiter 并未被 signal，只是各自 park。
+   作者改成了准确表述。
+2. 评审把 PR #4 上 `Integration (full)` 跑绿称作「门禁有效性的自证」，
+   作者指出**这推论偷懒了**：它只能证明配置语法正确且 job 能在 PR 事件下跑起来，
+   真正的证据得是**日后某个 PR 引入走私回归、在合并前被拦下**。
+
+**读数口径（不夸大）**：外部信任 80 → **85（档 2 上沿）**，不是更高——
+**合并 ≠ 审计**。合并证明的是"流程能走通"（外部找得到门禁、写得进门禁、
+评审意见被接受、作者按意见改了），不证明"框架被外部审计过"。
+B-14 判定维持未关。
+
+文档同步：`EVALUATION_2026-10.md` §1.2/§3.2/§七 S4 状态与总分 · `GOVERNANCE.md`
+外部贡献者行 + 投票制门槛 + 档位路线 · README 中英双版贡献者行 ·
+`v1.0-roadmap-1.0.md` 接触面清单与停止线分数。
+
+验证：合并后本地全量 `2321/2384 passed, skipped=63, binaries=8`；
+PR #3 修订版 head 上复跑 `2319/2382` 全绿（少2 = 删掉的测试及其占位）。
+
 ## [0.39.10] - 2026-10-10
 
 ### 第 153 批：集群安全四审计项（A-1/A-3/A-4/B-11）残留收尾（**破坏性：否；一处行为变化**）
