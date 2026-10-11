@@ -527,6 +527,68 @@ PR #3 修订版 head 上复跑 `2319/2382` 全绿（少2 = 删掉的测试及其
 `v1.0-roadmap-1.0.md:6` 的「1008 提交」**刻意不改**——它标注了「日期口径：2026-10-10」，
 属带日期的历史读数，按项目惯例（`dev/READING_NUMBERS.md`）保留。
 
+### 第 166 批：归档作废的完整性报告 + 独立 Astro 文档站（**破坏性：否；纯文档 + 新仓**）
+
+Two items: one archival in the Zig repo, one new repository.
+
+**1. `docs/COMPLETENESS_REPORT.md` → `docs/archive/superseded/`**
+
+The file is a 2026-05-08 / v0.8.0 snapshot and already carries a header saying
+so ("this is not the current state … entries known to be false are listed below,
+do not follow them"). `docs/README.md` now points at the archive path and marks it
+as such.
+
+`EVALUATION_REPORT.md` was **not** archived despite being equally superseded: it is
+cited **by path from four places in `src/`**, so moving it would break those
+references. It keeps its invalidation banner instead — the same treatment
+`dev/v1.0-readiness-v0.35.md` gets.
+
+Broken links after the move: **0 introduced** (checked with a link sweep). The 17
+broken links that exist under `docs/` are all pre-existing and none involve this
+file — 15 of them are `file:///Users/...` absolute paths inside
+`dev/archive/2026-05-review/todo2.md`, plus one in `MIGRATION_v04_to_v07.md` and
+one in `dev/todo.md`. Left alone: they are outside the scope of this change, and
+fixing the `file:///` ones is a separate job.
+
+**2. `zigmodu.github.io` — a standalone Astro 7 site (new repo)**
+
+Built in its own repository rather than under `examples/`, so it does not grow the
+framework's checkout, its 14-job CI matrix, or its `.paths` — the last of which
+would otherwise ship a `node_modules` to every downstream consumer.
+
+Markdown is not authored in the site. `npm run sync` reads `docs/` from the
+sibling Zig checkout and writes `src/content/docs/` with frontmatter (`title`,
+`slug`, `source`, `current`, `minutes`); the synced content is committed so the
+site builds on CI with no access to the Zig repo. **40 documents synced (37 current,
+3 historical)**, 41 pages built.
+
+De-duplication, with each exclusion reasoned rather than assumed:
+
+| Excluded | Why |
+|---|---|
+| `EVALUATION_REPORT.md` | superseded by `EVALUATION_2026-10.md`; the repo marks it "do not quote its numbers" |
+| `COMPLETENESS_REPORT.md` | v0.8.0 snapshot, archived in this batch |
+| `MIGRATION_v04_to_v07.md` · `API-MIGRATION.md` | both older than `UPGRADING.md`, which links to them as history |
+
+`docs/dev/`, `docs/archive/`, `docs/grafana/` and `docs/superpowers/` are not
+walked. Documents that are current-but-historical (`ISSUES_FROM_*`,
+`ZIGMODU_NOTES.md`) are **kept under "Snapshots" with a banner** rather than
+dropped — they are still evidence of real use, and hiding them would lose that
+while presenting them as current would mislead.
+
+The sidebar is grouped by what a reader is trying to do, not alphabetically; the
+grouping lives in the site because it is a navigation decision. Any document the
+groups do not name still appears under "Unfiled" — a silent omission would be
+worse than an extra line.
+
+Two assumptions in the source markdown are handled explicitly: internal links
+like `API.md` are rewritten to the route that serves them, and `zon` / `promql`
+fences are aliased to languages Shiki ships so `build.zig.zon` and PromQL snippets
+are highlighted instead of falling back to plaintext.
+
+Verified: 41 pages, no Shiki warnings; link rewriting confirmed against the built
+HTML; the dev server serves the index and doc routes.
+
 ## [0.39.10] - 2026-10-10
 
 ### 第 153 批：集群安全四审计项（A-1/A-3/A-4/B-11）残留收尾（**破坏性：否；一处行为变化**）

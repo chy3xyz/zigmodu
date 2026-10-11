@@ -71,7 +71,7 @@ integration, and the lesson is worth more than the rule it produced.
 | [ZIGMODU_NOTES.md](ZIGMODU_NOTES.md) | Field notes from another real integration (v0.14.x) |
 | [ISSUES_FROM_ZAPI.md](ISSUES_FROM_ZAPI.md) | Backlog raised by one downstream project |
 | [ISSUES_FROM_ZIGSHOP.md](ISSUES_FROM_ZIGSHOP.md) | Issues raised by another — with what was verified and how |
-| [COMPLETENESS_REPORT.md](COMPLETENESS_REPORT.md) | Point-in-time completeness assessment (superseded — see `dev/`) |
+| ~~[COMPLETENESS_REPORT.md](archive/superseded/COMPLETENESS_REPORT.md)~~ | 2026-05-08 / v0.8.0 的历史快照，已归档——**看到就别照做** |
 | [MIGRATION_v04_to_v07.md](MIGRATION_v04_to_v07.md) | Historical upgrade guide v0.4 → v0.7 (older than [UPGRADING.md](UPGRADING.md)) |
 | [API-MIGRATION.md](API-MIGRATION.md) | Simplified API → `Application` API (older than [UPGRADING.md](UPGRADING.md)) |
 | [modules.md](modules.md) | Short module reference — the long form is [MODULE_LAYERS.md](MODULE_LAYERS.md) |
