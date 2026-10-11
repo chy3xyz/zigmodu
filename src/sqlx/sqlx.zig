@@ -4629,8 +4629,31 @@ const ConnPool = struct {
                 self.mutex.unlock(self.io);
                 return error.ConnectionFailed;
             };
-            var waited_ms: u64 = 0;
-            while (waited_ms < self.max_wait_ms) {
+            // Deadline is measured on the monotonic clock, not by counting
+            // slices. A counting loop assumed each iteration consumed a full
+            // 50ms, but a slice can return early (a spurious wakeup), which
+            // made the budget over-count and abandon an acquire that still
+            // had time left. Same fix as `pool.Pool.acquire`.
+            //
+            // **No regression test, and that is deliberate.** While every slice
+            // sleeps its full 50ms, "slices counted" and "time elapsed" advance
+            // in lockstep: the loop condition is evaluated at each slice *head*,
+            // so the two implementations settle at `ceil(max_wait_ms/50)*50`
+            // and `[max_wait_ms, max_wait_ms+50)` respectively — ranges that
+            // overlap for every value of `max_wait_ms`. Any timing assertion
+            // therefore passes against both, which was confirmed by mutation
+            // (reverting this fix leaves a timing test green). They diverge
+            // only when a slice returns early, and here the sole source of that
+            // is a spurious wakeup: `release` signals only the head waiter
+            // (`orderedRemove(0)`), so queued waiters each park on their own
+            // condition and cannot be woken early by one another.
+            //
+            // Making this testable needs the slice budget to be injectable (the
+            // deterministic `Clock` in `src/runtime/scheduler.zig` is the
+            // natural route) — a larger change than this fix, so it is left to
+            // whoever takes it on rather than faked with a test that cannot fail.
+            const start_ms = Time.monotonicNowMilliseconds();
+            while (Time.monotonicNowMilliseconds() - start_ms < @as(i64, self.max_wait_ms)) {
                 const slice_woken = waiter.cond.waitTimeout(self.io, &self.mutex, .{
                     .duration = .{ .raw = .{ .nanoseconds = slice_ns }, .clock = .awake },
                 });
@@ -4674,7 +4697,6 @@ const ConnPool = struct {
                     self.mutex.unlock(self.io);
                     return error.ConnectionFailed;
                 }
-                waited_ms += 50;
             }
             self.removeWaiter(&waiter);
             self.mutex.unlock(self.io);
