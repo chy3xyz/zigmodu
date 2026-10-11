@@ -2,7 +2,7 @@
 
 一个可直接运行的完整示例：**zigmodu 后端**（org 隔离的 `orders` 业务模块，
 由 `zmodu saas` 生成）+ **saas-solidjs 前端**（管理页 + `zmoduFetch` REST
-client，由 `zsaas/scripts/gen-business.mjs` 生成）。
+client，由 `tools/zsaas/scripts/gen-business.mjs` 生成）。
 
 ## 结构
 
@@ -137,9 +137,9 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/orders
 ## 重新生成业务模块
 
 ```bash
-# 改 zsaas/examples/orders.model.json 后：
-zmodu saas zsaas/examples/orders.model.json --out examples/zmsaas/backend/src/modules
-node zsaas/scripts/gen-business.mjs zsaas/examples/orders.model.json examples/zmsaas/frontend
+# 改 tools/zsaas/examples/orders.model.json 后：
+zmodu saas tools/zsaas/examples/orders.model.json --out examples/zmsaas/backend/src/modules
+node tools/zsaas/scripts/gen-business.mjs tools/zsaas/examples/orders.model.json examples/zmsaas/frontend
 ```
 
 新增实体 → 追加到模型文件 → 两端重新生成（schema 记得同步 `db/schema.zig`）。

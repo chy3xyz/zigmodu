@@ -390,6 +390,43 @@ B-14 判定维持未关。
 验证：合并后本地全量 `2321/2384 passed, skipped=63, binaries=8`；
 PR #3 修订版 head 上复跑 `2319/2382` 全绿（少2 = 删掉的测试及其占位）。
 
+### 第 163 批：仓库根目录清理（`_ref` 与三个 AI 工具目录删除 · `zsaas` 归位到 `tools/`）（**破坏性：否**）
+
+**根目录从 6 个条目收到 2 个**（`README.md` / `build.zig.zon` 等之外的自建目录）。
+
+**1. 删 `_ref/`** —— 唯一文件 `zent-migrate-quota.patch` 的patch 目标
+`src/sql/schema/migrate.zig` **已完全不存在**（`src/sql/` 整个目录都没了），
+其主符号 `computeMigrationVersion` 全仓零命中。**纯死引用**，零信息量。
+
+**2. 删 `.reasonix/`（6 个跟踪文件）与 `.cursor/`** —— 全是工具运行状态
+（`tasks/*/snapshot.json`、`events.jsonl`、`task.lock`、`continual-learning.json`），
+不含任何设计信息。`.gitignore` 里**保留**这两个条目：工具随时会再生成，
+忽略规则防它们被误提交。
+
+**3. `.sisyphus/` 归档而非删除** —— 它含3 个跟踪文件，其中两份是**活文档**
+（`skills/zigmodu.md` 162 行开发技能 · `AI_DEVELOPER_GUIDE.md` 135 行），
+与 `AGENTS.md` 同类，不是工具残留。已归入 `docs/dev/`：
+
+| 原路径 | 新路径 |
+|---|---|
+| `.sisyphus/skills/zigmodu.md` | `docs/dev/SCAFFOLD_SKILL.zigmodu.md` |
+| `.sisyphus/AI_DEVELOPER_GUIDE.md` | `docs/dev/SCAFFOLD_GUIDE.md` |
+| `.sisyphus/plans/zigmodu-development.md` | `docs/dev/SCAFFOLD_PLAN_TEMPLATE.md` |
+
+**4. `zsaas/` 移到 `tools/zsaas/`（不删）** —— 它此前**挂在仓库根目录**，
+看起来像个示例，其实是**脚手架工具**（3 个 `.mjs` + 1 个模型 JSON + README），
+且被 8 处引用（含 `docs/ZMODU_CLI_INTEGRATION.md:160` 的正式用法）。
+**它是 `examples/zmsaas` 的配套生成器** —— zmsaas 的 README 明写前端
+"由 `zsaas/scripts/gen-business.mjs` 生成"，**删掉会让那个示例变成残废**。
+移到 `tools/` 后与 `tools/zmodu/` 同性质（都是工具），且 `.paths` 已含 `tools`，
+**自动随包分发，无需改 `.paths`**。已同步更新 `docs/ZMODU_CLI_INTEGRATION.md`、
+`examples/zmsaas/README.md`（3 处路径）、`tools/zsaas/README.md` 自引用。
+
+**顺带记录一个既有缺陷（不是本次引入，未修）**：
+`tools/zsaas/scripts/check-gen.mjs` 自检报 `MISSING src/libs/zmoduApi.ts`。
+已用 `git worktree` 在移动前的版本对照跑过—— **移动前同样报此错**，
+即 `gen-business.mjs` 建了 `src/libs` 目录却没写 `zmoduApi.ts`，与本次移动无关。
+
 ## [0.39.10] - 2026-10-10
 
 ### 第 153 批：集群安全四审计项（A-1/A-3/A-4/B-11）残留收尾（**破坏性：否；一处行为变化**）

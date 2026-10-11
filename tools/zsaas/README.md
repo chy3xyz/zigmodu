@@ -5,7 +5,7 @@
 - **后端**：`zmodu saas <model.json>` 生成 zigmodu 业务模块（Zig），严格按
   zigmodu 最佳实践（分层 model/persistence/service/api、参数化 SQL、org 租户
   隔离、ComptimeRouter + `.auth = .jwt` + permission 门控、`ctx.json`）；
-- **前端**：`node zsaas/scripts/gen-business.mjs <model.json> <dir>` 生成
+- **前端**：`node tools/zsaas/scripts/gen-business.mjs <model.json> <dir>` 生成
   SolidStart 管理端页面（列表/表单 + API client），走 **zigmodu REST API**
   （`/api/v1/<entity>`），不重复造 Drizzle 后端层。
 
@@ -37,7 +37,7 @@
 
 ```bash
 # 方式 A — 一键新建前后端工程（推荐）
-node zsaas/scripts/create-project.mjs orders.model.json \
+node tools/zsaas/scripts/create-project.mjs orders.model.json \
   --name mysaas --backend ./mysaas-backend --frontend ./mysaas-frontend
 #   → zigmodu 后端工程（zmodu new + zmodu saas 业务模块，可直接 zig build）
 #   → saas-solidjs 前端工程（模板复制 + 业务页面，npm install && npm run dev）
@@ -49,7 +49,7 @@ zmodu saas orders.model.json --out src/modules
 #    permissionGateWith(.rbac) + Router.scope.mountAll，并用 saas-schema.sql 建表
 
 # 2. 前端：生成 SolidStart 管理页面 + REST client
-node zsaas/scripts/gen-business.mjs orders.model.json <saas-solidjs-dir>
+node tools/zsaas/scripts/gen-business.mjs orders.model.json <saas-solidjs-dir>
 cd <saas-solidjs-dir> && npm run dev   # /dashboard/orders
 ```
 
@@ -82,7 +82,7 @@ REST 契约：`GET /api/v1/<entity>?page&size` → `{code,items,total}`；
 
 ## 验证
 
-- `node zsaas/scripts/check-gen.mjs` — 前端生成器自检（产物结构 + zmoduFetch 接线）；
+- `node tools/zsaas/scripts/check-gen.mjs` — 前端生成器自检（产物结构 + zmoduFetch 接线）；
 - 生成的前端在真实 saas-solidjs 工程 `tsc --noEmit` 通过；
 - 生成的后端模块在真实 zigmodu 工程 `zig build test` 编译通过。
 

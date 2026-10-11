@@ -157,7 +157,7 @@ module/root 五个文件；`examples/zmsaas/scripts/reapply-custom.py` 一键恢
 的自定义层（DTO/actions/transact 方法），工作流 = 重新生成 → reapply → 构建。
 
 前端同源产出：同一个 `orders.model.json` 可再跑
-`node zsaas/scripts/gen-business.mjs orders.model.json <frontend>`，生成
+`node tools/zsaas/scripts/gen-business.mjs orders.model.json <frontend>`，生成
 `src/models/Orders.ts`（类型 + 字段 schema）与
 `src/routes/dashboard/orders/index.tsx`（DataTable + EntityForm 数据驱动 CRUD
 页，直接对接后端 autoCrud）。共享脚手架（`libs/apiClient.ts`、
