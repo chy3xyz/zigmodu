@@ -530,9 +530,11 @@ test "doc snippets: the markdown corpus carries none of the known-uncompilable s
     for ([_][]const u8{ "AGENTS.md", "README.md", "README.zh.md" }) |path| scan(allocator, path, .{ .init_first_arg = true }, &violations);
 
     // Every markdown file under docs/, recursively. `docs/dev/**` carries the
-    // pre-implementation design notes the follow-up pass cleaned; the plugin's
-    // own tree under `docs/superpowers/**` is not this project's docs.
-    scanMarkdownTree(allocator, "docs", &.{"superpowers"}, .{ .init_first_arg = true }, &violations);
+    // pre-implementation design notes the follow-up pass cleaned, and
+    // `docs/archive/**` holds finished implementation plans whose snippets were
+    // written against the tree as it stood when they ran — neither is a contract
+    // a reader is expected to compile.
+    scanMarkdownTree(allocator, "docs", &.{ "archive", "superpowers" }, .{ .init_first_arg = true }, &violations);
 
     if (violations > 0) {
         std.debug.print("[doc-snippets] {d} snippet(s) that cannot compile\n", .{violations});

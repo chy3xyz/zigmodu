@@ -200,7 +200,7 @@ AI 侧、集群侧）的实测结果：builder 绑定、worker 归 app、不手�
 4. **修可执行文档 + 加护栏** —— ✅ **已完成（v0.24.0）**：`Application.init` 真签名示例、`app.runtime()` 的
    `try` / comptime capacity、`ClusterView` 的 refcount 表述、`tuneSocket` 的 keepalive 说明全部改正；
    `src/test/DocSnippets.zig` 增补 `try app.runtime()` 与 `Application.init(allocator…` 两类模式
-   （`DocSnippets.zig:31,33`），并把 markdown 扫描**递归到 `docs/**`**（跳过 `docs/superpowers/**`）。
+   （`DocSnippets.zig:31,33`），并把 markdown 扫描**递归到 `docs/**`**（跳过 `docs/archive/**` 与 `docs/superpowers/**`）。
 5. **错误与契约文案** —— ✅ **已完成（v0.24.0）**：12/12 pub error set 补齐成员级 `///`（新补 8 个 set / 94 条成员注释）；
    5 处 `@compileError` / `@panic` 文案统一成"期望形态 + 怎么改"。
 

@@ -39,16 +39,55 @@ Comprehensive documentation for the ZigModu modular framework.
 | [Production Roadmap](PRODUCTION_ROADMAP.md) | 维护边界、prefork 边界、`src/ai` 可剔离域 | Advanced |
 | [部署参考](../examples/production-deploy/README.md) | TLS 边车、探针语义、`Restart=always`、Dockerfile | Advanced |
 
-## 📎 Other documents
+## 🧱 Core specifications
 
-These are referenced by task but were not indexed before — kept as-is.
+The contracts the rest of the docs defer to. Read these before the guides above —
+they are where "what does the framework actually promise" is written down.
+
+| Spec | Covers |
+|------|--------|
+| [**RUNTIME.md**](RUNTIME.md) | Execution plane: workers, mailboxes, pools, priorities, supervision, determinism, metrics (§8 / §12 / §15). **2 630 lines — the single largest doc, and the one most often needed.** |
+| [**DISTRIBUTED.md**](DISTRIBUTED.md) | Raft / bus / membership, the transport-encryption boundary (A-2), per-node identity, rotation |
+| [**API_FREEZE.md**](API_FREEZE.md) | The frozen API surface vs the preview surface, before 1.0 |
+| [**ARCHITECTURE.md**](ARCHITECTURE.md) | System design and the module/layer rules everything else assumes |
+| [**API.md**](API.md) | Full API reference |
+| [**EVENTS_DI.md**](EVENTS_DI.md) | EventBus + DI: how `Application` wires them, and the runnable sample |
+| [**WORKFLOW.md**](WORKFLOW.md) | Long-running, resumable processes |
+| [**AGENT_RUNTIME.md**](AGENT_RUNTIME.md) | Agent runtime — **agents cannot act by default** (v0.21+) |
+| [**AI_BOUNDARY.md**](AI_BOUNDARY.md) | Preconditions for extracting the `ai` package (v0.20.1+) |
+| [**CLUSTER-QUICKSTART.md**](CLUSTER-QUICKSTART.md) | Single-node cluster in five minutes |
+| [**WEB4.md**](WEB4.md) | DID identity + x402 payments |
+
+## 📎 Field notes & project history
+
+Not contracts. Kept because each records something that happened in a real
+integration, and the lesson is worth more than the rule it produced.
 
 | Doc | What it covers |
 |-----|----------------|
 | [LOGGING.md](LOGGING.md) | Structured logging: levels, fields, sinks |
+| [elegant-code-patterns.md](elegant-code-patterns.md) | Five-file layout + handler/input/response conventions |
+| [best-practices-heysen-lessons.md](best-practices-heysen-lessons.md) | Lessons from a real SaaS integration (SQLx / ORM / route conventions) |
+| [ZIGMODU_NOTES.md](ZIGMODU_NOTES.md) | Field notes from another real integration (v0.14.x) |
+| [ISSUES_FROM_ZAPI.md](ISSUES_FROM_ZAPI.md) | Backlog raised by one downstream project |
+| [ISSUES_FROM_ZIGSHOP.md](ISSUES_FROM_ZIGSHOP.md) | Issues raised by another — with what was verified and how |
+| [COMPLETENESS_REPORT.md](COMPLETENESS_REPORT.md) | Point-in-time completeness assessment (superseded — see `dev/`) |
 | [MIGRATION_v04_to_v07.md](MIGRATION_v04_to_v07.md) | Historical upgrade guide v0.4 → v0.7 (older than [UPGRADING.md](UPGRADING.md)) |
-| [ZIGMODU_NOTES.md](ZIGMODU_NOTES.md) | Field notes from a real project integration (v0.14.x) |
-| [docs/dev/](dev/) | Internal review / assessment / roadmap scratch notes (not user-facing contracts). **先看 [dev/README.md](dev/README.md)** —— 22 份里哪几份仍生效、哪几份被哪一份取代、哪些路径被源码按字面引用不能动 |
+| [API-MIGRATION.md](API-MIGRATION.md) | Simplified API → `Application` API (older than [UPGRADING.md](UPGRADING.md)) |
+| [modules.md](modules.md) | Short module reference — the long form is [MODULE_LAYERS.md](MODULE_LAYERS.md) |
+
+## 🔒 Project status & governance
+
+| Doc | What it covers |
+|-----|----------------|
+| [**EVALUATION_2026-10.md**](EVALUATION_2026-10.md) | **Current** quality & competitiveness assessment (86.4/100, 7 weighted axes) |
+| [EVALUATION_REPORT.md](EVALUATION_REPORT.md) | ⛔ Superseded 2026-10-10 — kept because source comments cite it by path. **Do not quote its numbers.** |
+| [`../GOVERNANCE.md`](../GOVERNANCE.md) | Who decides what, and how to push for a change |
+| [`../SECURITY.md`](../SECURITY.md) | Reporting a vulnerability; the attack surface this project admits to |
+| [FRAMEWORK_BACKLOG.md](FRAMEWORK_BACKLOG.md) | Deferred work, kept visible rather than forgotten |
+| [PRODUCTION_ROADMAP.md](PRODUCTION_ROADMAP.md) | Maintenance boundaries, prefork boundary, removable domains |
+| [docs/dev/](dev/) | Internal review / assessment / roadmap notes (not user-facing contracts). **先看 [dev/README.md](dev/README.md)** —— 哪几份仍生效、哪几份被哪一份取代、哪些路径被源码按字面引用不能动 |
+| [docs/archive/](archive/) | 已完成的实施计划（2026-07 的 modulith / sqlx 批次）。产出早已落在正式文档里，计划本身只作史料 |
 
 ## 🔧 Features
 

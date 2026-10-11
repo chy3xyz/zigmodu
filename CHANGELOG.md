@@ -444,6 +444,47 @@ PR #3 修订版 head 上复跑 `2319/2382` 全绿（少2 = 删掉的测试及其
 已用 `git worktree` 在移动前的版本对照跑过—— **移动前同样报此错**，
 即 `gen-business.mjs` 建了 `src/libs` 目录却没写 `zmoduApi.ts`，与本次移动无关。
 
+### 第 164 批：examples 构建产物清理（4.5G → 443M）+ docs 结构整理（**破坏性：否；一处代码注释级改动**）
+
+**1. examples 构建产物清理（磁盘，非版本库）**
+
+`shopdemo` 的 183M 里**166M 是 `.zig-global-cache`**——即"shopdemo 是否适合删除"这个问题，
+答案是它的体积与它的代码无关。全 examples 扫一遍共 **3.8G** 是构建缓存：
+
+| 项 | 体积 | 说明 |
+|---|---|---|
+| `examples/*/.zig-global-cache` · `.zig-cache` · `zig-out` | **3.8G** | `git ls-files` 全为 0，且全部已在 `.gitignore` |
+| `examples/` 清理后 | **443M** | 真实内容（含 `schema.sql` 364K） |
+| `shopdemo` 清理后 | **688K** | 31 个文件，代码 7 984 行 |
+
+**没有删 shopdemo 的任何代码**——它被 19 个文件引用，且是三处 CI 承重用法：
+`ci.yml:358-372` 的 migration 差分 + audit 基线路径、`ci.yml:298` 的 doctor 清单、
+`scripts/ci-integration.sh:102-121` 的集成冒烟。
+
+**2. docs 结构整理**
+
+- **`docs/superpowers/` → `docs/archive/2026-07-plans/`**（5 份已完成的实施计划，
+  2 402 行）。核实产出确已落地：`src/core/WorkerPool.zig` 与
+  `KafkaConnector.cooperative_sticky` 都在。归档而非删除——计划本身只作史料。
+- **删 `.DS_Store`**（2 个）并把 `.DS_Store` 加入 `.gitignore`（此前会再生成）。
+- **重写 `docs/README.md` 索引**：覆盖率 **26/44 → 43/44**（仅索引自身不计）。
+  此前 18 份文档没有入口，其中包括**最大的两份规范**——`RUNTIME.md`（2 630 行）
+  与 `DISTRIBUTED.md`（734 行）。新增分层：
+  - **🧱 Core specifications**：RUNTIME / DISTRIBUTED / API_FREEZE / ARCHITECTURE /
+    API / EVENTS_DI / WORKFLOW / AGENT_RUNTIME / AI_BOUNDARY / CLUSTER-QUICKSTART / WEB4
+  - **📎 Field notes & project history**：明确"不是契约，保留是因为其中的教训"
+  - **🔒 Project status & governance**：指向当前的 `EVALUATION_2026-10.md`，
+    并标明 `EVALUATION_REPORT.md` ⛔ 已作废（勿引用其数字）
+- **`src/test/DocSnippets.zig` 的排除列表加 `archive`**（唯一代码改动）：该门禁递归
+  扫 `docs/**`，原先只排除 `docs/superpowers/**`；目录移走后会开始扫描归档计划里
+  针对旧树写的代码片段。同步更新 `docs/BEST_PRACTICES.md:203` 的对应描述。
+
+验证：`--force-run` 连跑三次均 **2321/2384 passed, skipped=63, binaries=8**，
+`zig fmt` clean，`docs/README.md` 全部相对链接 0 坏链，索引覆盖 43/44。
+（中途一次 `ClusterBootstrap accepts an app-supplied Raft transport` 失败，
+已用 `git stash` + worktree 在干净的 `344a2cf` 上对照，确认与本批改动无关——
+清缓存后首次编译的瞬态，三次重跑均绿。）
+
 ## [0.39.10] - 2026-10-10
 
 ### 第 153 批：集群安全四审计项（A-1/A-3/A-4/B-11）残留收尾（**破坏性：否；一处行为变化**）
