@@ -237,9 +237,22 @@ jobs:
         # `zig build docs` is a dev step that `test`/`check` never compile, so it
         # rotted silently: by the time it was run by hand it had two independent
         # drifts (removed `std.heap.GeneralPurposeAllocator`, and a 3-arg call to
-        # the now-4-arg `generateDocs`). Compiling it here costs seconds and is
-        # the only thing that keeps it honest.
+        # the now-4-arg `generateDocs`). Compiling it here costs seconds and is the
+        # only thing that keeps it honest.
         run: zig build docs
+
+      - name: Doc-path citation gate
+        # The tree points at its own docs by literal path — 454 references, with
+        # docs/RUNTIME.md accounting for 156. Nothing else checks them: a renamed
+        # or moved document leaves the comment intact and pointing at nothing, and
+        # the break surfaces only when someone follows the citation months later
+        # and cannot tell a rotted path from their own mistake.
+        #
+        # Runs on every push that touches source. `docs/**` is in this workflow's
+        # `paths-ignore`, so a docs-only commit skips it — which is correct here,
+        # because deleting a document is exactly the change that should fail: it
+        # arrives as a source edit to every comment that cited it.
+        run: bash scripts/check-doc-paths.sh
 
       - name: Tenant-scope compile gate
         run: bash scripts/check-tenant-scope.sh
