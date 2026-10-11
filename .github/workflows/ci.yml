@@ -292,6 +292,9 @@ jobs:
         run: |
           set -euo pipefail
           # Subset by construction: doctor needs a module graph, so only module-layout examples are listed.
+          # Note `basic` is NOT here: its modules are single `src/modules/<name>.zig` files, while
+          # `audit.collectModules` only discovers directory-layout modules (`src/modules/<name>/module.zig`).
+          # Listing it would report `modules: 0` and pass without checking anything.
           for app in tenant-mgmt tenant-shop shopdemo zent-modulith alpha-engine metaverse-creative; do
             echo "== doctor examples/$app =="
             ./zig-out/bin/zmodu doctor "examples/$app"
@@ -552,7 +555,20 @@ jobs:
     # the platform matrix (fresh checkout, own compile), and starting in
     # parallel takes ~8 minutes off the green path. A broken base build costs
     # a wasted run here, never a wrong result.
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    #
+    # Runs on pull_request as well as push-to-master. These are functional and
+    # security assertions — the CL/TE smuggling probes below are exactly the
+    # regression a reviewer cannot eyeball — and unlike `benchmark` (which
+    # stays push-only because its numbers move with runner load, see ci.yml
+    # `benchmark`), a pass/fail verdict here does not depend on the machine it
+    # ran on. It needs no secrets, so fork PRs run it too; ubuntu-latest
+    # provides docker for the gateway steps.
+    #
+    # Branch pushes that are not master are excluded on purpose: they run in
+    # `pull_request` instead, so the same change is not probed twice.
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))
     steps:
       - uses: actions/checkout@v4
 
