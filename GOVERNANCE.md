@@ -12,7 +12,7 @@
 |项 | 现状 |
 |---|---|
 | 仓库所有者 | `chy3xyz`（`CHANGELOG` 署名 `Antigravity Agent`） |
-| 提交构成 | 1008 提交：`Antigravity Agent` 758 / `neox33` 220 / `ZigModu Developer` 29 / 所有者 1 |
+| 提交构成 | 1 022 提交：`Antigravity Agent` 770 / `neox33` 220 / `ZigModu Developer` 29 / **`knot3bot` 4（外部）** / 所有者 `chy3xyz` 1 |
 | 外部贡献者 | **2 个 PR 已合并**（`@knot3bot`，见下）；`neox33` 的 220 提交为共同维护者身份，非外部 |
 | stars / forks | 3 / 0 |
 | 第三方审计 | **无**——见 [`docs/EVALUATION_2026-10.md`](docs/EVALUATION_2026-10.md) §3.2 |
