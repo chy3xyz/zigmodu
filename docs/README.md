@@ -23,14 +23,16 @@ Comprehensive documentation for the ZigModu modular framework.
 
 ## 🤖 For AI agents
 
+**权威路由是 [`AGENTS.md`](../AGENTS.md)** —— 它的"文档地图"一节已经给出每类任务该读哪份。
+下表只是从本索引进来的快捷方式。
+
 | Doc | Role |
 |-----|------|
 | [**AGENTS.md**](../AGENTS.md) | **Canonical** — doc map, DO/DON'T, ComptimeRouter, Path A auth |
 | [CLAUDE.md](../CLAUDE.md) | Compact Claude Code rules (points to AGENTS) |
-| [AI_METHODOLOGY.md](dev/AI_METHODOLOGY.md) | Why modulith + AI; anti-patterns (philosophy) |
 | [ROUTE_TABLE.md](reference/ROUTE_TABLE.md) §7 | Auth / RBAC detail |
 | [BEST_PRACTICES.md](guide/BEST_PRACTICES.md) | DAU + JWT checklist |
-| [AI.md](ai/AI.md) | LLM **chat product** module (`--with-aichat`) — not agent ops |
+| [**ai/**](ai/README.md) | **AI 子系统入口** — 先看这一页定位你要哪条线，再进具体文档 |
 | [AI_DEV_GUIDE.md](ai/AI_DEV_GUIDE.md) | **AI 开发指南**：KeyManager → Provider → Skill → Agent/Workflow → 接入（HTTP/cron/outbox/MCP） |
 | [AI_SKILLS.md](ai/AI_SKILLS.md) | 内置 AI 技能目录（db.query / kpi / approval / admin…） |
 | [AI_ORCHESTRATION.md](ai/AI_ORCHESTRATION.md) | Workflow 编排（线性/DAG/审批门/WAL 恢复/触发/审计） |

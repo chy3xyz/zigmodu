@@ -89,6 +89,7 @@ export default defineConfig({
       {
         text: 'AI (optional)',
         items: [
+          { text: 'Overview', link: '/ai/README' },
           { text: 'AI Chat', link: '/ai/AI' },
           { text: 'AI Dev Guide', link: '/ai/AI_DEV_GUIDE' },
           { text: 'AI Skills', link: '/ai/AI_SKILLS' },
