@@ -96,18 +96,18 @@ pub const Application = struct {
         /// logged as a warning by `validate()` (sizing is a smell, never a
         /// reason to refuse to start). `0` disables the check.
         max_dependencies: usize = 8,
-        /// Declared upper bound on `.mode = .pooled` workers (docs/RUNTIME.md
+        /// Declared upper bound on `.mode = .pooled` workers (docs/reference/RUNTIME.md
         /// §12): the runtime `app.runtime()` creates is sized for it, and its
         /// pool threads appear the first time a pooled worker is spawned. `0` —
         /// the default — means this app has no pool, and `.pooled` is refused at
         /// `spawn` rather than starting a thread nobody declared.
         max_pooled_workers: usize = 0,
-        /// How many pool threads that pool runs (docs/RUNTIME.md §12.12). `1` —
+        /// How many pool threads that pool runs (docs/reference/RUNTIME.md §12.12). `1` —
         /// the default — is the single-consumer shape, so an app that declares a
         /// pool and no width keeps exactly the scheduling behaviour it had
         /// before. Ignored when `max_pooled_workers` is 0: no pool is created.
         pool_threads: usize = 1,
-        /// How many threads the **blocking** pool runs (docs/RUNTIME.md §12.13).
+        /// How many threads the **blocking** pool runs (docs/reference/RUNTIME.md §12.13).
         /// `0` — the default — means no blocking pool: `.execution_class =
         /// .blocking` is refused at `spawn`, exactly as `.pooled` is without
         /// `max_pooled_workers`, so an app that never asks for one starts no
@@ -119,7 +119,7 @@ pub const Application = struct {
         /// thread parked in `read` is not competing for a core.
         blocking_threads: usize = 0,
         /// Declared upper bound on `.execution_class = .blocking` workers. `0`
-        /// means "the same count as `max_pooled_workers`" (docs/RUNTIME.md
+        /// means "the same count as `max_pooled_workers`" (docs/reference/RUNTIME.md
         /// §12.13): the two bounds are independent admissions, so the app's total
         /// worker bound is their sum, not one number split in two.
         max_blocking_workers: usize = 0,
@@ -410,15 +410,15 @@ pub const ApplicationBuilder = struct {
     /// Declared upper bound on `.pooled` workers, handed to the runtime
     /// `app.runtime()` creates (`Config.max_pooled_workers`). `0` — the default —
     /// means the app has no pool, so a `.mode = .pooled` spawn is refused
-    /// (docs/RUNTIME.md §12.8 D2).
+    /// (docs/reference/RUNTIME.md §12.8 D2).
     max_pooled_workers: usize = 0,
     /// How many threads that pool runs (`Config.pool_threads`), handed to the same
     /// `1` — the default — keeps the single-consumer scheduling shape
-    /// (docs/RUNTIME.md §12.12).
+    /// (docs/reference/RUNTIME.md §12.12).
     pool_threads: usize = 1,
     /// How many threads the blocking pool runs (`Config.blocking_threads`). `0` —
     /// the default — means the app has no blocking pool, so `.execution_class =
-    /// .blocking` is refused at `spawn` (docs/RUNTIME.md §12.13).
+    /// .blocking` is refused at `spawn` (docs/reference/RUNTIME.md §12.13).
     blocking_threads: usize = 0,
     /// Declared upper bound on blocking workers (`Config.max_blocking_workers`).
     /// `0` means "the same count as `max_pooled_workers`".
@@ -470,7 +470,7 @@ pub const ApplicationBuilder = struct {
         return self;
     }
 
-    /// Declare the runtime pool this app may use (docs/RUNTIME.md §12.8 D2): the
+    /// Declare the runtime pool this app may use (docs/reference/RUNTIME.md §12.8 D2): the
     /// runtime behind `app.runtime()` / `ctx.runtime()` is sized for it, and its
     /// pool threads appear with the first `.pooled` spawn. Left alone, the app
     /// has no pool and `.mode = .pooled` is refused at `spawn` — a declaration is
@@ -481,7 +481,7 @@ pub const ApplicationBuilder = struct {
     }
 
     /// How many threads the pool declared by `withMaxPooledWorkers` runs
-    /// (docs/RUNTIME.md §12.12). The default of 1 is the single-consumer shape,
+    /// (docs/reference/RUNTIME.md §12.12). The default of 1 is the single-consumer shape,
     /// and it is what an app that does not call this keeps. Widening the pool is
     /// for the long tail (§12.5): a pooled worker's state exclusivity is the
     /// claim, not thread identity, so more threads do not weaken §12.3 — but each
@@ -493,7 +493,7 @@ pub const ApplicationBuilder = struct {
     }
 
     /// Declare the **blocking** pool and how many threads it runs
-    /// (docs/RUNTIME.md §12.13) — the resource that keeps a handler waiting on
+    /// (docs/reference/RUNTIME.md §12.13) — the resource that keeps a handler waiting on
     /// something outside the process from occupying the CPU pool.
     ///
     /// Declaring it is what makes `.execution_class = .blocking` legal at `spawn`;
@@ -1256,7 +1256,7 @@ test "Application: no withBlockingThreads means no blocking pool at all" {
     const rt = try app.runtime();
     // The default has to be "nothing changes": no thread, no ring, and a
     // `.blocking` spawn refused — the same shape `.pooled` has without a
-    // declaration (docs/RUNTIME.md §12.8 D2 / §12.13).
+    // declaration (docs/reference/RUNTIME.md §12.8 D2 / §12.13).
     try std.testing.expect(rt.blockingPoolStats() == null);
     try std.testing.expectEqual(@as(usize, 0), rt.stats().workers);
 

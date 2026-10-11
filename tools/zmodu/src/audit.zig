@@ -20,7 +20,7 @@
 //!
 //! Every section carries a matching `// ==== §N ... ====` anchor — `grep "==== §3"`
 //! jumps there. `§N` in prose without that prefix is a *document* section (e.g.
-//! `docs/ZENT.md §14`), never one of these.
+//! `docs/reference/ZENT.md §14`), never one of these.
 
 const std = @import("std");
 const Io = std.Io;
@@ -864,7 +864,7 @@ fn lintFile(
         // them into the wrong allocator", and `queryRowOwned` /
         // `scanRowsToOwned` are the same shape. Freeing one here is a
         // cross-allocator free: `free of invalid memory`, which kills the
-        // process (the allocator-mismatch incident in docs/ZENT.md §14).
+        // process (the allocator-mismatch incident in docs/reference/ZENT.md §14).
         //
         // Deliberately narrow: it keys on "the producer call mentions an
         // allocator/arena", which is the discriminator the docs give. A rule

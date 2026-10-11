@@ -2,8 +2,8 @@
 
 > 状态：**推荐栈已钉死；scaffold 默认 RBAC；zent-modulith / tenant-shop 已迁；tenant-mgmt 用 CatalogPermDb**。  
 > 推荐：`jwtAuthFromCatalogWithPermissions` + `permissionGateWith(.rbac)` + `RolePermissionTable` / `CatalogPermDb` / 自定义 `CatalogPermissionLoader`。  
-> 多门户 / 多主体 RBAC 最佳实践摘要：[`BEST_PRACTICES.md`](BEST_PRACTICES.md)「JWT / 多端身份」；细则 §7.1。  
-> **AI**：[`AGENTS.md`](../AGENTS.md) DO/DON'T + 本文 §7；勿把 AuthInfo 写入 `user_data`。  
+> 多门户 / 多主体 RBAC 最佳实践摘要：[`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「JWT / 多端身份」；细则 §7.1。  
+> **AI**：[`AGENTS.md`](../../AGENTS.md) DO/DON'T + 本文 §7；勿把 AuthInfo 写入 `user_data`。  
 > Legacy：`security.auth.jwtAuth*` / `AppSecurity.rbacJwtMiddleware*` 现只写 **`auth_info`**，可与 ComptimeRouter `user_data` State 共存；读 auth 用 `getAuth` / `ctx.authInfo`，**勿再 `@ptrCast(user_data)` 当 AuthInfo**。  
 > 前提：未生产化，**不做**旧 URL 兼容。
 
@@ -311,7 +311,7 @@ WS：`pub const ws_routes = [_]http.WsSpec(State){ .{ .path = "ws", .on_connect 
 ### 7.1 多端 / 自定义身份 claim（应用层扩展 · 最佳实践）
 
 框架 **不** 内置 `type=user|admin|shop_user|…` 枚举。多门户（C 端 / 店主 / 平台 / 供应商）用 **现有槽位** 扩展，避免第二套 JWT 核心模型。  
-可执行清单与接线样例亦见 [`BEST_PRACTICES.md`](BEST_PRACTICES.md)「JWT / 多端身份」。
+可执行清单与接线样例亦见 [`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「JWT / 多端身份」。
 
 #### 分层（与现有组件对齐）
 
@@ -509,13 +509,13 @@ catalog_slot.set(try router.finish());
 | WS 出站 | `ws_write_timeout_ms` + `WsFramer.isWritable()` | 不读的慢客户端阻塞写线程 |
 
 指标 / 告警 / Grafana：[`OBSERVABILITY.md`](OBSERVABILITY.md)；
-TLS 边车与守护拓扑：[`../examples/production-deploy/`](../examples/production-deploy/)。
+TLS 边车与守护拓扑：[`../examples/production-deploy/`](../../examples/production-deploy/)。
 
 配套的两件事（都在同一批加固里，别只做 profile）：
 
 - **启动预检**：`zigmodu.Preflight.run(...)` 检查必填 env、占位 JWT secret、
   DB 连通、待应用迁移、时钟偏移；`!report.ok()` 就拒绝启动。
-  见 [`BEST_PRACTICES.md`](BEST_PRACTICES.md)「上线前预检」。
+  见 [`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「上线前预检」。
 - **密钥轮换**：`app_sec.module.setKeyring(&ring)` 让 token 带 `kid`，新旧密钥
   双验；否则换 secret 只能全员重登。见同文「JWT 密钥轮换」。
 

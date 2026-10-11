@@ -59,7 +59,7 @@ const WsFramer = ws_framer.WsFramer;
 /// stay analyzable and testable on every platform. What is verified where — and
 /// what no test executes anywhere (the real ring; nothing in-tree calls
 /// `WsUring.init`) — is written down as the authoritative boundary note in
-/// `docs/API.md` 「ws_uring 环境边界（A-7 定界）」.
+/// `docs/reference/API.md` 「ws_uring 环境边界（A-7 定界）」.
 pub const WsUring = struct {
     const Self = @This();
 

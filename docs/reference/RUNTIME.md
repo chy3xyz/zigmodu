@@ -473,7 +473,7 @@ worker 先停（邮箱关闭）、定时器随后到点，于是它跳一次 —
 项目**声明了什么**接线 —— worker 类型与邮箱容量、`Mailbox`/`HotBus` 等原语、定时器调用点、
 recorder/trace 引用、时钟选择 —— 可以用 `zmodu runtime [dir]` 盘出来（只读源码，每条带
 `file:line`；没用 runtime 的项目也退 0）。两者互补：一个答"接线长什么样"，一个答"跑起来怎么样"。
-见 [`ZMODU_CLI_INTEGRATION.md`](ZMODU_CLI_INTEGRATION.md) 的 `zmodu runtime` 一节。
+见 [`ZMODU_CLI_INTEGRATION.md`](../guide/ZMODU_CLI_INTEGRATION.md) 的 `zmodu runtime` 一节。
 
 ### 8.1 Worker trace context —— 消息可归属到发起它的那次请求
 
@@ -2550,7 +2550,7 @@ exit 2 / 翻转字节 → corrupt 定位 + exit 3 / 空 log / 目录缺失是错
 ## 15. Deterministic mode —— Phase D 已落地（v0.36 后批次 140），S 级完整
 
 > 设计与分级（D/S/P 三级、六条不变式、四阶段路线）在
-> [`dev/deterministic-runtime-design.md`](dev/deterministic-runtime-design.md)；
+> [`dev/deterministic-runtime-design.md`](../dev/deterministic-runtime-design.md)；
 > 本节只记**使用契约**。一句话：同一份输入 + 同一个 seed + 同一拓扑 ⇒ 同一条
 > 事件序列。它是「配置出来的执行模式」，不是第二套 runtime —— 默认（生产）模式
 > 一字不改。

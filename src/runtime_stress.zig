@@ -1,5 +1,5 @@
 //! `zig build runtime-stress` — the long-horizon harness for the runtime
-//! (docs/RUNTIME.md §5, §8, §12, §14).
+//! (docs/reference/RUNTIME.md §5, §8, §12, §14).
 //!
 //! ## Why this file exists
 //!
@@ -1232,19 +1232,19 @@ fn run(io: std.Io, backing: std.mem.Allocator, p: Params) !Report {
         // to have room: that half exercises a *successful* timer delivery, while
         // the pooled half exercises §12.11-3's `enqueue` + `announceReady` on a
         // mailbox that is usually full (those deliveries are dropped and
-        // counted — `timer_deliveries_dropped`, docs/RUNTIME.md §5). Two arms
+        // counted — `timer_deliveries_dropped`, docs/reference/RUNTIME.md §5). Two arms
         // because the two members have two handle types; the error handling is
         // the same for both.
         if (i % 4 == 3) {
             _ = progress_handle.after(delay, payload) catch |err| {
                 report.fail(.window_coverage, "arming timer {d} failed: {s} (the timer command queue is a bounded " ++
-                    "hand-off, docs/RUNTIME.md §5)", .{ i, @errorName(err) });
+                    "hand-off, docs/reference/RUNTIME.md §5)", .{ i, @errorName(err) });
                 break;
             };
         } else {
             _ = cpu_handles[i % cpu_handles.len].after(delay, payload) catch |err| {
                 report.fail(.window_coverage, "arming timer {d} failed: {s} (the timer command queue is a bounded " ++
-                    "hand-off, docs/RUNTIME.md §5)", .{ i, @errorName(err) });
+                    "hand-off, docs/reference/RUNTIME.md §5)", .{ i, @errorName(err) });
                 break;
             };
         }

@@ -1,6 +1,6 @@
 //! Outbox + Idempotency smoke sample (unit-level — no listen).
 //! Pattern: business write + outbox insert SQL; HTTP writes guarded by Idempotency-Key.
-//! See docs/FRAMEWORK_BACKLOG.md §7 and docs/MODULITH.md.
+//! See docs/meta/FRAMEWORK_BACKLOG.md §7 and docs/guide/MODULITH.md.
 
 const std = @import("std");
 const OutboxPublisher = @import("OutboxPublisher.zig").OutboxPublisher;

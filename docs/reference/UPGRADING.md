@@ -84,7 +84,7 @@
 `Simplified` 整块入口**已经不在了**，所以它不在上面的表里：`不早于 1.0` 是对**还在**的别名做的承诺，
 对一个已经删掉的名字继续承诺删除时点，只会让读者以为 `zigmodu.App` 今天还能用。
 
-- **移除的名字**：`zigmodu.App` / `zigmodu.ModuleImpl`（旧写法长什么样见 [`API-MIGRATION.md`](API-MIGRATION.md)
+- **移除的名字**：`zigmodu.App` / `zigmodu.ModuleImpl`（旧写法长什么样见 [`API-MIGRATION.md`](../meta/API-MIGRATION.md)
   的 Before 段 —— 那段今天**照抄编译不过**，它的价值只剩"看懂旧代码在写什么"）。
 - **何时移除的**：commit `557190a`（2026-05-12，标题 `…+ Simplified removal`）已把它从 `src/root.zig` 移除，
   此后顶层不再有这些名字。
@@ -142,8 +142,8 @@
 
 > 每条变更标注 **Breaking?** / **影响面** / **一行改法**。
 > 只记"会咬人"的：行为变化、公开签名变化、默认值变化、需要动手删代码的地方。
-> 完整变更列表见 [`../CHANGELOG.md`](../CHANGELOG.md)；框架级迁移（Simplified → Application）
-> 见 [`API-MIGRATION.md`](API-MIGRATION.md)。
+> 完整变更列表见 [`../CHANGELOG.md`](../../CHANGELOG.md)；框架级迁移（Simplified → Application）
+> 见 [`API-MIGRATION.md`](../meta/API-MIGRATION.md)。
 
 自查命令（升级后先跑这两条）：
 
@@ -183,7 +183,7 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 > （行为收紧）。另有 ④⑤⑥ 三条行为变化（④ scheduler `push` 的预算语义，非破坏性；
 > ⑤ sqlx `query_timeout_ms = 0` 从「无界 + 警告」改为「回落默认有界」+ 删
 > `hasUnboundedPgReads`；⑥ TimerWheel 同 deadline 触发序从 LIFO 反转为 FIFO）。逐条背景见
-> [`../CHANGELOG.md`](../CHANGELOG.md) `[0.39.6]` 段的第 138 / 136 / 135 / 134 / 133 / 130 批。
+> [`../CHANGELOG.md`](../../CHANGELOG.md) `[0.39.6]` 段的第 138 / 136 / 135 / 134 / 133 / 130 批。
 
 ### ① 中间件工厂与槽位池函数返回错误（第 134 批，**编译错**）
 
@@ -414,7 +414,7 @@ HTTP/1.1 缓冲响应、chunked/streaming、SSE、HTTP/2 帧、`Server` 的 WS �
 > 静默返回 `0`/`false`、表单解析超限从 200 变 400、`CachedConn` 的坏缓存条目从 `DatabaseError` 变成
 > "缓存未命中 + 修复"、`BufferPool` 的取消语义、认证中间件对"我们这侧失败"改回 500、API key 比较改恒定
 > 时间、MySQL 的 NULL 元数据不再读成"零行"。
-> 逐条背景见 [`../CHANGELOG.md`](../CHANGELOG.md) 的 `[Unreleased]` 段。
+> 逐条背景见 [`../CHANGELOG.md`](../../CHANGELOG.md) 的 `[Unreleased]` 段。
 
 **破坏 ②：`Middleware.attachIdentityBestEffort` 由 `void` 变成 `!void`。** 它以前在构建 `roles` 属性失败时
 **静默返回**，留下一个"有 `user_id`/`tenant_id`、没有 `roles`"的身份继续处理请求（role gate 一律 403，
@@ -596,7 +596,7 @@ if (!ok) return unauthorized();
 
 > **本版有 2 处破坏性变更，都是编译错**（`Cursor.next` 的错误联合、`csrf()` 要求中间件拿到
 > `CsrfConfig`），另有 1 处**默认行为收紧**（CSRF 不再采信 `X-Forwarded-Host`）。逐条背景见
-> [`../CHANGELOG.md`](../CHANGELOG.md) 的 `[0.33.3]` 段。
+> [`../CHANGELOG.md`](../../CHANGELOG.md) 的 `[0.33.3]` 段。
 
 **破坏 ①：`Cursor.next` 返回错误联合。** `sqlx.Cursor.next` 从 `?*Row` 变成
 `errors.ResultT(?*Row)`——**流中途的驱动/服务器错误以前被折叠成 `null`**，即"查询坏了"和"结果取完"
@@ -678,7 +678,7 @@ if (!ok) return unauthorized();
 
 ## v0.33.1
 
-> 本版无破坏性变更。以下为 additive 亮点；完整列表见 [CHANGELOG](../CHANGELOG.md)。
+> 本版无破坏性变更。以下为 additive 亮点；完整列表见 [CHANGELOG](../../CHANGELOG.md)。
 
 **新增：校验失败的结构化错误体与消息本地化（opt-in）。** `Validation` 中间件新增
 `structured_errors` 与 `message_hook` 选项（`withStructuredErrors()` /
@@ -700,7 +700,7 @@ deinit），`Validator.MessageHook` 可本地化默认规则消息（`FieldRules
 
 > **本版有 7 处破坏性变更，其中 3 处是编译错**（WS 路由声明、CSPRNG 的 `io` 参数、`Method.fromString` 返回类型）。
 > v0.29.0–v0.31.0 **没有**破坏性变更，所以本节是 v0.28.0 之后的唯一一段。
-> 逐条背景见 [`../CHANGELOG.md`](../CHANGELOG.md) 的 `[0.32.0]` 段。
+> 逐条背景见 [`../CHANGELOG.md`](../../CHANGELOG.md) 的 `[0.32.0]` 段。
 
 ### WebSocket 路由必须显式声明 `.meta.auth = .public`（**编译错**）
 

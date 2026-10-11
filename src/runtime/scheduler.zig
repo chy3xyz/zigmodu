@@ -1,5 +1,5 @@
 //! Scheduler — the *pooled* execution mode of `Runtime.spawn`
-//! (docs/RUNTIME.md §12; `queued`/`claimed`, a ready ring, `pool_threads` pool
+//! (docs/reference/RUNTIME.md §12; `queued`/`claimed`, a ready ring, `pool_threads` pool
 //! threads — Phase 2; the default width of 1 is the Phase 1 shape, so an
 //! app that declares a pool and no width keeps running exactly what it ran
 //! before).
@@ -17,7 +17,7 @@
 //! guarantees §12.3's state exclusivity: with a dedicated thread it is thread
 //! identity; here it is an exclusive declaration (`claimed`).
 //!
-//! ## One protocol, one or two pools (docs/RUNTIME.md §6)
+//! ## One protocol, one or two pools (docs/reference/RUNTIME.md §6)
 //!
 //! This type is the whole pool: ring, threads, admission bound, protocol. A
 //! runtime that declares a *blocking* pool (`SchedulerConfig.blocking_threads`)
@@ -124,7 +124,7 @@ const clock_mod = @import("clock.zig");
 /// run before the worker goes back into the ready ring.
 ///
 /// **Two pools, one protocol.** A runtime may declare a *blocking* pool as well
-/// (docs/RUNTIME.md §6): a `.blocking` worker runs on a second `Scheduler` built
+/// (docs/reference/RUNTIME.md §6): a `.blocking` worker runs on a second `Scheduler` built
 /// from `blocking_threads` / `max_blocking_workers`, with its own ready ring,
 /// its own threads and its own admission bound. Nothing about the protocol
 /// changes — the two rings share no state — which is exactly what makes "a
@@ -137,7 +137,7 @@ pub const SchedulerConfig = struct {
     /// spawn. `0` = no pool: the runtime starts no pool thread, and
     /// `.mode = .pooled` is a configuration error at `spawn`.
     max_pooled_workers: usize = 0,
-    /// How many threads consume the ready ring (docs/RUNTIME.md §12.12). It is
+    /// How many threads consume the ready ring (docs/reference/RUNTIME.md §12.12). It is
     /// also the number of ring slots that can be *held by a consumer inside
     /// `tryPop`* at one instant — the window `push` retries over — which is why
     /// the ready ring's capacity is derived from `max_pooled_workers +
@@ -158,7 +158,7 @@ pub const SchedulerConfig = struct {
     /// D3's starting point. `1` is the latency end (one message per claim, every
     /// message pays a ring round trip), the mailbox capacity the throughput end
     /// (one slow handler starves every other ready worker). 16 is a first
-    /// measurement, not a conclusion — docs/RUNTIME.md §12.9 is the reasoning, and
+    /// measurement, not a conclusion — docs/reference/RUNTIME.md §12.9 is the reasoning, and
     /// §12.16 is the measurement that closes it. It closes it at 16, because
     /// everything from 8 up sits on one plateau whose round-to-round spread is
     /// wider than the gap between its points, while a peer's worst-case wait
@@ -166,7 +166,7 @@ pub const SchedulerConfig = struct {
     /// `batch = 16`, 53 118 at `batch = 65 536`).
     batch: usize = default_batch,
     /// How many threads run workers declared `.execution_class = .blocking`, i.e.
-    /// whether this runtime has a blocking pool at all (docs/RUNTIME.md §6).
+    /// whether this runtime has a blocking pool at all (docs/reference/RUNTIME.md §6).
     /// `0` (the default) = none, and `.blocking` is then refused at `spawn`
     /// (`error.BlockingPoolNotConfigured`) instead of quietly sharing the pool a
     /// handler that blocks would hold down — the same discipline D2 applies to
@@ -188,7 +188,7 @@ pub const SchedulerConfig = struct {
 
 pub const default_batch: usize = 16;
 
-/// Which ready ring a pooled worker's token lives in (docs/RUNTIME.md §12.17).
+/// Which ready ring a pooled worker's token lives in (docs/reference/RUNTIME.md §12.17).
 ///
 /// Three classes, strict order, one reservation: turns try `high → normal →
 /// low`, except every `reservation_period`-th turn, which tries the classes in
@@ -244,7 +244,7 @@ pub const reservation_period: u64 = 8;
 pub const starvation_threshold_ms: i64 = 50;
 
 /// Phase 1's pool width, and the default: a runtime that declares a pool but not
-/// a width runs exactly one pool thread (docs/RUNTIME.md §12.12).
+/// a width runs exactly one pool thread (docs/reference/RUNTIME.md §12.12).
 pub const default_pool_threads: usize = 1;
 
 /// How long `push` spins for a slot it was told is full before it starts
@@ -520,7 +520,7 @@ const ReadyRing = struct {
 /// starts no thread until a pooled worker is actually spawned.
 ///
 /// A runtime owns one of these per execution class it declares: `Runtime.scheduler`
-/// for `.cpu`, `Runtime.blocking_scheduler` for `.blocking` (docs/RUNTIME.md §6).
+/// for `.cpu`, `Runtime.blocking_scheduler` for `.blocking` (docs/reference/RUNTIME.md §6).
 /// A worker is admitted by exactly one of them, and its `pool` link points at that
 /// one — so `announce`, the hand-back re-check and `join` all stay in the pool
 /// that owns it, with no class anywhere in the protocol.
@@ -680,7 +680,7 @@ pub const Scheduler = struct {
         /// claim is free — so it reads as a defect signal. With more than one it
         /// is a normal reading: two threads can be at the same worker's token at
         /// once (one running it, one arriving after the hand-back started), and
-        /// the skip is the protocol working (docs/RUNTIME.md §12.12).
+        /// the skip is the protocol working (docs/reference/RUNTIME.md §12.12).
         claim_misses: u64,
         /// Pushes that had to wait past the whole spin/yield budget for a ring
         /// slot — counted once per call, after which the push sleeps and retries
@@ -1780,7 +1780,7 @@ test "scheduler (§12.17): a claim-miss re-push keeps the token in its own class
 }
 
 // ─────────────────────────────────────────────────
-// The ring under N consumers (Phase 2, docs/RUNTIME.md §12.12)
+// The ring under N consumers (Phase 2, docs/reference/RUNTIME.md §12.12)
 // ─────────────────────────────────────────────────
 //
 // Every test above drives the ring from **one** consumer, which is what Phase 1

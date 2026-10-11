@@ -343,7 +343,7 @@ pub fn build(b: *std.Build) void {
     // passthrough API restores the `b.args` form the dev toolchain removed —
     // args after `--` reach the CLI and no longer force a build-script rebuild
     // when they change. The installed `zig-out/bin/zmodu …` form stays valid
-    // for scripts (docs/ZMODU_CLI_INTEGRATION.md).
+    // for scripts (docs/guide/ZMODU_CLI_INTEGRATION.md).
     run_zmodu_cmd.addPassthruArgs();
     const zmodu_step = b.step("zmodu", "Build and install the unified zmodu CLI code generator");
     zmodu_step.dependOn(&run_zmodu_cmd.step);
@@ -473,7 +473,7 @@ pub fn build(b: *std.Build) void {
     // batch 105, and a Windows build is not asked to compile code that could
     // never run there. Making the cluster transport itself Windows-portable is
     // a separate, larger piece of work — tracked as a documented limitation in
-    // `docs/DISTRIBUTED.md`, not folded into a harness fix.
+    // `docs/reference/DISTRIBUTED.md`, not folded into a harness fix.
     if (target.result.os.tag != .windows) {
         b.installArtifact(cluster_node_exe);
         const cluster_node_step = b.step("cluster-node", "Build the single-node cluster harness used by scripts/ci-mixed-version.sh (installed as zig-out/bin/cluster-node; POSIX-only, like the cluster transport it drives)");

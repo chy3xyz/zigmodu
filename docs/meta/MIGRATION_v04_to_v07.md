@@ -190,6 +190,6 @@ try bus.publish(.{ .topic = "order", .payload = data });
 
 ## Getting Help
 
-- [API Documentation](../docs/API.md)
-- [Quick Start Guide](../QUICK-START.md)
+- [API Documentation](../reference/API.md)
+- [Quick Start Guide](../guide/QUICK-START.md)
 - [GitHub Issues](https://github.com/knot3bot/zigmodu/issues)

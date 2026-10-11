@@ -11,7 +11,7 @@
    - `model.zig` — 结构体、数据表名定位、JSON field 名称与默认值。
    - `persistence.zig` — `Repository(T)` 数据存储与自定义 SQL 探针。
    - `service.zig` — 业务逻辑校验与 EventBus 消息事件发布。
-   - `api.zig` — ComptimeRouter `pub const routes`（`http.RouteSpec`）+ typed handler；scaffold 经 `mountAll` 接线（见 [`ROUTE_TABLE.md`](ROUTE_TABLE.md)）。
+   - `api.zig` — ComptimeRouter `pub const routes`（`http.RouteSpec`）+ typed handler；scaffold 经 `mountAll` 接线（见 [`ROUTE_TABLE.md`](../reference/ROUTE_TABLE.md)）。
    - `module.zig` — Module 生命期（`init` / `deinit`）与导出链。
    - `test.zig` — **仅单表模块**产出（`orm_tpl.sqlx_test` + `writeModuleFiles`）：基于 `http.Testkit` 的两条真断言 —— `openMemorySqlite` 上的 repository 往返（insert → findById → delete），以及一次 `dispatch` 打生成的 POST 路由（断言信封与"行真的落库"）。`generateScaffoldTestsZig` 会同步写入 `test { _ = @import("modules/<name>/test.zig"); }`，所以 `zig build test` 直接跑它。多表模块不产出：模板按 `model.<PascalModule>` 取类型，多表时该类型名不成立。
 3. **内置 MCP Server 交互能力**：内置 Model Context Protocol (MCP) Server，AI 智能体可直接通过 MCP Tool (如 `scaffold`, `module`, `verify`, `sql_diff`) 与代码库联动。
@@ -345,7 +345,7 @@ summary: 4 worker(s) (1 .pooled), 4 bus(es), 1 timer call site(s), pool: declare
 **它不做什么**（很重要）：它**不读活进程**。队列深度、`dropped_full`、`timer_lag_ms`，以及池自己的
 读数（`pool_claimed` / `pool_ready_len` / `pool_ready_push_failures`）都是运行中进程的属性，
 已由 `Runtime.MetricsBridge` 导出成 Prometheus 指标 —— 抓取配方见
-[`RUNTIME.md`](RUNTIME.md) §8。它也**不做任何判据**：只报看得见的事实（"`attachRecorder(` 在
+[`RUNTIME.md`](../reference/RUNTIME.md) §8。它也**不做任何判据**：只报看得见的事实（"`attachRecorder(` 在
 `src/x.zig:42`"），不做静态不可靠的推断（"recorder 是不是在 `freeze()` 之后挂的"，
 "声明了池的那个 build 和 `.pooled` 的 spawn 是不是同一个"），所以 `--json` 可以直接进 CI 而不产生假警报。
 

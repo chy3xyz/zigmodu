@@ -1,4 +1,4 @@
-//! Allocation contract for the runtime's hot paths (docs/RUNTIME.md §4/§5/§6).
+//! Allocation contract for the runtime's hot paths (docs/reference/RUNTIME.md §4/§5/§6).
 //!
 //! The runtime's promise is that the producer side of the L0 paths allocates
 //! nothing: a `send` copies into a fixed-capacity slot, a `publish` fans out

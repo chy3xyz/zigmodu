@@ -3,24 +3,24 @@
 > **两条平面**：ZigModu 是"**编译期模块化应用框架 + worker 导向执行运行时**"。本文按这两条平面组织 ——
 > **应用平面**（模块 / DI / HTTP / 数据 / 事件 / 安全 / 运维，默认就在用）与**执行平面**
 > （worker / mailbox / 调度 / 定时器 / 监督 / 回放，`app.runtime()` opt-in）。
-> 执行平面的**规格**在 [RUNTIME.md](RUNTIME.md)；**该不该用、怎么用、哪里会踩**在本文
+> 执行平面的**规格**在 [RUNTIME.md](../reference/RUNTIME.md)；**该不该用、怎么用、哪里会踩**在本文
 > 「执行平面（Runtime）最佳实践」一节。没碰执行平面的应用，行为与本文的其他章节一致。
 >
 > **Modulith 从第一天怎么写高并发应用**：见专文 [MODULITH.md](MODULITH.md)（边界、fiber、池化、规模阶梯、反模式）。
 > 
 > **model / persistence / service / Tx 分层**：见专文 [MODULE_LAYERS.md](MODULE_LAYERS.md)（参考实现 `examples/tenant-shop`）。  
-> **ZigModu × zent（schema / Client / privacy / 模块级选型）**：见专文 [ZENT.md](ZENT.md)（参考实现 `examples/zent-modulith`）。  
+> **ZigModu × zent（schema / Client / privacy / 模块级选型）**：见专文 [ZENT.md](../reference/ZENT.md)（参考实现 `examples/zent-modulith`）。  
 > **SQLx 选择性驱动链接（`-Ddb=` / `.db=`）**：见专文 [SQLX_DRIVERS.md](SQLX_DRIVERS.md)。  
-> **HTTP 路由 + catalog JWT / RBAC**：见专文 [ROUTE_TABLE.md](ROUTE_TABLE.md) §7；可执行清单见下文「JWT / 多端身份」。  
-> **AI / Agent 写代码**：先读仓库根目录 [AGENTS.md](../AGENTS.md)（文档地图 + DO/DON'T）；方法论见 [AI_METHODOLOGY.md](AI_METHODOLOGY.md)。  
-> **代码片段基线**：**ZigModu v0.35.0 · Zig 0.17.0**（CI 钉 `0.17.0` **正式版**，见 `.github/workflows/ci.yml` 的 `ZIG_VERSION`）。跨版本升级看 [UPGRADING.md](UPGRADING.md)；"哪些是证明过的、哪些不是"看 [v1.0 差距评估](dev/v1.0-readiness-v0.35.md)。  
+> **HTTP 路由 + catalog JWT / RBAC**：见专文 [ROUTE_TABLE.md](../reference/ROUTE_TABLE.md) §7；可执行清单见下文「JWT / 多端身份」。  
+> **AI / Agent 写代码**：先读仓库根目录 [AGENTS.md](../../AGENTS.md)（文档地图 + DO/DON'T）；方法论见 [AI_METHODOLOGY.md](../ai/AI_METHODOLOGY.md)。  
+> **代码片段基线**：**ZigModu v0.35.0 · Zig 0.17.0**（CI 钉 `0.17.0` **正式版**，见 `.github/workflows/ci.yml` 的 `ZIG_VERSION`）。跨版本升级看 [UPGRADING.md](../reference/UPGRADING.md)；"哪些是证明过的、哪些不是"看 [v1.0 差距评估](../dev/v1.0-readiness-v0.35.md)。  
 > **片段口径**：本文的代码围栏分两类 —— **可照抄的完整示例**，和**示意用的片段/伪码**（含 `...`、`// ...`、
 > 或引用了上下文里没给的标识符）。伪码**不保证可直接编译**，只表达结构与契约；可编译的完整示例看
 > `examples/**`。逐段标注见各围栏前的说明。
 
 ## 📋 目录 (Table of Contents)
 
-- [📦 已归档：v0.26.0 现状复核审计快照 →](archive/superseded/BEST_PRACTICES-audit-v0.26.md)
+- [📦 已归档：v0.26.0 现状复核审计快照 →](../archive/superseded/BEST_PRACTICES-audit-v0.26.md)
 - [渐进式架构演进路线图](#-渐进式架构演进路线图)
 - [执行平面（Runtime）最佳实践](#-执行平面runtime最佳实践)
 - [模块设计原则](#-模块设计原则)
@@ -54,7 +54,7 @@
 - [团队协作](#-团队协作)
 
 > **原 §「🔄 现状复核（v0.26.0 快照）」已移出本文** →
-> [`archive/superseded/BEST_PRACTICES-audit-v0.26.md`](archive/superseded/BEST_PRACTICES-audit-v0.26.md)。
+> [`archive/superseded/BEST_PRACTICES-audit-v0.26.md`](../archive/superseded/BEST_PRACTICES-audit-v0.26.md)。
 > 那是 2026-09-18 的内部审计台账（占原文件 14%），不是给使用者的最佳实践；
 > 留在正文里会让人把当时的采样值读成现行结论。
 
@@ -65,7 +65,7 @@ ZigModu 核心设计理念：**从单体部署到分布式集群，随着用户�
 > **本节讲的是第一条轴（应用平面的规模）。** 另有一条**正交**的轴 —— **执行平面**
 > （worker / mailbox / 调度 / 定时器 / 监督 / 回放）：它不由用户量驱动，而由**负载形状**驱动
 > （要不要跨请求的状态、会不会长时间占住一条执行流）。两条轴可以各自推进，都不需要拆服务：
-> 见上文 [执行平面（Runtime）最佳实践](#-执行平面runtime最佳实践) 与 [RUNTIME.md](RUNTIME.md)。
+> 见上文 [执行平面（Runtime）最佳实践](#-执行平面runtime最佳实践) 与 [RUNTIME.md](../reference/RUNTIME.md)。
 
 **起步请先读** [MODULITH.md](MODULITH.md) 与 [MODULE_LAYERS.md](MODULE_LAYERS.md)：五文件模块边界、Tx 工作单元、Day-1 连接池/Outbox、以及何时才拆独立进程。本节描述用户量增长驱动的架构演进，框架能力随阶段自动解锁。
 
@@ -706,7 +706,7 @@ ZigModu 不绑定 ORM：**同一个应用里按模块选型**，但两者正交�
 | 需要与既有 SQL schema 对齐 | zent + `StorageKey`（v0.36+） | 字段名与列名解耦，不必改库表命名 |
 | 既有 sqlx 代码迁移 | 逐模块替换 | 分层契约不变（model / persistence / service），改动局限在 persistence |
 
-铁律与细节：[`docs/ZENT.md`](ZENT.md) §1 定位、§2 何时用哪个、§12 反模式、§14 升级注意。
+铁律与细节：[`docs/ZENT.md`](../reference/ZENT.md) §1 定位、§2 何时用哪个、§12 反模式、§14 升级注意。
 租户来源必须是 JWT 注入的 attr（`.tenant_source = .attr`），从 query 取租户会被
 `zmodu audit` b22 拦下。
 
@@ -904,7 +904,7 @@ model/persistence/service/api/module/root 五个文件，自定义逻辑可放�
 ## 🚀 执行平面（Runtime）最佳实践
 
 > **适用**：`app.runtime()` 已经或将要出现在你的应用里。**没用它的应用不必读这一节** ——
-> 不调 `runtime()` 就不多起线程，行为与上文完全一致。规格与 API 看 [RUNTIME.md](RUNTIME.md)；
+> 不调 `runtime()` 就不多起线程，行为与上文完全一致。规格与 API 看 [RUNTIME.md](../reference/RUNTIME.md)；
 > 领域背景见 [alpha-engine](https://github.com/chy3xyz/zigmodu/tree/master/examples/alpha-engine)。
 
 ### 0. 先判断该不该上执行平面
@@ -930,7 +930,7 @@ model/persistence/service/api/module/root 五个文件，自定义逻辑可放�
 * mailbox 的 `.capacity` 决定"满了会怎样"：生产者拿到 `error.Full`（**不是**无限增长）。
   容量要按"消费者最慢时能容忍多少积压"算，不是"看起来够大"。
 * 满与丢都必须**看得见**：`messages_dropped` / `record_dropped` / `pool_ready_push_failures` /
-  HotBus 的丢计数。生产上至少给这些挂一条告警（[OBSERVABILITY.md](OBSERVABILITY.md)）。
+  HotBus 的丢计数。生产上至少给这些挂一条告警（[OBSERVABILITY.md](../reference/OBSERVABILITY.md)）。
 * 定时器不是队列：`Wheel.schedule` 有容量，迟到以 `timer_lag_max_ms` 暴露。
 
 ### 3. 热路径**零分配**是有测试的契约，不是口号
@@ -965,7 +965,7 @@ model/persistence/service/api/module/root 五个文件，自定义逻辑可放�
   挪去 `.blocking`（或让它跑在阻塞池上）。
 * **用 `.pooled` 装"必须准时"的实时 worker** —— 池线程可能正在跑别人。实时路径用 `.dedicated`。
 * **忘了声明 `.blocking`** —— 调度器不会替你检测；阻塞调用会直接吃掉 CPU 池的线程。这正是
-  "非阻塞 IO"仍是 v1.0 缺口之一的实际形状（[dev/v1.0-readiness-v0.35.md](dev/v1.0-readiness-v0.35.md) A-5）。
+  "非阻塞 IO"仍是 v1.0 缺口之一的实际形状（[dev/v1.0-readiness-v0.35.md](../dev/v1.0-readiness-v0.35.md) A-5）。
 
 ### 5. 失败与停机：策略要显式
 
@@ -1115,7 +1115,7 @@ Zig 的 panic 不可捕获——请求路径上任何一次 panic 都会终止**
 拖垮全部在途请求。框架提供四层防线（预防 → 收口 → 诊断 → 恢复）。
 
 **生产一行接入**（细节与顺序约束见
-[`ROUTE_TABLE.md`](ROUTE_TABLE.md) §7.4）：
+[`ROUTE_TABLE.md`](../reference/ROUTE_TABLE.md) §7.4）：
 
 ```zig
 var profile = zigmodu.http.ProductionProfileState.init(allocator);
@@ -1128,7 +1128,7 @@ try zigmodu.http.productionProfile(&server, .{
 
 它同时挂出 `/metrics`（黄金信号）、`/health/live`、`/health/ready` 与
 tracing/access-log/security-headers；告警与看板见
-[`OBSERVABILITY.md`](OBSERVABILITY.md)。
+[`OBSERVABILITY.md`](../reference/OBSERVABILITY.md)。
 
 **1. 预防 · 共享注册表用 FrozenMap（消除最高发的崩溃源）**
 
@@ -1194,7 +1194,7 @@ Server 在 dispatch 前写入 threadlocal 请求上下文、结束后清除，�
 panic 钩子管诊断，不管存活。进程存活靠 supervisor：`systemd`
 `Restart=always`、k8s `restartPolicy: Always` 或容器编排的重启策略。
 多进程隔离（prefork）的边界与前置条件见
-[`PRODUCTION_ROADMAP.md`](PRODUCTION_ROADMAP.md)「单进程单点与原位隔离」。
+[`PRODUCTION_ROADMAP.md`](../meta/PRODUCTION_ROADMAP.md)「单进程单点与原位隔离」。
 
 ### 持锁纪律：临界区里允许出现什么（v0.35.0 逐处复核）
 
@@ -2074,7 +2074,7 @@ const avatar = form.file("avatar").?;   // 到这里才可信
 
 ### JWT / 多端身份（与路由栈）
 
-权威细则：[`ROUTE_TABLE.md`](ROUTE_TABLE.md) §7 + §7.1。此处为可执行摘要。
+权威细则：[`ROUTE_TABLE.md`](../reference/ROUTE_TABLE.md) §7 + §7.1。此处为可执行摘要。
 
 #### 默认栈（路径 A · 新应用必选）
 
@@ -2723,7 +2723,7 @@ macOS 腿 `100 checks x10K` 42.9ms vs 基线 19.9ms，同 commit 原样重跑 28
 | 覆盖率 | **没有强制阈值**（`zig build test` 不产出覆盖率门禁）。想加就得先有工具与基线；在那之前不写进清单当承诺 | —— |
 
 文档与示例的口径：公共 API 要有 doc comment（`zig build docs` 生成）、示例要能编译（CI 的
-Build Examples 腿），"哪些证明过、哪些没有"逐条记在 [dev/v1.0-readiness-v0.35.md](dev/v1.0-readiness-v0.35.md)。
+Build Examples 腿），"哪些证明过、哪些没有"逐条记在 [dev/v1.0-readiness-v0.35.md](../dev/v1.0-readiness-v0.35.md)。
 
 ## 🛠️ 版本升级指南
 

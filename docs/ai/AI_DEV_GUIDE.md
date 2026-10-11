@@ -26,9 +26,9 @@
 
 | 示例 | 示范什么 |
 |------|----------|
-| [`examples/ai-ops`](../examples/ai-ops) | 业务工具全链路：告警 → 诊断 → 审批 → 通知 → 审计；审批队列经 HTTP 暴露 |
-| [`examples/llm-policies`](../examples/llm-policies) | LLM 策略真实接线（`json_fn` 注入可无模型测试） |
-| [`examples/mcp-server`](../examples/mcp-server) | SkillRegistry → MCP stdio server（`tools/list` / `tools/call`） |
+| [`examples/ai-ops`](../../examples/ai-ops) | 业务工具全链路：告警 → 诊断 → 审批 → 通知 → 审计；审批队列经 HTTP 暴露 |
+| [`examples/llm-policies`](../../examples/llm-policies) | LLM 策略真实接线（`json_fn` 注入可无模型测试） |
+| [`examples/mcp-server`](../../examples/mcp-server) | SkillRegistry → MCP stdio server（`tools/list` / `tools/call`） |
 
 ## 3. 最小链路
 
@@ -94,7 +94,7 @@ try registry.register(.{
 ### 3.3 执行：Agent
 
 用 `ai.AgentSpec` 装配（**不要**手搓裸 `Agent{}`：漏掉 `.guard` 就是无界 —— 任何已注册工具都能跑）。
-闸门 / 工具类别 / 权限默认 deny 的完整说明见 [`AGENT_RUNTIME.md`](AGENT_RUNTIME.md)。
+闸门 / 工具类别 / 权限默认 deny 的完整说明见 [`AGENT_RUNTIME.md`](../reference/AGENT_RUNTIME.md)。
 
 ```zig
 var budget = zigmodu.ai.Budget.init(2000);          // 硬 token 预算（预留制）

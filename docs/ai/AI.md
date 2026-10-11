@@ -1,7 +1,7 @@
 # AI Chat Module — 使用指南
 
 > 本文档描述 **LLM 对话 / Agent 产品能力**（`zmodu scaffold --with-aichat` / `--with-agent`）。  
-> 写 ZigModu 框架代码的 coding agent 请读：[AGENTS.md](../AGENTS.md)。  
+> 写 ZigModu 框架代码的 coding agent 请读：[AGENTS.md](../../AGENTS.md)。  
 > `zmodu mcp` 是 **codegen** MCP 服务端，与运行时 `SkillRegistry` 正交。
 > 在业务系统里完整接入 AI（KeyManager / Agent / Workflow / 自定义技能 / MCP）
 > 请读：[AI_DEV_GUIDE.md](AI_DEV_GUIDE.md)。
@@ -46,7 +46,7 @@ var result = try agent.run(allocator, "ping the system", &skill_ctx, 5);
 defer result.deinit(allocator);
 ```
 
-闸门 / 工具类别 / 权限默认 deny 的完整规则见 [`AGENT_RUNTIME.md`](AGENT_RUNTIME.md)。
+闸门 / 工具类别 / 权限默认 deny 的完整规则见 [`AGENT_RUNTIME.md`](../reference/AGENT_RUNTIME.md)。
 
 **刻意不做**：默认任意 shell / 外部 MCP client。需要时自行 `register` 受控 handler。
 

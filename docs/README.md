@@ -2,42 +2,57 @@
 
 Comprehensive documentation for the ZigModu modular framework.
 
+## 📁 目录结构
+
+| 目录 | 放什么 | 判断依据 |
+|------|--------|---------|
+| [`guide/`](guide/QUICK-START.md) | 教程与任务导向：「我要做 X」 | 按**上手路径**组织 |
+| [`reference/`](reference/RUNTIME.md) | 契约：框架实际承诺什么 | **零历史、零待办**，只描述现状 |
+| [`ai/`](ai/AI.md) | AI 子系统（与上面两组正交） | 按**能力切面**分：产品 chat / 编排 / 技能 / 策略 / MCP |
+| [`meta/`](meta/EVALUATION_2026-10.md) | 评估、路线图、历史记录、外部反馈 | **有时效**，会过期 |
+| `dev/` `archive/` | 内部设计笔记 / 已归档史料 | 不面向使用者 |
+| `README.md` `index.md` | 本索引 / 站点首页 | — |
+
+> 分组依据是**文档之间的实际引用**，不是主题相似度。实测链接图只聚为两簇
+> （交叉率 5%），所以没有按「运行时/数据/网络」这类主题再切——那样做只会把
+> 互链切断 58%。`ai/` 是例外：它 7 篇自成一体、互链密集，且与其余文档正交。
+
 ## 🤖 For AI agents
 
 | Doc | Role |
 |-----|------|
 | [**AGENTS.md**](../AGENTS.md) | **Canonical** — doc map, DO/DON'T, ComptimeRouter, Path A auth |
 | [CLAUDE.md](../CLAUDE.md) | Compact Claude Code rules (points to AGENTS) |
-| [AI_METHODOLOGY.md](AI_METHODOLOGY.md) | Why modulith + AI; anti-patterns (philosophy) |
-| [ROUTE_TABLE.md](ROUTE_TABLE.md) §7 | Auth / RBAC detail |
-| [BEST_PRACTICES.md](BEST_PRACTICES.md) | DAU + JWT checklist |
-| [AI.md](AI.md) | LLM **chat product** module (`--with-aichat`) — not agent ops |
-| [AI_DEV_GUIDE.md](AI_DEV_GUIDE.md) | **AI 开发指南**：KeyManager → Provider → Skill → Agent/Workflow → 接入（HTTP/cron/outbox/MCP） |
-| [AI_SKILLS.md](AI_SKILLS.md) | 内置 AI 技能目录（db.query / kpi / approval / admin…） |
-| [AI_ORCHESTRATION.md](AI_ORCHESTRATION.md) | Workflow 编排（线性/DAG/审批门/WAL 恢复/触发/审计） |
-| [LLM_POLICIES.md](LLM_POLICIES.md) | LLM 策略真实接线（审批/风控/诊断/质量门 + KeyPool） |
-| [MCP.md](MCP.md) | SkillRegistry → MCP 桥（外部 LLM 平台调用框架技能） |
+| [AI_METHODOLOGY.md](ai/AI_METHODOLOGY.md) | Why modulith + AI; anti-patterns (philosophy) |
+| [ROUTE_TABLE.md](reference/ROUTE_TABLE.md) §7 | Auth / RBAC detail |
+| [BEST_PRACTICES.md](guide/BEST_PRACTICES.md) | DAU + JWT checklist |
+| [AI.md](ai/AI.md) | LLM **chat product** module (`--with-aichat`) — not agent ops |
+| [AI_DEV_GUIDE.md](ai/AI_DEV_GUIDE.md) | **AI 开发指南**：KeyManager → Provider → Skill → Agent/Workflow → 接入（HTTP/cron/outbox/MCP） |
+| [AI_SKILLS.md](ai/AI_SKILLS.md) | 内置 AI 技能目录（db.query / kpi / approval / admin…） |
+| [AI_ORCHESTRATION.md](ai/AI_ORCHESTRATION.md) | Workflow 编排（线性/DAG/审批门/WAL 恢复/触发/审计） |
+| [LLM_POLICIES.md](ai/LLM_POLICIES.md) | LLM 策略真实接线（审批/风控/诊断/质量门 + KeyPool） |
+| [MCP.md](ai/MCP.md) | SkillRegistry → MCP 桥（外部 LLM 平台调用框架技能） |
 
 ## 📚 Core Guides
 
 | Guide | Description | Level |
 |-------|-------------|-------|
-| [Quick Start](QUICK-START.md) | Get started in 5 minutes | Beginner |
-| [Modulith 高并发](MODULITH.md) | Day-one modulith boundaries + concurrency | All |
-| [领域分层](MODULE_LAYERS.md) | model / persistence.Tx / service Cmd | All |
-| [多租户店蓝图](MODULITH_TENANT_SHOP.md) | Module graph + directory for tenant shop | All |
-| [ZigModu × zent](ZENT.md) | **电商/社交主推组合**：zent ORM + modulith practices | Intermediate |
-| [SQLx 驱动链接](SQLX_DRIVERS.md) | `-Ddb=` / `.db=` 选择性链接、stub、测试约定 | All |
-| [zmodu CLI 生成器](ZMODU_CLI_INTEGRATION.md) | DDL schema generator + `@initialized` model + MCP | All |
-| [Best Practices](BEST_PRACTICES.md) | Architecture evolution + JWT / auth checklist | All |
-| [Declarative Routes](ROUTE_TABLE.md) | ComptimeRouter + catalog JWT / RBAC gate (§7) | All |
-| [Elegant Code Patterns](elegant-code-patterns.md) | Five-file layout + code samples | Intermediate |
-| [API Reference](API.md) | Detailed API documentation | Advanced |
-| [Architecture](ARCHITECTURE.md) | System design and patterns | Intermediate |
-| [Framework Backlog](FRAMEWORK_BACKLOG.md) | Extractors / SSE / Testkit recipes | Intermediate |
-| [**Observability**](OBSERVABILITY.md) | 黄金信号、PromQL、告警阈值、Grafana dashboard、上线自检 | Advanced |
-| [Production Roadmap](PRODUCTION_ROADMAP.md) | 维护边界、prefork 边界、`src/ai` 可剔离域 | Advanced |
-| [部署参考](../examples/production-deploy/README.md) | TLS 边车、探针语义、`Restart=always`、Dockerfile | Advanced |
+| [Quick Start](guide/QUICK-START.md) | Get started in 5 minutes | Beginner |
+| [Modulith 高并发](guide/MODULITH.md) | Day-one modulith boundaries + concurrency | All |
+| [领域分层](guide/MODULE_LAYERS.md) | model / persistence.Tx / service Cmd | All |
+| [多租户店蓝图](guide/MODULITH_TENANT_SHOP.md) | Module graph + directory for tenant shop | All |
+| [ZigModu × zent](reference/ZENT.md) | **电商/社交主推组合**：zent ORM + modulith practices | Intermediate |
+| [SQLx 驱动链接](guide/SQLX_DRIVERS.md) | `-Ddb=` / `.db=` 选择性链接、stub、测试约定 | All |
+| [zmodu CLI 生成器](guide/ZMODU_CLI_INTEGRATION.md) | DDL schema generator + `@initialized` model + MCP | All |
+| [Best Practices](guide/BEST_PRACTICES.md) | Architecture evolution + JWT / auth checklist | All |
+| [Declarative Routes](reference/ROUTE_TABLE.md) | ComptimeRouter + catalog JWT / RBAC gate (§7) | All |
+| [Elegant Code Patterns](guide/elegant-code-patterns.md) | Five-file layout + code samples | Intermediate |
+| [API Reference](reference/API.md) | Detailed API documentation | Advanced |
+| [Architecture](reference/ARCHITECTURE.md) | System design and patterns | Intermediate |
+| [Framework Backlog](meta/FRAMEWORK_BACKLOG.md) | Extractors / SSE / Testkit recipes | Intermediate |
+| [**Observability**](reference/OBSERVABILITY.md) | 黄金信号、PromQL、告警阈值、Grafana dashboard、上线自检 | Advanced |
+| [Production Roadmap](meta/PRODUCTION_ROADMAP.md) | 维护边界、prefork 边界、`src/ai` 可剔离域 | Advanced |
+| [部署参考](README.md) | TLS 边车、探针语义、`Restart=always`、Dockerfile | Advanced |
 
 ## 🧱 Core specifications
 
@@ -46,17 +61,17 @@ they are where "what does the framework actually promise" is written down.
 
 | Spec | Covers |
 |------|--------|
-| [**RUNTIME.md**](RUNTIME.md) | Execution plane: workers, mailboxes, pools, priorities, supervision, determinism, metrics (§8 / §12 / §15). **The largest contract doc, and the one most often needed** |
-| [**DISTRIBUTED.md**](DISTRIBUTED.md) | Raft / bus / membership, the transport-encryption boundary (A-2), per-node identity, rotation |
-| [**API_FREEZE.md**](API_FREEZE.md) | The frozen API surface vs the preview surface, before 1.0 |
-| [**ARCHITECTURE.md**](ARCHITECTURE.md) | System design and the module/layer rules everything else assumes |
-| [**API.md**](API.md) | Full API reference |
-| [**EVENTS_DI.md**](EVENTS_DI.md) | EventBus + DI: how `Application` wires them, and the runnable sample |
-| [**WORKFLOW.md**](WORKFLOW.md) | Long-running, resumable processes |
-| [**AGENT_RUNTIME.md**](AGENT_RUNTIME.md) | Agent runtime — **agents cannot act by default** (v0.21+) |
-| [**AI_BOUNDARY.md**](AI_BOUNDARY.md) | 抽包前置条件（v0.20.1+）；`src/test/AiBoundary.zig` 持续核对，是**活的契约**不是决策记录 |
-| [**CLUSTER-QUICKSTART.md**](CLUSTER-QUICKSTART.md) | Single-node cluster in five minutes |
-| [**WEB4.md**](WEB4.md) | DID identity + x402 payments |
+| [**RUNTIME.md**](reference/RUNTIME.md) | Execution plane: workers, mailboxes, pools, priorities, supervision, determinism, metrics (§8 / §12 / §15). **The largest contract doc, and the one most often needed** |
+| [**DISTRIBUTED.md**](reference/DISTRIBUTED.md) | Raft / bus / membership, the transport-encryption boundary (A-2), per-node identity, rotation |
+| [**API_FREEZE.md**](reference/API_FREEZE.md) | The frozen API surface vs the preview surface, before 1.0 |
+| [**ARCHITECTURE.md**](reference/ARCHITECTURE.md) | System design and the module/layer rules everything else assumes |
+| [**API.md**](reference/API.md) | Full API reference |
+| [**EVENTS_DI.md**](guide/EVENTS_DI.md) | EventBus + DI: how `Application` wires them, and the runnable sample |
+| [**WORKFLOW.md**](guide/WORKFLOW.md) | Long-running, resumable processes |
+| [**AGENT_RUNTIME.md**](reference/AGENT_RUNTIME.md) | Agent runtime — **agents cannot act by default** (v0.21+) |
+| [**AI_BOUNDARY.md**](reference/AI_BOUNDARY.md) | 抽包前置条件（v0.20.1+）；`src/test/AiBoundary.zig` 持续核对，是**活的契约**不是决策记录 |
+| [**CLUSTER-QUICKSTART.md**](guide/CLUSTER-QUICKSTART.md) | Single-node cluster in five minutes |
+| [**WEB4.md**](reference/WEB4.md) | DID identity + x402 payments |
 
 ## 📎 Field notes
 
@@ -65,13 +80,13 @@ integration, and the lesson is worth more than the rule it produced.
 
 | Doc | What it covers |
 |-----|----------------|
-| [LOGGING.md](LOGGING.md) | Structured logging: levels, fields, sinks |
-| [elegant-code-patterns.md](elegant-code-patterns.md) | Five-file layout + handler/input/response conventions |
-| [best-practices-heysen-lessons.md](best-practices-heysen-lessons.md) | Lessons from a real SaaS integration (SQLx / ORM / route conventions) |
-| [ZIGMODU_NOTES.md](ZIGMODU_NOTES.md) | Field notes from another real integration (v0.14.x) |
-| [ISSUES_FROM_ZAPI.md](ISSUES_FROM_ZAPI.md) | Backlog raised by one downstream project |
-| [ISSUES_FROM_ZIGSHOP.md](ISSUES_FROM_ZIGSHOP.md) | Issues raised by another — with what was verified and how |
-| *(`modules.md`)* | Generated by `zig build docs` — not tracked, so there is nothing to link. The long form is [MODULE_LAYERS.md](MODULE_LAYERS.md) |
+| [LOGGING.md](guide/LOGGING.md) | Structured logging: levels, fields, sinks |
+| [elegant-code-patterns.md](guide/elegant-code-patterns.md) | Five-file layout + handler/input/response conventions |
+| [best-practices-heysen-lessons.md](guide/best-practices-heysen-lessons.md) | Lessons from a real SaaS integration (SQLx / ORM / route conventions) |
+| [ZIGMODU_NOTES.md](meta/ZIGMODU_NOTES.md) | Field notes from another real integration (v0.14.x) |
+| [ISSUES_FROM_ZAPI.md](meta/ISSUES_FROM_ZAPI.md) | Backlog raised by one downstream project |
+| [ISSUES_FROM_ZIGSHOP.md](meta/ISSUES_FROM_ZIGSHOP.md) | Issues raised by another — with what was verified and how |
+| *(`modules.md`)* | Generated by `zig build docs` — not tracked, so there is nothing to link. The long form is [MODULE_LAYERS.md](guide/MODULE_LAYERS.md) |
 
 ## 🗄 Historical & superseded
 
@@ -80,22 +95,22 @@ integration, and the lesson is worth more than the rule it produced.
 
 | Doc | Status |
 |-----|--------|
-| [MIGRATION_v04_to_v07.md](MIGRATION_v04_to_v07.md) | 历史升级指南 v0.4 → v0.7，已被 [UPGRADING.md](UPGRADING.md) 覆盖 |
-| [API-MIGRATION.md](API-MIGRATION.md) | 旧 Simplified API → `Application` API，已被 [UPGRADING.md](UPGRADING.md) 覆盖 |
+| [MIGRATION_v04_to_v07.md](meta/MIGRATION_v04_to_v07.md) | 历史升级指南 v0.4 → v0.7，已被 [UPGRADING.md](reference/UPGRADING.md) 覆盖 |
+| [API-MIGRATION.md](meta/API-MIGRATION.md) | 旧 Simplified API → `Application` API，已被 [UPGRADING.md](reference/UPGRADING.md) 覆盖 |
 | ~~[COMPLETENESS_REPORT.md](archive/superseded/COMPLETENESS_REPORT.md)~~ | 2026-05-08 / v0.8.0 快照，已归档——**看到就别照做** |
-| [EVALUATION_REPORT.md](EVALUATION_REPORT.md) | ⛔ 分数与逐维读数**全部作废**（2026-10-10），取代它的是 [EVALUATION_2026-10.md](EVALUATION_2026-10.md) |
+| [EVALUATION_REPORT.md](meta/EVALUATION_REPORT.md) | ⛔ 分数与逐维读数**全部作废**（2026-10-10），取代它的是 [EVALUATION_2026-10.md](meta/EVALUATION_2026-10.md) |
 
 ## 🔒 Project status & governance
 
 | Doc | What it covers |
 |-----|----------------|
-| [**EVALUATION_2026-10.md**](EVALUATION_2026-10.md) | **Current** quality & competitiveness assessment (86.4/100, 7 weighted axes) |
+| [**EVALUATION_2026-10.md**](meta/EVALUATION_2026-10.md) | **Current** quality & competitiveness assessment (86.4/100, 7 weighted axes) |
 | [`../GOVERNANCE.md`](../GOVERNANCE.md) | Who decides what, and how to push for a change |
 | [`../SECURITY.md`](../SECURITY.md) | Reporting a vulnerability; the attack surface this project admits to |
-| [FRAMEWORK_BACKLOG.md](FRAMEWORK_BACKLOG.md) | Deferred work, kept visible rather than forgotten |
-| [PRODUCTION_ROADMAP.md](PRODUCTION_ROADMAP.md) | Maintenance boundaries, prefork boundary, removable domains |
-| [docs/dev/](dev/README.md) | Internal review / assessment / roadmap notes (not user-facing contracts). **先看 [dev/README.md](dev/README.md)** —— 哪几份仍生效、哪几份被哪一份取代、哪些路径被源码按字面引用不能动 |
-| [docs/archive/](archive/README.md) | 已完成的实施计划（2026-07 的 modulith / sqlx 批次）。产出早已落在正式文档里，计划本身只作史料 |
+| [FRAMEWORK_BACKLOG.md](meta/FRAMEWORK_BACKLOG.md) | Deferred work, kept visible rather than forgotten |
+| [PRODUCTION_ROADMAP.md](meta/PRODUCTION_ROADMAP.md) | Maintenance boundaries, prefork boundary, removable domains |
+| [docs/dev/](README.md) | Internal review / assessment / roadmap notes (not user-facing contracts). **先看 [dev/README.md](README.md)** —— 哪几份仍生效、哪几份被哪一份取代、哪些路径被源码按字面引用不能动 |
+| [docs/archive/](README.md) | 已完成的实施计划（2026-07 的 modulith / sqlx 批次）。产出早已落在正式文档里，计划本身只作史料 |
 
 ## 🔧 Features
 
@@ -118,7 +133,7 @@ integration, and the lesson is worth more than the rule it produced.
 - PrometheusMetrics - Counter, Gauge, Histogram
 - `productionProfile` - `/metrics` golden signals (traffic / status classes /
   latency histogram) + `/health/live` + `/health/ready` in one call
-- Grafana dashboard + alert thresholds: [`OBSERVABILITY.md`](OBSERVABILITY.md)
+- Grafana dashboard + alert thresholds: [`OBSERVABILITY.md`](reference/OBSERVABILITY.md)
 
 ### Production hardening
 - Connection backpressure (`max_connections`, `over_limit_response`) and header
@@ -152,7 +167,7 @@ integration, and the lesson is worth more than the rule it produced.
 
 ## 🌍 Translations
 
-- [English](../README.md)
+- [English](README.md)
 - [中文](../README.zh.md)
 
 ## 🤝 Contributing

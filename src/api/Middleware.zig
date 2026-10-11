@@ -591,7 +591,7 @@ fn sameTable(a: *const Rbac.RolePermissionTable, b: *const Rbac.RolePermissionTa
 /// silently, and inside the permission check rather than beside it. Giving the
 /// loader a context-carrying type would fix it without a bound, but
 /// `CatalogPermissionLoader` is public API (passed as a bare fn pointer by the
-/// example apps, the CLI template and `docs/ROUTE_TABLE.md`), so the bound is
+/// example apps, the CLI template and `docs/reference/ROUTE_TABLE.md`), so the bound is
 /// the price of leaving that type — and every call site — alone.
 ///
 /// Slots are claimed at wiring time and never released, so this bounds how many

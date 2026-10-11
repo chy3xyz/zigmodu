@@ -41,7 +41,7 @@ pub const usage =
     \\Module layout rule (src/modules/<module>/):
     \\  Strict: model.zig, persistence.zig, service.zig, api.zig, module.zig, root.zig.
     \\  Loose rule: a module WITHOUT persistence.zig — the table-less / BFF convention
-    \\  in docs/MODULITH_TENANT_SHOP.md (no persistence, no own tables) — is accepted
+    \\  in docs/guide/MODULITH_TENANT_SHOP.md (no persistence, no own tables) — is accepted
     \\  when its module.zig declares `pub const info`; then only api.zig, module.zig and
     \\  root.zig are required, and model.zig / service.zig may be omitted. Without
     \\  `pub const info` the strict list applies and persistence.zig is reported missing.
@@ -131,7 +131,7 @@ fn moduleDeclaresInfo(allocator: std.mem.Allocator, io: Io, mod_dir: Dir) bool {
 ///   * strict — the 6 files model.zig, persistence.zig, service.zig, api.zig,
 ///     module.zig, root.zig;
 ///   * loose rule — a module without `persistence.zig` whose `module.zig` declares
-///     `pub const info` is a table-less module (BFF; docs/MODULITH_TENANT_SHOP.md
+///     `pub const info` is a table-less module (BFF; docs/guide/MODULITH_TENANT_SHOP.md
 ///     §「BFF 约定」), so only api.zig, module.zig and root.zig are required.
 ///     Without `pub const info` the strict list applies, so a stray directory still
 ///     reports persistence.zig as missing.

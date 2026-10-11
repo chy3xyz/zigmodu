@@ -123,7 +123,7 @@ fn sameClient(a: *sqlx.Client, b: *sqlx.Client) bool {
 /// permission databases would answer for each other. Giving the loader a
 /// context-carrying type would fix it without a bound, but `CatalogPermissionLoader`
 /// itself is public API (`api/Middleware.zig`, passed as a bare fn pointer by
-/// the two example apps, the CLI template and `docs/ROUTE_TABLE.md`), so the
+/// the two example apps, the CLI template and `docs/reference/ROUTE_TABLE.md`), so the
 /// bound is the price of leaving that type — and every call site — alone.
 ///
 /// Slots are claimed at wiring time and never released, so this bounds how many

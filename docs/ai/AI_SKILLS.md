@@ -3,7 +3,7 @@
 > 从「AI 驱动业务框架」角度规划的内置 skill 目录。所有 skill 遵守受控执行
 > 姿态：LLM 不写代码、白名单 + 人机门 + 配额 + 审计 + 租户隔离。
 
-> **运行时姿态见 [`AGENT_RUNTIME.md`](AGENT_RUNTIME.md)**：`ai.Guard`（闸门已经接进 `Agent.run`）、
+> **运行时姿态见 [`AGENT_RUNTIME.md`](../reference/AGENT_RUNTIME.md)**：`ai.Guard`（闸门已经接进 `Agent.run`）、
 > `skill.Tool.action`（默认 `.execute`，fail-closed）、`ai.AgentWorker`、`ai.ProposalPipeline`。
 > 本文只列"有什么工具"，那篇写"工具被允许怎么跑"。
 
@@ -35,7 +35,7 @@
 `Guard` 只看名字、看不到类别：`allow` 里全是 `execute` 工具时 `isInert()` 仍返回 false，但实际一件
 事也做不了。启动期体检用 `registry.auditPolicy(allocator, guard.permissions)`（或规格侧
 `AgentSpec.auditPolicy`），`class_denied_tools` 会列出被**类别**（而非名字）拒掉的工具 ——
-详见 [`AGENT_RUNTIME.md`](AGENT_RUNTIME.md) §一。
+详见 [`AGENT_RUNTIME.md`](../reference/AGENT_RUNTIME.md) §一。
 
 ## P0 · 只读高价值（✅ 已落地）
 

@@ -231,7 +231,7 @@ pub const ClusterMember = @import("cluster/ClusterView.zig").Member;
 /// of this *name* — the framework holds the type directly.
 pub const ClusterSnapshot = @import("cluster/ClusterView.zig").Snapshot;
 /// The bridge that feeds `ClusterView` from `ClusterMembership` — use this, not
-/// the membership map, on request paths (`docs/DISTRIBUTED.md`).
+/// the membership map, on request paths (`docs/reference/DISTRIBUTED.md`).
 pub const MembershipView = @import("cluster/MembershipView.zig").MembershipView;
 /// One member as the read-side bridge sees it (id, address, healthy).
 ///
@@ -243,9 +243,9 @@ pub const ClusterMembership = @import("core/ClusterMembership.zig").ClusterMembe
 /// Cluster building blocks. Exported so an app can assemble its own topology
 /// instead of taking the whole `ClusterBootstrap`; each is independently tested
 /// and **not** wired into a request path by the framework (see the readiness
-/// notes in `docs/DISTRIBUTED.md`).
+/// notes in `docs/reference/DISTRIBUTED.md`).
 pub const RaftElection = @import("core/cluster/RaftElection.zig").RaftElection;
-/// The real transport behind `RaftElection` (`docs/DISTRIBUTED.md`「真选主要什么」):
+/// The real transport behind `RaftElection` (`docs/reference/DISTRIBUTED.md`「真选主要什么」):
 /// outbound vote/replication RPCs over TCP, inbound dispatch, address book.
 pub const RaftTransport = @import("core/cluster/RaftTransport.zig");
 /// Blocking TCP dial without std's EINTR→EISCONN panic (`posixConnect` reads
@@ -310,7 +310,7 @@ pub const datapermission = @import("datapermission/DataPermission.zig");
 // 6. EXTENSIONS
 // ============================================================
 /// Records plugin names in a registry — **no shared library is loaded**
-/// (`dynamicLoadingSupported()` is `false`; see `docs/UPGRADING.md`).
+/// (`dynamicLoadingSupported()` is `false`; see `docs/reference/UPGRADING.md`).
 ///
 /// Positioning: user-facing; no in-tree consumer, kept exported deliberately.
 pub const PluginManager = @import("extensions/PluginManager.zig").PluginManager;
@@ -319,7 +319,7 @@ pub const PluginManifest = @import("extensions/PluginManager.zig").PluginManifes
 /// Watches module files and fires a callback — **it does not replace code**.
 ///
 /// Positioning: user-facing; no in-tree consumer. Zig links statically, so
-/// `reloadModule` only logs; the app drives its own response (`docs/API.md`).
+/// `reloadModule` only logs; the app drives its own response (`docs/reference/API.md`).
 pub const HotReloader = @import("extensions/HotReloader.zig").HotReloader;
 /// How a reload treats state: restart, preserve state, gradual migration.
 pub const ReloadStrategy = @import("extensions/HotReloader.zig").ReloadStrategy;

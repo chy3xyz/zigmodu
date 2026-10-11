@@ -1,4 +1,4 @@
-//! Real Raft transport — the layer `docs/DISTRIBUTED.md`「真选主要什么」describes.
+//! Real Raft transport — the layer `docs/reference/DISTRIBUTED.md`「真选主要什么」describes.
 //!
 //! `RaftElection` owns the algorithm and only calls out through
 //! `ElectionTransport` (three bare function pointers). This file is the
@@ -1325,7 +1325,7 @@ pub const ElectionTransportImpl = TransportImpl(0);
 /// `ElectionConfig.rpc_timeout_ms`) — but a *bounded* IO under a spin lock is
 /// still IO under a spin lock, and `rpc_timeout_ms` is a budget a busy node can
 /// still spend in full with the lock held.
-/// `docs/DISTRIBUTED.md` §"出站 IO 与锁" holds the three-phase design that closes
+/// `docs/reference/DISTRIBUTED.md` §"出站 IO 与锁" holds the three-phase design that closes
 /// it, with the obligations (self-contained requests, stale-response guard) any
 /// implementation has to meet.
 pub fn handleConnection(raft: *RaftElection, addresses: ?*const AddressBook, conn: *NetworkTransport.ClusterConnection) void {

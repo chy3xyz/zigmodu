@@ -2,7 +2,7 @@
 
 > zigmodu 的 Web4 原语：`zigmodu.web4`（DID `did:key` 身份 + HTTP 402/x402
 > 支付协议）与 HTTP 中间件（`zigmodu.web4.middleware`）。配套示例：
-> [`examples/web4`](../examples/web4)。
+> [`examples/web4`](../../examples/web4)。
 
 ## 1. DID 身份（`zigmodu.web4.DidKey`）
 

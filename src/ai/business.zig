@@ -1,6 +1,6 @@
 //! Built-in business skills for AI Agents.
 //!
-//! Follows the framework's controlled-execution posture (docs/AI.md):
+//! Follows the framework's controlled-execution posture (docs/ai/AI.md):
 //! - `db.query`  — read-only, parameterized SELECT only, row-capped, and
 //!   tenant-scoped by the framework whenever a tenant context is present;
 //! - `entity.lookup` / `entity.list` — queries against an app-registered

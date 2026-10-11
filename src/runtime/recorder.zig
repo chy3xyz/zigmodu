@@ -5,7 +5,7 @@
 //! counts it) and its ordering is only defined per mailbox, so "what did this
 //! run actually deliver, in what order, at what time?" cannot be answered from
 //! the runtime after the fact. Two logs in this file answer it, from the two
-//! sides of the same hand-off (`docs/RUNTIME.md` §11 and §13):
+//! sides of the same hand-off (`docs/reference/RUNTIME.md` §11 and §13):
 //!
 //! * `Recorder(E, capacity)` — the `HotBus` **publish** stream, i.e. what a
 //!   producer published, recorded inside `publish` before the fan-out. What a
@@ -67,7 +67,7 @@
 //! `EventStore` misuses streams/versions, and using either log for durability
 //! loses everything on exit.
 //!
-//! ## What v1 is not (`docs/RUNTIME.md` §11.4, §13.5/§13.7)
+//! ## What v1 is not (`docs/reference/RUNTIME.md` §11.4, §13.5/§13.7)
 //!
 //! - **Single event type per log.** A `Recorder(E, capacity)` logs one `E`, and
 //!   so does a `Track`. `MpscRing` cross-producer interleavings within one
@@ -278,7 +278,7 @@ pub fn Recorder(comptime E: type, comptime capacity: usize) type {
 // §13 — delivery tracks: what each worker received, in one global order
 // ─────────────────────────────────────────────────
 
-/// The spawn-time declaration of a worker's delivery track (docs/RUNTIME.md
+/// The spawn-time declaration of a worker's delivery track (docs/reference/RUNTIME.md
 /// §13.2): `.record = .{ .id = "book:0", .capacity = 1024 }`.
 ///
 /// Both fields are the caller's, deliberately. `capacity` is the memory bound —
@@ -295,7 +295,7 @@ pub const TrackSpec = struct {
     /// Track capacity in messages. Memory is `capacity × (sizeof(Message) + the
     /// entry's overhead)` — `seq`, `clock_ms` and the delivery `kind` ride along
     /// per slot, and the struct's alignment rounds the total up (real numbers for
-    /// the message sizes in use: `docs/RUNTIME.md` §13.11) — held for the life of
+    /// the message sizes in use: `docs/reference/RUNTIME.md` §13.11) — held for the life of
     /// the runtime.
     capacity: usize,
 };
@@ -321,7 +321,7 @@ pub const TrackEntry = struct {
 };
 
 /// One track's ring in **claim space**, which is where the drain tells "an entry
-/// I can write" from "a delivery the ring could not keep" (`docs/RUNTIME.md`
+/// I can write" from "a delivery the ring could not keep" (`docs/reference/RUNTIME.md`
 /// §13.9 D3). Claims are what the ring's own counter hands out, in order, and
 /// today's `Track` refuses a claim it has no room for rather than overwriting
 /// the slot the drain has not read yet.
@@ -647,7 +647,7 @@ fn checkCodec(comptime E: type, comptime C: type) void {
     inline for (required) |decl| {
         if (!@hasDecl(C, decl)) @compileError(
             "the codec for " ++ @typeName(E) ++ " declares no `" ++ decl ++
-                "` — docs/RUNTIME.md §13.9 D2's contract is `Codec(" ++ @typeName(E) ++ ")`",
+                "` — docs/reference/RUNTIME.md §13.9 D2's contract is `Codec(" ++ @typeName(E) ++ ")`",
         );
     }
     const name: []const u8 = C.name;
@@ -685,7 +685,7 @@ fn installCodec(track: *TrackRef, comptime C: type, comptime E: type) void {
 }
 
 /// What one `drainTo` call wrote, and what the file it wrote is missing
-/// (docs/RUNTIME.md §13.9 D3).
+/// (docs/reference/RUNTIME.md §13.9 D3).
 pub const DrainReport = struct {
     /// Records this call appended.
     records: usize,
@@ -811,7 +811,7 @@ pub const DeliveryLog = struct {
         return total;
     }
 
-    /// Attach a payload codec to a declared track (docs/RUNTIME.md §13.9 D2):
+    /// Attach a payload codec to a declared track (docs/reference/RUNTIME.md §13.9 D2):
     /// from here on `drainTo` can turn its entries into bytes, and
     /// `TrackRef.payload_codec` records which codec's bytes they are.
     ///
@@ -829,7 +829,7 @@ pub const DeliveryLog = struct {
         const T = @TypeOf(track.*);
         if (!@hasField(T, "ref") or !@hasDecl(T, "Event"))
             @compileError("DeliveryLog.setCodec expects a track (*Track(E, capacity)) — pass " ++
-                "what `addTrack` returned (docs/RUNTIME.md §13.9 D2)");
+                "what `addTrack` returned (docs/reference/RUNTIME.md §13.9 D2)");
         if (!self.owns(&track.ref)) return error.UnknownTrack;
         const E = T.Event;
         comptime checkCodec(E, C);
@@ -866,7 +866,7 @@ pub const DeliveryLog = struct {
     }
 
     /// Append every track's not-yet-drained entries to a segment file, oldest
-    /// global `seq` first (docs/RUNTIME.md §13.9). Returns what this call wrote
+    /// global `seq` first (docs/reference/RUNTIME.md §13.9). Returns what this call wrote
     /// and what the file is missing.
     ///
     /// * **The hot path is untouched.** Values become bytes here and nowhere
@@ -1501,7 +1501,7 @@ const LoadedTrack = struct {
     post: ?*const fn (target: *anyopaque, payload: *const anyopaque) mbox.SendError!void = null,
 };
 
-/// Replays a delivery log **from its segment file** (`docs/RUNTIME.md` §13.10):
+/// Replays a delivery log **from its segment file** (`docs/reference/RUNTIME.md` §13.10):
 /// the reader half of §13.9's `drainTo`, for a track whose payloads left the
 /// process as bytes and have to come back through a codec.
 ///
@@ -2479,7 +2479,7 @@ test "Track.recordKind: the ring carries the kind, and record() means .message" 
     // the padding a small `E` already had (0 extra bytes for a `u32` message) and
     // pushes an 8-byte-aligned `E` onto the next 8-byte boundary (+8 for a `u64`).
     // An `E` of any alignment in between behaves like one of these two. The
-    // absolute sizes are asserted too, so the numbers `docs/RUNTIME.md` §13.11
+    // absolute sizes are asserted too, so the numbers `docs/reference/RUNTIME.md` §13.11
     // publishes are the ones this test measures rather than a reading of them.
     const WithoutKind = struct { seq: u64, clock_ms: i64, event: u32 };
     try std.testing.expectEqual(@as(usize, 24), @sizeOf(Track(u32, 4).Entry));
@@ -3657,7 +3657,7 @@ test "ReplayFromLog: codec name and message type are checked against the id they
 
     // The file holds only ids and bytes: which codec wrote them is the caller's
     // declaration, so a handle of the wrong `Message` type can only be caught
-    // against what was declared (docs/RUNTIME.md §13.10 D2).
+    // against what was declared (docs/reference/RUNTIME.md §13.10 D2).
     var wide = FakeTarget(u64){};
     try loader.setCodec("a", U32Codec, u32);
     try std.testing.expectError(error.MessageTypeMismatch, loader.bindDecoded("a", &wide));

@@ -26,7 +26,7 @@
 //! That last rule is the difference from `app.eventBus(T)`: the L1 bus is for
 //! *business* events where "everyone eventually sees it" matters, so it is
 //! allowed to allocate and to be slower. Use L0 where a missed event is
-//! acceptable and a stalled publisher is not. See `docs/RUNTIME.md` §6.
+//! acceptable and a stalled publisher is not. See `docs/reference/RUNTIME.md` §6.
 //!
 //! To replay a run later, attach a `Recorder` (default: off, one null check per
 //! publish) with `attachRecorder` before `freeze()`. It is *not* a subscriber —

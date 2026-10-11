@@ -1,6 +1,6 @@
 //! `zmodu runtime` — the runtime wiring a project *declares*, read out of source.
 //!
-//! `docs/RUNTIME.md` makes the runtime opt-in: nothing runs until a module asks
+//! `docs/reference/RUNTIME.md` makes the runtime opt-in: nothing runs until a module asks
 //! `ctx.runtime()` for the app's runtime. What follows — which workers exist
 //! (and in which execution mode), how big their mailboxes are, whether a pool
 //! was declared for the `.pooled` ones, who fans out on a `HotBus`, where timers
@@ -11,7 +11,7 @@
 //! **What it does not do**: read a *live* process. Queue depth, `dropped_full`,
 //! `timer_lag_ms` and the pool's own counters are properties of a running
 //! runtime, not of source — the runtime exports them as Prometheus metrics
-//! (`Runtime.MetricsBridge`, scrape recipe in `docs/RUNTIME.md` §8) and this
+//! (`Runtime.MetricsBridge`, scrape recipe in `docs/reference/RUNTIME.md` §8) and this
 //! command neither reads them nor guesses at them.
 //!
 //! It also **makes no judgement**. Every line is something the text says — a
@@ -49,7 +49,7 @@ const usage =
     \\
     \\This command reads source only. It cannot see a live process: queue depth,
     \\dropped_full, timer_lag_ms and the pool's own counters are runtime
-    \\(properties — scrape /metrics (docs/RUNTIME.md §8) for those.
+    \\(properties — scrape /metrics (docs/reference/RUNTIME.md §8) for those.
     \\
 ;
 
@@ -262,7 +262,7 @@ const Worker = struct {
     /// it does not write one: a positional capacity (`rt.spawn(W, .{}, 256)`), a
     /// config struct without `.mode`, or a mode this scan does not follow.
     ///
-    /// The API default is `.dedicated` (docs/RUNTIME.md §12.8 D1: the mode is
+    /// The API default is `.dedicated` (docs/reference/RUNTIME.md §12.8 D1: the mode is
     /// additive). That default is *not* reported here, because a default is not
     /// something the text says.
     mode: ?[]const u8,
@@ -270,7 +270,7 @@ const Worker = struct {
     line: usize,
 };
 
-/// How a project sized its pool (docs/RUNTIME.md §12.8 D2 — both spellings end
+/// How a project sized its pool (docs/reference/RUNTIME.md §12.8 D2 — both spellings end
 /// up as `SchedulerConfig.max_pooled_workers`).
 const PoolForm = enum {
     /// `builder.withMaxPooledWorkers(2)` — the application-side spelling.
@@ -594,7 +594,7 @@ fn analyzeSource(
         }
     }
 
-    // Pool declarations (docs/RUNTIME.md §12.8 D2). Reported as their own facts,
+    // Pool declarations (docs/reference/RUNTIME.md §12.8 D2). Reported as their own facts,
     // not as "this project has a working pool": whether the `.pooled` spawn sites
     // are in the same build as the declaration is a question about reachability,
     // and this command only reads text.
@@ -1127,7 +1127,7 @@ fn renderText(project_dir: []const u8, report: Report, w: anytype) !void {
     // The pool (§12): one half is "who asked to be pooled", the other is "what
     // was the pool sized to". Both are facts; that they match is not asserted,
     // because reachability is not something a text scan sees.
-    try w.writeAll("\npool (.mode = .pooled; docs/RUNTIME.md §12):\n");
+    try w.writeAll("\npool (.mode = .pooled; docs/reference/RUNTIME.md §12):\n");
     const s0 = report.summary();
     try w.print("  spawn site(s) writing .mode = .pooled: {d} of {d}\n", .{ s0.pooled, s0.workers });
     if (report.pools.items.len == 0) {
@@ -1196,7 +1196,7 @@ fn renderFootnote(w: anytype) !void {
         \\note: static wiring only — this reads source, not a live process. Queue depth /
         \\      dropped_full / timer_lag_ms and the pool's own counters (claims, ready
         \\      depth, refused pushes) are properties of a running runtime: scrape
-        \\      /metrics (docs/RUNTIME.md §8) for those.
+        \\      /metrics (docs/reference/RUNTIME.md §8) for those.
         \\
     );
 }

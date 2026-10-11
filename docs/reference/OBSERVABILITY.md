@@ -1,7 +1,7 @@
 # 可观测性与告警（生产接入）
 
 > 目标：把"服务活着吗、它现在好不好"变成**一屏可见 + 可告警**，而不是等用户报障。
-> 相关：[`BEST_PRACTICES.md`](BEST_PRACTICES.md)「韧性」· [`PRODUCTION_ROADMAP.md`](PRODUCTION_ROADMAP.md)
+> 相关：[`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「韧性」· [`PRODUCTION_ROADMAP.md`](../meta/PRODUCTION_ROADMAP.md)
 
 ## 1. 一行接入
 
@@ -166,7 +166,7 @@ metrics.setScrapeHook(struct {
 // 告警：db_pool_waiters > 0 持续 1 分钟 = 池已饱和，延迟即将整体抬升
 ```
 
-完整可抄版本见 [`../examples/zmsaas/backend/src/main.zig`](../examples/zmsaas/backend/src/main.zig)。
+完整可抄版本见 [`../examples/zmsaas/backend/src/main.zig`](../../examples/zmsaas/backend/src/main.zig)。
 
 业务指标自己加（同一个 registry）：`profile.prometheus.?.createCounter(...)`；
 需要按维度拆分时用 `createCounterFamily` / `createHistogramFamily`
@@ -236,7 +236,7 @@ annotations:
 
 ## 6. Grafana
 
-导入 [`grafana/zigmodu-overview.json`](grafana/zigmodu-overview.json)
+导入 [`grafana/zigmodu-overview.json`](../grafana/zigmodu-overview.json)
 （Grafana → Dashboards → Import → 上传 JSON，数据源选 Prometheus）。
 面板：QPS、5xx 错误率、4xx 比率、P50/P95/P99 延迟、状态码分类堆叠、总请求数。
 
@@ -263,7 +263,7 @@ annotations:
   所以 span → 日志的关联要显式做：谁手里有 id，谁负责 `setTraceId`。
 - **panic 归因**：应用 root 加 `pub const panic = zmodu.panicHook;`，panic 时
   stderr 会先打印"正在处理哪个请求"，再输出标准堆栈。详见
-  [`BEST_PRACTICES.md`](BEST_PRACTICES.md)「韧性」。
+  [`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「韧性」。
 
 ## 8. 上线前自检
 

@@ -1,7 +1,7 @@
 //! `replay.Driver` — the deterministic (S-level) replay driver: plays a
 //! delivery-log file back through a **det-mode** runtime, one recorded step at
 //! a time, letting each step's cascade quench before the next one starts
-//! (docs/dev/deterministic-runtime-design.md §4.2, docs/RUNTIME.md §15).
+//! (docs/dev/deterministic-runtime-design.md §4.2, docs/reference/RUNTIME.md §15).
 //!
 //! ## What this is
 //!

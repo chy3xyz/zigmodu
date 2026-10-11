@@ -1,7 +1,7 @@
 //! @initialized by zmodu — AI may modify freely
 //!
 //! HTTP API for module: <<MODULE_NAME>>
-//! ComptimeRouter: `pub const routes` + `http.Router.scope(...).mount` (docs/ROUTE_TABLE.md)
+//! ComptimeRouter: `pub const routes` + `http.Router.scope(...).mount` (docs/reference/ROUTE_TABLE.md)
 
 const http = @import("zigmodu").http;
 <<STD_IMPORT>>const service = @import("service.zig");

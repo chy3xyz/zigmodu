@@ -86,8 +86,8 @@
 //!
 //! Every section carries a matching `// ==== §N ... ====` anchor — `grep "==== §5"`
 //! jumps there. §N *with* the `====` prefix is a section of this file; a bare `§N`
-//! is `docs/RUNTIME.md`, and every reference of that kind below spells the file out
-//! (`docs/RUNTIME.md §5`) so the two numberings can never be confused.
+//! is `docs/reference/RUNTIME.md`, and every reference of that kind below spells the file out
+//! (`docs/reference/RUNTIME.md §5`) so the two numberings can never be confused.
 
 const std = @import("std");
 const mbox = @import("mailbox.zig");
@@ -105,13 +105,13 @@ const supervisor_mod = @import("supervisor.zig");
 pub const Clock = clock_mod.Clock;
 pub const Wheel = wheel_mod.Wheel;
 pub const Mailbox = mbox.Mailbox;
-/// The pool behind `.mode = .pooled` (docs/RUNTIME.md §12).
+/// The pool behind `.mode = .pooled` (docs/reference/RUNTIME.md §12).
 pub const Scheduler = scheduler_mod.Scheduler;
 /// How the pool is declared: `Runtime.InitOptions.scheduler`.
 pub const SchedulerConfig = scheduler_mod.SchedulerConfig;
 /// Which ready ring a pooled worker's token lives in: strict order plus one
 /// reserved low-first turn in every `reservation_period`, so priority is a
-/// *bounded* difference, never a starvation licence (docs/RUNTIME.md §12.17).
+/// *bounded* difference, never a starvation licence (docs/reference/RUNTIME.md §12.17).
 pub const Priority = scheduler_mod.Priority;
 /// One worker's delivery track, and the log all of them merge into (§13):
 /// `rt.deliveryLog().?.replayer(&manual)`.
@@ -128,14 +128,14 @@ pub const SpawnMode = enum {
     /// Its own OS thread. The default, and the v0.16 behaviour: a message wakes
     /// the worker's thread directly. Latency chains stay here.
     dedicated,
-    /// A thread from the runtime's pool (docs/RUNTIME.md §12). The worker keeps
+    /// A thread from the runtime's pool (docs/reference/RUNTIME.md §12). The worker keeps
     /// its own mailbox and contract; what changes is who guarantees §12.3's state
     /// exclusivity — an explicit claim instead of thread identity.
     pooled,
 };
 
 /// What a worker's `handle` does with the thread it is given, i.e. which pool may
-/// run it (docs/RUNTIME.md §6: "a pooled worker must not block for long").
+/// run it (docs/reference/RUNTIME.md §6: "a pooled worker must not block for long").
 ///
 /// **This is a declaration, not a detection.** Zig cannot answer "will this code
 /// wait on something outside the process?" in general — a `handle` may block on a
@@ -181,7 +181,7 @@ pub const ExecutionClass = enum {
 /// behind it (`immediate`), while the pool kept handing a pooled actor back while
 /// its mailbox had anything in it (`drain`). Both answers are still reachable —
 /// they are what `null` resolves to, per mode — but they are now a decision at the
-/// spawn site rather than something to be discovered from `docs/RUNTIME.md`
+/// spawn site rather than something to be discovered from `docs/reference/RUNTIME.md`
 /// §12.10. Declaring the other one moves a worker to the other behaviour.
 ///
 /// **What this does not cover, said plainly:** `Handle.stop()` — the external
@@ -190,13 +190,13 @@ pub const ExecutionClass = enum {
 /// queued messages available, and neither receive loop stops while one is). The
 /// policy governs the *stop for good*, i.e. where a worker ends its own service:
 /// the supervisor's decision inside `handle`/`run`. Shutdown has its own,
-/// structural answer (`docs/RUNTIME.md` §12.6: the pools go before the workers, so
+/// structural answer (`docs/reference/RUNTIME.md` §12.6: the pools go before the workers, so
 /// a pooled worker's tail is unreachable rather than drained) and is deliberately
 /// not redirected by this field.
 pub const StopPolicy = enum {
     /// The worker stops now. Whatever is still in the mailbox is counted as
     /// abandoned (`WorkerStats.discarded_on_stop`,
-    /// `RuntimeStats.messages_discarded_on_stop`) and never handled — docs/RUNTIME.md §5's "a
+    /// `RuntimeStats.messages_discarded_on_stop`) and never handled — docs/reference/RUNTIME.md §5's "a
     /// drop has to be visible" applies to work that was accepted and then
     /// abandoned by a stop.
     immediate,
@@ -218,7 +218,7 @@ pub const SpawnConfig = struct {
     /// field changes nothing at all, and a runtime that declares no blocking
     /// width cannot spawn a `.blocking` worker in the first place.
     execution_class: ExecutionClass = .cpu,
-    /// Which ready ring this worker's tokens wait in (docs/RUNTIME.md §12.17).
+    /// Which ready ring this worker's tokens wait in (docs/reference/RUNTIME.md §12.17).
     /// `.normal` (the default) is the class every worker had before the field
     /// existed: an undeclared priority changes nothing at all.
     ///
@@ -232,11 +232,11 @@ pub const SpawnConfig = struct {
     ///
     /// `null` (the default) is **the mode's historical answer**, which is what
     /// keeps this declaration from changing any existing worker: `.dedicated`
-    /// resolves to `.immediate`, `.pooled` to `.drain` (docs/RUNTIME.md §12.10's
+    /// resolves to `.immediate`, `.pooled` to `.drain` (docs/reference/RUNTIME.md §12.10's
     /// two rows, unchanged). Declare it to move one worker to the other
     /// behaviour; `handle.stop_policy` is the resolved value.
     stop_policy: ?StopPolicy = null,
-    /// Declare a delivery track for this worker (docs/RUNTIME.md §13): every
+    /// Declare a delivery track for this worker (docs/reference/RUNTIME.md §13): every
     /// message that reaches its mailbox — from `send*`, from a `HotBus` fan-out,
     /// from `after(...)` — is then logged with a global sequence number, and the
     /// runtime's `DeliveryLog` can replay the run into a fresh graph.
@@ -288,7 +288,7 @@ pub fn spawnConfig(comptime arg: anytype) SpawnConfig {
                 const ST = @TypeOf(spec);
                 if (!@hasField(ST, "id") or !@hasField(ST, "capacity")) @compileError(
                     "`.record` takes the track declaration `.{ .id = \"worker-id\", .capacity = 1024 }` " ++
-                        "(docs/RUNTIME.md §13.2), not `" ++ @typeName(ST) ++ "`",
+                        "(docs/reference/RUNTIME.md §13.2), not `" ++ @typeName(ST) ++ "`",
                 );
                 config.record = .{ .id = @field(spec, "id"), .capacity = @field(spec, "capacity") };
             }
@@ -403,7 +403,7 @@ pub const Supervision = struct {
     /// 0 = unlimited (plain-worker behaviour: never stop on errors).
     max_errors: u32 = 0,
     window_ms: i64 = 10_000,
-    /// The **supervision group** this worker belongs to, if any (docs/RUNTIME.md
+    /// The **supervision group** this worker belongs to, if any (docs/reference/RUNTIME.md
     /// §14). A group member that is going down hands the decision to the group —
     /// which may rebuild it, rebuild its group-mates, or take the group down —
     /// instead of stopping where it stands. A worker with no group keeps the
@@ -415,7 +415,7 @@ pub const Supervision = struct {
     group: ?*supervisor_mod.Group = null,
 };
 
-/// A supervision group's failure policy (docs/RUNTIME.md §14). Re-exported here
+/// A supervision group's failure policy (docs/reference/RUNTIME.md §14). Re-exported here
 /// so a caller configuring supervision never has to name `runtime.supervisor`.
 pub const GroupPolicy = supervisor_mod.Policy;
 /// A group's restart budget: at most `max_restarts` rebuilds inside `window_ms`.
@@ -440,7 +440,7 @@ pub const WorkerStats = struct {
     /// message was never accepted, the caller knows), while this is work that
     /// was accepted and then thrown away by the *worker's* stop. Merging them
     /// would read "the producers are under backpressure" and "this actor's
-    /// queue was abandoned" as the same event. See docs/RUNTIME.md §5.
+    /// queue was abandoned" as the same event. See docs/reference/RUNTIME.md §5.
     discarded_on_stop: u64,
     /// Panics inside `handle`/`run` do not reach here (they abort the process);
     /// this counts returned errors.
@@ -468,7 +468,7 @@ pub const RuntimeStats = struct {
     /// joins and destroys a worker in the same pass: a sum would be back to 0 by
     /// the time anyone could read the loss. `timers_discarded` is accumulated
     /// for the same reason. NOT a second reading of `messages_dropped` — see
-    /// that field's sibling in `WorkerStats` and docs/RUNTIME.md §5.
+    /// that field's sibling in `WorkerStats` and docs/reference/RUNTIME.md §5.
     messages_discarded_on_stop: u64,
     handler_errors: u64,
     timer_fires: u64,
@@ -490,7 +490,7 @@ pub const RuntimeStats = struct {
     /// `messages_dropped` by construction — the same `send` bumps the mailbox's
     /// own counter — which is precisely why this one exists: only this reading
     /// separates "a producer is under backpressure" from "a fired timer's
-    /// message never arrived". See docs/RUNTIME.md §5.
+    /// message never arrived". See docs/reference/RUNTIME.md §5.
     timer_deliveries_dropped: u64,
     /// Members stopped by supervision (§14) — the "counter" §3b's error budget
     /// was always meant to end in, which until now stopped at
@@ -608,7 +608,7 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         /// plus the bits it shares with it (`claimed`/`queued`). Null for a
         /// dedicated worker, whose readiness the mailbox's own condition
         /// variable carries — `announceReady` is then one predictable branch and
-        /// the ready ring sees nothing at all (docs/RUNTIME.md §12.4).
+        /// the ready ring sees nothing at all (docs/reference/RUNTIME.md §12.4).
         pool: ?scheduler_mod.Ready = null,
         /// `.pooled` only: true while a pool thread is executing this worker.
         /// This is §12.3's state exclusivity — an exclusive declaration instead
@@ -652,7 +652,7 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         /// `join` (which must not wait for a queue nobody will serve).
         abandoned: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         /// Set only when this worker was spawned with `.record = …`: its delivery
-        /// track (docs/RUNTIME.md §13), owned by the runtime's `DeliveryLog`. Null
+        /// track (docs/reference/RUNTIME.md §13), owned by the runtime's `DeliveryLog`. Null
         /// — the default — is what keeps `send` costing one null check, and the
         /// track is what the replay driver reads back.
         track: ?*recorder_mod.TrackRef = null,
@@ -764,7 +764,7 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         /// readiness is its thread parked in `recv`, a pooled worker's is a token
         /// in the ready ring. Signature and backpressure are unchanged — a full
         /// mailbox still comes back as `error.Full` from `send`, before this
-        /// line, and nothing here allocates (docs/RUNTIME.md §4's zero-allocation contract).
+        /// line, and nothing here allocates (docs/reference/RUNTIME.md §4's zero-allocation contract).
         fn announceReady(self: *Self) void {
             const item = self.pool orelse return; // `.dedicated`: the mailbox signal is the whole story
             scheduler_mod.announce(item);
@@ -792,7 +792,7 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         /// and handed to the wheel's owner, which is what keeps a worker's
         /// `after(50)` independent of how busy the ticker is. The timer fires
         /// somewhere in `[delay_ms, delay_ms + enqueue latency + tick_interval_ms]`
-        /// (see `docs/RUNTIME.md` §3).
+        /// (see `docs/reference/RUNTIME.md` §3).
         ///
         /// Callable from any thread, and it does not touch the wheel: the request
         /// goes onto a bounded queue that grows nothing. `error.Full` means that
@@ -810,7 +810,7 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         /// or full when the timer comes due, and the fire path cannot block on it
         /// without letting a timer stall the ticker. That is a lost *delivery*,
         /// not a lost timer, and it is counted — `RuntimeStats.timer_deliveries_dropped`,
-        /// plus a debug line naming the worker. See `docs/RUNTIME.md` §5.
+        /// plus a debug line naming the worker. See `docs/reference/RUNTIME.md` §5.
         pub fn after(self: *Self, delay_ms: i64, message: Message) !wheel_mod.Wheel(TimerAction).Id {
             const Delivery = struct {
                 handle: *Self,
@@ -876,7 +876,7 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         /// returned (dedicated, or a `.pooled` worker stopped under
         /// `.stop_policy = .immediate`), or the pool that would have dispatched it
         /// has (`Runtime.shutdown`'s teardown). Nobody is going to handle those
-        /// messages, so the least this can do is leave a number (docs/RUNTIME.md §5's rule), on
+        /// messages, so the least this can do is leave a number (docs/reference/RUNTIME.md §5's rule), on
         /// the worker *and* on the runtime — the handle is destroyed by the very
         /// `shutdown` that abandoned them, so a per-worker counter alone would be
         /// unreadable exactly when it matters.
@@ -912,7 +912,7 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
                 // for a dedicated worker that is its thread having started (and
                 // not yet joined), for a pooled one it is the claim — which is
                 // also why the pooled total can never exceed the number of pool
-                // threads (docs/RUNTIME.md §12.9). The dedicated half is read off
+                // threads (docs/reference/RUNTIME.md §12.9). The dedicated half is read off
                 // `thread_live`/`joined`, never off `thread`: this runs on
                 // whatever thread asked, and `join` — another thread — is what
                 // clears both flags.
@@ -1227,10 +1227,10 @@ pub const Runtime = struct {
     /// The pool behind `.mode = .pooled`, present only when it was declared at
     /// construction (`Runtime.initWithOptions`). Null — the default — means this
     /// runtime runs no pool thread at all and `.pooled` is a configuration error
-    /// (docs/RUNTIME.md §12.8 D2). This is the **`.cpu`** pool: the one that has
+    /// (docs/reference/RUNTIME.md §12.8 D2). This is the **`.cpu`** pool: the one that has
     /// always existed.
     scheduler: ?*Scheduler = null,
-    /// The **blocking** pool behind `.execution_class = .blocking` (docs/RUNTIME.md
+    /// The **blocking** pool behind `.execution_class = .blocking` (docs/reference/RUNTIME.md
     /// §6), present only when a blocking width was declared. A second `Scheduler`,
     /// not a setting inside the first: the two share no ring, no thread and no
     /// admission counter, which is what makes "a blocked blocking worker cannot
@@ -1238,7 +1238,7 @@ pub const Runtime = struct {
     /// is refused at `spawn` rather than quietly falling back to the pool a
     /// blocking handler would hold down.
     blocking_scheduler: ?*Scheduler = null,
-    /// The delivery log (docs/RUNTIME.md §13), present only once a worker
+    /// The delivery log (docs/reference/RUNTIME.md §13), present only once a worker
     /// declared `.record = …` — created on the first such `spawn`, so a runtime
     /// whose workers declare no track allocates nothing and holds no rings. It
     /// outlives `shutdown` on purpose: a replay normally happens *after* the run,
@@ -1281,13 +1281,13 @@ pub const Runtime = struct {
     ///
     /// A timer armed with `after(delay_ms)` therefore fires somewhere in
     /// `[delay_ms, delay_ms + enqueue latency + tick_interval_ms]` — see
-    /// `docs/RUNTIME.md` §3.
+    /// `docs/reference/RUNTIME.md` §3.
     pub const tick_interval_ms: u32 = 5;
 
     /// How a runtime is constructed when it needs more than "a clock".
     pub const InitOptions = struct {
         clock: Clock = .monotonic,
-        /// Declare the pool (docs/RUNTIME.md §12.8 D2). Left at its default the
+        /// Declare the pool (docs/reference/RUNTIME.md §12.8 D2). Left at its default the
         /// runtime owns no pool at all: no ring, no thread, and `.mode = .pooled`
         /// is a configuration error at `spawn` rather than a thread appearing
         /// behind the caller's back.
@@ -1334,7 +1334,7 @@ pub const Runtime = struct {
     /// push infallible, so it cannot be deferred to a constant).
     ///
     /// A declared **blocking** width builds a second pool, with the same rules
-    /// applied to its own bound (docs/RUNTIME.md §6): `max_blocking_workers`, or
+    /// applied to its own bound (docs/reference/RUNTIME.md §6): `max_blocking_workers`, or
     /// `max_pooled_workers` when that is left 0, sizes its ring and admits its
     /// workers. `blocking_threads` without any bound to size the ring from is a
     /// configuration mistake — refused here rather than asserted inside
@@ -1409,7 +1409,7 @@ pub const Runtime = struct {
         self.blocking_scheduler = null;
         // After `shutdown` (the handles that point into it are already destroyed),
         // and only here: the log has to survive a `shutdown` so the run can be
-        // replayed at all (docs/RUNTIME.md §13.4).
+        // replayed at all (docs/reference/RUNTIME.md §13.4).
         if (self.delivery_log) |log| {
             log.deinit();
             self.allocator.destroy(log);
@@ -1420,7 +1420,7 @@ pub const Runtime = struct {
 
     /// The delivery log — the tracks declared with `.record = …` and the shared
     /// sequence that orders them — or `null` when no worker declared one
-    /// (docs/RUNTIME.md §13).
+    /// (docs/reference/RUNTIME.md §13).
     ///
     /// Replay reads from here:
     ///
@@ -1528,11 +1528,11 @@ pub const Runtime = struct {
         // Then the pools: either can be running a worker whose handle the lines
         // below are about to free. `Scheduler.shutdown` waits for the batch in
         // flight to finish (a worker that never returns still blocks shutdown —
-        // docs/RUNTIME.md §4's rule, kept).
+        // docs/reference/RUNTIME.md §4's rule, kept).
         //
         // Both are stopped before the assertion that follows, because a worker's
         // class decides *which* pool holds its claim and the check below is about
-        // the claim, not about the pool (docs/RUNTIME.md §6). A `.blocking` worker
+        // the claim, not about the pool (docs/reference/RUNTIME.md §6). A `.blocking` worker
         // whose pool was left running is exactly the shape §12.6's order exists to
         // rule out.
         if (self.scheduler) |sched| sched.shutdown();
@@ -1607,7 +1607,7 @@ pub const Runtime = struct {
         return self.spawnSupervised(W, initial_state, config, .{});
     }
 
-    /// Create a **supervision group** (docs/RUNTIME.md §14): a set of workers
+    /// Create a **supervision group** (docs/reference/RUNTIME.md §14): a set of workers
     /// whose failures are handled together, by `policy`, inside a restart budget.
     ///
     /// The group is owned by this runtime and freed at `shutdown` — it has to
@@ -1687,7 +1687,7 @@ pub const Runtime = struct {
         // `if` over a comptime-known bool still reports the error (measured).
         if (comptime (pooled and !poolable(W))) @compileError(
             @typeName(W) ++ " cannot be pooled: it declares `run`, which owns a loop of its own — " ++
-                "a pool thread running it would be occupied for as long as it runs (docs/RUNTIME.md §12.5). " ++
+                "a pool thread running it would be occupied for as long as it runs (docs/reference/RUNTIME.md §12.5). " ++
                 "Declare `pub const Message` + `pub fn handle` to pool a worker, or leave it `.dedicated`.",
         );
 
@@ -1696,12 +1696,12 @@ pub const Runtime = struct {
         // `run`-owned worker is its own loop. Refusing this here (rather than
         // ignoring the class on a dedicated worker) is the whole reason the class
         // is a field instead of a comment: a declaration that silently does
-        // nothing is worse than no declaration at all (docs/RUNTIME.md §6).
+        // nothing is worse than no declaration at all (docs/reference/RUNTIME.md §6).
         const execution_class = comptime spawn_config.execution_class;
         if (comptime (execution_class == .blocking and !pooled)) @compileError(
             @typeName(W) ++ " declares `.execution_class = .blocking` but not `.mode = .pooled`: " ++
                 "the class says *which pool* runs the handler, and a `.dedicated` worker has a " ++
-                "thread of its own (docs/RUNTIME.md §6). Write " ++
+                "thread of its own (docs/reference/RUNTIME.md §6). Write " ++
                 "`.{ .capacity = …, .mode = .pooled, .execution_class = .blocking }`, or leave the " ++
                 "class at its default (`.cpu`).",
         );
@@ -1713,7 +1713,7 @@ pub const Runtime = struct {
         if (comptime (priority != .normal and !pooled)) @compileError(
             @typeName(W) ++ " declares `.priority = ." ++ @tagName(priority) ++ "` but not `.mode = .pooled`: " ++
                 "a priority orders tokens waiting in a pool's ready rings, and a `.dedicated` " ++
-                "worker has a thread of its own (docs/RUNTIME.md §12.17). Write " ++
+                "worker has a thread of its own (docs/reference/RUNTIME.md §12.17). Write " ++
                 "`.{ .capacity = …, .mode = .pooled, .priority = ." ++ @tagName(priority) ++ " }`, or leave the " ++
                 "priority at its default (`.normal`).",
         );
@@ -1722,12 +1722,12 @@ pub const Runtime = struct {
         // capacity is comptime by construction: the ring is a fixed array of the
         // worker's own `Message`.
         const track_capacity: ?usize = comptime if (spawn_config.record) |spec| spec.capacity else null;
-        // A `run`-owned worker has no `Message` to record (docs/RUNTIME.md §3's contract: the
+        // A `run`-owned worker has no `Message` to record (docs/reference/RUNTIME.md §3's contract: the
         // runtime hands it nothing), so `.record` on one is a wiring mistake
         // rather than a track that would sit empty and look like a quiet worker.
         if (comptime (track_capacity != null and !@hasDecl(W, "Message"))) @compileError(
             @typeName(W) ++ " declares `run` and has no `Message`: there is nothing for a delivery " ++
-                "track to record (docs/RUNTIME.md §13). Declare `pub const Message` + `pub fn handle`, " ++
+                "track to record (docs/reference/RUNTIME.md §13). Declare `pub const Message` + `pub fn handle`, " ++
                 "or drop `.record`.",
         );
 
@@ -1800,7 +1800,7 @@ pub const Runtime = struct {
             // `null` = "whatever this mode has always done", resolved here so the
             // policy is one value at one moment: `.dedicated` keeps the loop's
             // historical `immediate` stop, `.pooled` keeps the pool's `drain`
-            // (docs/RUNTIME.md §12.10). An *undeclared* policy therefore changes
+            // (docs/reference/RUNTIME.md §12.10). An *undeclared* policy therefore changes
             // nothing at all, which is the compatibility requirement that made the
             // default per-mode instead of a single value.
             .stop_policy = spawn_config.stop_policy orelse if (pooled) .drain else .immediate,
@@ -2089,7 +2089,7 @@ pub const Runtime = struct {
         return sched.stats();
     }
 
-    /// The blocking pool's own counters (docs/RUNTIME.md §6), same shape as
+    /// The blocking pool's own counters (docs/reference/RUNTIME.md §6), same shape as
     /// `poolStats`. Null when no blocking width was declared — which is also when
     /// `.execution_class = .blocking` is refused at `spawn`, so a null here and a
     /// `.blocking` worker cannot both exist.
@@ -2109,7 +2109,7 @@ pub const Runtime = struct {
     /// The runtime is the one place where "is it healthy" cannot be read off an
     /// HTTP histogram: a flooded mailbox, dropped messages, worker handler
     /// errors and a starved ticker are all invisible from the request side —
-    /// `timer_lag_ms` in particular is the signal `docs/RUNTIME.md` §8 calls out
+    /// `timer_lag_ms` in particular is the signal `docs/reference/RUNTIME.md` §8 calls out
     /// as more telling than any timer count. Everything here is **sampled**
     /// rather than accumulated, so the values are gauges and carry no `_total`
     /// suffix (`PrometheusMetrics.Counter` has no `set`, only `inc`/`add`).
@@ -2119,7 +2119,7 @@ pub const Runtime = struct {
     /// process, so keep it in a stable location (not a stack frame you return
     /// from).
     ///
-    /// The pool's counters (`docs/RUNTIME.md` §12) come from `poolStats()` and
+    /// The pool's counters (`docs/reference/RUNTIME.md` §12) come from `poolStats()` and
     /// are the half `RuntimeStats` cannot show: it counts *workers*, and after
     /// poolization "how many workers exist" no longer answers "how much work is
     /// in flight" — `pool_claimed` does, and `pool_ready_push_failures` is the
@@ -2151,7 +2151,7 @@ pub const Runtime = struct {
             pool_dispatches: *MetricsT.Gauge,
             pool_ready_push_failures: *MetricsT.Gauge,
             // The blocking pool is a **second, independent** `Scheduler`
-            // (docs/RUNTIME.md §12.13), so it gets its own set of the same six
+            // (docs/reference/RUNTIME.md §12.13), so it gets its own set of the same six
             // readings rather than sharing one: a `.blocking` worker parked in a
             // DB round trip shows up as a full blocking pool, and the CPU pool's
             // six numbers stay what answers "is the scheduler keeping up". One
@@ -2164,7 +2164,7 @@ pub const Runtime = struct {
             blocking_pool_claimed: *MetricsT.Gauge,
             blocking_pool_dispatches: *MetricsT.Gauge,
             blocking_pool_ready_push_failures: *MetricsT.Gauge,
-            // Per-class splits of `*_ready_len` (docs/RUNTIME.md §12.17): the
+            // Per-class splits of `*_ready_len` (docs/reference/RUNTIME.md §12.17): the
             // aggregate occupancy answers "is anyone waiting", the per-class
             // gauges answer "which priority class is waiting" — the reading that
             // shows the reservation slot working (low drained against a busy
@@ -2281,7 +2281,7 @@ pub const Runtime = struct {
                 self.blocking_pool_ready_push_failures.set(@floatFromInt(if (bp) |x| x.ready_push_failures else 0));
 
                 // Same "0 = no pool declared" answer for the per-class splits
-                // (docs/RUNTIME.md §12.17): indexed by `@backingInt(Priority)`
+                // (docs/reference/RUNTIME.md §12.17): indexed by `@backingInt(Priority)`
                 // — high = 0, normal = 1, low = 2.
                 self.pool_ready_len_high.set(@floatFromInt(if (p) |x| x.ready_len_by_class[0] else 0));
                 // Fairness (§12.17). Published per class, and deliberately
@@ -2376,7 +2376,7 @@ pub const Runtime = struct {
     ///   wheel;
     /// * without a ticker, whoever calls `tick()` owns the wheel, and `shutdown`
     ///   is expected to come from that same thread (the caller-driven
-    ///   configuration of `docs/RUNTIME.md` §4).
+    ///   configuration of `docs/reference/RUNTIME.md` §4).
     ///
     /// A wheel owned by some *other* thread is left alone: writing it from here
     /// is precisely the cross-thread violation the ownership contract exists to
@@ -2430,7 +2430,7 @@ pub const Runtime = struct {
         // ordering guard lives there; this is the cheap second one, covering the
         // arrangements that ordering cannot cover — a `tick()` caller on another
         // thread racing a `shutdown()` (a misuse the ownership contract in
-        // `docs/RUNTIME.md` §4 already forbids, but `post` into freed memory is
+        // `docs/reference/RUNTIME.md` §4 already forbids, but `post` into freed memory is
         // too expensive an answer to a misuse).
         //
         // A dropped fire is not a fire: it is released through the same `drop`
@@ -2587,7 +2587,7 @@ fn workerMain(comptime W: type, comptime capacity: usize) fn (*Handle(W, capacit
                 // always done — ends the loop here and hands the queue behind it to
                 // `countAbandoned` below; `.drain` keeps pulling until the mailbox
                 // is empty, which is what a pooled worker does on every stop
-                // (docs/RUNTIME.md §12.10). An external `stop()` drains the queue
+                // (docs/reference/RUNTIME.md §12.10). An external `stop()` drains the queue
                 // under either policy: the check at the top of the loop only breaks
                 // when nothing is left.
                 while (true) {
@@ -2656,7 +2656,7 @@ fn workerMain(comptime W: type, comptime capacity: usize) fn (*Handle(W, capacit
             // a `.drain` stop), and a `run`-owned worker never recv's at all.
             // Counted, not run: an actor on its way down is not supposed to keep
             // working, but it is not allowed to lose the number either
-            // (docs/RUNTIME.md §5, §12.10).
+            // (docs/reference/RUNTIME.md §5, §12.10).
             handle.countAbandoned();
             // The dedicated half of the supervised-stop count; the pooled half
             // rides on `Entry.abandon`, and the swap makes the pair land once.
@@ -2722,7 +2722,7 @@ fn pooledDispatch(comptime W: type, comptime H: type) *const fn (*anyopaque, usi
         fn run(ctx: *anyopaque, max: usize) bool {
             const handle: *H = @ptrCast(@alignCast(ctx));
 
-            // docs/RUNTIME.md §4's owner contract, pooled flavour: *this* thread owns the worker
+            // docs/reference/RUNTIME.md §4's owner contract, pooled flavour: *this* thread owns the worker
             // while it runs it. That is the answer `Handle.after`'s trace
             // inheritance needs ("am I the worker's thread?"), and 0 afterwards
             // says "no message is being handled here" — the same reading a
@@ -3161,7 +3161,7 @@ test "Runtime: after(delay) never fires early and lands on the first tick at or 
 
 // ── a timer that fired and whose message could not be handed over ─────────
 //
-// The drop counter in docs/RUNTIME.md §5's list was missing: the timer *did* fire (`timer_fires`
+// The drop counter in docs/reference/RUNTIME.md §5's list was missing: the timer *did* fire (`timer_fires`
 // moved), and the mailbox refused the message anyway. Not a producer being
 // refused (`messages_dropped`): there was no producer. Not a message abandoned
 // by a stop (`messages_discarded_on_stop`): nothing was ever accepted. Not a
@@ -3549,7 +3549,7 @@ test "Runtime: shutdown drains the wheel before it tears a worker down" {
 /// `error.Full` is the documented answer to a saturated command queue, and the
 /// ticker is draining it — so for a test that needs the cancel *applied*, the
 /// only honest handling is to wait and retry. (Production code gets to choose:
-/// drop, coalesce or retry, see `docs/RUNTIME.md` §5.)
+/// drop, coalesce or retry, see `docs/reference/RUNTIME.md` §5.)
 fn requestCancelRetry(rt: *Runtime, id: u64) !void {
     while (true) {
         rt.requestCancelTimer(id) catch |err| switch (err) {
@@ -3829,7 +3829,7 @@ test "T2 Runtime: concurrent arm/cancel/advance keeps scheduled = fired + cancel
 
 /// T3 — the documented worker idiom: a handler arms a timer through its own
 /// handle, and the runtime's ticker delivers the message later. This is the
-/// path §3 of `docs/RUNTIME.md` tells workers to use, so it has to keep
+/// path §3 of `docs/reference/RUNTIME.md` tells workers to use, so it has to keep
 /// working whatever the wheel's internals become.
 const DeferProbe = struct {
     pub const Message = u32;
@@ -4225,7 +4225,7 @@ const FlakyActor = struct {
     }
 };
 
-/// The probe `docs/RUNTIME.md` §12.10's lifecycle table is measured with.
+/// The probe `docs/reference/RUNTIME.md` §12.10's lifecycle table is measured with.
 /// `handled` counts *invocations*, so a message whose handler returns an error is
 /// in it too — that is what makes the table's "2/8 vs 8/8" the number it carries.
 ///
@@ -4976,7 +4976,7 @@ test "Runtime.MetricsBridge reports no pool as zeros" {
 }
 
 // ─────────────────────────────────────────────────
-// Pooled workers (docs/RUNTIME.md §12, Phase 1)
+// Pooled workers (docs/reference/RUNTIME.md §12, Phase 1)
 // ─────────────────────────────────────────────────
 //
 // These tests use the *real* pool thread, which is what makes them end-to-end:
@@ -5351,7 +5351,7 @@ test "Runtime: a pooled worker loses nothing under concurrent producers" {
 
 test "Runtime: N pool threads conserve messages and never overlap on one worker" {
     // The same shape as the test above, with **more than one pool thread**
-    // (docs/RUNTIME.md §12.12). Two things change and both are what this asserts:
+    // (docs/reference/RUNTIME.md §12.12). Two things change and both are what this asserts:
     // §12.3's state exclusivity can no longer be explained away by "there is only
     // one thread", so the claim is the only thing holding it up (the overlap
     // witness below is the measurement), and the counters have to add up across
@@ -5608,7 +5608,7 @@ test "Runtime: `.pooled` without a declared pool is refused, and the bound is ha
 }
 
 test "Runtime: a blocked `.blocking` worker does not hold the cpu pool" {
-    // What the class buys, measured instead of argued (docs/RUNTIME.md §6): while
+    // What the class buys, measured instead of argued (docs/reference/RUNTIME.md §6): while
     // a worker that *declared* itself `.blocking` sits inside its handler — the
     // shape of a DB round trip or a blocking HTTP call — a `.cpu` worker must
     // still be run. Both pools run exactly one thread here, which is the sharpest
@@ -6139,7 +6139,7 @@ test "Runtime: a `run`-owned worker cannot be pooled" {
 }
 
 // ─────────────────────────────────────────────────
-// Runtime Replay (docs/RUNTIME.md §13)
+// Runtime Replay (docs/reference/RUNTIME.md §13)
 // ─────────────────────────────────────────────────
 
 /// One handler invocation as both phases observe it: which worker ran, what it
@@ -6543,7 +6543,7 @@ test "Runtime Replay: replayAll hands a whole log to a fresh graph, in order" {
 }
 
 // ─────────────────────────────────────────────────
-// Delivery kinds (docs/RUNTIME.md §13.9): what a track — and the file it
+// Delivery kinds (docs/reference/RUNTIME.md §13.9): what a track — and the file it
 // drains to — says each delivery was
 // ─────────────────────────────────────────────────
 
@@ -6986,7 +6986,7 @@ test "ReplayFromLog e2e (§13.10): a drained delivery log replays into a fresh r
 }
 
 // ─────────────────────────────────────────────────
-// Deterministic runtime (docs/RUNTIME.md §13.13)
+// Deterministic runtime (docs/reference/RUNTIME.md §13.13)
 // ─────────────────────────────────────────────────
 
 test "Deterministic runtime (§13.13): two live runs with the same driver produce the same handler log" {
@@ -7187,7 +7187,7 @@ test "Deterministic runtime (§13.13): the same records replay bit-identically i
 }
 
 // ---------------------------------------------------------------------------
-// Supervision groups (docs/RUNTIME.md §14)
+// Supervision groups (docs/reference/RUNTIME.md §14)
 //
 // The group machinery — policy, budget, escalation — is unit-tested in
 // `supervisor.zig`, where a member is a probe and no thread is involved. What is
@@ -7562,7 +7562,7 @@ test "Supervision (§14.5): a nested group escalates to its parent, and the pare
 /// A pooled worker that **tops its own mailbox back up**, so its backlog can be
 /// unbounded: it hands itself one message per message it runs. That is the shape
 /// a starved scheduler needs — a busy worker with finite work cannot starve
-/// anyone for long, so `docs/RUNTIME.md` §12.3's "one token per worker in a FIFO
+/// anyone for long, so `docs/reference/RUNTIME.md` §12.3's "one token per worker in a FIFO
 /// ring" only means something against a worker that never runs out.
 ///
 /// One-for-one rather than a periodic refill is what makes "never runs out" a
@@ -7681,7 +7681,7 @@ test "Pooled (§12.3): an endlessly busy worker cannot starve a ready one" {
     // runs out. So `batch` is not a throughput knob with a fairness side effect;
     // **it is the fairness bound**, and a worker's worst-case wait behind a busy
     // peer is one batch. Smaller batches cost throughput, larger ones cost
-    // latency for everyone else — the trade `docs/RUNTIME.md` §12.5 records.
+    // latency for everyone else — the trade `docs/reference/RUNTIME.md` §12.5 records.
     //
     // The *shape* of this reading is what flaked on a loaded macOS CI runner, and
     // the flake was the test's, not the scheduler's: the older form compared A's

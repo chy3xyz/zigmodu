@@ -28,7 +28,7 @@ pub const AppSecurity = struct {
     /// RBAC-aware JWT middleware — sets `Rbac.AuthInfo` in `ctx.auth_info` only
     /// (does not overwrite ComptimeRouter `user_data` State). Prefer catalog stack
     /// for new apps: `http.jwtAuthFromCatalogWithPermissions` +
-    /// `http.permissionGateWith(.{ .mode = .rbac })` (see `docs/ROUTE_TABLE.md`).
+    /// `http.permissionGateWith(.{ .mode = .rbac })` (see `docs/reference/ROUTE_TABLE.md`).
     ///
     /// Permissions stay empty — use `rbacJwtMiddlewareWithPermissions` when
     /// requirePermission() checks are in the chain. Read auth via

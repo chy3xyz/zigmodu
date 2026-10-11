@@ -54,7 +54,7 @@ pub const ModuleContext = struct {
     /// ```
     ///
     /// `Application.stop()` requests stop and joins every worker spawned this
-    /// way, in either creation order — see `docs/RUNTIME.md`.
+    /// way, in either creation order — see `docs/reference/RUNTIME.md`.
     pub fn runtime(self: *ModuleContext) !*rt_mod.Runtime {
         const provider = self.runtime_provider orelse return error.RuntimeUnavailable;
         return provider.get(provider.ctx);

@@ -42,8 +42,8 @@ typed identity). Sibling ORM backlog: `zig_ws/zent/docs/ISSUES_FROM_ZAPI.md`.
 | 10 | 审计规则 | `zmodu audit` b19–b24 | 请求路径裸 panic / 共享可变 HashMap / 裸 `@alignCast` / query 取租户 / 分配器归属（`deinitRow(s)` 收下别家 allocator 产出的行）/ 非 CSPRNG 熵源（`std.Io.random`） |
 | 11 | 验证手段 | `zig build soak` · `src/test/FaultInjection.zig` · `src/test/ContractGate.zig` | 跨租户泄漏、熔断恢复行为、接口契约漂移 |
 
-权威细节：[`BEST_PRACTICES.md`](BEST_PRACTICES.md)「韧性 / 上线前预检 / 多副本」
-· [`OBSERVABILITY.md`](OBSERVABILITY.md) · [`ROUTE_TABLE.md`](ROUTE_TABLE.md) §7.4
+权威细节：[`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「韧性 / 上线前预检 / 多副本」
+· [`OBSERVABILITY.md`](../reference/OBSERVABILITY.md) · [`ROUTE_TABLE.md`](../reference/ROUTE_TABLE.md) §7.4
 · `examples/production-deploy/`。
 
 ---
@@ -99,7 +99,7 @@ try http.productionProfile(&server, .{
 //   + GET /health/live + /health/ready（+ 可选 dashboard）
 ```
 
-细节与告警阈值：[`OBSERVABILITY.md`](OBSERVABILITY.md) · 接线顺序：[`ROUTE_TABLE.md`](ROUTE_TABLE.md) §7.4。
+细节与告警阈值：[`OBSERVABILITY.md`](../reference/OBSERVABILITY.md) · 接线顺序：[`ROUTE_TABLE.md`](../reference/ROUTE_TABLE.md) §7.4。
 
 ### Testkit
 
@@ -152,7 +152,7 @@ fn stream(ctx: *http.Context, _: *State) !void {
 
 ## Related docs
 
-- [ROUTE_TABLE.md](./ROUTE_TABLE.md)
-- [PRODUCTION_ROADMAP.md](./PRODUCTION_ROADMAP.md)
-- [MODULITH.md](./MODULITH.md)
-- [AGENTS.md](../AGENTS.md)
+- [ROUTE_TABLE.md](../reference/ROUTE_TABLE.md)
+- [PRODUCTION_ROADMAP.md](PRODUCTION_ROADMAP.md)
+- [MODULITH.md](../guide/MODULITH.md)
+- [AGENTS.md](../../AGENTS.md)

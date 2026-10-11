@@ -1,6 +1,6 @@
 //! Comptime / generic HTTP routing (Zig-native).
 //!
-//! See `docs/ROUTE_TABLE.md`. Modules declare `routes` + `module_name` + `nest`;
+//! See `docs/reference/ROUTE_TABLE.md`. Modules declare `routes` + `module_name` + `nest`;
 //! `Router(AppState).scope(prefix).mount(Mod, state)` expands them with `inline for`.
 //!
 //! Does NOT scan the filesystem. Registration is an explicit comptime module tuple.
@@ -883,7 +883,7 @@ pub fn Scoped(comptime AppState: type) type {
                             "`.meta.auth`.\n" ++
                             "A WS route has no enforcement point — the upgrade is answered before " ++
                             "`router.match` and before any middleware runs, so an inherited `auth` would be " ++
-                            "recorded and never checked (docs/RUNTIME.md §12.14).\n" ++
+                            "recorded and never checked (docs/reference/RUNTIME.md §12.14).\n" ++
                             "Say who owns the identity, explicitly:\n" ++
                             "  .meta = .{ .auth = .public }                       // you authenticate inside on_connect\n" ++
                             "and if that is what you mean, do it there — the `ctx` is the upgrade request.",
@@ -893,7 +893,7 @@ pub fn Scoped(comptime AppState: type) type {
                             @tagName(spec.meta.auth) ++ "`, which cannot be enforced.\n" ++
                             "The upgrade is handled before `router.match` and before any global middleware, so " ++
                             "nothing would check it — the route would be open while reading as protected " ++
-                            "(docs/RUNTIME.md §12.14).\n" ++
+                            "(docs/reference/RUNTIME.md §12.14).\n" ++
                             "Declare `.auth = .public` and authenticate inside `on_connect`, where `ctx` is the " ++
                             "upgrade request.",
                     );
@@ -901,7 +901,7 @@ pub fn Scoped(comptime AppState: type) type {
                         "WebSocket route '" ++ spec.path ++ "' in " ++ @typeName(Mod) ++ " declares " ++
                             "`permission` / `roles`, which cannot be enforced on a WS route (nothing runs before " ++
                             "the upgrade is answered).\n" ++
-                            "Check them inside `on_connect` instead, or drop them (docs/RUNTIME.md §12.14).",
+                            "Check them inside `on_connect` instead, or drop them (docs/reference/RUNTIME.md §12.14).",
                     );
 
                     const auth = resolveAuth(spec.meta, self.router.default_auth);

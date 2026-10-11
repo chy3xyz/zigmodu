@@ -7,7 +7,7 @@
 //! `Runtime.tick_interval_ms = 5` ms drives them, so a timer armed with
 //! `after(delay_ms)` fires somewhere in
 //! `[delay_ms, delay_ms + enqueue latency + tick_interval_ms]`
-//! (docs/RUNTIME.md §3). That is the right shape for "a million timers, O(1)
+//! (docs/reference/RUNTIME.md §3). That is the right shape for "a million timers, O(1)
 //! schedule/cancel, bounded work per tick" — a heartbeat, a retry, a cache
 //! expiry — and *useless* for a deadline measured in microseconds, where the
 //! 5 ms tick alone is 5000x the budget.
@@ -173,7 +173,7 @@
 //!
 //! CPU affinity, thread priority/NUMA, TSC reading and kernel-bypass hooks are
 //! **out of scope here** — they are execution-policy concerns that
-//! docs/RUNTIME.md §12.7 excludes from the runtime, and none of them is needed to
+//! docs/reference/RUNTIME.md §12.7 excludes from the runtime, and none of them is needed to
 //! get the accuracy this file reports. The one exception sits in a different
 //! file, not this one: the affinity *primitive* is `runtime.pinCurrentThread`
 //! (`affinity.zig`), which pins the calling thread and returns

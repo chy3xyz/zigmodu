@@ -167,7 +167,7 @@ pub const default_system_prompt = "You are a helpful agent. Prefer tools for fac
 ///
 /// A hand-built `Agent{}` can silently forget `guard` (and then nothing is
 /// enforced), `memory`, or its identity. A `Spec` makes those one reviewable
-/// literal and `build()` wires them, so `docs/AGENT_RUNTIME.md` §八 ("an agent
+/// literal and `build()` wires them, so `docs/reference/AGENT_RUNTIME.md` §八 ("an agent
 /// is not allowed to act by default") is the *default* rather than something a
 /// caller has to remember.
 pub const Spec = struct {
@@ -251,7 +251,7 @@ pub const Agent = struct {
     /// (the tool's declared `action` × its name) before dispatch; a denied call
     /// is fed back to the model as `{"error":"ToolDenied","reason":…}` instead
     /// of running, so it can pivot to proposing. `null` keeps the legacy path
-    /// (allowlist + `hooks.on_tool_request` only) — see `docs/AGENT_RUNTIME.md`.
+    /// (allowlist + `hooks.on_tool_request` only) — see `docs/reference/AGENT_RUNTIME.md`.
     guard: ?*guard_mod.Guard = null,
     /// Memory: facts for this run's tenant **and** user are recalled into the
     /// system message. The run must carry a non-zero tenant *and* user id or

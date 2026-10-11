@@ -9,7 +9,7 @@
 //! source is `PeerDiscovery` ("service name → peers"), which is a *different fact*
 //! from the read side's "member id → address + health", so `ClusterBootstrap`
 //! deliberately does not drive it — request paths route with `ClusterView.pick` /
-//! `pickRanked` (`docs/DISTRIBUTED.md`). An app that wants canary or
+//! `pickRanked` (`docs/reference/DISTRIBUTED.md`). An app that wants canary or
 //! least-connections policy assembles `PeerDiscovery` + `LoadBalancer` itself.
 //! - Canary routing (weighted traffic splitting)
 //!

@@ -1,5 +1,5 @@
 //! Delivery-log segments — the **storage layer** for a persisted delivery track
-//! (`docs/RUNTIME.md` §13.3 Q4, tier 2).
+//! (`docs/reference/RUNTIME.md` §13.3 Q4, tier 2).
 //!
 //! `src/runtime/recorder.zig` keeps the delivery stream in bounded in-memory
 //! rings and says so: §13.5 lists "no cross-process replay" as out of scope for

@@ -4,10 +4,10 @@
 **版本口径**: zent **v0.86.0**（0.86 起 `field.String.VarChar(n)`（MySQL 落 `VARCHAR(n)`，PG/SQLite 保持 TEXT；**所有方言**写路径拒绝超长 `ValidationFailed`）+ `client.<entity>.AllOwned(allocator)` 一行式放页；**0.85 `ShardSet` 改借用 `ShardRouter`**（所有权契约破坏：调用方持有并 `deinit` router，按值拷贝的 router 在 `init` 后不得再变异——本仓库示例不用 `ShardSet`，无动作）；0.84 起 EntQL 按**字段名优先**寻址（`StorageKey` 感知，物理列名仍可用，都不是 → `UnknownField`）、`Has{Edge}With` 校验谓词列存在（`UnknownField`）、边外键 DDL 尊重目标 `.pk`/`StorageKey`（此前新库首插 `foreign key mismatch`）；**0.81 起 `insertMany`/`upsertMany` 必传 `tenant_id`**（与 0.54 的 `create` 双参同一契约，忽略实体自带租户值）；0.81 起 `cursorPage` 拒绝可空整数游标列（`NullableCursorColumn`，旧的 `has_more=true + next_cursor=null` 会死循环翻页）；0.78 起七个单值聚合（`Sum`/`Avg`/`Max`/`Min`/`SumOrZero`/`AggregateOne`/`AggregateText`）拒绝带 `GROUP BY` 的查询（`GroupByNotSupported`，分组聚合用 `AggregateBy`/`GroupCount`）；0.78 起 `SaveOne`/`ExecOne`/`ForceExecOne` 在驱动无计数时报 `RowsAffectedUnknown` 而非 `NotFound`（三内置驱动不可达）；0.82 起工具链钉 **0.17.0 正式版**（`minimum_zig_version`，旧 dev 快照不再满足）；0.83 comptime quota 显式化（300 实体图压测）+ `id.uuidv4/uuidv7` 换 threadlocal ChaCha+OS 熵（修并发 UB）+ `allocPrint` 弃用迁移；**0.76 起可按驱动裁剪构建**：`b.dependency("zent", .{ .pg = false, .mysql = false })`，翻译期跳过对应 `translate-c`；**0.75 起** junction 表名与某个实体表名撞车时 `checkSchema` 报 **`junction_name_collision`** 并归为 read-breaking，`migrateSchema` 计划建表时 `warn` —— 只有一方能存在，改名是调用方的决定；0.76.1 修三处 OOM 路径泄漏（`Builder.initCapacity`/`takeQuery`/`Selector.init`）；0.73 起 `CrudService.get` → **`getOwned`**、配套 `deinitRowWith(allocator, &e)`；0.73 起 `Sum`/`Avg` 空集报 `EmptyAggregate`；0.70 起 **SQLite 强制外键**（`PRAGMA foreign_keys = ON`）；0.70 起 PG 的 `23502/23503` 不再误报 `UniqueViolation`；0.69 起 `SaveError` 增 `InconsistentRowFields`/`MissingPrimaryKey`；0.72 起 `Restore` 受策略过滤与拦截器约束；0.74 起 EntQL 拒绝未知字段；0.54 起 `CrudService.create(entity, tenant_id)` 双参；0.57 起 MySQL 的 `String`/`Enum` 落 `VARCHAR(255)`；0.40 起一行式实体释放 `deinitRows`/`deinitRow`/`deinitEdgeRows`；0.38 起 `queryTargets*` fail-closed；0.39 起 `zent.scope` 让裸 SQL 也走同一套读契约，见 §14/§15）· 本仓库示例按 **v0.86.0** 验证；`create` 双参签名要求 **≥ v0.54.0**，`getOwned` 要求 **≥ v0.73.0**，按驱动裁剪要求 **≥ v0.76.0**，`insertMany`/`upsertMany` 双参要求 **≥ v0.81.0**，`ShardSet` 借用契约要求 **≥ v0.85.0**，其余条目见 §14 · ZigModu **v0.15.22+** · Zig **≥ 0.17**  
 **主推组合**: **电商 / 社交类项目默认选 ZigModu + zent**（见 §2 决策表与 §4.8 场景能力矩阵）；只有存量 SQL 繁重、报表主导或 DBA 强管控的项目才默认 sqlx。这是**新项目选型建议**，与框架自带的默认实现不是一件事——口径见 §1「与框架自带那条的关系」。
 
-**参考实现**: [`examples/zent-modulith/`](../examples/zent-modulith/)  
+**参考实现**: [`examples/zent-modulith/`](../../examples/zent-modulith/)  
 **zent 自带示例**: `zig build run-start` / `run-complex` / `run-pool`（在 zent 仓库内）
 
-相关文档：[MODULE_LAYERS.md](MODULE_LAYERS.md) · [MODULITH.md](MODULITH.md) · [BEST_PRACTICES.md](BEST_PRACTICES.md) · [SQLX_DRIVERS.md](SQLX_DRIVERS.md)（zigmodu 侧 `-Ddb=`）· [DATA / sqlx](../src/data.zig)
+相关文档：[MODULE_LAYERS.md](../guide/MODULE_LAYERS.md) · [MODULITH.md](../guide/MODULITH.md) · [BEST_PRACTICES.md](../guide/BEST_PRACTICES.md) · [SQLX_DRIVERS.md](../guide/SQLX_DRIVERS.md)（zigmodu 侧 `-Ddb=`）· [DATA / sqlx](../../src/data.zig)
 
 ---
 
@@ -42,7 +42,7 @@
 框架**自带的默认数据层是 sqlx，不是 zent**，两者层次不同，别把本文的"默认"读成"框架默认值变了"：
 
 - `data.SqlxBackend` 是框架默认的 ORM backend，`data.Repository(T)` 就是
-  `orm.Orm(SqlxBackend).Repository`（见 [`src/data.zig`](../src/data.zig)）；
+  `orm.Orm(SqlxBackend).Repository`（见 [`src/data.zig`](../../src/data.zig)）；
 - `build.zig.zon` 的 `.dependencies = .{}` —— **zent 不是框架依赖**，只在示例/应用里
   按 git tag 单独 pin（见 §11 依赖接入）。
 
@@ -50,7 +50,7 @@
 不是"框架默认改成 zent 了"。框架默认值决定"你不选也能跑什么"，本文决定"你该选什么"。
 
 > **Shared helper**：示例级生命周期和测试工具位于
-> [`examples/_shared/zent_helpers.zig`](../examples/_shared/zent_helpers.zig)。它只封装
+> [`examples/_shared/zent_helpers.zig`](../../examples/_shared/zent_helpers.zig)。它只封装
 > `open → migrate → makeClient → deinit`，不属于 ZigModu core，也不改变 zent 与 `data.sqlx` 的正交边界。
 
 | 层 | 用 ZigModu | 用 zent |
@@ -590,7 +590,7 @@ zig_ws/
   zent/          # git clone https://github.com/chy3xyz/zent.git
 ```
 
-**zigmodu 侧驱动链接**：`examples/zent-modulith` 等 path 依赖仍 `addImport("zigmodu")`，并用 `db_link.Features.sqlite_only`，避免 zigmodu sqlx 再链 libpq/mysql。业务只走 zent 时也建议如此。完整约定见 [SQLX_DRIVERS.md](SQLX_DRIVERS.md) §8。
+**zigmodu 侧驱动链接**：`examples/zent-modulith` 等 path 依赖仍 `addImport("zigmodu")`，并用 `db_link.Features.sqlite_only`，避免 zigmodu sqlx 再链 libpq/mysql。业务只走 zent 时也建议如此。完整约定见 [SQLX_DRIVERS.md](../guide/SQLX_DRIVERS.md) §8。
 
 ---
 
@@ -730,7 +730,7 @@ zig_ws/
 
 | 资源 | 用途 |
 |------|------|
-| [`examples/zent-modulith/`](../examples/zent-modulith/) | ZigModu HTTP + zent 分层冒烟 |
-| [`examples/tenant-shop/`](../examples/tenant-shop/) | sqlx + Tx/Outbox 旗舰路径 |
-| [MODULE_LAYERS.md](MODULE_LAYERS.md) | model / persistence / service 通则 |
+| [`examples/zent-modulith/`](../../examples/zent-modulith/) | ZigModu HTTP + zent 分层冒烟 |
+| [`examples/tenant-shop/`](../../examples/tenant-shop/) | sqlx + Tx/Outbox 旗舰路径 |
+| [MODULE_LAYERS.md](../guide/MODULE_LAYERS.md) | model / persistence / service 通则 |
 | [chy3xyz/zent](https://github.com/chy3xyz/zent) | ORM 本体与 `run-complex` / `run-pool` |

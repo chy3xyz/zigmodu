@@ -4,7 +4,7 @@
 > `raft_cluster_size > 1` refuses to start (`error.RaftTransportUnavailable`) unless you pass a real
 > `.transport` — or acknowledge `.allow_stub_raft_transport = true` to run membership + the read side only.
 > What exists today (transport ✅, election state machine still gapped) and the contract a real transport
-> must satisfy are written out in [`DISTRIBUTED.md`](DISTRIBUTED.md), sections
+> must satisfy are written out in [`DISTRIBUTED.md`](../reference/DISTRIBUTED.md), sections
 > *"multi-node startup is fail-closed"* and *"what real leader election needs"*.
 > The walkthrough below is the single-node path that works today.
 
@@ -49,7 +49,7 @@ pub fn main(init: std.process.Init) !void {
 
 Request paths read the **view**, never the membership map
 (`ClusterBootstrap.getView().acquire()` / `.pick(key)` / `.release(snap)` — see
-[`DISTRIBUTED.md`](DISTRIBUTED.md) reading side notes).
+[`DISTRIBUTED.md`](../reference/DISTRIBUTED.md) reading side notes).
 
 ## 2. HTTP health endpoint (you mount it)
 
@@ -89,7 +89,7 @@ Two honest notes on that output:
   configured id yet (it is on the fix list, not implemented).
 - A single node has no peer to vote for it, so `raft_term` stays `0` and `raft_state` stays
   `follower`/`candidate`; real leadership needs a transport plus the missing vote counting
-  ([`DISTRIBUTED.md`](DISTRIBUTED.md)).
+  ([`DISTRIBUTED.md`](../reference/DISTRIBUTED.md)).
 
 ```bash
 curl -s http://localhost:8080/cluster/metrics

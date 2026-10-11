@@ -3,7 +3,7 @@
 > `zigmodu.ai.llm` 提供开箱即用的 LLM-backed 策略：审批、风控、异常归因、
 > workflow 质量门。本文是**真实接线**指南——从 `AiProvider` 初始化到把
 > 策略挂进 `ApprovalFlow` / `RiskReview` / `DiagnosisFlow` / `Workflow.reflection`，
-> 含完整代码与验证方法。配套可编译示例：[`examples/llm-policies`](../examples/llm-policies)。
+> 含完整代码与验证方法。配套可编译示例：[`examples/llm-policies`](../../examples/llm-policies)。
 
 ## 1. 前置：AiProvider
 

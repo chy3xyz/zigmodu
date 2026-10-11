@@ -1,4 +1,4 @@
-//! Supervision groups — the tree half of `Supervision` (docs/RUNTIME.md §14).
+//! Supervision groups — the tree half of `Supervision` (docs/reference/RUNTIME.md §14).
 //!
 //! §3b supervises **one** actor: it counts its own errors and decides whether to
 //! stop. What it cannot say is "and then what" — a stopped member is terminal,

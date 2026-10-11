@@ -33,7 +33,7 @@ pub const Identity = server_mod.Identity;
 /// Response envelope dialect for `ctx.ok/fail/unauth/paginated` (M6).
 pub const EnvelopeDialect = server_mod.EnvelopeDialect;
 
-/// Comptime / generic route table (see `docs/ROUTE_TABLE.md`).
+/// Comptime / generic route table (see `docs/reference/ROUTE_TABLE.md`).
 pub const comptime_router = @import("api/ComptimeRouter.zig");
 /// Route auth requirement: inherit / public / optional / jwt.
 pub const Auth = comptime_router.Auth;

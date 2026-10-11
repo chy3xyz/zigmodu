@@ -11,7 +11,7 @@
 //! Everything here is **additive**: the module API, DI, `Application.eventBus`,
 //! lifecycle and HTTP surface are untouched, and an application that never
 //! touches `runtime` behaves exactly as it did before (no threads are started).
-//! See `docs/RUNTIME.md` for the compatibility principles and when each
+//! See `docs/reference/RUNTIME.md` for the compatibility principles and when each
 //! primitive is the right tool.
 
 const std = @import("std");
@@ -36,17 +36,17 @@ pub const hot_bus = @import("runtime/hot_bus.zig");
 /// Recorder module: bounded delivery log + replay against a manual clock.
 pub const recorder = @import("runtime/recorder.zig");
 /// Delivery log module: the `ZDL1` segment-file storage a recording drains to
-/// and a replay scans back (docs/RUNTIME.md §13.9–§13.12) — the replay driver's
+/// and a replay scans back (docs/reference/RUNTIME.md §13.9–§13.12) — the replay driver's
 /// file format, public so consumers can write and read their own logs.
 pub const delivery_log = @import("runtime/delivery_log.zig");
 /// Replay driver module: the deterministic (S-level) playback of a delivery
 /// log through a det-mode runtime — tick + settle between steps
-/// (docs/RUNTIME.md §15, dev/deterministic-runtime-design.md §4.2).
+/// (docs/reference/RUNTIME.md §15, dev/deterministic-runtime-design.md §4.2).
 pub const replay_driver = @import("runtime/replay_driver.zig");
-/// Scheduler module: the pool behind `.mode = .pooled` (docs/RUNTIME.md §12).
+/// Scheduler module: the pool behind `.mode = .pooled` (docs/reference/RUNTIME.md §12).
 pub const scheduler = @import("runtime/scheduler.zig");
 /// Supervisor module: supervision groups — policies, restart budget, the tree
-/// (docs/RUNTIME.md §14).
+/// (docs/reference/RUNTIME.md §14).
 pub const supervisor = @import("runtime/supervisor.zig");
 /// CPU affinity module: pin the calling thread to a CPU where the platform
 /// allows it. The module doc is the platform truth table (macOS: no API at all;
@@ -97,7 +97,7 @@ pub const Intensity = runtime_impl.Intensity;
 /// Who runs a worker's `handle`: its own thread (`.dedicated`) or the pool.
 pub const SpawnMode = runtime_impl.SpawnMode;
 /// What a worker's handler does with its thread — `.cpu` or `.blocking` — i.e.
-/// which pool may run it. Declared, never detected (docs/RUNTIME.md §6).
+/// which pool may run it. Declared, never detected (docs/reference/RUNTIME.md §6).
 pub const ExecutionClass = runtime_impl.ExecutionClass;
 /// What a stop for good does with the queue: abandon it (`.immediate`) or work
 /// it off first (`.drain`). Undeclared, a worker keeps its mode's answer.

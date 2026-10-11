@@ -1,4 +1,4 @@
-//! AI boundary — the machine-checked half of `docs/AI_BOUNDARY.md`.
+//! AI boundary — the machine-checked half of `docs/reference/AI_BOUNDARY.md`.
 //!
 //! `src/ai/` is the largest optional surface in the tree (~12k lines) and the one
 //! most likely to become its own package. It used to reach into the **driver
@@ -34,7 +34,7 @@ const allowed_prefixes = [_][]const u8{
     "http/", // Sse.zig — streaming is AI's own transport concern
     "http.zig", // the http domain barrel
     "data.zig", // the data domain barrel (the seam AI *should* use)
-    "runtime.zig", // the runtime domain barrel — Agent as a worker (docs/AGENT_RUNTIME.md)
+    "runtime.zig", // the runtime domain barrel — Agent as a worker (docs/reference/AGENT_RUNTIME.md)
     "messaging/",
     "scheduler/",
     "resilience/",
@@ -112,7 +112,7 @@ test "AI boundary: imports stay inside the allowlist (root export is the only wa
                 .allowed => {},
                 .unknown => {
                     unknown += 1;
-                    std.debug.print("[ai-boundary] {s}: '{s}' is not in the allowlist — add it to docs/AI_BOUNDARY.md first\n", .{ path, target });
+                    std.debug.print("[ai-boundary] {s}: '{s}' is not in the allowlist — add it to docs/reference/AI_BOUNDARY.md first\n", .{ path, target });
                 },
             }
         }

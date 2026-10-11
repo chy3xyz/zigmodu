@@ -1,13 +1,13 @@
 //! Deprecation and API-freeze gate: the names the docs promise are still there.
 //!
-//! `docs/UPGRADING.md` promises that the deprecated aliases are only removed at
-//! 1.0, and `docs/API_FREEZE.md` names the entry points 1.0 freezes. Both are
+//! `docs/reference/UPGRADING.md` promises that the deprecated aliases are only removed at
+//! 1.0, and `docs/reference/API_FREEZE.md` names the entry points 1.0 freezes. Both are
 //! promises about *names*, and nothing checked them: deleting `ctx.paramPath`,
 //! re-exporting a name the docs record as removed, or hoisting an unstable
 //! `runtime.*` type onto the frozen top-level surface, would have been found at
 //! 1.0 — or by the consumer whose build broke first.
 //!
-//! `DocsConsistency.zig` covers the other half (a symbol shown in `docs/API.md`
+//! `DocsConsistency.zig` covers the other half (a symbol shown in `docs/reference/API.md`
 //! must exist somewhere in `src/`); this file covers the half it cannot: the
 //! table's own promises, the exact import path a consumer writes, and the split
 //! between the frozen surface and the preview one.
@@ -25,7 +25,7 @@
 //!    `DEPRECATED` marker inside its doc comment, and that comment must name the
 //!    replacement.
 //! 3. **Removal** — the opposite direction for names that already left. The
-//!    「已移除」 record in `docs/UPGRADING.md` carries `zigmodu.App` /
+//!    「已移除」 record in `docs/reference/UPGRADING.md` carries `zigmodu.App` /
 //!    `zigmodu.ModuleImpl` and `zigmodu.extensions`, so re-exporting one from
 //!    `root.zig` is red. That is the failure the old table row invited: "removed
 //!    no earlier than 1.0" reads as "still available", and a `@hasDecl` is
@@ -38,16 +38,16 @@
 //!    `validateStruct*` entry points behind `http.validateRequest` /
 //!    `http.extractJsonValidated` to `validation/FieldValidation.zig`, with
 //!    neither home reaching back into the deprecated file.
-//! 5. **Anchor resolution** — every anchor `docs/API_FREEZE.md` names resolves
+//! 5. **Anchor resolution** — every anchor `docs/reference/API_FREEZE.md` names resolves
 //!    (`@hasDecl`, data-driven from the doc's own rows, so the check follows the
 //!    doc rather than a hand-written list of calls).
-//! 6. **Table ↔ gate sync** — the rows are parsed out of `docs/UPGRADING.md` and
-//!    `docs/API_FREEZE.md` and compared with the tables here. A row added
+//! 6. **Table ↔ gate sync** — the rows are parsed out of `docs/reference/UPGRADING.md` and
+//!    `docs/reference/API_FREEZE.md` and compared with the tables here. A row added
 //!    without a check is red, and so is a check for a row that no longer exists
 //!    — the two failure modes the deprecation table would otherwise have.
 //!
 //! What none of this covers (signature accuracy; how tightly a marker window
-//! isolates one doc comment) is written down in `docs/API_FREEZE.md`
+//! isolates one doc comment) is written down in `docs/reference/API_FREEZE.md`
 //! 「覆盖不到的部分」 rather than left implied.
 
 const std = @import("std");
@@ -56,10 +56,10 @@ const zmodu = @import("../root.zig");
 const http = zmodu.http;
 
 // ============================================================
-// 1. Deprecated aliases — mirrors docs/UPGRADING.md
+// 1. Deprecated aliases — mirrors docs/reference/UPGRADING.md
 // ============================================================
 
-/// The section of `docs/UPGRADING.md` the rows are read from. A heading rename
+/// The section of `docs/reference/UPGRADING.md` the rows are read from. A heading rename
 /// fails the sync test, which is the point: the table is the promise.
 const deprecation_heading = "## 弃用别名与删除计划";
 
@@ -146,7 +146,7 @@ const ALIASES = [_]Alias{
 /// How much text before the declaration counts as "its doc comment". Wide
 /// enough for a box-drawn banner or a multi-line comment, narrow enough that a
 /// `DEPRECATED` marker further up the file cannot satisfy the check (how loose
-/// it stays for the two `root.zig` markers is recorded in `docs/API_FREEZE.md`
+/// it stays for the two `root.zig` markers is recorded in `docs/reference/API_FREEZE.md`
 /// 「覆盖不到的部分」).
 const marker_window = 1500;
 
@@ -154,7 +154,7 @@ const marker_window = 1500;
 // 1b. Removed names — the other side of the deprecation table
 // ============================================================
 
-/// Heading of the record `docs/UPGRADING.md` keeps for names that already left
+/// Heading of the record `docs/reference/UPGRADING.md` keeps for names that already left
 /// the surface. They are deliberately *not* rows in the table: "removed no
 /// earlier than 1.0" would read as a promise that the name still works.
 const removed_heading = "### 已移除";
@@ -403,7 +403,7 @@ test "deprecation table: every row's replacement name still resolves" {
     // renamed again), and nothing else checks it.
     inline for (ALIASES) |alias| {
         if (!replacementResolves(alias.doc_target)) {
-            std.debug.print("[api-freeze] docs/UPGRADING.md row `{s}` tells the reader to use `{s}`, which does not resolve\n", .{ alias.doc_deprecated, alias.doc_target });
+            std.debug.print("[api-freeze] docs/reference/UPGRADING.md row `{s}` tells the reader to use `{s}`, which does not resolve\n", .{ alias.doc_deprecated, alias.doc_target });
             missing += 1;
         }
     }
@@ -436,7 +436,7 @@ test "removed: the names off the root stay off, and their files are still compil
     // so `true` here is exactly the regression the 「已移除」 record guards.
     inline for (REMOVED) |removed| {
         if (comptime @hasDecl(zmodu, removed.root_name)) {
-            std.debug.print("[api-freeze] `zigmodu.{s}` is exported again — docs/UPGRADING.md records it as removed ({s}); use the domain files / `Application` instead\n", .{ removed.root_name, removed.evidence });
+            std.debug.print("[api-freeze] `zigmodu.{s}` is exported again — docs/reference/UPGRADING.md records it as removed ({s}); use the domain files / `Application` instead\n", .{ removed.root_name, removed.evidence });
             return error.RemovedNameReexported;
         }
     }
@@ -514,14 +514,14 @@ test "removed: the extensions shim is a rename, not a fork" {
     try std.testing.expect(Ext.RedisClient == zmodu.data.redis.Redis);
 }
 
-test "removed: docs/UPGRADING.md records the same removals this gate pins" {
+test "removed: docs/reference/UPGRADING.md records the same removals this gate pins" {
     const allocator = std.testing.allocator;
 
-    const content = try readDoc(allocator, "docs/UPGRADING.md");
+    const content = try readDoc(allocator, "docs/reference/UPGRADING.md");
     defer allocator.free(content);
 
     const section = sectionText(content, removed_heading) orelse {
-        std.debug.print("[api-freeze] docs/UPGRADING.md has no '{s}' record — a removed name must not stay in the table (that reads as \"still available\")\n", .{removed_heading});
+        std.debug.print("[api-freeze] docs/reference/UPGRADING.md has no '{s}' record — a removed name must not stay in the table (that reads as \"still available\")\n", .{removed_heading});
         return error.RemovedRecordMissing;
     };
 
@@ -533,22 +533,22 @@ test "removed: docs/UPGRADING.md records the same removals this gate pins" {
         defer allocator.free(name);
 
         if (std.mem.indexOf(u8, section, name) == null) {
-            std.debug.print("[api-freeze] docs/UPGRADING.md '{s}' does not name {s}, which this gate asserts stays off the root\n", .{ removed_heading, name });
+            std.debug.print("[api-freeze] docs/reference/UPGRADING.md '{s}' does not name {s}, which this gate asserts stays off the root\n", .{ removed_heading, name });
             problems += 1;
         }
         if (std.mem.indexOf(u8, section, removed.evidence) == null) {
-            std.debug.print("[api-freeze] docs/UPGRADING.md '{s}' does not cite {s} for `zigmodu.{s}` — the record needs evidence (a commit, or the oldest written record there is), not just a name\n", .{ removed_heading, removed.evidence, removed.root_name });
+            std.debug.print("[api-freeze] docs/reference/UPGRADING.md '{s}' does not cite {s} for `zigmodu.{s}` — the record needs evidence (a commit, or the oldest written record there is), not just a name\n", .{ removed_heading, removed.evidence, removed.root_name });
             problems += 1;
         }
         if (std.mem.indexOf(u8, section, removed.file) == null) {
-            std.debug.print("[api-freeze] docs/UPGRADING.md '{s}' does not say where `zigmodu.{s}` can still be found ({s})\n", .{ removed_heading, removed.root_name, removed.file });
+            std.debug.print("[api-freeze] docs/reference/UPGRADING.md '{s}' does not say where `zigmodu.{s}` can still be found ({s})\n", .{ removed_heading, removed.root_name, removed.file });
             problems += 1;
         }
     }
 
     // A record without the replacement is a dead end for the reader.
     if (std.mem.indexOf(u8, section, "Application") == null) {
-        std.debug.print("[api-freeze] docs/UPGRADING.md '{s}' never names the replacement `Application`\n", .{removed_heading});
+        std.debug.print("[api-freeze] docs/reference/UPGRADING.md '{s}' never names the replacement `Application`\n", .{removed_heading});
         problems += 1;
     }
 
@@ -577,7 +577,7 @@ test "banners: the whole-file DEPRECATED notices are still at the top, and http.
         const head = content[0..@min(content.len, banner_window)];
         for (banner.must_contain) |needle| {
             if (std.mem.indexOf(u8, head, needle) != null) continue;
-            std.debug.print("[api-freeze] {s}: the file-level deprecation banner lost '{s}' from its opening {d} bytes (docs/UPGRADING.md rule 1: mark it deprecated and name the replacement)\n", .{ banner.file, needle, banner_window });
+            std.debug.print("[api-freeze] {s}: the file-level deprecation banner lost '{s}' from its opening {d} bytes (docs/reference/UPGRADING.md rule 1: mark it deprecated and name the replacement)\n", .{ banner.file, needle, banner_window });
             problems += 1;
         }
     }
@@ -685,13 +685,13 @@ test "banners: the whole-file DEPRECATED notices are still at the top, and http.
 
     if (problems > 0) return error.BannerDrift;
 
-    // The classification itself is written down (docs/API_FREEZE.md), so a reader
+    // The classification itself is written down (docs/reference/API_FREEZE.md), so a reader
     // meets "these two are neither rows nor removals" before the failure does.
-    const freeze_doc = try readDoc(allocator, "docs/API_FREEZE.md");
+    const freeze_doc = try readDoc(allocator, "docs/reference/API_FREEZE.md");
     defer allocator.free(freeze_doc);
     for (BANNERS) |banner| {
         if (std.mem.indexOf(u8, freeze_doc, banner.file) == null) {
-            std.debug.print("[api-freeze] docs/API_FREEZE.md does not mention {s}, which this gate treats as a file-level deprecation banner — the classification has to live somewhere a reader can find it\n", .{banner.file});
+            std.debug.print("[api-freeze] docs/reference/API_FREEZE.md does not mention {s}, which this gate treats as a file-level deprecation banner — the classification has to live somewhere a reader can find it\n", .{banner.file});
             return error.BannerUndocumented;
         }
     }
@@ -885,11 +885,11 @@ fn sectionText(content: []const u8, heading: []const u8) ?[]const u8 {
     return rest[0..end];
 }
 
-test "deprecation table: docs/UPGRADING.md, the markers and this gate stay in sync" {
+test "deprecation table: docs/reference/UPGRADING.md, the markers and this gate stay in sync" {
     const allocator = std.testing.allocator;
 
-    const content = readDoc(allocator, "docs/UPGRADING.md") catch |err| {
-        std.debug.print("[api-freeze] docs/UPGRADING.md unreadable ({s}) — the deprecation table is the promise this test checks\n", .{@errorName(err)});
+    const content = readDoc(allocator, "docs/reference/UPGRADING.md") catch |err| {
+        std.debug.print("[api-freeze] docs/reference/UPGRADING.md unreadable ({s}) — the deprecation table is the promise this test checks\n", .{@errorName(err)});
         return error.DeprecationTableUnreadable;
     };
     defer allocator.free(content);
@@ -898,14 +898,14 @@ test "deprecation table: docs/UPGRADING.md, the markers and this gate stay in sy
     defer rows.deinit(allocator);
 
     if (rows.items.len == 0) {
-        std.debug.print("[api-freeze] docs/UPGRADING.md: no rows under '{s}' — has the table moved?\n", .{deprecation_heading});
+        std.debug.print("[api-freeze] docs/reference/UPGRADING.md: no rows under '{s}' — has the table moved?\n", .{deprecation_heading});
         return error.DeprecationTableMissing;
     }
 
     var problems: usize = 0;
     for (rows.items) |row| {
         const target = firstBackticked(row.right_cell) orelse {
-            std.debug.print("[api-freeze] docs/UPGRADING.md:{d}: row `{s}` has no backticked replacement name\n", .{ row.line, row.left });
+            std.debug.print("[api-freeze] docs/reference/UPGRADING.md:{d}: row `{s}` has no backticked replacement name\n", .{ row.line, row.left });
             problems += 1;
             continue;
         };
@@ -913,12 +913,12 @@ test "deprecation table: docs/UPGRADING.md, the markers and this gate stay in sy
         // The deletion column must not be empty (the table's own rule 2) and
         // must still carry the unified "not before 1.0" plan.
         if (row.note.len == 0 or std.mem.indexOf(u8, row.note, "1.0") == null) {
-            std.debug.print("[api-freeze] docs/UPGRADING.md:{d}: row `{s}` has no deletion plan containing 1.0 (got '{s}')\n", .{ row.line, row.left, row.note });
+            std.debug.print("[api-freeze] docs/reference/UPGRADING.md:{d}: row `{s}` has no deletion plan containing 1.0 (got '{s}')\n", .{ row.line, row.left, row.note });
             problems += 1;
         }
 
         if (!coversAlias(row.left, target)) {
-            std.debug.print("[api-freeze] docs/UPGRADING.md:{d}: `{s}` → `{s}` has no gate in src/test/ApiFreeze.zig\n", .{ row.line, row.left, target });
+            std.debug.print("[api-freeze] docs/reference/UPGRADING.md:{d}: `{s}` → `{s}` has no gate in src/test/ApiFreeze.zig\n", .{ row.line, row.left, target });
             problems += 1;
         }
     }
@@ -930,7 +930,7 @@ test "deprecation table: docs/UPGRADING.md, the markers and this gate stay in sy
             if (std.mem.eql(u8, row.left, alias.doc_deprecated)) found = true;
         }
         if (!found) {
-            std.debug.print("[api-freeze] src/test/ApiFreeze.zig checks `{s}`, but docs/UPGRADING.md no longer lists that row\n", .{alias.doc_deprecated});
+            std.debug.print("[api-freeze] src/test/ApiFreeze.zig checks `{s}`, but docs/reference/UPGRADING.md no longer lists that row\n", .{alias.doc_deprecated});
             problems += 1;
         }
     }
@@ -965,14 +965,14 @@ fn checkDeprecatedMarkers(allocator: std.mem.Allocator) !void {
 
         for (alias.decl_must_contain) |needle| {
             if (std.mem.indexOf(u8, window, needle) != null) continue;
-            std.debug.print("[api-freeze] the `{s}` declaration in {s} lost '{s}' from its doc comment (docs/UPGRADING.md rule 1: mark it deprecated, name the replacement)\n", .{ alias.doc_deprecated, alias.decl_file, needle });
+            std.debug.print("[api-freeze] the `{s}` declaration in {s} lost '{s}' from its doc comment (docs/reference/UPGRADING.md rule 1: mark it deprecated, name the replacement)\n", .{ alias.doc_deprecated, alias.decl_file, needle });
             return error.DeprecationMarkerMissing;
         }
     }
 }
 
 // ============================================================
-// 2. Frozen entry points — mirrors docs/API_FREEZE.md
+// 2. Frozen entry points — mirrors docs/reference/API_FREEZE.md
 // ============================================================
 
 const freeze_heading = "## 冻结的入口类别";
@@ -997,7 +997,7 @@ const namespaces = .{
 };
 
 /// True when the anchor a doc row names still resolves. Data-driven on purpose:
-/// `docs/API_FREEZE.md`'s rows are the list, so the check cannot drift into
+/// `docs/reference/API_FREEZE.md`'s rows are the list, so the check cannot drift into
 /// asserting a set of names the doc no longer mentions.
 fn anchorResolves(comptime anchor: []const u8) bool {
     inline for (namespaces) |ns| {
@@ -1010,9 +1010,9 @@ fn anchorResolves(comptime anchor: []const u8) bool {
 
 /// The frozen surface: the entry points 1.0 keeps. Anchors are the *identity*
 /// symbol of each category, not the category's full export list — that list
-/// stays in `root.zig` and `docs/API.md` rather than becoming a second one here.
+/// stays in `root.zig` and `docs/reference/API.md` rather than becoming a second one here.
 const FreezeCategory = struct {
-    /// Category name as `docs/API_FREEZE.md` writes it (failure messages only).
+    /// Category name as `docs/reference/API_FREEZE.md` writes it (failure messages only).
     name: []const u8,
     anchors: []const []const u8,
 };
@@ -1097,7 +1097,7 @@ const FREEZE_CATEGORIES = [_]FreezeCategory{
     },
 };
 
-/// The preview surface docs/RUNTIME.md documents in §12–§14 (plus §11/§13's
+/// The preview surface docs/reference/RUNTIME.md documents in §12–§14 (plus §11/§13's
 /// recorder): `runtime.*` may break during 0.x (RUNTIME.md §2 item 10), so these
 /// names stay under `zigmodu.runtime` and off the frozen top level — otherwise a
 /// change the runtime is allowed to make lands on the surface that is not.
@@ -1121,13 +1121,13 @@ const PREVIEW = [_][]const u8{
     "runtime.Sequencer",
 };
 
-test "freeze: every anchor docs/API_FREEZE.md names still resolves" {
+test "freeze: every anchor docs/reference/API_FREEZE.md names still resolves" {
     var missing: usize = 0;
 
     inline for (FREEZE_CATEGORIES) |category| {
         inline for (category.anchors) |anchor| {
             if (!anchorResolves(anchor)) {
-                std.debug.print("[api-freeze] {s}: anchor `{s}` does not resolve — docs/API_FREEZE.md names it as frozen\n", .{ category.name, anchor });
+                std.debug.print("[api-freeze] {s}: anchor `{s}` does not resolve — docs/reference/API_FREEZE.md names it as frozen\n", .{ category.name, anchor });
                 missing += 1;
             }
         }
@@ -1147,11 +1147,11 @@ test "preview: the runtime surface under §12-§14 stays off the frozen top leve
             const dot = comptime std.mem.lastIndexOfScalar(u8, anchor, '.').?;
             const bare = anchor[dot + 1 ..];
             if (comptime @hasDecl(zmodu, bare)) {
-                std.debug.print("[api-freeze] `{s}` is exported from root.zig: preview surface moved onto the frozen top level (docs/RUNTIME.md §2 item 10 allows `runtime.*` to break in 0.x)\n", .{bare});
+                std.debug.print("[api-freeze] `{s}` is exported from root.zig: preview surface moved onto the frozen top level (docs/reference/RUNTIME.md §2 item 10 allows `runtime.*` to break in 0.x)\n", .{bare});
                 problems += 1;
             }
         } else {
-            std.debug.print("[api-freeze] preview symbol `{s}` no longer resolves — docs/RUNTIME.md documents it\n", .{anchor});
+            std.debug.print("[api-freeze] preview symbol `{s}` no longer resolves — docs/reference/RUNTIME.md documents it\n", .{anchor});
             problems += 1;
         }
     }
@@ -1160,14 +1160,14 @@ test "preview: the runtime surface under §12-§14 stays off the frozen top leve
 }
 
 // ============================================================
-// 3. Doc ↔ gate sync for docs/API_FREEZE.md
+// 3. Doc ↔ gate sync for docs/reference/API_FREEZE.md
 // ============================================================
 
-test "freeze: the anchors in docs/API_FREEZE.md and here are the same set" {
+test "freeze: the anchors in docs/reference/API_FREEZE.md and here are the same set" {
     const allocator = std.testing.allocator;
 
-    const content = readDoc(allocator, "docs/API_FREEZE.md") catch |err| {
-        std.debug.print("[api-freeze] docs/API_FREEZE.md unreadable ({s})\n", .{@errorName(err)});
+    const content = readDoc(allocator, "docs/reference/API_FREEZE.md") catch |err| {
+        std.debug.print("[api-freeze] docs/reference/API_FREEZE.md unreadable ({s})\n", .{@errorName(err)});
         return error.FreezeDocUnreadable;
     };
     defer allocator.free(content);
@@ -1181,7 +1181,7 @@ test "freeze: the anchors in docs/API_FREEZE.md and here are the same set" {
     try collectAnchorTokens(allocator, content, preview_heading, &doc_preview);
 
     if (doc_freeze.items.len == 0 or doc_preview.items.len == 0) {
-        std.debug.print("[api-freeze] docs/API_FREEZE.md: no anchor rows under '{s}' (frozen: {d}) or '{s}' (preview: {d})\n", .{ freeze_heading, doc_freeze.items.len, preview_heading, doc_preview.items.len });
+        std.debug.print("[api-freeze] docs/reference/API_FREEZE.md: no anchor rows under '{s}' (frozen: {d}) or '{s}' (preview: {d})\n", .{ freeze_heading, doc_freeze.items.len, preview_heading, doc_preview.items.len });
         return error.FreezeDocMissingRows;
     }
 
@@ -1190,13 +1190,13 @@ test "freeze: the anchors in docs/API_FREEZE.md and here are the same set" {
     // The doc's rows against the gate's tables…
     for (doc_freeze.items) |token| {
         if (!coveredBy(&FREEZE_CATEGORIES, token)) {
-            std.debug.print("[api-freeze] docs/API_FREEZE.md names `{s}` as frozen, but nothing in src/test/ApiFreeze.zig checks it\n", .{token});
+            std.debug.print("[api-freeze] docs/reference/API_FREEZE.md names `{s}` as frozen, but nothing in src/test/ApiFreeze.zig checks it\n", .{token});
             problems += 1;
         }
     }
     for (doc_preview.items) |token| {
         if (!contains(&PREVIEW, token)) {
-            std.debug.print("[api-freeze] docs/API_FREEZE.md names `{s}` as preview, but nothing in src/test/ApiFreeze.zig checks it\n", .{token});
+            std.debug.print("[api-freeze] docs/reference/API_FREEZE.md names `{s}` as preview, but nothing in src/test/ApiFreeze.zig checks it\n", .{token});
             problems += 1;
         }
     }
@@ -1205,14 +1205,14 @@ test "freeze: the anchors in docs/API_FREEZE.md and here are the same set" {
     for (FREEZE_CATEGORIES) |category| {
         for (category.anchors) |anchor| {
             if (!contains(doc_freeze.items, anchor)) {
-                std.debug.print("[api-freeze] src/test/ApiFreeze.zig checks `{s}` ({s}), but docs/API_FREEZE.md no longer names it as frozen\n", .{ anchor, category.name });
+                std.debug.print("[api-freeze] src/test/ApiFreeze.zig checks `{s}` ({s}), but docs/reference/API_FREEZE.md no longer names it as frozen\n", .{ anchor, category.name });
                 problems += 1;
             }
         }
     }
     for (PREVIEW) |anchor| {
         if (!contains(doc_preview.items, anchor)) {
-            std.debug.print("[api-freeze] src/test/ApiFreeze.zig checks preview `{s}`, but docs/API_FREEZE.md no longer names it as preview\n", .{anchor});
+            std.debug.print("[api-freeze] src/test/ApiFreeze.zig checks preview `{s}`, but docs/reference/API_FREEZE.md no longer names it as preview\n", .{anchor});
             problems += 1;
         }
     }

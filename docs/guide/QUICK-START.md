@@ -186,7 +186,7 @@ info: Application started successfully!
 Before the first deploy, do these four things:
 
 Fragment — `server` / `allocator` come from your own `main` (runnable wiring:
-[`examples/tenant-mgmt`](../examples/tenant-mgmt/)):
+[`examples/tenant-mgmt`](../../examples/tenant-mgmt/)):
 
 ```zig
 // 1) one call: backpressure + security middleware + /metrics + /health/*
@@ -205,22 +205,22 @@ pub const panic = zigmodu.panicHook;
    checks required env, placeholder JWT secrets, DB reachability, pending
    migrations and clock skew (see `docs/BEST_PRACTICES.md`「上线前预检」).
 4. TLS terminates at a sidecar/gateway — reference topology in
-   [`../examples/production-deploy/`](../examples/production-deploy/).
+   [`../examples/production-deploy/`](../../examples/production-deploy/).
 5. Run under a supervisor (`Restart=always` / k8s `restartPolicy: Always`).
 
-Read next: [`OBSERVABILITY.md`](OBSERVABILITY.md) (alerts + dashboard),
-[`BEST_PRACTICES.md`](BEST_PRACTICES.md)「韧性」, [`ROUTE_TABLE.md`](ROUTE_TABLE.md) §7.4.
+Read next: [`OBSERVABILITY.md`](../reference/OBSERVABILITY.md) (alerts + dashboard),
+[`BEST_PRACTICES.md`](BEST_PRACTICES.md)「韧性」, [`ROUTE_TABLE.md`](../reference/ROUTE_TABLE.md) §7.4.
 
 ## What's Next?
 
 | Tutorial | Description |
 |----------|-------------|
-| [Examples](../examples/) | More complete examples |
+| [Examples](../../examples/) | More complete examples |
 | [Best Practices](BEST_PRACTICES.md) | Architecture + JWT / auth checklist |
-| [Declarative Routes](ROUTE_TABLE.md) | ComptimeRouter + catalog RBAC |
-| [AGENTS.md](../AGENTS.md) | AI agent handbook |
-| [API Reference](API.md) | Detailed API docs |
-| [Architecture](ARCHITECTURE.md) | System design |
+| [Declarative Routes](../reference/ROUTE_TABLE.md) | ComptimeRouter + catalog RBAC |
+| [AGENTS.md](../../AGENTS.md) | AI agent handbook |
+| [API Reference](../reference/API.md) | Detailed API docs |
+| [Architecture](../reference/ARCHITECTURE.md) | System design |
 
 ## Common Commands
 
@@ -249,4 +249,4 @@ zig build docs        # Generate docs
 **"missing init/deinit"**
 - Every module must implement both functions
 
-For more help, see [CONTRIBUTING.md](../CONTRIBUTING.md) or open an issue.
+For more help, see [CONTRIBUTING.md](../../CONTRIBUTING.md) or open an issue.

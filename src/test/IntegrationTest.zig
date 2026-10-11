@@ -4,7 +4,7 @@
 //! Positioning: user-facing testing helper; no in-tree consumer. The framework's
 //! own tests drive `Application` / `Container` / `EventBus` directly, so nothing
 //! under `src/` builds an `IntegrationTest`; it is the harness an *application*
-//! uses for its own suite (`docs/API.md` § Integration Testing).
+//! uses for its own suite (`docs/reference/API.md` § Integration Testing).
 
 const std = @import("std");
 const EventBus = @import("../core/EventBus.zig").EventBus;

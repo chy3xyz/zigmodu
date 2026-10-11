@@ -10,7 +10,7 @@
 //! 零依赖铁律（加密只用 `std.crypto`）加上 Zig std 没有 server-side TLS，而自研
 //! TLS 栈是安全禁区。生产部署把集群端口限制在受信二层（VPC/专线/localhost），
 //! 跨域/公网用边车或服务网格终结 mTLS —— 权威说明与最小拓扑见
-//! `docs/DISTRIBUTED.md`「传输加密边界（A-2 定界）」。std 若日后长出 server-side
+//! `docs/reference/DISTRIBUTED.md`「传输加密边界（A-2 定界）」。std 若日后长出 server-side
 //! TLS，该节写明了重开条件。
 
 const std = @import("std");

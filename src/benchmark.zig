@@ -1065,7 +1065,7 @@ const bench_drain_timeout_spins = 4_000_000_000;
 /// This is the pair the scheduler needed and never had. The runtime's execution
 /// modes were documented as a trade — "a dedicated worker costs a thread, a
 /// pooled one costs a ready-ring round trip, so keep the critical path
-/// dedicated" (`docs/RUNTIME.md` §12.5) — with nothing measuring either side.
+/// dedicated" (`docs/reference/RUNTIME.md` §12.5) — with nothing measuring either side.
 /// Same producer loop, same worker, same mailbox capacity; the only difference is
 /// whether the drain happens on the worker's own parked thread or on a pool
 /// thread that had to claim it first.

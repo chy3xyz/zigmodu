@@ -308,7 +308,7 @@ pub const TwoPhaseCommit = struct {
         });
     }
 
-    /// Attach the durable coordinator log (`docs/DISTRIBUTED.md`).
+    /// Attach the durable coordinator log (`docs/reference/DISTRIBUTED.md`).
     pub fn setJournal(self: *Self, journal: *TransactionJournal) void {
         self.journal = journal;
     }

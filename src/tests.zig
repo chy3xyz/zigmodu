@@ -142,8 +142,8 @@ test "compile all source files" {
     _ = @import("test/ContractGate.zig");
     _ = @import("test/DocsConsistency.zig");
     _ = @import("test/DocSnippets.zig");
-    // Deprecation / API-freeze gate: the names docs/UPGRADING.md and
-    // docs/API_FREEZE.md promise must still exist and still work.
+    // Deprecation / API-freeze gate: the names docs/reference/UPGRADING.md and
+    // docs/reference/API_FREEZE.md promise must still exist and still work.
     _ = @import("test/ApiFreeze.zig");
     _ = @import("test/ErrorSetSnapshot.zig");
     _ = @import("test/CombinationMatrix.zig");
@@ -153,9 +153,9 @@ test "compile all source files" {
 
     // Runtime (v0.16): ring/mailbox/timer/pool/worker primitives
     _ = @import("runtime.zig");
-    // Scheduler: the pooled execution mode of `Runtime.spawn` (docs/RUNTIME.md §12)
+    // Scheduler: the pooled execution mode of `Runtime.spawn` (docs/reference/RUNTIME.md §12)
     _ = @import("runtime/scheduler.zig");
-    // The deterministic replay driver (docs/RUNTIME.md §15). Reached from the
+    // The deterministic replay driver (docs/reference/RUNTIME.md §15). Reached from the
     // `runtime.zig` barrel too, but pinned here like `scheduler.zig` is, so a
     // barrel edit can never orphan its tests.
     _ = @import("runtime/replay_driver.zig");
@@ -164,7 +164,7 @@ test "compile all source files" {
     // the only thing that makes its tests run at all — the same wiring
     // `im/ConnectionRegistry.zig` above needed.
     _ = @import("runtime/delivery_log.zig");
-    // Allocation contract for the L0 hot paths (docs/RUNTIME.md §4–§6)
+    // Allocation contract for the L0 hot paths (docs/reference/RUNTIME.md §4–§6)
     _ = @import("runtime/alloc_contract_test.zig");
     // Precision deadline timer: the sleep-then-spin alternative to the wheel for
     // sub-millisecond deadlines. Its tests are the *measurement* — the lateness
@@ -186,7 +186,7 @@ test "compile all source files" {
     // via `api/Server.zig`; only this one was orphaned.
     _ = @import("im/ConnectionRegistry.zig");
 
-    // AI boundary: ratcheted coupling + one-way seam (docs/AI_BOUNDARY.md)
+    // AI boundary: ratcheted coupling + one-way seam (docs/reference/AI_BOUNDARY.md)
     _ = @import("test/AiBoundary.zig");
     _ = @import("ai/guard.zig");
     _ = @import("ai/proposal.zig");

@@ -11,7 +11,7 @@
 //!   const sql = try alloc.print("SELECT * FROM users WHERE name = '{s}'", .{name});
 //!   client.query(sql, &.{}); // ← name may contain '; DROP TABLE users; --
 //!
-//! STRUCTURE (monolith — intentionally NOT split; see docs/PRODUCTION_ROADMAP.md):
+//! STRUCTURE (monolith — intentionally NOT split; see docs/meta/PRODUCTION_ROADMAP.md):
 //!   §1  Types & helpers     —— Value, Row, Rows, ExecResult, Driver, Conn, Stmt + SQL-fragment guards
 //!   §2  Struct scanning      —— buildColumnIndices, scanStruct, valueToType, freeScanned, QueryResult
 //!   §3  SQLite driver        —— SQLiteConn + VTable, bind/read helpers, LRU statement cache

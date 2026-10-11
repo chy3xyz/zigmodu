@@ -39,7 +39,7 @@
       "summary": "LLM policy real-wiring: llmApprove / llmRiskDecide / llmDiagnose / llmVerify against a real provider",
       "tags": ["ai", "llm", "policy", "deepseek", "openai"],
       "min_version": "0.15.0",
-      "doc": "docs/LLM_POLICIES.md"
+      "doc": "docs/ai/LLM_POLICIES.md"
     },
     {
       "id": "example/mcp-server",
@@ -49,7 +49,7 @@
       "summary": "SkillRegistry → MCP bridge over stdio: expose framework AI skills to Claude/Codex",
       "tags": ["mcp", "ai", "skills", "stdio"],
       "min_version": "0.15.2",
-      "doc": "docs/MCP.md"
+      "doc": "docs/ai/MCP.md"
     },
     {
       "id": "example/web4",
@@ -59,7 +59,7 @@
       "summary": "Web4 production path: x402 payment middleware + DID auth + invoice redemption",
       "tags": ["web4", "x402", "did", "payment"],
       "min_version": "0.15.0",
-      "doc": "docs/WEB4.md"
+      "doc": "docs/reference/WEB4.md"
     },
     {
       "id": "example/tenant-shop",

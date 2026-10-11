@@ -1,6 +1,6 @@
 # Distributed Modules — Production Readiness
 
-> Modulith day-one concurrency (single process, multi-instance, when to use RobustMQ): **[MODULITH.md](MODULITH.md)**.
+> Modulith day-one concurrency (single process, multi-instance, when to use RobustMQ): **[MODULITH.md](../guide/MODULITH.md)**.
 
 ## Status Overview
 

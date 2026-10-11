@@ -1588,7 +1588,7 @@ const StopProbe = struct {
 /// Wide, and on purpose: the shape this has to fail is "nothing was woken, so
 /// the drain waits for the peer", which never ends, while a wake that works is a
 /// `shutdown` call per connection. So the number is not a latency claim —
-/// `docs/RUNTIME.md` §12.15 is the reason the *assertions* are counts of what the
+/// `docs/reference/RUNTIME.md` §12.15 is the reason the *assertions* are counts of what the
 /// wake did, and this budget only appears in a printed line.
 const silent_peer_stop_budget_ms: i64 = 10_000;
 
@@ -2086,7 +2086,7 @@ fn waitForUpdateSleep(monitor: *WebSocketMonitor) bool {
 // period it was in must have ended with `error.Canceled`. Both are properties of
 // the mechanism (`std.Io.sleep`'s error set is exactly `error.Canceled`,
 // `std/Io.zig:813`, and `update_periods_completed` is bumped only by a sleep that
-// returned), so they hold on any host — the lesson `docs/RUNTIME.md` §12.15
+// returned), so they hold on any host — the lesson `docs/reference/RUNTIME.md` §12.15
 // records. The host-dependent readings (how long `stop()` took, how far into the
 // 5 s period the cancel landed) are printed, not asserted.
 //

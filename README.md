@@ -6,8 +6,8 @@ Two planes, one library — adopt either, or both:
 
 | Plane | What you get | Start here |
 |-------|--------------|-----------|
-| **Application plane** (the default) | Modules with compile-time dependency validation, lifecycle, DI, HTTP/1.1 + h2c + WebSocket + gRPC, SQLx / ORM / migrations, cache + Redis, events + transactional outbox, JWT / RBAC / multi-tenancy, resilience, metrics + tracing | [Quick Start](docs/QUICK-START.md) · [Modulith](docs/MODULITH.md) |
-| **Execution plane** (opt-in) | Workers that own their state, bounded mailboxes, lock-free queues, a fan-out whose `publish` takes no lock, timers (ms **and** µs), supervision, delivery replay from a segment log | [Runtime](docs/RUNTIME.md) |
+| **Application plane** (the default) | Modules with compile-time dependency validation, lifecycle, DI, HTTP/1.1 + h2c + WebSocket + gRPC, SQLx / ORM / migrations, cache + Redis, events + transactional outbox, JWT / RBAC / multi-tenancy, resilience, metrics + tracing | [Quick Start](docs/guide/QUICK-START.md) · [Modulith](docs/guide/MODULITH.md) |
+| **Execution plane** (opt-in) | Workers that own their state, bounded mailboxes, lock-free queues, a fan-out whose `publish` takes no lock, timers (ms **and** µs), supervision, delivery replay from a segment log | [Runtime](docs/reference/RUNTIME.md) |
 
 An app that never calls `app.runtime()` spawns **no extra threads** — the application plane stands alone.
 The execution plane is where one-fiber-per-request stops being the right shape: market data and order
@@ -28,24 +28,24 @@ services only after the boundary is proven — with the dependency rules enforce
 | Guide | Description |
 |-------|-------------|
 | [**AGENTS.md**](AGENTS.md) | **AI agent handbook** (DO/DON'T, Path A auth, ComptimeRouter) |
-| [Quick Start](docs/QUICK-START.md) | Get started in 5 minutes |
-| [**Runtime**](docs/RUNTIME.md) | **The execution plane**: workers, mailboxes, scheduler, timers, supervision, replay |
-| [Modulith & Concurrency](docs/MODULITH.md) | Day-one modulith + high-concurrency practices |
-| [Best Practices](docs/BEST_PRACTICES.md) | Both planes: architecture evolution, JWT checklist, resilience, and where the runtime earns its keep |
-| [Declarative Routes](docs/ROUTE_TABLE.md) | ComptimeRouter + catalog JWT/RBAC |
-| [Events & DI](docs/EVENTS_DI.md) | `initWith(ctx)` + `app.eventBus` + container freeze |
-| [ZigModu × zent](docs/ZENT.md) | **Recommended pairing for commerce/social**: zent ORM integration best practices |
-| [SQLx drivers](docs/SQLX_DRIVERS.md) | Selective driver linking (`-Ddb=`, `.db=`) |
-| [Distributed](docs/DISTRIBUTED.md) | Multi-instance, cluster stack, fail-closed startup |
-| [Agent Runtime](docs/AGENT_RUNTIME.md) | **Agents can't act by default**: `Guard` (two fail-closed axes — an `execute` second switch + empty-by-default allow list) |
-| [Observability](docs/OBSERVABILITY.md) | Golden signals, PromQL, alert thresholds, Grafana dashboard |
-| [API Reference](docs/API.md) | Detailed API documentation |
-| [Architecture](docs/ARCHITECTURE.md) | System design and patterns |
-| [Upgrading](docs/UPGRADING.md) | Per-version notes: what changed in behavior, and the one-line fixes |
-| [Status & readiness](docs/dev/v1.0-readiness-v0.35.md) | **What is proven and what is not** — dated, per item, with evidence (for the older self-scoring report, see [Evaluation Report](docs/EVALUATION_REPORT.md)) |
+| [Quick Start](docs/guide/QUICK-START.md) | Get started in 5 minutes |
+| [**Runtime**](docs/reference/RUNTIME.md) | **The execution plane**: workers, mailboxes, scheduler, timers, supervision, replay |
+| [Modulith & Concurrency](docs/guide/MODULITH.md) | Day-one modulith + high-concurrency practices |
+| [Best Practices](docs/guide/BEST_PRACTICES.md) | Both planes: architecture evolution, JWT checklist, resilience, and where the runtime earns its keep |
+| [Declarative Routes](docs/reference/ROUTE_TABLE.md) | ComptimeRouter + catalog JWT/RBAC |
+| [Events & DI](docs/guide/EVENTS_DI.md) | `initWith(ctx)` + `app.eventBus` + container freeze |
+| [ZigModu × zent](docs/reference/ZENT.md) | **Recommended pairing for commerce/social**: zent ORM integration best practices |
+| [SQLx drivers](docs/guide/SQLX_DRIVERS.md) | Selective driver linking (`-Ddb=`, `.db=`) |
+| [Distributed](docs/reference/DISTRIBUTED.md) | Multi-instance, cluster stack, fail-closed startup |
+| [Agent Runtime](docs/reference/AGENT_RUNTIME.md) | **Agents can't act by default**: `Guard` (two fail-closed axes — an `execute` second switch + empty-by-default allow list) |
+| [Observability](docs/reference/OBSERVABILITY.md) | Golden signals, PromQL, alert thresholds, Grafana dashboard |
+| [API Reference](docs/reference/API.md) | Detailed API documentation |
+| [Architecture](docs/reference/ARCHITECTURE.md) | System design and patterns |
+| [Upgrading](docs/reference/UPGRADING.md) | Per-version notes: what changed in behavior, and the one-line fixes |
+| [Status & readiness](docs/dev/v1.0-readiness-v0.35.md) | **What is proven and what is not** — dated, per item, with evidence (for the older self-scoring report, see [Evaluation Report](docs/meta/EVALUATION_REPORT.md)) |
 | [Examples](examples/) | Runnable example projects |
 | [Production deploy](examples/production-deploy/) | TLS sidecar (nginx/Envoy), k8s, systemd, Dockerfile, request-smuggling e2e |
-| [ZModu CLI](docs/ZMODU_CLI_INTEGRATION.md) | Built-in codegen (`zig build zmodu`) |
+| [ZModu CLI](docs/guide/ZMODU_CLI_INTEGRATION.md) | Built-in codegen (`zig build zmodu`) |
 
 ## ✨ Features
 
@@ -127,7 +127,7 @@ services only after the boundary is proven — with the dependency rules enforce
 
 ### High-Performance Runtime (the execution plane)
 
-Opt-in via `app.runtime()`. Spec: [docs/RUNTIME.md](docs/RUNTIME.md) · runnable:
+Opt-in via `app.runtime()`. Spec: [docs/reference/RUNTIME.md](docs/reference/RUNTIME.md) · runnable:
 [runtime-workers](examples/runtime-workers) · workload: [alpha-engine](examples/alpha-engine).
 
 **Workers & scheduling**
@@ -180,11 +180,11 @@ Opt-in via `app.runtime()`. Spec: [docs/RUNTIME.md](docs/RUNTIME.md) · runnable
 - **Affinity** — `runtime.affinity.pinCurrentThread(cpu)` pins the *calling* thread on
   Linux; macOS and Windows return `error.Unsupported` rather than reporting a pin that
   did not happen. There is no `.affinity` field on `spawn` yet, and the reason is in
-  [RUNTIME.md §12.7](docs/RUNTIME.md)
+  [RUNTIME.md §12.7](docs/reference/RUNTIME.md)
 
 **What this plane deliberately does not have (yet)** — priority / weighted fairness,
 a deterministic-execution mode, remote workers. Each is refused with a stated reason
-rather than half-built; the list is in [RUNTIME.md](docs/RUNTIME.md) §12.7.
+rather than half-built; the list is in [RUNTIME.md](docs/reference/RUNTIME.md) §12.7.
 
 ### Developer Experience
 - **Architecture Tester** — Compile-time dependency rule validation
@@ -231,7 +231,7 @@ A feature list is the least useful half of a README. These boundaries decide dep
   (authentication and integrity, **not confidentiality**). Keep cluster ports on trusted L2
   (VPC / leased line / localhost); across trust boundaries terminate mTLS in a sidecar or
   service mesh — the boundary is defined in the "Transport encryption boundary (A-2)" section
-  of [docs/DISTRIBUTED.md](docs/DISTRIBUTED.md), with topology references in
+  of [docs/reference/DISTRIBUTED.md](docs/reference/DISTRIBUTED.md), with topology references in
   [examples/production-deploy](examples/production-deploy/). The PSK auth helpers live in
   `src/core/cluster/ClusterAuth.zig`.
 - **Cluster identity is opt-in per-node, not the default.** With `own_key`/`peer_keys` configured,
@@ -244,7 +244,7 @@ A feature list is the least useful half of a README. These boundaries decide dep
   2PC, Plugin, WebMonitor, HotReloader. They have tests; they do not have a production track record here.
 - **AI is an optional domain, not the core.** `src/ai` is a small share of the tree and the
   HTTP / data / security / observability core does not depend on it. Agents cannot act by default
-  ([AGENT_RUNTIME.md](docs/AGENT_RUNTIME.md)).
+  ([AGENT_RUNTIME.md](docs/reference/AGENT_RUNTIME.md)).
 - **Self-assessed.** Every "done" here was produced by the same maintainers and their AI agents; there
   has been no independent audit. The dated, per-item version of that sentence is
   [docs/dev/v1.0-readiness-v0.35.md](docs/dev/v1.0-readiness-v0.35.md).
@@ -343,7 +343,7 @@ zig build soak                 # concurrency soak: N clients x M tenants (real s
 ```
 
 A complete `build.zig` (install + `run` + `test` steps) is in
-[docs/QUICK-START.md](docs/QUICK-START.md) Step 3.
+[docs/guide/QUICK-START.md](docs/guide/QUICK-START.md) Step 3.
 
 Production: one call wires backpressure, security, `/metrics` (golden signals)
 and `/health/*`. It must run **before** routes are registered. Fragment —
@@ -363,9 +363,9 @@ try zigmodu.http.productionProfile(&server, .{
 
 Deployment topology (TLS at a sidecar/gateway, graceful restarts, probes):
 [`examples/production-deploy/`](examples/production-deploy/) ·
-dashboards & alerting: [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md).
+dashboards & alerting: [`docs/reference/OBSERVABILITY.md`](docs/reference/OBSERVABILITY.md).
 
-Disabled drivers → C stubs; runtime `error.DriverNotEnabled` (HTTP 400). Full guide: **[docs/SQLX_DRIVERS.md](docs/SQLX_DRIVERS.md)**.
+Disabled drivers → C stubs; runtime `error.DriverNotEnabled` (HTTP 400). Full guide: **[docs/guide/SQLX_DRIVERS.md](docs/guide/SQLX_DRIVERS.md)**.
 
 ### Prerequisites
 
@@ -456,7 +456,7 @@ const bus = try app.eventBus(OrderEvent);                // ThreadSafeEventBus o
 try bus.subscribe(auditListener);
 ```
 
-Full rules and anti-patterns: [docs/EVENTS_DI.md](docs/EVENTS_DI.md) · runnable wiring: `examples/shopdemo`.
+Full rules and anti-patterns: [docs/guide/EVENTS_DI.md](docs/guide/EVENTS_DI.md) · runnable wiring: `examples/shopdemo`.
 
 ### Quick HTTP Server
 
@@ -545,18 +545,18 @@ requires splitting anything into services:
 
 | Axis | Stage | What you add | Where it lands |
 |------|-------|--------------|----------------|
-| **Application** | one process | modules with compile-time dependency rules, DI, HTTP, data | [BEST_PRACTICES.md](docs/BEST_PRACTICES.md) |
+| **Application** | one process | modules with compile-time dependency rules, DI, HTTP, data | [BEST_PRACTICES.md](docs/guide/BEST_PRACTICES.md) |
 | | several instances | rate limiting, circuit breakers, distributed locks, cache/Redis, outbox | same |
-| | a cluster | `DistributedEventBus` + Raft via `ClusterBootstrap`, Kafka, sharding | [DISTRIBUTED.md](docs/DISTRIBUTED.md) — mind the hard-cut upgrade boundary |
-| **Execution** | request → response | nothing to do: fibers plus a pool already serve this shape | [MODULITH.md](docs/MODULITH.md) |
-| | owned state | workers that keep state across requests (`app.runtime()`) | [RUNTIME.md](docs/RUNTIME.md) |
+| | a cluster | `DistributedEventBus` + Raft via `ClusterBootstrap`, Kafka, sharding | [DISTRIBUTED.md](docs/reference/DISTRIBUTED.md) — mind the hard-cut upgrade boundary |
+| **Execution** | request → response | nothing to do: fibers plus a pool already serve this shape | [MODULITH.md](docs/guide/MODULITH.md) |
+| | owned state | workers that keep state across requests (`app.runtime()`) | [RUNTIME.md](docs/reference/RUNTIME.md) |
 | | many of the same worker | `.mode = .pooled` — N workers over N pool threads, state still exclusive | same |
 | | latency-critical | `.dedicated` workers, µs `PrecisionTimer`, delivery replay for backtests | [alpha-engine](examples/alpha-engine) |
 | | off-machine work | `.execution_class = .blocking` for anything that waits on the outside world | same |
 
 The rules that keep the first axis honest (dependency validation at compile time) and the second one
 predictable (bounded queues, zero-allocation hot paths) are the same rules this repo's own gates enforce.
-Detailed guide: [Best Practices](docs/BEST_PRACTICES.md).
+Detailed guide: [Best Practices](docs/guide/BEST_PRACTICES.md).
 
 ## 🛠️ Commands
 
@@ -606,8 +606,8 @@ Each directory is a runnable project with its own README; the index is
 | **[tenant-mgmt](examples/tenant-mgmt/)** | **Application plane, end to end**: multi-tenant SaaS, module graph, middleware chain, catalog-permission auth, health probes, CI integration target |
 | **[runtime-workers](examples/runtime-workers/)** | **Execution plane**: workers, mailboxes, HotBus, supervision — the smallest complete use of `app.runtime()` |
 | **[alpha-engine](examples/alpha-engine/)** | **The load the execution plane exists for**: feed → order book → alpha → risk → execution, with the blocking pool for the off-machine parts |
-| **[tenant-shop](examples/tenant-shop/)** | Module layers: `model` / `persistence` / `service` / `api` with `Tx` — see [MODULE_LAYERS.md](docs/MODULE_LAYERS.md) |
-| **[zent-modulith](examples/zent-modulith/)** | The zent ORM pairing (schema-as-code) — see [ZENT.md](docs/ZENT.md) |
+| **[tenant-shop](examples/tenant-shop/)** | Module layers: `model` / `persistence` / `service` / `api` with `Tx` — see [MODULE_LAYERS.md](docs/guide/MODULE_LAYERS.md) |
+| **[zent-modulith](examples/zent-modulith/)** | The zent ORM pairing (schema-as-code) — see [ZENT.md](docs/reference/ZENT.md) |
 | **[production-deploy](examples/production-deploy/)** | TLS sidecar (nginx/Envoy), k8s, systemd, Dockerfile, and the request-smuggling e2e with a real proxy |
 | **[zmsaas](examples/zmsaas/)** | A generated SaaS skeleton (what `zmodu saas` produces, then customised) |
 | **[ai-ops](examples/ai-ops/) · [llm-policies](examples/llm-policies/) · [mcp-server](examples/mcp-server/)** | The AI side: ops agent, policy enforcement, MCP server |

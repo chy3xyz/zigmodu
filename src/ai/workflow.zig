@@ -149,7 +149,7 @@ pub const Workflow = struct {
     /// Authority for `.agent` steps: handed to the `Agent` each one builds, so a
     /// workflow that is policed as a whole does not silently run unbounded agent
     /// steps. `null` (the default) keeps the legacy behavior; see
-    /// `docs/AGENT_RUNTIME.md` §二 and `SkillRegistry.auditPolicy`.
+    /// `docs/reference/AGENT_RUNTIME.md` §二 and `SkillRegistry.auditPolicy`.
     guard: ?*@import("guard.zig").Guard = null,
     steps: []const Step,
     /// Reflection quality gate on the final step's output.

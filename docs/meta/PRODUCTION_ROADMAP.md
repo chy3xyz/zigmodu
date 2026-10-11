@@ -81,7 +81,7 @@ bash scripts/ci-integration.sh   # tenant-mgmt + http-stress-test（需 curl）
 2. **新数据库 driver**：新文件 `sqlx/<name>_conn.zig` + `sqlx.zig` 仅加 VTable 注册与 re-export。
 3. **禁止**在 sqlx.zig 增加与 HTTP、租户、缓存无关的业务逻辑。
 4. 修改 ConnPool / Row arena / stmt 复用路径时，**必须**跑全量 `zig build test`。
-5. **选择性链接**：用 `build_options.enable_*` + `sqlx/*_c_stub.zig` + `examples/_shared/db_link.zig`；**不要**为减体积拆 `sqlx.zig`。默认 `-Ddb=all`；消费者与测试约定见 [SQLX_DRIVERS.md](SQLX_DRIVERS.md)。
+5. **选择性链接**：用 `build_options.enable_*` + `sqlx/*_c_stub.zig` + `examples/_shared/db_link.zig`；**不要**为减体积拆 `sqlx.zig`。默认 `-Ddb=all`；消费者与测试约定见 [SQLX_DRIVERS.md](../guide/SQLX_DRIVERS.md)。
 
 ---
 
@@ -144,7 +144,7 @@ bash scripts/ci-integration.sh   # tenant-mgmt + http-stress-test（需 curl）
    - **OpenTelemetry (OTLP) Exporter**：`src/tracing/OtlpExporter.zig` — JSON 序列化 + **`exportSpans` OTLP/HTTP POST**（重试 429/5xx；`http(s)://` **均可**，HTTPS 经 `std.http.Client` 系统信任库 —— `OtlpTlsNotSupported` 已不存在）。
    - **在 `observability.zig` 导出**：`OtlpExporter`；live 用例需 `OTLP_ENDPOINT`。
 4. **工具链与生成器集成 (zmodu CLI) (✅ 已落地)**
-   - **`zmodu` 独立 CLI 集成**：编写 [`docs/ZMODU_CLI_INTEGRATION.md`](ZMODU_CLI_INTEGRATION.md)，打通 SQL DDL Schema 一键构建 `@initialized` 模版工程，全量支持 MCP Server 与 Modulith 六层分层生成。
+   - **`zmodu` 独立 CLI 集成**：编写 [`docs/ZMODU_CLI_INTEGRATION.md`](../guide/ZMODU_CLI_INTEGRATION.md)，打通 SQL DDL Schema 一键构建 `@initialized` 模版工程，全量支持 MCP Server 与 Modulith 六层分层生成。
 5. **协议传输层高阶演进 (gRPC Streaming & HTTP/2)** — **本轮加深（出站合并写 + GOAWAY/RST 隔离）**
    - HTTP/2：WINDOW_UPDATE + SETTINGS + **PRIORITY 依赖树** + **加权 fair 出站**（deficit WRR；有更多入站缓冲时 slice drain，阻塞读前 drainAll）+ **ConnWriter 32KiB 合并写** + **完整 GOAWAY/RST** + **pending 出站上限**（流级错误 RST，不杀连接）+ h2c Upgrade（共享 StreamReader）
    - Kafka：`cooperative_sticky` + **`applyCooperativeAssignment` / `acknowledgeRevocation` 两阶段**（revoking → stable）
@@ -284,7 +284,7 @@ Agent / Workflow / Skill / MCP / LLM 策略等**业务产品能力**，不是后
 
 
 6. **分布式状态机与容错增强 (✅ 已落地)**
-   - **Raft Log Compaction & InstallSnapshot**：在 [`src/core/cluster/RaftElection.zig`](../src/core/cluster/RaftElection.zig) 中实现 `InstallSnapshotRequest`/`Response` 协议，提供 `compactLog` 内存裁切与 Follower 快照覆盖能力，防止 Raft 日志无限增长。
+   - **Raft Log Compaction & InstallSnapshot**：在 [`src/core/cluster/RaftElection.zig`](../../src/core/cluster/RaftElection.zig) 中实现 `InstallSnapshotRequest`/`Response` 协议，提供 `compactLog` 内存裁切与 Follower 快照覆盖能力，防止 Raft 日志无限增长。
    - **Saga 事务协调器**：持续支持服务节点崩溃重启后的 WAL Recovery。
 
 

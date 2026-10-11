@@ -74,7 +74,7 @@ pub const BootstrapConfig = struct {
     /// Bring your own Raft transport. The built-in one is a stub, so a multi-node
     /// cluster is **refused** unless this is set or the caller acknowledges with
     /// `allow_stub_raft_transport`. What a real transport must do is written out in
-    /// `docs/DISTRIBUTED.md`「真选主要什么」（出站发送 + 入站分发到
+    /// `docs/reference/DISTRIBUTED.md`「真选主要什么」（出站发送 + 入站分发到
     /// `RaftElection.handleVoteRequest` / `handleVoteResponse` / `handleAppendEntries`
     /// 并在同一连接上回包）—— 出站由这个 vtable 提供，**入站由 `start()` 自己监听
     /// `port` 并分发**（`RaftTransport.handleConnection`），所以自带的传输只需要管发。
@@ -503,7 +503,7 @@ pub const ClusterBootstrap = struct {
     // exist (node not started, or no raft) is skipped. `SecretsManager` stays
     // the source of truth — these are the operational hooks a secrets watcher
     // calls when a key changes; the three-phase rotation sequence is in
-    // `docs/DISTRIBUTED.md` §"密钥轮换与撤销". None of them changes the wire
+    // `docs/reference/DISTRIBUTED.md` §"密钥轮换与撤销". None of them changes the wire
     // format.
 
     /// Swap this node's own signing key on both planes. Frames signed after

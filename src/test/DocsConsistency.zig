@@ -5,7 +5,7 @@
 //! tell whether a *signature* is still accurate, but it does catch the case
 //! that actually bites consumers — a documented symbol that was renamed or
 //! never existed (`TransportProtocol`, `MqttTransport`, `TaskScheduler`,
-//! `PasRaftAdapter` were all documented in `docs/API.md` while absent from the
+//! `PasRaftAdapter` were all documented in `docs/reference/API.md` while absent from the
 //! tree). A symbol check is noisy-free, so it can be a hard gate.
 
 const std = @import("std");
@@ -15,7 +15,7 @@ const std = @import("std");
 /// Only the API reference: BEST_PRACTICES deliberately shows *application*
 /// code (`OrdersApi`, `createOrder`, `AppError` …) that must not exist in the
 /// framework, so scanning it would be all false positives.
-const DOC_FILES = [_][]const u8{"docs/API.md"};
+const DOC_FILES = [_][]const u8{"docs/reference/API.md"};
 
 const Declaration = struct {
     name: []const u8,

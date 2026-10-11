@@ -243,7 +243,7 @@ jobs:
 
       - name: Doc-path citation gate
         # The tree points at its own docs by literal path — 454 references, with
-        # docs/RUNTIME.md accounting for 156. Nothing else checks them: a renamed
+        # docs/reference/RUNTIME.md accounting for 156. Nothing else checks them: a renamed
         # or moved document leaves the comment intact and pointing at nothing, and
         # the break surfaces only when someone follows the citation months later
         # and cannot tell a rotted path from their own mistake.

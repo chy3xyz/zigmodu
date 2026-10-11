@@ -946,7 +946,7 @@ test "auditPolicy: a read-only policy admits read tools and kills nothing by cla
     defer reg.deinit();
     try registerBuiltinCatalog(&reg);
 
-    // Exactly the policy docs/AGENT_RUNTIME.md §二 recommends: name the read
+    // Exactly the policy docs/reference/AGENT_RUNTIME.md §二 recommends: name the read
     // tools, leave execution off.
     var allow: [builtin_classes.len][]const u8 = undefined;
     var n: usize = 0;

@@ -827,8 +827,8 @@ pub const panic = zmodu.panicHook;
 
 A panic still aborts the process — the hook is the *diagnosis* half. Recovery
 comes from a supervisor (`Restart=always`, k8s `restartPolicy: Always`); see
-[`BEST_PRACTICES.md`](BEST_PRACTICES.md)「韧性」and
-[`PRODUCTION_ROADMAP.md`](PRODUCTION_ROADMAP.md) for the prefork boundary.
+[`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「韧性」and
+[`PRODUCTION_ROADMAP.md`](../meta/PRODUCTION_ROADMAP.md) for the prefork boundary.
 
 ### `zigmodu.Params` (multi-value query/form)
 
@@ -992,7 +992,7 @@ pub fn clockCheck(*ClockCheck) Check                 // wall-clock sanity
 ```
 
 Checks never panic and are isolated: one failure does not hide the others.
-See [`BEST_PRACTICES.md`](BEST_PRACTICES.md)「上线前预检」.
+See [`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「上线前预检」.
 
 ### `zigmodu.security.JwksKeyRing` (key rotation)
 
@@ -1025,7 +1025,7 @@ Coverage: SQLite in-memory, plus a real PostgreSQL 17 test gated on
 (`INSERT IGNORE`) is implemented but still awaits a real-server test. Claiming is one atomic
 statement (`ON CONFLICT DO NOTHING` / `INSERT IGNORE`), so contention is
 `rows_affected == 0`, not an error; a crashed holder is reaped after `ttl_ms`.
-See [`BEST_PRACTICES.md`](BEST_PRACTICES.md)「多副本后台任务」.
+See [`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「多副本后台任务」.
 
 ### `zigmodu.NetworkProbe`
 
@@ -1669,7 +1669,7 @@ pub fn sendErrorEnvelope(self: *Context, status: u16, code: i32, message: []cons
 pub const ModuleGateConfig = struct { reject: AuthRejectFn = defaultReject, ... };
 ```
 
-细节与三条守则见 [`BEST_PRACTICES.md`](BEST_PRACTICES.md)「错误响应形状」。
+细节与三条守则见 [`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「错误响应形状」。
 
 ---
 
@@ -1842,7 +1842,7 @@ pub const CacheManager = struct {
 
 Cron expression jobs (`* * * * *`), driven by a background thread. For
 multi-replica deployments guard it with `DistributedLock` (see
-[`BEST_PRACTICES.md`](BEST_PRACTICES.md)「多副本后台任务」).
+[`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「多副本后台任务」).
 
 ```zig
 pub fn init(allocator: std.mem.Allocator, io: std.Io) Scheduler
@@ -1908,7 +1908,7 @@ pub const ClusterMembership = struct {
 
 Leader election lives in `src/core/cluster/RaftElection.zig` (plus
 `ClusterMembership` / `ClusterHealth`). It is marked **experimental** — see
-[`PRODUCTION_ROADMAP.md`](PRODUCTION_ROADMAP.md) for the position on using it
+[`PRODUCTION_ROADMAP.md`](../meta/PRODUCTION_ROADMAP.md) for the position on using it
 in production. The older `PasRaftAdapter` documented here never existed in this
 repository.
 
@@ -1950,4 +1950,4 @@ pub const PluginManager = struct {
 ---
 
 *Last updated: 2026-09-15*
-*For more examples, see [examples](../examples/)*
+*For more examples, see [examples](../../examples/)*

@@ -4,7 +4,7 @@
 >
 > 版本：1.1 | ZigModu **v0.39.10** | Zig **0.17.0**
 >
-> **操作手册（写代码先读）**：仓库根目录 [`AGENTS.md`](../AGENTS.md) — 文档地图、近期栈 DO/DON'T、ComptimeRouter / Path A 鉴权。  
+> **操作手册（写代码先读）**：仓库根目录 [`AGENTS.md`](../../AGENTS.md) — 文档地图、近期栈 DO/DON'T、ComptimeRouter / Path A 鉴权。  
 > 本文讲**为什么**；与 AGENTS / `ROUTE_TABLE` / `MODULE_LAYERS` 冲突时，以那三份为准。
 
 ---
@@ -427,7 +427,7 @@ src/modules/order/module.zig:15:32: note: expected type '[]const u8'
 | 三套业务 RBAC 并进 `CatalogPermDb` | 自定义 `CatalogPermissionLoader` |
 | `sendSuccess` / 大写 `Authorization` header key | `ctx.json`；header 键 **小写** |
 
-完整 DO/DON'T → [`AGENTS.md`](../AGENTS.md)。
+完整 DO/DON'T → [`AGENTS.md`](../../AGENTS.md)。
 
 ### 6.1 反模式：循环依赖
 
@@ -719,11 +719,11 @@ AI 每生成一段代码后，应自问：
 
 ## 参考
 
-- [AGENTS.md](../AGENTS.md) — **AI 操作手册**
-- [ROUTE_TABLE.md](ROUTE_TABLE.md) — ComptimeRouter + catalog JWT
-- [MODULE_LAYERS.md](MODULE_LAYERS.md) — 领域分层
-- [BEST_PRACTICES.md](BEST_PRACTICES.md) — DAU + 鉴权清单
-- [ARCHITECTURE.md](ARCHITECTURE.md)
+- [AGENTS.md](../../AGENTS.md) — **AI 操作手册**
+- [ROUTE_TABLE.md](../reference/ROUTE_TABLE.md) — ComptimeRouter + catalog JWT
+- [MODULE_LAYERS.md](../guide/MODULE_LAYERS.md) — 领域分层
+- [BEST_PRACTICES.md](../guide/BEST_PRACTICES.md) — DAU + 鉴权清单
+- [ARCHITECTURE.md](../reference/ARCHITECTURE.md)
 - [Zig 0.17.0 Language Reference](https://ziglang.org/documentation/0.17.0/)
 - [Spring Modulith Reference](https://docs.spring.io/spring-modulith/reference/)
 

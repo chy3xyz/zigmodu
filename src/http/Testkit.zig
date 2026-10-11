@@ -224,7 +224,7 @@ pub fn auditAuthCoverage(
         // was the one automated check that could have caught a `ws_routes` entry
         // declaring `.auth = .jwt` with nothing to enforce it — it looked away
         // instead. `ComptimeRouter` now refuses anything but `.public` on a WS
-        // route at compile time (docs/RUNTIME.md §12.14), so this is an invariant;
+        // route at compile time (docs/reference/RUNTIME.md §12.14), so this is an invariant;
         // an assert keeps it from becoming an assumption again.
         if (e.is_ws) {
             std.debug.assert(e.auth == .public);

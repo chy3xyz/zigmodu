@@ -16,7 +16,7 @@ const Time = @import("../Time.zig");
 /// The lock guarding a `RaftElection`'s state.
 ///
 /// The algorithm's entry points are driven from two threads in the documented
-/// wiring (`docs/DISTRIBUTED.md`): the app's tick loop calls `tick()`, while the
+/// wiring (`docs/reference/DISTRIBUTED.md`): the app's tick loop calls `tick()`, while the
 /// node's accept thread dispatches peers' RPCs into `handleVoteRequest` /
 /// `handleAppendEntries` / … Both streams free-then-restore `voted_for` and
 /// `leader_id`, push into and truncate `log`, and rewrite `next_index` /
@@ -707,7 +707,7 @@ pub const RaftElection = struct {
     }
 
     /// The node's outbound pump, and the answer to "the outbound round used to
-    /// run under `lock` for its whole length" (docs/DISTRIBUTED.md 「出站 IO 与
+    /// run under `lock` for its whole length" (docs/reference/DISTRIBUTED.md 「出站 IO 与
     /// 锁」). `tick()` is one call to this; `handleVoteResponse` calls it after
     /// releasing its own lock, so a won election's first heartbeat goes out
     /// immediately rather than at the next due interval.
@@ -1778,7 +1778,7 @@ pub const RaftElection = struct {
     // rotation window lives entirely in *which key verifies*.
     //
     // The three-phase, no-partition rotation sequence for node B's key
-    // (K1 → K2), spelled out in `docs/DISTRIBUTED.md` §"密钥轮换与撤销":
+    // (K1 → K2), spelled out in `docs/reference/DISTRIBUTED.md` §"密钥轮换与撤销":
     //   1. every peer: `rotatePeerKey(B, K2)` — K2 is current, K1 still verifies;
     //   2. B: `rotateOwnKey(K2)` — B's frames now sign with K2 and verify
     //      everywhere as current; in-flight K1 frames verify as previous;

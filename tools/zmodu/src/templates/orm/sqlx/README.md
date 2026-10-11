@@ -14,7 +14,7 @@ Embedded by `orm_tpl.zig` (`expandOrm`) via `@embedFile` (paths relative to `too
 | `<<DEPS>>` | `&.{}` |
 | `<<STD_IMPORT>>` | `const std = @import("std");\n`, or empty — see below |
 
-`api_header.zig.tpl` emits ComptimeRouter `pub const routes` (`docs/ROUTE_TABLE.md`).
+`api_header.zig.tpl` emits ComptimeRouter `pub const routes` (`docs/reference/ROUTE_TABLE.md`).
 Handlers are `fn (*http.Context, *State) !void`; scaffold wires via `http.Router.scope.mountAll`.
 
 `<<STD_IMPORT>>` appears in `service_header*.zig.tpl` and in `api_header.zig.tpl`.

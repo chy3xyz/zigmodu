@@ -6,7 +6,7 @@
 > **本文只讲应用平面**（模块边界、fiber、池化、缓存、消息）。当"一请求一 fiber"不再是正确的形状
 > —— 行情/订单簿、实时网关、AI agent 循环、IoT 状态机 —— 那是**执行平面**：worker 持有自己的状态、
 > 有界 mailbox 做背压、锁自由队列、定时器、监督树、可回放的投递日志。
-> 规格见 [RUNTIME.md](RUNTIME.md)，"该不该用/怎么用/哪里会踩"见
+> 规格见 [RUNTIME.md](../reference/RUNTIME.md)，"该不该用/怎么用/哪里会踩"见
 > [BEST_PRACTICES.md](BEST_PRACTICES.md) 的「执行平面（Runtime）最佳实践」一节。
 > 应用平面自己站得住：不调 `app.runtime()` 的应用**不会多起一条线程**。
 
@@ -14,15 +14,15 @@
 
 | 文档 | 内容 |
 |------|------|
-| [ARCHITECTURE.md](ARCHITECTURE.md) | 模块概念、分层、通信模式 |
+| [ARCHITECTURE.md](../reference/ARCHITECTURE.md) | 模块概念、分层、通信模式 |
 | [MODULE_LAYERS.md](MODULE_LAYERS.md) | **model / persistence / service / Tx 分层细则** |
 | [BEST_PRACTICES.md](BEST_PRACTICES.md) | 按 DAU 阶段演进（1K → 1M+）+ JWT 可执行清单 |
-| [ROUTE_TABLE.md](ROUTE_TABLE.md) | ComptimeRouter + catalog JWT / RBAC |
-| [AGENTS.md](../AGENTS.md) | **AI 操作手册**（DO/DON'T） |
+| [ROUTE_TABLE.md](../reference/ROUTE_TABLE.md) | ComptimeRouter + catalog JWT / RBAC |
+| [AGENTS.md](../../AGENTS.md) | **AI 操作手册**（DO/DON'T） |
 | [elegant-code-patterns.md](elegant-code-patterns.md) | 五文件布局与代码样例 |
-| [DISTRIBUTED.md](DISTRIBUTED.md) | 多实例 / RobustMQ / 集群注意点 |
+| [DISTRIBUTED.md](../reference/DISTRIBUTED.md) | 多实例 / RobustMQ / 集群注意点 |
 | [MODULITH_TENANT_SHOP.md](MODULITH_TENANT_SHOP.md) | **蓝图**：多租户店依赖图 + 目录清单 |
-| [ZENT.md](ZENT.md) | **zent**：schema-as-code ORM 与 ZigModu 正交集成 |
+| [ZENT.md](../reference/ZENT.md) | **zent**：schema-as-code ORM 与 ZigModu 正交集成 |
 | [SQLX_DRIVERS.md](SQLX_DRIVERS.md) | **sqlx**：`-Ddb=` / `.db=` 选择性驱动链接 |
 | [best-practices-heysen-lessons.md](best-practices-heysen-lessons.md) | 生产踩坑（sqlx / ORM） |
 
@@ -96,7 +96,7 @@ pub fn deinit() void {}
 |------|------|------|
 | 同事务、强一致 | service 编排 + 依赖模块 **`persistence.Tx`** | 例如下单预留库存；见 [MODULE_LAYERS.md](MODULE_LAYERS.md) |
 | 跨域副作用 | **EventBus** / Outbox | 例如 `OrderCreated` → 发邮件、积分；接线规则见 [EVENTS_DI.md](EVENTS_DI.md) |
-| 跨实例异步 | **RobustMQ**（Kafka wire） | 见 [DISTRIBUTED.md](DISTRIBUTED.md) |
+| 跨实例异步 | **RobustMQ**（Kafka wire） | 见 [DISTRIBUTED.md](../reference/DISTRIBUTED.md) |
 
 禁止：业务模块互相 `import` 对方的非 Tx persistence 做随意读写；禁止 handler 里写 SQL。同事务工作流可 import 兄弟模块的 **`persistence.Tx`（仅 SQL）**。
 
@@ -120,7 +120,7 @@ pub fn deinit() void {}
 |--------|------|
 | 自研 Cluster / Raft 当主路径 | 先用多实例 + LB + Redis / RobustMQ |
 | 模块间同步 RPC / 服务网格 | 同进程直接调；跨实例用消息 |
-| 物理拆分 `Server.zig` / `sqlx.zig` | 用 § 分区维护；见 [PRODUCTION_ROADMAP.md](PRODUCTION_ROADMAP.md) |
+| 物理拆分 `Server.zig` / `sqlx.zig` | 用 § 分区维护；见 [PRODUCTION_ROADMAP.md](../meta/PRODUCTION_ROADMAP.md) |
 
 ### 3.3 规模阶梯
 

@@ -4,7 +4,7 @@
 //! via tool calls. The LLM only supplies a task name + cron expression — it
 //! never provides code. Tasks themselves are plain Zig functions the app
 //! registers up front, so the bridge stays within the framework's "controlled
-//! execution" posture (see docs/AI.md).
+//! execution" posture (see docs/ai/AI.md).
 
 const std = @import("std");
 const Scheduler = @import("../scheduler/Cron.zig").Scheduler;

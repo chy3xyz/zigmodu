@@ -4,7 +4,7 @@ const Rbac = @import("../security/Rbac.zig");
 const log = std.log.scoped(.data_permission);
 
 /// The fail-closed predicate every rejected scope materializes — the
-/// counterpart of zent's `data_scope.deny_pred` (v0.66.0, see `docs/ZENT.md`
+/// counterpart of zent's `data_scope.deny_pred` (v0.66.0, see `docs/reference/ZENT.md`
 /// §14: "空 `dept_ids` 拒绝而非放行"). `1 = 0` matches no row on SQLite,
 /// PostgreSQL and MySQL, and carrying no column reference keeps it unambiguous
 /// wherever a caller splices it in.

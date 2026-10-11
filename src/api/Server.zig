@@ -3,7 +3,7 @@
 //! Provides HTTP server with routing, middleware, and handlers.
 //! Aligned with go-zero's rest package.
 //!
-//! STRUCTURE (monolith — intentionally NOT split; see docs/PRODUCTION_ROADMAP.md):
+//! STRUCTURE (monolith — intentionally NOT split; see docs/meta/PRODUCTION_ROADMAP.md):
 //!   §1  Method / Route / RouteGroup / WS callbacks —— routing declarations, middleware and listener types
 //!   §2  Process-wide error renderers —— setErrorRenderer / setTransportErrorRenderer and the transport body
 //!   §3  Context —— request/response, arena, bindJson, streaming and parameter helpers
@@ -3366,7 +3366,7 @@ fn connectionHasUpgrade(value: []const u8) bool {
 /// `Sec-WebSocket-Key`.
 ///
 /// The upgrade is answered *before* `router.match` and before every middleware
-/// (docs/RUNTIME.md §12.14), so this is the pre-auth surface: checking only
+/// (docs/reference/RUNTIME.md §12.14), so this is the pre-auth surface: checking only
 /// `Upgrade` + a non-empty key used to be enough to get a 101 for a request that
 /// is not a WebSocket handshake at all.
 fn wsHandshakeValid(ctx: *const Context) bool {

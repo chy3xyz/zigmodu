@@ -144,7 +144,7 @@ const max_frame_size = NetworkTransport.MAX_MESSAGE_SIZE;
 /// A-3: a peer's credential as a rotation window. `current` is the only key
 /// ever signed with; while `previous` is set, inbound material signed with
 /// **either** verifies — that is what makes rotating a live peer's key a
-/// no-partition sequence (`docs/DISTRIBUTED.md` §"密钥轮换与撤销"). The window
+/// no-partition sequence (`docs/reference/DISTRIBUTED.md` §"密钥轮换与撤销"). The window
 /// is explicit: `rotatePeerKey` opens it, `setPeerKey` / `dropPreviousPeerKey`
 /// close it, `removePeerKey` drops the entry altogether.
 pub const PeerKeyWindow = struct {
@@ -510,7 +510,7 @@ pub const DistributedEventBus = struct {
     /// Where the `ConcurrencyUnavailable` branch is and is not tested
     /// (`std.testing.io` can never produce it — the pinned-limit tests bring
     /// their own bounded `Io.Threaded`) is written down in
-    /// `docs/DISTRIBUTED.md` 「并发额度耗尽分支（A-8 定界）」.
+    /// `docs/reference/DISTRIBUTED.md` 「并发额度耗尽分支（A-8 定界）」.
     pub fn start(self: *Self, port: u16) !void {
         if (self.is_running) return;
 
@@ -2226,7 +2226,7 @@ pub const DistributedEventBus = struct {
     /// handshake signed after the swap uses `new_key`; peers whose window for
     /// this node still covers the old key (`PeerKeyWindow.previous`, opened by
     /// their `rotatePeerKey`) keep verifying the in-flight old-signed material.
-    /// The full no-partition sequence is in `docs/DISTRIBUTED.md` §"密钥轮换与撤销".
+    /// The full no-partition sequence is in `docs/reference/DISTRIBUTED.md` §"密钥轮换与撤销".
     pub fn rotateOwnKey(self: *Self, new_key: [32]u8) void {
         self.setOwnKey(new_key);
     }
@@ -5538,7 +5538,7 @@ test "a snapshot that runs out of memory leaves nothing behind" {
 // on that configuration, is always. The node stayed registered with
 // `socket == null`, nothing was ever delivered, and every connect logged a
 // "refused the handshake: PeerKeyMissing" warning. The one configuration the
-// docs describe as the bare-frame path (`docs/DISTRIBUTED.md`: "完全没配凭证才是
+// docs describe as the bare-frame path (`docs/reference/DISTRIBUTED.md`: "完全没配凭证才是
 // 既有的裸帧路径"; `start()`'s warning is supposed to be the only thing
 // complaining) could therefore never form an outbound link at all — nor could
 // the event-bus mesh of the unauthenticated multi-node cluster `ClusterBootstrap`
@@ -5630,7 +5630,7 @@ test "a bus with credentials still fails closed when the handshake cannot comple
     bus.setOwnKey(peer_key);
 
     // A peer with no key of ours is refused **before the dial** — the address is
-    // irrelevant on purpose (`docs/DISTRIBUTED.md`: "在 dial 之前").
+    // irrelevant on purpose (`docs/reference/DISTRIBUTED.md`: "在 dial 之前").
     const dead = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 1);
     try std.testing.expectError(error.PeerKeyMissing, bus.connectToNode("node-unknown", dead));
     try std.testing.expectEqual(@as(usize, 0), bus.getNodeCount());

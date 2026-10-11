@@ -22,7 +22,7 @@ pub const PermissionLoader = *const fn (allocator: std.mem.Allocator, auth: *Rba
 /// Safe with ComptimeRouter: route `*State` stays in `user_data`; read auth via
 /// `getAuth(ctx)` / `ctx.authInfo(Rbac.AuthInfo)`. Catalog stack
 /// (`http.jwtAuthFromCatalogWithPermissions`) remains preferred for new apps
-/// (see `docs/ROUTE_TABLE.md`).
+/// (see `docs/reference/ROUTE_TABLE.md`).
 ///
 /// NOTE: `AuthInfo.permissions` stays empty with this variant, so requirePermission()
 /// will always deny. Use `jwtAuthWithPermissions` when permission checks are needed.

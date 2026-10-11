@@ -870,7 +870,7 @@ fn cmdCi(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) voi
 /// mailbox/queue primitives, timer call sites, recorder/trace references, clock
 /// selection). It reads source only: live queue depth / dropped_full /
 /// timer_lag_ms and the pool's own counters live in `Runtime.MetricsBridge` —
-/// scrape `/metrics` (docs/RUNTIME.md §8).
+/// scrape `/metrics` (docs/reference/RUNTIME.md §8).
 fn cmdRuntime(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) void {
     const code = runtime_mod.run(io, allocator, args);
     if (code != 0) std.process.exit(code);
@@ -945,7 +945,7 @@ fn cmdSaas(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !
         return;
     }
     try saas_mod.generateModule(io, allocator, model_json, out_dir);
-    std.log.info("saas: mount + auth wiring per docs/ROUTE_TABLE.md §7 (jwtAuthFromCatalogWithPermissions + permissionGate)", .{});
+    std.log.info("saas: mount + auth wiring per docs/reference/ROUTE_TABLE.md §7 (jwtAuthFromCatalogWithPermissions + permissionGate)", .{});
 }
 
 fn cmdMarket(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) void {
@@ -2075,7 +2075,7 @@ fn generateModule(allocator: std.mem.Allocator, module_name: []const u8) ![]cons
 
 /// `zmodu module <name> --full`: the rest of the module skeleton. `module.zig`
 /// alone is a declaration — a module that earns the name owns its layer files
-/// (model / persistence / service / api / root, see `docs/MODULE_LAYERS.md`).
+/// (model / persistence / service / api / root, see `docs/guide/MODULE_LAYERS.md`).
 fn writeModuleSkeleton(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -2111,7 +2111,7 @@ fn writeModuleSkeleton(
 
 const module_model_tpl =
     \\//! Row shape for the `{{NAME}}` module: fields mirror columns 1:1.
-    \\//! No SQL here — persistence owns the statements (docs/MODULE_LAYERS.md).
+    \\//! No SQL here — persistence owns the statements (docs/guide/MODULE_LAYERS.md).
     \\
     \\pub const {{PASCAL_NAME}} = struct {
     \\    id: i64 = 0,
@@ -2123,7 +2123,7 @@ const module_model_tpl =
 
 const module_persistence_tpl =
     \\//! Parameterized SQL for `{{NAME}}`. Every statement takes `?` arguments —
-    \\//! never interpolate values into SQL (docs/BEST_PRACTICES.md).
+    \\//! never interpolate values into SQL (docs/guide/BEST_PRACTICES.md).
     \\
     \\pub const find_by_id =
     \\    "SELECT id, created_at, updated_at FROM {{NAME}} WHERE id = ?";
@@ -2134,7 +2134,7 @@ const module_persistence_tpl =
 
 const module_service_tpl =
     \\//! `{{PASCAL_NAME}}` service: commands in, results out; the transaction
-    \\//! boundary lives here (docs/MODULE_LAYERS.md). SQL stays in persistence.zig.
+    \\//! boundary lives here (docs/guide/MODULE_LAYERS.md). SQL stays in persistence.zig.
     \\
     \\const std = @import("std");
     \\const model = @import("model.zig");
@@ -2189,7 +2189,7 @@ const module_api_tpl =
 
 const module_root_tpl =
     \\//! Barrel for `{{NAME}}` — import this from outside the module, never the
-    \\//! layer files directly (docs/MODULITH.md).
+    \\//! layer files directly (docs/guide/MODULITH.md).
     \\
     \\pub const model = @import("model.zig");
     \\pub const persistence = @import("persistence.zig");
@@ -7112,7 +7112,7 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     defer allocator.free(rm_path);
     if (!fileExists(io, rm_path)) try safeWrite(io, allocator, rm_path,
         \\# AI Chat Module
-        \\Full docs: [zigmodu/docs/AI.md](https://github.com/chy3xyz/zigmodu/blob/main/docs/AI.md)
+        \\Full docs: [zigmodu/docs/ai/AI.md](https://github.com/chy3xyz/zigmodu/blob/main/docs/ai/AI.md)
         \\## Quick Start
         \\```zig
         \\var http_client = zigmodu.http.HttpClient.init(allocator, io, 10, 30000);
@@ -7134,7 +7134,7 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
         \\| GET | /admin-api/ai/chat/messages?conversationId=N | Message history |
         \\| POST | /admin-api/ai/chat/conversations | Create conversation |
         \\| DELETE | /admin-api/ai/chat/conversations?id=N | Delete conversation |
-        \\Routes via ComptimeRouter `pub const routes` (docs/ROUTE_TABLE.md).
+        \\Routes via ComptimeRouter `pub const routes` (docs/reference/ROUTE_TABLE.md).
         \\## Features
         \\- Multi-turn context loading
         \\- Cache-optimized message ordering (DeepSeek V4)
@@ -7826,7 +7826,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
             \\
             \\### api.zig — Custom endpoints (ComptimeRouter)
             \\```zig
-            \\// Add rows to `pub const routes` (docs/ROUTE_TABLE.md):
+            \\// Add rows to `pub const routes` (docs/reference/ROUTE_TABLE.md):
             \\.{ .method = .GET, .path = "search", .handler = searchMessages },
             \\```
             \\
@@ -8168,7 +8168,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
         \\            .on_close = gateway.ImGateway.onClose,
         \\            // A WS route has no enforcement point — the upgrade is answered before
         \\            // `router.match` and before any middleware — so the framework refuses
-        \\            // any `auth` but `.public` here at compile time (docs/RUNTIME.md §12.14).
+        \\            // any `auth` but `.public` here at compile time (docs/reference/RUNTIME.md §12.14).
         \\            // The identity is verified in `ImGateway.accept`.
         \\            .meta = .{ .auth = .public },
         \\        },
@@ -8184,7 +8184,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
         \\        const size = ctx.queryInt(usize, "pageSize", 10);
         \\        // From the identity the JWT middleware resolved, never from the query
         \\        // string: `?userId=` is attacker-controlled, so reading it would let any
-        \\        // signed-in user list anyone's conversations (docs/RUNTIME.md §12.14).
+        \\        // signed-in user list anyone's conversations (docs/reference/RUNTIME.md §12.14).
         \\        const user_id = try ctx.requireUserIdInt(i64);
         \\        const result = try self.service.getConversations(user_id, page, size);
         \\        try R.wrapList(ctx, result);
@@ -8290,7 +8290,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
         \\    msg_ctx: ?*anyopaque = null,
         \\    /// Verifies a bearer token into a user id. **Null by default**, deliberately:
         \\    /// with nothing wired in, `accept` refuses every upgrade rather than
-        \\    /// trusting a client-supplied id (docs/RUNTIME.md §12.14). See `verifyBearer`.
+        \\    /// trusting a client-supplied id (docs/reference/RUNTIME.md §12.14). See `verifyBearer`.
         \\    verifier: ?*const fn (token: []const u8) ?u64 = null,
         \\
         \\    pub fn init(allocator: std.mem.Allocator, io: std.Io) ImGateway {
@@ -8333,7 +8333,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
         \\
         \\        // A **verified** identity or nothing. This used to read `?userId=` from
         \\        // the query string, which is attacker-controlled: any client could
-        \\        // connect as any user (docs/RUNTIME.md §12.14).
+        \\        // connect as any user (docs/reference/RUNTIME.md §12.14).
         \\        const user_id = self.verifyBearer(ctx) orelse {
         \\            std.log.warn("[im] refusing a WS upgrade with no verified identity", .{});
         \\            return null;

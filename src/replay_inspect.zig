@@ -1,5 +1,5 @@
 //! `replay-inspect` — offline incident inspection for a delivery-log
-//! directory (docs/RUNTIME.md §13.9–§13.12).
+//! directory (docs/reference/RUNTIME.md §13.9–§13.12).
 //!
 //! Invocation: `zig build replay-inspect -- <dir> …` (0.17.0's
 //! `addPassthruArgs` forwards args after `--`; the dev toolchain's `b.args`
@@ -345,7 +345,7 @@ const usage =
     \\  args reach this tool — or run the installed binary:
     \\  `zig build` once, then `zig-out/bin/replay-inspect <dir> …`)
     \\
-    \\Read a delivery-log directory (docs/RUNTIME.md §13.9) and report what an
+    \\Read a delivery-log directory (docs/reference/RUNTIME.md §13.9) and report what an
     \\incident replay starts from: verified records, the seq range, per-track
     \\and per-kind counts, holes in the sequence chain, and the damage that
     \\stopped the scan. Never writes.

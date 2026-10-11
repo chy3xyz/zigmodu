@@ -1,42 +1,42 @@
 # ZigModu — AI Agent Guide
 
 > **面向 AI 的权威入口。** 写代码前先读本节「文档地图」与「近期栈 DO/DON'T」。  
-> 人类长文：`docs/BEST_PRACTICES.md` · 路由/鉴权细则：`docs/ROUTE_TABLE.md` §7。  
-> 哲学长文（可后读）：`docs/AI_METHODOLOGY.md`（以本文为准若冲突）。
+> 人类长文：`docs/guide/BEST_PRACTICES.md` · 路由/鉴权细则：`docs/reference/ROUTE_TABLE.md` §7。  
+> 哲学长文（可后读）：`docs/ai/AI_METHODOLOGY.md`（以本文为准若冲突）。
 
 ## 文档地图（按任务选读）
 
 | 任务 | 先读 |
 |------|------|
-| 新模块 / HTTP API | 本文 Critical Rules + `docs/ROUTE_TABLE.md` §1–4、§7 |
-| JWT / 多门户 / RBAC | `docs/ROUTE_TABLE.md` §7.1 + `docs/BEST_PRACTICES.md`「JWT / 多端身份」 |
-| model / Tx / service | `docs/MODULE_LAYERS.md` |
-| Day-1 并发 / 反模式 | `docs/MODULITH.md` |
-| 模块间事件 / DI 注入 | `docs/EVENTS_DI.md`（`initWith(ctx)` + `app.eventBus` + freeze） |
-| 多租户列名 | `docs/ARCHITECTURE.md` § Multi-Tenancy |
-| zent ORM（电商/社交主推组合） | `docs/ZENT.md`（勿与 sqlx 混事务；§4.8 场景能力矩阵） |
-| SQLx 驱动链接 | `docs/SQLX_DRIVERS.md`（`-Ddb=` / `.db=`） |
-| 生产接线 / 背压 / 编排 | `docs/ROUTE_TABLE.md` §7.4 + `docs/BEST_PRACTICES.md`「韧性」 |
-| 文件上传 / 内容校验 / 限额顺序 | `docs/BEST_PRACTICES.md`「上传与 multipart」 |
-| Worker / 邮箱 / 定时器 / RingBuffer / **池化（§12）** | `docs/RUNTIME.md`（定位、契约、背压语义、兼容 10 条；§12.10 = WorkerPool Phase 1 落地边界） |
-| 架构检查 / 依赖图 / `zmodu doctor` | `docs/ARCHITECTURE.md`「Architecture engine」+ `src/core/ModuleGraph.zig` |
-| 集群成员读侧（请求路径选节点/健康度） | `docs/DISTRIBUTED.md`「集群读侧」+ `zigmodu.ClusterView`（`acquire`/`release`，别读写入侧的哈希表） |
-| 集群传输 / Raft / 密钥轮换 / 混合版本对跑 | `docs/DISTRIBUTED.md`（「传输加密边界」：HMAC=认证不加密，生产走边车 mTLS）· `scripts/ci-mixed-version.sh`（`MIXED_EXPECT=refuse\|interop`） |
+| 新模块 / HTTP API | 本文 Critical Rules + `docs/reference/ROUTE_TABLE.md` §1–4、§7 |
+| JWT / 多门户 / RBAC | `docs/reference/ROUTE_TABLE.md` §7.1 + `docs/guide/BEST_PRACTICES.md`「JWT / 多端身份」 |
+| model / Tx / service | `docs/guide/MODULE_LAYERS.md` |
+| Day-1 并发 / 反模式 | `docs/guide/MODULITH.md` |
+| 模块间事件 / DI 注入 | `docs/guide/EVENTS_DI.md`（`initWith(ctx)` + `app.eventBus` + freeze） |
+| 多租户列名 | `docs/reference/ARCHITECTURE.md` § Multi-Tenancy |
+| zent ORM（电商/社交主推组合） | `docs/reference/ZENT.md`（勿与 sqlx 混事务；§4.8 场景能力矩阵） |
+| SQLx 驱动链接 | `docs/guide/SQLX_DRIVERS.md`（`-Ddb=` / `.db=`） |
+| 生产接线 / 背压 / 编排 | `docs/reference/ROUTE_TABLE.md` §7.4 + `docs/guide/BEST_PRACTICES.md`「韧性」 |
+| 文件上传 / 内容校验 / 限额顺序 | `docs/guide/BEST_PRACTICES.md`「上传与 multipart」 |
+| Worker / 邮箱 / 定时器 / RingBuffer / **池化（§12）** | `docs/reference/RUNTIME.md`（定位、契约、背压语义、兼容 10 条；§12.10 = WorkerPool Phase 1 落地边界） |
+| 架构检查 / 依赖图 / `zmodu doctor` | `docs/reference/ARCHITECTURE.md`「Architecture engine」+ `src/core/ModuleGraph.zig` |
+| 集群成员读侧（请求路径选节点/健康度） | `docs/reference/DISTRIBUTED.md`「集群读侧」+ `zigmodu.ClusterView`（`acquire`/`release`，别读写入侧的哈希表） |
+| 集群传输 / Raft / 密钥轮换 / 混合版本对跑 | `docs/reference/DISTRIBUTED.md`（「传输加密边界」：HMAC=认证不加密，生产走边车 mTLS）· `scripts/ci-mixed-version.sh`（`MIXED_EXPECT=refuse\|interop`） |
 | v1.0 差距与证据状态（勿重复报告已关项） | `docs/dev/v1.0-readiness-v0.35.md`（A/B/C 组逐条带证据 + 各批跟进注） |
-| 长流程 / 崩溃续跑（Saga、补偿、检查点） | `docs/WORKFLOW.md` + `SagaOrchestrator.resumeInstance`（有副作用的一步必须幂等） |
-| 改 `src/ai/**` 前（它只能依赖领域缝） | `docs/AI_BOUNDARY.md` + `src/test/AiBoundary.zig`（驱动层 import 数只减不增） |
-| Agent 能做什么（默认不能执行） | `docs/AGENT_RUNTIME.md` + `ai.Guard` / `ai.AgentSpec` / `ai.ProposalPipeline` / `ai.AgentWorker`（闸门已接进 `Agent.run`；Agent 可跑成运行时 worker） |
-| 观测 / 告警 / Grafana | `docs/OBSERVABILITY.md`（黄金信号 + 阈值 + dashboard JSON；夜间 `zig build soak` 见 CI `soak` job） |
+| 长流程 / 崩溃续跑（Saga、补偿、检查点） | `docs/guide/WORKFLOW.md` + `SagaOrchestrator.resumeInstance`（有副作用的一步必须幂等） |
+| 改 `src/ai/**` 前（它只能依赖领域缝） | `docs/reference/AI_BOUNDARY.md` + `src/test/AiBoundary.zig`（驱动层 import 数只减不增） |
+| Agent 能做什么（默认不能执行） | `docs/reference/AGENT_RUNTIME.md` + `ai.Guard` / `ai.AgentSpec` / `ai.ProposalPipeline` / `ai.AgentWorker`（闸门已接进 `Agent.run`；Agent 可跑成运行时 worker） |
+| 观测 / 告警 / Grafana | `docs/reference/OBSERVABILITY.md`（黄金信号 + 阈值 + dashboard JSON；夜间 `zig build soak` 见 CI `soak` job） |
 | 部署拓扑（TLS 边车/探针/守护；集群 mTLS 边车） | `examples/production-deploy/`（nginx · Envoy · k8s · systemd · **cluster-sidecar**） |
-| Extract / SSE / Testkit / Outbox | `docs/FRAMEWORK_BACKLOG.md` |
+| Extract / SSE / Testkit / Outbox | `docs/meta/FRAMEWORK_BACKLOG.md` |
 | 故障注入 / 契约门禁模板 | `src/test/FaultInjection.zig` · `src/test/ContractGate.zig` |
-| 升级注意事项（breaking / 影响面 / 改法） | `docs/UPGRADING.md` |
-| 外部反馈核实与处置 | `docs/ISSUES_FROM_ZAPI.md` · `docs/ISSUES_FROM_ZIGSHOP.md` |
-| CLI 生成 | `docs/ZMODU_CLI_INTEGRATION.md` · `zig build zmodu -- scaffold …`（0.17.0 `addPassthruArgs` 透传，**必须从仓库根跑**）或装好后跑 `zig-out/bin/zmodu scaffold …`（脚本推荐；见下方"两个 zmodu 入口"） |
+| 升级注意事项（breaking / 影响面 / 改法） | `docs/reference/UPGRADING.md` |
+| 外部反馈核实与处置 | `docs/meta/ISSUES_FROM_ZAPI.md` · `docs/meta/ISSUES_FROM_ZIGSHOP.md` |
+| CLI 生成 | `docs/guide/ZMODU_CLI_INTEGRATION.md` · `zig build zmodu -- scaffold …`（0.17.0 `addPassthruArgs` 透传，**必须从仓库根跑**）或装好后跑 `zig-out/bin/zmodu scaffold …`（脚本推荐；见下方"两个 zmodu 入口"） |
 | 只跑一个/一组测试、filter 为什么不能瞎用 | 本文 §Testing「只跑匹配的测试」+ `scripts/test-fast.sh --help` |
 | 「某个文件的测试根本没被收集」（绿着跑了个空） | `src/test/TestCollection.zig`（闸门本体，按 `builtin.test_functions` 对账）+ `scripts/check-test-collection.sh`（排除项是否真是别的 build step 的编译根 + 强制重跑；`zig build test` 缓存重放不会执行它） |
-| LLM 对话模块（产品功能） | `docs/AI.md`（**不是** agent 指南） |
-| AI 业务接入（KeyManager/Agent/Workflow/Skill/接入） | `docs/AI_DEV_GUIDE.md` + `docs/AI_SKILLS.md` + `docs/LLM_POLICIES.md` |
+| LLM 对话模块（产品功能） | `docs/ai/AI.md`（**不是** agent 指南） |
+| AI 业务接入（KeyManager/Agent/Workflow/Skill/接入） | `docs/ai/AI_DEV_GUIDE.md` + `docs/ai/AI_SKILLS.md` + `docs/ai/LLM_POLICIES.md` |
 
 ## Quick Reference
 
@@ -99,7 +99,7 @@ CI、`scripts/ci-*.sh`、本文件都用那个。`cd tools/zmodu && zig build` �
 | sqlx：`Client.open` 后注意 pool/client 指针；CB 传 `io` | 在 ConnPool 上缓存失效的 `*Client` |
 | 阻塞 TCP dial：`zigmodu.netdial.connectBlocking(io, addr)`（std `posixConnect` 的 EINTR 重试撞 EISCONN 会 `errnoBug` panic —— 信号落进 dial 窗口 = 进程死；第 112 批） | 新代码直接 `addr.connect(io, .{ .mode = .stream })`（生产路径全已换走；需超时要 `RaftTransport.connectTimeout`，其非阻塞主路径本免疫） |
 | sqlx 驱动链接：`-Ddb=sqlite\|postgres\|mysql\|all`（默认 `all`） | 小系统用 `.db = "sqlite"`，勿默认三库全链 |
-| Runtime 监督树：`rt.spawnGroup(.one_for_one\|.one_for_all\|.rest_for_one\|.stop_group)` + `Supervision.group`；重建是原地 `deinit`+`init`（`docs/RUNTIME.md` §14） | 让 handler 自己 `catch` 装作没事（错误预算就废了）；把声明 `run` 的 worker 放进会重建的组（spawn 报 `NotRestartable`） |
+| Runtime 监督树：`rt.spawnGroup(.one_for_one\|.one_for_all\|.rest_for_one\|.stop_group)` + `Supervision.group`；重建是原地 `deinit`+`init`（`docs/reference/RUNTIME.md` §14） | 让 handler 自己 `catch` 装作没事（错误预算就废了）；把声明 `run` 的 worker 放进会重建的组（spawn 报 `NotRestartable`） |
 | Agent：`AgentSpec{.guard=…}` + 技能声明 `.action`（默认 `execute`）；`ai.ProposalPipeline` 走提议→风险→执行 | 裸 `Agent{}` 不设 `guard`（= **无界**）；用 `MemoryStore.formatContext` 给 agent 喂记忆（`0` = 任意 = 跨租户） |
 | Agent 跑成 worker：webhook / cron 路径用 `ai.AgentWorker`（`rt.spawn(ai.AgentWorker, …)` 拿 `*runtime.Handle(AgentWorker, cap)`，再 `ai.agent_worker.post(handle, goal)`）；被拒/失败经 `on_result` 回报，不占监督预算 | 在请求线程里同步 `Agent.run`（`ai.trigger.Trigger.fire` 是同步的，会占住 handler）；把失败当 supervisor 错误反复重试 |
 | 共享注册表：`zmodu.FrozenMap/FrozenStringMap`，启动期填充后 `freeze()` | 文件作用域裸 HashMap 在 worker 池上并发写（撕裂元数据 → 进程崩溃） |
@@ -110,7 +110,7 @@ CI、`scripts/ci-*.sh`、本文件都用那个。`cd tools/zmodu && zig build` �
 | handler 问门户：`ctx.permissionMatches("portal:user\|portal:shop")`（与路由声明同表达式） | handler 重写门户检查只认一侧（OR meta 会被窄化成 403） |
 | 上传：`http.extractMultipart(ctx, mp)` + `http.UploadGuard.checkForm(&form, …)` | 只查扩展名 / 只信 `Content-Type` / 放行 SVG（脚本容器 → stored-XSS） |
 | 上传限额：`Multipart.Config.forBodyLimit(n)` 与 `Server.Config.max_body_size` 用同一个数 | 只设 `Multipart.Config.max_total_bytes`（服务端 8MB 先 413，它永不触发） |
-| 高并发/热路径：`rt.spawn(W, init, cap)` + 邮箱（状态单线程独占，无锁）· 完整见 `docs/RUNTIME.md` | 多个线程共享可变状态再加锁；把 L0 热事件塞进 `app.eventBus`（那是 L1 业务事件通道） |
+| 高并发/热路径：`rt.spawn(W, init, cap)` + 邮箱（状态单线程独占，无锁）· 完整见 `docs/reference/RUNTIME.md` | 多个线程共享可变状态再加锁；把 L0 热事件塞进 `app.eventBus`（那是 L1 业务事件通道） |
 | 队列满时必须显式处理：`catch error.Full` → 丢弃/合并/退避，并读 `stats().dropped_full` | 让队列"自己长大"（邮箱容量是 comptime 有界的，`error.Full` 是唯一出口） |
 | 定时器只投消息：`handle.after(ms, msg)`（在 worker 线程上处理） | 在 ticker 线程上跑业务回调（会破坏 worker 的单线程状态所有权） |
 | 运行时是 opt-in：不调用 `app.runtime()` 就零线程、零定时器（v0.16 起） | 为普通 CRUD API 引入 worker（多一层，没有收益） |
@@ -159,11 +159,11 @@ const zigmodu_dep = b.dependency("zigmodu", .{
 
 框架自测必须用默认 `-Ddb=all`（`zig build test`）。窄化 `-Ddb=` 只适合应用/示例构建。
 
-**跨平台编译**：探测是**面向目标**的——主机路径（Homebrew、`/usr/include`、pkg-config）只在 `target` 就是构建机时才用（按 `b.graph.host` 的解析三元组比较），所以外来目标不会再把主机的 `-I`/`-L` 交给链接（那正是"Mac 上出 Linux 产物时 `ld` 拿到 Mach-O 的 `libmysqlclient.a`、换来 191 行未定义符号"的原因）。带驱动要给**目标平台**的库：`XCOMPILE_ROOT`（或 `ZENT_XROOT`）指向 sysroot / 发行版 rootfs，单驱动可用 `SQLITE_LIB` / `PQ_*` / `MYSQL_*` 压过；都没有时构建脚本**只警告一次**（`-Ddb=none` 既不探测也不警告）。glibc 目标还须写 glibc 版本（`-Dtarget=aarch64-linux-gnu.2.34`，否则 `@GLIBC_2.34` 一屏未定义符号）。跨目标**跑不了测试**，且内存大头是优化等级不是"跨"：ReleaseSafe/Fast ~0.86 GB vs Debug ~0.27 GB，只编产物用 `-Doptimize=ReleaseSmall`（~0.42 GB）或 Debug，配 `-j2 --maxrss 1G --skip-oom-steps`。实测数字与配方 → **[`docs/SQLX_DRIVERS.md`](docs/SQLX_DRIVERS.md) §12**。
+**跨平台编译**：探测是**面向目标**的——主机路径（Homebrew、`/usr/include`、pkg-config）只在 `target` 就是构建机时才用（按 `b.graph.host` 的解析三元组比较），所以外来目标不会再把主机的 `-I`/`-L` 交给链接（那正是"Mac 上出 Linux 产物时 `ld` 拿到 Mach-O 的 `libmysqlclient.a`、换来 191 行未定义符号"的原因）。带驱动要给**目标平台**的库：`XCOMPILE_ROOT`（或 `ZENT_XROOT`）指向 sysroot / 发行版 rootfs，单驱动可用 `SQLITE_LIB` / `PQ_*` / `MYSQL_*` 压过；都没有时构建脚本**只警告一次**（`-Ddb=none` 既不探测也不警告）。glibc 目标还须写 glibc 版本（`-Dtarget=aarch64-linux-gnu.2.34`，否则 `@GLIBC_2.34` 一屏未定义符号）。跨目标**跑不了测试**，且内存大头是优化等级不是"跨"：ReleaseSafe/Fast ~0.86 GB vs Debug ~0.27 GB，只编产物用 `-Doptimize=ReleaseSmall`（~0.42 GB）或 Debug，配 `-j2 --maxrss 1G --skip-oom-steps`。实测数字与配方 → **[`docs/guide/SQLX_DRIVERS.md`](docs/guide/SQLX_DRIVERS.md) §12**。
 
-权威细则（取值表、stub、`DriverNotEnabled`、scaffold、symlink/Windows、体积预期）→ **[`docs/SQLX_DRIVERS.md`](docs/SQLX_DRIVERS.md)**。
+权威细则（取值表、stub、`DriverNotEnabled`、scaffold、symlink/Windows、体积预期）→ **[`docs/guide/SQLX_DRIVERS.md`](docs/guide/SQLX_DRIVERS.md)**。
 
-权威细则与接线样例 → `docs/BEST_PRACTICES.md`「JWT / 多端身份」· `docs/ROUTE_TABLE.md` §7。
+权威细则与接线样例 → `docs/guide/BEST_PRACTICES.md`「JWT / 多端身份」· `docs/reference/ROUTE_TABLE.md` §7。
 
 ## Critical Rules (MUST follow)
 
@@ -249,14 +249,14 @@ const now_ms = Time.monotonicNowMilliseconds();
 - **Profiles**: `applyHttpDefaults` + `applyResilienceDefaults`
 - **OpenAPI**: `openApiParamsFromStruct` + `RouteMeta.openapi_params`；`openApiRoutes` / `swaggerUiHandler` / `scalarUiHandler` HTML 零配置一键挂载 UI
 - **Outbox**: `zigmodu.outbox.*`；幂等 `idempotencyMiddleware`（header `idempotency-key`）
-- Guide: `docs/ROUTE_TABLE.md` · recipes: `docs/FRAMEWORK_BACKLOG.md`
+- Guide: `docs/reference/ROUTE_TABLE.md` · recipes: `docs/meta/FRAMEWORK_BACKLOG.md`
 
 ### Imports
 - NEVER use `zigmodu.http_server` — use `zigmodu.http.Context`
 - NEVER use `zigmodu.orm.Orm(...)` — use `zigmodu.data.Repository(T)`
 - NEVER use `zigmodu.PasswordEncoder` — use `zigmodu.security.PasswordEncoder`
 - Domain files are CANONICAL: `http.zig`, `data.zig`, `security.zig`, `observability.zig`
-- 数据层默认 = 框架自带 `data.sqlx` / `data.Repository`（`SqlxBackend` 是自带 backend）；**zent 是平行栈**（`docs/ZENT.md`），按 git tag 在应用/示例里单独引入，**不是框架依赖**，两者不共享驱动与事务
+- 数据层默认 = 框架自带 `data.sqlx` / `data.Repository`（`SqlxBackend` 是自带 backend）；**zent 是平行栈**（`docs/reference/ZENT.md`），按 git tag 在应用/示例里单独引入，**不是框架依赖**，两者不共享驱动与事务
 
 ### Module lifecycle
 ```zig
@@ -273,7 +273,7 @@ pub fn deinit() void {}  // reverse order
 ### Error handling
 - Use `ZigModuError` from `zmodu.ZigModuError` (NOT raw `error{...}`)
 - Log errors — never **swallow** a failure you depend on. `catch {}` on an I/O or DB call whose result the rest of the code needs is a violation (audit `b10`); on *best-effort cleanup* — `errdefer` teardown, a `rollback` you can no longer act on, `sendError` writing to an already-failing response — the original error is what matters and the cleanup failure is secondary, so a bare `catch {}` is idiomatic there. **但两条链的口径不同，别只看这一条**：`zmodu audit` 的 b10 豁免是**整行子串匹配** `errdefer` / `rollback` / `sendError`（行尾注释、`self.rollback_cmd`、`self.sendError_queue.peek()` 这类同名列同样会被豁免——实测如此），`// audit: ignore b10` 也必须与该行同处一行；而 `zig build check` 的 hot-path catch 扫描（`scripts/check-production.sh`）**不豁免这三类、也没有 ignore 标记**，在它 `ENFORCED_PREFIXES` 下的生产代码里写这三种形状照样判红。要两边都过就按扫描器的口径写：`catch |err|` + 非空 body（清理场景可以只降级成 debug 日志）。
-- 「分配后失败即丢」（inline alloc）同样有两条链，且**仓库侧那条更严**：`scripts/lib/zig-scan.awk` 的 `inline_alloc` + `inline_alloc_owned`（经 `check-production.sh` 的 `INLINE_ALLOC_ENFORCED` **强制**，exit 非 0）比 `zmodu audit` 的 **b25** 多认半条 —— `*Owned(` 交接 helper 上的内联分配；b25 只扫消费方应用代码（`src/modules/**`），且不含那半条（`putOwned` 是框架内部名）。两条共同盲区：**首参本身内联**的写法（`put(try dupe(k), try dupe(v))`）都看不见。细则见 `docs/BEST_PRACTICES.md`「实践 ↔ 门禁一致性」§F。
+- 「分配后失败即丢」（inline alloc）同样有两条链，且**仓库侧那条更严**：`scripts/lib/zig-scan.awk` 的 `inline_alloc` + `inline_alloc_owned`（经 `check-production.sh` 的 `INLINE_ALLOC_ENFORCED` **强制**，exit 非 0）比 `zmodu audit` 的 **b25** 多认半条 —— `*Owned(` 交接 helper 上的内联分配；b25 只扫消费方应用代码（`src/modules/**`），且不含那半条（`putOwned` 是框架内部名）。两条共同盲区：**首参本身内联**的写法（`put(try dupe(k), try dupe(v))`）都看不见。细则见 `docs/guide/BEST_PRACTICES.md`「实践 ↔ 门禁一致性」§F。
 - Use `zmodu.Result(T)` for fallible operations
 
 ### Security
@@ -307,7 +307,7 @@ pub fn deinit() void {}  // reverse order
   ```
 - 模型字段名必须与列名一致；codegen：`zmodu … --tenant-column app_id`
 - JWT `aud` → catalog 中间件写 attr `tenant_id`（SQL 列名可仍是 `app_id`）
-- Details: `docs/ARCHITECTURE.md` § Multi-Tenancy
+- Details: `docs/reference/ARCHITECTURE.md` § Multi-Tenancy
 
 ### Observability / protocols (recent)
 - OTLP: `OtlpExporter.exportSpans` → `http(s)://` + retries（HTTPS 经 std.http.Client）
@@ -450,15 +450,15 @@ filter 是**测试全限定名的子串**（形如 `core.cluster.RaftElection.te
 - 其它测试入口：`zig build soak`（N 并发 × M 租户，默认 16×50；CI 夜间 64×200）·
   `zig build test -Dnet-tests=false`（沙箱里跳过全部 socket 用例）·
   `bash scripts/test-fast.sh [--filter …]`（聚焦单测/强制重跑；见 §Testing）
-- 质量现状：以 `CHANGELOG.md` 与 `docs/dev/v1.0-readiness-v0.35.md` 为准（`docs/EVALUATION_REPORT.md` 是 2026-09 加固批次之前的旧快照，勿引其分数）
-- Roadmap: `docs/PRODUCTION_ROADMAP.md`（阶段 1–8 ✅；**阶段 9「高阶演进」是滚动项，非一次性完成**——其子项 1–4 已落地，子项 5「协议传输层高阶演进（gRPC Streaming / HTTP/2 深化）」仍在演进中，标题里的「（演进中）」是实时的，不是客套话）
+- 质量现状：以 `CHANGELOG.md` 与 `docs/dev/v1.0-readiness-v0.35.md` 为准（`docs/meta/EVALUATION_REPORT.md` 是 2026-09 加固批次之前的旧快照，勿引其分数）
+- Roadmap: `docs/meta/PRODUCTION_ROADMAP.md`（阶段 1–8 ✅；**阶段 9「高阶演进」是滚动项，非一次性完成**——其子项 1–4 已落地，子项 5「协议传输层高阶演进（gRPC Streaming / HTTP/2 深化）」仍在演进中，标题里的「（演进中）」是实时的，不是客套话）
 
 ### Release 流程（强制）
 - 发布一律走 `bash scripts/release.sh <x.y.z> [--push]`：自动 bump 全部版本引用
   （`build.zig.zon` / `src/ai/mcp.zig` / README* / CLAUDE.md / AGENTS.md /
   AI_METHODOLOGY.md）、promote CHANGELOG `[Unreleased]`、跑门禁
   （fmt + 全量测试 + deadcode）、commit + annotated tag，收尾断言 tag 与
-  包内 version 一致。同时把 `docs/UPGRADING.md` 的 `## v<旧版> 之后（未发布批次）`
+  包内 version 一致。同时把 `docs/reference/UPGRADING.md` 的 `## v<旧版> 之后（未发布批次）`
   节自动改名为 `## v<新版>`（残留该标题直接判失败），并打印本版的行为变化摘要
   （`破坏性:` / `行为变化` / `行为收紧` 行）供发布者过目。
 - 推 tag 前本地先过 `bash scripts/check-release-tag.sh`；CI 的 `release-verify`
@@ -491,9 +491,9 @@ filter 是**测试全限定名的子串**（形如 `core.cluster.RaftElection.te
 
 - Respond in 中文 for user-facing communication.
 - Do not create git commits unless the user explicitly asks.
-- Prefer the production-readiness plan without physically splitting `sqlx.zig` or `Server.zig`; use section comments plus `docs/PRODUCTION_ROADMAP.md` maintenance boundaries instead.
+- Prefer the production-readiness plan without physically splitting `sqlx.zig` or `Server.zig`; use section comments plus `docs/meta/PRODUCTION_ROADMAP.md` maintenance boundaries instead.
 - When generating framework code from SQL scripts (zmodu), follow zigmodu best practices for complete module output and place reusable templates in a dedicated templates folder.
-- When refining architecture or best practices, land them in docs (`docs/ZENT.md`, `MODULITH.md`, `MODULE_LAYERS.md`, `BEST_PRACTICES.md`, `ROUTE_TABLE.md`, `SQLX_DRIVERS.md`, **`AGENTS.md`**) rather than chat-only advice.
+- When refining architecture or best practices, land them in docs (`docs/reference/ZENT.md`, `MODULITH.md`, `MODULE_LAYERS.md`, `BEST_PRACTICES.md`, `ROUTE_TABLE.md`, `SQLX_DRIVERS.md`, **`AGENTS.md`**) rather than chat-only advice.
 - When restructuring examples, preserve existing domain/business logic unless explicitly asked to change it.
 
 ## Learned Workspace Facts
@@ -502,9 +502,9 @@ filter 是**测试全限定名的子串**（形如 `core.cluster.RaftElection.te
 - Sandbox cache：`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`.
 - Auth Path A + `CatalogPermLoadInput` 已落地；legacy JWT 只写 `auth_info`。
 - x402 fail-closed；OTLP/Vault 已支持 HTTPS（系统 CA）。
-- zent **v0.86.0**（示例按此验证）与 `data.sqlx` 正交，勿混驱动/共享事务；版本行为差（`getOwned`/`insertMany` 双参/裁剪构建/`zent.scope`/junction 撞名/`ShardSet` 借用契约/`VarChar(n)` 等）全在 `docs/ZENT.md`「版本口径」与 §14。两条实测陷阱：① `deinitRow(s)` 只用于**驱动扫描出来**的行——`getOwned` 这类带 allocator 返回的要用 `deinitRowWith(allocator, &e)`，配错 = 跨分配器 free 打死进程（`zmodu audit` b23 拦）；② 改依赖 pin 后先 `rm -rf .zig-cache`——增量缓存会沿用旧 fetch 模块（实测"编译通过"却跑旧版本）。
-- SQLx 选择性链接：`-Ddb=` / `.db=`，默认 `all`；框架测试勿收窄；见 `docs/SQLX_DRIVERS.md`。
+- zent **v0.86.0**（示例按此验证）与 `data.sqlx` 正交，勿混驱动/共享事务；版本行为差（`getOwned`/`insertMany` 双参/裁剪构建/`zent.scope`/junction 撞名/`ShardSet` 借用契约/`VarChar(n)` 等）全在 `docs/reference/ZENT.md`「版本口径」与 §14。两条实测陷阱：① `deinitRow(s)` 只用于**驱动扫描出来**的行——`getOwned` 这类带 allocator 返回的要用 `deinitRowWith(allocator, &e)`，配错 = 跨分配器 free 打死进程（`zmodu audit` b23 拦）；② 改依赖 pin 后先 `rm -rf .zig-cache`——增量缓存会沿用旧 fetch 模块（实测"编译通过"却跑旧版本）。
+- SQLx 选择性链接：`-Ddb=` / `.db=`，默认 `all`；框架测试勿收窄；见 `docs/guide/SQLX_DRIVERS.md`。
 - WS：`WsMessageFn` 含 `WsFrameKind`；fiber/io_uring 分发 text+binary（OpenIM protobuf OK）。
 - CI：`bash scripts/ci-integration.sh`（tenant-mgmt + stress + shopdemo，`-Ddb=sqlite`）。
-- Runtime 监督树（v0.31，`docs/RUNTIME.md` §14）：`rt.spawnGroup(policy)` + `Supervision.group`；重建是**原地** `deinit`+`init`（同线程同循环，handle 不换、邮箱不关）。声明 `run` 的 worker 进会重建的组 = spawn 报 `NotRestartable`。**多了一个"接收者可以回来"的理由**：`Mailbox.wake` / `recvWakeable` —— 成员必须在**读 `restart_requested` 之前**取 epoch，落在这两步之间的 `wake()` 否则会丢（`stop()` 靠关邮箱唤醒，重启不能关邮箱）。
+- Runtime 监督树（v0.31，`docs/reference/RUNTIME.md` §14）：`rt.spawnGroup(policy)` + `Supervision.group`；重建是**原地** `deinit`+`init`（同线程同循环，handle 不换、邮箱不关）。声明 `run` 的 worker 进会重建的组 = spawn 报 `NotRestartable`。**多了一个"接收者可以回来"的理由**：`Mailbox.wake` / `recvWakeable` —— 成员必须在**读 `restart_requested` 之前**取 epoch，落在这两步之间的 `wake()` 否则会丢（`stop()` 靠关邮箱唤醒，重启不能关邮箱）。
 - 旗舰示例：`examples/tenant-mgmt`（CatalogPermDb）；多主体门户参考应用侧 Alignment 文档（如 ZigShop）。
