@@ -104,3 +104,14 @@ docs/modules.md
 # runtime-stress history series (scripts/runtime-stress-record.sh default path)
 runtime-stress-history.jsonl
 .soak/
+
+# Node — the documentation site (site/.vitepress, sources in docs/)
+#
+# `package.json` / `package-lock.json` at the root are deliberately tracked:
+# they pin VitePress for GitHub Pages. `node_modules` sits at the root too,
+# not under `site/` — VitePress sets Vite's root to `srcDir` (docs/), and Node
+# resolution walks *up* from there, so a `site/node_modules` is invisible and
+# every `vue/*` import in a compiled Markdown SFC fails to resolve.
+node_modules/
+site/.vitepress/dist/
+site/.vitepress/cache/

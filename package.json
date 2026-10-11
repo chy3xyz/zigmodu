@@ -1,0 +1,15 @@
+{
+  "name": "zigmodu-site",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "vitepress dev site",
+    "build": "vitepress build site",
+    "preview": "vitepress preview site"
+  },
+  "dependencies": {
+    "markdown-it": "^15.0.2",
+    "markdown-it-plugins": "^0.4.0",
+    "vitepress": "^1.6.4"
+  }
+}

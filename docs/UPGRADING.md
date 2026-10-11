@@ -925,7 +925,13 @@ try R.wrapSuccess(ctx);
 ### 生成的 `shared/response.zig` 的成功信封曾是**非法 JSON**
 
 **Breaking?** 是（生成的响应体变了）。`wrapSuccess` 用了普通字符串字面量而不是 format string，
+
+<div v-pre>
+
 `{{\"code\":0…` 原样落进响应体 → 每个生成项目的成功信封都是 `{{"code":0,…}}`，任何 JSON 解析器都拒。
+
+</div>
+
 **一行改法**：重新生成即可（现在产出 `{"code":0,"msg":"","data":null}`）。
 自查：`curl … | python3 -m json.tool` —— 以前这里会报解析错误。
 

@@ -1,0 +1,65 @@
+name: docs
+
+# The site builds straight from the repository's own `docs/`, so a documentation
+# edit is an ordinary commit — there is no separate tree to keep in sync and no
+# sync step that can silently fall behind. That is the whole reason this lives
+# in-tree rather than in a standalone site repository.
+on:
+  push:
+    # This repository's default branch is `master`, not `main` — ci.yml lists
+    # both because it runs across forks, but a Pages trigger names one branch.
+    branches: [master]
+    paths:
+      - 'docs/**'
+      - 'site/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `node_modules` sits at the repository root, not under `site/`. VitePress
+      # sets Vite's root to `srcDir` (`docs/`), and Node resolves modules by
+      # walking *up* from the importer — so a `site/node_modules` is invisible to
+      # every Markdown file and the build dies on unresolved `vue/*` imports.
+      # A root install is what makes the upward walk land somewhere real.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: VitePress build
+        run: npm run build
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/.vitepress/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
