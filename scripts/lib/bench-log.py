@@ -321,7 +321,7 @@ def verdict_for(run, baseline, refs, normalized, threshold, suspect, roles):
     handoff = [d for d in measured if roles.get(d[0], ("reference", ""))[0] not in HOST_ROLES]
     if handoff:
         lines.append("    MOVED on a hand-off row is that pair's own noise (1.84x / 3.09x within one machine),")
-        lines.append("    not the host: only HOST-MOVED drives the verdict below. docs/RUNTIME.md §12.5.")
+        lines.append("    not the host: only HOST-MOVED drives the verdict below. docs/reference/RUNTIME.md §12.5.")
 
     lines.append("")
     lines.append(f"  step 2 - what the gate would fail on (threshold {threshold}x, the same lists the gate uses)")

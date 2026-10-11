@@ -2,10 +2,10 @@
 # Verify that document paths cited in source comments actually exist.
 #
 # The source tree points at its own docs by literal path — 454 times at the
-# time of writing, `docs/RUNTIME.md` accounting for 156 of them. Nothing checks
+# time of writing, `docs/reference/RUNTIME.md` accounting for 156 of them. Nothing checks
 # those paths, and nothing fails when one goes stale: a moved or renamed
 # document leaves a comment that still reads perfectly and points at nothing.
-# The failure surfaces months later, as a reader following `docs/RUNTIME.md
+# The failure surfaces months later, as a reader following `docs/reference/RUNTIME.md
 # §12` and finding no such file, with no way to tell the comment rotted rather
 # than the reader being wrong.
 #
@@ -34,10 +34,17 @@ cd "$ROOT"
 # Only these trees hold citations. `tools/zmodu/.zig-cache` is build output and
 # would otherwise contribute binary matches that grep reports as file names.
 #
-# This script is deliberately NOT scanned: its own header quotes example paths
-# (`docs/crm.md`, `docs/....md`) as illustrations of what to ignore, and a
-# scanner that flags its own documentation is worse than no scanner.
-SCAN=(src tools/zmodu/src .github/workflows)
+# `scripts/` IS scanned, deliberately, and excluding it was a mistake once
+# already: check-version.sh, bump-version.sh and release.sh each hardcode a
+# list of document paths to rewrite on a version bump, and when docs/ moved the
+# check-version gate failed with a path that no longer existed. The other three
+# went unnoticed because nothing referenced them. A stale path in a release
+# script rewrites the wrong file, or silently does nothing.
+#
+# This script's *header* is exempt, not the whole file: it quotes example paths
+# (`docs/crm.md`) to document what is ignored. Its inline code comments are
+# scanned like anything else, since those are the kind that rot.
+SCAN=(src tools/zmodu/src .github/workflows scripts)
 FILES=(AGENTS.md CLAUDE.md build.zig build.zig.zon README.md)
 
 # Build the file list, skipping anything absent so the script also runs in a
@@ -78,7 +85,8 @@ printf '%s\n' "$HITS" | while IFS= read -r hit; do
   case "$path" in *'*'*) continue ;; esac
   # Skip the test-fixture case described in the header.
   case "$loc" in
-    tools/zmodu/src/market.zig) continue ;;
+    tools/zmodu/src/market.zig) continue ;;   # test fixture, see header
+    scripts/check-doc-paths.sh) continue ;;   # this file's header, see header
   esac
   if [ -f "$path" ]; then
     continue
@@ -94,7 +102,7 @@ while IFS= read -r hit; do
   loc="${hit%:*}"          # file:line
   loc="${loc%:*}"          # file
   case "$path" in *'*'*) continue ;; esac
-  case "$loc" in tools/zmodu/src/market.zig) continue ;; esac
+  case "$loc" in tools/zmodu/src/market.zig) continue ;; scripts/check-doc-paths.sh) continue ;; esac
   if [ -f "$path" ]; then
     checked=$((checked + 1))
   else

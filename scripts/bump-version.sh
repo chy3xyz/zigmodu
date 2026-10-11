@@ -28,7 +28,7 @@ echo "bump-version: $OLD -> $NEW"
 sed -i '' "s/\.version = \"$OLD\"/.version = \"$NEW\"/" build.zig.zon
 
 # 2) Derived doc/readme references (CHANGELOG handled below).
-for f in README.md README.zh.md AGENTS.md CLAUDE.md docs/AI_METHODOLOGY.md docs/ZIGMODU_NOTES.md; do
+for f in README.md README.zh.md AGENTS.md CLAUDE.md docs/ai/AI_METHODOLOGY.md docs/meta/ZIGMODU_NOTES.md; do
   sed -i '' "s/$OLD/$NEW/g" "$f"
 done
 

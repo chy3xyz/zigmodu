@@ -5,7 +5,7 @@ usage: runtime_stress_trend.py [history.jsonl] [--window N] [--last K]
 
 The harness (src/runtime_stress.zig, RUNTIME_STRESS_HISTORY) appends one
 schema-v1 JSON line per run. This reader answers two questions separately,
-the same split docs/RUNTIME.md §12.15/§12.16 use:
+the same split docs/reference/RUNTIME.md §12.15/§12.16 use:
 
   * hard gates (host-INDEPENDENT, exit 1 on trip): the run failed, a push
     failure happened, a timer delivery was dropped, a measured window
@@ -104,7 +104,7 @@ def main() -> int:
     gate_zero("cpu.push_failures", get(latest, "cpu", "push_failures"))
     gate_zero("blocking.push_failures", get(latest, "blocking", "push_failures"))
     # NB: timers.dropped is NOT a gate — drop-on-full is the documented
-    # backpressure semantic (docs/RUNTIME.md §5), the harness only prints it.
+    # backpressure semantic (docs/reference/RUNTIME.md §5), the harness only prints it.
     # It is a drift row below; gating it would fail PASS runs.
     gate_zero("windows.alloc_calls", get(latest, "windows", "alloc_calls"))
     gate_zero("windows.alloc_bytes", get(latest, "windows", "alloc_bytes"))

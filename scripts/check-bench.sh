@@ -41,7 +41,7 @@
 # `[pct]` lines are **not** part of the criterion. Since 2026-09-19 the suite also
 # prints a latency distribution (p50/p95/p99/p99.9, ns/op, 1000 batch samples per
 # metric) for the latency-sensitive metrics — see `src/benchmark.zig` and
-# `docs/BEST_PRACTICES.md`. Those numbers never reach `bench-results.json`, so this
+# `docs/guide/BEST_PRACTICES.md`. Those numbers never reach `bench-results.json`, so this
 # script neither thresholds them nor knows their names: they pass through the log
 # verbatim to be read, and nothing here grows a `[pct]` criterion until the
 # cross-host spread of a tail is known (the same reason the atomic-path metrics
@@ -221,7 +221,7 @@
 # then, **28.19 ms** after that index became an `AutoArrayHashMapUnmanaged` —
 # a 9.4x no fresh-wheel harness can show, and the recorded 28.193 ms is the
 # `--update` run's value. `TimerWheel x100K` is unaffected in the judged run
-# (7.24 ms against 6.808 ms, 1.06x). Mechanism: `docs/RUNTIME.md` §4, the `nodes`
+# (7.24 ms against 6.808 ms, 1.06x). Mechanism: `docs/reference/RUNTIME.md` §4, the `nodes`
 # field's comment, and the `a long-lived wheel's lookups do not get slower as it
 # ages` test in that file.
 #
@@ -265,7 +265,7 @@
 # This loop never frees — it arms and drops — so nothing returns to any freelist
 # and the swap only adds `smp_allocator`'s own slab metadata. Tried and measured:
 # 7.95-12.17 ms, run-to-run 1.53x, worst in-run 1.86x. It is worse on every axis.
-# Full table: `docs/BEST_PRACTICES.md`, the `[pct]` section's last two bullets.
+# Full table: `docs/guide/BEST_PRACTICES.md`, the `[pct]` section's last two bullets.
 #
 # The CI file (`scripts/bench-baseline.ci.json`) does **not** carry that entry
 # yet. Recording it from this laptop would bake a value from the wrong machine
@@ -579,7 +579,7 @@ REF_METRIC="atomic RMW x10M"
 # 214.4-661.6 ms (3.09x), against 1.26x for `Mailbox post+drain x1M` in the same
 # runs. A 2.0x window on a number that swings 3x within one machine is a
 # false-red machine — one run in eight already breached it against its own low
-# sample. What the pair is *for* is the boundary (`docs/RUNTIME.md` §12.5):
+# sample. What the pair is *for* is the boundary (`docs/reference/RUNTIME.md` §12.5):
 # pooled costs ~2x a dedicated hand-off (ratio 1.57-2.93 over those runs), which
 # is why the critical path stays dedicated and the long tail pools.
 REF_METRICS=(

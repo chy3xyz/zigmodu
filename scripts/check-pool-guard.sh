@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Compile gate for `.mode = .pooled` on a worker that cannot be pooled.
 #
-# docs/RUNTIME.md §12.5: a `run`-owned worker has a loop of its own, so a pool
+# docs/reference/RUNTIME.md §12.5: a `run`-owned worker has a loop of its own, so a pool
 # thread running it would be occupied for as long as it runs — the pool would
 # have one worker. `spawnSupervised` turns that into a `@compileError`, which
 # cannot be asserted from inside the test suite (the failure *is* the test file's

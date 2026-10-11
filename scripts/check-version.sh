@@ -30,7 +30,7 @@ if [[ -z "$VERSION" ]]; then
 fi
 
 fail=0
-for f in README.md README.zh.md AGENTS.md CLAUDE.md docs/AI_METHODOLOGY.md; do
+for f in README.md README.zh.md AGENTS.md CLAUDE.md docs/ai/AI_METHODOLOGY.md; do
   if ! grep -q "$VERSION" "$f"; then
     echo "check-version: $f does not reference version $VERSION" >&2
     fail=1

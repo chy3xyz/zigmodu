@@ -331,10 +331,10 @@ print(f"  {len(moved)} of {len(host_readable)} host reference(s) outside the {su
       + ("" if moved else " — the host did not move in this run"))
 if handoff_moved:
     print(f"  {len(handoff_moved)} hand-off row(s) MOVED — that pair swings 1.84x/3.09x within one machine by")
-    print("  construction, so its drift says nothing about the host (docs/RUNTIME.md §12.5).")
+    print("  construction, so its drift says nothing about the host (docs/reference/RUNTIME.md §12.5).")
 print("  role tags: control reference = the host's own atomic cost (gating it fires on a host-generation")
 print("  change); candidate reference = recorded for a reference change no single machine can settle;")
-print("  hand-off pair = judged against each other (docs/RUNTIME.md §12.5), not against a gate.")
+print("  hand-off pair = judged against each other (docs/reference/RUNTIME.md §12.5), not against a gate.")
 print("  'noise or regression?' — bash scripts/check-bench.sh --explain <this log>; the convention is")
 print("  docs/dev/READING_NUMBERS.md.")
 

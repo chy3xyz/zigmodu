@@ -53,11 +53,11 @@ perl -0pi -e "s/\.version = \"$OLD\"/.version = \"$VERSION\"/" build.zig.zon
 perl -0pi -e "s/\.version = \"$OLD\"/.version = \"$VERSION\"/" tools/zmodu/build.zig.zon
 perl -0pi -e "s/\"version\", \"$OLD\"/\"version\", \"$VERSION\"/" src/ai/mcp.zig
 perl -0pi -e "s/# ZigModu v$OLD/# ZigModu v$VERSION/" README.md README.zh.md
-perl -0pi -e "s/ZigModu \*\*v$OLD\*\*/ZigModu **v$VERSION**/" CLAUDE.md docs/AI_METHODOLOGY.md
+perl -0pi -e "s/ZigModu \*\*v$OLD\*\*/ZigModu **v$VERSION**/" CLAUDE.md docs/ai/AI_METHODOLOGY.md
 perl -0pi -e "s/\*\*v$OLD\*\*/**v$VERSION**/g" AGENTS.md
-perl -0pi -e "s/\*\*框架版本\*\*: v$OLD/**框架版本**: v$VERSION/" docs/EVALUATION_REPORT.md
-perl -0pi -e "s/ZigModu \*\*v$OLD\*\*/ZigModu **v$VERSION**/" docs/EVALUATION_REPORT.md
-perl -0pi -e "s/\*\*版本口径\*\*: v$OLD/**版本口径**: v$VERSION/" docs/PRODUCTION_ROADMAP.md
+perl -0pi -e "s/\*\*框架版本\*\*: v$OLD/**框架版本**: v$VERSION/" docs/meta/EVALUATION_REPORT.md
+perl -0pi -e "s/ZigModu \*\*v$OLD\*\*/ZigModu **v$VERSION**/" docs/meta/EVALUATION_REPORT.md
+perl -0pi -e "s/\*\*版本口径\*\*: v$OLD/**版本口径**: v$VERSION/" docs/meta/PRODUCTION_ROADMAP.md
 fi
 
 # 2. CHANGELOG: promote Unreleased to the new version.
@@ -81,7 +81,7 @@ if grep -q "^## \[Unreleased\]" CHANGELOG.md; then
     # saying "v0.39.5 之后"), and the in-section pointer kept aiming at
     # CHANGELOG's [Unreleased] — so the rename is mechanical here, and any
     # leftover "（未发布批次）" heading is a hard failure below.
-    perl -0pi -e "s/## v\Q$OLD\E 之后（未发布批次）/## v$VERSION/" docs/UPGRADING.md
+    perl -0pi -e "s/## v\Q$OLD\E 之后（未发布批次）/## v$VERSION/" docs/reference/UPGRADING.md
 elif [ "$SKIP_BUMP" = "1" ]; then
     echo "CHANGELOG already promoted to [$VERSION]"
 else
@@ -91,8 +91,8 @@ fi
 
 # The template section mentions the in-cycle heading shape inline; only a
 # heading at line start is a leftover.
-if grep -n "^## .*（未发布批次）" docs/UPGRADING.md; then
-    echo "FAIL: docs/UPGRADING.md still has an （未发布批次） section heading."
+if grep -n "^## .*（未发布批次）" docs/reference/UPGRADING.md; then
+    echo "FAIL: docs/reference/UPGRADING.md still has an （未发布批次） section heading."
     echo "Rename it to v$VERSION and repoint in-body [Unreleased] references to [$VERSION]."
     exit 1
 fi
@@ -118,7 +118,7 @@ if ! grep -q "v$VERSION" CLAUDE.md || ! grep -q "v$VERSION" AGENTS.md; then
 fi
 # These two docs were historically missed by the bump; their top "版本口径"
 # line must track the release or the evaluation report drifts (820 vs 990 tests).
-if ! grep -q "v$VERSION" docs/EVALUATION_REPORT.md || ! grep -q "v$VERSION" docs/PRODUCTION_ROADMAP.md; then
+if ! grep -q "v$VERSION" docs/meta/EVALUATION_REPORT.md || ! grep -q "v$VERSION" docs/meta/PRODUCTION_ROADMAP.md; then
     echo "FAIL: EVALUATION_REPORT / PRODUCTION_ROADMAP version not updated to v$VERSION"
     exit 1
 fi
