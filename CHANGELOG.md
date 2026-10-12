@@ -38,6 +38,31 @@ Verified locally with the exact CI command shape: all pages generated,
 search index + sitemap + mermaid present, same-directory links resolve with
 the prefix (`/zigmodu/guide/MODULITH/`).
 
+### 第 173 批：文档站排除开发噪音树 + zdoc v0.16.2（**破坏性：否；CI-only**）
+
+The published site carried the repository's working notes: `docs/dev/` (33
+files — TODO piles, security-audit working notes, readiness snapshots,
+scaffold plans) and `docs/archive/` (19 files — superseded status reports).
+Both stay in the repository, where they are useful; on the site they were
+noise.
+
+1. **zdoc v0.16.1 → v0.16.2**, which added exactly the missing capability:
+   `--exclude <glob>` drops matching pages **entirely** — no HTML, no
+   sitemap entry, no search result (VitePress's curated sidebar only hid
+   them from navigation; zdoc now removes them from the site). The workflow
+   passes `--exclude 'dev/**' --exclude 'archive/**'`.
+2. **Verified against the real tree**: `dev/` and `archive/` are absent from
+   the output and from `sitemap.xml`; unresolved links drop 160 → 90 and
+   warnings 99 → 79 (0.16.2 also fixed the `../`-climb link parsing that
+   produced spurious unknown-page warnings, and now attributes warnings to
+   `file:line:col`).
+3. Remaining warnings are the known, by-design set: 40 unknown-page
+   (out-of-tree climbs like `../../CHANGELOG.md` — the VitePress build
+   exempted the same class), 48 unknown-ref (GitHub-style emoji heading
+   anchors vs zdoc's emoji-dropping ids), 2 unknown-language (`promql`,
+   rendered as plain text). The homepage hero `--url-prefix` defect also
+   persists upstream.
+
 ## [0.39.11] - 2026-10-12
 
 ### 第 154 批：文档数字漂移修正（死代码基线 / test artifact 数 / runtime gauge 数）（**破坏性：否**）

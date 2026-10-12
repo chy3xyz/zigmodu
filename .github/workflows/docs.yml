@@ -35,8 +35,8 @@ concurrency:
 env:
   # Pinned zdoc release; bump together with the SHA256 line below (the
   # upstream SHA256SUMS asset is the source of truth for the hash).
-  ZDOC_VERSION: v0.16.1
-  ZDOC_SHA256: 17aaf2e38e9c49a2b719c9fddc1385c610abdd14be5e9653fa751af86d82e7f1
+  ZDOC_VERSION: v0.16.2
+  ZDOC_SHA256: 6f0fd393be6d85ce45c47c39a9451ac689bc604f7751e743dd2ae821b0daf819
 
 jobs:
   build:
@@ -53,10 +53,17 @@ jobs:
           ./zdoc version
 
       - name: Build documentation site
+        # `--exclude` drops the development-noise trees entirely: no HTML, no
+        # sitemap entry, no search result. They stay in the repository for
+        # the people who work on it (and GitHub renders them fine) — a reader
+        # of the published site has no use for TODO piles, security-audit
+        # working notes and superseded status reports.
         run: |
           ./zdoc docs docs \
             --title ZigModu \
             --url-prefix zigmodu \
+            --exclude 'dev/**' \
+            --exclude 'archive/**' \
             --output site-dist
 
       - uses: actions/configure-pages@v5
