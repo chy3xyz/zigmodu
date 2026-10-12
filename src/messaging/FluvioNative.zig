@@ -25,10 +25,17 @@ pub const NativeTransport = struct {
     stream: std.Io.net.Stream,
 
     pub fn connect(allocator: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) !Self {
+        return connectWithTimeout(allocator, io, host, port, 0);
+    }
+
+    /// `connect` with a bound on the TCP dial (`0` = kernel default, which is
+    /// what plain `connect` keeps). A black-holed endpoint otherwise costs the
+    /// kernel's default for the whole attempt.
+    pub fn connectWithTimeout(allocator: std.mem.Allocator, io: std.Io, host: []const u8, port: u16, connect_timeout_ms: u32) !Self {
         const addr = try std.Io.net.IpAddress.parseIp4(host, port);
         // netdial, not std: a signal inside std's blocking connect panics on
         // the EINTR retry's EISCONN (`errnoBug`) — core/netdial.zig.
-        const stream = try netdial.connectBlocking(io, addr);
+        const stream = try netdial.connectTimeout(io, addr, connect_timeout_ms);
         return .{ .allocator = allocator, .io = io, .stream = stream };
     }
 
@@ -82,9 +89,16 @@ pub const NativeTransport = struct {
             if (!std.mem.startsWith(u8, line, "RECORD ")) return error.ProtocolError;
             const rest = line["RECORD ".len..];
             const tab = std.mem.indexOfScalar(u8, rest, '\t') orelse return error.ProtocolError;
+            // Dupe into locals first: inline in `append`'s argument list, a
+            // failing second dupe (or the append's own growth) stranded the
+            // first copy — nothing still named it.
+            const key = try self.allocator.dupe(u8, rest[0..tab]);
+            errdefer self.allocator.free(key);
+            const value = try self.allocator.dupe(u8, rest[tab + 1 ..]);
+            errdefer self.allocator.free(value);
             try records.append(self.allocator, .{
-                .key = try self.allocator.dupe(u8, rest[0..tab]),
-                .value = try self.allocator.dupe(u8, rest[tab + 1 ..]),
+                .key = key,
+                .value = value,
                 .offset = seq,
                 .timestamp = 0,
             });

@@ -42,6 +42,7 @@ const InstallSnapshotRequest = @import("RaftElection.zig").InstallSnapshotReques
 const InstallSnapshotResponse = @import("RaftElection.zig").InstallSnapshotResponse;
 const Snapshotter = @import("RaftElection.zig").Snapshotter;
 const default_snapshot_chunk_bytes = @import("RaftElection.zig").default_snapshot_chunk_bytes;
+const default_max_snapshot_bytes = @import("RaftElection.zig").default_max_snapshot_bytes;
 const ClusterMetrics = @import("ClusterMetrics.zig").ClusterMetrics;
 const ClusterHealth = @import("ClusterHealth.zig");
 const MembershipView = @import("../../cluster/MembershipView.zig").MembershipView;
@@ -133,6 +134,11 @@ pub const BootstrapConfig = struct {
     /// Per-frame payload cap for InstallSnapshot chunks — forwarded to
     /// `ElectionConfig.snapshot_chunk_bytes`.
     snapshot_chunk_bytes: usize = default_snapshot_chunk_bytes,
+    /// Total-bytes cap on one InstallSnapshot accumulation — forwarded to
+    /// `ElectionConfig.max_snapshot_bytes` (`0` disables the bound). A
+    /// misbehaving leader can otherwise grow a follower's `pending_snapshot`
+    /// without limit.
+    max_snapshot_bytes: usize = default_max_snapshot_bytes,
 };
 
 pub const ClusterBootstrap = struct {
@@ -201,6 +207,7 @@ pub const ClusterBootstrap = struct {
         const bus = try self.allocator.create(DistributedEventBus);
         bus.* = try DistributedEventBus.init(self.allocator, self.io, self.config.node_id);
         self.bus = bus;
+        bus.setMetrics(&self.metrics);
         // The bus is its own inbound surface — its own listener, its own wire
         // format (`docs/dev/cluster-auth-design.md` §3.3, threat #5) — so the
         // same key has to reach it: an authenticated Raft port next to an
@@ -305,6 +312,7 @@ pub const ClusterBootstrap = struct {
             .peer_keys = self.config.peer_keys,
             .snapshot_threshold_entries = self.config.snapshot_threshold_entries,
             .snapshot_chunk_bytes = self.config.snapshot_chunk_bytes,
+            .max_snapshot_bytes = self.config.max_snapshot_bytes,
             .snapshotter = self.config.snapshotter,
             .snapshotter_ctx = self.config.snapshotter_ctx,
         };
@@ -342,6 +350,7 @@ pub const ClusterBootstrap = struct {
         const raft = try self.allocator.create(RaftElection);
         raft.* = try RaftElection.init(self.allocator, self.config.node_id, &.{}, election_cfg, &self.election_transport);
         self.raft = raft;
+        raft.setMetrics(&self.metrics);
 
         // Add peers to Raft **by id** — that is the name their ballots are counted
         // under (a peer answers a vote with its `node_id`, so `addPeer(p.host)`
@@ -647,6 +656,66 @@ test "ClusterBootstrap initialization" {
     try std.testing.expectEqual(@as(usize, 1), snap.count());
     try std.testing.expectEqualStrings("test-node", snap.find("test-node").?.id);
     try std.testing.expect(snap.find("test-node").?.healthy);
+}
+
+// The bootstrap path forwards snapshot knobs into `ElectionConfig` by named
+// field, so a default that drifts from the election-side constant would
+// silently bind cluster users to a different bound than direct Raft users
+// get (batch 169's review flagged exactly this gap for `max_snapshot_bytes`).
+test "ClusterBootstrap forwards snapshot bounds with the election defaults" {
+    try std.testing.expectEqual(
+        @import("RaftElection.zig").default_max_snapshot_bytes,
+        (BootstrapConfig{ .node_id = "" }).max_snapshot_bytes,
+    );
+    try std.testing.expectEqual(
+        @import("RaftElection.zig").default_snapshot_chunk_bytes,
+        (BootstrapConfig{ .node_id = "" }).snapshot_chunk_bytes,
+    );
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var cluster = try ClusterBootstrap.init(allocator, io, .{
+        .node_id = "test-node",
+        // Not in the 19000–19005 range the sibling tests use: OrbStack port
+        // forwards on this host squat that range and a fixed port here then
+        // collides with an unrelated container.
+        .port = 19191,
+        .peers = &.{},
+        .raft_cluster_size = 1,
+        .max_snapshot_bytes = 4096,
+    });
+    defer cluster.deinit();
+    try cluster.start();
+    try std.testing.expectEqual(@as(usize, 4096), cluster.getRaft().?.config.max_snapshot_bytes);
+}
+
+test "ClusterBootstrap wires its metrics into the bus and the raft" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var cluster = try ClusterBootstrap.init(allocator, io, .{
+        .node_id = "metrics-node",
+        .port = 19760,
+        .peers = &.{},
+        // Single node: nothing to elect with, so the stub transport is fine.
+        .raft_cluster_size = 1,
+    });
+    defer cluster.deinit();
+    try cluster.start();
+
+    // Same sink, by pointer identity — the bus's frame counters and the raft's
+    // epoch gauge both land in what `getMetrics` hands out.
+    try std.testing.expect(cluster.getEventBus().?.metrics.? == cluster.getMetrics());
+    try std.testing.expect(cluster.getRaft().?.metrics.? == cluster.getMetrics());
+
+    // And the wiring is live: a single-node cluster elects itself once the
+    // election timeout (150-300 ms wall-clock) has elapsed, and becoming
+    // leader moves the epoch gauge to this node's own term.
+    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(400), .awake) catch {};
+    try cluster.tick();
+    const raft = cluster.getRaft().?;
+    try std.testing.expect(raft.isLeader());
+    try std.testing.expectEqual(raft.getTerm(), cluster.getMetrics().leader_epoch.load(.monotonic));
 }
 
 test "ClusterBootstrap accepts an app-supplied Raft transport" {

@@ -148,6 +148,13 @@ pub const RateLimiter = struct {
     }
 };
 
+/// Default for `RateLimiterRegistry.max_keys`, named so a wrapper can share it
+/// instead of restating the number. 65k limiters is generous for real
+/// per-client traffic (a limiter is a few dozen bytes plus its key) while still
+/// capping the absolute growth of a registry keyed by attacker-controlled
+/// input.
+pub const default_max_keys: usize = 65_536;
+
 /// Per-key `RateLimiter` pool (per user, per IP, per route).
 ///
 /// Limiters are heap-allocated and the map holds pointers, so a `*RateLimiter`
@@ -163,14 +170,19 @@ pub const RateLimiterRegistry = struct {
     limiters: std.StringHashMap(*RateLimiter),
     default_max_tokens: u32,
     default_refill_rate: u32,
-    /// Upper bound on tracked limiters. 0 = unbounded (previous behaviour).
+    /// Upper bound on tracked limiters. 0 = unbounded — the previous behaviour,
+    /// now available **only** as an explicit opt-in.
     ///
     /// Per-client limiters are keyed by attacker-controlled input (IP, user id),
     /// so an unbounded registry grows for as long as someone keeps sending new
-    /// keys — a memory-growth vector, not a style question. At `max_keys` the
+    /// keys — a memory-growth vector, not a style question. The default is
+    /// therefore `default_max_keys`, not unbounded: at `max_keys` the
     /// least-recently-used limiter is evicted on insert (its budget resets if it
     /// comes back, which under eviction pressure is the intended trade).
-    max_keys: usize = 0,
+    ///
+    /// A caller that truly wants no bound passes 0 to `initWithCapacity` or
+    /// assigns the field after `init` — a bare `init` never gets it.
+    max_keys: usize = default_max_keys,
 
     pub fn init(allocator: std.mem.Allocator, default_max_tokens: u32, default_refill_rate: u32) Self {
         return .{
@@ -658,13 +670,47 @@ test "registry remove and retain reclaim entries" {
 }
 
 test "registry.max_keys = 0 keeps the unbounded behaviour" {
+    // Unbounded growth survives only as an explicit opt-in — a bare `init` is
+    // bounded (`default_max_keys`), so this pins the escape hatch: an explicit
+    // 0 must keep accepting keys past the default cap.
+    const allocator = std.testing.allocator;
+    var registry = RateLimiterRegistry.initWithCapacity(allocator, 5, 0, 0);
+    defer registry.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), registry.max_keys);
+    for (0..default_max_keys + 1) |i| {
+        var buf: [16]u8 = undefined;
+        _ = try registry.getOrCreate(try std.fmt.bufPrint(&buf, "k{d}", .{i}));
+    }
+    try std.testing.expectEqual(default_max_keys + 1, registry.count());
+}
+
+test "registry defaults to a bounded key table" {
+    // Per-client keys come from the request (IP, user id), so the default must
+    // not be a memory-growth vector: a bare `init` caps the table at
+    // `default_max_keys`, and inserts past the cap evict (the count holds at
+    // the cap — the LRU test above pins *which* entry goes).
     const allocator = std.testing.allocator;
     var registry = RateLimiterRegistry.init(allocator, 5, 0);
     defer registry.deinit();
 
-    for (0..20) |i| {
+    try std.testing.expectEqual(default_max_keys, registry.max_keys);
+    for (0..default_max_keys + 1) |i| {
         var buf: [16]u8 = undefined;
         _ = try registry.getOrCreate(try std.fmt.bufPrint(&buf, "k{d}", .{i}));
     }
-    try std.testing.expectEqual(@as(usize, 20), registry.count());
+    try std.testing.expectEqual(default_max_keys, registry.count());
+}
+
+test "registry.max_keys honours an explicit value above the default" {
+    const allocator = std.testing.allocator;
+    var registry = RateLimiterRegistry.initWithCapacity(allocator, 5, 0, 100_000);
+    defer registry.deinit();
+
+    try std.testing.expectEqual(@as(usize, 100_000), registry.max_keys);
+    for (0..10) |i| {
+        var buf: [16]u8 = undefined;
+        _ = try registry.getOrCreate(try std.fmt.bufPrint(&buf, "k{d}", .{i}));
+    }
+    try std.testing.expectEqual(@as(usize, 10), registry.count());
 }

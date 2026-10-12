@@ -172,6 +172,11 @@ pub const RedisConfig = struct {
     pool_size: u32 = 100,
     read_timeout_ms: u32 = 3000,
     write_timeout_ms: u32 = 3000,
+    /// Bound on the TCP dial itself; `0` keeps the kernel's default (the
+    /// pre-existing behaviour). A wedged peer whose SYNs go unanswered
+    /// otherwise costs that default — measured >25 s on macOS for a
+    /// black-holed link-local address.
+    connect_timeout_ms: u32 = 0,
 
     /// Config from a URL-shaped address (`redis://127.0.0.1:6379`, the shape
     /// `REDIS_URL` carries). Scheme, `user:password@` and any path are dropped;
@@ -262,7 +267,7 @@ pub const Redis = struct {
         const address = std.Io.net.IpAddress.parseIp4(self.config.host, self.config.port) catch return error.RedisError;
         // netdial, not std: a signal inside std's blocking connect panics on
         // the EINTR retry's EISCONN (`errnoBug`) — core/netdial.zig.
-        self.stream = netdial.connectBlocking(self.io, address) catch return error.RedisError;
+        self.stream = netdial.connectTimeout(self.io, address, self.config.connect_timeout_ms) catch return error.RedisError;
         // `write_timeout_ms` used to be declared and never applied: a stalled
         // Redis made writes block forever (and held `stream_mu` while doing it).
         if (self.stream) |s| sockread.setSendTimeout(s, self.config.write_timeout_ms);
@@ -290,7 +295,7 @@ pub const Redis = struct {
                     return .{ .stream = slot.*.?, .pool_idx = i };
                 }
                 const address = std.Io.net.IpAddress.parseIp4(self.config.host, self.config.port) catch return error.RedisError;
-                const s = netdial.connectBlocking(self.io, address) catch return error.RedisError;
+                const s = netdial.connectTimeout(self.io, address, self.config.connect_timeout_ms) catch return error.RedisError;
                 slot.* = s;
                 p.in_use[i] = true;
                 return .{ .stream = s, .pool_idx = i };

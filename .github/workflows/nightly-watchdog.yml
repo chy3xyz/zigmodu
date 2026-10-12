@@ -1,0 +1,95 @@
+name: Nightly Watchdog
+
+# Guards the one failure mode ci.yml cannot report about itself: a nightly
+# that never produced a verdict. ci.yml's soak / bench-x86_64 jobs fire on
+# `schedule` (03:17 UTC), but from the outside a cancelled nightly and a green
+# nightly look identical — ci.yml says so itself in the soak-smoke step
+# comment — and GitHub also disables schedules silently on repos it considers
+# inactive. Both end states are *no signal at all*, and no job inside ci.yml
+# can notice (a job only runs when the workflow already did).
+#
+# So the check lives in its own workflow, on its own schedule, a few hours
+# after the nightly: read the most recent `schedule`-triggered ci.yml run and
+# require that it (a) exists, (b) was created within the last 24 hours — i.e.
+# last night's run really fired — and (c) concluded `success`. Anything else
+# writes a job-summary banner, raises an ::error annotation, and exits 1, so
+# the failure shows up as a red run in the Actions tab (and in the mail of
+# whoever watches scheduled-workflow failures) instead of as silence.
+#
+# Deliberately NOT done here: no artifact marker file written by the nightly
+# itself (the scheduled run's record in the runs API *is* the marker — an
+# artifact-based one would need the artifacts API, fight artifact retention,
+# and still not say *which* job failed), and no re-run of anything the nightly
+# covers. This is a watchdog, not a second nightly.
+on:
+  schedule:
+    # 06:47 UTC. The nightly fires 03:17 UTC and every job in it is capped at
+    # 30 minutes, so even with runner-queue slack the verdict is final by
+    # ~04:30; 06:47 leaves hours of margin. Off the hour/half-hour on purpose
+    # (the fleet-wide cron rush lands there).
+    - cron: '47 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: read # `gh run list` — nothing else is needed, no checkout either.
+
+jobs:
+  check-last-nightly:
+    name: Last scheduled ci.yml run is recent and green
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check the last scheduled ci.yml run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No actions/checkout: gh takes the repo from GH_REPO, and the check
+          # reads only the runs API — it never touches the tree.
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh run list --workflow=ci.yml --event schedule --limit 1 \
+            --json databaseId,status,conclusion,createdAt,url > "$RUNNER_TEMP/last-nightly.json"
+          python3 - "$RUNNER_TEMP/last-nightly.json" <<'PY'
+          import datetime, json, os, sys
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+
+          def report(md):
+              """Job summary + log line, one call."""
+              print(md)
+              if summary_path:
+                  with open(summary_path, "a") as fh:
+                      fh.write(md + "\n")
+
+          def alarm(md):
+              report("## :rotating_light: nightly watchdog\n\n" + md)
+              # Single-line variant for the annotation (workflow commands are
+              # line-based; the summary carries the detail).
+              first = md.split("\n", 1)[0]
+              print(f"::error::nightly watchdog: {first}")
+              sys.exit(1)
+
+          runs = json.load(open(sys.argv[1]))
+          if not runs:
+              alarm("**No `schedule`-triggered ci.yml run exists at all.** The nightly "
+                    "never fired — GitHub disables schedules on repos it considers "
+                    "inactive, which is exactly the silence this watchdog exists for.")
+          run = runs[0]
+          created = datetime.datetime.fromisoformat(run["createdAt"].replace("Z", "+00:00"))
+          age_h = (datetime.datetime.now(datetime.timezone.utc) - created).total_seconds() / 3600
+          head = (f"last scheduled ci.yml run: {run['url']} — status={run['status']} "
+                  f"conclusion={run['conclusion']} created {age_h:.1f}h ago")
+
+          if age_h > 24:
+              alarm(f"**The nightly did not run last night.** {head} — the most recent "
+                    "scheduled run is more than 24h old, so the 03:17 UTC slot fired "
+                    "nothing (cancelled slot, disabled schedule, or Actions outage).")
+          if run["status"] != "completed":
+              # Every nightly job is timeout-bounded, so a run still going at this
+              # hour is queueing, not a hang; next morning's check reads its verdict.
+              report(f"## :hourglass_flowing_sand: nightly watchdog\n\n{head} — still running; "
+                     "the per-job timeouts bound it, and tomorrow's check reads the verdict.")
+              sys.exit(0)
+          if run["conclusion"] != "success":
+              alarm(f"**Last night's ci.yml run concluded `{run['conclusion']}`.** {head}")
+          report(f"## :white_check_mark: nightly watchdog\n\n{head}")
+          PY

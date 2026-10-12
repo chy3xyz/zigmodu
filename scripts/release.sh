@@ -123,16 +123,35 @@ if ! grep -q "v$VERSION" docs/archive/status/EVALUATION_REPORT.md || ! grep -q "
     exit 1
 fi
 
-# 3. Quality gates. Keep this list a superset of what ci.yml blocks on: a gate
-#    that only CI runs can reject the very tag this script is about to cut.
-#    v0.27.0 shipped that way — `check-version.sh` was missing here and failed
-#    the "Version consistency" step minutes after the tag was pushed.
+# 3. Quality gates. Every *fast* gate ci.yml blocks on also runs here, so the
+#    tag this script cuts cannot be rejected by a check that could have run
+#    locally first. v0.27.0 shipped that way — `check-version.sh` was missing
+#    here and failed the "Version consistency" step minutes after the tag was
+#    pushed — and the doc-paths / pool-guard / test-collection gates were
+#    CI-only in the same way until they were added below.
+#
+#    Deliberately CI-only (kept out by choice, not by omission):
+#      - integration-full (scripts/ci-integration.sh) and the nginx/envoy
+#        smuggling probes — need docker and real gateways;
+#      - test-postgres / test-mysql / test-live-services — need the service
+#        containers only CI provides;
+#      - the benchmark gate and the nightly bench-x86_64 cross-host gate —
+#        a benchmark verdict is only meaningful on the runner class its
+#        baseline was recorded on (see the scripts/check-bench.sh header);
+#      - the nightly legs (soak / soak-cluster / runtime-stress /
+#        mixed-version / fuzz) — long scheduled runs;
+#      - the per-OS example builds / doctor / smokes, `zig build docs`,
+#        soak-compile and soak-smoke — matrix/Linux-gated CI legs; the suite
+#        above already compiles and tests the framework itself.
 echo "-- gates --"
 zig fmt --check src tools examples
 ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test --summary all
 bash scripts/check-deadcode.sh
 bash scripts/check-version.sh
+bash scripts/check-doc-paths.sh
 bash scripts/check-tenant-scope.sh
+bash scripts/check-pool-guard.sh
+bash scripts/check-test-collection.sh
 zig build check-api
 zig build check
 
@@ -157,6 +176,40 @@ if [ "$PUSH" = "1" ]; then
     git push origin master
     git push origin "v$VERSION"
     echo "pushed master + v$VERSION"
+
+    # 6. GitHub Release: create it from this version's CHANGELOG section.
+    #    Publishing the release fires ci.yml's `release: published` trigger, so
+    #    the docker + release jobs build zigmodu-v$VERSION-linux-x86_64.tar.gz
+    #    and its .sha256 companion and attach both — until this was automated,
+    #    a pushed tag waited for someone to open the Releases page by hand.
+    #    Not fatal when it cannot happen here: the tag is the source of truth
+    #    (release-verify still gates it), so a missing `gh` or a failed create
+    #    degrades to the printed manual commands instead of a failed release.
+    if command -v gh >/dev/null 2>&1; then
+        if gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "release: GitHub Release v$VERSION already exists — skipping create"
+        else
+            NOTES="$(mktemp -t zm-release-notes.XXXXXX)"
+            if bash scripts/release-notes.sh "$VERSION" > "$NOTES" && [ -s "$NOTES" ]; then
+                if gh release create "v$VERSION" --verify-tag --notes-file "$NOTES"; then
+                    echo "release: GitHub Release v$VERSION created — the ci.yml release job now"
+                    echo "  builds and attaches zigmodu-v$VERSION-linux-x86_64.tar.gz (+ .sha256)."
+                else
+                    echo "WARN: gh release create failed; create the release by hand:" >&2
+                    echo "  bash scripts/release-notes.sh $VERSION > /tmp/notes-v$VERSION.md" >&2
+                    echo "  gh release create v$VERSION --verify-tag --notes-file /tmp/notes-v$VERSION.md" >&2
+                fi
+            else
+                echo "WARN: no CHANGELOG section extracted for $VERSION; create the release by hand:" >&2
+                echo "  gh release create v$VERSION --verify-tag --generate-notes" >&2
+            fi
+            rm -f "$NOTES"
+        fi
+    else
+        echo "gh CLI not found — create the GitHub Release by hand (the tag is already pushed):"
+        echo "  bash scripts/release-notes.sh $VERSION > /tmp/notes-v$VERSION.md"
+        echo "  gh release create v$VERSION --verify-tag --notes-file /tmp/notes-v$VERSION.md"
+    fi
 
     # The tag push only runs release-verify (tag == package version). The real
     # suite runs on the *master* push, and `ci.yml` cancels in-progress runs for

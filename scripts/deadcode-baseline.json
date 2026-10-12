@@ -50,48 +50,6 @@
       "parent": null
     },
     {
-      "file": "src/core/cluster/RaftTransport.zig",
-      "line": 782,
-      "kind": "field",
-      "name": "wHighVersion",
-      "parent": "InitData"
-    },
-    {
-      "file": "src/core/cluster/RaftTransport.zig",
-      "line": 783,
-      "kind": "field",
-      "name": "szDescription",
-      "parent": "InitData"
-    },
-    {
-      "file": "src/core/cluster/RaftTransport.zig",
-      "line": 784,
-      "kind": "field",
-      "name": "szSystemStatus",
-      "parent": "InitData"
-    },
-    {
-      "file": "src/core/cluster/RaftTransport.zig",
-      "line": 785,
-      "kind": "field",
-      "name": "iMaxSockets",
-      "parent": "InitData"
-    },
-    {
-      "file": "src/core/cluster/RaftTransport.zig",
-      "line": 786,
-      "kind": "field",
-      "name": "iMaxUdpDg",
-      "parent": "InitData"
-    },
-    {
-      "file": "src/core/cluster/RaftTransport.zig",
-      "line": 787,
-      "kind": "field",
-      "name": "lpVendorInfo",
-      "parent": "InitData"
-    },
-    {
       "file": "src/core/eventbus/WAL.zig",
       "line": 13,
       "kind": "constant",
@@ -104,6 +62,48 @@
       "kind": "field",
       "name": "_pad",
       "parent": "WALEntryHeader"
+    },
+    {
+      "file": "src/core/netdial.zig",
+      "line": 420,
+      "kind": "field",
+      "name": "wHighVersion",
+      "parent": "InitData"
+    },
+    {
+      "file": "src/core/netdial.zig",
+      "line": 421,
+      "kind": "field",
+      "name": "szDescription",
+      "parent": "InitData"
+    },
+    {
+      "file": "src/core/netdial.zig",
+      "line": 422,
+      "kind": "field",
+      "name": "szSystemStatus",
+      "parent": "InitData"
+    },
+    {
+      "file": "src/core/netdial.zig",
+      "line": 423,
+      "kind": "field",
+      "name": "iMaxSockets",
+      "parent": "InitData"
+    },
+    {
+      "file": "src/core/netdial.zig",
+      "line": 424,
+      "kind": "field",
+      "name": "iMaxUdpDg",
+      "parent": "InitData"
+    },
+    {
+      "file": "src/core/netdial.zig",
+      "line": 425,
+      "kind": "field",
+      "name": "lpVendorInfo",
+      "parent": "InitData"
     },
     {
       "file": "src/extensions/HotReloader.zig",

@@ -127,6 +127,16 @@ pub fn rateLimit(limiter: *RateLimiter) api.Middleware {
 
 /// Per-client rate limiting — uses a specific key from the request (IP, API key, etc).
 /// Usage: `try server.addMiddleware(try rateLimitPerClient(&registry, extractKey))`
+///
+/// The key comes from the request, so every distinct caller mints a limiter —
+/// the registry this middleware writes into is keyed by attacker-controlled
+/// input. `RateLimiterRegistry` answers that with a bounded table: `init`
+/// defaults `max_keys` to `default_max_keys` (65_536) and evicts the
+/// least-recently-used limiter past the cap, which is what keeps rotating keys
+/// from being a memory-growth vector. An unbounded registry is still possible
+/// but only as an explicit opt-in (`RateLimiterRegistry.initWithCapacity(…, 0)`
+/// or assigning `max_keys` after `init`); this middleware deliberately does not
+/// second-guess the caller's registry configuration.
 pub fn rateLimitPerClient(
     registry: *RateLimiterRegistry,
     key_extractor: *const fn (*api.Context) []const u8,

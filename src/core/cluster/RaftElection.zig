@@ -12,6 +12,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Time = @import("../Time.zig");
+const ClusterMetrics = @import("ClusterMetrics.zig").ClusterMetrics;
+const AuthFailLogLimiter = @import("ClusterAuth.zig").AuthFailLogLimiter;
 
 /// The lock guarding a `RaftElection`'s state.
 ///
@@ -310,6 +312,25 @@ pub const ElectionConfig = struct {
     /// 65535.
     snapshot_chunk_bytes: usize = default_snapshot_chunk_bytes,
 
+    /// Total byte cap on one inbound InstallSnapshot's reassembly buffer
+    /// (`pending_snapshot`): a stream whose next chunk would push the assembled
+    /// bytes past this is refused — the partial bytes are dropped **and freed**,
+    /// and the reply is the same term-only answer a mismatching continuation
+    /// gets. The wire protocol has no rejection flag, so the leader reads the
+    /// transfer as incomplete and re-offers the snapshot from `offset = 0` on a
+    /// later round: a legitimate snapshot under the cap still lands, just after
+    /// a retry.
+    ///
+    /// Each frame is small (`snapshot_chunk_bytes`, wire-clamped to a u16), but
+    /// nothing else stops a malfunctioning or hostile leader from streaming
+    /// chunks forever — the buffer is follower memory, filled one
+    /// peer-controlled frame at a time. The default is generous on purpose:
+    /// 256 MiB (`default_max_snapshot_bytes`), i.e. 16k chunks of the default
+    /// `snapshot_chunk_bytes`, so a real state-machine snapshot fits and only a
+    /// runaway stream trips the cap. `0` disables the bound (the pre-cap
+    /// behaviour).
+    max_snapshot_bytes: usize = default_max_snapshot_bytes,
+
     /// §7: where snapshot bytes come from when `snapshot_threshold_entries`
     /// fires (or when an app drives `compactLog` itself it passes the bytes
     /// directly). Called from `tick()` with the lock held, on whichever role
@@ -331,6 +352,11 @@ pub const ElectionConfig = struct {
 /// Default for `ElectionConfig.snapshot_chunk_bytes`, named so
 /// `BootstrapConfig` can share it instead of restating the number.
 pub const default_snapshot_chunk_bytes: usize = 16 * 1024;
+
+/// Default for `ElectionConfig.max_snapshot_bytes` — 256 MiB, named so a
+/// wrapper config can share it instead of restating the number (the same
+/// convention as `default_snapshot_chunk_bytes`).
+pub const default_max_snapshot_bytes: usize = 256 * 1024 * 1024;
 
 /// See `ElectionConfig.snapshotter`.
 pub const Snapshotter = *const fn (ctx: ?*anyopaque, up_to_index: u64, allocator: std.mem.Allocator) anyerror![]u8;
@@ -509,6 +535,18 @@ pub const RaftElection = struct {
 
     // Transport interface for sending messages
     transport: *const ElectionTransport,
+
+    /// The cluster metrics sink, wired by `setMetrics` (which
+    /// `ClusterBootstrap.start()` calls on its own metrics instance). All
+    /// updates are single atomic stores/fetch-adds, so the accept thread and
+    /// the tick thread can both report without touching `lock`/`key_lock`.
+    /// Null means "no sink": a standalone raft simply does not report.
+    metrics: ?*ClusterMetrics = null,
+
+    /// Rate limiter for the inbound MAC-failure warn line — the state lives
+    /// here because `RaftTransport.handleConnection` is a free function whose
+    /// only durable anchor is the raft it serves. See `ClusterAuth.zig`.
+    auth_fail_log: AuthFailLogLimiter = .{},
 
     // ── Outbound staging (the three-phase flush — see `flushOutgoing`) ──
 
@@ -696,6 +734,24 @@ pub const RaftElection = struct {
         self.* = undefined;
     }
 
+    /// Wire the cluster metrics sink. Startup-time only: call it before the
+    /// first `tick()` and before any inbound dispatch reaches this raft (the
+    /// order `ClusterBootstrap.start()` already keeps), so it deliberately
+    /// takes no lock.
+    pub fn setMetrics(self: *Self, metrics: *ClusterMetrics) void {
+        self.metrics = metrics;
+    }
+
+    /// Publish the term this node currently acknowledges as the cluster's
+    /// leadership generation. Called at the two epoch events: winning an
+    /// election (`becomeLeader` — the epoch is this node's own term) and a
+    /// standing leader conceding to a higher term (the cluster has moved past
+    /// the epoch this node led). A follower re-asserting `.follower` is not an
+    /// epoch event and must not call this.
+    fn noteLeaderEpoch(self: *Self) void {
+        if (self.metrics) |m| m.setLeaderEpoch(self.current_term);
+    }
+
     /// Main tick function - called periodically.
     ///
     /// One tick is one `flushOutgoing`: decide under `lock` (election timeout →
@@ -860,8 +916,12 @@ pub const RaftElection = struct {
         }
 
         if (req.term > self.current_term) {
+            const was_leader = self.state == .leader;
             self.current_term = req.term;
             self.state = .follower;
+            // A standing leader conceding to a higher term is an epoch event;
+            // a follower adopting one is not.
+            if (was_leader) self.noteLeaderEpoch();
             if (self.voted_for) |v| self.allocator.free(v);
             self.voted_for = null;
         }
@@ -936,7 +996,9 @@ pub const RaftElection = struct {
         }
 
         // Reset to follower state and update election deadline
+        const was_leader = self.state == .leader;
         self.state = .follower;
+        if (was_leader) self.noteLeaderEpoch();
         const now_ms = Time.monotonicNowMilliseconds();
         self.last_heartbeat_ms = now_ms;
         self.election_deadline_ms = now_ms + @as(i64, @intCast(self.randomElectionTimeout()));
@@ -1500,6 +1562,9 @@ pub const RaftElection = struct {
     /// Become leader (we've won the election)
     fn becomeLeader(self: *Self) void {
         self.state = .leader;
+        // The epoch gauge's primary source: this node's term is the leadership
+        // generation it now leads.
+        self.noteLeaderEpoch();
         // Allocate before freeing: the old order freed `leader_id` first, so a
         // failed dupe left it dangling until the `catch` reassigned it.
         const leader_copy = self.allocator.dupe(u8, self.local_id) catch self.local_id;
@@ -1545,8 +1610,10 @@ pub const RaftElection = struct {
     /// synchronous send path's phase 3).
     fn processInstallSnapshotResponse(self: *Self, resp: InstallSnapshotResponse, from_peer: []const u8) void {
         if (resp.term > self.current_term) {
+            const was_leader = self.state == .leader;
             self.current_term = resp.term;
             self.state = .follower;
+            if (was_leader) self.noteLeaderEpoch();
             return;
         }
         if (self.state != .leader) return;
@@ -1577,6 +1644,11 @@ pub const RaftElection = struct {
             try self.defaultSnapshotBytes(up_to);
         defer self.allocator.free(bytes);
         try self.compactLogLocked(up_to, bytes);
+        // Counted here rather than inside `compactLogLocked`: past the early
+        // returns above, a successful return means the prefix really was folded
+        // — and a `compactLog` the app drives itself is not this metric's story
+        // (it measures the automatic §7 housekeeping).
+        if (self.metrics) |m| m.incSnapshotsCompacted();
     }
 
     /// The no-`snapshotter` snapshot: a parseable debug summary of what was
@@ -1610,8 +1682,10 @@ pub const RaftElection = struct {
             defer self.lock.release();
 
             if (resp.term > self.current_term) {
+                const was_leader = self.state == .leader;
                 self.current_term = resp.term;
                 self.state = .follower;
+                if (was_leader) self.noteLeaderEpoch();
                 self.votes_received.clearRetainingCapacity();
                 break :locked;
             }
@@ -1789,23 +1863,32 @@ pub const RaftElection = struct {
     /// `new_key`; a receiver whose window still covers the old key
     /// (`PeerKey.previous`) keeps verifying the in-flight old-signed frames.
     pub fn rotateOwnKey(self: *Self, new_key: [32]u8) void {
-        self.key_lock.acquire();
-        defer self.key_lock.release();
-        self.config.own_key = new_key;
+        {
+            self.key_lock.acquire();
+            defer self.key_lock.release();
+            self.config.own_key = new_key;
+        }
+        // Outside `key_lock`: it is a leaf lock whose discipline forbids IO
+        // under it, and a log line is IO. Action and node id only — never key
+        // material.
+        std.log.info("[RaftElection] own key rotated (node {s})", .{self.local_id});
     }
 
     /// Set (or overwrite) `peer_id`'s credential, closing any open rotation
     /// window (`previous` cleared). For a rotation that keeps the old key
     /// acceptable while peers catch up, use `rotatePeerKey` instead.
     pub fn setPeerKey(self: *Self, peer_id: []const u8, key: [32]u8) !void {
-        self.key_lock.acquire();
-        defer self.key_lock.release();
-        if (self.peerKeyEntry(peer_id)) |pk| {
-            pk.key = key;
-            pk.previous = null;
-            return;
+        {
+            self.key_lock.acquire();
+            defer self.key_lock.release();
+            if (self.peerKeyEntry(peer_id)) |pk| {
+                pk.key = key;
+                pk.previous = null;
+            } else {
+                try self.appendPeerKeyLocked(peer_id, key);
+            }
         }
-        try self.appendPeerKeyLocked(peer_id, key);
+        std.log.info("[RaftElection] peer key set for {s} (rotation window closed)", .{peer_id});
     }
 
     /// Rotate `peer_id`'s credential: `new_key` becomes the current key and the
@@ -1813,14 +1896,19 @@ pub const RaftElection = struct {
     /// until the window is closed (`setPeerKey` / `dropPreviousPeerKey`). An
     /// unknown id is upserted with no window (there is no old key to keep).
     pub fn rotatePeerKey(self: *Self, peer_id: []const u8, new_key: [32]u8) !void {
-        self.key_lock.acquire();
-        defer self.key_lock.release();
-        if (self.peerKeyEntry(peer_id)) |pk| {
-            pk.previous = pk.key;
-            pk.key = new_key;
-            return;
+        var opened_window = false;
+        {
+            self.key_lock.acquire();
+            defer self.key_lock.release();
+            if (self.peerKeyEntry(peer_id)) |pk| {
+                pk.previous = pk.key;
+                pk.key = new_key;
+                opened_window = true;
+            } else {
+                try self.appendPeerKeyLocked(peer_id, new_key);
+            }
         }
-        try self.appendPeerKeyLocked(peer_id, new_key);
+        std.log.info("[RaftElection] peer key rotated for {s} (window open: {})", .{ peer_id, opened_window });
     }
 
     /// Close `peer_id`'s rotation window: frames signed with the previous key
@@ -1848,29 +1936,35 @@ pub const RaftElection = struct {
     /// the entry is still in place and the call may be retried; refusing to
     /// report it would leave an operator believing a revoked key is dead.
     pub fn revokePeerKey(self: *Self, peer_id: []const u8) error{OutOfMemory}!bool {
-        self.key_lock.acquire();
-        defer self.key_lock.release();
-        const old = self.peer_keys_mut;
-        var index: ?usize = null;
-        for (old, 0..) |pk, i| {
-            if (std.mem.eql(u8, pk.id, peer_id)) {
-                index = i;
-                break;
+        const revoked = blk: {
+            self.key_lock.acquire();
+            defer self.key_lock.release();
+            const old = self.peer_keys_mut;
+            var index: ?usize = null;
+            for (old, 0..) |pk, i| {
+                if (std.mem.eql(u8, pk.id, peer_id)) {
+                    index = i;
+                    break;
+                }
             }
-        }
-        const i = index orelse return false;
+            const i = index orelse break :blk false;
 
-        const shrunk = try self.allocator.alloc(PeerKey, old.len - 1);
-        var out: usize = 0;
-        for (old, 0..) |pk, j| {
-            if (j == i) continue;
-            shrunk[out] = pk;
-            out += 1;
-        }
-        self.allocator.free(old[i].id);
-        self.allocator.free(old);
-        self.publishPeerKeysLocked(shrunk);
-        return true;
+            const shrunk = try self.allocator.alloc(PeerKey, old.len - 1);
+            var out: usize = 0;
+            for (old, 0..) |pk, j| {
+                if (j == i) continue;
+                shrunk[out] = pk;
+                out += 1;
+            }
+            self.allocator.free(old[i].id);
+            self.allocator.free(old);
+            self.publishPeerKeysLocked(shrunk);
+            break :blk true;
+        };
+        // Outside `key_lock` (a leaf lock: no IO under it), and only when the
+        // entry really left the table. Peer id and action only.
+        if (revoked) std.log.info("[RaftElection] peer key revoked for {s}", .{peer_id});
+        return revoked;
     }
 
     /// The mutable entry for `peer_id`, or null. `key_lock` must be held — the
@@ -1994,7 +2088,9 @@ pub const RaftElection = struct {
         if (req.term > self.current_term) {
             self.current_term = req.term;
         }
+        const was_leader = self.state == .leader;
         self.state = .follower;
+        if (was_leader) self.noteLeaderEpoch();
 
         // A snapshot from the leader is leader contact, same as an
         // AppendEntries: reset the election clock and record who leads. Both
@@ -2012,7 +2108,11 @@ pub const RaftElection = struct {
         // Chunk assembly. A mismatching continuation is dropped, not applied:
         // the sender restarts at `offset = 0` on its next attempt.
         if (req.offset == 0) {
-            self.pending_snapshot.clearRetainingCapacity();
+            // A new stream replaces whatever a previous one left: release the
+            // buffer instead of retaining a peak this stream may never reach
+            // again. Streams are rare (one per boundary-lagged follower
+            // catch-up), so the re-alloc on the next chunk is not a hot path.
+            self.pending_snapshot.clearAndFree(self.allocator);
             self.pending_snapshot_index = req.last_included_index;
             self.pending_snapshot_term = req.last_included_term;
         } else {
@@ -2020,13 +2120,34 @@ pub const RaftElection = struct {
                 req.last_included_term != self.pending_snapshot_term or
                 req.offset != self.pending_snapshot.items.len)
             {
-                self.pending_snapshot.clearRetainingCapacity();
+                self.pending_snapshot.clearAndFree(self.allocator);
                 return InstallSnapshotResponse{ .term = self.current_term };
             }
         }
+
+        // Bound the assembled total (`ElectionConfig.max_snapshot_bytes`). Every
+        // append into the buffer goes through this guard, so
+        // `pending_snapshot.items.len <= max` is an invariant and the
+        // subtraction cannot underflow. Over the cap the stream is refused: the
+        // partial bytes are freed and the answer is the same term-only reply a
+        // mismatch gets — the protocol has no rejection flag, and the leader's
+        // retry loop re-offers from `offset = 0` (see the field's doc). This is
+        // warn-, not err-level: a misbehaving peer is its own problem, and this
+        // node's answer to it is simply to keep its memory.
+        const max_snapshot_bytes = self.config.max_snapshot_bytes;
+        if (max_snapshot_bytes > 0 and req.data.len > max_snapshot_bytes - self.pending_snapshot.items.len) {
+            std.log.warn("[RaftElection] InstallSnapshot from {s} refused: {d} assembled + {d} chunk bytes exceeds max_snapshot_bytes {d}", .{
+                req.leader_id, self.pending_snapshot.items.len, req.data.len, max_snapshot_bytes,
+            });
+            self.pending_snapshot.clearAndFree(self.allocator);
+            return InstallSnapshotResponse{ .term = self.current_term };
+        }
+
         try self.pending_snapshot.appendSlice(self.allocator, req.data);
         if (!req.done) return InstallSnapshotResponse{ .term = self.current_term };
-        defer self.pending_snapshot.clearRetainingCapacity();
+        // The transfer ends here, applied or not: free the assembly buffer
+        // rather than holding the peak resident until the next stream starts.
+        defer self.pending_snapshot.clearAndFree(self.allocator);
 
         if (req.last_included_index > self.last_included_index) {
             // Allocate the snapshot **first**: everything below this line is
@@ -3640,6 +3761,84 @@ test "RaftElection assembles a chunked InstallSnapshot, retains a continuing suf
     try testing.expectEqualStrings("n8", raft.getLogEntry(8).?.command);
 }
 
+test "RaftElection refuses an InstallSnapshot stream that outgrows max_snapshot_bytes, and the next stream starts clean" {
+    const allocator = testing.allocator;
+
+    // The refusal is a warn line by design (a misbehaving peer is not this
+    // node's error); the runner prints at .warn, so silence it here — the
+    // same pattern as the DLQ churn tests.
+    const prev_log_level = std.testing.log_level;
+    defer std.testing.log_level = prev_log_level;
+    std.testing.log_level = .err;
+
+    var impl = TestTransportVTable{
+        .sendVoteRequest = noopVoteRequest,
+        .sendAppendEntries = rejectAppendEntries,
+        .sendInstallSnapshot = noopInstallSnapshot,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
+
+    var peers = [_]Peer{.{ .id = "leader", .address = "" }};
+    var raft = try RaftElection.init(allocator, "f1", &peers, .{ .max_snapshot_bytes = 16 }, &transport);
+    defer raft.deinit();
+
+    // The first chunk fits (10 of 16); the second would take the stream to 20.
+    _ = try raft.handleInstallSnapshot(.{ .term = 1, .leader_id = "leader", .last_included_index = 6, .last_included_term = 1, .offset = 0, .data = "0123456789", .done = false });
+    try testing.expectEqual(@as(usize, 10), raft.pending_snapshot.items.len);
+
+    const refused = try raft.handleInstallSnapshot(.{ .term = 1, .leader_id = "leader", .last_included_index = 6, .last_included_term = 1, .offset = 10, .data = "abcdefghij", .done = false });
+    // The refusal speaks the existing protocol: a term-only reply, nothing new
+    // on the wire. The partial stream is gone — length and capacity both.
+    try testing.expectEqual(@as(u64, 1), refused.term);
+    try testing.expectEqual(@as(usize, 0), raft.pending_snapshot.items.len);
+    try testing.expectEqual(@as(usize, 0), raft.pending_snapshot.capacity);
+    try testing.expect(raft.snapshot_data == null);
+
+    // The rest of the refused stream cannot apply: its continuation lands on
+    // an empty buffer, mismatches, and is dropped — `done` is never reached.
+    _ = try raft.handleInstallSnapshot(.{ .term = 1, .leader_id = "leader", .last_included_index = 6, .last_included_term = 1, .offset = 20, .data = "kl", .done = true });
+    try testing.expect(raft.snapshot_data == null);
+    try testing.expectEqual(@as(u64, 0), raft.last_included_index);
+
+    // A fresh stream restarts at offset 0 and applies normally — the refusal
+    // left no residue, and the applied stream released its buffer too.
+    _ = try raft.handleInstallSnapshot(.{ .term = 1, .leader_id = "leader", .last_included_index = 6, .last_included_term = 1, .offset = 0, .data = "fits", .done = true });
+    try testing.expectEqualStrings("fits", raft.snapshot_data.?);
+    try testing.expectEqual(@as(u64, 6), raft.last_included_index);
+    try testing.expectEqual(@as(usize, 0), raft.pending_snapshot.items.len);
+    try testing.expectEqual(@as(usize, 0), raft.pending_snapshot.capacity);
+}
+
+test "RaftElection applies an InstallSnapshot that lands exactly on max_snapshot_bytes" {
+    const allocator = testing.allocator;
+
+    var impl = TestTransportVTable{
+        .sendVoteRequest = noopVoteRequest,
+        .sendAppendEntries = rejectAppendEntries,
+        .sendInstallSnapshot = noopInstallSnapshot,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
+
+    // The default is the documented 256 MiB hardening bound; this test drives
+    // the boundary itself with a cap the payload fits exactly (the guard is
+    // `>`, so equality must apply).
+    try testing.expectEqual(default_max_snapshot_bytes, (ElectionConfig{}).max_snapshot_bytes);
+    const payload = "0123456789abcdefghij0123456";
+    try testing.expectEqual(@as(usize, 27), payload.len);
+
+    var peers = [_]Peer{.{ .id = "leader", .address = "" }};
+    var raft = try RaftElection.init(allocator, "f1", &peers, .{ .max_snapshot_bytes = 27 }, &transport);
+    defer raft.deinit();
+
+    _ = try raft.handleInstallSnapshot(.{ .term = 1, .leader_id = "leader", .last_included_index = 6, .last_included_term = 1, .offset = 0, .data = payload[0..10], .done = false });
+    _ = try raft.handleInstallSnapshot(.{ .term = 1, .leader_id = "leader", .last_included_index = 6, .last_included_term = 1, .offset = 10, .data = payload[10..20], .done = false });
+    _ = try raft.handleInstallSnapshot(.{ .term = 1, .leader_id = "leader", .last_included_index = 6, .last_included_term = 1, .offset = 20, .data = payload[20..27], .done = true });
+    try testing.expectEqualStrings(payload, raft.snapshot_data.?);
+    try testing.expectEqual(@as(u64, 6), raft.last_included_index);
+    // Applied → the assembly buffer is freed, not retained at the peak.
+    try testing.expectEqual(@as(usize, 0), raft.pending_snapshot.capacity);
+}
+
 test "RaftElection leader tick compacts the committed prefix once the log outgrows snapshot_threshold_entries" {
     const allocator = testing.allocator;
 
@@ -3834,6 +4033,79 @@ test "RaftElection compactLog refuses an uncommitted or out-of-range boundary" {
     // Re-compacting at or below the boundary is a no-op, not an error.
     try solo.compactLog(2, "ignored");
     try testing.expectEqualStrings("ok", solo.snapshot_data.?);
+}
+
+test "RaftElection wires leader epoch and compaction counts into ClusterMetrics" {
+    const allocator = testing.allocator;
+
+    var impl = TestTransportVTable{
+        .sendVoteRequest = noopVoteRequest,
+        .sendAppendEntries = rejectAppendEntries,
+        .sendInstallSnapshot = noopInstallSnapshot,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
+
+    var metrics = ClusterMetrics.init(allocator);
+    var raft = try RaftElection.init(allocator, "n1", &.{}, .{ .snapshot_threshold_entries = 2 }, &transport);
+    defer raft.deinit();
+    raft.setMetrics(&metrics);
+
+    // Nothing led yet: the gauge is at its initial value.
+    try testing.expectEqual(@as(u64, 0), metrics.leader_epoch.load(.monotonic));
+
+    // A single-node election is won on the self-vote: becoming leader publishes
+    // the epoch.
+    raft.lock.acquire();
+    try raft.startElection();
+    raft.lock.release();
+    try testing.expect(raft.isLeader());
+    try testing.expectEqual(raft.getTerm(), metrics.leader_epoch.load(.monotonic));
+
+    // Three committed entries against a threshold of two: the tick compacts the
+    // prefix, once.
+    for (0..3) |i| {
+        var buf: [16]u8 = undefined;
+        _ = try raft.appendEntry(try std.fmt.bufPrint(&buf, "cmd-{d}", .{i}));
+    }
+    try raft.tick();
+    try testing.expectEqual(@as(u64, 1), metrics.snapshots_compacted.load(.monotonic));
+    // Nothing new to fold: the next tick records nothing more.
+    try raft.tick();
+    try testing.expectEqual(@as(u64, 1), metrics.snapshots_compacted.load(.monotonic));
+}
+
+test "RaftElection moves the leader epoch when a standing leader concedes to a higher term" {
+    const allocator = testing.allocator;
+
+    var impl = TestTransportVTable{
+        .sendVoteRequest = noopVoteRequest,
+        .sendAppendEntries = rejectAppendEntries,
+        .sendInstallSnapshot = noopInstallSnapshot,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
+
+    var metrics = ClusterMetrics.init(allocator);
+    var peers = [_]Peer{.{ .id = "n2", .address = "" }};
+    var raft = try RaftElection.init(allocator, "n1", &peers, .{}, &transport);
+    defer raft.deinit();
+    raft.setMetrics(&metrics);
+
+    raft.lock.acquire();
+    try raft.startElection();
+    raft.lock.release();
+    try raft.handleVoteResponse(.{ .term = 1, .vote_granted = true }, "n2");
+    try testing.expect(raft.isLeader());
+    try testing.expectEqual(@as(u64, 1), metrics.leader_epoch.load(.monotonic));
+
+    // The peer's next-term vote request arrives: the standing leader concedes,
+    // and the gauge follows the term it adopted.
+    _ = try raft.handleVoteRequest(.{ .term = 5, .candidate_id = "n2", .last_log_index = 0, .last_log_term = 0 });
+    try testing.expectEqual(RaftState.follower, raft.getState());
+    try testing.expectEqual(@as(u64, 5), metrics.leader_epoch.load(.monotonic));
+
+    // A follower re-asserting the same term is not an epoch event.
+    _ = try raft.handleVoteRequest(.{ .term = 5, .candidate_id = "n2", .last_log_index = 0, .last_log_term = 0 });
+    try testing.expectEqual(@as(u64, 5), metrics.leader_epoch.load(.monotonic));
 }
 
 /// Shape of `RaftElection.ElectionTransport`, restated at file scope so the

@@ -589,6 +589,97 @@ are highlighted instead of falling back to plaintext.
 Verified: 41 pages, no Shiki warnings; link rewriting confirmed against the built
 HTML; the dev server serves the index and doc routes.
 
+### 第 168 批：正确性与可观测性收尾（NATS / Migration / challenge / StaticFiles / Fluvio / 集群指标接线）（**破坏性：是——一处编译错级签名变更**）
+
+Wave-1 of the production-hardening correctness sweep. Four parallel tracks; focused tests named per item.
+
+**1. NATS client: four correctness fixes (`src/messaging/Nats.zig`)**
+
+- Frame reassembly is now a persistent **bounded** buffer (`max_pending_bytes = 1 MiB`): a peer whose bytes never complete a frame — or one endless garbage stream — used to grow the buffer without limit; past the bound the read paths fail with `error.MessageTooLarge`. `poll` / `request` / `ping` share one `appendPending` → `drainPending` path.
+- `readSome == 0` maps to `error.ConnectionClosed` instead of spinning (the old loop re-read a half-closed socket up to 50 000 times).
+- The server INFO line read during `connect` is bounded (`max_info_line_bytes = 64 KiB`, `error.ProtocolError` past it) — a peer that never sends `\n` used to block `connect` forever.
+- `draining` re-entry is rejected with `error.Reentrant`.
+- **Known remaining (deliberately unfixed)**: the `ServerInfo` returned by `connect()` borrows the INFO-line buffer, which is freed on return — a dangling slice. The fix is an ownership change on a public API; scheduled for a follow-up batch.
+
+**2. Migration failure semantics tightened (`src/migration/Migration.zig`)**（行为收紧）
+
+A failed statement used to be tolerated as "already applied" unconditionally. Now only a provably redundant `ALTER TABLE ADD COLUMN` is exempt (post-failure probe `SELECT <col> FROM <t> LIMIT 0`, because the drivers expose no structured error code); anything else returns `error.MigrationFailed` and the migration is **not** marked applied. Failure logs drop `err` → `warn` (expected-error paths must not trip the err-log gate).
+
+**3. Web4 challenge store bounded (`src/web4/challenge.zig`)**
+
+`max_entries = 10_000`; expired entries are swept under the lock and re-checked at verify time (`verifyAndConsume` deletes expired entries for real). Previously unbounded growth by repeated challenge calls.
+
+**4. `StaticFiles.staticMiddleware` returns an error（编译错级）**
+
+Signature is now `!api.Middleware`: the construction path can fail and that used to be swallowed internally. Call sites add `try`. Verified not a 1.0-freeze anchor.
+
+**5. Fluvio: two inline-dupe ownership fixes (`FluvioNative.zig` / `FluvioConnector.zig`)** — errdefer discipline aligned with the codebase norm.
+
+**6. Cluster metrics actually wired (`ClusterMetrics` / `ClusterAuth` / `RaftElection` / `RaftTransport` / `ClusterBootstrap` / `DistributedEventBus`)**（新增指标，无行为变化）
+
+The `ClusterMetrics` counters existed but most were never incremented. Now live: Raft transport send/recv/failures, DEB frame paths, leader-epoch transitions (`noteLeaderEpoch` at all five step-up/step-down sites), partition count from the DEB ring, `auth_failures` (inbound MAC failures — logged as a rate-limited `warn`, one line per 60 s window, plus the counter; routine current-key misses inside a rotation window stay uncounted), key rotation/revocation `log.info` at 8 sites (after lock release, no key material in logs), and `snapshots_compacted` / `snapshots_sent` / `snapshots_received`. New fields are `std.atomic.Value(u64)`; PROM names `zigmodu_cluster_*_total`; `ClusterBootstrap.start` wires one shared instance into bus + raft.
+
+Focused: Nats 8 pass/3 skip · Migration 18/18 · challenge 10/10 · StaticFiles 4/4 · Fluvio 8+2 skip · RaftElection 51 · RaftTransport 33 · DEB 55 · ClusterBootstrap 15.
+
+### 第 169 批：可用性三件套（dial 超时全量接线 / HttpClient 加固 / 快照与限流上界）（**破坏性：否；多处行为收紧，见 UPGRADING**）
+
+Wave-2. Everything is "bounded by default, explicit opt-out preserved".
+
+**1. `netdial.connectTimeout` promoted to a shared primitive and wired everywhere** (`src/core/netdial.zig` + redis / Kafka / NATS / Fluvio / DEB)
+
+Batch-151's Raft-only timeout dial is now public (`connectTimeout(io, addr, timeout_ms)`, `0` = kernel default). Wired per module:
+
+- `redis.RedisConfig.connect_timeout_ms = 0` — behaviour-preserving opt-in.
+- Kafka producer **and** consumer `connect_timeout_ms = 5000`: the producer field existed but was never forwarded, so its documented 5 s was a lie — now real (set `0` for the old kernel default). Consumer gains the same field.
+- `Nats.Config.connect_timeout_ms = 0` — behaviour-preserving opt-in.
+- `FluvioNative.connectWithTimeout` (new); plain `connect` unchanged (kernel default).
+- `DistributedEventBus.connect_timeout_ms = 5000` — family-consistent with `outbound_send_timeout_ms`; a black-holed peer used to park the dialling fiber for the kernel default on every attempt.
+- `ClusterBootstrap`'s wake dial stays unbounded (loopback self-connect, no config surface).
+
+**2. HttpClient hardening (`src/http/HttpClient.zig`)**（`timeout_ms` 语义变化）
+
+- `ConnectionPool.acquire` no longer holds the pool mutex across DNS + dial: slot reservation under the lock (`pending_dials` counts in-flight dials so concurrent acquirers cannot jointly overshoot `max_connections`), dial with the lock released, uncancelable hand-over. A wedged resolver no longer blocks callers that only want an idle connection. All four cancellation-semantics tests preserved unchanged.
+- `max_response_bytes: usize = 0` (0 = unlimited): a `Content-Length` past the bound is rejected **before** the allocation it names; a chunked body is cut off at its decoded total (`error.ResponseTooLarge`). The streaming path is unaffected by design (it never holds the body).
+- `timeout_ms` is now a per-request deadline, not a per-read budget: a response delivered in N dribbles could previously take N × timeout in total; expired budget returns `error.Timeout`. `0` = unlimited, kept. Also fixes a latent leak: the body buffer for a `Content-Length` response was leaked when a wait failed mid-loop (pre-existing; now `errdefer`).
+
+**3. Raft `InstallSnapshot` accumulation bound (`RaftElection.zig`)**
+
+`ElectionConfig.max_snapshot_bytes = 256 MiB` (0 = disabled): a misbehaving leader can no longer grow `pending_snapshot` without limit. Rejection answers term-only, so the leader restarts the stream at offset 0 and a legitimate snapshot self-heals. The pending buffer now `clearAndFree`s on completion / reject / replacement — peak memory no longer stays resident.
+
+**4. Rate limiter key table bounded (`RateLimiter.zig`)**（行为收紧）
+
+`RateLimiterRegistry.init`'s `max_keys` default changes 0 (unbounded) → `default_max_keys = 65_536` (LRU-bounded). Explicit `initWithCapacity(…, 0)` still means unbounded. Keys come from request input, so the unbounded default was a remote memory-growth vector; `rateLimitPerClient`'s docs now say so.
+
+Focused: netdial black-hole 1/1 · connect-filter 70 pass/7 skip · Kafka 30+2 skip · redis 18+5 skip · Fluvio 8+2 skip · DEB 55 · HttpClient max-response 2 + deadline 1 (the deadline test also red-lined the mid-read body-buffer leak) · InstallSnapshot 9/9 · registry 29 · rateLimit 2. Full suite (force-run): **aggregate 2350/2413 passed, 63 skipped, 0 failed**.
+
+### 第 170 批：发布工程（bench 真门禁 / nightly 看门狗 / release 脚本收口）（**破坏性：否；CI-only**）
+
+Wave-3, no `src/` changes.
+
+1. **bench-x86_64 is a real gate** (`.github/workflows/ci.yml`): `BENCH_THRESHOLD=3.0` applied cross-host, confirm run on by default, allocation budget not relaxed, failing section printed plus a `::error::` annotation before going red.
+2. **`.github/workflows/nightly-watchdog.yml` (new)**: daily 06:47 UTC check that the last scheduled nightly run succeeded, exit 1 otherwise. Live-verified on creation — it immediately caught the 2026-10-11 nightly actually failing.
+3. **`scripts/release.sh`**: adds the check-doc-paths / pool-guard / test-collection gates to the pre-release run; comments updated to match what it does; after `--push` it creates the GitHub release from the verified tag via `scripts/release-notes.sh` (extracts the CHANGELOG section; idempotent; degrades gracefully without `gh`).
+4. **Release artifacts**: `.sha256` sidecar files next to the archives in the release job.
+5. **Deadcode baseline 32 → 38**: −6 (RaftTransport's pre-batch-151 timeout dial moved into netdial) +6 (netdial's Windows `WSADATA` ABI mirror — std ships no definition; the six unread fields complete the fixed layout). Recorded via `--force` as deliberate.
+
+Gates at close: fmt · deadcode · production · version · tenant-scope · doc-paths · pool-guard · test-collection · check-api — all green.
+
+### 第 171 批：遗留两项收尾（NATS `ServerInfo` 悬垂 slice / ClusterBootstrap 快照上界转发）（**破坏性：否**）
+
+Follow-ups flagged by batch 169's review.
+
+**1. NATS `connect()` no longer returns dangling strings (`src/messaging/Nats.zig`)**
+
+The `ServerInfo` returned by `connect()` borrowed the INFO line — which a `defer free` released before returning, so `server_id` / `server_name` / `version` / `host` / `raw_json` were all use-after-free reads (under the testing allocator: `0xAA` fill). The client now owns the line (`info_line`): freed on the next `connect()` (reconnect) and in `deinit`. Field types and the return shape are unchanged — the lifetime is now *defined* ("valid until the next `connect()` or `deinit`") instead of undefined, and no consumer could have relied on the old behavior.
+
+**2. `ClusterBootstrap` forwards `max_snapshot_bytes` (`src/core/cluster/ClusterBootstrap.zig`)**
+
+Batch 169 added `ElectionConfig.max_snapshot_bytes` (256 MiB default) but the bootstrap path's named-field construction never set it, so cluster users were pinned to the default with no knob. `BootstrapConfig.max_snapshot_bytes` (defaulting to `RaftElection.default_max_snapshot_bytes`) now forwards. A default-pinning test guards both snapshot knobs against drift, and a forwarding test asserts a custom value reaches the raft.
+
+Environment note: the full-suite run during this batch had exactly one failure — `accepts an app-supplied Raft transport`, which binds fixed port 19004 — because an OrbStack container's port-forwards squatted 19001–19005 on the verification host at the time. The collision is transient (ports free again afterwards) and not code; the sibling tests in that range passed. The new test deliberately uses 19191 to stay clear of the range.
+
+Focused: `ServerInfo backed` 1/1 · `forwards snapshot bounds` 1/1. Full suite: 2351/2415 passed, 63 skipped, 1 failed (the OrbStack port collision above; unchanged test, untouched by this batch).
+
 ## [0.39.10] - 2026-10-10
 
 ### 第 153 批：集群安全四审计项（A-1/A-3/A-4/B-11）残留收尾（**破坏性：否；一处行为变化**）

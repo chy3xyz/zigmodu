@@ -1195,9 +1195,9 @@ jobs:
           path: ${{ runner.temp }}/bench-baseline.ci.updated.json
           retention-days: 30
 
-  # ── x86_64 bench: cross-host evidence, never a gate ──
+  # ── x86_64 bench: cross-host gate, wide threshold ──
   bench-x86_64:
-    name: Bench x86_64 (cross-host evidence, non-gating)
+    name: Bench x86_64 (cross-host gate, 3.0x)
     runs-on: ubuntu-latest
     # Same trigger as the nightly `soak` job. What A2 (docs/dev/v1.0-gap.md)
     # asks for is a *series* — the same commit's numbers on two host classes —
@@ -1205,6 +1205,12 @@ jobs:
     # `benchmark` job below, against the runner-recorded
     # `bench-baseline.ci.json`). ubuntu-latest is the x86_64 leg;
     # ubuntu-24.04-arm in the matrix above is the aarch64 one.
+    #
+    # The verdict is additionally a real gate now (the step below fails the
+    # night when a metric reads > 3.0x the aarch64 baseline) — wide enough that
+    # the host class alone cannot trip it, narrow enough that an
+    # order-of-magnitude cross-host regression can no longer pass unnoticed.
+    # The series upload below is unchanged.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     timeout-minutes: 30
     steps:
@@ -1230,7 +1236,7 @@ jobs:
       - name: Install deps
         run: sudo apt-get install -y libpq-dev libmariadb-dev libmariadb-dev-compat libsqlite3-dev
 
-      - name: Run the bench gate against the aarch64 baseline (evidence only)
+      - name: Run the bench gate against the aarch64 baseline (cross-host gate)
         # A2: every performance number the repo quotes was recorded on one
         # aarch64 laptop (`scripts/bench-baseline.json`, the default
         # BENCH_BASELINE — named explicitly here so the comparison target is
@@ -1245,25 +1251,48 @@ jobs:
         # verdict itself. `scripts/check-bench.sh --ratios` reads these logs
         # together with the laptop's.
         #
-        # Deliberately NOT a gate, and the exit code is the mechanism: the
-        # baseline is aarch64-tuned, so a breach on this runner can be the
-        # host class speaking (the runner measures ~1.3x the laptop on
-        # absolute metrics; the ring's *ratio* differs ~9x between classes —
-        # see the RingBuffer SPSC note in scripts/check-bench.sh), and gating
-        # on it would false-red. The script's status is captured into `rc`,
-        # printed for the log, and the step always exits 0 — the verdict lives
-        # in the artifact, never in the night's status.
+        # The verdict now GATES the night, with a threshold widened for the
+        # host-class gap. This used to be evidence-only (`exit 0` no matter
+        # what the gate script said), which meant a cross-host regression
+        # could pass every night without ever turning anything red. The gate
+        # is real but deliberately wider than the same-host 2.0x:
+        #
+        #   * the comparison target is a baseline recorded on a *different*
+        #     machine class — on identical code this runner measures ~1.3x
+        #     the aarch64 laptop on absolute metrics, and a ratio metric's
+        #     value is not host-independent either (the ring's ratio differs
+        #     ~9x between the classes, in x86_64's favour — see the
+        #     RingBuffer SPSC note in scripts/check-bench.sh). The same-host
+        #     2.0x window cannot absorb that; 3.0x sits above every measured
+        #     host-class spread and still fails any metric that is
+        #     order-of-magnitude slower than its aarch64 recording.
+        #   * the confirm pass (BENCH_CONFIRM, on by default) re-runs a
+        #     duration-only failure once before this step goes red, so one
+        #     loaded neighbour cannot red the night by itself.
+        #   * the max_alloc_per_op budgets in the baseline are *counts*, not
+        #     durations — host-independent, so they gate here at full
+        #     strength, unwidened.
+        #
+        # The full per-metric table prints before any red: the script's
+        # stdout (kept in the artifact via tee) is that table, and on a
+        # breach the failure branch below re-prints the log from its first
+        # FAIL line to the end — verdict, breached metrics, samples, host
+        # check — so the red step reads without opening the artifact.
         env:
           BENCH_BASELINE: scripts/bench-baseline.json
+          BENCH_THRESHOLD: "3.0"
         run: |
           mkdir -p "$RUNNER_TEMP/bench-x86_64"
           rc=0
           bash scripts/check-bench.sh 2>&1 | tee "$RUNNER_TEMP/bench-x86_64/bench-x86_64.log" || rc=$?
-          echo "check-bench.sh exited $rc against the aarch64 baseline ($BENCH_BASELINE) —"
-          echo "evidence only. A breach here is the host class (or runner load), not a red"
-          echo "night: the gate lives in the push-time 'benchmark' job against"
-          echo "scripts/bench-baseline.ci.json. Cross-host read: scripts/check-bench.sh --ratios."
-          exit 0
+          if [ "$rc" -ne 0 ]; then
+            echo
+            echo "== cross-host gate FAILED at ${BENCH_THRESHOLD}x against $BENCH_BASELINE — verdict, from the log's first FAIL line =="
+            awk '/^FAIL:/{f=1} f' "$RUNNER_TEMP/bench-x86_64/bench-x86_64.log"
+            echo "::error::cross-host bench gate breached (${BENCH_THRESHOLD}x vs $BENCH_BASELINE); full per-metric table is this step's output above, raw log in the bench-x86_64 artifact"
+            exit "$rc"
+          fi
+          echo "cross-host gate green at ${BENCH_THRESHOLD}x against $BENCH_BASELINE (same-host gate stays 2.0x in the push-time 'benchmark' job)."
 
       - name: Upload x86_64 bench evidence
         # Sibling of nightly-soak-<sha>: one artifact per night, named by
@@ -1374,11 +1403,18 @@ jobs:
           # no zig-out/lib: `zig build` only installs bin/
           cp README.md CHANGELOG.md LICENSE release/ 2>/dev/null || true
           tar -czf zigmodu-${{ github.ref_name }}-linux-x86_64.tar.gz -C release .
+          # Companion checksum in `sha256sum -c` format, generated next to the
+          # tarball it describes (same step, same build) so the two can never
+          # drift apart — a consumer can tell a truncated or tampered download
+          # from a good one.
+          sha256sum zigmodu-${{ github.ref_name }}-linux-x86_64.tar.gz > zigmodu-${{ github.ref_name }}-linux-x86_64.tar.gz.sha256
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
-          files: zigmodu-${{ github.ref_name }}-linux-x86_64.tar.gz
+          files: |
+            zigmodu-${{ github.ref_name }}-linux-x86_64.tar.gz
+            zigmodu-${{ github.ref_name }}-linux-x86_64.tar.gz.sha256
 
   # ── AI real-provider smoke (optional; runs only when LLM_API_KEY is set) ──
   ai-real-provider:

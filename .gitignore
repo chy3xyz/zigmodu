@@ -115,3 +115,6 @@ runtime-stress-history.jsonl
 node_modules/
 site/.vitepress/dist/
 site/.vitepress/cache/
+
+# Local zdoc theme scratch (untracked until the docs-site migration lands)
+.zdoc-theme/

@@ -257,9 +257,16 @@ fn parseConsumeOutput(allocator: std.mem.Allocator, stdout: []const u8) ![]Recor
             }
         }
 
+        // Dupe into locals first: inline in `append`'s argument list, a
+        // failing second dupe (or the append's own growth) stranded the
+        // first copy — nothing still named it.
+        const key_copy = try allocator.dupe(u8, key);
+        errdefer allocator.free(key_copy);
+        const value_copy = try allocator.dupe(u8, value);
+        errdefer allocator.free(value_copy);
         try records.append(allocator, .{
-            .key = try allocator.dupe(u8, key),
-            .value = try allocator.dupe(u8, value),
+            .key = key_copy,
+            .value = value_copy,
             .offset = offset_counter,
             .timestamp = timestamp,
         });
@@ -409,6 +416,28 @@ test "parseConsumeOutput - with timestamps" {
     try std.testing.expectEqualStrings("key1", records[0].key);
     try std.testing.expectEqualStrings("value1", records[0].value);
     try std.testing.expectEqual(@as(i64, 1234567890), records[0].timestamp);
+}
+
+// The record copies were made inline in `append`'s argument list, so a failing
+// second dupe (or the append's own growth) stranded the first copy — only
+// `error.OutOfMemory` reached the caller and nothing still named the leaked
+// key. Held in locals with errdefers, every failure point gives the bytes back.
+test "parseConsumeOutput frees partial copies when an allocation fails" {
+    const output = "key1\tvalue1\nkey2\tvalue2\n";
+    for (0..16) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        if (parseConsumeOutput(failing.allocator(), output)) |records| {
+            for (records) |r| {
+                failing.allocator().free(r.key);
+                failing.allocator().free(r.value);
+            }
+            failing.allocator().free(records);
+        } else |err| {
+            try std.testing.expectEqual(@as(anyerror, error.OutOfMemory), err);
+        }
+        // Every allocation of this attempt came back, whichever copy failed.
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
 }
 
 test "parseTopicList - basic" {

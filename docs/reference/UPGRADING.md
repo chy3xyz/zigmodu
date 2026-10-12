@@ -178,6 +178,41 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 
 ---
 
+## v0.39.10 之后（未发布批次）
+
+> 本节收当前周期（批 168–170）的「会咬人」变更。发布时由 `scripts/release.sh` 自动改名为新版本号。
+
+### ① `staticMiddleware` 返回错误（第 168 批，**编译错**）
+
+`StaticFiles.staticMiddleware` 的返回类型改为 `!api.Middleware`：构造路径可能失败，此前被内部吞掉。调用处加 `try` 即可。
+
+### ② Migration 失败不再一律视为「已应用」（第 168 批，**行为收紧**）
+
+此前失败语句被无条件豁免并标记已应用；现在只豁免可证明冗余的 `ALTER TABLE ADD COLUMN`（失败后用 `SELECT <列> FROM <表> LIMIT 0` 探针验证——驱动拿不到结构化错误码），其余返回 `error.MigrationFailed` 且该迁移**不**标记已应用。依赖「失败即跳过」的迁移脚本需要修正。
+
+### ③ dial 超时默认值（第 169 批，**行为收紧**）
+
+黑掉的对端此前会把拨号挂到内核默认（macOS 实测 >25 s）。本批各模块补上 TCP dial 上界：
+
+- **Kafka**：`KafkaProducerConfig.connect_timeout_ms = 5000` **现在真生效**——该字段此前声明了但从未转发，实际一直用内核默认；要旧行为请显式设 `0`。consumer 新增同名字段、同默认。
+- **DistributedEventBus**：新增 `connect_timeout_ms`，默认 `5000`（`0` = 内核默认）。
+- **redis / NATS**：新增 `connect_timeout_ms`，默认 `0` = 内核默认（行为不变，显式可设）。
+- `FluvioNative.connectWithTimeout` 为新增 API；原 `connect` 不变。
+
+### ④ HttpClient `timeout_ms` 语义：每次读独立 → 整个请求（第 169 批，**行为变化**）
+
+原来每轮 read 各自等满 `timeout_ms`，慢滴流响应总耗时可达 N × timeout；现在是请求级 deadline，预算耗尽返回 `error.Timeout`。`0` = 不限，语义不变。同批新增 `max_response_bytes`（默认 `0` = 不限）：设值后 `Content-Length` 超限在分配前拒绝、chunked 按解码总量截断（`error.ResponseTooLarge`）——对端决定这两个尺寸，不该由它决定你的分配。
+
+### ⑤ RateLimiter registry 默认有界（第 169 批，**行为收紧**）
+
+`RateLimiterRegistry.init` 的 `max_keys` 默认 `0`（无界）→ `default_max_keys = 65_536`（LRU 上界）。显式 `initWithCapacity(…, 0)` 仍是无界。键来自请求输入，默认无界是远程可触发的内存增长向量。
+
+### ⑥ Raft 快照累积上界（第 169 批，**行为收紧，仅 >256 MiB 快照流可见**）
+
+`ElectionConfig.max_snapshot_bytes` 新增，默认 256 MiB（`0` = 禁用）。超限即拒绝该快照流并清空缓冲（term-only 应答，leader 下轮从 offset 0 重发，合法快照自愈）；快照完成/拒绝/替换后缓冲真释放（峰值内存不再常驻）。
+
+---
+
 ## v0.39.10
 
 > 本节收本发布周期的「会咬人」变更。

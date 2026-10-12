@@ -20,14 +20,17 @@
 | 集群 mTLS 边车拓扑（A-2） | `cd examples/production-deploy/cluster-sidecar && ./run.sh`（同上 skip/`--require` 约定） | —（按需本地跑） | 唯一选主 + mesh 全连 + 明文绕过被拒 + 无证书握手被拒 + 干净退出 |
 | Fuzz（有界） | `zig build test --fuzz=2000 -Ddb=all -Dtest-llvm=true --test-timeout 300s` | —（同夜间 job 日志） | exit 0；x86_64 上 **必须**带 `-Dtest-llvm=true`（默认后端不产 sancov 覆盖段，见 `ci.yml` Fuzz 步注释） |
 | Bench 基线 + 分配预算（B-13） | `bash scripts/check-bench.sh`（`THRESHOLD=2.0`，基线 `bench-baseline.ci.json`） | benchmark job 日志 | 32 条基线全在门内、32 条 `max_alloc_per_op` 预算零违例 |
-| x86_64 bench 跨宿主证据（A2，**非门禁**） | `bash scripts/check-bench.sh`（默认基线 `bench-baseline.json` 即 aarch64 记录；跨宿主读法 `--ratios <log>…`） | **独立 artifact** `bench-x86_64-<sha>` 里的 `bench-x86_64.log`（同 30 天留存） | 不设判定——机器行 + 每指标 med3（含未门禁的 `atomic RMW` / `StoreForward` 参考）+ 对 aarch64 基线的 verdict 全在日志；exit 码只进日志，永不染红夜间 |
+| x86_64 bench 跨宿主门禁（A2，阈值放宽到 3.0×） | `BENCH_THRESHOLD=3.0 bash scripts/check-bench.sh`（默认基线 `bench-baseline.json` 即 aarch64 记录；跨宿主读法 `--ratios <log>…`） | **独立 artifact** `bench-x86_64-<sha>` 里的 `bench-x86_64.log`（同 30 天留存） | 所有指标 ≤3.0× aarch64 基线 + `max_alloc_per_op` 预算零违例（分配计数与宿主无关，不放宽）；红之前 step 输出完整指标表与 FAIL 段（含 samples 与 host check）。3.0× 比同宿主门禁的 2.0× 宽，因为基线来自另一机器类（绝对值实测差 ~1.3×、ring 比值差 ~9× 且方向对 x86_64 有利），阈值只拦数量级回归 |
 
 ## 下载夜间 artifact
 
 夜间 job 每次跑完上传一份 `nightly-soak-<commit-sha>`（30 天留存，`ci.yml` "Upload nightly
 soak/stress logs" 步，`if: always()`——**红的那晚日志一定在**）；同一个 schedule 还有一个并行的
-`bench-x86_64` 证据 job 上传 `bench-x86_64-<sha>`（同 30 天、同 `always()`；bench 步**永远 exit 0**，
-对 aarch64 基线的判定只写进日志，所以它的红只意味着基础设施失败）：
+`bench-x86_64` job 上传 `bench-x86_64-<sha>`（同 30 天、同 `always()`；该 job 现在是**真实门禁**：
+对 aarch64 基线 3.0× 阈值，见上表——红 = 有指标超阈或基础设施失败，两种情况下 FAIL 段都在
+artifact 日志里）。
+另外，`nightly-watchdog.yml` 每天 06:47 UTC 复核最近一次 scheduled run：夜间没跑或跑红时它自己变红
+（job summary + annotation），不再有"被 cancel 与绿夜看起来一样"的盲区：
 
 ```bash
 # 找到最近一次夜间运行

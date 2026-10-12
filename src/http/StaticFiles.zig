@@ -66,20 +66,30 @@ const Mount = struct {
 /// try staticFiles(io, &assets, "public", .{});
 /// ```
 pub fn staticFiles(io: std.Io, server: *api.Server, allocator: std.mem.Allocator, prefix: []const u8, root_dir: []const u8, config: Config) !void {
-    try server.addMiddleware(staticMiddleware(io, allocator, prefix, root_dir, config));
+    try server.addMiddleware(try staticMiddleware(io, allocator, prefix, root_dir, config));
 }
 
 /// Middleware form: answers requests under `prefix` and passes everything else
 /// to `next`. Implemented as middleware rather than a route deliberately — the
 /// router's `/*` matches only the prefix itself, so a route-based mount cannot
 /// serve files below it.
-pub fn staticMiddleware(io: std.Io, allocator: std.mem.Allocator, prefix: []const u8, root_dir: []const u8, config: Config) api.Middleware {
+///
+/// Returns `!api.Middleware`: the mount (struct + both path copies) is
+/// allocated up front, and an allocation failure is the caller's to see —
+/// the earlier non-error signature could only answer OOM with a silent
+/// pass-through, which disabled the static mount without a log line.
+pub fn staticMiddleware(io: std.Io, allocator: std.mem.Allocator, prefix: []const u8, root_dir: []const u8, config: Config) !api.Middleware {
     const normalized = std.mem.trimEnd(u8, prefix, "/");
-    const mount = allocator.create(Mount) catch return .{ .func = passThrough };
+    const mount = try allocator.create(Mount);
+    errdefer allocator.destroy(mount);
+    const prefix_copy = try allocator.dupe(u8, normalized);
+    errdefer allocator.free(prefix_copy);
+    const root_copy = try allocator.dupe(u8, root_dir);
+    errdefer allocator.free(root_copy);
     mount.* = .{
         .io = io,
-        .prefix = allocator.dupe(u8, normalized) catch return .{ .func = passThrough },
-        .root = allocator.dupe(u8, root_dir) catch return .{ .func = passThrough },
+        .prefix = prefix_copy,
+        .root = root_copy,
         .config = config,
     };
     const S = struct {
@@ -90,10 +100,6 @@ pub fn staticMiddleware(io: std.Io, allocator: std.mem.Allocator, prefix: []cons
         }
     };
     return .{ .func = S.mw, .user_data = mount };
-}
-
-fn passThrough(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
-    return next(ctx);
 }
 
 /// True when `path` is the mount prefix or lives under it.
@@ -325,6 +331,26 @@ test "parseRange: closed / open / suffix / invalid / multi" {
     try std.testing.expectEqual(@as(u64, 90), parseRange("bytes=-10", 100).ok.start);
     try std.testing.expectEqual(@as(u64, 0), parseRange("bytes=-500", 100).ok.start);
     try std.testing.expectEqual(@as(u64, 99), parseRange("bytes=0-999", 100).ok.end); // clamped
+}
+
+// The mount build used to answer OOM with a silent pass-through middleware —
+// static serving quietly disabled, the already-allocated half of the mount
+// leaked, and no log line. Now the error reaches the caller, and the errdefers
+// return whatever was already copied.
+test "staticMiddleware propagates OOM and never strands a half-built mount" {
+    const allocator = std.testing.allocator;
+    // Three allocations: the Mount, the prefix copy, the root copy. Fail each
+    // in turn; the arena keeps the successful case's process-lifetime mount.
+    for (0..4) |fail_index| {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var failing = std.testing.FailingAllocator.init(arena.allocator(), .{ .fail_index = fail_index });
+        if (staticMiddleware(std.testing.io, failing.allocator(), "/static", "public", .{})) |mw| {
+            try std.testing.expect(mw.user_data != null);
+        } else |err| {
+            try std.testing.expectEqual(@as(anyerror, error.OutOfMemory), err);
+        }
+    }
 }
 
 test "static files: serve, HEAD, 304, Range and traversal refusal" {

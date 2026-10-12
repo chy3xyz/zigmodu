@@ -13,6 +13,8 @@ const RequeuedMessage = @import("eventbus/DLQ.zig").RequeuedMessage;
 const Partitioner = @import("eventbus/Partitioner.zig").ConsistentHashPartitioner;
 const NetworkTransport = @import("cluster/NetworkTransport.zig");
 const ClusterAuth = @import("cluster/ClusterAuth.zig").ClusterAuth;
+const AuthFailLogLimiter = @import("cluster/ClusterAuth.zig").AuthFailLogLimiter;
+const ClusterMetrics = @import("cluster/ClusterMetrics.zig").ClusterMetrics;
 
 // ── Wire format for peer traffic (both directions) ──────────────────────────
 //
@@ -134,6 +136,7 @@ const heartbeat_interval_ms: u32 = 5_000;
 /// grows, the DLQ gets the message at the threshold and the node is
 /// quarantined. 0 disables the bound.
 const default_outbound_send_timeout_ms: u32 = 5_000;
+const default_connect_timeout_ms: u32 = 5_000;
 
 /// Cap on one frame body (`mac32 + json`). The same 1 MiB
 /// `NetworkTransport.MAX_MESSAGE_SIZE` puts on a Raft frame: same cluster, same
@@ -276,6 +279,11 @@ pub const DistributedEventBus = struct {
     /// turns into.
     outbound_send_timeout_ms: u32 = default_outbound_send_timeout_ms,
 
+    /// Bound on the TCP dial to a peer (`connectToNode` and every re-dial
+    /// path). 0 keeps the kernel's default. A black-holed peer otherwise
+    /// parks the dialling fiber for that default on every attempt.
+    connect_timeout_ms: u32 = default_connect_timeout_ms,
+
     /// Highest `"seq"` accepted per claimed source id, **authenticated path
     /// only**: an entry is created after the frame's MAC verified, so this table
     /// cannot be grown by anyone who does not hold `cluster_secret`.
@@ -289,6 +297,18 @@ pub const DistributedEventBus = struct {
     /// moving forward rather than colliding with its own history; see
     /// `forgetPeerSeq` for the cases that still roll back.
     next_seq: std.atomic.Value(u64),
+
+    /// The cluster metrics sink, wired by `setMetrics` (which
+    /// `ClusterBootstrap.start()` calls on its own instance). All updates are
+    /// single atomic fetch-adds/stores, so accept fibers and the publish path
+    /// can report without touching any of the bus's locks. Null means "no
+    /// sink": a standalone bus simply does not report.
+    metrics: ?*ClusterMetrics = null,
+
+    /// Rate limiter for the inbound MAC-failure warn line — see
+    /// `ClusterAuth.AuthFailLogLimiter`. Per bus instance: the bound peer's id
+    /// is in the line itself.
+    auth_fail_log: AuthFailLogLimiter = .{},
 
     /// Optional distributed components
     partitioner: ?*Partitioner = null,
@@ -885,7 +905,10 @@ pub const DistributedEventBus = struct {
         defer self.nodes_lock.unlock(self.io);
         for (self.nodes.items, 0..) |node, i| {
             if (std.mem.eql(u8, node.id, node_id)) {
-                if (self.partitioner) |p| p.removeNode(node_id);
+                if (self.partitioner) |p| {
+                    p.removeNode(node_id);
+                    if (self.metrics) |m| m.setPartitionCount(@intCast(p.ringSize()));
+                }
                 return self.nodes.swapRemove(i);
             }
         }
@@ -909,7 +932,9 @@ pub const DistributedEventBus = struct {
         if (p.nodes.contains(node_id)) return;
         p.addNode(node_id) catch |err| {
             std.log.err("[DistributedEventBus] Failed to add node {s} to partitioner: {}", .{ node_id, err });
+            return;
         };
+        if (self.metrics) |m| m.setPartitionCount(@intCast(p.ringSize()));
     }
 
     /// Heap-allocate one registry entry, append it and put it in the ring, all
@@ -1098,7 +1123,11 @@ pub const DistributedEventBus = struct {
         // (`recordSendFailure` → counter → DLQ at the threshold → quarantine).
         // The whole frame still leaves as one `writeAll`-style loop, so framing is
         // unchanged.
-        try sockread.writeFull(sock, frame);
+        sockread.writeFull(sock, frame) catch |err| {
+            if (self.metrics) |m| m.incMessagesFailed();
+            return err;
+        };
+        if (self.metrics) |m| m.incMessagesSent(@intCast(frame.len));
     }
 
     /// The receive half of `sendEventFrame`: return the json inside one frame
@@ -1143,6 +1172,19 @@ pub const DistributedEventBus = struct {
         if (openEventFrame(keys.current, body)) |json| return json;
         const prev = keys.previous orelse return null;
         return openEventFrame(prev, body);
+    }
+
+    /// One inbound frame failed MAC verification against its bound peer: count
+    /// it, and say so at warn level — rate-limited (`auth_fail_log`), because a
+    /// mis-keyed peer retries in a tight loop and the connection drop does not
+    /// slow it down. This sits at the *call site* of `openEventFrameWindowed`
+    /// rather than inside `openEventFrame`'s two failure branches on purpose:
+    /// those fire per key attempt, and a `previous`-key hit during a rotation
+    /// window is routine — only the windowed null is the drop verdict.
+    fn noteFrameAuthFailure(self: *Self, peer_id: []const u8) void {
+        if (self.metrics) |m| m.incAuthFailures();
+        if (self.auth_fail_log.allow(Time.monotonicNowMilliseconds()))
+            std.log.warn("[DistributedEventBus] dropping connection: frame from bound peer '{s}' failed MAC verification", .{peer_id});
     }
 
     /// A connection's identity, settled by the handshake: who the peer proved
@@ -1507,10 +1549,18 @@ pub const DistributedEventBus = struct {
                         std.log.debug("[DEB] dropping connection: bound peer '{s}' has no key on record (revoked?)", .{b.id});
                         break;
                     };
-                    break :blk openEventFrameWindowed(keys, body.items) orelse break;
+                    break :blk openEventFrameWindowed(keys, body.items) orelse {
+                        self.noteFrameAuthFailure(b.id);
+                        break;
+                    };
                 }
                 break :blk openEventFrame(null, body.items) orelse break;
             };
+
+            // Authenticated against the binding (or deliberately bare) and the
+            // stream still in sync: one cluster message received. The byte count
+            // is the json proper, without the MAC `openEventFrame` stripped.
+            if (self.metrics) |m| m.incMessagesReceived(@intCast(data.len));
 
             // Parse using our arena to avoid multiple tiny heap allocations
             const maybe_event = parseEvent(ma, data) catch |err| switch (err) {
@@ -2204,6 +2254,13 @@ pub const DistributedEventBus = struct {
         self.credentials_configured.store(true, .release);
     }
 
+    /// Attach the shared cluster metrics sink (frame counters, auth failures,
+    /// partition count). Startup-time wiring only — `ClusterBootstrap` does it
+    /// before `start` — so the send/receive paths read the pointer lock-free.
+    pub fn setMetrics(self: *Self, metrics: *ClusterMetrics) void {
+        self.metrics = metrics;
+    }
+
     /// This node's own credential — what it proves at handshake time and signs
     /// its frames with. Source it from `secrets.SecretsManager`; the framework
     /// deliberately does not read keys for you (the same convention as
@@ -2213,13 +2270,17 @@ pub const DistributedEventBus = struct {
     /// readers, so calling this on a started bus is sound. `rotateOwnKey` is
     /// the same call named for the rotation sequence.
     pub fn setOwnKey(self: *Self, key: [32]u8) void {
-        self.peer_keys_lock.lock(self.io) catch {
-            std.log.err("[DistributedEventBus] own key NOT set: key table lock unavailable", .{});
-            return;
-        };
-        defer self.peer_keys_lock.unlock(self.io);
-        self.own_key = key;
-        self.credentials_configured.store(true, .release);
+        {
+            self.peer_keys_lock.lock(self.io) catch {
+                std.log.err("[DistributedEventBus] own key NOT set: key table lock unavailable", .{});
+                return;
+            };
+            defer self.peer_keys_lock.unlock(self.io);
+            self.own_key = key;
+            self.credentials_configured.store(true, .release);
+        }
+        // Outside the leaf lock: logging is I/O and must not hold it.
+        std.log.info("[DistributedEventBus] own signing key set (rotateOwnKey)", .{});
     }
 
     /// A-3: swap this node's signing key on a **running** bus. Every frame and
@@ -2244,17 +2305,21 @@ pub const DistributedEventBus = struct {
         const id_copy = try self.allocator.dupe(u8, peer_id);
         errdefer self.allocator.free(id_copy);
 
-        self.peer_keys_lock.lock(self.io) catch return error.KeyTableLocked;
-        defer self.peer_keys_lock.unlock(self.io);
+        {
+            self.peer_keys_lock.lock(self.io) catch return error.KeyTableLocked;
+            defer self.peer_keys_lock.unlock(self.io);
 
-        const gop = try self.peer_keys.getOrPut(id_copy);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = id_copy;
-        } else {
-            self.allocator.free(id_copy);
+            const gop = try self.peer_keys.getOrPut(id_copy);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = id_copy;
+            } else {
+                self.allocator.free(id_copy);
+            }
+            gop.value_ptr.* = .{ .current = key, .previous = null };
+            self.credentials_configured.store(true, .release);
         }
-        gop.value_ptr.* = .{ .current = key, .previous = null };
-        self.credentials_configured.store(true, .release);
+        // Outside the leaf lock: logging is I/O and must not hold it.
+        std.log.info("[DistributedEventBus] peer key set for '{s}' (setPeerKey: rotation window closed)", .{peer_id});
     }
 
     /// A-3: rotate `peer_id`'s credential — `new_key` becomes the key its
@@ -2264,19 +2329,29 @@ pub const DistributedEventBus = struct {
     /// is no old key to keep, and refusing the upsert would only invent a
     /// second way to say `setPeerKey`.
     pub fn rotatePeerKey(self: *Self, peer_id: []const u8, new_key: [32]u8) !void {
-        self.peer_keys_lock.lock(self.io) catch return error.KeyTableLocked;
-        defer self.peer_keys_lock.unlock(self.io);
+        var opened_window = false;
+        {
+            self.peer_keys_lock.lock(self.io) catch return error.KeyTableLocked;
+            defer self.peer_keys_lock.unlock(self.io);
 
-        if (self.peer_keys.getPtr(peer_id)) |entry| {
-            entry.previous = entry.current;
-            entry.current = new_key;
-            self.credentials_configured.store(true, .release);
-            return;
+            if (self.peer_keys.getPtr(peer_id)) |entry| {
+                entry.previous = entry.current;
+                entry.current = new_key;
+                self.credentials_configured.store(true, .release);
+                opened_window = true;
+            } else {
+                const id_copy = try self.allocator.dupe(u8, peer_id);
+                errdefer self.allocator.free(id_copy);
+                try self.peer_keys.put(id_copy, .{ .current = new_key, .previous = null });
+                self.credentials_configured.store(true, .release);
+            }
         }
-        const id_copy = try self.allocator.dupe(u8, peer_id);
-        errdefer self.allocator.free(id_copy);
-        try self.peer_keys.put(id_copy, .{ .current = new_key, .previous = null });
-        self.credentials_configured.store(true, .release);
+        // Outside the leaf lock: logging is I/O and must not hold it.
+        if (opened_window) {
+            std.log.info("[DistributedEventBus] peer key rotated for '{s}' (rotatePeerKey: previous key accepted until the window closes)", .{peer_id});
+        } else {
+            std.log.info("[DistributedEventBus] peer key rotated for '{s}' (rotatePeerKey: upsert, no previous window)", .{peer_id});
+        }
     }
 
     /// A-3: close `peer_id`'s rotation window — material signed with the
@@ -2313,6 +2388,7 @@ pub const DistributedEventBus = struct {
         // Outside `peer_keys_lock` (the leaf): `disconnectNode` walks the
         // registry under `nodes_lock` and waits on the node's `write_lock`.
         self.disconnectNode(peer_id);
+        std.log.info("[DistributedEventBus] peer key revoked for '{s}' (removePeerKey: entry removed, connections closed)", .{peer_id});
         return true;
     }
 
@@ -2545,7 +2621,7 @@ pub const DistributedEventBus = struct {
         // blocking dial makes std's EINTR retry panic on EISCONN (`errnoBug`)
         // — the batch-112 trap, see core/netdial.zig. The helper's error set
         // is a subset of the std call's, so this catch reads exactly as before.
-        stream = netdial.connectBlocking(self.io, address) catch |err| blk: {
+        stream = netdial.connectTimeout(self.io, address, self.connect_timeout_ms) catch |err| blk: {
             std.log.warn("[DistributedEventBus] Connection to {s} at {any} failed: {}", .{ node_id, address, err });
             break :blk null;
         };
@@ -2646,6 +2722,7 @@ pub const DistributedEventBus = struct {
         for (self.nodes.items) |node| {
             self.addToRingLocked(node.id);
         }
+        if (self.metrics) |m| m.setPartitionCount(@intCast(p.ringSize()));
     }
 
     /// Set the write-ahead log for crash recovery
@@ -3621,6 +3698,76 @@ test "a frame signed with another key is dropped" {
     // key and not about a frame that could never arrive.
     feedAuthed(&bus, "peer-a", peer_key, peer_key, &.{json});
     try std.testing.expectEqual(@as(usize, 1), received);
+}
+
+test "a frame signed with another key is counted as an auth failure in the wired metrics" {
+    const allocator = std.testing.allocator;
+    const peer_key: [32]u8 = @splat(0x11);
+    const other_key: [32]u8 = @splat(0x22);
+    const receiver_key: [32]u8 = @splat(0x23);
+
+    var json_buf: [128]u8 = undefined;
+    const json = DistributedEventBus.serializeEvent(.{
+        .topic = "key.topic",
+        .payload = "confidential",
+        .source_node = "peer-a",
+        .timestamp = 3,
+        .seq = 1,
+    }, &json_buf);
+
+    var received: usize = 0;
+    var bus = try framedBus(allocator, "key-metrics-node", "key.topic", &received);
+    defer bus.deinit();
+    bus.setOwnKey(receiver_key);
+    try bus.setPeerKey("peer-a", peer_key);
+    var metrics = ClusterMetrics.init(allocator);
+    bus.setMetrics(&metrics);
+
+    // Wrong key: dropped at the MAC check — and now counted, and not received.
+    feedAuthed(&bus, "peer-a", peer_key, other_key, &.{json});
+    try std.testing.expectEqual(@as(usize, 0), received);
+    try std.testing.expectEqual(@as(u64, 1), metrics.auth_failures.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), metrics.messages_received.load(.monotonic));
+
+    // Positive control: the right key delivers and counts as received, and is
+    // not itself an auth failure.
+    feedAuthed(&bus, "peer-a", peer_key, peer_key, &.{json});
+    try std.testing.expectEqual(@as(usize, 1), received);
+    try std.testing.expectEqual(@as(u64, 1), metrics.auth_failures.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), metrics.messages_received.load(.monotonic));
+}
+
+test "sendEventFrame counts outbound frames and write failures in the wired metrics" {
+    const allocator = std.testing.allocator;
+    var bus = try DistributedEventBus.init(allocator, std.testing.io, "metrics-sender");
+    defer bus.deinit();
+    var metrics = ClusterMetrics.init(allocator);
+    bus.setMetrics(&metrics);
+
+    var fds: [2]std.posix.socket_t = undefined;
+    const rc = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    const writer = std.Io.net.Stream{ .socket = .{ .handle = fds[0], .address = undefined } };
+    const reader = std.Io.net.Stream{ .socket = .{ .handle = fds[1], .address = undefined } };
+    defer reader.close(std.testing.io);
+
+    // No credentials: the bare frame shape, 4-byte length prefix + json.
+    const json = "{\"topic\":\"m\",\"payload\":\"x\",\"source\":\"metrics-sender\",\"time\":1}";
+    try bus.sendEventFrame(writer, json);
+    try std.testing.expectEqual(@as(u64, 1), metrics.messages_sent.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 4 + json.len), metrics.bytes_sent.load(.monotonic));
+
+    // A failed write is counted as a failed delivery (and still reported to the
+    // caller — the counter does not swallow the error).
+    writer.close(std.testing.io);
+    if (bus.sendEventFrame(writer, json)) |_| {
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    try std.testing.expectEqual(@as(u64, 1), metrics.messages_failed.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), metrics.messages_sent.load(.monotonic));
 }
 
 test "a frame whose json changed after signing is dropped" {

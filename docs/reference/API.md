@@ -545,10 +545,12 @@ pub fn count(self: *Self) usize
 pub fn generateReport(self: *Self, allocator: std.mem.Allocator) ![]const u8
 ```
 
-`max_keys` (default 0 = unbounded) caps tracked limiters and evicts the
-least-recently-used on insert. Per-client keys come from the request, so an
-unbounded registry grows for as long as someone invents new keys — set a cap when
-you key by IP. `getOrCreate*` returns a pointer that stays valid for the life of
+`max_keys` (default `default_max_keys` = 65 536, LRU-bounded; `0` = unbounded
+when set explicitly via `initWithCapacity`) caps tracked limiters and evicts the
+least-recently-used on insert. Per-client keys come from the request, so the old
+unbounded default grew for as long as someone invented new keys — the bounded
+default is the safe choice; keep `0` only when you key by something you control.
+`getOrCreate*` returns a pointer that stays valid for the life of
 the registry.
 
 ### SlidingWindowRateLimiter
@@ -935,7 +937,7 @@ branch on it.
 
 ```zig
 pub fn staticFiles(io, server: *Server, allocator, prefix: []const u8, root_dir: []const u8, config: Config) !void
-pub fn staticMiddleware(io, allocator, prefix, root_dir, config) Middleware
+pub fn staticMiddleware(io, allocator, prefix, root_dir, config) !Middleware
 ```
 
 Implemented as middleware (the router's `/prefix/*` matches only the prefix

@@ -2,6 +2,11 @@
 //! short-lived random challenge to a DID, the client signs it and returns it;
 //! `verifyAndConsume` accepts each challenge exactly once. Wire into
 //! `DidAuthConfig.challenge_store` to prevent signature replay attacks.
+//!
+//! The store is bounded (`max_entries`, default 10k): `issue` sweeps expired
+//! entries on every call and refuses new DIDs once full, and
+//! `verifyAndConsume` drops an expired entry on sight — a public issuance
+//! endpoint cannot grow the map without bound.
 
 const std = @import("std");
 const Time = @import("../core/Time.zig");
@@ -18,6 +23,11 @@ pub const ChallengeStore = struct {
     map: std.StringHashMap(Entry),
     mutex: std.Io.Mutex = .init,
     ttl_s: i64 = 300,
+    /// Hard cap on live entries. `issue` sweeps expired entries first and
+    /// refuses with `error.ChallengeStoreFull` when the store is still full —
+    /// a public issuance endpoint would otherwise pin one entry per fresh DID
+    /// forever, growing the map without bound.
+    max_entries: usize = 10_000,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Self {
         return .{ .allocator = allocator, .io = io, .map = std.StringHashMap(Entry).init(allocator) };
@@ -40,10 +50,12 @@ pub const ChallengeStore = struct {
     /// never from a seeded PRNG: a predictable challenge is one an attacker can
     /// sign for a DID it does not control. A failing entropy source surfaces as
     /// `error.EntropyUnavailable` instead of a degraded challenge — new in this
-    /// function's inferred error set, which otherwise holds `error.OutOfMemory`
-    /// and the `error.Canceled` of a canceled lock wait (`std.Io.Mutex.lock`
-    /// fails with nothing else; the old `catch return error.LockFailed` named
-    /// lock-machinery failure for a cancelation). Red:
+    /// function's inferred error set, which otherwise holds `error.OutOfMemory`,
+    /// `error.ChallengeStoreFull` (store still at `max_entries` after the
+    /// expired-entry sweep) and the `error.Canceled` of a canceled lock wait
+    /// (`std.Io.Mutex.lock` fails with nothing else; the old
+    /// `catch return error.LockFailed` named lock-machinery failure for a
+    /// cancelation). Red:
     /// `web4.challenge.test.issue reports a canceled lock wait as error.Canceled`
     /// reads `expected error.Canceled, found error.LockFailed`.
     pub fn issue(self: *Self, allocator: std.mem.Allocator, did: []const u8) ![]const u8 {
@@ -59,6 +71,8 @@ pub const ChallengeStore = struct {
             allocator.free(old.key);
             allocator.free(old.value.challenge);
         }
+        self.sweepExpiredLocked(Time.monotonicNowSeconds());
+        if (self.map.count() >= self.max_entries) return error.ChallengeStoreFull;
         // Both copies are made before the insert, and either one failing (or the
         // insert's own growth) would strand whatever was already copied: the key
         // a caller cannot name, because the call only reports `error.OutOfMemory`.
@@ -78,7 +92,8 @@ pub const ChallengeStore = struct {
     }
 
     /// Accept `challenge` for `did` exactly once. Expired or unknown
-    /// challenges are rejected.
+    /// challenges are rejected; an expired entry is dropped on the way out so
+    /// it stops occupying the bounded map.
     pub fn verifyAndConsume(self: *Self, allocator: std.mem.Allocator, did: []const u8, challenge: []const u8) bool {
         _ = allocator;
         // Deliberately `false` on a canceled wait — the one wait in this file that
@@ -94,6 +109,12 @@ pub const ChallengeStore = struct {
         defer self.mutex.unlock(self.io);
         const entry = self.map.getPtr(did) orelse return false;
         if (entry.expires_at < Time.monotonicNowSeconds()) {
+            // Expired: reject, and drop the entry now instead of leaving one
+            // stale record per DID pinned in the map until the next sweep.
+            if (self.map.fetchRemove(did)) |old| {
+                self.allocator.free(old.key);
+                self.allocator.free(old.value.challenge);
+            }
             return false;
         }
         if (!std.mem.eql(u8, entry.challenge, challenge)) return false;
@@ -103,6 +124,35 @@ pub const ChallengeStore = struct {
             self.allocator.free(old.value.challenge);
         }
         return true;
+    }
+
+    /// Drop every entry past its TTL. Runs under the mutex from `issue`;
+    /// best-effort on allocation failure — the `max_entries` check after it
+    /// still bounds growth either way.
+    fn sweepExpiredLocked(self: *Self, now: i64) void {
+        var expired: usize = 0;
+        var count_it = self.map.iterator();
+        while (count_it.next()) |e| {
+            if (e.value_ptr.expires_at < now) expired += 1;
+        }
+        if (expired == 0) return;
+        // Collect-then-remove: removal invalidates a live iterator.
+        const keys = self.allocator.alloc([]const u8, expired) catch return;
+        defer self.allocator.free(keys);
+        var n: usize = 0;
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.expires_at < now) {
+                keys[n] = e.key_ptr.*;
+                n += 1;
+            }
+        }
+        for (keys[0..n]) |k| {
+            if (self.map.fetchRemove(k)) |old| {
+                self.allocator.free(old.key);
+                self.allocator.free(old.value.challenge);
+            }
+        }
     }
 };
 
@@ -134,6 +184,67 @@ test "ChallengeStore re-issuing for the same DID yields a different challenge" {
     const second = try store.issue(allocator, did);
     defer allocator.free(second);
     try std.testing.expect(!std.mem.eql(u8, first, second));
+}
+
+test "ChallengeStore.verifyAndConsume drops expired entries" {
+    const allocator = std.testing.allocator;
+    var store = ChallengeStore.init(allocator, std.testing.io);
+    defer store.deinit();
+    store.ttl_s = -1; // issued challenges are already expired
+
+    const ch = try store.issue(allocator, "did:key:stale");
+    defer allocator.free(ch);
+    try std.testing.expectEqual(@as(usize, 1), store.map.count());
+    // Expired → rejected, and the entry is removed instead of lingering.
+    try std.testing.expect(!store.verifyAndConsume(allocator, "did:key:stale", ch));
+    try std.testing.expectEqual(@as(usize, 0), store.map.count());
+}
+
+test "ChallengeStore.issue sweeps expired entries before enforcing the cap" {
+    const allocator = std.testing.allocator;
+    var store = ChallengeStore.init(allocator, std.testing.io);
+    defer store.deinit();
+    store.ttl_s = -1; // everything expires on arrival
+    store.max_entries = 1; // only the sweep keeps issuance possible at all
+
+    const a = try store.issue(allocator, "did:key:a");
+    defer allocator.free(a);
+    try std.testing.expectEqual(@as(usize, 1), store.map.count());
+    // Issuing for another DID sweeps the expired one first; without the sweep
+    // this second issue would hit the cap.
+    const b = try store.issue(allocator, "did:key:b");
+    defer allocator.free(b);
+    try std.testing.expectEqual(@as(usize, 1), store.map.count());
+    try std.testing.expect(store.map.get("did:key:a") == null);
+    try std.testing.expect(store.map.get("did:key:b") != null);
+
+    // A live entry survives the sweep on the next issue.
+    store.ttl_s = 300;
+    store.max_entries = 10;
+    const c = try store.issue(allocator, "did:key:c"); // sweeps expired b
+    defer allocator.free(c);
+    const d = try store.issue(allocator, "did:key:d"); // sweeps nothing
+    defer allocator.free(d);
+    try std.testing.expect(store.map.get("did:key:c") != null);
+    try std.testing.expect(store.map.get("did:key:d") != null);
+    try std.testing.expectEqual(@as(usize, 2), store.map.count());
+}
+
+test "ChallengeStore.issue refuses new DIDs once full" {
+    const allocator = std.testing.allocator;
+    var store = ChallengeStore.init(allocator, std.testing.io);
+    defer store.deinit();
+    store.max_entries = 2;
+
+    const c1 = try store.issue(allocator, "did:key:1");
+    defer allocator.free(c1);
+    const c2 = try store.issue(allocator, "did:key:2");
+    defer allocator.free(c2);
+    try std.testing.expectError(error.ChallengeStoreFull, store.issue(allocator, "did:key:3"));
+    // Re-issuing an existing DID replaces in place — the cap must not refuse it.
+    const c1b = try store.issue(allocator, "did:key:1");
+    defer allocator.free(c1b);
+    try std.testing.expectEqual(@as(usize, 2), store.map.count());
 }
 
 // `issue` built the entry's two copies inline in the `put` call, so the DID key

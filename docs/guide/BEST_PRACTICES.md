@@ -1630,7 +1630,7 @@ try ring.addKey("v2", new_secret, true);      // 新签发的 token 用 v2
 | 只有 `success = true` 的行会被跳过 | 修复后**重启即自动重试**那条迁移，无需手工改状态 |
 | 部分语句可能已生效（断在第 N 条） | 迁移脚本必须**可重复执行**：`CREATE TABLE IF NOT EXISTS` / `ADD COLUMN IF NOT EXISTS` / 先判断再建索引 |
 | `validateChecksums()` 校验已应用迁移的 checksum | 已上线的迁移文件**不许改**；要改就加新版本 |
-| `ALTER TABLE` 语句失败会被 log + 跳过并记 success | 这是为了兼容"列已存在"，代价是**真的写错也会被吞**——ALTER 请用 `IF NOT EXISTS` 形式，测试环境先跑一遍 |
+| `ALTER TABLE … ADD COLUMN` 失败**仅当**列已存在时才豁免（探针 `SELECT <col> FROM <t> LIMIT 0` 验证事后状态） | 语法错/表不存在/权限拒绝会让迁移失败且**不**记 success，修复后重启自动重试；多动作 ALTER（顶层逗号）不豁免 |
 
 恢复步骤：修脚本（保持同一版本号与幂等）→ 重启（或再跑一次 `run()`）→ 用
 `getMigrationStatus()` / 查询 `_zigmodu_migrations` 确认 `success = true`。

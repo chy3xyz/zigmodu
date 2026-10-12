@@ -25,11 +25,11 @@
 //! elections and sends heartbeats, so keep calling it from your loop.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const NetworkTransport = @import("NetworkTransport.zig");
 const netdial = @import("../netdial.zig");
 const sockread = @import("../sockread.zig");
 const ClusterAuth = @import("ClusterAuth.zig").ClusterAuth;
+const ClusterMetrics = @import("ClusterMetrics.zig").ClusterMetrics;
 const RaftElection = @import("RaftElection.zig").RaftElection;
 const ElectionConfig = @import("RaftElection.zig").ElectionConfig;
 const Peer = @import("RaftElection.zig").Peer;
@@ -564,7 +564,8 @@ fn readFrameAuth(keys: ?NodeKeys, conn: *NetworkTransport.ClusterConnection, buf
 /// 0.17.0-dev.2151+2ec5523d5: passing a `.timeout` and dialling loopback
 /// `127.0.0.1:1` aborts the process (`panic: TODO implement netConnectIpPosix
 /// with timeout`, SIGABRT). So the field is a trap rather than a knob, and the
-/// bound is built here out of non-blocking `connect` + `poll`.
+/// bound comes from `netdial.connectTimeout` (non-blocking `connect` + `poll`,
+/// re-exported below).
 ///
 /// It is worth having: without it a peer whose SYNs are dropped (a firewall, a
 /// wedged box) costs the kernel's default — measured on macOS, a link-local
@@ -580,390 +581,13 @@ fn dialTo(allocator: std.mem.Allocator, io: std.Io, ep: Endpoint, timeout_ms: u3
 
 /// `IpAddress.ConnectError` plus the one error std's connect cannot report on
 /// this toolchain, because it never reaches the kernel to find out.
-pub const ConnectTimeoutError = std.Io.net.IpAddress.ConnectError || error{ConnectTimeout};
-
-/// Connect to `addr`, giving up `timeout_ms` after the call starts. `0` means
-/// no bound — `sockread.setRecvTimeout`'s convention, and what lets a pre-fix
-/// `rpc_timeout_ms = 0` config keep the unbounded behaviour.
 ///
-/// The returned stream is **blocking**, like every other socket `std.Io` hands
-/// out: `sockread.readSome` is a bare `read` and `writeFull` a bare `write`, so
-/// a non-blocking socket would come back `EAGAIN` — which the WebSocket write
-/// path, for one, treats as a programmer bug and panics on in debug builds.
-///
-/// Windows dials the same bounded shape over ws2_32 (`connectTimeoutWindows`:
-/// non-blocking `connect` + `WSAPoll` + `SO_ERROR`), because std's Windows
-/// dial has the same unimplemented-timeout trap as the POSIX one and std
-/// exposes no poll there — its own Windows networking talks to the AFD driver
-/// directly, so the handful of ws2_32 symbols the dial needs is declared in
-/// the `wsa` block below.
-///
-/// The unbounded `timeout_ms == 0` escape goes through netdial on every
-/// target: std's blocking connect panics when a signal interrupts it (EINTR
-/// retry → EISCONN → `errnoBug`; see `core/netdial.zig`). On Windows netdial
-/// delegates back to std, which is fine there — a blocking WSA connect has no
-/// EINTR/EISCONN asymmetry.
-pub fn connectTimeout(io: std.Io, addr: std.Io.net.IpAddress, timeout_ms: u32) ConnectTimeoutError!std.Io.net.Stream {
-    if (timeout_ms == 0) return netdial.connectBlocking(io, addr);
-    if (builtin.target.os.tag == .windows) return connectTimeoutWindows(addr, timeout_ms);
-    return connectTimeoutPosix(addr, timeout_ms);
-}
-
-/// The POSIX half of `connectTimeout`: non-blocking `connect(2)` + `poll` +
-/// `SO_ERROR` over raw syscalls. Kept behind its own function — not just an
-/// early `return` above — so a Windows-targeted compile never analyzes it:
-/// Zig skips the not-taken branch of a comptime condition but still analyzes
-/// the code that *follows* it, and this half's `std.posix` surface (`pollfd`,
-/// `fcntl`, raw `socket`) does not exist on Windows.
-fn connectTimeoutPosix(addr: std.Io.net.IpAddress, timeout_ms: u32) ConnectTimeoutError!std.Io.net.Stream {
-    var storage: std.Io.Threaded.PosixAddress = undefined;
-    const addr_len = std.Io.Threaded.addressToPosix(&addr, &storage);
-
-    // Raw syscalls, not the `std.posix.*` wrappers: this call has to be able to
-    // *return* an error, and the wrappers map several errno values onto
-    // `unreachable` (`std.posix.poll`'s `.FAULT`/`.INVAL`, `setsockopt`'s
-    // `.INVAL` — the reason `sockread` exists at all). Same shape as
-    // `sockread.applyTimeout`.
-    const rc = std.posix.system.socket(std.Io.Threaded.posixAddressFamily(&addr), std.posix.SOCK.STREAM, 0);
-    const fd: std.posix.socket_t = switch (std.posix.errno(rc)) {
-        .SUCCESS => @intCast(rc),
-        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
-        .INVAL => return error.ProtocolUnsupportedBySystem,
-        .MFILE => return error.ProcessFdQuotaExceeded,
-        .NFILE => return error.SystemFdQuotaExceeded,
-        .NOBUFS, .NOMEM => return error.SystemResources,
-        .PROTONOSUPPORT => return error.ProtocolUnsupportedByAddressFamily,
-        .PROTOTYPE => return error.SocketModeUnsupported,
-        else => |e| return std.posix.unexpectedErrno(e),
-    };
-    errdefer std.Io.Threaded.closeFd(fd);
-
-    // Neither of these can be a `socket()` flag: macOS rejects `SOCK.NONBLOCK`
-    // there (measured: `socket()` → `EINVAL`), which is why std sets
-    // `FD_CLOEXEC` by hand on darwin too.
-    if (fcntlSet(fd, std.posix.F.SETFD, std.posix.FD_CLOEXEC)) |e| return std.posix.unexpectedErrno(e);
-    if (setNonblock(fd, true)) |e| return std.posix.unexpectedErrno(e);
-
-    switch (std.posix.errno(std.posix.system.connect(fd, &storage.any, addr_len))) {
-        // Immediate: loopback, or a listener on this host. That is the common
-        // case between nodes in one rack, and every case in these tests.
-        .SUCCESS => {},
-        // The SYN is out and the kernel reports the outcome as writability plus
-        // `SO_ERROR`. `EINTR` is the same state reached with a signal on the
-        // way in: the attempt is still in flight and must not be retried.
-        .INPROGRESS, .AGAIN, .INTR => try awaitConnect(fd, timeout_ms),
-        .ADDRNOTAVAIL => return error.AddressUnavailable,
-        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
-        .ALREADY => return error.ConnectionPending,
-        .CONNREFUSED => return error.ConnectionRefused,
-        .CONNRESET => return error.ConnectionResetByPeer,
-        .HOSTUNREACH => return error.HostUnreachable,
-        .NETUNREACH => return error.NetworkUnreachable,
-        .TIMEDOUT => return error.Timeout,
-        .ACCES => return error.AccessDenied,
-        .NETDOWN => return error.NetworkDown,
-        else => |e| return std.posix.unexpectedErrno(e),
-    }
-
-    // Hand back the same state `netConnectIpPosix` does: a blocking socket
-    // whose `address` is the *local* endpoint `getsockname` reports (i.e. the
-    // ephemeral port). The name is best-effort there too — a failure leaves a
-    // perfectly usable stream.
-    if (setNonblock(fd, false)) |e| return std.posix.unexpectedErrno(e);
-    var local: std.Io.Threaded.PosixAddress = undefined;
-    var local_len: std.posix.socklen_t = @sizeOf(std.Io.Threaded.PosixAddress);
-    const local_addr = if (std.posix.errno(std.posix.system.getsockname(fd, &local.any, &local_len)) == .SUCCESS)
-        std.Io.Threaded.addressFromPosix(&local)
-    else
-        addr;
-    return .{ .socket = .{ .handle = fd, .address = local_addr } };
-}
-
-/// Wait out an in-flight `connect` (`EINPROGRESS`), up to `timeout_ms` from
-/// *now*.
-///
-/// `poll(POLLOUT)` means "the kernel is done with the attempt", not "it
-/// worked": `SO_ERROR` carries the verdict, and a refused connection arrives
-/// exactly that way — writable, then `ECONNREFUSED`.
-fn awaitConnect(fd: std.posix.socket_t, timeout_ms: u32) ConnectTimeoutError!void {
-    const started = Time.monotonicNowMilliseconds();
-    var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
-    while (true) {
-        const elapsed = Time.monotonicNowMilliseconds() - started;
-        if (elapsed >= timeout_ms) return error.ConnectTimeout;
-        const prc = std.posix.system.poll(&fds, 1, @intCast(timeout_ms - elapsed));
-        switch (std.posix.errno(prc)) {
-            .SUCCESS => {},
-            // A signal, not an answer: recompute what is left and wait again.
-            .INTR => continue,
-            else => |e| return std.posix.unexpectedErrno(e),
-        }
-        if (prc == 0) return error.ConnectTimeout;
-        break;
-    }
-
-    var so_error: i32 = 0;
-    var len: std.posix.socklen_t = @sizeOf(i32);
-    switch (std.posix.errno(std.posix.system.getsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.ERROR, @ptrCast(&so_error), &len))) {
-        .SUCCESS => {},
-        else => |e| return std.posix.unexpectedErrno(e),
-    }
-    // The mapping `std.Io.Threaded.posixConnect` applies to the blocking form,
-    // so a caller cannot tell which of the two dialled.
-    switch (so_error) {
-        0 => {},
-        @backingInt(std.posix.E.ADDRNOTAVAIL) => return error.AddressUnavailable,
-        @backingInt(std.posix.E.CONNREFUSED) => return error.ConnectionRefused,
-        @backingInt(std.posix.E.CONNRESET) => return error.ConnectionResetByPeer,
-        @backingInt(std.posix.E.HOSTUNREACH) => return error.HostUnreachable,
-        @backingInt(std.posix.E.NETUNREACH) => return error.NetworkUnreachable,
-        @backingInt(std.posix.E.TIMEDOUT) => return error.Timeout,
-        @backingInt(std.posix.E.ACCES), @backingInt(std.posix.E.PERM) => return error.AccessDenied,
-        @backingInt(std.posix.E.NETDOWN) => return error.NetworkDown,
-        else => |e| {
-            log.debug("[raft] connect failed with errno {d}", .{e});
-            return error.Unexpected;
-        },
-    }
-}
-
-// ── Windows bounded dial (ws2_32) ───────────────────────────────────────────
-//
-// The Windows half of `connectTimeout`. std's own Windows dial neither
-// implements `ConnectOptions.timeout` (`std/Io/Threaded.zig`'s
-// `netConnectIpWindows` is the same `@panic("TODO … with timeout")` as the
-// POSIX line quoted above) nor exposes `WSAPoll` (`std.c.pollfd` aliases a
-// `ws2_32.pollfd` the std module does not define — referencing `std.c.poll` on
-// a Windows target is a compile error), and `std.os.windows.ws2_32` carries
-// constants but no function declarations, because std does its Windows
-// networking over raw AFD IOCTLs instead of Winsock. So the handful of ws2_32
-// symbols the dial needs is declared below; Zig's bundled import libraries
-// resolve them on both Windows ABIs (measured: a probe exe referencing all of
-// them links for `-target x86_64-windows` and `x86_64-windows-gnu`), so no
-// `linkSystemLibrary` is asked of a consumer.
-
-/// The ws2_32 surface `connectTimeoutWindows` needs, as one block so the
-/// extern count stays reviewable at a glance.
-const wsa = struct {
-    const INVALID_SOCKET = ~@as(usize, 0); // (SOCKET)(~0)
-    const SOCKET_ERROR = -1;
-    const FIONBIO: i32 = @bitCast(@as(u32, 0x8004667E)); // ioctlsocket command
-
-    const POLLWRNORM = 0x0010;
-    const POLLNVAL = 0x0004;
-
-    const SOL_SOCKET = std.os.windows.ws2_32.SOL.SOCKET;
-    const SO_ERROR = std.os.windows.ws2_32.SO.ERROR;
-
-    // The WSA error codes the tables below read (MSDN numeric values; std
-    // carries no names for them).
-    const EINTR = 10004;
-    const EACCES = 10013;
-    const EMFILE = 10024;
-    const EWOULDBLOCK = 10035;
-    const EALREADY = 10037;
-    const EPROTOTYPE = 10041;
-    const EPROTONOSUPPORT = 10043;
-    const EAFNOSUPPORT = 10047;
-    const EADDRNOTAVAIL = 10049;
-    const ENETDOWN = 10050;
-    const ENETUNREACH = 10051;
-    const ECONNRESET = 10054;
-    const ENOBUFS = 10055;
-    const EISCONN = 10056;
-    const ETIMEDOUT = 10060;
-    const ECONNREFUSED = 10061;
-    const EHOSTUNREACH = 10065;
-
-    /// WSADATA: the field order is fixed by the Win32 ABI, and the alignment
-    /// Zig computes for this extern struct matches it on both word sizes.
-    const InitData = extern struct {
-        wVersion: u16,
-        wHighVersion: u16,
-        szDescription: [257]u8,
-        szSystemStatus: [129]u8,
-        iMaxSockets: u16,
-        iMaxUdpDg: u16,
-        lpVendorInfo: ?[*]u8,
-    };
-
-    /// WSAPOLLFD.
-    const PollFd = extern struct { fd: usize, events: i16, revents: i16 };
-
-    extern "ws2_32" fn WSAStartup(wVersionRequired: u16, lpWSAData: *InitData) i32;
-    extern "ws2_32" fn WSAGetLastError() i32;
-    extern "ws2_32" fn socket(af: i32, type_: i32, protocol: i32) usize;
-    extern "ws2_32" fn closesocket(s: usize) i32;
-    extern "ws2_32" fn ioctlsocket(s: usize, cmd: i32, argp: *u32) i32;
-    extern "ws2_32" fn connect(s: usize, name: *const anyopaque, namelen: i32) i32;
-    extern "ws2_32" fn WSAPoll(fds: [*]PollFd, nfds: u32, timeout: i32) i32;
-    extern "ws2_32" fn getsockopt(s: usize, level: i32, optname: i32, optval: *anyopaque, optlen: *i32) i32;
-    extern "ws2_32" fn getsockname(s: usize, name: *anyopaque, namelen: *i32) i32;
-};
-
-/// What one WSA error code from `connect` means for a bounded dial. Pure data —
-/// the error policy of the Windows half in one table, unit-tested per arm
-/// (netdial's `classifyConnectErrno` is the same idea for POSIX errnos).
-const WsaConnectVerdict = union(enum) {
-    /// WSAEISCONN: the attempt had already completed (a repeated connect).
-    connected,
-    /// WSAEWOULDBLOCK / WSAEINTR / WSAEALREADY: the attempt is in flight —
-    /// wait it out with WSAPoll, never retry the connect.
-    in_progress,
-    /// Terminal failure, mapped onto the same error names the POSIX half uses.
-    failed: ConnectTimeoutError,
-};
-
-fn classifyWsaConnect(code: i32) WsaConnectVerdict {
-    return switch (code) {
-        wsa.EWOULDBLOCK, wsa.EINTR, wsa.EALREADY => .in_progress,
-        wsa.EISCONN => .connected,
-        else => .{ .failed = wsaFailure(code) },
-    };
-}
-
-/// Map a terminal WSA failure code onto the POSIX half's error names, so a
-/// caller cannot tell which of the two dialled. Codes with no named
-/// counterpart — WSAECONNABORTED among them, the same reading `awaitConnect`
-/// gives ECONNABORTED — fold into `error.Unexpected`: a dial reports, it never
-/// panics.
-fn wsaFailure(code: i32) ConnectTimeoutError {
-    return switch (code) {
-        wsa.ETIMEDOUT => error.Timeout,
-        wsa.ECONNREFUSED => error.ConnectionRefused,
-        wsa.ECONNRESET => error.ConnectionResetByPeer,
-        wsa.EHOSTUNREACH => error.HostUnreachable,
-        wsa.ENETUNREACH => error.NetworkUnreachable,
-        wsa.EACCES => error.AccessDenied,
-        wsa.ENETDOWN => error.NetworkDown,
-        wsa.EADDRNOTAVAIL => error.AddressUnavailable,
-        wsa.EAFNOSUPPORT => error.AddressFamilyUnsupported,
-        wsa.ENOBUFS => error.SystemResources,
-        wsa.EMFILE => error.ProcessFdQuotaExceeded,
-        wsa.EPROTONOSUPPORT => error.ProtocolUnsupportedByAddressFamily,
-        wsa.EPROTOTYPE => error.SocketModeUnsupported,
-        else => error.Unexpected,
-    };
-}
-
-/// The Windows half of `connectTimeout`, reached only when `timeout_ms != 0`:
-/// non-blocking `connect` + `WSAPoll` + `SO_ERROR`, the POSIX half's exact
-/// shape over Winsock.
-///
-/// WSAStartup runs on every call: it is refcounted and cheap, nothing else in
-/// the process is guaranteed to have started Winsock (std's own Windows
-/// networking never touches ws2_32), and the matching WSACleanup is
-/// deliberately never called — the reference stays held until process exit,
-/// which is the documented way to keep the catalog valid.
-fn connectTimeoutWindows(addr: std.Io.net.IpAddress, timeout_ms: u32) ConnectTimeoutError!std.Io.net.Stream {
-    var init_data: wsa.InitData = undefined;
-    if (wsa.WSAStartup(0x0202, &init_data) != 0) return error.NetworkDown;
-    // The grant comes back in `wVersion`: less than the 2.2 requested means no
-    // WSAPoll (2.2 / Vista+), which is what `awaitConnectWindows` waits on.
-    if (init_data.wVersion < 0x0202) return error.NetworkDown;
-
-    var storage: std.Io.Threaded.PosixAddress = undefined;
-    const addr_len = std.Io.Threaded.addressToPosix(&addr, &storage);
-
-    const w32 = std.os.windows.ws2_32;
-    const sock = wsa.socket(@intCast(std.Io.Threaded.posixAddressFamily(&addr)), w32.SOCK.STREAM, w32.IPPROTO.TCP);
-    if (sock == wsa.INVALID_SOCKET) return wsaFailure(wsa.WSAGetLastError());
-    errdefer _ = wsa.closesocket(sock);
-
-    // Non-blocking for the duration of the dial; the socket is put back to
-    // blocking before it is handed out, for the same reason the POSIX half
-    // restores O_NONBLOCK (its comment names the sockread contract).
-    var nonblocking: u32 = 1;
-    if (wsa.ioctlsocket(sock, wsa.FIONBIO, &nonblocking) != 0) return wsaFailure(wsa.WSAGetLastError());
-
-    if (wsa.connect(sock, &storage.any, @intCast(addr_len)) != 0) {
-        switch (classifyWsaConnect(wsa.WSAGetLastError())) {
-            .connected => {},
-            .in_progress => try awaitConnectWindows(sock, timeout_ms),
-            .failed => |err| return err,
-        }
-    }
-
-    var blocking: u32 = 0;
-    if (wsa.ioctlsocket(sock, wsa.FIONBIO, &blocking) != 0) return wsaFailure(wsa.WSAGetLastError());
-
-    // Hand back the same state the POSIX half does: a blocking socket whose
-    // `address` is the local endpoint `getsockname` reports. The name is
-    // best-effort there and here — a failure leaves a perfectly usable stream.
-    var local: std.Io.Threaded.PosixAddress = undefined;
-    var local_len: i32 = @sizeOf(std.Io.Threaded.PosixAddress);
-    const local_addr = if (wsa.getsockname(sock, &local, &local_len) == 0)
-        std.Io.Threaded.addressFromPosix(&local)
-    else
-        addr;
-    return .{ .socket = .{ .handle = @ptrFromInt(sock), .address = local_addr } };
-}
-
-/// Wait out an in-flight WSA `connect` (`WSAEWOULDBLOCK`), up to `timeout_ms`
-/// from *now* — `awaitConnect`'s counterpart. `WSAPoll(POLLWRNORM)` means "the
-/// attempt settled", not "it worked": `SO_ERROR` carries the verdict, and a
-/// refused connection arrives exactly that way.
-fn awaitConnectWindows(sock: usize, timeout_ms: u32) ConnectTimeoutError!void {
-    const started = Time.monotonicNowMilliseconds();
-    var pfd = wsa.PollFd{ .fd = sock, .events = wsa.POLLWRNORM, .revents = 0 };
-    while (true) {
-        const elapsed = Time.monotonicNowMilliseconds() - started;
-        if (elapsed >= timeout_ms) return error.ConnectTimeout;
-        // elapsed < timeout_ms above, so the subtraction cannot underflow.
-        // WSAPoll's timeout is a signed int of milliseconds; clamp rather than
-        // `@intCast` an absurdly large `timeout_ms` into a panic.
-        const left_ms = timeout_ms - @as(u32, @intCast(elapsed));
-        const remaining: i32 = @intCast(@min(left_ms, @as(u32, std.math.maxInt(i32))));
-        const rc = wsa.WSAPoll(@ptrCast(&pfd), 1, remaining);
-        if (rc == 0) return error.ConnectTimeout;
-        if (rc == wsa.SOCKET_ERROR) {
-            switch (wsa.WSAGetLastError()) {
-                // Interrupted, not answered: recompute what is left and wait again.
-                wsa.EINTR => continue,
-                else => |e| return wsaFailure(e),
-            }
-        }
-        if (pfd.revents & wsa.POLLNVAL != 0) return error.Unexpected;
-        break;
-    }
-
-    var so_error: i32 = 0;
-    var len: i32 = @sizeOf(i32);
-    if (wsa.getsockopt(sock, wsa.SOL_SOCKET, wsa.SO_ERROR, &so_error, &len) != 0)
-        return wsaFailure(wsa.WSAGetLastError());
-    if (so_error != 0) return wsaFailure(so_error);
-}
-
-comptime {
-    if (builtin.target.os.tag == .windows) {
-        // Force analysis of the Windows dial in every Windows-targeted compile
-        // of this file: nothing in the default install set calls the raft
-        // transport, so Zig's lazy analysis would otherwise let a broken
-        // ws2_32 declaration through the `windows-cross` CI job until the
-        // first consumer actually dialled.
-        _ = connectTimeoutWindows;
-        _ = awaitConnectWindows;
-    }
-}
-
-/// Set or clear `O_NONBLOCK`; returns the errno when the kernel refuses.
-///
-/// Not a `socket()` flag: macOS rejects `SOCK.NONBLOCK` there (measured:
-/// `socket()` → `EINVAL`). `F_SETFL` cannot touch the access-mode bits, so `0`
-/// clears exactly `O_NONBLOCK` — the standard way to make a socket blocking
-/// again.
-fn setNonblock(fd: std.posix.socket_t, on: bool) ?std.posix.E {
-    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
-    return fcntlSet(fd, std.posix.F.SETFL, if (on) nonblock else 0);
-}
-
-/// `fcntl` with the error reported as a value — `std.posix` has no `fcntl`
-/// wrapper in this toolchain, and the raw call is what `sockread.applyTimeout`
-/// does for `setsockopt` for the same reason.
-fn fcntlSet(fd: std.posix.socket_t, cmd: i32, arg: u32) ?std.posix.E {
-    const e = std.posix.errno(std.posix.system.fcntl(fd, cmd, @as(usize, arg)));
-    return if (e == .SUCCESS) null else e;
-}
+/// The bounded dial itself lives in `core/netdial.zig` — it graduated to a
+/// shared home so the other dial paths (redis / kafka / nats / event bus /
+/// bootstrap wake) can bound their connects too. These re-exports keep the
+/// `RaftTransport.connectTimeout` spelling working.
+pub const ConnectTimeoutError = netdial.ConnectTimeoutError;
+pub const connectTimeout = netdial.connectTimeout;
 
 // ── Address book ────────────────────────────────────────────────────────────
 
@@ -1149,6 +773,7 @@ pub fn TransportImpl(comptime slot: usize) type {
         pub fn sendFrame(self: *Self, ep: Endpoint, frame: []const u8, auth: SignAuth) void {
             var conn = dialTo(self.allocator, self.io, ep, self.rpcTimeoutMs()) catch |err| {
                 log.debug("[raft] connect {s}:{d} failed, message dropped ({})", .{ ep.host, ep.port, err });
+                if (self.raft.metrics) |m| m.incMessagesFailed();
                 return;
             };
             defer conn.deinit();
@@ -1158,7 +783,10 @@ pub fn TransportImpl(comptime slot: usize) type {
             sockread.setSendTimeout(conn.stream, self.rpcTimeoutMs());
             writeFrameSigned(auth, &conn, frame) catch |err| {
                 log.debug("[raft] write {s}:{d} failed, message dropped ({})", .{ ep.host, ep.port, err });
+                if (self.raft.metrics) |m| m.incMessagesFailed();
+                return;
             };
+            if (self.raft.metrics) |m| m.incMessagesSent(@intCast(frame.len));
         }
 
         /// Fire-and-forget: the voter answers on its own initiative (see
@@ -1166,16 +794,19 @@ pub fn TransportImpl(comptime slot: usize) type {
         pub fn sendVoteRequest(self: *Self, peer_id: ?[]const u8, address: []const u8, req: VoteRequest) void {
             const ep = self.resolve(peer_id, address) orelse {
                 log.debug("[raft] no address for peer {s}, vote request dropped", .{peer_id orelse "?"});
+                if (self.raft.metrics) |m| m.incMessagesFailed();
                 return;
             };
             const keys = self.outboundKeys(peer_id) orelse {
                 log.debug("[raft] no key for peer {s}, vote request dropped", .{peer_id orelse "?"});
+                if (self.raft.metrics) |m| m.incMessagesFailed();
                 return;
             };
             var frame = std.ArrayList(u8).empty;
             defer frame.deinit(self.allocator);
             encodeVoteRequest(&frame, self.allocator, req) catch |err| {
                 log.debug("[raft] encoding the vote request failed ({})", .{err});
+                if (self.raft.metrics) |m| m.incMessagesFailed();
                 return;
             };
             self.sendFrame(ep, frame.items, keys.sign);
@@ -1186,9 +817,15 @@ pub fn TransportImpl(comptime slot: usize) type {
         /// "lost message" answer — never a panic.
         pub fn sendAppendEntries(self: *Self, peer_id: ?[]const u8, address: []const u8, req: AppendEntriesRequest) AppendEntriesResponse {
             const lost = AppendEntriesResponse{ .term = 0, .success = false, .match_index = 0 };
-            const ep = self.resolve(peer_id, address) orelse return lost;
+            // Metrics: one attempt counts exactly once — `sent` when the reply
+            // was read and decoded (delivery confirmed), `failed` otherwise.
+            const ep = self.resolve(peer_id, address) orelse {
+                if (self.raft.metrics) |m| m.incMessagesFailed();
+                return lost;
+            };
             const keys = self.outboundKeys(peer_id) orelse {
                 log.debug("[raft] no key for peer {s}, AppendEntries dropped", .{peer_id orelse "?"});
+                if (self.raft.metrics) |m| m.incMessagesFailed();
                 return lost;
             };
 
@@ -1196,13 +833,20 @@ pub fn TransportImpl(comptime slot: usize) type {
             defer frame.deinit(self.allocator);
             encodeAppendEntries(&frame, self.allocator, req) catch |err| {
                 log.debug("[raft] encoding AppendEntries failed ({})", .{err});
+                if (self.raft.metrics) |m| m.incMessagesFailed();
                 return lost;
             };
 
-            var conn = dialTo(self.allocator, self.io, ep, self.rpcTimeoutMs()) catch return lost;
+            var conn = dialTo(self.allocator, self.io, ep, self.rpcTimeoutMs()) catch {
+                if (self.raft.metrics) |m| m.incMessagesFailed();
+                return lost;
+            };
             defer conn.deinit();
             sockread.setSendTimeout(conn.stream, self.rpcTimeoutMs());
-            writeFrameSigned(keys.sign, &conn, frame.items) catch return lost;
+            writeFrameSigned(keys.sign, &conn, frame.items) catch {
+                if (self.raft.metrics) |m| m.incMessagesFailed();
+                return lost;
+            };
 
             // Bound the wait for the reply as well as the dial: a peer that
             // accepts the connection and never answers is the failure this is
@@ -1215,9 +859,15 @@ pub fn TransportImpl(comptime slot: usize) type {
             defer reply.deinit(self.allocator);
             const bytes = readFrameAuth(keys.verify, &conn, &reply) catch |err| {
                 log.debug("[raft] no reply from {s}:{d} within {d}ms, or the peer closed ({}) — message dropped", .{ ep.host, ep.port, self.rpcTimeoutMs(), err });
+                if (self.raft.metrics) |m| m.incMessagesFailed();
                 return lost;
             };
-            return decodeAppendEntriesResponse(bytes) catch lost;
+            const resp = decodeAppendEntriesResponse(bytes) catch {
+                if (self.raft.metrics) |m| m.incMessagesFailed();
+                return lost;
+            };
+            if (self.raft.metrics) |m| m.incMessagesSent(@intCast(frame.items.len));
+            return resp;
         }
 
         fn thunkVoteRequest(peer_id: ?[]const u8, address: []const u8, req: VoteRequest) void {
@@ -1240,9 +890,14 @@ pub fn TransportImpl(comptime slot: usize) type {
         /// dropped frame and retries next round. Never a panic.
         pub fn sendInstallSnapshot(self: *Self, peer_id: ?[]const u8, address: []const u8, req: InstallSnapshotRequest) InstallSnapshotResponse {
             const lost = InstallSnapshotResponse{ .term = 0 };
-            const ep = self.resolve(peer_id, address) orelse return lost;
+            // Same one-count-per-attempt accounting as `sendAppendEntries`.
+            const ep = self.resolve(peer_id, address) orelse {
+                if (self.raft.metrics) |m| m.incMessagesFailed();
+                return lost;
+            };
             const keys = self.outboundKeys(peer_id) orelse {
                 log.debug("[raft] no key for peer {s}, InstallSnapshot dropped", .{peer_id orelse "?"});
+                if (self.raft.metrics) |m| m.incMessagesFailed();
                 return lost;
             };
 
@@ -1250,13 +905,20 @@ pub fn TransportImpl(comptime slot: usize) type {
             defer frame.deinit(self.allocator);
             encodeInstallSnapshot(&frame, self.allocator, req) catch |err| {
                 log.debug("[raft] encoding InstallSnapshot failed ({})", .{err});
+                if (self.raft.metrics) |m| m.incMessagesFailed();
                 return lost;
             };
 
-            var conn = dialTo(self.allocator, self.io, ep, self.rpcTimeoutMs()) catch return lost;
+            var conn = dialTo(self.allocator, self.io, ep, self.rpcTimeoutMs()) catch {
+                if (self.raft.metrics) |m| m.incMessagesFailed();
+                return lost;
+            };
             defer conn.deinit();
             sockread.setSendTimeout(conn.stream, self.rpcTimeoutMs());
-            writeFrameSigned(keys.sign, &conn, frame.items) catch return lost;
+            writeFrameSigned(keys.sign, &conn, frame.items) catch {
+                if (self.raft.metrics) |m| m.incMessagesFailed();
+                return lost;
+            };
 
             // Same bounded reply wait as `sendAppendEntries` — a snapshot can be
             // the largest frame a peer ever gets, so a WAN should raise
@@ -1267,9 +929,20 @@ pub fn TransportImpl(comptime slot: usize) type {
             defer reply.deinit(self.allocator);
             const bytes = readFrameAuth(keys.verify, &conn, &reply) catch |err| {
                 log.debug("[raft] no snapshot reply from {s}:{d} within {d}ms, or the peer closed ({}) — message dropped", .{ ep.host, ep.port, self.rpcTimeoutMs(), err });
+                if (self.raft.metrics) |m| m.incMessagesFailed();
                 return lost;
             };
-            return decodeInstallSnapshotResponse(bytes) catch lost;
+            const resp = decodeInstallSnapshotResponse(bytes) catch {
+                if (self.raft.metrics) |m| m.incMessagesFailed();
+                return lost;
+            };
+            if (self.raft.metrics) |m| {
+                m.incMessagesSent(@intCast(frame.items.len));
+                // Chunked transfers count per chunk — the transport never sees
+                // the whole transfer at once.
+                m.incSnapshotsSent();
+            }
+            return resp;
         }
 
         fn thunkInstallSnapshot(peer_id: ?[]const u8, address: []const u8, req: InstallSnapshotRequest) InstallSnapshotResponse {
@@ -1383,7 +1056,16 @@ pub fn handleConnection(raft: *RaftElection, addresses: ?*const AddressBook, con
                 return;
             },
             .shared => break :blk verifiedRecv(config.cluster_secret.?, conn, &in) catch |err| {
-                log.debug("[raft] inbound frame not authenticated ({})", .{err});
+                // `verifiedRecv` also reports plain read failures; only a MAC
+                // verdict is an authentication event worth counting and warning
+                // on (rate-limited — a mis-keyed peer retries in a tight loop).
+                if (err == error.ClusterAuthFailed) {
+                    if (raft.metrics) |m| m.incAuthFailures();
+                    if (raft.auth_fail_log.allow(Time.monotonicNowMilliseconds()))
+                        log.warn("[raft] inbound frame failed MAC verification, connection dropped", .{});
+                } else {
+                    log.debug("[raft] inbound frame not readable ({})", .{err});
+                }
                 return;
             },
             .per_node => {
@@ -1407,13 +1089,22 @@ pub fn handleConnection(raft: *RaftElection, addresses: ?*const AddressBook, con
                 };
                 // A-3: current first, then the previous key while the peer's
                 // rotation window is open — signing never uses `previous`.
-                break :blk verifyFrameMacWindowed(ks, raw) catch |err| {
-                    log.debug("[raft] inbound frame not authenticated as {s} ({})", .{ claimed, err });
+                // `verifyFrameMacWindowed` is pure (no IO), so its only error
+                // is the MAC verdict — every catch here is an auth failure.
+                break :blk verifyFrameMacWindowed(ks, raw) catch {
+                    if (raft.metrics) |m| m.incAuthFailures();
+                    if (raft.auth_fail_log.allow(Time.monotonicNowMilliseconds()))
+                        log.warn("[raft] inbound frame claiming {s} failed MAC verification, connection dropped", .{claimed});
                     return;
                 };
             },
         }
     };
+
+    // Received and authenticated: the frame is about to be dispatched, so the
+    // cluster's receive counters move. Byte count is the frame proper, without
+    // the MAC trailer `verifiedRecv`/`verifyFrameMacWindowed` stripped.
+    if (raft.metrics) |m| m.incMessagesReceived(@intCast(frame.len));
 
     var arena_state = std.heap.ArenaAllocator.init(conn.allocator);
     defer arena_state.deinit();
@@ -1449,6 +1140,9 @@ pub fn handleConnection(raft: *RaftElection, addresses: ?*const AddressBook, con
         .install_snapshot => {
             const req = decodeInstallSnapshot(allocator, frame) catch |err| return logDrop(err);
             const resp = raft.handleInstallSnapshot(req) catch |err| return logDrop(err);
+            // One inbound InstallSnapshot RPC served. Chunked transfers count
+            // per chunk — the transport never sees the whole transfer at once.
+            if (raft.metrics) |m| m.incSnapshotsReceived();
             encodeInstallSnapshotResponse(&out, allocator, resp) catch |err| return logDrop(err);
         },
         .vote_response => {
@@ -1463,9 +1157,14 @@ pub fn handleConnection(raft: *RaftElection, addresses: ?*const AddressBook, con
         .append_entries_response, .install_snapshot_response => return,
     }
 
-    writeFrameSigned(sign, conn, out.items) catch |err| {
+    // The reply (and the relayed vote response below) are this node's outbound
+    // frames: same sent/failed accounting as the TransportImpl send paths.
+    if (writeFrameSigned(sign, conn, out.items)) {
+        if (raft.metrics) |m| m.incMessagesSent(@intCast(out.items.len));
+    } else |err| {
         log.debug("[raft] replying on the inbound connection failed ({})", .{err});
-    };
+        if (raft.metrics) |m| m.incMessagesFailed();
+    }
 
     if (relay_candidate) |candidate| {
         const ep = if (addresses) |book| book.lookup(candidate) else null;
@@ -1479,6 +1178,7 @@ pub fn handleConnection(raft: *RaftElection, addresses: ?*const AddressBook, con
             }
             var conn_out = dialTo(conn.allocator, conn.io, endpoint, raft.config.rpc_timeout_ms) catch |err| {
                 log.debug("[raft] relaying the vote response to {s}:{d} failed ({})", .{ endpoint.host, endpoint.port, err });
+                if (raft.metrics) |m| m.incMessagesFailed();
                 return;
             };
             defer conn_out.deinit();
@@ -1486,7 +1186,10 @@ pub fn handleConnection(raft: *RaftElection, addresses: ?*const AddressBook, con
             // signed too — an unsigned relay is a vote the candidate drops.
             writeFrameSigned(sign, &conn_out, out.items) catch |err| {
                 log.debug("[raft] relaying the vote response failed ({})", .{err});
+                if (raft.metrics) |m| m.incMessagesFailed();
+                return;
             };
+            if (raft.metrics) |m| m.incMessagesSent(@intCast(out.items.len));
         } else {
             log.debug("[raft] candidate {s} is not in the address book, vote response not relayed", .{candidate});
         }
@@ -2012,6 +1715,87 @@ test "a bare frame with no MAC is refused once a secret is configured" {
     // And a frame with no room for a MAC at all is refused without reading past it.
     try writeFrame(pair[0].stream, &.{ @backingInt(MessageTag.vote_request), 0, 0, 0, 0, 0 });
     try testing.expectError(error.ClusterAuthFailed, verifiedRecv(receiver.pre_shared_key, &pair[1], &in));
+}
+
+test "handleConnection counts authenticated frames, and MAC failures, in the wired metrics" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    if (!@import("../../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    const secret: [32]u8 = @splat(0x5a);
+    var impl: ElectionTransportImpl = undefined;
+    var raft: RaftElection = undefined;
+    impl.init(allocator, io, &raft);
+    defer impl.deinit();
+    raft = try RaftElection.init(allocator, "metrics-node", &.{}, .{ .cluster_secret = secret }, &impl.transport());
+    defer raft.deinit();
+    var metrics = ClusterMetrics.init(allocator);
+    raft.setMetrics(&metrics);
+
+    var frame = std.ArrayList(u8).empty;
+    defer frame.deinit(allocator);
+    try encodeVoteRequest(&frame, allocator, .{ .term = 1, .candidate_id = "some-candidate", .last_log_index = 0, .last_log_term = 0 });
+
+    // A correctly signed frame is authenticated, dispatched and counted.
+    var pair: [2]NetworkTransport.ClusterConnection = undefined;
+    if (!socketPair(allocator, io, &pair)) return error.SkipZigTest;
+    defer {
+        pair[0].deinit();
+        pair[1].deinit();
+    }
+    try sendSigned(secret, &pair[0], frame.items);
+    handleConnection(&raft, null, &pair[1]);
+    try testing.expectEqual(@as(u64, 1), metrics.messages_received.load(.monotonic));
+    try testing.expect(metrics.bytes_received.load(.monotonic) > 0);
+    try testing.expectEqual(@as(u64, 0), metrics.auth_failures.load(.monotonic));
+
+    // A frame signed with the wrong key is dropped and counted as an auth
+    // failure — and not as a received message.
+    var pair2: [2]NetworkTransport.ClusterConnection = undefined;
+    if (!socketPair(allocator, io, &pair2)) return error.SkipZigTest;
+    defer {
+        pair2[0].deinit();
+        pair2[1].deinit();
+    }
+    try sendSigned(@splat(0x5b), &pair2[0], frame.items);
+    handleConnection(&raft, null, &pair2[1]);
+    try testing.expectEqual(@as(u64, 1), metrics.messages_received.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), metrics.auth_failures.load(.monotonic));
+}
+
+test "handleConnection counts a per-node MAC failure against the wired metrics" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    if (!@import("../../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    const own: [32]u8 = @splat(0xaa);
+    const peer_keys = [_]PeerKey{.{ .id = "peer-a", .key = @splat(0xbb) }};
+    var impl: ElectionTransportImpl = undefined;
+    var raft: RaftElection = undefined;
+    impl.init(allocator, io, &raft);
+    defer impl.deinit();
+    raft = try RaftElection.init(allocator, "metrics-node-2", &.{}, .{ .own_key = own, .peer_keys = &peer_keys }, &impl.transport());
+    defer raft.deinit();
+    var metrics = ClusterMetrics.init(allocator);
+    raft.setMetrics(&metrics);
+
+    var pair: [2]NetworkTransport.ClusterConnection = undefined;
+    if (!socketPair(allocator, io, &pair)) return error.SkipZigTest;
+    defer {
+        pair[0].deinit();
+        pair[1].deinit();
+    }
+
+    // The frame claims to be the keyed peer "peer-a" but is signed with a key
+    // that is not peer-a's: the claimed id resolves, the MAC does not verify.
+    var frame = std.ArrayList(u8).empty;
+    defer frame.deinit(allocator);
+    try encodeVoteRequest(&frame, allocator, .{ .term = 1, .candidate_id = "peer-a", .last_log_index = 0, .last_log_term = 0 });
+    try sendSigned(@splat(0xcc), &pair[0], frame.items);
+    handleConnection(&raft, null, &pair[1]);
+
+    try testing.expectEqual(@as(u64, 1), metrics.auth_failures.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), metrics.messages_received.load(.monotonic));
 }
 
 test "address book parses host:port and resolves by peer id" {
@@ -3551,144 +3335,6 @@ test "real loopback per-node snapshot catch-up: keyed InstallSnapshot converges"
     // Leader bookkeeping: c resumed just past the snapshot and ended caught up.
     try testing.expectEqual(@as(?u64, 7), a_raft.next_index.get("node-c"));
     try testing.expectEqual(@as(?u64, 6), a_raft.match_index.get("node-c"));
-}
-
-// ── Bounded dial ────────────────────────────────────────────────────────────
-
-/// `O_NONBLOCK` as the *kernel* sees it on `fd`, read back with `fcntl` — the
-/// assertion is about the socket's real state rather than about what we meant
-/// to ask for.
-fn nonblockSet(fd: std.posix.socket_t) bool {
-    const rc = std.posix.system.fcntl(fd, std.posix.F.GETFL, @as(usize, 0));
-    if (std.posix.errno(rc) != .SUCCESS) return false;
-    const bits: u32 = @truncate(@as(u64, @bitCast(@as(i64, @intCast(rc)))));
-    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
-    return bits & nonblock != 0;
-}
-
-// Verified red: with the bound removed (the pre-fix `dialTo`, i.e. a plain
-// `IpAddress.connect`) this dial does not return — the SYN to a link-local
-// address that has no responder is never answered and macOS keeps the socket in
-// SYN_SENT (measured: still pending after 25 s). Green: it returns on the
-// configured bound, and the elapsed time proves the bound was *reached* rather
-// than the dial failing early for some other reason.
-//
-// The bound is the assertion; the address is not. `169.254.255.254` is RFC 3927
-// link-local with nothing on the link, which is what this machine black-holes
-// today (and what the 25 s measurement above used). Another environment may
-// answer it, or refuse it outright — hence the probe: without a black hole to
-// dial there is nothing to assert, and skipping says so.
-test "a black-holed dial returns on the bound, not on the kernel's default" {
-    const io = testing.io;
-    if (!@import("../../test/NetworkProbe.zig").available()) return error.SkipZigTest;
-
-    const black_hole = try std.Io.net.IpAddress.parse("169.254.255.254", 80);
-
-    if (connectTimeout(io, black_hole, 150)) |stream| {
-        stream.close(io); // something on this link answers: no black hole here
-        return error.SkipZigTest;
-    } else |err| switch (err) {
-        error.ConnectTimeout => {},
-        else => {
-            std.log.info("[raft] {s}:80 does not black-hole here ({s}) — skipping the connect-bound test", .{ "169.254.255.254", @errorName(err) });
-            return error.SkipZigTest;
-        },
-    }
-
-    const bound_ms: u32 = 700;
-    const started = Time.monotonicNowMilliseconds();
-    const result = connectTimeout(io, black_hole, bound_ms);
-    const elapsed = Time.monotonicNowMilliseconds() - started;
-    if (result) |stream| {
-        stream.close(io);
-        return error.SkipZigTest; // answered inside the bound after all
-    } else |err| switch (err) {
-        error.ConnectTimeout => {},
-        else => {
-            // Black-holing a link-local address relies on its ARP going
-            // unanswered; back-to-back dials race the kernel's neighbour
-            // cache, and a negative entry turns this second dial into an
-            // immediate EHOSTUNREACH even though the probe above timed out.
-            // The premise (the address hangs) proved unstable — skip, as the
-            // probe does, rather than assert on an environment artifact.
-            std.log.info("[raft] {s}:80 stopped black-holing between probe and measurement ({s}) — skipping the connect-bound test", .{ "169.254.255.254", @errorName(err) });
-            return error.SkipZigTest;
-        },
-    }
-
-    // The bound, and not something shorter: `ConnectionRefused` and friends
-    // would mean the dial was never hanging, which is the case this test is not
-    // about. The upper end is the real assertion — the kernel's own default for
-    // this address is the >25 s measured above.
-    try testing.expect(elapsed >= @as(i64, bound_ms) - 150);
-    try testing.expect(elapsed < 5_000);
-}
-
-test "connectTimeout hands back a blocking stream the sockread helpers can use" {
-    const io = testing.io;
-    if (!@import("../../test/NetworkProbe.zig").available()) return error.SkipZigTest;
-
-    const bind = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-    var server = try bind.listen(io, .{});
-    defer server.deinit(io);
-    var client = try connectTimeout(io, try std.Io.net.IpAddress.parse("127.0.0.1", server.socket.address.getPort()), test_dial_timeout_ms);
-    defer client.close(io);
-    var accepted = try server.accept(io);
-    defer accepted.close(io);
-
-    // The invariant `sockread` is built on: a socket left non-blocking would
-    // come back `EAGAIN` from these, and the WebSocket write path treats `EAGAIN`
-    // as a programmer bug and panics on it in debug builds. Then the helpers
-    // themselves, which is what the cluster transport actually calls.
-    try testing.expect(!nonblockSet(client.socket.handle));
-    try sockread.writeFull(client, "ping");
-    var buf: [4]u8 = undefined;
-    try sockread.readFull(accepted, &buf);
-    try testing.expectEqualStrings("ping", &buf);
-
-    // A dial that really fails is still reported as itself: `SO_ERROR` is read
-    // even though `poll` said "ready", so a refused port is not folded into the
-    // timeout.
-    var gone = try bind.listen(io, .{});
-    const gone_port = gone.socket.address.getPort();
-    gone.deinit(io);
-    try testing.expectError(error.ConnectionRefused, connectTimeout(io, try std.Io.net.IpAddress.parse("127.0.0.1", gone_port), test_dial_timeout_ms));
-}
-
-// The Windows half's error policy is pure data, so it is verified here on
-// every host — the dial itself can only run on Windows, where the CI
-// cross-compile (`zig build -Ddb=none -Dtarget=x86_64-windows`) plus the
-// comptime reference next to `connectTimeoutWindows` are the gate.
-
-test "WSA connect classification: in-progress vs connected vs failed" {
-    try testing.expectEqual(WsaConnectVerdict.in_progress, classifyWsaConnect(wsa.EWOULDBLOCK));
-    try testing.expectEqual(WsaConnectVerdict.in_progress, classifyWsaConnect(wsa.EINTR));
-    try testing.expectEqual(WsaConnectVerdict.in_progress, classifyWsaConnect(wsa.EALREADY));
-    try testing.expectEqual(WsaConnectVerdict.connected, classifyWsaConnect(wsa.EISCONN));
-    switch (classifyWsaConnect(wsa.ECONNREFUSED)) {
-        .failed => |err| try testing.expectEqual(error.ConnectionRefused, err),
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "WSA failure codes keep the POSIX dial's error names" {
-    try testing.expectEqual(error.Timeout, wsaFailure(wsa.ETIMEDOUT));
-    try testing.expectEqual(error.ConnectionRefused, wsaFailure(wsa.ECONNREFUSED));
-    try testing.expectEqual(error.ConnectionResetByPeer, wsaFailure(wsa.ECONNRESET));
-    try testing.expectEqual(error.HostUnreachable, wsaFailure(wsa.EHOSTUNREACH));
-    try testing.expectEqual(error.NetworkUnreachable, wsaFailure(wsa.ENETUNREACH));
-    try testing.expectEqual(error.AccessDenied, wsaFailure(wsa.EACCES));
-    try testing.expectEqual(error.NetworkDown, wsaFailure(wsa.ENETDOWN));
-    try testing.expectEqual(error.AddressUnavailable, wsaFailure(wsa.EADDRNOTAVAIL));
-    try testing.expectEqual(error.AddressFamilyUnsupported, wsaFailure(wsa.EAFNOSUPPORT));
-    try testing.expectEqual(error.SystemResources, wsaFailure(wsa.ENOBUFS));
-    try testing.expectEqual(error.ProcessFdQuotaExceeded, wsaFailure(wsa.EMFILE));
-    try testing.expectEqual(error.ProtocolUnsupportedByAddressFamily, wsaFailure(wsa.EPROTONOSUPPORT));
-    try testing.expectEqual(error.SocketModeUnsupported, wsaFailure(wsa.EPROTOTYPE));
-    // No named counterpart: report, never panic. WSAECONNABORTED (10053) is
-    // folded the same way the POSIX half folds ECONNABORTED into `Unexpected`.
-    try testing.expectEqual(error.Unexpected, wsaFailure(10053));
-    try testing.expectEqual(error.Unexpected, wsaFailure(-1));
 }
 
 // ── A-3: rotation window & revocation on the wire ───────────────────────────

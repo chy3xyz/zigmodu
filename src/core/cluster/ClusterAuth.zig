@@ -103,6 +103,37 @@ pub const ClusterAuth = struct {
     }
 };
 
+/// Rate limiter for authentication-failure log lines: at most one line per
+/// `interval_ms` per instance, counting what it suppresses so the silence is
+/// itself observable. A flood of bad-MAC frames (a mis-keyed peer retrying in a
+/// tight loop, or a port scan) used to be either invisible (`log.debug`) or, had
+/// it been promoted naively, a log flood of its own — this is the middle ground.
+///
+/// Plain atomics, no lock: the worst race is one extra line per interval (two
+/// threads both seeing an expired window), which is the safe side of a logging
+/// decision. The clock is the caller's (`Time.monotonicNowMilliseconds()`) so
+/// this type stays IO-free and testable.
+pub const AuthFailLogLimiter = struct {
+    last_log_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    suppressed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    /// One warn line per minute per instance.
+    pub const interval_ms: i64 = 60_000;
+
+    /// True when this occurrence should be logged now. The first occurrence
+    /// always logs (`last_log_ms == 0` predates every monotonic reading);
+    /// later ones inside the window are counted in `suppressed` instead.
+    pub fn allow(self: *AuthFailLogLimiter, now_ms: i64) bool {
+        const last = self.last_log_ms.load(.monotonic);
+        if (last != 0 and now_ms - last < interval_ms) {
+            _ = self.suppressed.fetchAdd(1, .monotonic);
+            return false;
+        }
+        self.last_log_ms.store(now_ms, .monotonic);
+        return true;
+    }
+};
+
 // The audit this pin answers read `verify`'s `self.sign(payload) catch return
 // false` as a live path: an allocation failure on *our* side would have been
 // reported as "your signature is invalid" — a valid peer accused of forging.
@@ -173,4 +204,19 @@ test "ClusterAuth different keys reject" {
 
     const sig = try a1.sign("data");
     try std.testing.expect(!a2.verify("data", &sig));
+}
+
+test "AuthFailLogLimiter allows the first line, then one per interval" {
+    var limiter: AuthFailLogLimiter = .{};
+
+    // First occurrence always logs.
+    try std.testing.expect(limiter.allow(1_000));
+    // Inside the window: suppressed and counted.
+    try std.testing.expect(!limiter.allow(2_000));
+    try std.testing.expect(!limiter.allow(30_000));
+    try std.testing.expectEqual(@as(u64, 2), limiter.suppressed.load(.monotonic));
+    // At the boundary the next line is allowed again (and the window re-opens).
+    try std.testing.expect(limiter.allow(1_000 + AuthFailLogLimiter.interval_ms));
+    try std.testing.expect(!limiter.allow(1_000 + AuthFailLogLimiter.interval_ms + 1));
+    try std.testing.expectEqual(@as(u64, 3), limiter.suppressed.load(.monotonic));
 }

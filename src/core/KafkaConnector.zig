@@ -105,6 +105,9 @@ pub const KafkaConsumerConfig = struct {
     default_partition_count: i32 = 3,
     partition_assignor: PartitionAssignorKind = .range,
     offline: bool = false,
+    /// Bound on the TCP dial to the bootstrap broker. Mirrors
+    /// `KafkaProducerConfig.connect_timeout_ms`.
+    connect_timeout_ms: u64 = 5000,
 };
 
 // ==== §2  Transport & wire helpers ====
@@ -124,6 +127,10 @@ pub const RobustMQTransport = struct {
     reader: ?sockread.Reader = null,
     /// Set when redirected via FindCoordinator (owned).
     owned_host: ?[]u8 = null,
+    /// Bound on the TCP dial (`0` = kernel default). Producer/consumer set
+    /// this from their config in `ensureTransport`; `init` cannot take it
+    /// without changing the public signature.
+    connect_timeout_ms: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, bootstrap: []const u8, client_id: []const u8) !Self {
         const host, const port = try parseBootstrap(bootstrap);
@@ -212,7 +219,7 @@ pub const RobustMQTransport = struct {
         const addr = try std.Io.net.IpAddress.parseIp4(self.host, self.port);
         // netdial, not std: a signal landing inside std's blocking connect
         // panics on the EINTR retry's EISCONN (`errnoBug`) — core/netdial.zig.
-        const stream = try netdial.connectBlocking(self.io, addr);
+        const stream = try netdial.connectTimeout(self.io, addr, self.connect_timeout_ms);
         self.stream = stream;
         // Negotiate API versions (best-effort; ignore body details).
         self.sendApiVersions() catch |err| {
@@ -459,6 +466,9 @@ pub const KafkaProducer = struct {
         const io = self.io orelse return error.IoRequired;
         var t = try RobustMQTransport.init(self.allocator, io, self.config.bootstrap_servers, self.config.client_id);
         errdefer t.deinit();
+        // Apply the documented `connect_timeout_ms` (5 s default): the field
+        // existed but was never forwarded, so dials used the kernel default.
+        t.connect_timeout_ms = @intCast(@min(self.config.connect_timeout_ms, std.math.maxInt(u32)));
         try t.connect();
         self.transport = t;
     }
@@ -1751,6 +1761,7 @@ pub const KafkaConsumer = struct {
         const io = self.io orelse return error.IoRequired;
         var t = try RobustMQTransport.init(self.allocator, io, self.config.bootstrap_servers, self.config.client_id);
         errdefer t.deinit();
+        t.connect_timeout_ms = @intCast(@min(self.config.connect_timeout_ms, std.math.maxInt(u32)));
         try t.connect();
         self.transport = t;
     }

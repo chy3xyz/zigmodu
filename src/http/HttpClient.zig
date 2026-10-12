@@ -31,6 +31,16 @@ pub const HttpClient = struct {
     connection_pool: ConnectionPool,
     retry_policy: RetryPolicy,
     timeout_ms: u64,
+    /// Upper bound on a buffered response body (`request`, not the streaming
+    /// path — streaming never holds the body, so it has nothing to bound).
+    /// `0` = unlimited, the default: the old behaviour. When set, a
+    /// `Content-Length` past the bound is rejected before the allocation it
+    /// names, and a chunked body is cut off the moment its decoded total
+    /// passes the bound — both with `error.ResponseTooLarge`. The bound is a
+    /// property of the client because those sizes are a property of the peer:
+    /// it chooses them, so "trust the header" and "allocate for the header"
+    /// must not be the same decision.
+    max_response_bytes: usize = 0,
     /// Shared `std.http.Client` for the HTTPS path, created on first use and
     /// kept until `deinit`. One instance is what lets outbound TLS connections
     /// be reused (`keep_alive`) and keeps the system CA bundle from being
@@ -70,6 +80,12 @@ pub const HttpClient = struct {
         max_connections: usize,
         idle_connections: std.ArrayList(Connection),
         active_connections: std.ArrayList(Connection),
+        /// Dials currently in flight (reserved by `acquireIdleOrReserve`,
+        /// released by `installDialed`/`abandonDialSlot`). Counted alongside
+        /// `active_connections` against `max_connections` so that concurrent
+        /// acquirers cannot jointly overshoot the bound while none of their
+        /// connections is on the active list yet.
+        pending_dials: usize = 0,
         mutex: std.Io.Mutex,
 
         pub const Connection = struct {
@@ -119,15 +135,51 @@ pub const HttpClient = struct {
         }
 
         pub fn acquire(self: *ConnectionPool, host: []const u8, port: u16) !Connection {
-            // Cancelable, unlike `release`/`discard`: nothing is at stake here.
-            // The caller is asking for a room it does not have yet, and neither
-            // list is touched until the lock is held, so there is no resource a
-            // cancelation could strand. Waiting it out uncancelably would be the
-            // wrong answer for the opposite reason: the critical section is not
-            // a list move — it dials (`IpAddress.resolve` + `connect`) — so a
-            // caller told to stop would be held for the length of a connect.
-            // The old mapping to `error.ServerError` could not be told apart
-            // from a broken pool, so the cancelation is propagated as itself
+            if (try self.acquireIdleOrReserve(host, port)) |conn| return conn;
+
+            // Dial phase — the lock is released. It used to run while holding
+            // it, so one slow `IpAddress.resolve` (a wedged resolver, a cold
+            // cache) blocked every other borrower, including ones that only
+            // wanted an idle connection that was already there. Same shape as
+            // `sqlx.ConnPool`: reserve the slot under the lock, build the
+            // connection with the lock released, take the lock again to hand
+            // it over. The slot reservation (`pending_dials`) is what keeps
+            // concurrent acquirers from jointly overshooting `max_connections`
+            // while none of them is on the active list yet.
+            const addr = std.Io.net.IpAddress.resolve(self.io, host, port) catch |err| {
+                self.abandonDialSlot();
+                return err;
+            };
+            // netdial, not std: a signal inside std's blocking connect panics
+            // on the EINTR retry's EISCONN (`errnoBug`) — core/netdial.zig.
+            const stream = netdial.connectBlocking(self.io, addr) catch |err| {
+                self.abandonDialSlot();
+                return err;
+            };
+            // Nothing owns the socket or the copy yet, so these are the only
+            // chances to close/free them if a later step fails: the append in
+            // `installDialed` is the last fallible operation before the pool
+            // takes over.
+            const host_copy = self.allocator.dupe(u8, host) catch |err| {
+                stream.close(self.io);
+                self.abandonDialSlot();
+                return err;
+            };
+            return self.installDialed(host_copy, port, stream);
+        }
+
+        /// The locked half of `acquire`: the idle scan and the dial-slot
+        /// reservation — list work only, which is what makes a cancelable
+        /// wait the right choice here (see `acquire`'s comment). Returns the
+        /// idle connection when one matches, otherwise reserves a slot and
+        /// returns `null` for the caller to dial outside the lock.
+        fn acquireIdleOrReserve(self: *ConnectionPool, host: []const u8, port: u16) !?Connection {
+            // Cancelable, unlike `release`/`discard`: nothing is at stake
+            // here. The caller is asking for a room it does not have yet, and
+            // neither list is touched until the lock is held, so there is no
+            // resource a cancelation could strand. The old mapping to
+            // `error.ServerError` could not be told apart from a broken pool,
+            // so the cancelation is propagated as itself
             // (`std.Io.Mutex.lock` fails only with `error.Canceled`).
             try self.mutex.lock(self.io);
             defer self.mutex.unlock(self.io);
@@ -160,21 +212,32 @@ pub const HttpClient = struct {
                 idx += 1;
             }
 
-            // Create new connection
-            if (self.active_connections.items.len >= self.max_connections) {
+            if (self.active_connections.items.len + self.pending_dials >= self.max_connections) {
                 return error.PoolExhausted;
             }
+            self.pending_dials += 1;
+            return null;
+        }
 
-            const addr = try std.Io.net.IpAddress.resolve(self.io, host, port);
-            // netdial, not std: a signal inside std's blocking connect panics
-            // on the EINTR retry's EISCONN (`errnoBug`) — core/netdial.zig.
-            const stream = try netdial.connectBlocking(self.io, addr);
-            // Nothing owns the socket or the copy yet, so these are the only
-            // chances to close/free them if a later step fails: the append below
-            // is the last fallible operation before the pool takes over.
-            errdefer stream.close(self.io);
-            const host_copy = try self.allocator.dupe(u8, host);
-            errdefer self.allocator.free(host_copy);
+        /// Give back a dial slot whose dial failed. Uncancelable: the
+        /// reservation is a counter correction, and a canceled lock wait here
+        /// would leave the slot spent forever — every later `acquire` would
+        /// see a phantom dial in flight.
+        fn abandonDialSlot(self: *ConnectionPool) void {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            self.pending_dials -= 1;
+        }
+
+        /// Hand a dialed connection over to the pool. Uncancelable for the
+        /// same reason as `release`: the socket and the host copy are owned
+        /// here, so a canceled lock wait would strand them along with the
+        /// reserved slot — and the critical section is a list append, not a
+        /// wait.
+        fn installDialed(self: *ConnectionPool, host_copy: []u8, port: u16, stream: std.Io.net.Stream) !Connection {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            self.pending_dials -= 1;
 
             const conn = Connection{
                 .host = host_copy,
@@ -184,7 +247,10 @@ pub const HttpClient = struct {
                 .last_used = Time.monotonicNowSeconds(),
                 .request_count = 0,
             };
-
+            errdefer {
+                stream.close(self.io);
+                self.allocator.free(host_copy);
+            }
             try self.active_connections.append(self.allocator, conn);
             return conn;
         }
@@ -783,14 +849,38 @@ pub const HttpClient = struct {
         return error.ConnectionError;
     }
 
-    /// Wait up to `timeout_ms` for the socket to become readable so
-    /// `request()` cannot block indefinitely against a peer that never
-    /// responds. `timeout_ms == 0` disables the timeout.
+    /// One request's read budget. `timeout_ms` used to be handed to every
+    /// `poll` independently, so a response delivered in N dribbles — each one
+    /// inside the timeout — could take N × timeout in total. The deadline
+    /// makes the bound a property of the request, not of one read.
+    /// `at == null` is the unbounded case (`timeout_ms == 0`).
+    const Deadline = struct {
+        at: ?i64,
+
+        fn start(timeout_ms: u64) Deadline {
+            if (timeout_ms == 0) return .{ .at = null };
+            return .{ .at = Time.monotonicNowMilliseconds() + @as(i64, @intCast(timeout_ms)) };
+        }
+
+        /// Wait budget for the next poll: `0` is `waitForReadable`'s "no
+        /// timeout", and an expired deadline fails before polling.
+        fn remaining(self: Deadline) !u64 {
+            const at = self.at orelse return 0;
+            const now = Time.monotonicNowMilliseconds();
+            if (now >= at) return error.Timeout;
+            return @intCast(at - now);
+        }
+    };
+
+    /// Wait up to the `deadline`'s remaining budget for the socket to become
+    /// readable so `request()` cannot block indefinitely against a peer that
+    /// never responds. An unbounded deadline (`timeout_ms == 0`) waits
+    /// indefinitely.
     /// Blocking read (waitForReadable + posix.read). The streaming path must
     /// not use fiber-based sockread.readSome outside an async context — it
     /// hangs on local HTTP (non-TLS) connections.
-    fn blockingRead(stream: std.Io.net.Stream, buf: []u8, timeout_ms: u64) !usize {
-        try waitForReadable(stream.socket.handle, timeout_ms);
+    fn blockingRead(stream: std.Io.net.Stream, buf: []u8, deadline: Deadline) !usize {
+        try waitForReadable(stream.socket.handle, try deadline.remaining());
         return std.posix.read(stream.socket.handle, buf) catch return error.ConnectionError;
     }
 
@@ -894,9 +984,12 @@ pub const HttpClient = struct {
         var resp = HttpResponse.init(self.allocator);
         errdefer resp.deinit();
 
+        // One budget for the whole response, not one per read.
+        const deadline = Deadline.start(self.timeout_ms);
+
         var buf: [8192]u8 = undefined;
 
-        try waitForReadable(stream.socket.handle, self.timeout_ms);
+        try waitForReadable(stream.socket.handle, try deadline.remaining());
         const n = std.posix.read(stream.socket.handle, &buf) catch return error.ConnectionError;
         if (n == 0) return error.ConnectionError;
         const raw = buf[0..n];
@@ -939,20 +1032,36 @@ pub const HttpClient = struct {
         // branch the caller got the raw framing back as the body. (The streaming
         // path has decoded it all along.)
         if (chunked) {
-            resp.body = try self.readChunkedBody(stream, &buf, initial_body);
+            resp.body = try self.readChunkedBody(stream, &buf, initial_body, deadline);
             return resp;
         }
         if (content_length == 0) {
+            // `catch 0` above means a malformed or overflow length reads as 0,
+            // so this path is reachable with peer-chosen sizes too.
+            if (self.max_response_bytes > 0 and initial_body.len > self.max_response_bytes) {
+                return error.ResponseTooLarge;
+            }
             resp.body = try self.allocator.dupe(u8, initial_body);
             return resp;
         }
 
+        // The peer picks `Content-Length`; checking the bound before the
+        // allocation it names is what keeps a lying header from turning into
+        // an allocation.
+        if (self.max_response_bytes > 0 and content_length > self.max_response_bytes) {
+            return error.ResponseTooLarge;
+        }
+
         var body_buf = try self.allocator.alloc(u8, content_length);
+        // Covers the read loop below: a `Timeout` / `ConnectionError` there
+        // used to leak the buffer (the `IncompleteBody` branch freed it by
+        // hand, the wait errors did not).
+        errdefer self.allocator.free(body_buf);
         var copied: usize = @min(initial_body.len, content_length);
         @memcpy(body_buf[0..copied], initial_body[0..copied]);
 
         while (copied < content_length) {
-            try waitForReadable(stream.socket.handle, self.timeout_ms);
+            try waitForReadable(stream.socket.handle, try deadline.remaining());
             const more = std.posix.read(stream.socket.handle, &buf) catch return error.ConnectionError;
             if (more == 0) break;
             const to_copy = @min(@as(usize, more), content_length - copied);
@@ -961,7 +1070,6 @@ pub const HttpClient = struct {
         }
 
         if (copied != content_length) {
-            self.allocator.free(body_buf);
             return error.IncompleteBody;
         }
 
@@ -1015,7 +1123,10 @@ pub const HttpClient = struct {
 
         var buf: [8192]u8 = undefined;
 
-        const n = try blockingRead(stream, &buf, self.timeout_ms);
+        // One budget for the whole response, not one per read.
+        const deadline = Deadline.start(self.timeout_ms);
+
+        const n = try blockingRead(stream, &buf, deadline);
         if (n == 0) return error.ConnectionError;
         const raw = buf[0..n];
 
@@ -1055,11 +1166,11 @@ pub const HttpClient = struct {
         const initial = raw[body_start..];
 
         if (chunked) {
-            try streamChunkedBody(stream, &buf, initial, self.timeout_ms, cb_ctx, on_chunk);
+            try streamChunkedBody(stream, &buf, initial, deadline, cb_ctx, on_chunk);
         } else if (content_length) |cl| {
-            try streamContentLengthBody(stream, &buf, initial, cl, self.timeout_ms, cb_ctx, on_chunk);
+            try streamContentLengthBody(stream, &buf, initial, cl, deadline, cb_ctx, on_chunk);
         } else {
-            try streamUntilEofBody(stream, &buf, initial, self.timeout_ms, cb_ctx, on_chunk);
+            try streamUntilEofBody(stream, &buf, initial, deadline, cb_ctx, on_chunk);
         }
         return resp;
     }
@@ -1067,19 +1178,25 @@ pub const HttpClient = struct {
     /// Buffer a chunked response body into contiguous bytes, reusing the same
     /// decoder the streaming path uses (so there is one chunked implementation,
     /// not one per entry point).
-    fn readChunkedBody(self: *Self, stream: std.Io.net.Stream, buf: []u8, initial: []const u8) ![]u8 {
+    fn readChunkedBody(self: *Self, stream: std.Io.net.Stream, buf: []u8, initial: []const u8, deadline: Deadline) ![]u8 {
         const Collector = struct {
             allocator: std.mem.Allocator,
+            max_bytes: usize,
             out: std.ArrayList(u8),
 
             fn onChunk(raw: *anyopaque, chunk: []const u8) anyerror!void {
                 const sink: *@This() = @ptrCast(@alignCast(raw));
+                // Saturating: a chunk can be larger than a small bound, and the
+                // comparison must not wrap into "fits" when it does.
+                if (sink.max_bytes > 0 and sink.out.items.len > sink.max_bytes -| chunk.len) {
+                    return error.ResponseTooLarge;
+                }
                 try sink.out.appendSlice(sink.allocator, chunk);
             }
         };
-        var collector = Collector{ .allocator = self.allocator, .out = .empty };
+        var collector = Collector{ .allocator = self.allocator, .max_bytes = self.max_response_bytes, .out = .empty };
         errdefer collector.out.deinit(self.allocator);
-        try streamChunkedBody(stream, buf, initial, self.timeout_ms, &collector, Collector.onChunk);
+        try streamChunkedBody(stream, buf, initial, deadline, &collector, Collector.onChunk);
         return try collector.out.toOwnedSlice(self.allocator);
     }
 
@@ -1154,7 +1271,7 @@ fn streamContentLengthBody(
     buf: []u8,
     initial: []const u8,
     content_length: usize,
-    timeout_ms: u64,
+    deadline: HttpClient.Deadline,
     cb_ctx: *anyopaque,
     on_chunk: HttpClient.OnBodyChunk,
 ) !void {
@@ -1165,7 +1282,7 @@ fn streamContentLengthBody(
         copied = n;
     }
     while (copied < content_length) {
-        const more = try HttpClient.blockingRead(stream, buf, timeout_ms);
+        const more = try HttpClient.blockingRead(stream, buf, deadline);
         if (more == 0) return error.IncompleteBody;
         const to_copy = @min(@as(usize, more), content_length - copied);
         try on_chunk(cb_ctx, buf[0..to_copy]);
@@ -1177,13 +1294,13 @@ fn streamUntilEofBody(
     stream: std.Io.net.Stream,
     buf: []u8,
     initial: []const u8,
-    timeout_ms: u64,
+    deadline: HttpClient.Deadline,
     cb_ctx: *anyopaque,
     on_chunk: HttpClient.OnBodyChunk,
 ) !void {
     if (initial.len > 0) try on_chunk(cb_ctx, initial);
     while (true) {
-        const more = try HttpClient.blockingRead(stream, buf, timeout_ms);
+        const more = try HttpClient.blockingRead(stream, buf, deadline);
         if (more == 0) break;
         try on_chunk(cb_ctx, buf[0..more]);
     }
@@ -1220,7 +1337,7 @@ fn streamChunkedBody(
     stream: std.Io.net.Stream,
     buf: []u8,
     initial: []const u8,
-    timeout_ms: u64,
+    deadline: HttpClient.Deadline,
     cb_ctx: *anyopaque,
     on_chunk: HttpClient.OnBodyChunk,
 ) !void {
@@ -1233,7 +1350,7 @@ fn streamChunkedBody(
         var line_len: usize = 0;
         while (std.mem.indexOfScalar(u8, size_line[0..line_len], '\n') == null) {
             if (line_len == size_line.len) return error.InvalidChunked;
-            try fillFrom(stream, buf, &pending, size_line[line_len..][0..1], timeout_ms);
+            try fillFrom(stream, buf, &pending, size_line[line_len..][0..1], deadline);
             line_len += 1;
         }
         // A fresh parser per chunk: `ChunkParser` accumulates `chunk_len` across
@@ -1252,7 +1369,7 @@ fn streamChunkedBody(
             // the connection usable for the next request instead of leaving
             // stray CRLF bytes for the next response parser to trip over.
             var trailer_end: [2]u8 = undefined;
-            try fillFrom(stream, buf, &pending, &trailer_end, timeout_ms);
+            try fillFrom(stream, buf, &pending, &trailer_end, deadline);
             if (!std.mem.eql(u8, &trailer_end, "\r\n")) return error.InvalidChunked;
             return;
         }
@@ -1260,7 +1377,7 @@ fn streamChunkedBody(
         var left = parser.chunk_len;
         while (left > 0) {
             if (pending.len == 0) {
-                const more = try HttpClient.blockingRead(stream, buf, timeout_ms);
+                const more = try HttpClient.blockingRead(stream, buf, deadline);
                 if (more == 0) return error.IncompleteChunked;
                 pending = buf[0..more];
             }
@@ -1271,7 +1388,7 @@ fn streamChunkedBody(
         }
 
         var crlf: [2]u8 = undefined;
-        try fillFrom(stream, buf, &pending, &crlf, timeout_ms);
+        try fillFrom(stream, buf, &pending, &crlf, deadline);
         if (!std.mem.eql(u8, &crlf, "\r\n")) return error.InvalidChunked;
     }
 }
@@ -1284,12 +1401,12 @@ fn fillFrom(
     buf: []u8,
     pending: *[]const u8,
     dest: []u8,
-    timeout_ms: u64,
+    deadline: HttpClient.Deadline,
 ) !void {
     var got: usize = 0;
     while (got < dest.len) {
         if (pending.len == 0) {
-            const more = try HttpClient.blockingRead(stream, buf, timeout_ms);
+            const more = try HttpClient.blockingRead(stream, buf, deadline);
             if (more == 0) return error.IncompleteChunked;
             pending.* = buf[0..more];
         }
@@ -2010,6 +2127,176 @@ test "HttpClient request times out against a stalled peer" {
 
     const err = client.request(req) catch |e| e;
     try std.testing.expectEqual(error.Timeout, err);
+}
+
+// `max_response_bytes` bounds the buffered body: a `Content-Length` past the
+// bound is rejected before the allocation it names. The peer chooses the
+// length, so the bound has to be checked against the wire, not the
+// allocation — and an exact-size body still goes through.
+test "HttpClient max_response_bytes rejects a Content-Length past the bound" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var body: [64]u8 = undefined;
+    @memset(&body, 'A');
+    var payload_buf: [192]u8 = undefined;
+    const payload = try std.fmt.bufPrint(&payload_buf, "HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\n{s}", .{&body});
+    const server_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try server_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = server.socket.address.getPort();
+
+    var seen: [512]u8 = undefined;
+    var canned = CannedServer{ .listener = &server, .payload = payload, .seen = &seen };
+    const th = try std.Thread.spawn(.{}, CannedServer.run, .{&canned});
+    defer th.join();
+
+    var url_buf: [128]u8 = undefined;
+
+    {
+        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/cl-over", .{port});
+        var client = HttpClient.init(allocator, std.testing.io, 2, 2000);
+        defer client.deinit();
+        client.retry_policy.max_retries = 0;
+        client.max_response_bytes = 16;
+        var req = HttpClient.HttpRequest.init(allocator, "GET", url);
+        defer req.deinit();
+        const err = client.request(req) catch |e| e;
+        try std.testing.expectEqual(error.ResponseTooLarge, err);
+    }
+
+    {
+        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/cl-exact", .{port});
+        var client = HttpClient.init(allocator, std.testing.io, 2, 2000);
+        defer client.deinit();
+        client.retry_policy.max_retries = 0;
+        client.max_response_bytes = body.len;
+        var req = HttpClient.HttpRequest.init(allocator, "GET", url);
+        defer req.deinit();
+        var resp = try client.request(req);
+        defer resp.deinit();
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+        try std.testing.expectEqualStrings(&body, resp.body);
+    }
+}
+
+// The chunked bound is checked on the decoded total, at the moment each chunk
+// lands — a peer cannot smuggle an unbounded body through framing that hides
+// its size until delivery.
+test "HttpClient max_response_bytes cuts off a chunked body past the bound" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var body: [32]u8 = undefined;
+    @memset(&body, 'B');
+    const payload = try chunkedResponse(allocator, &body, 2, 16);
+    defer allocator.free(payload);
+
+    const server_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try server_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = server.socket.address.getPort();
+
+    var seen: [512]u8 = undefined;
+    var canned = CannedServer{ .listener = &server, .payload = payload, .seen = &seen };
+    const th = try std.Thread.spawn(.{}, CannedServer.run, .{&canned});
+    defer th.join();
+
+    var url_buf: [128]u8 = undefined;
+
+    {
+        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/chunked-over", .{port});
+        var client = HttpClient.init(allocator, std.testing.io, 2, 2000);
+        defer client.deinit();
+        client.retry_policy.max_retries = 0;
+        client.max_response_bytes = 16;
+        var req = HttpClient.HttpRequest.init(allocator, "GET", url);
+        defer req.deinit();
+        const err = client.request(req) catch |e| e;
+        try std.testing.expectEqual(error.ResponseTooLarge, err);
+    }
+
+    {
+        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/chunked-exact", .{port});
+        var client = HttpClient.init(allocator, std.testing.io, 2, 2000);
+        defer client.deinit();
+        client.retry_policy.max_retries = 0;
+        client.max_response_bytes = body.len;
+        var req = HttpClient.HttpRequest.init(allocator, "GET", url);
+        defer req.deinit();
+        var resp = try client.request(req);
+        defer resp.deinit();
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+        try std.testing.expectEqualStrings(&body, resp.body);
+    }
+}
+
+// The deadline bounds the whole response, not one read: a body dribbled in
+// chunks that each arrive well inside `timeout_ms` still times out once the
+// total passes it. Under the per-read budget this request *succeeded* (each
+// wait saw its bytes arrive), which is exactly the semantics this replaces.
+test "HttpClient request deadline bounds the total response time" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    const server_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try server_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = server.socket.address.getPort();
+
+    const DribbleCtx = struct {
+        server: *std.Io.net.Server,
+        fn run(ctx: *@This()) void {
+            const accepted = ctx.server.accept(std.testing.io) catch return;
+            defer accepted.close(std.testing.io);
+            var total: usize = 0;
+            var seen: [4096]u8 = undefined;
+            while (total < seen.len) {
+                HttpClient.waitForReadable(accepted.socket.handle, 3000) catch break;
+                const n = std.posix.read(accepted.socket.handle, seen[total..]) catch break;
+                if (n == 0) break;
+                total += n;
+                if (std.mem.indexOf(u8, seen[0..total], "\r\n\r\n") != null) break;
+            }
+            // Head plus half the body at once, then the rest in eight more
+            // dribbles one every 60 ms: every gap is far inside the client's
+            // 200 ms timeout, the total (480 ms) is far outside it.
+            const head = "HTTP/1.1 200 OK\r\nContent-Length: 32\r\nConnection: close\r\n\r\nCCCC";
+            writeRawAll(accepted.socket.handle, head);
+            var sent: usize = head.len;
+            while (sent < head.len + 16) {
+                std.Io.sleep(std.testing.io, .{ .nanoseconds = 60 * std.time.ns_per_ms }, .awake) catch return;
+                writeRawAll(accepted.socket.handle, "CCCC");
+                sent += 4;
+            }
+            var tail: [512]u8 = undefined;
+            while (true) {
+                const n = std.posix.read(accepted.socket.handle, &tail) catch break;
+                if (n == 0) break;
+            }
+        }
+    };
+
+    var dribble_ctx = DribbleCtx{ .server = &server };
+    const th = try std.Thread.spawn(.{}, DribbleCtx.run, .{&dribble_ctx});
+    defer th.join();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/dribble", .{port});
+
+    var client = HttpClient.init(allocator, std.testing.io, 2, 200);
+    defer client.deinit();
+    client.retry_policy.max_retries = 0;
+    var req = HttpClient.HttpRequest.init(allocator, "GET", url);
+    defer req.deinit();
+
+    const started = Time.monotonicNowMilliseconds();
+    const err = client.request(req) catch |e| e;
+    const elapsed = Time.monotonicNowMilliseconds() - started;
+    try std.testing.expectEqual(error.Timeout, err);
+    // A regression to per-read budgets would *succeed* here (~500 ms); a
+    // regression to no deadline would hang. Generous bound for slow CI hosts.
+    try std.testing.expect(elapsed < 4000);
 }
 
 // ── request framing / chunked decoding ─────────────────────────────────────
