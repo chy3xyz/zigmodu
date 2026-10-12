@@ -58,6 +58,7 @@ perl -0pi -e "s/\*\*v$OLD\*\*/**v$VERSION**/g" AGENTS.md
 perl -0pi -e "s/\*\*框架版本\*\*: v$OLD/**框架版本**: v$VERSION/" docs/archive/status/EVALUATION_REPORT.md
 perl -0pi -e "s/ZigModu \*\*v$OLD\*\*/ZigModu **v$VERSION**/" docs/archive/status/EVALUATION_REPORT.md
 perl -0pi -e "s/\*\*版本口径\*\*: v$OLD/**版本口径**: v$VERSION/" docs/archive/status/PRODUCTION_ROADMAP.md
+perl -0pi -e "s/\*\*本文描述的版本\*\*：ZigModu v$OLD/**本文描述的版本**：ZigModu v$VERSION/" docs/guide/BEST_PRACTICES.md
 fi
 
 # 2. CHANGELOG: promote Unreleased to the new version.

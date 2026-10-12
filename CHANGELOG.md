@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.39.11] - 2026-10-12
 
 ### 第 154 批：文档数字漂移修正（死代码基线 / test artifact 数 / runtime gauge 数）（**破坏性：否**）
 
