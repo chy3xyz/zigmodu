@@ -103,7 +103,7 @@ var client = try data.Client.open(allocator, io, .{ .driver = .postgres, .host =
 
 生成后仍可手改 `build.zig` 的 `.db=`，或与运行时 DSN 不一致时以 **链接侧** 为准（未链的驱动无法 connect）。
 
-细则：[ZMODU_CLI_INTEGRATION.md](ZMODU_CLI_INTEGRATION.md)。
+细则：[ZMODU_CLI_INTEGRATION.md](./ZMODU_CLI_INTEGRATION.md)。
 
 ---
 

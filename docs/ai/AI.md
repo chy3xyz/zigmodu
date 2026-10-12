@@ -4,7 +4,7 @@
 > 写 ZigModu 框架代码的 coding agent 请读：[AGENTS.md](../../AGENTS.md)。  
 > `zmodu mcp` 是 **codegen** MCP 服务端，与运行时 `SkillRegistry` 正交。
 > 在业务系统里完整接入 AI（KeyManager / Agent / Workflow / 自定义技能 / MCP）
-> 请读：[AI_DEV_GUIDE.md](AI_DEV_GUIDE.md)。
+> 请读：[AI_DEV_GUIDE.md](./AI_DEV_GUIDE.md)。
 
 ## 核心 API（zigmodu.ai）
 
@@ -409,7 +409,7 @@ try ai.registerScheduleSkills(&registry);
 ```
 
 内置业务 skill（`db.query` / `entity.lookup` / `entity.list`，只读参数化 SQL +
-实体白名单 + 租户隔离）见 [docs/AI_SKILLS.md](AI_SKILLS.md)。
+实体白名单 + 租户隔离）见 [docs/AI_SKILLS.md](./AI_SKILLS.md)。
 
 要点：
 

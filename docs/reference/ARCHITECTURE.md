@@ -40,19 +40,19 @@ A module in ZigModu is:
 
 | `src/` 子系统 | 读这份 |
 |---------------|--------|
-| `runtime/` `scheduler/` `pool/` | [RUNTIME.md](RUNTIME.md) —— 执行面：worker / 邮箱 / 池 / 优先级 / 监督 / 公平性 / 37 条指标 |
-| `api/` `http/` | [ROUTE_TABLE.md](ROUTE_TABLE.md) · [ARCHITECTURE.md](ARCHITECTURE.md) · 背压与超时默认值见 [RUNTIME.md](RUNTIME.md) |
-| `core/` | 基础设施原语（Time / EventBus / WAL / 分代工具）；契约散见 [RUNTIME.md](RUNTIME.md) 与 [DISTRIBUTED.md](DISTRIBUTED.md) |
-| `cluster/` `im/` `security/`（传输层） | [DISTRIBUTED.md](DISTRIBUTED.md) —— Raft / 总线 / 成员 / 传输加密边界 |
+| `runtime/` `scheduler/` `pool/` | [RUNTIME.md](./RUNTIME.md) —— 执行面：worker / 邮箱 / 池 / 优先级 / 监督 / 公平性 / 37 条指标 |
+| `api/` `http/` | [ROUTE_TABLE.md](./ROUTE_TABLE.md) · [ARCHITECTURE.md](./ARCHITECTURE.md) · 背压与超时默认值见 [RUNTIME.md](./RUNTIME.md) |
+| `core/` | 基础设施原语（Time / EventBus / WAL / 分代工具）；契约散见 [RUNTIME.md](./RUNTIME.md) 与 [DISTRIBUTED.md](./DISTRIBUTED.md) |
+| `cluster/` `im/` `security/`（传输层） | [DISTRIBUTED.md](./DISTRIBUTED.md) —— Raft / 总线 / 成员 / 传输加密边界 |
 | `data/` `sqlx/` `persistence/` | [SQLX_DRIVERS.md](../guide/SQLX_DRIVERS.md) · [MODULE_LAYERS.md](../guide/MODULE_LAYERS.md) |
 | `migration/` | **文档缺失**：见下方 §未成文的子系统 |
 | `tenant/` `datapermission/` | 本文 §Multi-Tenancy（`ShardRouter` 分片见该节） |
-| `observability/` `metrics/` `tracing/` `log/` | [OBSERVABILITY.md](OBSERVABILITY.md) · [LOGGING.md](../guide/LOGGING.md) |
+| `observability/` `metrics/` `tracing/` `log/` | [OBSERVABILITY.md](./OBSERVABILITY.md) · [LOGGING.md](../guide/LOGGING.md) |
 | `resilience/` | [BEST_PRACTICES.md](../guide/BEST_PRACTICES.md) §韧性原语（断路器/限流/隔离舱/**自适应卸压**） |
-| `ai/` | [AI_DEV_GUIDE.md](../ai/AI_DEV_GUIDE.md) · [AI_ORCHESTRATION.md](../ai/AI_ORCHESTRATION.md) · [MCP.md](../ai/MCP.md) · [AI_BOUNDARY.md](AI_BOUNDARY.md) |
+| `ai/` | [AI_DEV_GUIDE.md](../ai/AI_DEV_GUIDE.md) · [AI_ORCHESTRATION.md](../ai/AI_ORCHESTRATION.md) · [MCP.md](../ai/MCP.md) · [AI_BOUNDARY.md](./AI_BOUNDARY.md) |
 | `extensions/` | [FRAMEWORK_BACKLOG.md](../archive/status/FRAMEWORK_BACKLOG.md)（多数仍在计划中） |
 | `secrets/` `cache/` `kit/` `validation/` `config/` `di/` | **文档缺失**：见下方 §未成文的子系统 |
-| `web4/` | [WEB4.md](WEB4.md) —— DID 身份 + x402 |
+| `web4/` | [WEB4.md](./WEB4.md) —— DID 身份 + x402 |
 | `messaging/` | [AI_ORCHESTRATION.md](../ai/AI_ORCHESTRATION.md)（outbox 消费端接线见 AGENTS.md） |
 | `test/` | 各文档的测试约定；`examples/` 见 [QUICK-START.md](../guide/QUICK-START.md) |
 
@@ -583,7 +583,7 @@ CLI（报告+可选失败）跨模块直接 import 的纠缠     → doctor 的 
 2. **`TenantContext.isActive()`** 为 false 时，拦截器不注入条件。
 3. **租户列名**：默认 `tenant_id`；ZigShop 等用 `app_id` 时调用 `setTenantColumn("app_id")`，且模型字段名与列名一致。`zmodu --tenant-column app_id` 生成对应 `WHERE` 与 `setTenantColumn`。
 4. **JWT 默认** `generateToken(user, roles)` 的 `aud` 为 `"zigmodu-app"`，不是租户 ID；租户 claim 用 `generateTokenWithTenant`；catalog 中间件写入 attr `tenant_id`。
-5. **`examples/tenant-mgmt`** 是最佳实践演示；鉴权栈见 [`ROUTE_TABLE.md`](ROUTE_TABLE.md) §7、[`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)。
+5. **`examples/tenant-mgmt`** 是最佳实践演示；鉴权栈见 [`ROUTE_TABLE.md`](./ROUTE_TABLE.md) §7、[`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)。
 6. Legacy `security.auth.jwtAuth` / `rbacJwtMiddleware` 仅写 `auth_info`；新应用优先 catalog 路径。
 
 认证（`AppSecurity` + catalog JWT）与多租户正交：可以只要 JWT 不要租户，也可以只要租户 header 不要 JWT（不推荐生产）。

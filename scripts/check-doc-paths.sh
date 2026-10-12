@@ -15,7 +15,8 @@
 #
 # Scope: it checks that cited *repository* doc paths resolve. It does not
 # validate the §-references inside a document, nor markdown links, which the
-# VitePress dead-link build already covers.
+# zdoc documentation build reports as warnings (links that climb out of
+# `docs/` are exempt there by the same design as here).
 #
 # Two deliberate exclusions:
 #

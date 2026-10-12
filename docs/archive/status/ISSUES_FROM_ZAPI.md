@@ -2,7 +2,7 @@
 
 > Sourced from the **zmcanyin / zapi** ThinkPHP-compatible commerce API on ZigModu
 > (`zigmodu_ws/zmcanyin_zent/zapi`).  
-> Complements [`FRAMEWORK_BACKLOG.md`](FRAMEWORK_BACKLOG.md) (landed ergonomics) with
+> Complements [`FRAMEWORK_BACKLOG.md`](./FRAMEWORK_BACKLOG.md) (landed ergonomics) with
 > **auth / envelope / identity** gaps that forced app-level patches.  
 > Status: **Open** unless marked. Prefer GitHub issues linked from the `#` column.
 

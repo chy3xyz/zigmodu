@@ -108,7 +108,7 @@ registerReportSkills`（`userdata` 传对应 Ctx；`SkillContext.permissions` �
 映射 JSON Schema、返回值所有权归 `ctx.allocator`（调用方 `ai.freeValue` 深
 释放）、`required_permission` + `allowlist` 双重收口、`checkDeadline` 协作
 超时。完整代码模板与选型（Agent / Workflow / LLM 策略 / MCP 桥）见
-[`AI_DEV_GUIDE.md`](AI_DEV_GUIDE.md) §3–§5。
+[`AI_DEV_GUIDE.md`](./AI_DEV_GUIDE.md) §3–§5。
 
 ## 边界（不做）
 

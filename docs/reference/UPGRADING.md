@@ -312,7 +312,7 @@ base64url 本无 padding）。**影响面**：收过非标准实现的 token 的
 必须恒 0 的契约读数**，非零 = 宿主把出队窗口持有者抢占得超过 ~100ms，值得查宿主机而不是查框架）；
 首次越预算时 stderr 多一段环取证 dump（每调度器一次）；以及 ReleaseFast/Small 下那条
 「计数后静默返回、worker 永久失联」的路径**不再存在**。背景与根因推导见
-[`RUNTIME.md` §12.18](RUNTIME.md)。
+[`RUNTIME.md` §12.18](./RUNTIME.md)。
 
 ### ⑤ sqlx `query_timeout_ms = 0`：从「无界 + 警告」改为「回落默认有界」（第 136 批，**行为变化 + 一处 API 删除**）
 
@@ -1011,7 +1011,7 @@ Zig 接受该值且**不会**在 `zig build` 时改写它（实测 md5 前后一
 ### 删除 `src/persistence/Database.zig`
 
 **Breaking?** 否（它没有从 `root.zig`/`data.zig` 导出，全仓唯一引用是"编译所有源文件"那个测试）。
-数据层的入口是 `data.sqlx` / `data.Repository`（`Orm(Backend)`），见 [`ZENT.md`](ZENT.md) §1。
+数据层的入口是 `data.sqlx` / `data.Repository`（`Orm(Backend)`），见 [`ZENT.md`](./ZENT.md) §1。
 
 ---
 

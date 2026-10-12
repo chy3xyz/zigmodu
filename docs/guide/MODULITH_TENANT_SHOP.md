@@ -1,6 +1,6 @@
 # 蓝图：多租户店（Modulith）
 
-**定位**：按 [MODULITH.md](MODULITH.md) 骨架，给出一版可落地的**多租户电商店**模块依赖图与目录清单。  
+**定位**：按 [MODULITH.md](./MODULITH.md) 骨架，给出一版可落地的**多租户电商店**模块依赖图与目录清单。  
 **部署**：单二进制 + 多实例水平扩展；租户隔离用 `tenant_id`（表级）+ 中间件，不强制一租户一库。  
 **对照**：平台侧可参考可运行的 `examples/tenant-mgmt/`；本蓝图在其上扩展**店面交易域**（商品 / 库存 / 购物车 / 订单 / 支付）。
 
@@ -287,6 +287,6 @@ var app = try b.withName("tenant-shop")
 |----------|------|
 | `examples/tenant-mgmt/` | 平台三模块（tenant/user/subscription）可运行参考 |
 | `examples/shopdemo/` | schema / 生成代码参考，非完整交易闭环 |
-| `examples/tenant-shop/` | **本蓝图脚手架（Week 1–4 可跑）**：分层 Tx 编排 + checkout→pay→outbox 重试/DLQ→RobustMQ；见 [MODULE_LAYERS.md](MODULE_LAYERS.md) |
+| `examples/tenant-shop/` | **本蓝图脚手架（Week 1–4 可跑）**：分层 Tx 编排 + checkout→pay→outbox 重试/DLQ→RobustMQ；见 [MODULE_LAYERS.md](./MODULE_LAYERS.md) |
 
 实现时优先复制 `tenant-mgmt` 的五文件与中间件链，再按依赖表增量加模块，避免一次性铺满空文件。

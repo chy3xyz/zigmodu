@@ -2,7 +2,7 @@
 
 > 适用范围：zigmodu v0.15.34+（`Application` 内置 `EventRegistry` 与 `di.Container`）。
 > 本文回答三件事：模块间怎么通信、共享服务怎么注入、哪些场景**不该**用它们。
-> 配套阅读：[MODULITH.md](MODULITH.md) §2.3 通信规则 · [MODULE_LAYERS.md](MODULE_LAYERS.md)（分层纪律）。
+> 配套阅读：[MODULITH.md](./MODULITH.md) §2.3 通信规则 · [MODULE_LAYERS.md](./MODULE_LAYERS.md)（分层纪律）。
 
 ---
 

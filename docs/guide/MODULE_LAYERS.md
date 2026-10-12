@@ -7,11 +7,11 @@
 
 | 文档 | 关系 |
 |------|------|
-| [MODULITH.md](MODULITH.md) | 模块边界与并发 |
+| [MODULITH.md](./MODULITH.md) | 模块边界与并发 |
 | [elegant-code-patterns.md](../archive/elegant-code-patterns.md) | 五文件样例 |
-| [MODULITH_TENANT_SHOP.md](MODULITH_TENANT_SHOP.md) | 多租户店蓝图 |
+| [MODULITH_TENANT_SHOP.md](./MODULITH_TENANT_SHOP.md) | 多租户店蓝图 |
 | [ZENT.md](../reference/ZENT.md) | zent ORM 正交接入（schema / Client / migrate） |
-| [BEST_PRACTICES.md](BEST_PRACTICES.md) | DAU 演进 + JWT / 多端身份 |
+| [BEST_PRACTICES.md](./BEST_PRACTICES.md) | DAU 演进 + JWT / 多端身份 |
 | [ROUTE_TABLE.md](../reference/ROUTE_TABLE.md) | ComptimeRouter + catalog 鉴权门禁 |
 | [AGENTS.md](../../AGENTS.md) | AI 操作手册 |
 
@@ -187,7 +187,7 @@ pub fn checkout(self: *Self, cmd: CheckoutCmd) !CheckoutResult {
 | 跨域最终一致 | Outbox → RobustMQ / EventBus |
 | 只读聚合 | 调对方 **service** 公开方法 |
 
-详见 [MODULITH.md §2.3](MODULITH.md)。
+详见 [MODULITH.md §2.3](./MODULITH.md)。
 
 ---
 

@@ -209,14 +209,14 @@ pub const panic = zigmodu.panicHook;
 5. Run under a supervisor (`Restart=always` / k8s `restartPolicy: Always`).
 
 Read next: [`OBSERVABILITY.md`](../reference/OBSERVABILITY.md) (alerts + dashboard),
-[`BEST_PRACTICES.md`](BEST_PRACTICES.md)「韧性」, [`ROUTE_TABLE.md`](../reference/ROUTE_TABLE.md) §7.4.
+[`BEST_PRACTICES.md`](./BEST_PRACTICES.md)「韧性」, [`ROUTE_TABLE.md`](../reference/ROUTE_TABLE.md) §7.4.
 
 ## What's Next?
 
 | Tutorial | Description |
 |----------|-------------|
 | [Examples](../../examples/) | More complete examples |
-| [Best Practices](BEST_PRACTICES.md) | Architecture + JWT / auth checklist |
+| [Best Practices](./BEST_PRACTICES.md) | Architecture + JWT / auth checklist |
 | [Declarative Routes](../reference/ROUTE_TABLE.md) | ComptimeRouter + catalog RBAC |
 | [AGENTS.md](../../AGENTS.md) | AI agent handbook |
 | [API Reference](../reference/API.md) | Detailed API docs |

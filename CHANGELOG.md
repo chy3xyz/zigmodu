@@ -1,5 +1,43 @@
 # Changelog
 
+### 第 172 批：文档站 VitePress → zdoc（**破坏性：否；CI-only + 文档链接归一化**）
+
+The docs site now builds with [zdoc](https://github.com/chy3xyz/zdoc) v0.16.1 in
+documentation mode — one pinned static binary instead of a Node toolchain.
+
+1. **`.github/workflows/docs.yml` rewritten**: install zdoc v0.16.1
+   (x86_64-linux-musl, SHA256-verified against the upstream `SHA256SUMS`),
+   build with `zdoc docs docs --title ZigModu --url-prefix zigmodu`, publish
+   `site-dist`. No Node, no `npm ci`, no site config file; sidebar, per-page
+   TOC, search index and mermaid come from zdoc's built-in theme. Build time
+   drops from a npm-ci + VitePress run to ~1 s.
+2. **Removed**: `site/` (VitePress config; its theme was the stock one
+   "extended with nothing"), `package.json`, `package-lock.json` — the
+   repository no longer uses npm anywhere. `.gitignore` entries updated;
+   `.zdoc-theme/` stays untracked (it is the theme copy zdoc refreshes on
+   every run from the repository root, byte-identical to the built-in one).
+3. **Docs link normalization**: zdoc v0.16.1 does not resolve same-directory
+   bare `.md` links from pages in subdirectories (root pages are fine;
+   minimal repro filed upstream). 150 links across 33 files rewritten
+   `](X.md)` → `](./X.md)` — fence-aware, zero occurrences inside code
+   fences, and GitHub renders both spellings identically. After the rewrite
+   the only remaining build warnings are the by-design out-of-tree climbs
+   (`../../CHANGELOG.md`, `../../src/…`) that the VitePress build exempted
+   too, plus in-page anchors (below).
+4. **Known limitations** (upstream zdoc, non-fatal, reported as feedback):
+   the homepage hero actions (`/ARCHITECTURE`, `/QUICK-START`) miss the
+   `--url-prefix`; and heading anchors written GitHub-style with emoji do
+   not match zdoc's emoji-dropping ids, so ~48 in-page anchor links stay
+   unresolved warnings and do not scroll.
+5. **v0.16.1 specifically** (vs 0.16.0): fixes unknown-language code fences
+   rendering as *empty blocks* — our `promql` fences (2 blocks) now render
+   as plain text with a named warning; `zon` is a known language and warns
+   not at all.
+
+Verified locally with the exact CI command shape: all pages generated,
+search index + sitemap + mermaid present, same-directory links resolve with
+the prefix (`/zigmodu/guide/MODULITH/`).
+
 ## [0.39.11] - 2026-10-12
 
 ### 第 154 批：文档数字漂移修正（死代码基线 / test artifact 数 / runtime gauge 数）（**破坏性：否**）

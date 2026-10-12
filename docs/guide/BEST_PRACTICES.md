@@ -6,11 +6,11 @@
 > 执行平面的**规格**在 [RUNTIME.md](../reference/RUNTIME.md)；**该不该用、怎么用、哪里会踩**在本文
 > 「执行平面（Runtime）最佳实践」一节。没碰执行平面的应用，行为与本文的其他章节一致。
 >
-> **Modulith 从第一天怎么写高并发应用**：见专文 [MODULITH.md](MODULITH.md)（边界、fiber、池化、规模阶梯、反模式）。
+> **Modulith 从第一天怎么写高并发应用**：见专文 [MODULITH.md](./MODULITH.md)（边界、fiber、池化、规模阶梯、反模式）。
 > 
-> **model / persistence / service / Tx 分层**：见专文 [MODULE_LAYERS.md](MODULE_LAYERS.md)（参考实现 `examples/tenant-shop`）。  
+> **model / persistence / service / Tx 分层**：见专文 [MODULE_LAYERS.md](./MODULE_LAYERS.md)（参考实现 `examples/tenant-shop`）。  
 > **ZigModu × zent（schema / Client / privacy / 模块级选型）**：见专文 [ZENT.md](../reference/ZENT.md)（参考实现 `examples/zent-modulith`）。  
-> **SQLx 选择性驱动链接（`-Ddb=` / `.db=`）**：见专文 [SQLX_DRIVERS.md](SQLX_DRIVERS.md)。  
+> **SQLx 选择性驱动链接（`-Ddb=` / `.db=`）**：见专文 [SQLX_DRIVERS.md](./SQLX_DRIVERS.md)。  
 > **HTTP 路由 + catalog JWT / RBAC**：见专文 [ROUTE_TABLE.md](../reference/ROUTE_TABLE.md) §7；可执行清单见下文「JWT / 多端身份」。  
 > **AI / Agent 写代码**：先读仓库根目录 [AGENTS.md](../../AGENTS.md)（文档地图 + DO/DON'T）；方法论见 [AI_METHODOLOGY.md](../dev/AI_METHODOLOGY.md)。  
 > **代码片段基线**：**ZigModu v0.35.0 · Zig 0.17.0**（CI 钉 `0.17.0` **正式版**，见 `.github/workflows/ci.yml` 的 `ZIG_VERSION`）。跨版本升级看 [UPGRADING.md](../reference/UPGRADING.md)；"哪些是证明过的、哪些不是"看 [v1.0 差距评估](../dev/v1.0-readiness-v0.35.md)。  
@@ -81,7 +81,7 @@ ZigModu 核心设计理念：**从单体部署到分布式集群，随着用户�
 > [执行平面（Runtime）最佳实践](#🚀-执行平面-runtime-最佳实践) 与
 > [RUNTIME.md](../reference/RUNTIME.md) —— 它不参与本文的阶段编号。
 
-**起步请先读** [MODULITH.md](MODULITH.md) 与 [MODULE_LAYERS.md](MODULE_LAYERS.md)：五文件模块边界、Tx 工作单元、Day-1 连接池/Outbox、以及何时才拆独立进程。本节描述架构演进，框架能力随阶段自动解锁。
+**起步请先读** [MODULITH.md](./MODULITH.md) 与 [MODULE_LAYERS.md](./MODULE_LAYERS.md)：五文件模块边界、Tx 工作单元、Day-1 连接池/Outbox、以及何时才拆独立进程。本节描述架构演进，框架能力随阶段自动解锁。
 
 ---
 
@@ -94,7 +94,7 @@ ZigModu 核心设计理念：**从单体部署到分布式集群，随着用户�
 | service | Cmd/Result；`beginTx` 编排 Tx；同事务写 outbox |
 | api/BFF | 解析与 JSON；禁止 SQL |
 
-完整规则与 `tenant-shop` 对照表 → **[MODULE_LAYERS.md](MODULE_LAYERS.md)**。
+完整规则与 `tenant-shop` 对照表 → **[MODULE_LAYERS.md](./MODULE_LAYERS.md)**。
 
 ---
 
@@ -1277,7 +1277,7 @@ handler / subscriber / 钩子吗？③ 会分配（尤其可能增长/换页的�
 | 计数器是"读-改-写"吗？ | 丢更新（限流值只是"大致"）、令牌重复消费 | 原子 CAS，或加锁 |
 
 `zmodu audit` 的 b20/b21 规则正是扫前两类（文件作用域共享可变 HashMap / 请求路径裸 `@alignCast`）——
-两者都属于"一次就打死整个进程"，见 [`MODULITH.md`](MODULITH.md) 与「韧性」一节。
+两者都属于"一次就打死整个进程"，见 [`MODULITH.md`](./MODULITH.md) 与「韧性」一节。
 
 ### 请求预算要传给存储，否则超时只是"事后 408"
 
@@ -1957,7 +1957,7 @@ for (in_doubt) |tx| {
 3. **`freeInDoubt` 必须配对**（`defer`），每项里还有独立分配的 id 与参与者列表。
 
 一个进程内的 saga 另有一套崩溃续跑机制（`SagaOrchestrator.resumeInstance` + WAL，
-见 [WORKFLOW.md](WORKFLOW.md)）；本节管的是**跨进程 2PC** 那一条。
+见 [WORKFLOW.md](./WORKFLOW.md)）；本节管的是**跨进程 2PC** 那一条。
 
 ### Saga 步骤超时：`SagaStep.timeout_seconds`（必须设）
 

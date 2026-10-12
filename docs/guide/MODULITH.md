@@ -7,7 +7,7 @@
 > —— 行情/订单簿、实时网关、AI agent 循环、IoT 状态机 —— 那是**执行平面**：worker 持有自己的状态、
 > 有界 mailbox 做背压、锁自由队列、定时器、监督树、可回放的投递日志。
 > 规格见 [RUNTIME.md](../reference/RUNTIME.md)，"该不该用/怎么用/哪里会踩"见
-> [BEST_PRACTICES.md](BEST_PRACTICES.md) 的「执行平面（Runtime）最佳实践」一节。
+> [BEST_PRACTICES.md](./BEST_PRACTICES.md) 的「执行平面（Runtime）最佳实践」一节。
 > 应用平面自己站得住：不调 `app.runtime()` 的应用**不会多起一条线程**。
 
 相关文档：
@@ -15,15 +15,15 @@
 | 文档 | 内容 |
 |------|------|
 | [ARCHITECTURE.md](../reference/ARCHITECTURE.md) | 模块概念、分层、通信模式 |
-| [MODULE_LAYERS.md](MODULE_LAYERS.md) | **model / persistence / service / Tx 分层细则** |
-| [BEST_PRACTICES.md](BEST_PRACTICES.md) | 按 DAU 阶段演进（1K → 1M+）+ JWT 可执行清单 |
+| [MODULE_LAYERS.md](./MODULE_LAYERS.md) | **model / persistence / service / Tx 分层细则** |
+| [BEST_PRACTICES.md](./BEST_PRACTICES.md) | 按 DAU 阶段演进（1K → 1M+）+ JWT 可执行清单 |
 | [ROUTE_TABLE.md](../reference/ROUTE_TABLE.md) | ComptimeRouter + catalog JWT / RBAC |
 | [AGENTS.md](../../AGENTS.md) | **AI 操作手册**（DO/DON'T） |
 | [elegant-code-patterns.md](../archive/elegant-code-patterns.md) | 五文件布局与代码样例 |
 | [DISTRIBUTED.md](../reference/DISTRIBUTED.md) | 多实例 / RobustMQ / 集群注意点 |
-| [MODULITH_TENANT_SHOP.md](MODULITH_TENANT_SHOP.md) | **蓝图**：多租户店依赖图 + 目录清单 |
+| [MODULITH_TENANT_SHOP.md](./MODULITH_TENANT_SHOP.md) | **蓝图**：多租户店依赖图 + 目录清单 |
 | [ZENT.md](../reference/ZENT.md) | **zent**：schema-as-code ORM 与 ZigModu 正交集成 |
-| [SQLX_DRIVERS.md](SQLX_DRIVERS.md) | **sqlx**：`-Ddb=` / `.db=` 选择性驱动链接 |
+| [SQLX_DRIVERS.md](./SQLX_DRIVERS.md) | **sqlx**：`-Ddb=` / `.db=` 选择性驱动链接 |
 | [best-practices-heysen-lessons.md](../archive/best-practices-heysen-lessons.md) | 生产踩坑（sqlx / ORM） |
 
 ---
@@ -73,7 +73,7 @@ modules/<domain>/
 | `module` | `info`、生命周期、依赖名 | 业务逻辑 |
 | `model` | 纯数据 | 业务方法 |
 
-完整样例见 [elegant-code-patterns.md](../archive/elegant-code-patterns.md)；**Tx / Cmd / Outbox 细则**见 [MODULE_LAYERS.md](MODULE_LAYERS.md)。
+完整样例见 [elegant-code-patterns.md](../archive/elegant-code-patterns.md)；**Tx / Cmd / Outbox 细则**见 [MODULE_LAYERS.md](./MODULE_LAYERS.md)。
 
 ### 2.2 模块契约
 
@@ -94,8 +94,8 @@ pub fn deinit() void {}
 
 | 场景 | 方式 | 说明 |
 |------|------|------|
-| 同事务、强一致 | service 编排 + 依赖模块 **`persistence.Tx`** | 例如下单预留库存；见 [MODULE_LAYERS.md](MODULE_LAYERS.md) |
-| 跨域副作用 | **EventBus** / Outbox | 例如 `OrderCreated` → 发邮件、积分；接线规则见 [EVENTS_DI.md](EVENTS_DI.md) |
+| 同事务、强一致 | service 编排 + 依赖模块 **`persistence.Tx`** | 例如下单预留库存；见 [MODULE_LAYERS.md](./MODULE_LAYERS.md) |
+| 跨域副作用 | **EventBus** / Outbox | 例如 `OrderCreated` → 发邮件、积分；接线规则见 [EVENTS_DI.md](./EVENTS_DI.md) |
 | 跨实例异步 | **RobustMQ**（Kafka wire） | 见 [DISTRIBUTED.md](../reference/DISTRIBUTED.md) |
 
 禁止：业务模块互相 `import` 对方的非 Tx persistence 做随意读写；禁止 handler 里写 SQL。同事务工作流可 import 兄弟模块的 **`persistence.Tx`（仅 SQL）**。
@@ -131,7 +131,7 @@ pub fn deinit() void {}
 | 更高 | 多实例无状态 + 外置中间件 | JWT/会话外置、RobustMQ、只读副本 |
 | 再往后 | 按模块抽独立进程（可选） | 仅当边界已清晰且扩展收益明确 |
 
-更细的配置与指标见 [BEST_PRACTICES.md](BEST_PRACTICES.md)「渐进式架构演进」。
+更细的配置与指标见 [BEST_PRACTICES.md](./BEST_PRACTICES.md)「渐进式架构演进」。
 
 ---
 
@@ -227,7 +227,7 @@ pub fn main() !void {
 
 | 示例 | 用途 |
 |------|------|
-| [MODULITH_TENANT_SHOP.md](MODULITH_TENANT_SHOP.md) | **多租户店蓝图**：依赖图 + 目录清单 |
+| [MODULITH_TENANT_SHOP.md](./MODULITH_TENANT_SHOP.md) | **多租户店蓝图**：依赖图 + 目录清单 |
 | `examples/tenant-mgmt/` | 旗舰可运行演示（CI 集成） |
 | `examples/http-stress-test/` | 高并发压测二进制 |
 | `examples/shopdemo/` | 生成代码 / schema 参考 |

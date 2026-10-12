@@ -37,7 +37,7 @@ features:
 
 ## Where to go next
 
-The **[documentation index](dev/archive/README.md)** is the full map — it lists every document
+The **[documentation index](./dev/archive/README.md)** is the full map — it lists every document
 by role, so an agent or a newcomer can pick a path without guessing.
 
 Start with **[AGENTS.md](https://github.com/chy3xyz/zigmodu/blob/master/AGENTS.md)**

@@ -4,6 +4,15 @@ name: docs
 # edit is an ordinary commit — there is no separate tree to keep in sync and no
 # sync step that can silently fall behind. That is the whole reason this lives
 # in-tree rather than in a standalone site repository.
+#
+# Builder: `zdoc` (https://github.com/chy3xyz/zdoc) in documentation mode — one
+# pinned static binary, no Node, no npm lockfile, no site config. `zdoc docs`
+# derives the sidebar from the directory tree, emits per-page TOCs, search index
+# and mermaid support itself, and reports links it cannot resolve as warnings
+# while still generating the site. The warnings for links that climb out of
+# `docs/` (`../../CHANGELOG.md`, `../../src/…`) are by design: those documents
+# are written to be read in the repository, and both this workflow and the
+# VitePress build it replaced treat them as exempt rather than dead.
 on:
   push:
     # This repository's default branch is `master`, not `main` — ci.yml lists
@@ -11,9 +20,6 @@ on:
     branches: [master]
     paths:
       - 'docs/**'
-      - 'site/**'
-      - 'package.json'
-      - 'package-lock.json'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
@@ -26,33 +32,37 @@ concurrency:
   group: pages
   cancel-in-progress: true
 
+env:
+  # Pinned zdoc release; bump together with the SHA256 line below (the
+  # upstream SHA256SUMS asset is the source of truth for the hash).
+  ZDOC_VERSION: v0.16.1
+  ZDOC_SHA256: 17aaf2e38e9c49a2b719c9fddc1385c610abdd14be5e9653fa751af86d82e7f1
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # `node_modules` sits at the repository root, not under `site/`. VitePress
-      # sets Vite's root to `srcDir` (`docs/`), and Node resolves modules by
-      # walking *up* from the importer — so a `site/node_modules` is invisible to
-      # every Markdown file and the build dies on unresolved `vue/*` imports.
-      # A root install is what makes the upward walk land somewhere real.
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: package-lock.json
+      - name: Install zdoc (${{ env.ZDOC_VERSION }})
+        run: |
+          curl -sSfL -o zdoc.tar.xz \
+            "https://github.com/chy3xyz/zdoc/releases/download/${ZDOC_VERSION}/x86_64-linux-musl.tar.xz"
+          echo "${ZDOC_SHA256}  zdoc.tar.xz" | sha256sum -c -
+          tar -xJf zdoc.tar.xz
+          ./zdoc version
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: VitePress build
-        run: npm run build
+      - name: Build documentation site
+        run: |
+          ./zdoc docs docs \
+            --title ZigModu \
+            --url-prefix zigmodu \
+            --output site-dist
 
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: site/.vitepress/dist
+          path: site-dist
 
   deploy:
     needs: build

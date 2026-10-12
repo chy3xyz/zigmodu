@@ -1,7 +1,7 @@
 # `docs/dev/` — 文件索引
 
 17 份文件、约 5000 行，写于 **2026-04-23 → 2026-09-26** 的四个批次（另有 8 份已归档到
-[`archive/2026-05-review/`](archive/README.md)，约 1200 行）。这里是判断
+[`archive/2026-05-review/`](./archive/README.md)，约 1200 行）。这里是判断
 **"哪份还算数"** 与 **"哪份动不得"** 的唯一入口 —— 先看这张表，再打开具体文件。
 
 复现引用关系：
@@ -81,7 +81,7 @@ A-2（传输加密）第 111 批**定界**（不内嵌 TLS，机密性交受信�
 ## 4. 建议动作
 
 - ~~§2 那 8 份移动而非删除~~ —— **已执行**（2026-09-26，见 §2 与
-  [`archive/README.md`](archive/README.md)）。
+  [`archive/README.md`](./archive/README.md)）。
 - ~~todo 三代（`todo.md`/`todo3.md`/`todo3.1.md`）的状态表过期~~ —— **已处置**
   （2026-09-29）：三份都被现行文档按路径引用（`HotReloader.zig`、`docs/RUNTIME.md`），
   **不能移动**，改为各加"历史快照"文件头（COMPLETENESS_REPORT 同款），指向

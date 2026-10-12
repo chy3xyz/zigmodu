@@ -651,7 +651,7 @@ brief 说 `ClusterBootstrap drives raft.tick and serves inbound Raft RPCs` 里 `
   `self.nodes` 以 id 为键，而入站连接的对端地址是 `dialer_ip:临时端口` —— 与节点表里登记的
   `host:监听端口` **天然不等**（NAT 之后更不可能）。要真关掉得先有握手（连接上先自报 id 并证明），
   那是 §4 形状的另一件事，不是一次校验能补的。
-  **→ 已单独出设计：[`cluster-identity-design.md`](cluster-identity-design.md)（未实现）。**
+  **→ 已单独出设计：[`cluster-identity-design.md`](./cluster-identity-design.md)（未实现）。**
   那份文档同时说明了一件比"没对照"更根本的事：**`identityKey` 本身不绑定身份** ——
   它的 key 是 `HMAC(cluster_secret, claim)`，持有 `cluster_secret` 的人能推导任何节点的 key，
   所以它相对"直接 MAC 整段 json"没有额外安全性。要真绑定只能上**每节点凭证 + 握手**。

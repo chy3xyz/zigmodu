@@ -1,6 +1,6 @@
 # ZigModu × zmodu CLI 工具集成与代码生成指南
 
-`zmodu` 是专为 `ZigModu` 框架定制的高性能 CLI 代码生成器（独立工程位于 `w4_proj/zig_ws/zmodu`）。它支持直接解析 SQL DDL/Schema 或点对点反向工程数据库，一键产出符合 [`docs/MODULE_LAYERS.md`](MODULE_LAYERS.md) 六层架构契约的工程代码骨架。
+`zmodu` 是专为 `ZigModu` 框架定制的高性能 CLI 代码生成器（独立工程位于 `w4_proj/zig_ws/zmodu`）。它支持直接解析 SQL DDL/Schema 或点对点反向工程数据库，一键产出符合 [`docs/MODULE_LAYERS.md`](./MODULE_LAYERS.md) 六层架构契约的工程代码骨架。
 
 ---
 
@@ -389,7 +389,7 @@ CLI `--max-deps` 优先于配置文件，配置文件优先于内置默认值。
    const obs = zmodu.observability;
    ```
 3. **数据库与事务模式**：生成的存储层可通过参数选择 `sqlx` (标准) 或 `zent` (正交 ORM) 作为后端，两套引擎独立运行。
-4. **驱动链接**：scaffold / `new` 写入的 `build.zig` 含 `.db = "…"`（默认 `sqlite`；`--from-db` 按 DSN 映射 `postgres` / `mysql` / `sqlite`）。勿再手链三库。详见 [SQLX_DRIVERS.md](SQLX_DRIVERS.md)。
+4. **驱动链接**：scaffold / `new` 写入的 `build.zig` 含 `.db = "…"`（默认 `sqlite`；`--from-db` 按 DSN 映射 `postgres` / `mysql` / `sqlite`）。勿再手链三库。详见 [SQLX_DRIVERS.md](./SQLX_DRIVERS.md)。
 
 ---
 

@@ -508,7 +508,7 @@ catalog_slot.set(try router.finish());
 | 请求 | `request_timeout_ms` | handler 执行时长 |
 | WS 出站 | `ws_write_timeout_ms` + `WsFramer.isWritable()` | 不读的慢客户端阻塞写线程 |
 
-指标 / 告警 / Grafana：[`OBSERVABILITY.md`](OBSERVABILITY.md)；
+指标 / 告警 / Grafana：[`OBSERVABILITY.md`](./OBSERVABILITY.md)；
 TLS 边车与守护拓扑：[`../examples/production-deploy/`](../../examples/production-deploy/)。
 
 配套的两件事（都在同一批加固里，别只做 profile）：

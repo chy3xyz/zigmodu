@@ -3,7 +3,7 @@
 Complete API reference for the ZigModu modular framework.
 
 > 1.0 冻结的入口类别、0.x 允许破坏的 preview 面（`runtime.*`），以及每一条对应的门禁：
-> [`API_FREEZE.md`](API_FREEZE.md)。弃用别名与删除时点见 [`UPGRADING.md`](UPGRADING.md) 顶部那张表。
+> [`API_FREEZE.md`](./API_FREEZE.md)。弃用别名与删除时点见 [`UPGRADING.md`](./UPGRADING.md) 顶部那张表。
 
 ---
 
@@ -106,7 +106,7 @@ pub fn stop(self: *Self) void
 `Application.start/stop` 的内部实现；直接使用需自行管理模块生命周期。
 
 **DEPRECATED**（不早于 1.0 删除）：改用 `Application.start()` / `Application.stop()`，见
-[`UPGRADING.md`](UPGRADING.md) 的弃用别名表。
+[`UPGRADING.md`](./UPGRADING.md) 的弃用别名表。
 
 ```zig
 pub fn startAll(modules: *ApplicationModules) !void
@@ -770,7 +770,7 @@ Golden signals created by default (label-free, fixed cardinality):
 | `http_responses_2xx_total` / `_3xx_` / `_4xx_` / `_5xx_` | counters |
 | `http_request_duration_milliseconds` | histogram (1/5/10/25/50/100/250/500/1000/2500/5000 ms) |
 
-Thresholds, PromQL and the Grafana dashboard: [`OBSERVABILITY.md`](OBSERVABILITY.md).
+Thresholds, PromQL and the Grafana dashboard: [`OBSERVABILITY.md`](./OBSERVABILITY.md).
 
 ### Existing profiles
 
@@ -962,7 +962,7 @@ pub fn setScrapeHook(self, hook: ?ScrapeHook, userdata: ?*anyopaque) void  // sa
 
 Labels must be low-cardinality by construction: `productionProfile` labels the
 golden signals with `Context.route_template` (the matched pattern), never the raw
-path. See [`OBSERVABILITY.md`](OBSERVABILITY.md).
+path. See [`OBSERVABILITY.md`](./OBSERVABILITY.md).
 
 ### `zigmodu.outbox.OutboxConsumer`
 
@@ -1823,7 +1823,7 @@ is about to `deinit`.
 征用作循环体。该分支在 `std.testing.io` 下不可达（额度 `.unlimited`），由自带有界
 `Io.Threaded` 的专测锁定（`src/extensions/WebSocket.zig:1951`/`:1977`）——
 权威边界（机制、两种处理形状、各 site 的覆盖状态）见
-[`DISTRIBUTED.md`](DISTRIBUTED.md)「并发额度耗尽分支（A-8 定界）」。
+[`DISTRIBUTED.md`](./DISTRIBUTED.md)「并发额度耗尽分支（A-8 定界）」。
 
 ### Cache
 

@@ -1,6 +1,6 @@
 # AI 编排能力规划与现状
 
-> 与 [AI_SKILLS.md](AI_SKILLS.md)（Agent 能「做什么」的工具目录）互补，本文是
+> 与 [AI_SKILLS.md](./AI_SKILLS.md)（Agent 能「做什么」的工具目录）互补，本文是
 > Agent **怎么跑**的编排层：多步任务、预算、触发、子 Agent、人工交接。
 > 所有能力复用业务层基建（Saga/outbox/WAL、Scheduler、EventBus、quota/audit），
 > 遵守受控执行姿态。

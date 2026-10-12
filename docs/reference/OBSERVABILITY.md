@@ -102,7 +102,7 @@ metrics.setScrapeHook(bridge.publish);   // scrape 时把采样值推出去
   能交还 claim 的线程就是唯一能再 pop 的线程，等它再 pop 时槽位必然已出现，
   所以宽度 1 时这是可证的恒 0。
 - **`starvation_events`** —— 数的是"等待超过 `starvation_threshold_ms`（50）的 claim"。
-  非 0 即调度器 fairness 被破坏（§12.17 实测；详见 [RUNTIME.md](RUNTIME.md) §12）。
+  非 0 即调度器 fairness 被破坏（§12.17 实测；详见 [RUNTIME.md](./RUNTIME.md) §12）。
 
 无池的运行时这 18 条全为 0；**非 0 说明公平性坏了，不要当成噪声忽略**。
 
