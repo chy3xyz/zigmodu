@@ -21,6 +21,34 @@
 | Fuzz（有界） | `zig build test --fuzz=2000 -Ddb=all -Dtest-llvm=true --test-timeout 300s` | —（同夜间 job 日志） | exit 0；x86_64 上 **必须**带 `-Dtest-llvm=true`（默认后端不产 sancov 覆盖段，见 `ci.yml` Fuzz 步注释） |
 | Bench 基线 + 分配预算（B-13） | `bash scripts/check-bench.sh`（`THRESHOLD=2.0`，基线 `bench-baseline.ci.json`） | benchmark job 日志 | 32 条基线全在门内、32 条 `max_alloc_per_op` 预算零违例 |
 | x86_64 bench 跨宿主门禁（A2，阈值放宽到 3.0×） | `BENCH_THRESHOLD=3.0 bash scripts/check-bench.sh`（默认基线 `bench-baseline.json` 即 aarch64 记录；跨宿主读法 `--ratios <log>…`） | **独立 artifact** `bench-x86_64-<sha>` 里的 `bench-x86_64.log`（同 30 天留存） | 所有指标 ≤3.0× aarch64 基线 + `max_alloc_per_op` 预算零违例（分配计数与宿主无关，不放宽）；红之前 step 输出完整指标表与 FAIL 段（含 samples 与 host check）。3.0× 比同宿主门禁的 2.0× 宽，因为基线来自另一机器类（绝对值实测差 ~1.3×、ring 比值差 ~9× 且方向对 x86_64 有利），阈值只拦数量级回归 |
+| 确定性回放双跑（五 Worker 级联，Deterministic Runtime Phase D） | `cd examples/quant-replay && zig build run` | CI job 日志（`ci.yml` "Run the quant-replay example"，六条 `[assert]` 全 PASS 即绿） | 六条断言全 PASS 且 ledger digest 恒为 `0xbcdc937106650c23`；**该 digest 是场景的稳定常量**（喂入为固定种子随机游走、管线内唯一随机源是 seed-42 的 `rt.rng()`），换机器不应变化——变了就是确定性破坏，按确定性破坏上报 |
+
+## 确定性回放双跑（固定输入 → 预期输出）
+
+`examples/quant-replay` 是「输入与时间可控 → 执行有界 → 顺序可追踪 → 故障可重放 →
+结果可验证」这条链的最小完整样本：record 跑一个录制日，replay 从 ZDL1 日志重放同一条
+管线，五 Worker 级联（book→alpha→risk→exec→ledger），两边 ledger 逐条比对。
+
+```bash
+cd examples/quant-replay && zig build run   # exit 0 = 全部断言通过
+```
+
+**预期输出**（确定性常量，任何机器上都必须逐字符一致；不同即确定性破坏）：
+
+```
+info: [record] day done: trades=240 log_records=249 holes=0 (entries=170)
+info: [assert] log holds the whole boundary: 249 records for 240 trades (the rest are wheel marks), clean: PASS
+info: [assert] ledger byte-identical: record=170 entries digest=0xbcdc937106650c23, replay x2 agree: PASS
+info: [assert] book state identical: bid=10008 ask=10008 vwap=10012 prints=240: PASS
+info: [assert] counters identical: signals=161 approved=109 rejected=52 fills=109 position=39 pnl=1010 marks=9 (wheel-reproduced): PASS
+info: [assert] the day was non-vacuous: every downstream path fired (signals/fills/rejects/marks all > 0): PASS
+info: [assert] seed fork is legal: seed 43 digest=0x79db8e9f4f023dc5 != seed 42's 0xbcdc937106650c23, and two seed-43 runs agree: PASS
+```
+
+最后一条是**故意分叉**验证：换 seed 必须产生不同 digest（且同 seed 两次跑必须一致）——
+"改了输入而结果不变"才是确定性被假的信号。录制的日志留在 `./quant-replay-day/`，可用
+`zig build replay-inspect -- examples/quant-replay/quant-replay-day --track md --limit 3`
+离线检查（无需起 runtime）。
 
 ## 下载夜间 artifact
 

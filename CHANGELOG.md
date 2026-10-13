@@ -63,6 +63,33 @@ noise.
    rendered as plain text). The homepage hero `--url-prefix` defect also
    persists upstream.
 
+### 第 174 批：外部评审落档——v1.0 三档范围 + RC 门槛 + 确定性回放复现配方（**破坏性：否；纯文档**）
+
+一次外部评审（2026-10-13）确认技术成熟度上行、发布可信度是主线，并提出四项建议。
+逐项核对后的处置：
+
+1. **统一版本真相源——审计后确认已一致**。评审看到的「0.36.0 / 0.39.10 混用」是发版前
+   快照：`build.zig.zon` / `README` / `CHANGELOG` / `UPGRADING` /
+   `docs/archive/status/PRODUCTION_ROADMAP.md` 现全部随 `release.sh` 单源 bump、
+   `check-version.sh` 门禁逐文件核对，当前全线 **v0.39.11**。`docs/dev/` 的
+   readiness/gap 文档是带日期快照、头部横幅自声明时效——这是刻意设计，不是漂移。
+   `docs/dev/v1.0-roadmap-1.0.md` 头部补一行 2026-10-13 时效注指向 §七。
+2. **三档范围 + RC 门槛落档**（`docs/dev/v1.0-roadmap-1.0.md` 新增 §七，约束新增、
+   不回改原判定）：**Core**（Module/DI/Lifecycle/HTTP/数据/安全 = 稳定契约）、
+   **Runtime Core**（Worker/Mailbox/Scheduler/TimerWheel/Supervision/Replay/Deterministic
+   Mode = 必须全过质量门禁）、**Extensions**（Distributed Worker/NUMA/HFT 专用优化 =
+   实验性标注或移出 v1.0）。范围冻结规则：新增功能必须证明「对 v1.0 验收不可或缺」
+   否则推迟 v1.x。RC 门槛四件套映射到已有资产：API_FREEZE.md + check-api/audit 门禁、
+   CHANGELOG 破坏性标记、UPGRADING 周期节机制（0.39.6/0.39.10 已是模板）、复现证据包。
+3. **复现包补确定性回放配方**（`docs/dev/reproducing-evidence.md`）：quant-replay
+   五 Worker 级联双跑，本地一条命令 + CI job 双通道，**预期输出逐字符落档**——
+   ledger digest `0xbcdc937106650c23` 是场景稳定常量、seed-43 分叉断言防假确定性。
+   本机实跑复验：六条断言全 PASS、digest 一致、exit 0。
+4. **安全边界声明——确认已存在**：`docs/reference/DISTRIBUTED.md` §传输加密边界（A-2
+   定界：HMAC 是认证+完整性而非机密性、两种拓扑答案、"过了门 ≠ 已加密"）、§密钥轮换与
+   撤销（A-3 双 key 窗）、裸奧行为显式化——评审要求的「未实现能力清楚标注」已满足，
+   无需新增。发布节奏（评审另一建议）亦已由批 158 的 S1 约定覆盖。
+
 ## [0.39.11] - 2026-10-12
 
 ### 第 154 批：文档数字漂移修正（死代码基线 / test artifact 数 / runtime gauge 数）（**破坏性：否**）
