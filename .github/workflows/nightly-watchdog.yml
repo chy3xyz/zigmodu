@@ -90,6 +90,19 @@ jobs:
                      "the per-job timeouts bound it, and tomorrow's check reads the verdict.")
               sys.exit(0)
           if run["conclusion"] != "success":
+              if run["conclusion"] == "cancelled":
+                  # `cancelled` is the shape a job that hits its own
+                  # `timeout-minutes` reports, so it reads as "the nightly did
+                  # not run" until someone looks at the job. Say which it was —
+                  # a timeout in the soak job is a budget problem, not an
+                  # Actions outage, and the two need opposite fixes.
+                  alarm(f"**Last night's ci.yml run was `cancelled`.** {head} — "
+                        "a job that outlives its own `timeout-minutes` also reports "
+                        "`cancelled`, so check whether the `Nightly soak` job ran "
+                        "out of budget (most likely: it holds every "
+                        "`Mixed-version` shape, and each one compiles a different "
+                        "old tag) or whether the run was superseded/cancelled from "
+                        "outside.")
               alarm(f"**Last night's ci.yml run concluded `{run['conclusion']}`.** {head}")
           report(f"## :white_check_mark: nightly watchdog\n\n{head}")
           PY
