@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.39.12] - 2026-10-15
 
 ### 第 172 批：文档站 VitePress → zdoc（**破坏性：否；CI-only + 文档链接归一化**）
 
