@@ -173,7 +173,7 @@ const zigmodu_dep = b.dependency("zigmodu", .{
 | `std.Thread.sleep()` | busy-loop or `std.Io.sleep()` |
 | `std.Thread.Mutex` | `std.Io.Mutex` — needs `io` param: `.lock(io)` / `.unlock(io)` |
 | `std.Thread.WaitGroup` | no replacement; use `std.Io.Group` |
-| `std.time.milliTimestamp()` | `@import("core/Time.zig").monotonicNowMilliseconds()` |
+| `std.time.timestamp()` / `std.time.milliTimestamp()` | 时长/截止/超时：`Time.monotonicNowSeconds()` / `Time.monotonicNowMilliseconds()`；入库时间戳（墙钟，可回拨、差值非时长）：`Time.wallClockSeconds(io)` / `Time.wallClockMilliseconds(io)` |
 | `std.time.microTimestamp()` | same |
 | `std.os.getpid()` | `@intFromPtr(&seed)`（pid **形状**的值；**不是**熵源 —— 熵一律走 `std.Io.randomSecure`，见下） |
 | `std.fs.cwd()` | `std.Io.Dir.cwd(io)` |

@@ -214,8 +214,9 @@ pub const ProblemDetails = @import("http/ProblemDetails.zig").ProblemDetails;
 /// Problem document carrying per-field validation errors.
 pub const ValidationProblem = @import("http/ProblemDetails.zig").ValidationProblem;
 /// Stores `idempotency-key` → response so a retry replays instead of re-running.
+/// Middleware behavior (header name, TTL) is configured via `store.config`.
 pub const IdempotencyStore = @import("http/Idempotency.zig").IdempotencyStore;
-/// Replays/records responses by `idempotency-key` header.
+/// Replays/records responses by the configured header (default `Idempotency-Key`).
 pub const idempotencyMiddleware = @import("http/Idempotency.zig").idempotencyMiddleware;
 /// HTTP/2 frame codec (RFC 7540) plus HPACK.
 pub const Http2 = @import("http/Http2.zig");

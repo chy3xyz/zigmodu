@@ -408,6 +408,90 @@ test "dispatch 404 for unknown route" {
     try std.testing.expectEqual(@as(u16, 404), resp.status_code);
 }
 
+test "dispatch 404 did-you-mean points at the case-insensitive route" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(std.testing.io, allocator, 0);
+    defer server.deinit();
+
+    try server.addRoute(.{
+        .method = .GET,
+        .path = "/api/case/delivery",
+        .handler = struct {
+            fn handle(ctx: *Context) !void {
+                try ctx.text(200, "ok");
+            }
+        }.handle,
+    });
+
+    // Front-end frameworks capitalise controller segments; the trie does not.
+    var resp = try dispatch(&server, .GET, "/api/case/Delivery", null);
+    defer resp.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 404), resp.status_code);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "did you mean /api/case/delivery") != null);
+}
+
+test "dispatch 404 without a near route keeps the plain body" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(std.testing.io, allocator, 0);
+    defer server.deinit();
+
+    try server.addRoute(.{
+        .method = .GET,
+        .path = "/api/case/delivery",
+        .handler = struct {
+            fn handle(ctx: *Context) !void {
+                try ctx.text(200, "ok");
+            }
+        }.handle,
+    });
+
+    var resp = try dispatch(&server, .GET, "/totally/unrelated", null);
+    defer resp.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 404), resp.status_code);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "did you mean") == null);
+}
+
+test "dispatch 404 same path different method gets no hint" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(std.testing.io, allocator, 0);
+    defer server.deinit();
+
+    try server.addRoute(.{
+        .method = .GET,
+        .path = "/api/case/methodonly",
+        .handler = struct {
+            fn handle(ctx: *Context) !void {
+                try ctx.text(200, "ok");
+            }
+        }.handle,
+    });
+
+    // The path exists — for GET. Hints scan same-method routes only, so the
+    // POST gets the plain body rather than a suggestion it cannot use.
+    var resp = try dispatch(&server, .POST, "/api/case/methodonly", null);
+    defer resp.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 404), resp.status_code);
+    try std.testing.expectEqualStrings("{\"code\":404,\"msg\":\"Not Found\",\"data\":null}", resp.body);
+}
+
+test "dispatch unmatched route respects default_404" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(std.testing.io, allocator, 0);
+    defer server.deinit();
+
+    const Custom = struct {
+        fn notFound(ctx: *Context) !void {
+            try ctx.text(404, "custom-missing");
+        }
+    };
+    server.default_404 = Custom.notFound;
+
+    var resp = try dispatch(&server, .GET, "/nowhere", null);
+    defer resp.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 404), resp.status_code);
+    try std.testing.expectEqualStrings("custom-missing", resp.body);
+}
+
 test "tenantMiddleware sets attr" {
     const allocator = std.testing.allocator;
     var server = Server.init(std.testing.io, allocator, 0);

@@ -3,8 +3,10 @@ const builtin = @import("builtin");
 
 /// Centralized time utility for ZigModu.
 ///
-/// Zig 0.16.0 removed `std.time.Instant` / `std.time.nanoTimestamp()`.
-/// This module provides portable monotonic time using the OS clock.
+/// The 0.16/0.17 toolchains removed the old `std.time` helpers
+/// (`std.time.Instant` / `std.time.nanoTimestamp()`, and later
+/// `std.time.timestamp()` / `std.time.milliTimestamp()`). This module
+/// provides portable replacements on top of the OS clock.
 ///
 /// ## Usage
 ///
@@ -16,6 +18,17 @@ const builtin = @import("builtin");
 ///
 /// All subsystems (CircuitBreaker, RateLimiter, CacheManager, etc.) should call
 /// these functions instead of hardcoding `const now = 0`.
+///
+/// ## Wall clock vs monotonic（重要边界）
+///
+/// - `wallClockSeconds(io) i64` / `wallClockMilliseconds(io) i64`（自 v0.7.0 起）
+///   返回墙钟（realtime），需要一个 `std.Io`；用于入库时间戳、审计日志等
+///   "绝对时刻"场景。
+/// - **墙钟会被 NTP 同步、闰秒、手动拨动影响，可回拨**：两次读数之差不是时长。
+///   时长 / 截止 / 超时一律用 `monotonicNow*`。
+/// - **monotonic 值（进程 uptime 语义）禁止入库**：重启后同一数值对应的绝对
+///   时刻完全不同（与 zent 侧 nowUs 翻转事故同构的教训）；存库时间戳用
+///   `wallClock*`。
 /// Last-ditch fallback when no OS clock is available: a strictly increasing
 /// counter. Useless for measuring real durations, but preserves the
 /// monotonicity invariant that TTL / rate-limit / breaker logic relies on.

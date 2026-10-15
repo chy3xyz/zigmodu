@@ -408,6 +408,25 @@ WS：`pub const ws_routes = [_]http.WsSpec(State){ .{ .path = "ws", .on_connect 
 
 示例：`examples/tenant-mgmt`（单套 `CatalogPermDb`）；多主体见应用自定义 loader（ZigShop）。
 
+#### 跨门户身份（一个身份在 N 个门户工作）
+
+框架**不校验 `aud` 对门户的映射**（`SecurityModule.verifyToken` 只验结构 / alg / 签名 /
+exp），roles 门禁只比 JWT `roles` claim 的**并集**（`|` OR，`Middleware.zig:1139-1145`）。
+因此一个身份要在多个门户下工作，任选其一即可：
+
+1. **签发时放多个门户 role**：`generateTokenWithTenant(sub, roles, aud)` 的 `roles` 本来
+   就是数组，签 `roles = {"cashier","user"}` 即跨门户。框架对 roles 里有哪些门户、分布
+   如何**不做任何校验**——那是你的 loader / 路由声明的职责。
+2. **路由侧声明并集**：`RouteMeta.roles = "user|cashier"`，同样按 OR 匹配。
+3. **rbac 模式用门户权限码**：`permission = "portal:user|portal:shop"`。
+
+**前提：跨门户复用要求各门户共享验签密钥**（同一个 `AppSecurity` / keyring）。多 BFF /
+多门户若各挂各的 `SecurityModule`（验签密钥不同），跨门户 token 连签都验不过（401）——
+那是部署决策，不是框架限制；要跨门户，先统一验签侧。
+
+**勿做**：不要为跨门户在核心 `JwtPayload` 加 `type` 枚举——跨门户扩展槽位就是 `roles`
+（见本节「刻意不做（框架边界）」与「推荐约定」表）。
+
 ### 7.2 可插拔 AuthBackend / 身份与信封（v0.15.31+）
 
 源自 `docs/ISSUES_FROM_ZAPI.md`（zapi 落地反馈）：

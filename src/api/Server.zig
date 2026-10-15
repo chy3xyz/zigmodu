@@ -2416,6 +2416,31 @@ fn headerLookup(headers: std.StringHashMap([]const u8), key: []const u8) ?[]cons
     return null;
 }
 
+/// Outcome of the one-shot port-claim probe `start()` runs before its real
+/// listen. On POSIX, `reuse_address = true` sets SO_REUSEADDR *and*
+/// SO_REUSEPORT (std netListenIpPosix gates the latter on `@hasDecl(posix.SO,
+/// "REUSEPORT")`, true on Darwin/Linux), so a second process binding the same
+/// port is granted it silently and the kernel load-splits new connections
+/// between the two listeners — the failure mode behind the "on macOS a second
+/// process asking for the same number can be granted it too" incident note in
+/// src/extensions/WebSocket.zig. `enableReusePort()` documents intent but
+/// cannot detect the collision; this probe does: it re-binds the same address
+/// with `reuse_address = false`, which answers `error.AddressInUse` exactly
+/// when a sharing partner already holds the port.
+const PortClaim = enum { free, shared };
+
+fn probePortClaim(io: std.Io, addr: std.Io.net.IpAddress) PortClaim {
+    var listener = addr.listen(io, .{ .reuse_address = false }) catch |err| switch (err) {
+        error.AddressInUse => return .shared,
+        // The probe is advisory: anything else (permissions, ephemeral-port
+        // quirks) must not stop startup — the real listen reports its own
+        // error right after, with a channel the caller can act on.
+        else => return .free,
+    };
+    listener.deinit(io);
+    return .free;
+}
+
 /// HTTP server — async fiber-based
 pub const Server = struct {
     io: std.Io,
@@ -2424,6 +2449,9 @@ pub const Server = struct {
     router: Router,
     global_middleware: std.ArrayList(Middleware),
     default_404: ?HandlerFn = null,
+    /// Successful `addRoute` calls — the number start() reports next to the
+    /// listening line, so the per-route debug spam could go away.
+    route_count: usize = 0,
     ws_handlers: std.StringHashMap(WsRoute),
     /// Path rewriter callback (optional) — runs before router.match().
     /// Use for ThinkPHP /api/* compat, legacy URL mapping, prefix stripping.
@@ -2948,7 +2976,11 @@ pub const Server = struct {
             r.combined_middleware = combined;
         }
         try self.router.addRoute(r);
-        std.log.info("ROUTE: {s} {s}", .{ @tagName(r.method), r.path });
+        self.route_count += 1;
+        // Registration is startup noise at info level — a 1800-route app
+        // drowned real errors, and ReleaseFast's default level is still .info.
+        // The aggregate count lands in start()'s "listening" line instead.
+        std.log.debug("ROUTE: {s} {s}", .{ @tagName(r.method), r.path });
     }
 
     pub fn group(self: *Server, prefix: []const u8) RouteGroup {
@@ -3016,14 +3048,84 @@ pub const Server = struct {
             }.h, self.global_middleware.items) catch |err| std.log.err("[Server] global middleware on unmatched route failed: {}", .{err});
         }
         if (!ctx.responded) {
-            try ctx.sendError(404, "Not Found");
+            // Same fallback order as connFiber's production 404 (this entry
+            // point also serves the H2 dispatch path): a custom default_404
+            // owns the response; only the built-in body gets the hint.
+            if (self.default_404) |nf| {
+                nf(ctx) catch |err| std.log.err("[Server] default_404 handler failed: {}", .{err});
+            } else {
+                var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+                defer arena.deinit();
+                const message = self.notFoundMessage(arena.allocator(), ctx.method, ctx.path) catch "Not Found";
+                try ctx.sendError(404, message);
+            }
         }
+    }
+
+    /// Skip empty segments the way the trie does (`Router.addRoute` ignores
+    /// them), so "/a//b" and "/a/b" compare segment-for-segment.
+    fn nextPathSegment(it: *std.mem.SplitIterator(u8, .scalar)) ?[]const u8 {
+        while (it.next()) |seg| {
+            if (seg.len != 0) return seg;
+        }
+        return null;
+    }
+
+    /// Do two paths have the same segment count with every literal segment
+    /// equal ignoring ASCII case? `{name}` and `*` segments are wildcards on
+    /// the registered side — a hint is only useful when the request could
+    /// actually have matched the route.
+    fn pathSegmentsMatchIgnoreCase(registered: []const u8, request: []const u8) bool {
+        var reg_it = std.mem.splitScalar(u8, registered, '/');
+        var req_it = std.mem.splitScalar(u8, request, '/');
+        while (true) {
+            const reg_seg = nextPathSegment(&reg_it) orelse return nextPathSegment(&req_it) == null;
+            const req_seg = nextPathSegment(&req_it) orelse return false;
+            if (reg_seg[0] == '{' or reg_seg[0] == '*') continue;
+            if (req_seg[0] == '{' or req_seg[0] == '*') continue;
+            if (!std.ascii.eqlIgnoreCase(reg_seg, req_seg)) return false;
+        }
+    }
+
+    /// Case-insensitive "did you mean" hint for a 404. Both matching layers
+    /// (catalog and trie) are case-sensitive, and front-end frameworks that
+    /// capitalise path segments (/delivery/fee → /Delivery/fee) used to get a
+    /// bare 404 with no pointer at the route they almost certainly meant.
+    /// Scan the registered table for the first same-method route whose literal
+    /// segments equal the request's ignoring case — exact spellings skipped (a
+    /// 404 means none is registered) and `{param}`/`*` segments treated as
+    /// wildcards. Returns the full 404 message ("Not Found; did you mean
+    /// {path}") allocated in `alloc`, or the plain "Not Found". Under an
+    /// installed RFC 7807 renderer the hint rides in the message, i.e. the
+    /// problem's `detail` field — the renderer hook receives only the message
+    /// string, so there is no separate hint injection point without changing
+    /// the hook's signature.
+    fn notFoundMessage(self: *const Server, alloc: std.mem.Allocator, method: Method, path: []const u8) ![]const u8 {
+        const routes = try self.router.listRoutes(alloc);
+        defer {
+            for (routes) |info| {
+                alloc.free(info.method);
+                alloc.free(info.path);
+            }
+            alloc.free(routes);
+        }
+        for (routes) |info| {
+            if (!std.mem.eql(u8, info.method, method.toString())) continue;
+            if (std.mem.eql(u8, info.path, path)) continue;
+            if (pathSegmentsMatchIgnoreCase(info.path, path)) {
+                return alloc.print("Not Found; did you mean {s}", .{info.path});
+            }
+        }
+        return "Not Found";
     }
 
     /// Start the async HTTP server.
     /// Blocks until stop() is called (runs within self.io scheduler).
     pub fn start(self: *Server) !void {
         const addr = try std.Io.net.IpAddress.parseIp4("0.0.0.0", self.port);
+        if (probePortClaim(self.io, addr) == .shared) {
+            std.log.warn("[Server] port {d} is ALREADY BOUND by another process — SO_REUSEPORT sharing is in effect, so new connections on this port may be routed to THAT process instead of this one. If this is not an intentional multi-process deployment, stop and check for a stale instance (old process / pidfile) before continuing.", .{self.port});
+        }
         self.listener = try addr.listen(self.io, .{
             .reuse_address = true,
         });
@@ -3053,7 +3155,7 @@ pub const Server = struct {
         defer self.conn_group.await(self.io) catch |err| std.log.warn("[Server] conn_group await: {}", .{err});
 
         self.running.store(true, .monotonic);
-        std.log.info("Server listening on port {d}", .{self.port});
+        std.log.info("Server listening on port {d} ({d} routes)", .{ self.port, self.route_count });
 
         while (self.running.load(.monotonic)) {
             const stream = (self.listener orelse break).accept(self.io) catch |err| {
@@ -3831,7 +3933,9 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                 if (server.default_404) |nf| {
                     nf(&ctx) catch |err| std.log.err("[Server] default_404 handler failed: {}", .{err});
                 } else {
-                    ctx.sendError(404, "Not Found") catch |err| std.log.err("[Server] failed to send 404: {}", .{err});
+                    // The scan is paid only by 404s and rides the request arena.
+                    const message = server.notFoundMessage(arena_alloc, request.method, request.path) catch "Not Found";
+                    ctx.sendError(404, message) catch |err| std.log.err("[Server] failed to send 404: {}", .{err});
                 }
             }
         }
@@ -4219,6 +4323,52 @@ test "api server" {
 
     try server.addRoute(route);
     try std.testing.expect(server.port == 0);
+}
+
+test "probePortClaim reports shared while a reuse_address listener holds the port" {
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    // Same Threaded-io shape as the DistributedEventBus bind-race probe tests.
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Holder plays the already-running process: reuse_address=true is exactly
+    // what Server.start() binds with, and on POSIX it implies SO_REUSEPORT.
+    const any_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var holder = try any_addr.listen(io, .{ .reuse_address = true });
+    defer holder.deinit(io);
+    const port = holder.socket.address.getPort();
+    try std.testing.expect(port != 0);
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+    try std.testing.expectEqual(PortClaim.shared, probePortClaim(io, addr));
+}
+
+test "probePortClaim reports free on a released port" {
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Between releasing the placeholder and probing, a parallel test binary
+    // can claim the number (the same gap DistributedEventBus's start() test
+    // documents) — AddressInUse there is a race, not a probe regression, so
+    // retry with a fresh port a few times before failing.
+    var attempt: usize = 0;
+    while (true) {
+        const any_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        var placeholder = try any_addr.listen(io, .{ .reuse_address = true });
+        const port = placeholder.socket.address.getPort();
+        placeholder.deinit(io);
+        try std.testing.expect(port != 0);
+
+        const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+        if (probePortClaim(io, addr) == .free) break;
+        attempt += 1;
+        if (attempt >= 5) return error.AddressInUse;
+    }
 }
 
 test "path matching" {

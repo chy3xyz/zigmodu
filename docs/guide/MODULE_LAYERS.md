@@ -165,7 +165,7 @@ pub fn checkout(self: *Self, cmd: CheckoutCmd) !CheckoutResult {
 | 做法 | 说明 |
 |------|------|
 | **Cmd / Result** | 少用一长串标量；API 层组装 Cmd |
-| **幂等** | 支付等写路径用业务键；先查再写 |
+| **幂等** | 支付等写路径用业务键；先查再写（范式见 [BEST_PRACTICES.md「幂等：网络重试去重 vs 业务幂等键」](./BEST_PRACTICES.md)） |
 | **同事务 outbox** | 业务行 + outbox 同行提交，再由 poller → RobustMQ |
 | **错误稳定** | `InvalidInput` / `NotFound` / `ConstraintViolation`；API 再映射文案 |
 

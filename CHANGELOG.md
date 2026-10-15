@@ -1,5 +1,81 @@
 # Changelog
 
+## [Unreleased]
+
+### 第 178 批：外部评审清单核验落地——端口共听探针 + 404 did-you-mean + 幂等死配置接线 + 文档四件套（**破坏性：窄——Idempotency 占位 API 签名一处，无仓内调用点**）
+
+An external review (downstream production evidence + v0.39.12 source
+verification) produced 8 items; each claim was re-verified against this
+checkout before acting. Three claims were partly wrong in instructive ways —
+documented below.
+
+1. **P0-1 port sharing probe (CONFIRMED, worse than claimed)**: Zig 0.17 std's
+   `reuse_address = true` sets SO_REUSEADDR **and SO_REUSEPORT** on POSIX
+   (`std/Io/Threaded.zig` netListenIpPosix), so two processes silently share
+   one listening port everywhere POSIX — not just macOS. `Server.start()` now
+   runs a one-shot `probePortClaim` (re-bind with `reuse_address = false`)
+   and logs a loud warning when the port is already held (SO_REUSEPORT
+   sharing in effect, connections may be routed to the other process). The
+   probe is advisory — startup still proceeds; the real listen's own error
+   handling is unchanged. Precedent: the bind-race probe in
+   `DistributedEventBus` tests. 2 new loopback tests.
+2. **P1-4 route log flood (CONFIRMED, worse than claimed)**: per-route
+   `ROUTE:` registration logging dropped from info to debug — Zig 0.17's
+   default level is `.info` even in ReleaseFast, so production builds
+   drowned real errors. `start()` now reports the aggregate:
+   `Server listening on port {d} ({d} routes)` via a new `route_count`.
+3. **P0-2 case-sensitivity 404 hint (CONFIRMED)**: both matching layers
+   (catalog + trie) are case-sensitive; a front-end that capitalises path
+   segments used to get a bare 404. Both built-in 404 sites (prod `connFiber`
+   and `handleForTest`, which also serves the H2 dispatch path) now scan
+   `router.listRoutes` for a same-method route matching ignoring ASCII case
+   (`{param}`/`*` wildcards respected) and answer
+   `Not Found; did you mean {path}`. Under an RFC 7807 renderer the hint
+   rides in `detail` (the hook takes only the message string). Fixed the
+   existing test blind spot on the way: `handleForTest` now honours
+   `default_404` like the production path. 4 new Testkit tests.
+4. **P1-6 Idempotency dead config wired (+ a real leak fixed)**: the
+   middleware ignored `IdempotencyConfig.header_name` (hardcoded header) and
+   `.ttl_seconds` (hardcoded 24h) — consumer-facing traps. Config now lives
+   on `IdempotencyStore.config` (default-constructed, zero breakage;
+   `idempotencyMiddleware` signature unchanged); the placeholder path
+   (`wrapContextWithIdempotency`) reads the same config — its signature
+   changed but had zero in-repo callers. Writing the wiring tests exposed a
+   pre-existing leak: `recordIdempotencyResponse` dropped the placeholder
+   via `store.get()`, which only removes *expired* entries, so overwriting
+   the placeholder leaked its owned key/response copies; now `fetchRemove` +
+   free. 4 new tests (default regression, custom header name, custom TTL,
+   placeholder path).
+5. **P0-3 wall clock (claim STALE — corrected)**: `Time.wallClockSeconds/io`
+   and `wallClockMilliseconds/io` have existed since v0.7.0 with six
+   production callers; nothing to add. The real gap was documentation:
+   `Time.zig`'s header comment never mentioned the wall functions or the
+   monotonic-vs-wall boundary (wall can jump backwards; durations belong on
+   monotonic; monotonic values must never be persisted). Header comment
+   extended, AGENTS.md's removed-API table now maps
+   `std.time.timestamp()/milliTimestamp()` to the wall variants.
+6. **P1-5 cross-portal roles (phenomenon real, diagnosis wrong — docs
+   only)**: the framework never validates `aud` against a portal at all;
+   the 403 fires at the roles gate. Tokens can already carry multi-portal
+   roles (`generateTokenWithTenant` takes an array), `RouteMeta.roles` is
+   already `|`-OR. The only hard constraint is shared signing keys across
+   portals. ROUTE_TABLE.md §7.1 gains a「跨门户身份」section stating the
+   three supported paths and the shared-key prerequisite, instead of the
+   reviewer's「duplicate the endpoint」workaround.
+7. **P2-7 login rate limit**: not adopted as a feature per the v1.0-alpha
+   freeze — recorded as a v1.x candidate with an application-level recipe
+   (account+IP dimensions, failure window, 429 with ambiguous message) in
+   BEST_PRACTICES.md.
+8. **P2-8 Testkit × zent L0**: blocked on zent-side semantics — no action.
+
+Also: BEST_PRACTICES.md gains「幂等：网络重试去重 vs 业务幂等键」(middleware
+vs business-unique-key boundary, tenant-shop payment as the reference
+pattern); MODULE_LAYERS.md cross-references it.
+
+Verified: api.Server 113/113, Testkit 15/15, Idempotency 9/9, ErrorShape 5/5,
+probePortClaim 2/2; fmt / check-production / check-doc-paths green; full
+test-fast at commit time.
+
 ## [0.39.12] - 2026-10-15
 
 ### 第 172 批：文档站 VitePress → zdoc（**破坏性：否；CI-only + 文档链接归一化**）
