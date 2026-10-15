@@ -1,5 +1,7 @@
 # Changelog
 
+## [Unreleased]
+
 ### 第 172 批：文档站 VitePress → zdoc（**破坏性：否；CI-only + 文档链接归一化**）
 
 The docs site now builds with [zdoc](https://github.com/chy3xyz/zdoc) v0.16.1 in
