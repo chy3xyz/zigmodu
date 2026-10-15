@@ -13,6 +13,10 @@
 //!     on create (if-missing) and scoping queries — see `InterceptorApi`
 //!     at the bottom of this file (`/api/v1/tenant-injection`);
 //!   - request-scoped entity teardown (`managedEntity`/`dupeEntityTo`).
+//! v0.88 addition (see `FeedJoinApi`):
+//!   - controlled JOIN (`joinEdge`) — single-statement m2o inline: the FK's
+//!     owning side LEFT JOINs the target into `edges.author` with the
+//!     target's full read contract, saving the second round trip.
 
 const std = @import("std");
 const zigmodu = @import("zigmodu");
@@ -441,6 +445,68 @@ pub fn FeedModernApi(comptime Client: type) type {
             const arr = try maskedArrayJson(arena, persist.infos, persist.AuthorInfo, copies);
             const body = try arena.print("{{\"authors\":{s}}}", .{arr});
             try ctx.json(200, body);
+        }
+    };
+}
+
+/// FeedJoinApi: GET /api/v1/feed3/posts-with-author — v0.88 controlled JOIN
+/// (`joinEdge`): the FK-in-this-table m2o "author" edge is LEFT JOINed in the
+/// same statement and the target row is scanned straight into
+/// `row.edges.author` (a one-element slice, `WithEdge`-shaped). The target's
+/// full read contract (soft delete → privacy → interceptor) is qualified to
+/// the join alias — `.left` puts its scope in ON (an outer row survives a
+/// missing author, `edges.author == null`), `.inner` would put it in WHERE.
+/// Rows release with the same one-call `deinitRows` as every other read.
+pub fn FeedJoinApi(comptime Client: type) type {
+    return struct {
+        const Self = @This();
+
+        client: *Client,
+
+        pub const module_name = "catalog";
+        pub const nest = .{"feed3"};
+        pub const State = Self;
+
+        pub fn init(client: *Client) Self {
+            return .{ .client = client };
+        }
+
+        pub const routes = [_]http.RouteSpec(State){
+            .{ .method = .GET, .path = "posts-with-author", .handler = postsWithAuthor, .meta = .{ .auth = .public } },
+        };
+
+        fn postsWithAuthor(ctx: *http.Context, self: *State) !void {
+            // Request arena: JSON pieces die with the handler; zent-owned
+            // rows (author strings + per-row scan arenas) are released by
+            // deinitRows — the same one-liner as the feed2 handler above.
+            var arena_state = std.heap.ArenaAllocator.init(self.client.allocator);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+
+            var q = self.client.post.Query();
+            defer q.deinit();
+            _ = try q.joinEdge("author", .left, .{});
+            var rows = try q.All();
+            defer self.client.post.deinitRows(&rows);
+
+            var buf = std.ArrayList(u8).empty;
+            defer buf.deinit(arena);
+            try buf.appendSlice(arena, "{\"posts\":[");
+            for (rows.items, 0..) |*p, i| {
+                if (i > 0) try buf.append(arena, ',');
+                const item = .{
+                    .id = p.id,
+                    .title = p.title,
+                    // LEFT JOIN: null author means "no matching author row".
+                    .author = if (p.edges.author) |a| .{
+                        .id = a[0].id,
+                        .name = a[0].name,
+                    } else null,
+                };
+                try buf.appendSlice(arena, try std.json.Stringify.valueAlloc(arena, item, .{}));
+            }
+            try buf.appendSlice(arena, "]}");
+            try ctx.json(200, buf.items);
         }
     };
 }

@@ -1,6 +1,6 @@
 # zent-modulith — ZigModu + zent
 
-Demonstrates **ZigModu** (Application / HTTP / **ComptimeRouter**) with **[zent](https://github.com/chy3xyz/zent)** v0.86.0 as the schema-as-code data layer (demos span v0.21–v0.86 capabilities).
+Demonstrates **ZigModu** (Application / HTTP / **ComptimeRouter**) with **[zent](https://github.com/chy3xyz/zent)** v0.92.0 as the schema-as-code data layer (demos span v0.21–v0.92 capabilities).
 
 See framework guides: [`docs/reference/ZENT.md`](../../docs/reference/ZENT.md) · [`docs/reference/ROUTE_TABLE.md`](../../docs/reference/ROUTE_TABLE.md).
 
@@ -9,7 +9,7 @@ See framework guides: [`docs/reference/ZENT.md`](../../docs/reference/ZENT.md) �
 
 - Zig ≥ 0.17
 - No sibling checkout needed: `build.zig.zon` pins the released tag
-  `v0.86.0` via `git+https` (fetched by the build). For local development
+  `v0.92.0` via `git+https` (fetched by the build). For local development
   against a sibling checkout, replace it with
   `.zent = .{ .path = "../../../zent" }`.
 
@@ -31,7 +31,7 @@ ZENT_DEV_TOKEN=1 HTTP_PORT=18100 zig build run
 
 ## Smoke
 
-`smoke.sh` 把下面这串 curl 变成 43 项断言（含"空 `dept_ids` 必须拒绝"与
+`smoke.sh` 把下面这串 curl 变成 44 项断言（含"空 `dept_ids` 必须拒绝"与
 "服务器跑完仍存活、日志无 panic"），CI 的 Build Examples job 会跑它：
 
 ```bash
@@ -144,6 +144,17 @@ JSON。`comments` 边声明了 `WhereRaw("\"hidden\" = ?", false)` +
 
 ```bash
 curl -s http://127.0.0.1:18100/api/v1/feed/authors
+```
+
+**受控 JOIN（`joinEdge`，v0.88）**：`Post` 声明了 FK 在本表的 From 边
+`author`，`GET /api/v1/feed3/posts-with-author` 一条语句 LEFT JOIN 出
+author 并内联进 `edges.author`（目标的全读契约由 builder 限定到 join
+别名；`.left` 时目标 scope 进 ON，author 缺失则该字段为 null），省掉
+`WithEdge` 的第二次往返。
+
+```bash
+curl -s http://127.0.0.1:18100/api/v1/feed3/posts-with-author
+# -> {"posts":[{"id":1,"title":"hello-zent","author":{"id":1,"name":"alice"}}, ...]}
 ```
 
 ## 事务编排 / 分布式 ID / 游标 / 批量软删（v0.23–0.26）

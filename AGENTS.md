@@ -502,7 +502,7 @@ filter 是**测试全限定名的子串**（形如 `core.cluster.RaftElection.te
 - Sandbox cache：`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`.
 - Auth Path A + `CatalogPermLoadInput` 已落地；legacy JWT 只写 `auth_info`。
 - x402 fail-closed；OTLP/Vault 已支持 HTTPS（系统 CA）。
-- zent **v0.86.0**（示例按此验证）与 `data.sqlx` 正交，勿混驱动/共享事务；版本行为差（`getOwned`/`insertMany` 双参/裁剪构建/`zent.scope`/junction 撞名/`ShardSet` 借用契约/`VarChar(n)` 等）全在 `docs/reference/ZENT.md`「版本口径」与 §14。两条实测陷阱：① `deinitRow(s)` 只用于**驱动扫描出来**的行——`getOwned` 这类带 allocator 返回的要用 `deinitRowWith(allocator, &e)`，配错 = 跨分配器 free 打死进程（`zmodu audit` b23 拦）；② 改依赖 pin 后先 `rm -rf .zig-cache`——增量缓存会沿用旧 fetch 模块（实测"编译通过"却跑旧版本）。
+- zent **v0.92.0**（示例按此验证）与 `data.sqlx` 正交，勿混驱动/共享事务；版本行为差（`getOwned`/`insertMany` 双参/裁剪构建/`zent.scope`/junction 撞名/`ShardSet` 借用契约/`VarChar(n)`/`joinEdge` 受控 JOIN v1（FK 在本表的 From 边单语句内联，示例见 zent-modulith `feed3`；互指边须 base+wrapper 破环）/pgvector 等）全在 `docs/reference/ZENT.md`「版本口径」与 §14。两条实测陷阱：① `deinitRow(s)` 只用于**驱动扫描出来**的行——`getOwned` 这类带 allocator 返回的要用 `deinitRowWith(allocator, &e)`，配错 = 跨分配器 free 打死进程（`zmodu audit` b23 拦）；② 改依赖 pin 后先 `rm -rf .zig-cache`——增量缓存会沿用旧 fetch 模块（实测"编译通过"却跑旧版本）。
 - SQLx 选择性链接：`-Ddb=` / `.db=`，默认 `all`；框架测试勿收窄；见 `docs/guide/SQLX_DRIVERS.md`。
 - WS：`WsMessageFn` 含 `WsFrameKind`；fiber/io_uring 分发 text+binary（OpenIM protobuf OK）。
 - CI：`bash scripts/ci-integration.sh`（tenant-mgmt + stress + shopdemo，`-Ddb=sqlite`）。

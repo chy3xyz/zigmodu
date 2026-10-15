@@ -65,6 +65,33 @@ pub const Comment = Schema("Comment", .{
     },
 });
 
+/// Compose edges onto a `Schema()` base — the idiom from zent's own
+/// `examples/start/schema.zig`, needed here because `Schema()` evaluates its
+/// edge list eagerly: two schemas whose edges point at each other cannot both
+/// be plain `Schema()` values (comptime dependency loop). Declaring the
+/// fields as an edge-less base first and wrapping the side that needs edges
+/// breaks the cycle; the graph matches schemas by `schema_name`, so the
+/// wrapper and the base are the same table. Forwards these decls only:
+/// schema_name, fields, indexes, policy, is_view, view_sql, soft_delete.
+fn withEdges(comptime Base: type, comptime es: []const edge.Edge) type {
+    return struct {
+        pub const schema_name = Base.schema_name;
+        pub const fields = Base.fields;
+        pub const edges = es;
+        pub const indexes = Base.indexes;
+        pub const policy = if (@hasDecl(Base, "policy")) Base.policy else null;
+        pub const is_view = if (@hasDecl(Base, "is_view")) Base.is_view else false;
+        pub const view_sql = if (@hasDecl(Base, "view_sql")) Base.view_sql else null;
+        pub const soft_delete = if (@hasDecl(Base, "soft_delete")) Base.soft_delete else false;
+    };
+}
+
+/// Author fields without edges — declared before Post so Post's From edge
+/// (below) can target it without the Author↔Post dependency loop.
+const AuthorBase = Schema("Author", .{
+    .fields = &.{field.String("name")},
+});
+
 pub const Post = Schema("Post", .{
     .fields = &.{
         field.Int("author_id"),
@@ -73,21 +100,25 @@ pub const Post = Schema("Post", .{
     // Per-parent eager load: newest 2 *visible* comments per post — the
     // WhereRaw filter (v0.23) applies before order/limit, so limits rank
     // filtered rows only.
-    .edges = &.{edge.To("comments", Comment)
+    //
+    // From edge (v0.88 joinEdge demo): the FK lives in this table
+    // (post.author_id), so `joinEdge("author", …)` may inline the author row
+    // into `edges.author` in the same statement.
+    .edges = &.{ edge.To("comments", Comment)
         .Field("post_id")
         .WhereRaw("\"hidden\" = ?", &.{.{ .bool = false }})
         .OrderBy("id")
         .Desc()
-        .Limit(2)},
+        .Limit(2), edge.From("author", AuthorBase) },
     // Soft delete + restore demo (v0.26).
     .mixins = &.{zent.core.mixin.SoftDeleteMixin},
     .soft_delete = true,
 });
 
-pub const Author = Schema("Author", .{
-    .fields = &.{field.String("name")},
-    .edges = &.{edge.To("posts", Post)},
-});
+/// Author → posts (see the two-level nested preload demo on Comment above).
+/// Wrapped (not a plain `Schema()` value) because its `posts` edge points
+/// back at Post — see `withEdges` above.
+pub const Author = withEdges(AuthorBase, &.{edge.To("posts", Post)});
 
 /// Commerce demo: per-product stock with an optimistic-lock version column,
 /// decremented atomically via `setExprArgs` (oversell-safe).

@@ -4389,11 +4389,33 @@ test "a bus whose loops cannot be dispatched fails start() instead of hanging" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const port = try deadLoopbackPort(io);
     var bus = try DistributedEventBus.init(allocator, io, "no-dispatch");
     defer bus.deinit();
 
-    try std.testing.expectError(error.ConcurrencyUnavailable, bus.start(port));
+    // `deadLoopbackPort` closes its probe listener before `start()` rebinds
+    // the number, so under a parallel full-suite run another test binary can
+    // take the port in the gap (`error.AddressInUse`). That race is not what
+    // this test asserts — the bind never reached the dispatch stage, so the
+    // bus state is untouched (listener unassigned, is_running false) and a
+    // retry is safe. The ConcurrencyUnavailable assertion itself is
+    // deterministic under `.concurrent_limit = .nothing`.
+    var attempt: usize = 0;
+    var port: u16 = 0;
+    while (true) {
+        port = try deadLoopbackPort(io);
+        var bind_race = false;
+        if (bus.start(port)) |_| {
+            // start() succeeded with no concurrent units available — the
+            // silent eager-fallback regression this test exists to catch.
+            try std.testing.expect(false);
+        } else |err| switch (err) {
+            error.AddressInUse => bind_race = true,
+            else => try std.testing.expectEqual(error.ConcurrencyUnavailable, err),
+        }
+        if (!bind_race) break;
+        attempt += 1;
+        if (attempt >= 5) return error.AddressInUse;
+    }
     // Rolled back rather than half-started, and not a silent downgrade: the bus
     // is down and says so.
     try std.testing.expect(!bus.is_running);

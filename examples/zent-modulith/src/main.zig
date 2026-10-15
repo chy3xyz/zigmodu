@@ -197,6 +197,8 @@ pub fn main(init: std.process.Init) !void {
     var upsert_api = UpsertApiT.init(&env.client);
     const FeedModernApiT = features_demo.FeedModernApi(@TypeOf(env.client));
     var feed_modern_api = FeedModernApiT.init(&env.client);
+    const FeedJoinApiT = features_demo.FeedJoinApi(@TypeOf(env.client));
+    var feed_join_api = FeedJoinApiT.init(&env.client);
     const OrderApiT = tx_demo.OrderApi(@TypeOf(env.client));
     var order_api = OrderApiT.init(&env.client);
     const AccountApiT = tx_demo.AccountApi(@TypeOf(env.client));
@@ -311,7 +313,7 @@ pub fn main(init: std.process.Init) !void {
     const DevAuthApiT = dev_auth.DevAuthApi(@TypeOf(app_sec.module));
     var dev_auth_api = DevAuthApiT.init(&app_sec.module);
 
-    comptime zigmodu.http.assertNoDupes(.{ CatalogApiT, ProductApiT, OutboxApiT, DocApiT, InventoryApiT, FeedApiT, SummaryApiT, BatchApiT, UpsertApiT, FeedModernApiT, OrderApiT, AccountApiT, DevAuthApiT });
+    comptime zigmodu.http.assertNoDupes(.{ CatalogApiT, ProductApiT, OutboxApiT, DocApiT, InventoryApiT, FeedApiT, SummaryApiT, BatchApiT, UpsertApiT, FeedModernApiT, FeedJoinApiT, OrderApiT, AccountApiT, DevAuthApiT });
 
     const AppState = struct {};
     var app_state: AppState = .{};
@@ -330,6 +332,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .Mod = BatchApiT, .state = &batch_api },
         .{ .Mod = UpsertApiT, .state = &upsert_api },
         .{ .Mod = FeedModernApiT, .state = &feed_modern_api },
+        .{ .Mod = FeedJoinApiT, .state = &feed_join_api },
         .{ .Mod = OrderApiT, .state = &order_api },
         .{ .Mod = AccountApiT, .state = &account_api },
         .{ .Mod = InterceptorApiT, .state = &interceptor_api },
@@ -383,6 +386,7 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("[main] GET  /api/v1/events (SSE)", .{});
     std.log.info("[main] PUT  /api/v1/sku-stock (v0.30 SaveOrUpdateOn upsert + v0.31 field.Decimal)", .{});
     std.log.info("[main] GET  /api/v1/feed2/authors-with-posts (v0.31 WithEdgeOptions inner join, arena copies)", .{});
+    std.log.info("[main] GET  /api/v1/feed3/posts-with-author (v0.88 joinEdge 单语句内联 author)", .{});
     std.log.info("[main] OpenAPI: http://127.0.0.1:{d}/openapi.json", .{port});
 
     // Graceful shutdown: smoke.sh ends the run with SIGTERM and the process

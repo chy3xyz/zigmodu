@@ -97,6 +97,16 @@ hit "tenant-injection list"  '^200$' "$BASE/api/v1/tenant-injection"
 # ── social: nested preload, keyset cursor, bulk soft delete ───────────────
 hit "feed authors (nested)"  '^200$' "$BASE/api/v1/feed/authors"
 hit "feed2 authors+posts"    '^200$' "$BASE/api/v1/feed2/authors-with-posts"
+# v0.88 joinEdge: one statement, the author row inlined into edges.author.
+FEED3=$(curl -s -m 10 -w '\n%{http_code}' "$BASE/api/v1/feed3/posts-with-author")
+FEED3_CODE=$(printf '%s' "$FEED3" | tail -1)
+FEED3_BODY=$(printf '%s' "$FEED3" | sed '$d')
+n=$((n + 1))
+if [[ "$FEED3_CODE" =~ ^200$ ]] && [[ "$FEED3_BODY" == *'"name":"alice"'* ]]; then
+  printf 'ok   %-40s %s + author inlined\n' "feed3 posts-with-author (joinEdge)" "$FEED3_CODE"
+else
+  bad=$((bad + 1)); printf 'FAIL %-40s http=%s body=%s\n' "feed3 posts-with-author (joinEdge)" "$FEED3_CODE" "${FEED3_BODY:0:160}"
+fi
 hit "feed comments page 1"   '^200$' "$BASE/api/v1/feed/comments?page_size=1"
 hit "feed comments page 2"   '^200$' "$BASE/api/v1/feed/comments?cursor_ts=100&cursor_id=1&page_size=1"
 hit "feed bulk-delete"       '^200$' -H "$JSON" -X POST "$BASE/api/v1/feed/bulk-delete" -d '{"ids":[1,2]}'

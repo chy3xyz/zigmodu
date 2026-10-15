@@ -195,6 +195,48 @@ fmt / deadcode（基线内，Clock.nowUs 移除后可 --update 收缩）/ doc-pa
 version / tenant-scope / pool-guard / test-collection / check-api / check-production
 全绿；全量 test-fast 见提交时聚合行。
 
+### 第 177 批：zent v0.86.0 → v0.92.0 适配 + 偶发测试修复（**破坏性：否；两个示例 pin + joinEdge 演示端点 + 文档口径**）
+
+The two zent-consuming examples move from zent v0.86.0 to **v0.92.0**
+(0.87 → 0.92: implicit-M2M / `Through` junction `table_name` fixes, controlled
+JOIN v1, OOM-sweep hardening, `add_missing_foreign_keys`, pgvector). No breaking
+change touches this repository's usage — the pins, the verification, and one
+adoption:
+
+1. **Pins**: `examples/zent-modulith` + `examples/metaverse-creative`
+   `build.zig.zon` → `v0.92.0#d3e02ec…` with the `zig fetch` hash; stale
+   `zig-pkg/zent-0.86.0-*` and `.zig-cache` removed before rebuilding (the
+   documented incremental-cache trap).
+2. **Verification**: `zent-modulith` clean rebuild + `smoke.sh` **44/0, no
+   leaks**; `metaverse-creative` `zig build demo` → `demo_ok`.
+3. **Adoption — `joinEdge` demo (v0.88)**: new
+   `GET /api/v1/feed3/posts-with-author` in `zent-modulith` —
+   `QueryBuilder.joinEdge("author", .left, .{})` inlines the m2o author into
+   the eager edge field in one statement (vs `WithEdge`'s second round trip);
+   `Post` gains `edge.From("author", …)`. The mutual Author↔Post edge
+   references form a zent dependency loop, resolved with zent's
+   base+wrapper pattern (`AuthorBase` declared before `Post`, `Author =
+   withEdges(AuthorBase, …)` after) — A/B verified: existing feed/feed2
+   responses byte-identical. Smoke gains one check (author inlined).
+4. **Docs**: `docs/reference/ZENT.md` 版本口径 + §11 + §14 (new v0.87–0.92
+   row: joinEdge contract/分工, pgvector, `field.Bytes` PG fix, error-set
+   growth note), `AGENTS.md` learned-facts line, `examples/README.md`,
+   `zent-modulith/README.md` (span now v0.21–v0.92, smoke 44).
+5. **Flaky-test fix (drive-by)**: `DistributedEventBus`
+   "a bus whose loops cannot be dispatched fails start()" picked its port
+   via bind-read-close-rebind, so a parallel test binary could take the port
+   in the gap and the run failed with `AddressInUse` instead of the asserted
+   `ConcurrencyUnavailable` (observed once in the full suite, green in
+   isolation and on re-run). The test now retries on `AddressInUse` (≤5) —
+   that path never reaches the dispatch stage, so the bus state is untouched
+   and the retry is safe; the ConcurrencyUnavailable assertion is
+   unchanged.
+
+验证：`zent-modulith` 清缓存重建 + smoke 44/0 无泄漏；
+`metaverse-creative` demo_ok；fmt / version / doc-paths / tenant-scope /
+pool-guard / test-collection / check-production / deadcode 全绿；全量
+test-fast 复跑 EXIT=0（偶发失败后修复 + 最终全绿）。
+
 ## [0.39.11] - 2026-10-12
 
 ### 第 154 批：文档数字漂移修正（死代码基线 / test artifact 数 / runtime gauge 数）（**破坏性：否**）
