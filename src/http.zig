@@ -242,10 +242,17 @@ pub const Sse = SseWriter;
 pub const SseRecorder = @import("http/Sse.zig").SseRecorder;
 /// Reads the client's `Last-Event-ID` so a stream can resume where it stopped.
 pub const lastEventId = @import("http/Sse.zig").lastEventId;
+/// Low-level primitive behind `sse`: marks the context responded + streaming
+/// and applies the SSE response headers, without socket I/O. Prefer
+/// `http.sse(ctx)` on the normal path — this exists for transports that
+/// build their own writer.
+pub const markSseResponse = @import("http/Sse.zig").markSseResponse;
 
 /// Begin an SSE response (`Content-Type: text/event-stream`).
 /// Sets `ctx.responded` and `ctx.streaming` so Server skips buffered `writeResponse`.
 /// Requires live `ctx.stream` + `ctx.io`.
+/// In tests, record events with `http.SseRecorder` instead of a live socket;
+/// resume a stream after a client disconnect via `http.lastEventId(ctx)`.
 pub fn sse(ctx: *Context) !SseWriter {
     return SseWriter.init(ctx);
 }

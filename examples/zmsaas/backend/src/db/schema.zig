@@ -19,10 +19,7 @@ pub fn apply(client: *data.Client, allocator: std.mem.Allocator, io: std.Io) !vo
     );
     defer migration_lock.deinit();
     runner.setLock(migration_lock.lock(), 300_000);
-    try runner.addMigration(1, "orders", @embedFile("migrations/V1__orders.sql"));
-    try runner.addMigration(2, "order_events", @embedFile("migrations/V2__order_events.sql"));
-    try runner.addMigration(3, "event_outbox", @embedFile("migrations/V3__event_outbox.sql"));
-    try runner.addMigration(4, "rebalance_events", @embedFile("migrations/V4__rebalance_events.sql"));
+    try registerAll(&runner);
     try runner.run(client);
 
     // Lock released here (runner.run returned) — seeding is idempotent.
@@ -32,6 +29,29 @@ pub fn apply(client: *data.Client, allocator: std.mem.Allocator, io: std.Io) !vo
         "INSERT OR IGNORE INTO orders (org_id, customer, amount, status, notes, created_at, updated_at) VALUES (1, 'acme', 9900, 'paid', 'zmsaas seed', 0, 0)",
         &.{},
     );
+}
+
+fn registerAll(runner: *data.MigrationRunner) !void {
+    try runner.addMigration(1, "orders", @embedFile("migrations/V1__orders.sql"));
+    try runner.addMigration(2, "order_events", @embedFile("migrations/V2__order_events.sql"));
+    try runner.addMigration(3, "event_outbox", @embedFile("migrations/V3__event_outbox.sql"));
+    try runner.addMigration(4, "rebalance_events", @embedFile("migrations/V4__rebalance_events.sql"));
+}
+
+/// Preflight `migrationCheck` 的 `pending` 回调（ctx = `*data.Client`）：
+/// 数「已注册但尚未应用」的迁移条数。历史表可能尚不存在（全新库），先
+/// 建表再统计；统计只读，不与其他副本正在进行的迁移抢锁。
+pub fn pendingCount(ctx: ?*anyopaque) anyerror!usize {
+    const client: *data.Client = @ptrCast(@alignCast(ctx.?));
+    var runner = data.MigrationRunner.init(client.allocator);
+    defer runner.deinit();
+    try registerAll(&runner);
+    const ddl = try runner.generateHistoryTableDDL();
+    defer client.allocator.free(ddl);
+    _ = client.exec(ddl, &.{}) catch return error.QueryExecutionFailed;
+    try runner.loadHistory(client);
+    var buf: [16]data.MigrationEntry = undefined;
+    return runner.getPendingMigrations(&buf).len;
 }
 
 /// RBAC: role → permission grants for the orders module.

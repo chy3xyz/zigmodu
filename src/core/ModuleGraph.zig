@@ -64,6 +64,24 @@ pub const Finding = struct {
     cycle: ?[]const []const u8 = null,
 };
 
+/// How bad a `Finding` is. Defined as a local enum instead of reusing
+/// `Preflight.Severity`: this file is the CLI's standalone root module
+/// (`tools/zmodu/build.zig` compiles it with no framework imports, and the test
+/// blocks of any imported file would be pulled into that build), so it must not
+/// import other framework files. The division is exactly the one `Report.ok()`
+/// already makes: `ok()` ignores the `warn` kinds, everything else is `fatal`.
+pub const Severity = enum { warn, fatal };
+
+/// Severity of a finding kind, as a function — the `Report.ok()` whitelist:
+/// missing/self/duplicate/cycle mean the graph cannot start (`fatal`),
+/// too_many_dependencies/orphan are sizing/advisory (`warn`).
+pub fn severity(kind: Finding.Kind) Severity {
+    return switch (kind) {
+        .missing_dependency, .self_dependency, .duplicate_name, .cycle => .fatal,
+        .too_many_dependencies, .orphan => .warn,
+    };
+}
+
 /// Thresholds. Defaults are deliberately permissive: the engine's job is to catch
 /// *structural* mistakes (cycles, typos) not to have opinions about sizing.
 pub const Limits = struct {
@@ -557,11 +575,11 @@ pub fn renderText(report: Report, writer: anytype) !void {
     }
     try writer.writeAll("\nfindings:\n");
     for (report.findings) |f| {
-        const severity = switch (f.kind) {
-            .too_many_dependencies, .orphan => "warn",
-            else => "ERROR",
-        };
-        try writer.print("  [{s}] {s}: ", .{ severity, @tagName(f.kind) });
+        const sev = severity(f.kind);
+        try writer.print("  [{s}] {s}: ", .{ switch (sev) {
+            .warn => "warn",
+            .fatal => "ERROR",
+        }, @tagName(f.kind) });
         switch (f.kind) {
             .cycle => {
                 for (f.cycle.?, 0..) |name, i| {
@@ -659,6 +677,17 @@ test "ModuleGraph: sizing and orphans are advisory, not blocking" {
     try std.testing.expectEqualStrings("lonely", lonely.findings[0].subject);
     // Orphans are warnings: a graph with one still compiles.
     try std.testing.expect(lonely.ok());
+}
+
+test "ModuleGraph: severity is fatal for blocking kinds, warn for advisory kinds" {
+    // The mapping must stay isomorphic to `Report.ok()`'s whitelist: exactly
+    // the kinds `ok()` ignores are `warn`; everything else blocks and is `fatal`.
+    try std.testing.expectEqual(Severity.fatal, severity(.cycle));
+    try std.testing.expectEqual(Severity.fatal, severity(.missing_dependency));
+    try std.testing.expectEqual(Severity.fatal, severity(.self_dependency));
+    try std.testing.expectEqual(Severity.fatal, severity(.duplicate_name));
+    try std.testing.expectEqual(Severity.warn, severity(.too_many_dependencies));
+    try std.testing.expectEqual(Severity.warn, severity(.orphan));
 }
 
 test "ModuleGraph: renderers emit the edges they were given" {

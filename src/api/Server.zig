@@ -985,12 +985,16 @@ pub const Context = struct {
         return self.sendErrorEnvelope(status, status, message);
     }
 
-    /// Send a structured error response. Under a custom `error_renderer` the
-    /// `code` argument is not representable (RFC 7807 has no business code) and
-    /// is dropped; the HTTP `status` is always preserved.
-    pub fn sendErrorResponse(self: *Context, status: u16, code: i32, message: []const u8) !void {
+    /// Send a structured error response. Passing `null` for `code` is
+    /// equivalent to `sendError`: with no renderer the envelope code falls
+    /// back to the HTTP `status`. An independent business `code` is only
+    /// visible in the legacy `{code,msg,data}` envelope (under a custom
+    /// `error_renderer` it is not representable — RFC 7807 has no business
+    /// code — and is dropped, while the HTTP `status` is always preserved),
+    /// so prefer `null` or `sendError` in new code.
+    pub fn sendErrorResponse(self: *Context, status: u16, code: ?i32, message: []const u8) !void {
         if (error_renderer) |render| return render(self, status, message);
-        return self.sendErrorEnvelope(status, code, message);
+        return self.sendErrorEnvelope(status, code orelse status, message);
     }
 
     /// Write the legacy envelope directly, bypassing any installed renderer.
@@ -9776,4 +9780,31 @@ test "requestLineIsHead reads the method token, not a prefix of it" {
     try std.testing.expect(!requestLineIsHead("GET /x HTTP/1.1\r\n"));
     try std.testing.expect(!requestLineIsHead(""));
     try std.testing.expect(!requestLineIsHead("HEA"));
+}
+
+// ── sendErrorResponse: optional business code ────────────────────────────────
+//
+// `code` is `?i32`: `null` means "no independent business code" and the
+// envelope code falls back to the HTTP status, exactly what `sendError`
+// writes; an explicit code survives only in the renderer-less envelope
+// (under an installed renderer it is dropped — RFC 7807 has no field for it).
+
+test "sendErrorResponse with null code falls back to the status in the envelope" {
+    const allocator = std.testing.allocator;
+
+    var ctx = try Context.init(allocator, .GET, "/api/v1/x");
+    defer ctx.deinit();
+    try ctx.sendErrorResponse(422, null, "Nope");
+    try std.testing.expectEqual(@as(u16, 422), ctx.status_code);
+    try std.testing.expectEqualStrings("{\"code\":422,\"msg\":\"Nope\",\"data\":null}", ctx.response_body.items);
+}
+
+test "sendErrorResponse keeps an explicit code in the envelope" {
+    const allocator = std.testing.allocator;
+
+    var ctx = try Context.init(allocator, .GET, "/api/v1/x");
+    defer ctx.deinit();
+    try ctx.sendErrorResponse(422, 4711, "Nope");
+    try std.testing.expectEqual(@as(u16, 422), ctx.status_code);
+    try std.testing.expectEqualStrings("{\"code\":4711,\"msg\":\"Nope\",\"data\":null}", ctx.response_body.items);
 }

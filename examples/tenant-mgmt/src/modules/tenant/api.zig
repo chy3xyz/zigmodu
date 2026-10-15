@@ -42,7 +42,7 @@ pub fn TenantApi(comptime Service: type) type {
 
         fn listTenants(ctx: *http.Context, self: *State) !void {
             var tenants_qr = self.service.listActive() catch {
-                try ctx.sendErrorResponse(500, 0, "Failed to list tenants");
+                try ctx.sendError(500, "Failed to list tenants");
                 return;
             };
             defer tenants_qr.deinit(ctx.allocator);
@@ -67,17 +67,17 @@ pub fn TenantApi(comptime Service: type) type {
 
         fn createTenant(ctx: *http.Context, self: *State) !void {
             const name = ctx.queryParam("name") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing 'name' parameter");
+                try ctx.sendError(400, "Missing 'name' parameter");
                 return;
             };
             const domain = ctx.queryParam("domain") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing 'domain' parameter");
+                try ctx.sendError(400, "Missing 'domain' parameter");
                 return;
             };
             const tier = ctx.queryParam("tier") orelse "free";
 
             const tenant = self.service.create(name, domain, tier) catch |err| {
-                try ctx.sendErrorResponse(400, 0, @errorName(err));
+                try ctx.sendError(400, @errorName(err));
                 return;
             };
 
@@ -90,19 +90,19 @@ pub fn TenantApi(comptime Service: type) type {
 
         fn getTenant(ctx: *http.Context, self: *State) !void {
             const id_str = ctx.param("id") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing tenant ID");
+                try ctx.sendError(400, "Missing tenant ID");
                 return;
             };
             const id = std.fmt.parseInt(i64, id_str, 10) catch {
-                try ctx.sendErrorResponse(400, 0, "Invalid tenant ID");
+                try ctx.sendError(400, "Invalid tenant ID");
                 return;
             };
 
             const tenant = self.service.getById(id) catch |err| {
-                try ctx.sendErrorResponse(404, 0, @errorName(err));
+                try ctx.sendError(404, @errorName(err));
                 return;
             } orelse {
-                try ctx.sendErrorResponse(404, 0, "Tenant not found");
+                try ctx.sendError(404, "Tenant not found");
                 return;
             };
             defer self.service.freeTenant(tenant);
@@ -116,20 +116,20 @@ pub fn TenantApi(comptime Service: type) type {
 
         fn updateTier(ctx: *http.Context, self: *State) !void {
             const id_str = ctx.param("id") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing tenant ID");
+                try ctx.sendError(400, "Missing tenant ID");
                 return;
             };
             const id = std.fmt.parseInt(i64, id_str, 10) catch {
-                try ctx.sendErrorResponse(400, 0, "Invalid tenant ID");
+                try ctx.sendError(400, "Invalid tenant ID");
                 return;
             };
             const tier = ctx.queryParam("tier") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing 'tier' parameter");
+                try ctx.sendError(400, "Missing 'tier' parameter");
                 return;
             };
 
             self.service.updateTier(id, tier) catch |err| {
-                try ctx.sendErrorResponse(400, 0, @errorName(err));
+                try ctx.sendError(400, @errorName(err));
                 return;
             };
 
@@ -138,11 +138,11 @@ pub fn TenantApi(comptime Service: type) type {
 
         fn suspendTenant(ctx: *http.Context, self: *State) !void {
             const id_str = ctx.param("id") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing tenant ID");
+                try ctx.sendError(400, "Missing tenant ID");
                 return;
             };
             const id = std.fmt.parseInt(i64, id_str, 10) catch {
-                try ctx.sendErrorResponse(400, 0, "Invalid tenant ID");
+                try ctx.sendError(400, "Invalid tenant ID");
                 return;
             };
 
@@ -154,7 +154,7 @@ pub fn TenantApi(comptime Service: type) type {
 
             self.service.suspendTenant(id) catch |err| {
                 log.err("suspend tenant {d} failed: {s}", .{ id, @errorName(err) });
-                try ctx.sendErrorResponse(404, 0, @errorName(err));
+                try ctx.sendError(404, @errorName(err));
                 return;
             };
 

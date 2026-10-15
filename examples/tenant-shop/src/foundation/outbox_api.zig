@@ -48,7 +48,7 @@ pub fn OutboxApi(comptime Poller: type) type {
             defer self.poller.setSimulateFail(false);
 
             const res = self.poller.pollOnce() catch {
-                try ctx.sendErrorResponse(500, 0, "outbox drain failed");
+                try ctx.sendError(500, "outbox drain failed");
                 return;
             };
             const resp = try ctx.allocator.print(
@@ -61,7 +61,7 @@ pub fn OutboxApi(comptime Poller: type) type {
         fn list(ctx: *http.Context, self: *State) !void {
             if (ctx.queryParam("status")) |st| {
                 var rows_qr = self.poller.listByStatus(st, 50) catch {
-                    try ctx.sendErrorResponse(500, 0, "outbox list failed");
+                    try ctx.sendError(500, "outbox list failed");
                     return;
                 };
                 defer rows_qr.deinit(ctx.allocator);
@@ -69,7 +69,7 @@ pub fn OutboxApi(comptime Poller: type) type {
                 return;
             }
             var rows_qr = self.poller.listRecent(50) catch {
-                try ctx.sendErrorResponse(500, 0, "outbox list failed");
+                try ctx.sendError(500, "outbox list failed");
                 return;
             };
             defer rows_qr.deinit(ctx.allocator);
@@ -78,7 +78,7 @@ pub fn OutboxApi(comptime Poller: type) type {
 
         fn listDlq(ctx: *http.Context, self: *State) !void {
             var rows_qr = self.poller.listByStatus("dlq", 50) catch {
-                try ctx.sendErrorResponse(500, 0, "outbox dlq list failed");
+                try ctx.sendError(500, "outbox dlq list failed");
                 return;
             };
             defer rows_qr.deinit(ctx.allocator);
@@ -87,16 +87,16 @@ pub fn OutboxApi(comptime Poller: type) type {
 
         fn requeue(ctx: *http.Context, self: *State) !void {
             const id_s = ctx.queryParam("id") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing id");
+                try ctx.sendError(400, "Missing id");
                 return;
             };
             const id = try std.fmt.parseInt(i64, id_s, 10);
             const ok = self.poller.requeue(id) catch {
-                try ctx.sendErrorResponse(500, 0, "requeue failed");
+                try ctx.sendError(500, "requeue failed");
                 return;
             };
             if (!ok) {
-                try ctx.sendErrorResponse(404, 0, "DLQ entry not found");
+                try ctx.sendError(404, "DLQ entry not found");
                 return;
             }
             try ctx.json(200, "{\"status\":\"requeued\"}");

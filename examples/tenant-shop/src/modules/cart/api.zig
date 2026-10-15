@@ -24,11 +24,11 @@ pub fn CartApi(comptime Service: type) type {
 
         fn requireIds(ctx: *http.Context) !struct { tenant_id: i64, user_id: i64 } {
             const tid_s = ctx.queryParam("tenant_id") orelse ctx.getAttr("tenant_id") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing tenant_id");
+                try ctx.sendError(400, "Missing tenant_id");
                 return error.InvalidInput;
             };
             const uid_s = ctx.queryParam("user_id") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing user_id");
+                try ctx.sendError(400, "Missing user_id");
                 return error.InvalidInput;
             };
             return .{
@@ -40,7 +40,7 @@ pub fn CartApi(comptime Service: type) type {
         fn listCart(ctx: *http.Context, self: *State) !void {
             const ids = try requireIds(ctx);
             var items_qr = self.service.listItems(ids.tenant_id, ids.user_id) catch {
-                try ctx.sendErrorResponse(500, 0, "Failed to list cart");
+                try ctx.sendError(500, "Failed to list cart");
                 return;
             };
             defer items_qr.deinit(ctx.allocator);
@@ -63,14 +63,14 @@ pub fn CartApi(comptime Service: type) type {
         fn addItem(ctx: *http.Context, self: *State) !void {
             const ids = try requireIds(ctx);
             const pid_s = ctx.queryParam("product_id") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing product_id");
+                try ctx.sendError(400, "Missing product_id");
                 return;
             };
             const qty_s = ctx.queryParam("qty") orelse "1";
             const pid = try std.fmt.parseInt(i64, pid_s, 10);
             const qty = try std.fmt.parseInt(i64, qty_s, 10);
             self.service.addItem(ids.tenant_id, ids.user_id, pid, qty) catch |err| {
-                try ctx.sendErrorResponse(400, 0, @errorName(err));
+                try ctx.sendError(400, @errorName(err));
                 return;
             };
             try ctx.json(200, "{\"status\":\"ok\"}");
@@ -79,7 +79,7 @@ pub fn CartApi(comptime Service: type) type {
         fn clearCart(ctx: *http.Context, self: *State) !void {
             const ids = try requireIds(ctx);
             self.service.clear(ids.tenant_id, ids.user_id) catch |err| {
-                try ctx.sendErrorResponse(400, 0, @errorName(err));
+                try ctx.sendError(400, @errorName(err));
                 return;
             };
             try ctx.json(200, "{\"status\":\"ok\"}");

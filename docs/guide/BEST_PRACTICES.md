@@ -763,6 +763,11 @@ ZigModu 不绑定 ORM：**同一个应用里按模块选型**，但两者正交�
 `deinit(allocator)` 在 arena 路径上会忽略传入的 allocator（用 arena 自己的 backing allocator），
 所以**误传不同 allocator 不会立刻报错、却会让 SafeAllocator 拒收**——arena 路径请用 `deinitArena()`。
 
+分配器归属的同一条规矩在 zent 侧叫 `deinitRow(s)`：它只接收**驱动扫描出来**的行；把带
+allocator 形参函数的产出（`getOwned` / `AllIn(arena)` 等）交给它是跨分配器
+free——`zmodu audit` b23 静态拦这一类；单测抓不到（测试常共用同一 allocator），
+靠进程级泄漏门禁兜底。细节见 [`ZENT.md`](../reference/ZENT.md) §14。
+
 `Transaction` 内的读写**必须**走 `tx` 句柄（`tx.exec` / `backend.execTx`），否则自动提交且
 `rollback` 无效——伪事务，`zmodu audit` b18 会拦。
 
@@ -1504,6 +1509,8 @@ if (!report.ok()) return error.PreflightFailed;   // 不启动，胜过带病运
 - `Severity.warn` 只告警不阻塞（如"迁移未应用"在自动迁移的应用里只提示）。
 - 检查之间互不影响：单个探针失败不会掩盖其它结果。
 - 参考接线：`examples/zmsaas/backend/src/main.zig`（env + secret + DB + clock）。
+  `migrationCheck` 需应用侧提供 `pending` 回调（返回待应用迁移数，可对接
+  `MigrationRunner.getPendingMigrations`；回调形态见 `src/core/Preflight.zig` 单测）。
 
 ### 文档 ↔ 代码一致性（v0.15.42+）
 

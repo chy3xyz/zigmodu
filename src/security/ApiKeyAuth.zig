@@ -140,7 +140,7 @@ fn KeyAuthTrampoline(comptime slot: usize) type {
 }
 
 fn deny(ctx: *api.Context, config: ApiKeyConfig) !void {
-    try ctx.sendErrorResponse(config.unauthorized_status, 0, config.unauthorized_message);
+    try ctx.sendErrorResponse(config.unauthorized_status, config.unauthorized_status, config.unauthorized_message);
 }
 
 /// One distinct function pointer per slot — the identity a bare fn pointer cannot

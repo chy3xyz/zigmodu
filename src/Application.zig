@@ -94,8 +94,10 @@ pub const Application = struct {
         /// Advisory startup check, the runtime counterpart of `ModuleGraph`'s
         /// comptime one: a module declaring more than this many dependencies is
         /// logged as a warning by `validate()` (sizing is a smell, never a
-        /// reason to refuse to start). `0` disables the check.
-        max_dependencies: usize = 8,
+        /// reason to refuse to start). `0` disables the check. The default is
+        /// `ModuleGraph.Limits.max_dependencies`, the single source of truth
+        /// for the threshold (comptime check, startup validation, `zmodu doctor`).
+        max_dependencies: usize = (ModuleGraph.Limits{}).max_dependencies,
         /// Declared upper bound on `.mode = .pooled` workers (docs/reference/RUNTIME.md
         /// §12): the runtime `app.runtime()` creates is sized for it, and its
         /// pool threads appear the first time a pooled worker is spawned. `0` —
@@ -189,9 +191,7 @@ pub const Application = struct {
             return; // Already validated
         }
         try validateModules(&self.modules);
-        if (self.config.max_dependencies > 0) {
-            _ = warnOverDependencyLimit(&self.modules, self.config.max_dependencies);
-        }
+        try warnAdvisoryGraphFindings(self.allocator, &self.modules, self.config.max_dependencies);
         self.state = .validated;
     }
 
@@ -405,8 +405,9 @@ pub const ApplicationBuilder = struct {
     pending_services: std.ArrayList(PendingService),
     /// Compile-time module-graph check (see `ModuleGraph`), on by default.
     comptime_graph_check: bool = true,
-    /// Advisory threshold for "this module depends on too much".
-    max_dependencies: usize = 8,
+    /// Advisory threshold for "this module depends on too much". Defaults to
+    /// `ModuleGraph.Limits.max_dependencies` (the comptime check's limit).
+    max_dependencies: usize = (ModuleGraph.Limits{}).max_dependencies,
     /// Declared upper bound on `.pooled` workers, handed to the runtime
     /// `app.runtime()` creates (`Config.max_pooled_workers`). `0` — the default —
     /// means the app has no pool, so a `.mode = .pooled` spawn is refused
@@ -459,7 +460,8 @@ pub const ApplicationBuilder = struct {
 
     /// Advisory threshold checked at **startup** (not comptime — the number is
     /// runtime configuration): a module with more dependencies than this is
-    /// logged as a warning by `validate()`. Default 8; `0` disables the check.
+    /// logged as a warning by `validate()`. Default:
+    /// `ModuleGraph.Limits.max_dependencies`; `0` disables the check.
     pub fn withMaxDependencies(self: *ApplicationBuilder, max_deps: usize) *ApplicationBuilder {
         self.max_dependencies = max_deps;
         return self;
@@ -590,25 +592,66 @@ pub fn builder(allocator: std.mem.Allocator, io: std.Io) ApplicationBuilder {
     return ApplicationBuilder.init(allocator, io);
 }
 
-/// Log-and-count modules whose declared dependency count exceeds `limit` — the
-/// advisory half of startup validation (`ModuleGraph.analyze` cannot run here:
-/// the module set is a runtime value by the time `Application` exists). Returns
-/// how many modules were over, which is what the tests assert on.
-fn warnOverDependencyLimit(modules: *const ApplicationModules, limit: usize) usize {
-    var over: usize = 0;
+/// Map the scanned runtime module set to `ModuleGraph.Node`s for
+/// `ModuleGraph.analyzeRuntime` — the startup twin of the comptime
+/// `validateOrFail`. `ModuleInfo` carries no `is_internal` (scanModules drops
+/// it) and no finding consults it, so it maps to `false`; names, descriptions
+/// and dependencies are borrowed — `analyzeRuntime` copies what it keeps.
+fn moduleGraphNodes(allocator: std.mem.Allocator, modules: *const ApplicationModules) ![]ModuleGraph.Node {
+    var nodes = try allocator.alloc(ModuleGraph.Node, modules.modules.count());
+    errdefer allocator.free(nodes);
     var iter = modules.modules.iterator();
-    while (iter.next()) |entry| {
-        const module = entry.value_ptr.*;
-        if (module.deps.len > limit) {
-            std.log.warn("Module '{s}' declares {d} dependencies (advisory max {d})", .{
-                module.name,
-                module.deps.len,
-                limit,
-            });
-            over += 1;
+    var i: usize = 0;
+    while (iter.next()) |entry| : (i += 1) {
+        const m = entry.value_ptr.*;
+        nodes[i] = .{
+            .name = m.name,
+            .description = m.desc,
+            .dependencies = m.deps,
+            .is_internal = false,
+        };
+    }
+    return nodes;
+}
+
+/// Advisory half of startup validation, run by `Application.validate()` after
+/// `validateModules` (which already refused to start on every *fatal* finding):
+/// run the same `ModuleGraph.analyzeRuntime` the CLI uses over the runtime
+/// module set and log what it finds. Sizing is a smell, never a reason to
+/// refuse to start, so this never fails validation; `max_dependencies == 0`
+/// disables the check.
+fn warnAdvisoryGraphFindings(
+    allocator: std.mem.Allocator,
+    modules: *const ApplicationModules,
+    max_dependencies: usize,
+) !void {
+    if (max_dependencies == 0) return; // check disabled
+
+    const nodes = try moduleGraphNodes(allocator, modules);
+    defer allocator.free(nodes);
+    var owned = try ModuleGraph.analyzeRuntime(allocator, nodes, .{
+        .max_dependencies = max_dependencies,
+        // Keep the startup log surface historical (dependency count only);
+        // orphan leaves are `zmodu doctor`'s report, not boot noise.
+        .report_orphans = false,
+    });
+    defer owned.deinit();
+
+    for (owned.report.findings) |f| {
+        switch (f.kind) {
+            .too_many_dependencies => std.log.warn(
+                "Module '{s}' declares {s} dependencies (advisory max {d})",
+                .{ f.subject, f.detail, max_dependencies },
+            ),
+            // Unreachable in practice: `validateModules` errors out on every
+            // fatal kind first. The severity switch keeps the log level honest
+            // if that ordering ever changes.
+            else => switch (ModuleGraph.severity(f.kind)) {
+                .warn => std.log.warn("[module-graph] {s}: module '{s}'", .{ @tagName(f.kind), f.subject }),
+                .fatal => std.log.err("[module-graph] {s}: module '{s}'", .{ @tagName(f.kind), f.subject }),
+            },
         }
     }
-    return over;
 }
 
 test "Application lifecycle" {
@@ -700,10 +743,62 @@ test "advisory max-dependency limit is wired from the builder into startup valid
 
     // The builder's number reaches the config `validate()` reads.
     try std.testing.expectEqual(@as(usize, 1), app.config.max_dependencies);
-    try std.testing.expectEqual(@as(usize, 1), warnOverDependencyLimit(&app.modules, app.config.max_dependencies));
-    try std.testing.expectEqual(@as(usize, 0), warnOverDependencyLimit(&app.modules, 2));
+
+    // The startup check is `ModuleGraph.analyzeRuntime` over the scanned
+    // module set: 'wide' (2 deps) is over the limit of 1, and nothing is over
+    // under a limit of 2.
+    const nodes = try moduleGraphNodes(allocator, &app.modules);
+    defer allocator.free(nodes);
+    var owned = try ModuleGraph.analyzeRuntime(allocator, nodes, .{
+        .max_dependencies = app.config.max_dependencies,
+        .report_orphans = false,
+    });
+    defer owned.deinit();
+    try std.testing.expectEqual(@as(usize, 1), owned.report.count(.too_many_dependencies));
+    try std.testing.expectEqualStrings("wide", owned.report.findings[0].subject);
+
+    var relaxed = try ModuleGraph.analyzeRuntime(allocator, nodes, .{
+        .max_dependencies = 2,
+        .report_orphans = false,
+    });
+    defer relaxed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), relaxed.report.count(.too_many_dependencies));
 
     // ... and `validate()` runs it as part of startup (advisory: no error).
+    try app.validate();
+    try std.testing.expectEqual(Application.State.validated, app.getState());
+}
+
+test "validate() warns over the dependency limit without failing" {
+    const allocator = std.testing.allocator;
+
+    const Leaf = struct {
+        pub const info = api.Module{ .name = "warn-leaf", .description = "Leaf", .dependencies = &.{} };
+        pub fn init() !void {}
+        pub fn deinit() void {}
+    };
+    const Other = struct {
+        pub const info = api.Module{ .name = "warn-other", .description = "Leaf", .dependencies = &.{} };
+        pub fn init() !void {}
+        pub fn deinit() void {}
+    };
+    const Wide = struct {
+        pub const info = api.Module{
+            .name = "warn-wide",
+            .description = "Depends on both leaves",
+            .dependencies = &.{ "warn-leaf", "warn-other" },
+        };
+        pub fn init() !void {}
+        pub fn deinit() void {}
+    };
+
+    // Limit (1) below the declared count (2): advisory — `validate()` must log
+    // the finding and still succeed.
+    var app = try Application.init(std.testing.io, allocator, "warn-app", .{ Leaf, Other, Wide }, .{
+        .max_dependencies = 1,
+    });
+    defer app.deinit();
+
     try app.validate();
     try std.testing.expectEqual(Application.State.validated, app.getState());
 }

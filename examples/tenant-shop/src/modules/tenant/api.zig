@@ -23,7 +23,7 @@ pub fn TenantApi(comptime Service: type) type {
 
         fn listTenants(ctx: *http.Context, self: *State) !void {
             var tenants_qr = self.service.listActive() catch {
-                try ctx.sendErrorResponse(500, 0, "Failed to list tenants");
+                try ctx.sendError(500, "Failed to list tenants");
                 return;
             };
             defer tenants_qr.deinit(ctx.allocator);
@@ -46,16 +46,16 @@ pub fn TenantApi(comptime Service: type) type {
 
         fn createTenant(ctx: *http.Context, self: *State) !void {
             const name = ctx.queryParam("name") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing name");
+                try ctx.sendError(400, "Missing name");
                 return;
             };
             const domain = ctx.queryParam("domain") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing domain");
+                try ctx.sendError(400, "Missing domain");
                 return;
             };
             const tier = ctx.queryParam("tier") orelse "free";
             const tenant = self.service.create(name, domain, tier) catch |err| {
-                try ctx.sendErrorResponse(400, 0, @errorName(err));
+                try ctx.sendError(400, @errorName(err));
                 return;
             };
             const resp = try ctx.allocator.print(
@@ -68,7 +68,7 @@ pub fn TenantApi(comptime Service: type) type {
         fn getTenant(ctx: *http.Context, self: *State) !void {
             const id = try ctx.paramInt(i64, "id");
             const tenant = (try self.service.getById(id)) orelse {
-                try ctx.sendErrorResponse(404, 0, "Tenant not found");
+                try ctx.sendError(404, "Tenant not found");
                 return;
             };
             const resp = try ctx.allocator.print(

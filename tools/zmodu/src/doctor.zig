@@ -40,7 +40,11 @@ pub const Error = error{CliUsage};
 const Options = struct {
     dir: []const u8 = ".",
     json: bool = false,
-    max_deps: usize = 8,
+    /// Advisory threshold for "one module, how many dependencies" — the
+    /// default stays in lockstep with `ModuleGraph.Limits.max_dependencies`
+    /// (the single source the rest of the framework converged on in batch
+    /// 179); override with --max-deps.
+    max_deps: usize = (graph_mod.Limits{}).max_dependencies,
     /// Advisory threshold for "one service, how many modules ask for it".
     max_consumers: usize = 8,
     /// Entanglements the project has decided to live with, as `"from->to"`.

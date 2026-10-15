@@ -24,11 +24,11 @@ pub fn PaymentApi(comptime Service: type) type {
 
         fn tenantId(ctx: *http.Context) !i64 {
             const s = ctx.queryParam("tenant_id") orelse ctx.getAttr("tenant_id") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing tenant_id");
+                try ctx.sendError(400, "Missing tenant_id");
                 return error.InvalidInput;
             };
             return std.fmt.parseInt(i64, s, 10) catch {
-                try ctx.sendErrorResponse(400, 0, "Invalid tenant_id");
+                try ctx.sendError(400, "Invalid tenant_id");
                 return error.InvalidInput;
             };
         }
@@ -36,12 +36,12 @@ pub fn PaymentApi(comptime Service: type) type {
         fn listPayments(ctx: *http.Context, self: *State) !void {
             const tid = try tenantId(ctx);
             const oid_s = ctx.queryParam("order_id") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing order_id");
+                try ctx.sendError(400, "Missing order_id");
                 return;
             };
             const oid = try std.fmt.parseInt(i64, oid_s, 10);
             var rows_qr = self.service.listByOrder(tid, oid) catch {
-                try ctx.sendErrorResponse(500, 0, "Failed to list payments");
+                try ctx.sendError(500, "Failed to list payments");
                 return;
             };
             defer rows_qr.deinit(ctx.allocator);
@@ -64,17 +64,17 @@ pub fn PaymentApi(comptime Service: type) type {
         fn charge(ctx: *http.Context, self: *State) !void {
             const tid = try tenantId(ctx);
             const oid_s = ctx.queryParam("order_id") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing order_id");
+                try ctx.sendError(400, "Missing order_id");
                 return;
             };
             const key = ctx.queryParam("idempotency_key") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing idempotency_key");
+                try ctx.sendError(400, "Missing idempotency_key");
                 return;
             };
             const outcome = ctx.queryParam("outcome") orelse "success";
             const success = std.mem.eql(u8, outcome, "success");
             if (!success and !std.mem.eql(u8, outcome, "fail")) {
-                try ctx.sendErrorResponse(400, 0, "outcome must be success|fail");
+                try ctx.sendError(400, "outcome must be success|fail");
                 return;
             }
             const oid = try std.fmt.parseInt(i64, oid_s, 10);
@@ -90,7 +90,7 @@ pub fn PaymentApi(comptime Service: type) type {
                     error.InvalidInput => "Order not pending or bad input",
                     else => @errorName(err),
                 };
-                try ctx.sendErrorResponse(400, 0, msg);
+                try ctx.sendError(400, msg);
                 return;
             };
             const resp = try ctx.allocator.print(

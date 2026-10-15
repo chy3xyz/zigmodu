@@ -139,6 +139,20 @@ build() 注入 withService  ──▶  start() 模块 initWith 注册/读取  �
 - 同一类型多个实例用 name 区分（如 `"db_primary"` / `"db_replica"`）；
 - 编译期已知的查找可用 `getComptime(T, "name")`。
 
+### 3.4 Container 的定位边界
+
+- Container 是**应用级服务目录**：进程级单例语义——config、`db` 句柄、连接池、
+  跨模块共享的第三方 client；`freeze()` 后只读。它回答"应用里有哪些共享设施"，
+  不回答"模块 A 依赖模块 B 的哪个能力"。
+- **模块间依赖不走 Container**——走 `info.dependencies` 声明 + 构造注入
+  （`Service.init(db)`）+ 只 import 对方 `root.zig` barrel；装配处（main / 模块
+  `init`）把依赖显式传进构造函数。构造注入范式见
+  [MODULE_LAYERS.md](./MODULE_LAYERS.md) §3.1。
+- 字符串名打错没有编译期兜底，只能靠启动 fail-fast（`ctx.service(...) orelse
+  return error.MissingService`）——所以服务名集中定义为
+  `pub const svc_names = .{ ... }` 常量、与 `ctx.service` 调用点配对 review，
+  或者把 Container 窄化到单模块内部使用，不做跨模块命名约定。
+
 ---
 
 ## 4. EventBus 规则

@@ -22,11 +22,11 @@ pub fn ProductApi(comptime Service: type) type {
 
         fn tenantId(ctx: *http.Context) !i64 {
             const s = ctx.queryParam("tenant_id") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing tenant_id");
+                try ctx.sendError(400, "Missing tenant_id");
                 return error.InvalidInput;
             };
             return std.fmt.parseInt(i64, s, 10) catch {
-                try ctx.sendErrorResponse(400, 0, "Invalid tenant_id");
+                try ctx.sendError(400, "Invalid tenant_id");
                 return error.InvalidInput;
             };
         }
@@ -34,7 +34,7 @@ pub fn ProductApi(comptime Service: type) type {
         fn listProducts(ctx: *http.Context, self: *State) !void {
             const tid = try tenantId(ctx);
             var products_qr = self.service.listByTenant(tid) catch {
-                try ctx.sendErrorResponse(500, 0, "Failed to list products");
+                try ctx.sendError(500, "Failed to list products");
                 return;
             };
             defer products_qr.deinit(ctx.allocator);
@@ -57,13 +57,13 @@ pub fn ProductApi(comptime Service: type) type {
         fn createProduct(ctx: *http.Context, self: *State) !void {
             const tid = try tenantId(ctx);
             const name = ctx.queryParam("name") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing name");
+                try ctx.sendError(400, "Missing name");
                 return;
             };
             const price_str = ctx.queryParam("price_cents") orelse "0";
             const price = std.fmt.parseInt(i64, price_str, 10) catch 0;
             const p = self.service.create(tid, name, price) catch |err| {
-                try ctx.sendErrorResponse(400, 0, @errorName(err));
+                try ctx.sendError(400, @errorName(err));
                 return;
             };
             const resp = try ctx.allocator.print(

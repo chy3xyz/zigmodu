@@ -22,11 +22,11 @@ pub fn UserApi(comptime Service: type) type {
 
         fn requireTenantId(ctx: *http.Context) !i64 {
             const tenant_str = ctx.queryParam("tenant_id") orelse ctx.getAttr("tenant_id") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing tenant_id");
+                try ctx.sendError(400, "Missing tenant_id");
                 return error.InvalidInput;
             };
             return std.fmt.parseInt(i64, tenant_str, 10) catch {
-                try ctx.sendErrorResponse(400, 0, "Invalid tenant_id");
+                try ctx.sendError(400, "Invalid tenant_id");
                 return error.InvalidInput;
             };
         }
@@ -34,7 +34,7 @@ pub fn UserApi(comptime Service: type) type {
         fn listUsers(ctx: *http.Context, self: *State) !void {
             const tenant_id = try requireTenantId(ctx);
             var users_qr = self.service.listByTenant(tenant_id) catch {
-                try ctx.sendErrorResponse(500, 0, "Failed to list users");
+                try ctx.sendError(500, "Failed to list users");
                 return;
             };
             defer users_qr.deinit(ctx.allocator);
@@ -57,16 +57,16 @@ pub fn UserApi(comptime Service: type) type {
         fn createUser(ctx: *http.Context, self: *State) !void {
             const tenant_id = try requireTenantId(ctx);
             const username = ctx.queryParam("username") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing username");
+                try ctx.sendError(400, "Missing username");
                 return;
             };
             const email = ctx.queryParam("email") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing email");
+                try ctx.sendError(400, "Missing email");
                 return;
             };
             const role = ctx.queryParam("role") orelse "customer";
             const user = self.service.create(tenant_id, username, email, role) catch |err| {
-                try ctx.sendErrorResponse(400, 0, @errorName(err));
+                try ctx.sendError(400, @errorName(err));
                 return;
             };
             const resp = try ctx.allocator.print(

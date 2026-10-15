@@ -158,19 +158,21 @@ pub fn Router(comptime AppState: type) type {
 
         pub fn group(self: *Self, prefix: []const u8) Group(AppState) { ... }
 
-        /// 编译期展开 modules 元组；重复 method+path → compileError
-        pub fn mountAll(self: *Self, comptime modules: anytype) !void {
-            inline for (modules) |Mod| {
-                try self.mountModule(Mod);
+        /// `mounts` = `.{ .{ .Mod = M1, .state = &s1 }, .{ .Mod = M2, .state = &s2 } }`
+        /// （与 §6 调用点同形状；实现见 src/api/ComptimeRouter.zig）
+        pub fn mountAll(self: *Self, mounts: anytype) !void {
+            inline for (mounts) |m| {
+                try self.mount(m.Mod, m.state);
             }
         }
 
-        fn mountModule(self: *Self, comptime Mod: type) !void {
+        fn mount(self: *Self, comptime Mod: type, state: *Mod.State) !void {
             comptime {
                 if (!@hasDecl(Mod, "routes")) @compileError(@typeName(Mod) ++ " missing routes");
                 if (!@hasDecl(Mod, "module_name")) @compileError(...);
             }
             var g = self.group(scopePrefix).nestComptime(Mod.nest, Mod.module_name);
+            const state_ptr: ?*anyopaque = state;
             inline for (Mod.routes) |spec| {
                 try g.route(spec.method, spec.path, wrap(Mod.State, spec.handler), spec.meta);
             }
@@ -248,6 +250,12 @@ defer catalog.deinit();
 - **有自动化**：`inline for` + comptime 校验 + 统一 wrap  
 - **无魔法**：模块列表仍是人手维护的元组（可跳转、可 code review）
 - **State**：每个模块自带 `Mod.State`；`mount`/`mountAll` 传入对应指针（`wrap` 经 `ctx.user_data` 送达 handler）
+- **挂载清单与模块元组同源**：定义一份 comptime 模块列表
+  `const app_modules = .{ tenant, user, sub };` 同时供三处共用——
+  `ApplicationBuilder.build(app_modules)`（模块生命周期）、
+  `comptime assertNoDupes(app_modules)`（路由重复检查）、`inline for` 映射生成
+  `mountAll` 的 `.{ .Mod = m, .state = ... }` 元组（路由挂载）——模块从
+  `app_modules` 里裁掉时三处一起消失，从根上消除"裁剪模块留孤儿挂载"。
 
 Scope（admin/app/external）：推荐 **多个 `scope` + 各自 mountAll**（A）；模块级 `pub const scope` 分发（B）可后补。
 
@@ -535,6 +543,9 @@ TLS 边车与守护拓扑：[`../examples/production-deploy/`](../../examples/pr
 - **启动预检**：`zigmodu.Preflight.run(...)` 检查必填 env、占位 JWT secret、
   DB 连通、待应用迁移、时钟偏移；`!report.ok()` 就拒绝启动。
   见 [`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「上线前预检」。
+  其中 `migrationCheck` 需应用侧提供 `pending` 回调（返回待应用迁移数，可对接
+  `MigrationRunner.getPendingMigrations`；回调形态见 `src/core/Preflight.zig` 单测）——
+  zent 这类启动期自动迁移的栈没有 pending 语义，不适用。接线示例见 `examples/zmsaas`。
 - **密钥轮换**：`app_sec.module.setKeyring(&ring)` 让 token 带 `kid`，新旧密钥
   双验；否则换 secret 只能全员重登。见同文「JWT 密钥轮换」。
 

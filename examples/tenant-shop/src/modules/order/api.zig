@@ -24,11 +24,11 @@ pub fn OrderApi(comptime Service: type) type {
 
         fn tenantId(ctx: *http.Context) !i64 {
             const s = ctx.queryParam("tenant_id") orelse ctx.getAttr("tenant_id") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing tenant_id");
+                try ctx.sendError(400, "Missing tenant_id");
                 return error.InvalidInput;
             };
             return std.fmt.parseInt(i64, s, 10) catch {
-                try ctx.sendErrorResponse(400, 0, "Invalid tenant_id");
+                try ctx.sendError(400, "Invalid tenant_id");
                 return error.InvalidInput;
             };
         }
@@ -36,7 +36,7 @@ pub fn OrderApi(comptime Service: type) type {
         fn listOrders(ctx: *http.Context, self: *State) !void {
             const tid = try tenantId(ctx);
             var orders_qr = self.service.listByTenant(tid) catch {
-                try ctx.sendErrorResponse(500, 0, "Failed to list orders");
+                try ctx.sendError(500, "Failed to list orders");
                 return;
             };
             defer orders_qr.deinit(ctx.allocator);
@@ -59,7 +59,7 @@ pub fn OrderApi(comptime Service: type) type {
         fn checkout(ctx: *http.Context, self: *State) !void {
             const tid = try tenantId(ctx);
             const uid_s = ctx.queryParam("user_id") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing user_id");
+                try ctx.sendError(400, "Missing user_id");
                 return;
             };
             const uid = try std.fmt.parseInt(i64, uid_s, 10);
@@ -70,7 +70,7 @@ pub fn OrderApi(comptime Service: type) type {
                     error.InvalidInput => "Cart empty or invalid",
                     else => @errorName(err),
                 };
-                try ctx.sendErrorResponse(400, 0, msg);
+                try ctx.sendError(400, msg);
                 return;
             };
             const resp = try ctx.allocator.print(

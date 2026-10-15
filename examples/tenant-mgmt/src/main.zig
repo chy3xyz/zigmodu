@@ -3,7 +3,7 @@ const zigmodu = @import("zigmodu");
 
 // ═══════════════════════════════════════════════════
 // Multi-Tenant Management System
-// ZigModu v0.39.11 Best Practice Demo
+// ZigModu Best Practice Demo
 //
 // Architecture:
 //   HTTP → Middleware (JWT/Tenant/DataPermission) → API (Tenant/User/Subscription) → Service → Persistence → DB
@@ -57,6 +57,28 @@ pub fn main(init: std.process.Init) !void {
     });
     defer db_client.deinit();
     try db_client.connect();
+
+    // ── 启动预检：宁可拒绝启动，也不要带着缺失的依赖 / 坏时钟上线 ──
+    // 预检失败只记录 finding（不 panic），最后统一决定是否继续。
+    var env_ctx = zigmodu.Preflight.EnvCheck.fromMap(
+        init.environ_map,
+        &.{"JWT_SECRET"},
+    );
+    var secret_ctx = zigmodu.Preflight.SecretCheck{ .secret = init.environ_map.get("JWT_SECRET") orelse "" };
+    var clock_ctx = zigmodu.Preflight.ClockCheck{ .io = io };
+    var secret_probe = zigmodu.Preflight.secretCheck(&secret_ctx);
+    // 演示与 CI 以 dev-secret 启动（README 同款指令）：占位 secret 记 warn
+    // （会进启动日志）；生产部署保持默认 .fatal，占位值即拒绝启动。
+    secret_probe.severity = .warn;
+    var preflight = zigmodu.Preflight.run(allocator, &.{
+        zigmodu.Preflight.envCheck(&env_ctx),
+        secret_probe,
+        zigmodu.Preflight.clockCheck(&clock_ctx),
+    });
+    defer preflight.deinit();
+    preflight.log();
+    if (!preflight.ok()) return error.PreflightFailed;
+
     try schema.apply(&db_client);
     try zigmodu.security.CatalogPermDb.ensureSchema(&db_client);
     try zigmodu.security.CatalogPermDb.grant(&db_client, "admin", zigmodu.security.Rbac.Permissions.tenant_read);

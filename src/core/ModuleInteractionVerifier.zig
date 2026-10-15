@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const ModuleInfo = @import("Module.zig").ModuleInfo;
+const ModuleGraph = @import("ModuleGraph.zig");
 
 /// Module interaction verifier
 /// Validate modules communicate only through allowed channels, preventing architecture erosion
@@ -63,8 +64,11 @@ pub const ModuleInteractionVerifier = struct {
         allow_circular_deps: bool = false,
         /// Max dependency depth
         max_dependency_depth: usize = 5,
-        /// Max dependency count per module
-        max_dependencies_per_module: usize = 10,
+        /// Max dependency count per module. Aligned with
+        /// `ModuleGraph.Limits.max_dependencies` since v0.39.13 (the standalone
+        /// default was 10 before, so this tightens the limit to 8): the graph
+        /// engine is the single source of truth for the advisory threshold.
+        max_dependencies_per_module: usize = (ModuleGraph.Limits{}).max_dependencies,
         /// Whether to strictly require event-driven interaction (not enforced yet)
         enforce_event_driven: bool = false,
     };
@@ -359,4 +363,12 @@ test "ModuleInteractionVerifier config constraints" {
 
     try std.testing.expectEqual(@as(usize, 3), verifier.config.max_dependencies_per_module);
     try std.testing.expectEqual(@as(usize, 3), verifier.config.max_dependency_depth);
+
+    // The default comes from `ModuleGraph.Limits` (single source of truth).
+    var default_cfg = ModuleInteractionVerifier.init(allocator, .{});
+    defer default_cfg.deinit();
+    try std.testing.expectEqual(
+        (ModuleGraph.Limits{}).max_dependencies,
+        default_cfg.config.max_dependencies_per_module,
+    );
 }

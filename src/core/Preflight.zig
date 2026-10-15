@@ -249,12 +249,27 @@ pub fn migrationCheck(ctx: *MigrationCheck) Check {
     }.probe, .ctx = @ptrCast(ctx) };
 }
 
+/// Earliest plausible wall-clock year for `ClockCheck.min_year` /
+/// `clockProbe` (a container with a broken clock mints tokens that are
+/// already expired or valid forever).
+const default_min_year: i64 = 2024;
+
 pub const ClockCheck = struct {
     io: std.Io,
     /// Earliest plausible wall-clock year (a container with a broken clock
     /// mints tokens that are already expired or valid forever).
-    min_year: i64 = 2024,
+    min_year: i64 = default_min_year,
 };
+
+/// The clock judgment shared by `clockCheck` and `clockProbe`: the wall
+/// clock must be readable and not stuck years in the past. Zero allocation.
+fn probeClock(io: std.Io, min_year: i64) error{ ClockUnreadable, ClockSkewed }!void {
+    const now = Time.wallClockSeconds(io);
+    if (now <= 0) return error.ClockUnreadable;
+    // 1970-01-01 + 86400*365 days per year, cheap and dependency-free.
+    const years_since_epoch = @divFloor(now, 31_536_000);
+    if (1970 + years_since_epoch < min_year) return error.ClockSkewed;
+}
 
 pub fn clockCheck(ctx: *ClockCheck) Check {
     return .{
@@ -264,15 +279,19 @@ pub fn clockCheck(ctx: *ClockCheck) Check {
             fn probe(userdata: ?*anyopaque, allocator: std.mem.Allocator) anyerror!void {
                 _ = allocator;
                 const c: *ClockCheck = @ptrCast(@alignCast(userdata.?));
-                const now = Time.wallClockSeconds(c.io);
-                if (now <= 0) return error.ClockUnreadable;
-                // 1970-01-01 + 86400*365 days per year, cheap and dependency-free.
-                const years_since_epoch = @divFloor(now, 31_536_000);
-                if (1970 + years_since_epoch < c.min_year) return error.ClockSkewed;
+                try probeClock(c.io, c.min_year);
             }
         }.probe,
         .ctx = @ptrCast(ctx),
     };
+}
+
+/// Standalone clock probe for callers that want the verdict without building
+/// a `Report`: same judgment as `clockCheck` at its default `min_year`, zero
+/// allocation (the success path only reads the clock). Use `clockCheck` when
+/// the probe should join a preflight report instead.
+pub fn clockProbe(io: std.Io) error{ ClockUnreadable, ClockSkewed }!void {
+    return probeClock(io, default_min_year);
 }
 
 test "preflight collects findings and does not block on warnings" {
@@ -342,6 +361,19 @@ test "preflight migration and clock checks" {
     try std.testing.expectEqualStrings("migrations", report.findings.items[0].name);
     try std.testing.expectEqualStrings("PendingMigrations", report.findings.items[0].message);
     try std.testing.expectEqual(@as(usize, 1), report.passed); // clock check
+}
+
+test "clockProbe matches clockCheck's judgment without a Report" {
+    const allocator = std.testing.allocator;
+    // Success path, zero allocation: the same real threaded clock the
+    // clockCheck test above relies on.
+    try clockProbe(std.testing.io);
+
+    // The failure judgment is shared: an unreachable minimum year reads as a
+    // skewed clock through both entry points.
+    var skewed_ctx = ClockCheck{ .io = std.testing.io, .min_year = 2999 };
+    var check = clockCheck(&skewed_ctx);
+    try std.testing.expectError(error.ClockSkewed, check.run(check.ctx, allocator));
 }
 
 // `ok()` is the value the caller acts on — the example in the header of this

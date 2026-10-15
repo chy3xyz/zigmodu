@@ -13,7 +13,7 @@
 //! STRUCTURE:
 //!   §1  CLI entry, args & rule config —— usage, run, parseArgs, loadRuleConfig
 //!   §2  Architecture rules —— collectArchitecture, module graph, cycle detection
-//!   §3  Business lint —— lintFile & the b1–b25 rules, helpers, rule config
+//!   §3  Business lint —— lintFile & the b1–b26 rules, helpers, rule config
 //!   §4  Baseline —— read / write `.zmodu/audit-baseline.json`
 //!   §5  Output —— text & JSON rendering, exit codes
 //!   §6  Tests —— architecture fixtures, per-rule fixtures
@@ -45,7 +45,10 @@ pub const usage =
     \\                (use std.Io.randomSecure — seeding a PRNG from a clock or
     \\                pointer is the same defect), allocation built inline as a
     \\                fallible append/put argument (bind it to a guarded local;
-    \\                append/put last)
+    \\                append/put last), sendErrorResponse with a literal 0
+    \\                business code (0 is the {code,msg,data} success value —
+    \\                use sendError / a null code; only a real business code
+    \\                such as 4220 belongs in that slot)
     \\
     \\Options:
     \\  -j, --json              machine-readable JSON output
@@ -941,6 +944,27 @@ fn lintFile(
             }
         }
 
+        // b26 — `sendErrorResponse(<status>, 0, …)`: in the legacy
+        // `{code,msg,data}` envelope the second argument is the business
+        // `code`, and 0 is the *success* value there (`sendSuccess` writes
+        // `"code":0`) — so an error response carrying `code:0` is a
+        // self-contradicting contract, the exact anti-pattern
+        // BEST_PRACTICES.md calls an old-implementation bug (and the one
+        // that shipped in ApiKeyAuth's own deny path). Since the Server.zig
+        // ergonomics change the envelope code falls back to the HTTP status
+        // when the caller passes `null`, so `sendError(status, msg)` /
+        // `sendErrorResponse(status, null, msg)` is the correct shape; a
+        // genuine independent business code (Validation's 4220) is the only
+        // legitimate non-null second argument. Line-shaped: only a literal
+        // `0` as the second argument of a single-line call matches — null,
+        // non-zero literals and variables are the negative space and must
+        // never fire.
+        if (!config.disabled.contains("b26")) {
+            if (zeroCodeErrorResponse(trimmed)) {
+                try pushViolation(violations, allocator, "b26", rel_path, idx, "code=0 — {{code,msg,data}} 信封里 0 是成功语义（sendSuccess 就写 \"code\":0），错误响应带 code:0 是自相矛盾的契约（BEST_PRACTICES.md 点名的旧实现 bug，ApiKeyAuth 的 deny 自己就中过）。信封 code 为 ?i32、传 null 即回退 HTTP status：改用 sendError(status, msg) 或 sendErrorResponse(status, null, msg)；确需独立业务码（如 Validation 的 4220）才算正当非空实参。确属误报在同一行加 // audit: ignore b26 并注明缘由", .{});
+            }
+        }
+
         // b16 — track the current service method: count write calls, look for
         // a transaction, and flag 2+ writes without one when the method ends.
         if (std.mem.eql(u8, file_name, "service.zig") and !config.disabled.contains("b16")) {
@@ -1693,6 +1717,57 @@ fn weakPrngSeed(line: []const u8) bool {
         "Isaac64",     "Sfc64",         "RomuTrio",   "SplitMix64",
     };
     return containsAny(line, &weak);
+}
+
+/// b26 — is the second argument of a `sendErrorResponse(` call on this line
+/// the literal `0`? The parameter is `?i32`: `null` means "fall back to the
+/// HTTP status" (exactly what `sendError` writes into the envelope), so a
+/// literal 0 here is always the success-value-in-an-error-envelope bug, never
+/// a considered choice.
+///
+/// The argument list is split at top-level commas (parentheses nesting is
+/// tracked) and the segment after the first comma is compared to `0` —
+/// `null`, non-zero literals and variables are the negative space and must
+/// never match. Single-line calls only, in line with the other line-shaped
+/// rules; the exemption marker is `// audit: ignore b26` on the same line.
+fn zeroCodeErrorResponse(line: []const u8) bool {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, line, from, "sendErrorResponse(")) |at| {
+        const args_start = at + "sendErrorResponse(".len;
+        var depth: usize = 1;
+        var arg_start = args_start;
+        var arg_index: usize = 0;
+        var i = args_start;
+        var matched = false;
+        while (i < line.len) : (i += 1) {
+            const c = line[i];
+            if (c == '(') {
+                depth += 1;
+            } else if (c == ')') {
+                depth -= 1;
+                if (depth == 0) {
+                    // The closing paren ends the last argument.
+                    if (arg_index == 1) {
+                        const second = std.mem.trim(u8, line[arg_start..i], " \t");
+                        if (std.mem.eql(u8, second, "0")) matched = true;
+                    }
+                    break;
+                }
+            } else if (c == ',' and depth == 1) {
+                if (arg_index == 1) {
+                    // This comma ends the second argument.
+                    const second = std.mem.trim(u8, line[arg_start..i], " \t");
+                    if (std.mem.eql(u8, second, "0")) matched = true;
+                    break; // second argument judged; no need to scan further
+                }
+                arg_index += 1;
+                arg_start = i + 1;
+            }
+        }
+        if (matched) return true;
+        from = if (i > at) i else args_start;
+    }
+    return false;
 }
 
 /// b23 — the LHS of a binding whose initializer is a call that mentions an
@@ -2484,6 +2559,29 @@ test "audit business lint flags anti-patterns" {
     // b24 negative — a reproducible fixed seed is the sanctioned test use; the
     // marker is the口径 (audit has no test-block state).
     try lintFile(allocator, "service.zig", "test \"deterministic shuffle\" {\n    var prng = std.Random.DefaultPrng.init(42); // audit: ignore b24 reproducible test seed\n    _ = prng.random().int(u64);\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b26 — sendErrorResponse with a literal 0 business code: 0 is the
+    // {code,msg,data} success value, so an error envelope carrying it
+    // contradicts itself (the shape BEST_PRACTICES.md flags; ApiKeyAuth's
+    // deny() shipped it).
+    try lintFile(allocator, "api.zig", "fn h(ctx: *http.Context, self: *State) !void {\n    try ctx.sendErrorResponse(400, 0, \"Missing tenant_id\");\n    _ = self;\n}\n", "src/modules/x/api.zig", &cfg, &violations);
+    // b26 — a second call site with a real business code on the same file is
+    // judged on its own argument and is not swept up by the first finding.
+    try lintFile(allocator, "api.zig", "fn h(ctx: *http.Context) !void {\n    if (a) try ctx.sendErrorResponse(400, 0, \"bad\");\n    if (b) try ctx.sendErrorResponse(422, 4220, \"invalid\");\n}\n", "src/modules/x/api.zig", &cfg, &violations);
+    // b26 negative — null means "fall back to the HTTP status" (the sendError
+    // semantics) and must never fire.
+    try lintFile(allocator, "api.zig", "fn h(ctx: *http.Context) !void {\n    try ctx.sendErrorResponse(400, null, \"bad request\");\n}\n", "src/modules/x/api.zig", &cfg, &violations);
+    // b26 negative — a genuine independent business code (Validation's 4220)
+    // is the legitimate non-null second argument.
+    try lintFile(allocator, "api.zig", "fn h(ctx: *http.Context) !void {\n    try ctx.sendErrorResponse(422, 4711, \"Nope\");\n}\n", "src/modules/x/api.zig", &cfg, &violations);
+    // b26 negative — a variable second argument cannot be judged a literal 0.
+    try lintFile(allocator, "api.zig", "fn h(ctx: *http.Context, code: i32) !void {\n    try ctx.sendErrorResponse(401, code, \"unauthorized\");\n}\n", "src/modules/x/api.zig", &cfg, &violations);
+    // b26 negative — two-argument sendError has no code slot at all.
+    try lintFile(allocator, "api.zig", "fn h(ctx: *http.Context) !void {\n    try ctx.sendError(400, \"bad request\");\n}\n", "src/modules/x/api.zig", &cfg, &violations);
+    // b26 negative — prose mentioning the banned call in a leading comment is
+    // not a use.
+    try lintFile(allocator, "api.zig", "// old code did sendErrorResponse(400, 0, \"x\") here\nfn h(ctx: *http.Context) !void {\n    _ = ctx;\n}\n", "src/modules/x/api.zig", &cfg, &violations);
+    // b26 negative — the inline exemption marker suppresses the finding.
+    try lintFile(allocator, "api.zig", "fn h(ctx: *http.Context) !void {\n    try ctx.sendErrorResponse(400, 0, \"legacy demo\"); // audit: ignore b26 third-party demo contract\n}\n", "src/modules/x/api.zig", &cfg, &violations);
 
     var rules = std.StringHashMap(usize).init(allocator);
     defer rules.deinit();
@@ -2515,6 +2613,7 @@ test "audit business lint flags anti-patterns" {
     try std.testing.expectEqual(@as(usize, 3), rules.get("b22").?);
     try std.testing.expectEqual(@as(usize, 2), rules.get("b23").?);
     try std.testing.expectEqual(@as(usize, 5), rules.get("b24").?);
+    try std.testing.expectEqual(@as(usize, 2), rules.get("b26").?);
 }
 
 test "audit collectModelStructs picks up indented local const structs" {

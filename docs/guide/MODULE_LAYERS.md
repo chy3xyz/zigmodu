@@ -83,6 +83,9 @@ pub fn ProductPersistence(comptime Backend: type) type {
 };
 ```
 
+模块间依赖不走 DI Container，一律上面的构造注入（`init(db)` 显式传依赖）——
+Container 的定位边界见 [EVENTS_DI.md「Container 的定位边界」](./EVENTS_DI.md)。
+
 约定：
 
 | 方法前缀 | 语义 |

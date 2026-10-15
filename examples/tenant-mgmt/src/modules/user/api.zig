@@ -34,7 +34,7 @@ pub fn UserApi(comptime Service: type) type {
             const tenant_id = middleware.requireTenantId(ctx) catch return;
 
             var users_qr = self.service.listByTenant(tenant_id) catch {
-                try ctx.sendErrorResponse(500, 0, "Failed to list users");
+                try ctx.sendError(500, "Failed to list users");
                 return;
             };
             // `queryRowsPartial` is arena-backed: the arena came from the
@@ -60,17 +60,17 @@ pub fn UserApi(comptime Service: type) type {
         fn createUser(ctx: *http.Context, self: *State) !void {
             const tenant_id = middleware.requireTenantId(ctx) catch return;
             const username = ctx.queryParam("username") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing username");
+                try ctx.sendError(400, "Missing username");
                 return;
             };
             const email = ctx.queryParam("email") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing email");
+                try ctx.sendError(400, "Missing email");
                 return;
             };
             const role = ctx.queryParam("role") orelse "member";
 
             const user = self.service.create(tenant_id, username, email, role) catch |err| {
-                try ctx.sendErrorResponse(400, 0, @errorName(err));
+                try ctx.sendError(400, @errorName(err));
                 return;
             };
             const resp = try ctx.allocator.print(
@@ -83,18 +83,18 @@ pub fn UserApi(comptime Service: type) type {
         fn getUser(ctx: *http.Context, self: *State) !void {
             const tenant_id = middleware.requireTenantId(ctx) catch return;
             const id_str = ctx.param("id") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing user ID");
+                try ctx.sendError(400, "Missing user ID");
                 return;
             };
             const user_id = std.fmt.parseInt(i64, id_str, 10) catch {
-                try ctx.sendErrorResponse(400, 0, "Invalid user ID");
+                try ctx.sendError(400, "Invalid user ID");
                 return;
             };
             const user = self.service.getById(tenant_id, user_id) catch |err| {
-                try ctx.sendErrorResponse(404, 0, @errorName(err));
+                try ctx.sendError(404, @errorName(err));
                 return;
             } orelse {
-                try ctx.sendErrorResponse(404, 0, "User not found");
+                try ctx.sendError(404, "User not found");
                 return;
             };
             // `queryRowPartial` scans from the **client** allocator, so the row

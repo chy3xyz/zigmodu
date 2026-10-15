@@ -2,6 +2,83 @@
 
 ## [Unreleased]
 
+### 第 179 批：第二份外部评审核验落地——错误码默认值 + b26 审计 + 依赖上限收敛 + Preflight 全量示例 + 文档四连（**破坏性：窄——示例错误信封 code 0→status（反模式清扫）；ModuleInteractionVerifier 默认上限 10→8（advisory）**）
+
+Second external review (8 items, verified against this checkout before
+acting — three claims were stale or misdiagnosed, recorded below).
+
+1. **P0-1 sendErrorResponse ergonomics + a real framework bug**: the
+   `code` parameter is now `?i32 = null` (null → envelope code = status;
+   renderer path unchanged; the three-arg form stays for genuine business
+   codes like Validation's 4220). Fixed the framework's own instance of
+   the documented anti-pattern: `ApiKeyAuth.deny()` answered
+   `sendErrorResponse(status, 0, …)` where `0` means *success* in the
+   `{code,msg,data}` dialect. Swept all **113 example call sites**
+   (tenant-shop 72, tenant-mgmt 41) from `sendErrorResponse(N, 0, …)` to
+   `sendError(N, …)` — **behavior change**: those examples' error
+   envelopes now carry code=status (the fix's intent; example tests assert
+   status only). New audit rule **b26** (`sendErrorResponse(…, 0, …)`
+   literal zero → violation; numbered b26 because b25 is taken by the
+   inline-alloc rule).
+2. **P0-2 dependency-limit convergence**: defaults were scattered across
+   five places (Application.Config 8, ApplicationBuilder 8, ModuleGraph
+   8, ModuleInteractionVerifier **10**, a handwritten doctor default).
+   `ModuleGraph.Limits` is now the single source: Application Config +
+   Builder defaults reference it; **Verifier's default tightens 10 → 8**
+   (advisory only; no in-tree consumer — noted for downstreams at 8–9
+   dependencies); `zmodu doctor --max-deps` references it too.
+   Application's private duplicate `warnOverDependencyLimit` is deleted —
+   `validate()` now runs `ModuleGraph.analyzeRuntime` and logs findings
+   (advisory semantics unchanged, public signature unchanged). New
+   `Finding.Kind.severity()` maps blocking kinds to fatal / advisory to
+   warn, mirroring `Report.ok()`'s whitelist (lives in ModuleGraph itself
+   to preserve the standalone-root constraint).
+3. **P1-5 Preflight full-coverage example**: the "only 2 of 5 checks used"
+   claim was stale (zmsaas already wired 4). zmsaas — a genuine
+   MigrationRunner user — gains the first real **migrationCheck**
+   instance: `schema.pendingCount` counts pending migrations as a
+   post-apply assertion (pre-apply would suicide a fresh database; the
+   cross-instance lock inside `apply` is the rolling-deploy gate, this
+   check turns any future silent half-migration into a startup refusal).
+   tenant-mgmt gains a minimal env+secret+clock wiring (secretCheck at
+   `.warn` because CI starts it with the placeholder `dev-secret`; the
+   check still reports). New `Preflight.clockProbe(io)` — zero-allocation
+   convenience around the clock judgment; `clockCheck` delegates to it
+   (no signature changes). **Drive-by fix: a pre-existing UAF crash in
+   zmsaas** — `cron_lock` was deinitialized at the end of the `if (pooled)`
+   block while the cron thread keeps using the handle via `setLock`; file
+   DB startup segfaulted (`0xaaaaaaaa` poison pattern). The lock now
+   lives as a scheduler-lifetime `?SqlLock` with LIFO-ordered deinits.
+   Verified: file DB and `:memory:` startups both pass the 5-check
+   preflight.
+4. **P2-7 sse discoverability**: `markSseResponse` re-exported at
+   `http.markSseResponse` (was unreachable under the package manager);
+   `http.sse()` doc now cross-references `http.SseRecorder` (testing) and
+   `http.lastEventId` (resume).
+5. **Docs**: EVENTS_DI.md §3.4「Container 的定位边界」(application-level
+   service directory; inter-module deps go through info.dependencies +
+   constructor injection, NOT the Container); ROUTE_TABLE.md §4.4 mountAll
+   sketch corrected to the real `.{ .{ .Mod, .state } }` shape; §6
+   「挂载清单与模块元组同源」pattern; BEST_PRACTICES allocator-ownership
+   section now names the b23 audit rule (unit tests can't catch
+   cross-allocator frees — same-allocator test rigs hide them);
+   MODULE_LAYERS cross-link. P1-3 (comptime DI layer) and P2-6
+   (Owned-handle) recorded as v1.x candidates per the freeze; P2-8 stays
+   blocked on zent-side semantics.
+6. **Stale/misdiagnosed claims (no action or docs-only)**: P1-3 Container —
+   runtime-string naming confirmed, answer is documented positioning, not
+   a new comptime layer; P1-4 mountAll has existed long before the review
+   (docs gap closed); P2-8 banner drift lives in the downstream's own
+   main.zig (our scaffold injects the version via build_options and
+   cannot drift).
+
+Verified: ApiKeyAuth 10/10, ErrorShape 5/5, api.Server 115/115,
+ModuleGraph 8/8, Verifier 6/6, ApiFreeze 15/15, Preflight 7/7,
+tools/zmodu 148 (2 skipped); tenant-shop / tenant-mgmt / zmsaas / shopdemo
+build; zmsaas file-DB + :memory: 5-check startup smoke; tenant-mgmt
+CI-shape startup smoke; fmt / check-production / check-doc-paths green;
+full test-fast at commit time.
+
 ### 第 178 批：外部评审清单核验落地——端口共听探针 + 404 did-you-mean + 幂等死配置接线 + 文档四件套（**破坏性：窄——Idempotency 占位 API 签名一处，无仓内调用点**）
 
 An external review (downstream production evidence + v0.39.12 source

@@ -22,11 +22,11 @@ pub fn InventoryApi(comptime Service: type) type {
 
         fn tenantId(ctx: *http.Context) !i64 {
             const s = ctx.queryParam("tenant_id") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing tenant_id");
+                try ctx.sendError(400, "Missing tenant_id");
                 return error.InvalidInput;
             };
             return std.fmt.parseInt(i64, s, 10) catch {
-                try ctx.sendErrorResponse(400, 0, "Invalid tenant_id");
+                try ctx.sendError(400, "Invalid tenant_id");
                 return error.InvalidInput;
             };
         }
@@ -34,7 +34,7 @@ pub fn InventoryApi(comptime Service: type) type {
         fn listInventory(ctx: *http.Context, self: *State) !void {
             const tid = try tenantId(ctx);
             var rows_qr = self.service.listByTenant(tid) catch {
-                try ctx.sendErrorResponse(500, 0, "Failed to list inventory");
+                try ctx.sendError(500, "Failed to list inventory");
                 return;
             };
             defer rows_qr.deinit(ctx.allocator);
@@ -57,17 +57,17 @@ pub fn InventoryApi(comptime Service: type) type {
         fn setInventory(ctx: *http.Context, self: *State) !void {
             const tid = try tenantId(ctx);
             const pid_s = ctx.queryParam("product_id") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing product_id");
+                try ctx.sendError(400, "Missing product_id");
                 return;
             };
             const qty_s = ctx.queryParam("qty") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing qty");
+                try ctx.sendError(400, "Missing qty");
                 return;
             };
             const pid = try std.fmt.parseInt(i64, pid_s, 10);
             const qty = try std.fmt.parseInt(i64, qty_s, 10);
             self.service.setQty(tid, pid, qty) catch |err| {
-                try ctx.sendErrorResponse(400, 0, @errorName(err));
+                try ctx.sendError(400, @errorName(err));
                 return;
             };
             try ctx.json(200, "{\"status\":\"ok\"}");

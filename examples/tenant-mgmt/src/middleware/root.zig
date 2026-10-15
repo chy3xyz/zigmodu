@@ -18,21 +18,21 @@ pub fn tenantMiddleware() http.Middleware {
                 const jwt_tenant = ctx.tenantId();
                 if (ctx.header("X-Tenant-ID")) |raw| {
                     const header_id = std.fmt.parseInt(i64, raw, 10) catch {
-                        try ctx.sendErrorResponse(400, 0, "Invalid X-Tenant-ID");
+                        try ctx.sendError(400, "Invalid X-Tenant-ID");
                         return;
                     };
                     if (header_id <= 0) {
-                        try ctx.sendErrorResponse(400, 0, "Invalid X-Tenant-ID");
+                        try ctx.sendError(400, "Invalid X-Tenant-ID");
                         return;
                     }
                     if (jwt_tenant) |jt| {
                         const jwt_id = std.fmt.parseInt(i64, jt, 10) catch {
                             // JWT aud 非数值（门户名等）：不接受 header 覆盖
-                            try ctx.sendErrorResponse(403, 0, "X-Tenant-ID not allowed with this token");
+                            try ctx.sendError(403, "X-Tenant-ID not allowed with this token");
                             return;
                         };
                         if (jwt_id != header_id) {
-                            try ctx.sendErrorResponse(403, 0, "X-Tenant-ID conflicts with JWT tenant");
+                            try ctx.sendError(403, "X-Tenant-ID conflicts with JWT tenant");
                             return;
                         }
                     } else {
@@ -49,15 +49,15 @@ pub fn tenantMiddleware() http.Middleware {
 /// handler 用法：`const tenant_id = requireTenantId(ctx) catch return;`
 pub fn requireTenantId(ctx: *http.Context) !i64 {
     const raw = ctx.tenantId() orelse {
-        try ctx.sendErrorResponse(401, 0, "Missing tenant context (JWT aud or X-Tenant-ID)");
+        try ctx.sendError(401, "Missing tenant context (JWT aud or X-Tenant-ID)");
         return error.MissingTenantContext;
     };
     const id = std.fmt.parseInt(i64, raw, 10) catch {
-        try ctx.sendErrorResponse(400, 0, "Invalid tenant_id");
+        try ctx.sendError(400, "Invalid tenant_id");
         return error.InvalidTenantContext;
     };
     if (id <= 0) {
-        try ctx.sendErrorResponse(400, 0, "Invalid tenant_id");
+        try ctx.sendError(400, "Invalid tenant_id");
         return error.InvalidTenantContext;
     }
     return id;

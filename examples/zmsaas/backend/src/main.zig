@@ -56,6 +56,21 @@ pub fn main(init: std.process.Init) !void {
     try schema.grants(&db_client);
     std.log.info("[zmsaas] sqlite ready at {s}", .{sqlite_path});
 
+    // ── 第 5 查 migrations：服务只应在 schema 完整迁移后启动 ──────────
+    // 滚动发布语义 = 两层闸门：apply 内的跨实例 DistributedLock（另一副本
+    // 正在迁移时本副本 MigrationLocked 退出）+ 本查（迁移未完成即拒绝服务）。
+    // zmsaas 在进程内于启动时应用迁移，所以本查必须排在 apply 之后——排在
+    // 之前会让全新库首启被自己的 4 条 pending 误杀。apply 成功返回后
+    // pending 必为 0，此处是后置断言：把未来任何「静默半迁移」变成拒绝
+    // 启动，而不是带着残缺 schema 服务。
+    var migration_ctx = zigmodu.Preflight.MigrationCheck{ .pending = schema.pendingCount, .ctx = &db_client };
+    var postflight = zigmodu.Preflight.run(allocator, &.{
+        zigmodu.Preflight.migrationCheck(&migration_ctx),
+    });
+    defer postflight.deinit();
+    postflight.log();
+    if (!postflight.ok()) return error.PreflightFailed;
+
     const port: u16 = blk: {
         if (init.environ_map.get("ZFSAAS_PORT")) |p| {
             break :blk std.fmt.parseInt(u16, p, 10) catch 18080;
@@ -210,19 +225,23 @@ pub fn main(init: std.process.Init) !void {
 
     // ── Outbox cron 投递（文件 DB + 池化 client）──────────────
     var outbox_scheduler: ?zigmodu.cron.Scheduler = null;
+    // cron_lock 必须与 scheduler 同生命周期：setLock 存的是指向本变量的
+    // 句柄，scheduler 的 cron 线程每个 tick 都会用它；在 if 块里 deinit
+    // 等于让 cron 线程拿悬空的 allocator（文件 DB 启动即崩，实测）。
+    var cron_lock: ?zigmodu.DistributedLock.SqlLock(@TypeOf(db_client)) = null;
+    defer if (cron_lock) |*l| l.deinit();
     if (pooled) {
         var sched = zigmodu.cron.Scheduler.init(allocator, io);
         // One replica drains the outbox per minute: without the lock every
         // replica would deliver the same batch (duplicate side effects).
-        var cron_lock = try zigmodu.DistributedLock.SqlLock(@TypeOf(db_client)).init(
+        cron_lock = try zigmodu.DistributedLock.SqlLock(@TypeOf(db_client)).init(
             allocator,
             io,
             &db_client,
             "zigmodu_cron_lock",
             .sqlite,
         );
-        defer cron_lock.deinit();
-        sched.setLock(cron_lock.lock(), 120_000);
+        sched.setLock(cron_lock.?.lock(), 120_000);
         const expr = try zigmodu.cron.Expression.parse("* * * * *");
         const OutboxCtx = struct { allocator: std.mem.Allocator, client: *zigmodu.data.Client };
         const outbox_ctx = try allocator.create(OutboxCtx);
