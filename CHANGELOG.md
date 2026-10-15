@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+### 第 181 批：zent v0.92.0 → v0.94.0 适配——两示例 pin + 文档口径（**破坏性：否**）
+
+Routine zent pin advance, v0.92.0 → **v0.94.0** (`#5f6e2b5`). zent
+0.93–0.94 is additive for every callsite in this repo — no signature or
+behaviour changes touch our usage (`migrateSchema` keeps its signature;
+`getOwned`/`ownedCopy` unchanged in behaviour; the only error-set addition,
+`MissingPostgresExtension`, lands in `CreateTablesError` and matters only to
+exhaustive `switch`es, of which this repo has none over that set).
+
+1. **Both zent-consuming examples re-pinned** in `build.zig.zon` →
+   `v0.94.0#5f6e2b5…` (hash via `zig fetch` on the peeled commit — the
+   annotated-tag object itself answers `NotACommit`, same trap as previous
+   rounds). Per the documented cache trap, each example's
+   `zig-pkg/zent-0.92.0-*` and `.zig-cache` were deleted before rebuilding:
+   `zent-modulith` clean rebuild + **smoke 44/0, no leaks**;
+   `metaverse-creative` `zig build demo` → `demo_ok` (balanced books,
+   outbox published).
+2. **Docs**: ZENT.md 版本口径 + new §14 first row (v0.93 public wall clock
+   `zent.walltime` / `Row.textDup|blobDup` borrowed-row lifetime contract /
+   `sql_dialect_expr` / prepared-cache counters; v0.94 public `ownedCopy` /
+   caller-owned `migrateSchemaInTx` / pre-flight PG extension check /
+   unhonourable column-type warns), §14 heading chain, pin reference, sample
+   tarball URL; AGENTS.md learned facts; `examples/README.md`;
+   `zent-modulith/README.md` (span now v0.21–v0.94). New capabilities noted
+   for consumers but **not adopted** in examples — 1.0-alpha feature freeze
+   (documented recipes only).
+
 ### 第 180 批：zalpha 实战反馈核验落地——SSE 流内存契约 + 模块状态卫生 + 反例三连修 + 文档稳定性四件套（**破坏性：否**）
 
 Third feedback round, this time from three real zalpha development cycles

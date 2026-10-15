@@ -1,6 +1,6 @@
 # zent-modulith — ZigModu + zent
 
-Demonstrates **ZigModu** (Application / HTTP / **ComptimeRouter**) with **[zent](https://github.com/chy3xyz/zent)** v0.92.0 as the schema-as-code data layer (demos span v0.21–v0.92 capabilities).
+Demonstrates **ZigModu** (Application / HTTP / **ComptimeRouter**) with **[zent](https://github.com/chy3xyz/zent)** v0.94.0 as the schema-as-code data layer (demos span v0.21–v0.94 capabilities).
 
 See framework guides: [`docs/reference/ZENT.md`](../../docs/reference/ZENT.md) · [`docs/reference/ROUTE_TABLE.md`](../../docs/reference/ROUTE_TABLE.md).
 
@@ -9,7 +9,7 @@ See framework guides: [`docs/reference/ZENT.md`](../../docs/reference/ZENT.md) �
 
 - Zig ≥ 0.17
 - No sibling checkout needed: `build.zig.zon` pins the released tag
-  `v0.92.0` via `git+https` (fetched by the build). For local development
+  `v0.94.0` via `git+https` (fetched by the build). For local development
   against a sibling checkout, replace it with
   `.zent = .{ .path = "../../../zent" }`.
 
