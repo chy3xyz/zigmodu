@@ -6,8 +6,8 @@
 
 | 平面 | 你会拿到什么 | 从哪读起 |
 |------|--------------|----------|
-| **应用平面**（默认就在用） | 模块 + 编译期依赖校验、生命周期、DI、HTTP/1.1 + h2c + WebSocket + gRPC、SQLx / ORM / 迁移、缓存 + Redis、事件 + 事务性 outbox、JWT / RBAC / 多租户、弹性、指标与追踪 | [快速开始](docs/QUICK-START.md) · [Modulith](docs/MODULITH.md) |
-| **执行平面**（`app.runtime()` opt-in） | 独占状态的 worker、有界 mailbox、锁自由队列、L0 扇出、毫秒**与**微秒定时器、监督、从段文件回放投递日志 | [Runtime](docs/RUNTIME.md) |
+| **应用平面**（默认就在用） | 模块 + 编译期依赖校验、生命周期、DI、HTTP/1.1 + h2c + WebSocket + gRPC、SQLx / ORM / 迁移、缓存 + Redis、事件 + 事务性 outbox、JWT / RBAC / 多租户、弹性、指标与追踪 | [快速开始](docs/guide/QUICK-START.md) · [Modulith](docs/guide/MODULITH.md) |
+| **执行平面**（`app.runtime()` opt-in） | 独占状态的 worker、有界 mailbox、锁自由队列、L0 扇出、毫秒**与**微秒定时器、监督、从段文件回放投递日志 | [Runtime](docs/reference/RUNTIME.md) |
 
 不调 `app.runtime()` 的应用**不会多起一条线程**，应用平面自己站得住。执行平面用于"一请求一 fiber"
 不再是对的形状的场合：行情与订单簿、实时网关、AI agent 循环、IoT 状态机。它不是任何东西的移植：
@@ -29,19 +29,19 @@ comptime 轨道类型、手写队列、热路径上的分配是被**测试钉住
 | 指南 | 描述 |
 |------|------|
 | [**AGENTS.md**](AGENTS.md) | **AI 操作手册**（DO/DON'T、Path A 鉴权、ComptimeRouter） |
-| [快速开始](docs/QUICK-START.md) | 5分钟入门 |
-| [**Runtime**](docs/RUNTIME.md) | **执行平面**：worker、mailbox、调度器、定时器、监督、回放 |
-| [Modulith 高并发](docs/MODULITH.md) | 项目第一天：模块边界 + 高并发实践 |
-| [最佳实践](docs/BEST_PRACTICES.md) | **两条平面**：架构演进、JWT / 多端身份清单、执行平面何时该上 |
-| [事件与 DI](docs/EVENTS_DI.md) | `initWith(ctx)` + `app.eventBus` + 容器 freeze 最佳实践 |
-| [声明式路由](docs/ROUTE_TABLE.md) | ComptimeRouter + catalog JWT/RBAC |
-| [ZigModu × zent](docs/ZENT.md) | **电商/社交主推组合**：zent ORM 正交接入与最佳实践 |
-| [SQLx 驱动链接](docs/SQLX_DRIVERS.md) | `-Ddb=` / `.db=` 选择性链接 |
-| [分布式](docs/DISTRIBUTED.md) | 多实例、集群栈、fail-closed 启动 |
-| [Agent 运行时](docs/AGENT_RUNTIME.md) | **Agent 默认不能直接交易**：`Guard` 两条轴 fail-closed（`execute` 二次开关 + `allow` 默认空） |
-| [API参考](docs/API.md) | 完整API文档 |
-| [架构设计](docs/ARCHITECTURE.md) | 系统设计与模式 |
-| [升级注意](docs/UPGRADING.md) | 逐版本：行为变化与一行改法 |
+| [快速开始](docs/guide/QUICK-START.md) | 5分钟入门 |
+| [**Runtime**](docs/reference/RUNTIME.md) | **执行平面**：worker、mailbox、调度器、定时器、监督、回放 |
+| [Modulith 高并发](docs/guide/MODULITH.md) | 项目第一天：模块边界 + 高并发实践 |
+| [最佳实践](docs/guide/BEST_PRACTICES.md) | **两条平面**：架构演进、JWT / 多端身份清单、执行平面何时该上 |
+| [事件与 DI](docs/guide/EVENTS_DI.md) | `initWith(ctx)` + `app.eventBus` + 容器 freeze 最佳实践 |
+| [声明式路由](docs/reference/ROUTE_TABLE.md) | ComptimeRouter + catalog JWT/RBAC |
+| [ZigModu × zent](docs/reference/ZENT.md) | **电商/社交主推组合**：zent ORM 正交接入与最佳实践 |
+| [SQLx 驱动链接](docs/guide/SQLX_DRIVERS.md) | `-Ddb=` / `.db=` 选择性链接 |
+| [分布式](docs/reference/DISTRIBUTED.md) | 多实例、集群栈、fail-closed 启动 |
+| [Agent 运行时](docs/reference/AGENT_RUNTIME.md) | **Agent 默认不能直接交易**：`Guard` 两条轴 fail-closed（`execute` 二次开关 + `allow` 默认空） |
+| [API参考](docs/reference/API.md) | 完整API文档 |
+| [架构设计](docs/reference/ARCHITECTURE.md) | 系统设计与模式 |
+| [升级注意](docs/reference/UPGRADING.md) | 逐版本：行为变化与一行改法 |
 | [状态与就绪度](docs/dev/v1.0-readiness-v0.35.md) | **哪些证明过、哪些没有** —— 逐条 + 证据 + 日期 |
 | [示例项目](examples/) | 可运行的示例 |
 
@@ -104,11 +104,11 @@ comptime 轨道类型、手写队列、热路径上的分配是被**测试钉住
   [报告一个与实现不符的文档数字](.github/ISSUE_TEMPLATE/docs_drift.yml)。
 
 - **集群升级是硬切**：Raft 帧格式与总线握手都变过，新旧二进制**两个方向都听不懂**（刻意如此，不留"降级到不认证"的路）。混合版本互联仍不支持，但拒绝行为已门禁化：`scripts/ci-mixed-version.sh`（夜间 CI）拿 v0.32.0 节点对跑当前树，断言新侧拒掉旧节点的裸帧且保住可用 quorum。
-- **线上不加密**：集群帧是明文 + 逐帧 HMAC-SHA256（认证/完整性，**不是机密性**）；集群端口只放受信二层（VPC/专线/localhost），跨域走边车/网格终结 mTLS —— 定界见 [docs/DISTRIBUTED.md](docs/DISTRIBUTED.md)「传输加密边界（A-2 定界）」，拓扑参考 [examples/production-deploy](examples/production-deploy/)；PSK 认证 helpers 在 `src/core/cluster/ClusterAuth.zig`。
+- **线上不加密**：集群帧是明文 + 逐帧 HMAC-SHA256（认证/完整性，**不是机密性**）；集群端口只放受信二层（VPC/专线/localhost），跨域走边车/网格终结 mTLS —— 定界见 [docs/reference/DISTRIBUTED.md](docs/reference/DISTRIBUTED.md)「传输加密边界（A-2 定界）」，拓扑参考 [examples/production-deploy](examples/production-deploy/)；PSK 认证 helpers 在 `src/core/cluster/ClusterAuth.zig`。
 - **集群身份是可选配置，不是默认**：配上 `own_key`/`peer_keys` 后，只有持有节点 X 的 key 才能以 X 的身份出现 —— 总线靠挑战-应答握手绑定，Raft 端口靠每帧自述 id 落在 MAC 覆盖内 —— 且两面都支持运行时轮换（双 key 窗口）与撤销。只配 `cluster_secret` 则逐字节保持旧行为：帧有认证，但任何持 PSK 者都能自称任何节点。
 - **`ws_uring` 只在 Linux 生效**（io_uring）；其它平台走可移植路径。
 - **⚠️ 标的是 experimental 模块**：Saga、SecurityScanner、DistributedEventBus、ClusterMembership、2PC、Plugin、WebMonitor、HotReloader。有测试，但在这里没有生产记录。
-- **AI 是可选的领域，不是核心**：`src/ai` 只占一小部分，HTTP / 数据 / 安全 / 可观测核心不依赖它；Agent 默认不能动作（[AGENT_RUNTIME.md](docs/AGENT_RUNTIME.md)）。
+- **AI 是可选的领域，不是核心**：`src/ai` 只占一小部分，HTTP / 数据 / 安全 / 可观测核心不依赖它；Agent 默认不能动作（[AGENT_RUNTIME.md](docs/reference/AGENT_RUNTIME.md)）。
 - **自评**：这里每一个"已完成"都出自同一批维护者与其 AI agent，**没有独立审计**。逐条带日期的版本在 [docs/dev/v1.0-readiness-v0.35.md](docs/dev/v1.0-readiness-v0.35.md)。
 
 ## 🔬 如何验证
@@ -166,8 +166,8 @@ const zigmodu_dep = b.dependency("zigmodu", .{
 const db_opt = b.option([]const u8, "db", "SQL drivers to link: all|sqlite|postgres|mysql (comma-list)") orelse "sqlite";
 ```
 
-详见 [docs/SQLX_DRIVERS.md](docs/SQLX_DRIVERS.md)；完整的 `build.zig`（含 `run` / `test` step）见
-[docs/QUICK-START.md](docs/QUICK-START.md) 第 3 步。
+详见 [docs/guide/SQLX_DRIVERS.md](docs/guide/SQLX_DRIVERS.md)；完整的 `build.zig`（含 `run` / `test` step）见
+[docs/guide/QUICK-START.md](docs/guide/QUICK-START.md) 第 3 步。
 
 ### 前置要求
 
@@ -257,7 +257,7 @@ const bus = try app.eventBus(OrderEvent);                // 仅 ThreadSafeEventB
 try bus.subscribe(auditListener);
 ```
 
-完整规则与反模式：[docs/EVENTS_DI.md](docs/EVENTS_DI.md) · 可运行接线：`examples/shopdemo`。
+完整规则与反模式：[docs/guide/EVENTS_DI.md](docs/guide/EVENTS_DI.md) · 可运行接线：`examples/shopdemo`。
 
 ### 构建与运行
 
@@ -327,16 +327,16 @@ ZigModu 沿**两条正交的轴**成长 —— 可以在一条上走而不动另
 
 | 轴 | 阶段 | 你加什么 | 读哪份 |
 |----|------|----------|--------|
-| **应用** | 一个进程 | 模块 + 编译期依赖规则、DI、HTTP、数据 | [BEST_PRACTICES.md](docs/BEST_PRACTICES.md) |
+| **应用** | 一个进程 | 模块 + 编译期依赖规则、DI、HTTP、数据 | [BEST_PRACTICES.md](docs/guide/BEST_PRACTICES.md) |
 | | 多实例 | 限流、熔断、分布式锁、缓存 / Redis、outbox | 同上 |
-| | 集群 | `DistributedEventBus` + Raft（`ClusterBootstrap`）、Kafka、分片 | [DISTRIBUTED.md](docs/DISTRIBUTED.md) —— 注意硬切升级边界 |
-| **执行** | 请求 → 响应 | 什么都不用做：fiber + 连接池就是为这个形状准备的 | [MODULITH.md](docs/MODULITH.md) |
-| | 跨请求的状态 | 持有状态的 worker（`app.runtime()`） | [RUNTIME.md](docs/RUNTIME.md) |
+| | 集群 | `DistributedEventBus` + Raft（`ClusterBootstrap`）、Kafka、分片 | [DISTRIBUTED.md](docs/reference/DISTRIBUTED.md) —— 注意硬切升级边界 |
+| **执行** | 请求 → 响应 | 什么都不用做：fiber + 连接池就是为这个形状准备的 | [MODULITH.md](docs/guide/MODULITH.md) |
+| | 跨请求的状态 | 持有状态的 worker（`app.runtime()`） | [RUNTIME.md](docs/reference/RUNTIME.md) |
 | | 同类 worker 很多 | `.mode = .pooled`：N 个 worker 跑在 N 条池线程上，状态仍独占 | 同上 |
 | | 延迟敏感 | `.dedicated` worker、µs 级 `PrecisionTimer`、回放做回测 | [alpha-engine](examples/alpha-engine) |
 | | 等进程外的东西 | `.execution_class = .blocking`（否则会吃掉 CPU 池的线程） | 同上 |
 
-应用平面的详细演进指南见[最佳实践](docs/BEST_PRACTICES.md)。
+应用平面的详细演进指南见[最佳实践](docs/guide/BEST_PRACTICES.md)。
 
 ## 🛠️ 命令
 

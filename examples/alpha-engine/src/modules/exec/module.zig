@@ -57,5 +57,8 @@ pub const Module = struct {
         inbox = null;
         reporter = null;
         desk = null;
+        // Same-process rebuilds must not inherit the previous phase's flags.
+        drained.reset();
+        authorized_done.reset();
     }
 };

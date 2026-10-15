@@ -39,6 +39,8 @@ pub fn Module(comptime Exec: type) type {
 
         pub fn deinit() void {
             inbox = null;
+            // Same-process rebuilds must not inherit the previous phase's flag.
+            drained.reset();
         }
     };
 }

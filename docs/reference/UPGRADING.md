@@ -176,6 +176,36 @@ bash scripts/check-production.sh        # 分层门禁（含热路径裸 catch�
 zmodu ci                                # 业务项目：build + fmt + verify + audit + deadcode
 ```
 
+## Zig 0.17 工具链迁移 checklist（消费方自己的 app 代码）
+
+升级 Zig 0.17 后**你的应用代码**会撞的编译错误与改法。框架自身三波迁移（批 141 SafeAllocator/@divCeil、
+批 146 allocPrint→print 309 处、批 148 builtin.os.tag 等 48 处）已全部落地，下面是给消费方的同款清单——
+按编译错误原文检索，逐条对照改：
+
+| 编译错误原文（关键词） | 改法 | 备注 |
+|---|---|---|
+| `no member named 'allocPrint'` / `'allocPrintSentinel'` | `std.fmt.allocPrint` → **`Allocator.print`**（返回值改 `!void`，缓冲区自行管理）；或 `std.Io.Writer.fixed` + `print` | 批 146；`runtime_safety` 参数也没了 |
+| `no member named 'intFromEnum'`（deprecated 警告） | `@intFromEnum` → **`@backingInt`**；`@enumFromInt` → **`@fromBackingInt`** | `zig fmt` 可自动改大部分；`@fromBackingInt` 要求精确底层类型，fmt 会补 `@intCast` |
+| `no member named 'builtin' in 'std'` | `std.builtin.Type.Struct.FieldAttributes` → **`std.lang.Type.Struct.FieldAttributes`**（纯改名，类型相同） | 批 148 |
+| `no member named 'os'/'cpu'/'abi'/'object_format'`（`@import("builtin")` 顶层） | → **`builtin.target.os` / `target.cpu` / `target.abi` / `target.ofmt`**（注意 ofmt 不叫 object_format） | 0.18.0 将移除旧名，现在迁 |
+| `no member named 'DebugAllocator'` | → **`std.heap.DebugAllocator`（SafeAllocator）** 语义相同，改名 + 泄漏检测更严 | 批 141 |
+| `hasDecl`（函数形式） | → **`@hasDecl`**（comptime 内建） | 0.17 移除函数形态 |
+| `trimRight` / `trimLeft` | → **`trimEnd` / `trimStart`** | 纯改名 |
+
+**0.17 移除级**（不是弃用警告、直接编译错）：
+
+| 被移除 | 替代 |
+|---|---|
+| `std.Thread.sleep` / `std.Thread.Mutex` / `std.Thread.WaitGroup` | busy-loop 或 `std.Io.sleep` / **`std.Io.Mutex`**（`lock(io)`/`unlock(io)` 都要 io 参） / `std.Io.Group` |
+| `std.time.timestamp` / `milliTimestamp` / `microTimestamp` / `nanoTimestamp` | 时长用 **`Time.monotonicNowSeconds/Milliseconds`**（`zigmodu` 导出）；入库墙钟用 **`Time.wallClockSeconds/io` / `wallClockMilliseconds/io`**（墙钟可回拨，差值非时长） |
+| `std.os.getpid` | `@intFromPtr(&seed)` 取熵 |
+| `std.fs.cwd()` / `std.fs.File` | **`std.Io.Dir.cwd(io)` / `std.Io.File`**（全部 API 要 io 参）；`file.writeAll` → `writeStreamingAll(io, data)` |
+| `ArrayList(T).init(alloc)` | `ArrayList(T).empty` + 每个方法传 allocator |
+| `file.reader()` / `buf.writer(allocator)` | `allocPrint`+`appendSlice` 模式 / `std.Io.Writer` 形态 |
+
+> 框架内部的完整 removed 表（含 POSIX 信号、`crc.Crc32Iscsi` 等冷门项）见 [`AGENTS.md`](../../AGENTS.md)
+> 「Zig 0.17.0 — what's REMOVED」表——那张表面向框架贡献者，这张表面向消费方应用代码。
+
 ---
 
 ## v0.39.11

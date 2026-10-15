@@ -44,6 +44,8 @@ pub fn Module(comptime Alpha: type, comptime Audit: type, comptime Propose: type
 
         pub fn deinit() void {
             inbox = null;
+            // Same-process rebuilds must not inherit the previous phase's flag.
+            snapshot_taken.reset();
         }
     };
 }

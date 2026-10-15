@@ -2,6 +2,76 @@
 
 ## [Unreleased]
 
+### 第 180 批：zalpha 实战反馈核验落地——SSE 流内存契约 + 模块状态卫生 + 反例三连修 + 文档稳定性四件套（**破坏性：否**）
+
+Third feedback round, this time from three real zalpha development cycles
+(V1 loop / multi-asset / Alpha OS dual family). Nine items verified against
+this checkout before acting — #7 was mostly invalid as literally claimed,
+#1/#3/#4/#5 partially stale; the verifiable residue is below.
+
+1. **#2 SSE stream memory model (CONFIRMED, with an in-repo counter-example)**:
+   the connection loop resets the request arena only *between* requests;
+   a long-lived streaming handler allocating per frame from `ctx.allocator`
+   grows unbounded (arena `free` is a no-op in 0.17, and a streaming
+   response sets `responded` immediately, so even the request-timeout
+   backstop skips it). Fixed the framework's own instance:
+   `stream_sse.zig` no longer `valueAlloc`s every LLM token into the
+   request arena — each delta now serializes into a fixed 4 KiB stack
+   buffer with truncation-to-valid-JSON on overflow (one truncation
+   warning per stream). `SseWriter` itself was already bounded (per-event
+   stack buffer, zero allocation) — the docs now say so explicitly.
+   Contract documented (streaming frames must not accumulate on
+   `ctx.allocator`; per-iteration scratch / stream budget = 1.x candidate).
+2. **#1 module state hygiene (partial — mechanism existed, examples leaked)**:
+   added「模块状态与多相位卫生」to MODULE_LAYERS.md (state structs owned
+   by init/deinit, handles via the per-Application `ctx.services`
+   Container or route `State`; file-level `pub var` only for stateless
+   handles and must be fully reset in deinit). Fixed the live leaks this
+   verified in-repo: alpha-engine's `exec`/`risk`/`book`/`propose`/`audit`
+   modules now reset Latches / counters / pointers in `deinit`
+   (cross-phase residue was real). Per-Application state slots = 1.x.
+3. **#5 HotBus freeze (partial — API was already fail-loud; the flagship
+   example swallowed it)**: `runtime-workers` no longer `catch {}`es the
+   publish (typed `NotFrozen` now logged); two other bare `catch {}` in the
+   same file made loud. RUNTIME.md §3c documents the fail-loud contract.
+   Bus registry + start-time frozen diagnostics = 1.x.
+4. **#3 replay selection guide (partial — infra was more complete than
+   claimed)**: delivery_log already has a public on-disk format, a
+   `replay-inspect` CLI, and `ReplayFromLog` cross-process replay; RUNTIME.md
+   §13.1's two-row table is now a five-row selection table (+ det mode /
+   Testkit / L1 EventBus-outbox) with an explicit「not on this table」
+   paragraph: canonical business-event recording for external consumers is
+   out of delivery_log's scope (per-type private codec) — build at the
+   adapter boundary or use outbox.
+5. **#4 mailbox capacity dual profiles (documented pattern, API unchanged)**:
+   RUNTIME.md §3 records the `BookModule(comptime capacity)` organization —
+   the worker body stays capacity-free, comptime capacity passes through
+   only three points (Module fn / spawn callsite / `Handle(W, capacity)`),
+   two profiles = two comptime instantiations of one module type.
+6. **#7 Supervision vs Intensity (mostly invalid as claimed — anonymous
+   literals coerce fine; the real pitfall is field-name confusion)**:
+   cross-referencing doc comments on `Supervision.max_errors` ↔
+   `Intensity.max_restarts` plus a RUNTIME.md §3b row.
+7. **#8 docs-tree stability**: root `UPGRADING.md` forever-pointer created
+   (position never moves; only its single link changes on reorganizations).
+   README.zh.md's 13 stale links + docs/dev/README.md's 10 stale links
+   fixed; `check-doc-paths.sh` now scans README.zh.md too (the blind spot
+   that let 16 stale links accumulate).
+8. **#9 Zig 0.17 consumer migration checklist**: UPGRADING.md gains a
+  「Zig 0.17 工具链迁移 checklist（消费方自己的 app 代码）」section —
+   symptom/fix table for all three deprecation waves (allocPrint→print,
+   @intFromEnum→@backingInt, std.builtin→std.lang) plus the removal-level
+   list, cross-linked to AGENTS.md's contributor-facing removed table.
+9. **Deferred per the freeze (recorded as 1.x candidates)**: #1 per-app
+   state slots, #2 per-iteration scratch / stream budget, #3 canonical
+   event recording as a first-class capability, #5 bus registry, #6
+   ModuleScanner-generated handle accessors.
+
+Verified: stream_sse 3/3 (incl. truncation), Supervision 7/7, ai-ops 3/3,
+runtime-workers `zig build run` end-to-end, alpha-engine build, Preflight
+and ApiFreeze untouched-but-green, fmt / check-production /
+check-doc-paths (524/530) green; full test-fast at commit time.
+
 ### 第 179 批：第二份外部评审核验落地——错误码默认值 + b26 审计 + 依赖上限收敛 + Preflight 全量示例 + 文档四连（**破坏性：窄——示例错误信封 code 0→status（反模式清扫）；ModuleInteractionVerifier 默认上限 10→8（advisory）**）
 
 Second external review (8 items, verified against this checkout before

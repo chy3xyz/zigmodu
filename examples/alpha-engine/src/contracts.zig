@@ -122,6 +122,12 @@ pub const Latch = struct {
         self.armed.store(true, .release);
     }
 
+    /// Back to the initial state. `deinit` calls this so a same-process
+    /// rebuild of the Application does not inherit the previous phase's flag.
+    pub fn reset(self: *Latch) void {
+        self.armed.store(false, .release);
+    }
+
     pub fn isArmed(self: *const Latch) bool {
         return self.armed.load(.acquire);
     }

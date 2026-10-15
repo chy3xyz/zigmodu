@@ -29,14 +29,14 @@ grep -rn 'docs/dev/' --include='*.zig' --include='*.sh' --include='*.md' . | gre
 
 | 文件 | 首次入库 | 什么 | 引用者 |
 |------|----------|------|--------|
-| `cluster-identity-design.md` | 09-21 | 总线节点身份绑定 —— **已实现**；密钥轮换/撤销（A-3）**已实现**（第 110 批） | `src/core/DistributedEventBus.zig`、`docs/DISTRIBUTED.md` |
-| `cluster-auth-design.md` | 09-20 | 集群入站认证 —— **L1/L2 已实现**；Raft 侧身份绑定（A-1）**已实现**（第 109 批）；密钥轮换/撤销（A-3）**已实现**（第 110 批）；传输加密（A-2）**已定界**（第 111 批：明文+HMAC 是显式决策，框架不内嵌 TLS，机密性交部署拓扑） | `src/core/cluster/{RaftElection,RaftTransport,ClusterAuth,ClusterBootstrap,DistributedIntegrationTest}.zig`、`src/core/DistributedEventBus.zig`、`docs/DISTRIBUTED.md`、`docs/UPGRADING.md` |
+| `cluster-identity-design.md` | 09-21 | 总线节点身份绑定 —— **已实现**；密钥轮换/撤销（A-3）**已实现**（第 110 批） | `src/core/DistributedEventBus.zig`、`docs/reference/DISTRIBUTED.md` |
+| `cluster-auth-design.md` | 09-20 | 集群入站认证 —— **L1/L2 已实现**；Raft 侧身份绑定（A-1）**已实现**（第 109 批）；密钥轮换/撤销（A-3）**已实现**（第 110 批）；传输加密（A-2）**已定界**（第 111 批：明文+HMAC 是显式决策，框架不内嵌 TLS，机密性交部署拓扑） | `src/core/cluster/{RaftElection,RaftTransport,ClusterAuth,ClusterBootstrap,DistributedIntegrationTest}.zig`、`src/core/DistributedEventBus.zig`、`docs/reference/DISTRIBUTED.md`、`docs/reference/UPGRADING.md` |
 | `alpha-engine-spec.md` | 09-17 | alpha-engine 规格（todo3 §十六 的参考实现） | `examples/alpha-engine/**`（7 处）、`CHANGELOG.md` |
-| `READING_NUMBERS.md` | 09-20 | 读数约定：一个事实一个名字 | `scripts/test-fast.sh`、`scripts/check-bench.sh`、`docs/UPGRADING.md`、`CHANGELOG.md` |
-| `todo3.md` | 09-17 | 运行时**方向** | `docs/RUNTIME.md`（:5 与 :531） |
-| `todo3.1.md` | 09-17 | 运行时**兼容策略** | `docs/RUNTIME.md`、`CHANGELOG.md` |
+| `READING_NUMBERS.md` | 09-20 | 读数约定：一个事实一个名字 | `scripts/test-fast.sh`、`scripts/check-bench.sh`、`docs/reference/UPGRADING.md`、`CHANGELOG.md` |
+| `todo3.md` | 09-17 | 运行时**方向** | `docs/reference/RUNTIME.md`（:5 与 :531） |
+| `todo3.1.md` | 09-17 | 运行时**兼容策略** | `docs/reference/RUNTIME.md`、`CHANGELOG.md` |
 | `todo.md` | 04-23 | 第一代产品级评估（当 todo 用） | `src/extensions/HotReloader.zig` |
-| `upgrade-roadmap.md` | 05-12 | v0.9 → v1.0 路线 | `docs/BEST_PRACTICES.md`、`CHANGELOG.md` |
+| `upgrade-roadmap.md` | 05-12 | v0.9 → v1.0 路线 | `docs/guide/BEST_PRACTICES.md`、`CHANGELOG.md` |
 | `v1.0-readiness-v0.35.md` | 09-26 | **v0.35 → v1.0 差距评估（现行）** | `CHANGELOG.md` |
 | `v1.0-readiness-v0.32.md` | 09-21 | v0.32 → v1.0 差距评估（已被上一份取代） | `src/soak_cluster.zig`、`CHANGELOG.md` |
 | `v1.0-gap.md` | 09-20 | v0.31 → v1.0 差距评估（已被取代两代） | `CHANGELOG.md` |
@@ -73,7 +73,7 @@ grep -rn 'docs/dev/' --include='*.zig' --include='*.sh' --include='*.md' . | gre
    `gap-to-92.md`（已归档）属第 2 轮的评分口径，不与这三份同轴。
 
 **todo 四代**：`todo.md`(04-23) → `todo2.md`(04-23，已归档) → `todo3.md`(09-17) →
-`todo3.1.md`(09-17)。后两份被 `docs/RUNTIME.md` 引用、`todo.md` 被
+`todo3.1.md`(09-17)。后两份被 `docs/reference/RUNTIME.md` 引用、`todo.md` 被
 `HotReloader.zig` 引用 —— 这三份都留在原地。
 
 **安全审计三份并列**（同日 09-20，覆盖面不同，互不取代）：
@@ -81,16 +81,16 @@ v0.31.0 通用 / 集群·Raft 帧解码 / WebSocket 帧解析·握手。
 
 **设计文档两份并列**（状态不同，互不取代）：
 `cluster-identity-design.md` 已实现 · `cluster-auth-design.md` L1/L2 + A-1 均已实现；
-A-3（密钥轮换/撤销）第 110 批在两者之上落地，见 `docs/DISTRIBUTED.md`「密钥轮换与撤销」；
+A-3（密钥轮换/撤销）第 110 批在两者之上落地，见 `docs/reference/DISTRIBUTED.md`「密钥轮换与撤销」；
 A-2（传输加密）第 111 批**定界**（不内嵌 TLS，机密性交受信二层/边车/网格），见
-`docs/DISTRIBUTED.md`「传输加密边界（A-2 定界）」。
+`docs/reference/DISTRIBUTED.md`「传输加密边界（A-2 定界）」。
 
 ## 4. 建议动作
 
 - ~~§2 那 8 份移动而非删除~~ —— **已执行**（2026-09-26，见 §2 与
   [`archive/README.md`](./archive/README.md)）。
 - ~~todo 三代（`todo.md`/`todo3.md`/`todo3.1.md`）的状态表过期~~ —— **已处置**
-  （2026-09-29）：三份都被现行文档按路径引用（`HotReloader.zig`、`docs/RUNTIME.md`），
+  （2026-09-29）：三份都被现行文档按路径引用（`HotReloader.zig`、`docs/reference/RUNTIME.md`），
   **不能移动**，改为各加"历史快照"文件头（COMPLETENESS_REPORT 同款），指向
   `v1.0-readiness-v0.35.md` 作为现行差距判断。
 - §1 **一律不动**，尤其是 `cluster-*.md` / `alpha-engine-spec.md` /

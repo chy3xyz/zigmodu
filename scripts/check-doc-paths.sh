@@ -46,7 +46,7 @@ cd "$ROOT"
 # (`docs/crm.md`) to document what is ignored. Its inline code comments are
 # scanned like anything else, since those are the kind that rot.
 SCAN=(src tools/zmodu/src .github/workflows scripts)
-FILES=(AGENTS.md CLAUDE.md build.zig build.zig.zon README.md)
+FILES=(AGENTS.md CLAUDE.md build.zig build.zig.zon README.md README.zh.md)
 
 # Build the file list, skipping anything absent so the script also runs in a
 # partial checkout (and so a missing CLAUDE.md is not itself a failure).

@@ -100,6 +100,14 @@ book.stop();                                       // 请求结束（join 由 sh
 **契约要点**
 
 - `ctx` 是 `WorkerContext(W, capacity)`，用 `anytype` 接 —— worker 作者不必写出容量参数。
+  配套的组织方式是 `pub fn BookModule(comptime capacity: usize) type`：**Worker 本体零容量参数**
+  （`ctx` 走 `anytype`），comptime 容量只穿过三处 —— Module 函数的 comptime 形参、
+  `spawn` 调用点、`Handle(W, capacity)` 的类型名。要"回放无损 4096 / 生产有界 64"双画像，
+  就是同一模块类型做**两个 comptime 实例化**（`BookModule(4096)` / `BookModule(64)`）：
+  "每相位一套类型链"是刻意代价，换来 §5 背压承诺的 comptime 根基（容量在类型里，不是运行值）。
+  单画像的对照先例见 `examples/alpha-engine/src/modules/exec/module.zig:22`——
+  `ReporterInbox = runtime.Handle(Reporter, api.reporter_capacity)`，容量 const 单点定义在
+  同示例 `api.zig:22`（`reporter_capacity: usize = 32`）。
 - `ctx.stopped()`：`stop()` 或运行时关闭。**"没启动 ticker" 不算停止**（自己驱动 `tick()` 是受支持用法）。
 - `ctx.traceId()`：**当前正在处理的这条消息**带的 trace id（`sendTraced` 附上的），没有则 `null`；
   `init`/`run` 阶段也是 `null`。见 §8.1。
@@ -153,6 +161,7 @@ const h = try rt.spawnActor(Reporter, .{}, 32, .{ .max_errors = 3, .window_ms = 
 | `strategy = .stop` | 首个错误即停（fail-fast，邮箱关闭、线程退出） |
 | `max_errors` / `window_ms` | **错误预算**：窗口内超过 N 次即停。`0` = 不限 |
 | `onError(self, err, ctx)`（可选声明） | 现场决策，**覆盖** `strategy` |
+| （类型提示）`runtime.Supervision` | `spawnActor` 第 4 参的**具名类型**（`src/runtime/runtime.zig:398`，字段 `strategy` / `max_errors` / `window_ms` / `group`；该类型的 doc comment 自己也写着 "Do not confuse `max_errors` with `Intensity.max_restarts`"）；匿名字面量可 coerce 进去。**勿与 `supervisor.Intensity`（`spawnGroupWith` 的组重启预算，字段 `max_restarts` / `window_ms`，`src/runtime/supervisor.zig:64`）混淆** —— 两者同形不同名，写错字段名的编译错误不会替你指向另一个结构体 |
 
 **为什么需要预算**：一个"每条消息都出错"的 actor，在"只记录不停止"的语义下会永远烧掉一个核，
 从外部看却是健康的（线程在跑、邮箱在收）。预算把这种情况变成"停止 + 一条 warn + 计数"，
@@ -185,6 +194,14 @@ if (!try bus.publish(trade)) { /* 所有订阅者都满了 */ }
    未 freeze 就 publish 返回 `error.NotFrozen` —— 这是接线 bug，应该大声失败而不是竞争。
 2. **丢，但不长**：每个订阅者是**有界邮箱**，满即丢该条并计数（`stats().dropped`）。慢消费者既不能拖慢发布方，
    也不能把内存吃光。
+
+这两个 typed error 是**故意的 fail-loud**（`src/runtime/hot_bus.zig:49-58`）：`publish` 返回
+`Error.NotFrozen`（freeze 之前）/`Error.Frozen`（freeze 之后 `subscribe`），不是可忽略的噪音。
+`catch {}` 吞掉它 = 静默丢事件，同时把启动接线 bug 藏起来 —— debug / CI 下 `NotFrozen` 一律
+按 wiring bug 处理（`hot_bus.zig:291` 的测试就是这么断言的）。热路径上的正确写法见
+`examples/runtime-workers/src/main.zig:90`：先把 `NotFrozen` 注释钉成"必须是 loud 的"，
+再 `catch |err| std.log.err(...)` —— drop-on-full 语义走 `publish` 的 `bool` 返回值，
+error set 里只剩接线错误，没有"可以习惯性无视"的那一支。
 
 要事后重放这段投递流，用 **EventRecorder**（§11.6）：`bus.attachRecorder(&rec)` 必须在 `freeze()` 之前，
 记录点在**扇出之前** —— 它不占订阅者槽位，也不会被计成 `dropped`；日志满则 `error.Full`（不静默丢），
@@ -547,6 +564,7 @@ fn traceFromHeader(id: []const u8) zigmodu.runtime.TraceId {
 ### 11.6 v1 已实现（`src/runtime/recorder.zig`）
 
 这里是实际落地的形状。设计阶段的取舍记在 `docs/archive/`，本节只写实现。
+与投递轨的分工、以及"复现 / 测试 / 留证选哪件"的总选型表见 **§13.1**。
 
 ```zig
 const runtime = @import("zigmodu").runtime;
@@ -1640,19 +1658,35 @@ per-worker 的 `batch` 覆盖同理仍不做（§12.16 末尾已记）。
 > §11 的 EventRecorder 记的是 **L0 扇出**（`HotBus.publish` 之前）；本节做的是**投递流**——
 > "每个 worker 实际收到了什么"。**这是两个不同的问题，不是同一个 log 的两个视图。**
 
-### 13.1 先说清和 §11 的分工（不搞清必然做错）
+### 13.1 先说清和 §11 的分工（不搞清必然做错）——这张表同时是选型表
 
-同一个 `send` 会被两种视角看见，**不要记两遍**：
+同一个 `send` 会被两种视角看见，**不要记两遍**；而"我要复现 / 测试 / 留证，该选哪件"
+也按这张表对号——五种手段回答五个不同的问题，互相替代不了：
 
-| log | 取点 | 回答的问题 |
-|-----|------|-----------|
+| 手段 | 取点 / 形态 | 回答的问题 |
+|------|------------|-----------|
 | §11 `Recorder(E)` | `HotBus.publish`，**扇出之前** | "**生产者发布了什么**" —— L0 流的完整序列 |
 | 本节 · 投递轨 | `Handle.send*` | "**每个 worker 收到了什么**" —— L0 扇出的落点、直达 send、定时器投递 |
+| §15 det mode | `Runtime.initWithOptions(.{ .deterministic = .{ .seed = … } })` | "**整段编排执行可复现**" —— 不是事后留证，而是把执行本身钉进受控域（同输入 + 同 seed + 同拓扑 ⇒ 同事件序列，违反即 `error.DeterministicViolation`） |
+| `http.Testkit.dispatch` | 进程内直调 handler，不起 socket（`src/http/Testkit.zig`） | "**handler 级行为对不对**" —— 路由 / 鉴权 / JSON 形状的单测与回归 |
+| L1 `app.eventBus(T)` / outbox | L1 进程内类型化总线；跨进程走 outbox + poller | "**业务事件、跨模块 / 跨进程恰好一次**" —— 可读性 / 可靠性优先（可分配、可慢），不是热路径（分工见 §6） |
 
 为什么投递必须记在 `Handle.send*` 而不是 `publish`：**定时器投递根本不经过 `publish`**
 （`after` → `TimerCommand` → ticker → `Delivery.post` → `handle.send`），而它在流水线里往往是
 关键节拍（快照、结算、超时）。只记 `publish` 的 log **重放不出定时器驱动的那一半**。
 反过来 `publish` 在扇出**之前**，记它会漏掉"某订阅者满了被丢"——而那恰好是投递轨能看见的。
+
+**不在这张表上的需求**：要的是一份**外部系统可消费的 canonical 业务事件流**（稳定 wire 格式、
+跨组织工具可读、schema 演进有承诺）——这不在 delivery_log 的范围里。盘上 payload 是
+per-type Zig 私有 codec（解码要进程内 `setCodec` / `setCodecRef` 绑定同一类型，§13.9 / §13.10），
+`replay-inspect` 对载荷只按长度报告（§13.14）。这条需求去 **adapter 层自建**——外部先例：zalpha
+的 76 字节 `PackedEvent`，一条记录一个固定布局，专为跨组织消费而设计——或**用 outbox** 落库、
+由外部消费者按 schema 订阅。如实说清已经存在的读盘能力，免得误判：delivery_log 的盘上格式
+（ZDL1）本身就是**公开的**，逐字节写死在 `src/runtime/delivery_log.zig`（magic `0x314C445A`、
+显式小端、每帧 CRC）；离线有 `replay-inspect` CLI（§13.14）；`ReplayFromLog` 把落盘的 log 开回
+**另一个** runtime（§13.10 e2e：Runtime A 投递 → `drainTo` → Runtime B 同图重放，收端指纹逐条
+一致——读者不必是写者进程；边写边读的**实时**跨机跟随仍属 §13.10 D7 未做项，别混淆）。
+所以"外部工具完全不可读"的说法已过时——缺的是**业务 schema 层**，不是字节层。
 
 ### 13.2 真正的障碍，以及为什么它其实不是障碍
 
@@ -2456,7 +2490,8 @@ exit 2 / 翻转字节 → corrupt 定位 + exit 3 / 空 log / 目录缺失是错
 > [`dev/deterministic-runtime-design.md`](../dev/deterministic-runtime-design.md)；
 > 本节只记**使用契约**。一句话：同一份输入 + 同一个 seed + 同一拓扑 ⇒ 同一条
 > 事件序列。它是「配置出来的执行模式」，不是第二套 runtime —— 默认（生产）模式
-> 一字不改。
+> 一字不改。det 模式回答的是"整段执行可复现"，与 Recorder / 投递轨"事后留证"、
+> `Testkit.dispatch` "handler 级测试"的分工与选型见 **§13.1**。
 
 ```zig
 var rt = try Runtime.initWithOptions(allocator, io, .{

@@ -84,8 +84,10 @@ const OrderBook = struct {
         };
 
         // Fan out to audit + metrics. `publish` never blocks and never allocates:
-        // subscribers that cannot keep up drop this delta and count it.
-        _ = self.bus.publish(d) catch {};
+        // subscribers that cannot keep up drop this delta and count it. The only
+        // publish error is `NotFrozen` — a startup wiring bug that must be loud,
+        // not silently turned into a lost event.
+        _ = self.bus.publish(d) catch |err| std.log.err("[book] bus publish failed: {}", .{err});
 
         // Every 50 deltas, ask the runtime to wake us for a snapshot.
         if ((self.bids + self.asks) % 50 == 0) {
@@ -97,7 +99,7 @@ const OrderBook = struct {
             // Forward the barrier so the snapshot below also sees a drained risk
             // worker, then finish. `sendBlocking` is right here: the marker must
             // not be the one message that gets dropped, or main() waits forever.
-            self.risk.sendBlocking(d, 5_000) catch {};
+            self.risk.sendBlocking(d, 5_000) catch |err| std.log.err("[book] forwarding shutdown marker to risk failed: {}", .{err});
             self.done = true;
             ctx.handle.stop();
         }
@@ -302,7 +304,7 @@ pub fn main(init: std.process.Init) !void {
                     error.Closed => return,
                 };
             }
-            h.send(.{ .price = -1, .qty = 0, .bid = true }) catch {};
+            h.send(.{ .price = -1, .qty = 0, .bid = true }) catch |err| std.log.err("[feed] shutdown marker send failed: {}", .{err});
         }
     };
     const feed = try std.Thread.spawn(.{}, Feed.run, .{book});

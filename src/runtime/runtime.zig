@@ -390,6 +390,11 @@ const TimerCommand = union(enum) {
 /// down. The group may rebuild it instead — in place, `deinit` + `init` on the
 /// member's own thread — which is what turns "this actor died" into "this actor
 /// died and came back".
+///
+/// Do not confuse `max_errors` below with `Intensity.max_restarts`
+/// (`spawnGroupWith`'s group budget, `supervisor.zig`) — same shape, different
+/// name; writing one where the other is expected fails as a field-name error
+/// that reads like a type mismatch.
 pub const Supervision = struct {
     pub const Strategy = enum {
         /// Log the error, keep serving. The v0.16 worker contract.

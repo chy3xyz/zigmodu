@@ -58,6 +58,9 @@ pub const Policy = enum {
 /// restart is the same as `.stop_group`, and saying it this way keeps "0 = none"
 /// rather than borrowing `max_errors`' "0 = unlimited" (for restarts, unlimited
 /// *is* the CPU black hole this exists to prevent).
+///
+/// Do not confuse this with `runtime.Supervision.max_errors` (the per-actor
+/// budget for `spawnActor`) — same shape, different name.
 pub const Intensity = struct {
     max_restarts: u32 = 3,
     window_ms: i64 = 60_000,

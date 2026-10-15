@@ -25,8 +25,9 @@ const std = @import("std");
 const provider_mod = @import("provider.zig");
 
 /// One `data:` JSON event. The union tag is the event type; payload strings
-/// are borrowed from the live delta and copied during serialization, so the
-/// serialized buffer can be freed right after the write.
+/// are borrowed from the live delta and copied during serialization into a
+/// fixed stack buffer, so nothing is allocated (and, on an arena-backed
+/// request, nothing accumulates) per delta.
 pub const DeltaEvent = union(enum) {
     content: struct { delta: []const u8 },
     /// Incremental thinking-chain fragment (reasoning models only).
@@ -44,6 +45,8 @@ pub fn DeltaSse(comptime W: type) type {
     return struct {
         const Self = @This();
 
+        /// Retained for constructor compatibility with the pre-bounded
+        /// serialization; `onDelta` no longer allocates, so this goes unused.
         allocator: std.mem.Allocator,
         writer: *W,
 
@@ -65,11 +68,59 @@ pub fn DeltaSse(comptime W: type) type {
             else
                 return; // empty fragment — nothing worth an event
 
-            const payload = try std.json.Stringify.valueAlloc(self.allocator, event, .{});
-            defer self.allocator.free(payload);
+            var buf: [event_buf_len]u8 = undefined;
+            const payload = serializeFitting(&buf, event) orelse return; // logged inside
             try self.writer.sendData(payload);
             if (delta.done) try self.writer.done();
         }
+    };
+}
+
+/// Per-event serialization bound — the same 4096-byte budget `SseWriter`
+/// frames every event through (`src/http/Sse.zig`). A token delta is far
+/// below this; the bound only trips on a pathological single fragment.
+const event_buf_len = 4096;
+
+/// Serialize one event into a fixed stack buffer, the same bounded shape
+/// `SseWriter` uses per event: no allocation, so a long stream cannot
+/// accumulate in the caller's arena (an arena `free` is a no-op, so the old
+/// alloc-per-token serialization grew the request arena for the whole
+/// stream). A payload whose JSON would exceed the buffer is degraded to a
+/// truncated payload (halving retry) so every event on the wire stays valid
+/// JSON; only a payload that still does not fit with every string emptied is
+/// dropped, with a log.
+fn serializeFitting(buf: []u8, event: DeltaEvent) ?[]const u8 {
+    var cap: ?usize = null; // null = full payload; else per-string byte cap
+    var guard: usize = 0;
+    while (guard < 32) : (guard += 1) {
+        const attempt = if (cap) |c| capEvent(event, c) else event;
+        var fw = std.Io.Writer.fixed(buf);
+        std.json.Stringify.value(attempt, .{}, &fw) catch {
+            if (cap == null) std.log.warn("[stream_sse] delta JSON exceeds the {d}-byte event buffer; truncating the payload", .{buf.len});
+            cap = if (cap) |c| c / 2 else buf.len / 2;
+            continue;
+        };
+        return fw.buffered();
+    }
+    std.log.err("[stream_sse] delta JSON exceeds the {d}-byte event buffer even with an empty payload; dropping the event", .{buf.len});
+    return null;
+}
+
+/// Rebuild `event` with every string field truncated to `cap` bytes.
+fn capEvent(event: DeltaEvent, cap: usize) DeltaEvent {
+    const capStr = struct {
+        fn f(s: []const u8, c: usize) []const u8 {
+            return s[0..@min(s.len, c)];
+        }
+    }.f;
+    return switch (event) {
+        .content => |e| .{ .content = .{ .delta = capStr(e.delta, cap) } },
+        .reasoning => |e| .{ .reasoning = .{ .delta = capStr(e.delta, cap) } },
+        .tool => |e| .{ .tool = .{
+            .name = capStr(e.name, cap),
+            .arguments_delta = capStr(e.arguments_delta, cap),
+        } },
+        .done => event,
     };
 }
 
@@ -121,4 +172,30 @@ test "DeltaSse ignores empty fragments and propagates writer errors" {
     const BadBridge = DeltaSse(BadWriter);
     var bad_bridge = BadBridge.init(allocator, &bad);
     try std.testing.expectError(error.BrokenPipe, BadBridge.onDelta(&bad_bridge, .{ .content_delta = "x" }));
+}
+
+test "DeltaSse degrades an oversized delta to a truncated event instead of allocating" {
+    const allocator = std.testing.allocator;
+    const Sse = @import("../http/Sse.zig");
+
+    var rec = Sse.SseRecorder.init(allocator);
+    defer rec.deinit();
+    const Bridge = DeltaSse(Sse.SseRecorder);
+    var bridge = Bridge.init(allocator, &rec);
+
+    var big = std.ArrayList(u8).empty;
+    defer big.deinit(allocator);
+    try big.appendNTimes(allocator, 'x', 8 * event_buf_len);
+
+    try Bridge.onDelta(&bridge, .{ .content_delta = big.items });
+    try Bridge.onDelta(&bridge, .{ .done = true });
+
+    const wire = rec.bytes();
+    // The event still went out — valid JSON with a truncated payload — and
+    // the stream still terminated.
+    try std.testing.expect(std.mem.indexOf(u8, wire, "data: {\"content\":{\"delta\":\"") != null);
+    const x_count = std.mem.count(u8, wire, "x");
+    try std.testing.expect(x_count > 0);
+    try std.testing.expect(x_count < big.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "event: done\ndata: [DONE]\n\n") != null);
 }

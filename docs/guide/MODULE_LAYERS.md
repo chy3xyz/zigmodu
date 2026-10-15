@@ -194,7 +194,33 @@ pub fn checkout(self: *Self, cmd: CheckoutCmd) !CheckoutResult {
 
 ---
 
-## 7. 落地检查清单
+## 7. 模块状态与多相位卫生
+
+**状态结构体由 `initWith` 期 heap 分配、`deinit` 释放**；句柄经
+`ctx.services.register(T, "name", ptr)` 进 per-Application 的 Container（字段在
+`src/Application.zig:76`，随相位销毁），或经路由 `State` 传递。文件级 `pub var`
+**仅限无状态句柄**（`?*Inbox` 这类纯指针，相位结束置 `null` 即干净）。
+
+若必须文件级静态（句柄缓存、跨函数可见的同步原语），**`deinit` 必须复位全部字段** ——
+值类型 Latch / 计数器一并回初值。先例与教训同在
+[`examples/alpha-engine/src/modules/exec/module.zig`](../../examples/alpha-engine/src/modules/exec/module.zig)：
+`:34-36` 的文件级 `c.Latch`（`drained` / `authorized_done`）曾在 deinit 只置空句柄指针的年份里
+跨相位残留（上一相位的 armed 状态带进下一相位，调试计数器悄悄累计、专门误导定位）；现行
+`:56-64` 的 `deinit` 已补上 `drained.reset()` / `authorized_done.reset()`（`:61-62`，注释原文
+"Same-process rebuilds must not inherit the previous phase's flags"）。Latch 谁复位是**作者责任**，
+框架不查 —— 验收型多相位进程（同一 `main` 里 build / stop / build 多个相位）写文件级静态时
+把这条当 checklist。这类残留也正是"状态进 Container / State"方向要消灭的类别，别当范式照抄。
+
+模块仪式（`pub var inbox` + `initWith` spawn + `deinit` 置 null）的 handle 存取当前是手写：
+ModuleScanner 只扫 `info` / `init` / `initWith` / `deinit` 四个声明
+（`src/core/ModuleScanner.zig:13-53`），由它代劳 handle 存取属 **1.x 候选**；官方收敛方向 =
+状态进 Container / State，仪式自然缩短。runtime worker 的 spawn / join 归属见
+[RUNTIME.md §3d](../reference/RUNTIME.md)；Container 能装什么、不能装什么见
+[EVENTS_DI.md「Container 的定位边界」](./EVENTS_DI.md) §3.4。
+
+---
+
+## 8. 落地检查清单
 
 - [ ] 每个域有 `model` / `persistence` / `service` / `api` / `module`  
 - [ ] 工作流 SQL 不在 service 内联超过 ~10 行；已抽 `Tx` 或 `*_write`  
@@ -205,7 +231,7 @@ pub fn checkout(self: *Self, cmd: CheckoutCmd) !CheckoutResult {
 
 ---
 
-## 8. tenant-shop 对照
+## 9. tenant-shop 对照
 
 | 模块 | 分层要点 |
 |------|----------|

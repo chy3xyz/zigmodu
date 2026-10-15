@@ -94,6 +94,10 @@ pub fn Module(comptime Exec: type) type {
             // thread behind it.
             if (state) |s| s.deinit();
             state = null;
+            // Same-process rebuilds must not inherit the previous phase's flag
+            // or a `run` still pointing at the freed state.
+            agent_done.reset();
+            run = undefined;
         }
     };
 }
