@@ -2,7 +2,7 @@
 
 This directory contains comprehensive examples demonstrating various features of ZigModu.
 
-**DB linking**: most runnable examples use sqlite-only (`.db = "sqlite"` or `-Ddb=sqlite`). Path-dep apps share [`_shared/db_link.zig`](_shared/db_link.zig) via per-example symlinks. Full guide: [`docs/SQLX_DRIVERS.md`](../docs/SQLX_DRIVERS.md).
+**DB linking**: most runnable examples use sqlite-only (`.db = "sqlite"` or `-Ddb=sqlite`). Path-dep apps share [`_shared/db_link.zig`](_shared/db_link.zig) via per-example symlinks. Full guide: [`docs/guide/SQLX_DRIVERS.md`](../docs/guide/SQLX_DRIVERS.md).
 
 ## ★ Start here: Tenant Management (`examples/tenant-mgmt`)
 
@@ -21,7 +21,7 @@ See [tenant-mgmt/README.md](tenant-mgmt/README.md) for full API reference.
 
 ## Multi-Tenant Shop scaffold (`examples/tenant-shop`)
 
-**Modulith blueprint demo** — storefront domain graph from [`docs/MODULITH_TENANT_SHOP.md`](../docs/MODULITH_TENANT_SHOP.md). Week 1–4 scaffold: `tenant` / `user` / `product` / `inventory` plus `cart` → `order` → `payment` with the `shop_bff` / `admin_bff` edge modules (outbox retry + DLQ included).
+**Modulith blueprint demo** — storefront domain graph from [`docs/guide/MODULITH_TENANT_SHOP.md`](../docs/guide/MODULITH_TENANT_SHOP.md). Week 1–4 scaffold: `tenant` / `user` / `product` / `inventory` plus `cart` → `order` → `payment` with the `shop_bff` / `admin_bff` edge modules (outbox retry + DLQ included).
 
 ```bash
 cd examples/tenant-shop && HTTP_PORT=18090 zig build run
@@ -30,7 +30,7 @@ curl http://127.0.0.1:18090/health/live
 
 ## ZigModu × zent (`examples/zent-modulith`)
 
-**Orthogonal ORM demo** — ZigModu `http.Server` + [zent](https://github.com/chy3xyz/zent) schema-as-code Client/migrate. zent is pinned by git tag in `build.zig.zon` (`v0.67.0`); a sibling `../zent` checkout is only for developing zent itself. Practices: [`docs/ZENT.md`](../docs/ZENT.md).
+**Orthogonal ORM demo** — ZigModu `http.Server` + [zent](https://github.com/chy3xyz/zent) schema-as-code Client/migrate. zent is pinned by git tag in `build.zig.zon` (`v0.86.0`); a sibling `../zent` checkout is only for developing zent itself. Practices: [`docs/reference/ZENT.md`](../docs/reference/ZENT.md).
 
 ```bash
 cd examples/zent-modulith && HTTP_PORT=18100 zig build run
@@ -57,7 +57,7 @@ curl -X POST http://127.0.0.1:18087/api/approvals/order-2/approve
 zig build test                          # runs the single end-to-end pipeline test
 ```
 
-Covered in [docs/AI_ORCHESTRATION.md](../docs/AI_ORCHESTRATION.md).
+Covered in [docs/ai/AI_ORCHESTRATION.md](../docs/ai/AI_ORCHESTRATION.md).
 
 > **Removed 2026-09-18.** Two AI examples were dropped to keep this directory
 > lean: `tenant-ai` (tenant-scoped AI — its tenant isolation is covered by
@@ -72,7 +72,7 @@ Covered in [docs/AI_ORCHESTRATION.md](../docs/AI_ORCHESTRATION.md).
 
 **Real wiring for `zigmodu.ai.llm`** — connects `AiProvider` to the built-in
 LLM policies (`llmApprove` / `llmRiskDecide` / `llmDiagnose` / `llmVerify`),
-exactly as documented in [docs/LLM_POLICIES.md](../docs/LLM_POLICIES.md):
+exactly as documented in [docs/ai/LLM_POLICIES.md](../docs/ai/LLM_POLICIES.md):
 
 ```bash
 cd examples/llm-policies
@@ -98,7 +98,7 @@ cd examples/web4 && zig build run
 zig build test                          # asserts 402→200 and 401→200 flows
 ```
 
-Covered in [docs/WEB4.md](../docs/WEB4.md).
+Covered in [docs/WEB4.md](../docs/reference/WEB4.md).
 
 ## Production deployment (`examples/production-deploy`)
 
@@ -112,7 +112,7 @@ multi-stage Dockerfile.
 
 Backend flags wired throughout: `HTTP_MAX_CONNECTIONS`, `HTTP_HEADER_TIMEOUT_MS`,
 `WS_WRITE_TIMEOUT_MS`. See [`production-deploy/README.md`](production-deploy/README.md)
-and [`docs/OBSERVABILITY.md`](../docs/OBSERVABILITY.md).
+and [`docs/reference/OBSERVABILITY.md`](../docs/reference/OBSERVABILITY.md).
 
 ## ShopDemo boundary (`examples/shopdemo`)
 
@@ -458,10 +458,10 @@ pub fn main(init: std.process.Init) !void {
 
 ## 📚 Additional Resources
 
-- [API Documentation](../docs/API.md)
-- [Quick Start Guide](../docs/QUICK-START.md)
-- [Production Roadmap](../docs/PRODUCTION_ROADMAP.md)
-- [Observability & alerting](../docs/OBSERVABILITY.md)
+- [API Documentation](../docs/reference/API.md)
+- [Quick Start Guide](../docs/guide/QUICK-START.md)
+- [Production Roadmap](../docs/archive/status/PRODUCTION_ROADMAP.md)
+- [Observability & alerting](../docs/reference/OBSERVABILITY.md)
 - [Contributing Guide](../CONTRIBUTING.md)
 
 ---

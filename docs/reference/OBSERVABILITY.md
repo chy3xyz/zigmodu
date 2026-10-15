@@ -178,6 +178,39 @@ metrics.setScrapeHook(struct {
 （需要每抓取刷新的是 gauge，走 `setScrapeHook`，不受此限）。
 所以业务指标在启动接线阶段创建，别在 handler 里注册。
 
+### Dashboard 计数口径（`/api/dashboard/*`）
+
+人读面板（`productionProfile(.{ .dashboard = true })`，路由见 §1 表）的每个
+数字数的是什么、从哪来——面板只渲染接进来的 feed，**不编造数值**：
+
+| 字段 | 口径 | 来源 |
+|------|------|------|
+| `stats.routes` | 每次请求实时遍历路由 trie 的条数；含面板自身 5 条，路由后注册也计入（读 trie，非快照） | `DataSource.server.listRoutes()` |
+| `stats.middleware` | 全局中间件链当前长度 | `DataSource.server.global_middleware` |
+| `stats.modules` / `tests.*` | 启动期由应用写入的静态数（`tests.total` = 三项之和）；HTTP 层没有模块图/测试运行器 | `Dashboard.system_info` |
+| `stats.http.*` | 累计请求计数 + in-flight 快照；面板自身的轮询请求也会被计入（当它经过 collector 中间件时）；`r2xx`/`r4xx`/`r5xx` 是 collector 的状态桶（计数数组第 1/3/4 格） | `DataSource.http_metrics`（`HttpMetricsCollector`，由 `httpMetricsMiddleware` 累计） |
+| `modules[]` | 应用从模块图填充的切片；未接线时**返回空表**，不会生成假条目 | `DataSource.modules` |
+| `stats.uptime_seconds` | 单调钟 `now - started_at`；`started_at` 必须在启动时设置（`Time.monotonicNowSeconds()`），否则数值无意义 | `Dashboard.system_info` |
+| `events` | 保留位，恒 0（HTTP 层没有事件总线计数源） | — |
+
+接线（应用侧显式接全部 feed）：
+
+```zig
+var source = zigmodu.http.Dashboard.DataSource{
+    .server = &server,                       // routes / middleware 计数
+    .http_metrics = &collector,              // 可选：stats.http 块
+    .modules = &.{ .{ .name = "order", .desc = "Order module", .deps = 2 } }, // 从模块图填充
+};
+var group = server.group("");
+try zigmodu.http.Dashboard.registerRoutesWith(&group, &source);
+```
+
+`productionProfile` 已自动把 `server` 和 `HttpProfileState.metrics_collector`
+（`http.metrics = true` 时）接进 `ProductionProfileState.dashboard_source`；
+`modules` 切片仍需应用自己填。所有字段可选：缺 feed 时对应数字为 0 / 空表。
+响应的 key 集合稳定（`http` 块仅在接了 collector 时出现），JSON 形状见
+`src/http/Dashboard.zig` 文件头注释。
+
 ## 3. PromQL 速查
 
 ```promql

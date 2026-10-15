@@ -843,13 +843,27 @@ fn lintFile(
             }
         }
 
-        // b22 — client-chosen tenant: `.tenant_source = .query` (zent-modulith
-        // CrudApi) reads the tenant from a URL parameter, so anyone can switch
-        // tenants by editing the URL. Use `.attr` with the JWT middleware,
-        // which fills it from the verified token's `aud` claim.
+        // b22 — client-chosen tenant/identity. Three shapes, one bug class:
+        // the URL is attacker-controlled, so a tenant or user id pulled out
+        // of it lets anyone read (or write) another tenant's/user's rows by
+        // editing the query string.
+        //   - `.tenant_source = .query` (zent-modulith CrudApi)
+        //   - `ctx.queryInt(i64, "tenantId"/"tenant_id"/"userId"/"user_id", …)`
+        //   - `ctx.queryStr("tenantId"/…)`
+        // The tenant comes from the JWT `aud` claim via the catalog
+        // middleware (`.attr`, read back with `ctx.tenantId()`); the user id
+        // from `ctx.userIdInt` / `requireUserIdInt`.
         if (!config.disabled.contains("b22")) {
-            if (std.mem.indexOf(u8, trimmed, "tenant_source = .query") != null) {
-                try pushViolation(violations, allocator, "b22", rel_path, idx, "租户来源取自 query 参数（客户端可任意篡改，改一个 URL 即可跨租户读）— 改为 .attr 并由 JWT 中间件注入；仅公开 demo 可用 // audit: ignore b22 豁免", .{});
+            const query_identity = std.mem.indexOf(u8, trimmed, "queryInt(i64, \"tenantId\"") != null or
+                std.mem.indexOf(u8, trimmed, "queryStr(\"tenantId\"") != null or
+                std.mem.indexOf(u8, trimmed, "queryInt(i64, \"tenant_id\"") != null or
+                std.mem.indexOf(u8, trimmed, "queryStr(\"tenant_id\"") != null or
+                std.mem.indexOf(u8, trimmed, "queryInt(i64, \"userId\"") != null or
+                std.mem.indexOf(u8, trimmed, "queryStr(\"userId\"") != null or
+                std.mem.indexOf(u8, trimmed, "queryInt(i64, \"user_id\"") != null or
+                std.mem.indexOf(u8, trimmed, "queryStr(\"user_id\"") != null;
+            if (std.mem.indexOf(u8, trimmed, "tenant_source = .query") != null or query_identity) {
+                try pushViolation(violations, allocator, "b22", rel_path, idx, "租户/用户身份取自 query 参数（客户端可任意篡改，改一个 URL 即可跨租户/冒用用户）— 租户改走 JWT aud → attr（.attr / ctx.tenantId()），用户改走 ctx.userIdInt / requireUserIdInt；仅公开 demo 可用 // audit: ignore b22 豁免", .{});
             }
         }
 
@@ -2428,8 +2442,14 @@ test "audit business lint flags anti-patterns" {
     try lintFile(allocator, "api.zig", "fn handler(ctx: *http.Context, self: *State) !void {\n    const p: *Header = @alignCast(@ptrCast(self.raw));\n    _ = p;\n}\n", "src/modules/x/api.zig", &cfg, &violations);
     // b22 — tenant taken from the client-controlled query string.
     try lintFile(allocator, "zent_crud.zig", "const A = CrudApi(infos, Info, .{ .tenant_source = .query });\n", "src/modules/x/zent_crud.zig", &cfg, &violations);
+    // b22 — tenant read straight out of the query string in a handler.
+    try lintFile(allocator, "api.zig", "fn h(ctx: *http.Context, self: *State) !void {\n    const tid = ctx.queryInt(i64, \"tenantId\", 0);\n    _ = self;\n    _ = tid;\n}\n", "src/modules/x/api.zig", &cfg, &violations);
+    // b22 — user id chosen by the caller is the same tampering class.
+    try lintFile(allocator, "api.zig", "fn h(ctx: *http.Context, self: *State) !void {\n    const uid = ctx.queryStr(\"userId\") orelse \"\";\n    _ = self;\n    _ = uid;\n}\n", "src/modules/x/api.zig", &cfg, &violations);
     // b22 negative — .attr (JWT-provided tenant) is the sanctioned form.
     try lintFile(allocator, "zent_crud.zig", "const A = CrudApi(infos, Info, .{ .tenant_source = .attr });\n", "src/modules/x/zent_crud.zig", &cfg, &violations);
+    // b22 negative — the JWT attrs / helpers must never fire.
+    try lintFile(allocator, "api.zig", "fn h(ctx: *http.Context, self: *State) !void {\n    const tid = (try requireTenant(ctx)) orelse return;\n    const uid = try ctx.requireUserIdInt(i64);\n    _ = self;\n    _ = tid;\n    _ = uid;\n}\n", "src/modules/x/api.zig", &cfg, &violations);
     // b23 — the row came from a call that took the allocator, so it belongs to
     // that allocator; deinitRow frees it through the client's.
     try lintFile(allocator, "persistence.zig", "pub fn find(self: *@This(), allocator: std.mem.Allocator, id: i64) !void {\n    const e = try self.crud.getOwned(allocator, id);\n    defer self.client.user.deinitRow(&e);\n}\n", "src/modules/x/persistence.zig", &cfg, &violations);
@@ -2492,7 +2512,7 @@ test "audit business lint flags anti-patterns" {
     try std.testing.expectEqual(@as(usize, 2), rules.get("b19").?);
     try std.testing.expectEqual(@as(usize, 1), rules.get("b20").?);
     try std.testing.expectEqual(@as(usize, 1), rules.get("b21").?);
-    try std.testing.expectEqual(@as(usize, 1), rules.get("b22").?);
+    try std.testing.expectEqual(@as(usize, 3), rules.get("b22").?);
     try std.testing.expectEqual(@as(usize, 2), rules.get("b23").?);
     try std.testing.expectEqual(@as(usize, 5), rules.get("b24").?);
 }

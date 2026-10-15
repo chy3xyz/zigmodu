@@ -2779,14 +2779,14 @@ Build Examples 腿），"哪些证明过、哪些没有"逐条记在 [dev/v1.0-r
 [常见技术债，以及拿什么查](#常见技术债-以及拿什么查)）。审查的重点是
 **判断这些门禁该不该加**，而不是替它们再手工检查一遍。
 
-**怎么改** —— 见 [`CONTRIBUTING.md`](../CONTRIBUTING.md) 与
-[`GOVERNANCE.md`](../GOVERNANCE.md)（谁决定什么，以及怎么推动一个变更）。
+**怎么改** —— 见 [`CONTRIBUTING.md`](../../CONTRIBUTING.md) 与
+[`GOVERNANCE.md`](../../GOVERNANCE.md)（谁决定什么，以及怎么推动一个变更）。
 
 ### 新人上手
 
 按这个顺序读，前两份是硬前提：
 
-1. [`AGENTS.md`](../AGENTS.md) —— 文档地图 + DO / DON'T（**先读这份**）
+1. [`AGENTS.md`](../../AGENTS.md) —— 文档地图 + DO / DON'T（**先读这份**）
 2. 本文的 [两条轴](#📐-两条轴-先认清自己在哪条上) —— 决定你在哪条规模轴上
 3. [模块设计原则](#🏗️-模块设计原则) → [数据访问选型](#🗄-数据访问选型-zent-sqlx)
 4. 按需要查 [RUNTIME.md](../reference/RUNTIME.md) / [ARCHITECTURE.md](../reference/ARCHITECTURE.md)

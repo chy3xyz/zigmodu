@@ -18,6 +18,11 @@ pub const KpiMetric = struct {
     description: []const u8,
     sql: []const u8,
     value_column: []const u8 = "value",
+    /// Tenant-scoped variant of `sql` with a single `?` placeholder bound to
+    /// the caller's tenant id. A dispatch that carries a tenant must run this
+    /// variant; a scoped dispatch on a metric without one refuses with
+    /// `error.TenantScopeRequired` instead of answering across tenants.
+    tenant_sql: ?[]const u8 = null,
 };
 
 /// Capability bundle for the KPI skill bridge. The caller owns this value and
@@ -39,7 +44,31 @@ pub fn query(
     backend: *SqlxBackend,
     metric: KpiMetric,
 ) !KpiResult {
-    var cursor = try backend.client.queryCursorEx(metric.sql, &.{}, .{});
+    return runSql(allocator, backend, metric, metric.sql, &.{});
+}
+
+/// Query one metric bound to a tenant. Runs the metric's `tenant_sql` — a
+/// metric without one cannot be scoped and refuses, so a tenant-scoped caller
+/// never receives an unscoped value.
+pub fn queryForTenant(
+    allocator: std.mem.Allocator,
+    backend: *SqlxBackend,
+    metric: KpiMetric,
+    tenant_id: i64,
+) !KpiResult {
+    const scoped = metric.tenant_sql orelse return error.TenantScopeRequired;
+    const args = [_]sqlx.Value{.{ .int = tenant_id }};
+    return runSql(allocator, backend, metric, scoped, &args);
+}
+
+fn runSql(
+    allocator: std.mem.Allocator,
+    backend: *SqlxBackend,
+    metric: KpiMetric,
+    sql: []const u8,
+    args: []const sqlx.Value,
+) !KpiResult {
+    var cursor = try backend.client.queryCursorEx(sql, args, .{});
     defer cursor.deinit();
     const row = (try cursor.next()) orelse return error.NoRows;
     if ((try cursor.next()) != null) return error.MultipleRows;
@@ -81,7 +110,13 @@ pub fn registerKpiSkills(registry: *SkillRegistry) !void {
                 }
                 const metric = found orelse return error.MetricNotFound;
 
-                const res = try query(sctx.allocator, kc.backend, metric);
+                // Scoped callers must never see an unscoped value: run the
+                // tenant variant when the context carries a tenant, and let a
+                // metric without one refuse instead of falling back to `sql`.
+                const res = if (sctx.tenant_id) |tid|
+                    try queryForTenant(sctx.allocator, kc.backend, metric, tid)
+                else
+                    try query(sctx.allocator, kc.backend, metric);
                 var out = std.json.ObjectMap{};
                 // The result tree is handed to the caller by the `return`
                 // below; without this guard a field that fails to go in
@@ -192,4 +227,82 @@ test "kpi.query hands back its result at every allocation point (OOM scan)" {
         }
     };
     try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{ &registry, &base_ctx });
+}
+
+// The scoped dispatch must answer from the tenant variant only: tenant 2 asks
+// and receives tenant 2's sum, not the cross-tenant total the plain `sql`
+// would return.
+test "kpi.query under a tenant runs the tenant-scoped variant" {
+    const allocator = std.testing.allocator;
+    var client = sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    _ = try client.exec("CREATE TABLE orders (id INTEGER PRIMARY KEY, tenant_id INTEGER, amount INTEGER, status TEXT)", &.{});
+    _ = try client.exec("INSERT INTO orders (tenant_id, amount, status) VALUES (1, 100, 'paid'), (1, 5000, 'paid'), (2, 9000, 'paid')", &.{});
+    _ = try client.exec("INSERT INTO orders (tenant_id, amount, status) VALUES (2, 7000, 'failed')", &.{});
+
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    const metrics = [_]KpiMetric{
+        .{
+            .name = "paid_revenue",
+            .description = "Revenue from paid orders",
+            .sql = "SELECT SUM(amount) AS value FROM orders WHERE status = 'paid'",
+            .tenant_sql = "SELECT SUM(amount) AS value FROM orders WHERE tenant_id = ? AND status = 'paid'",
+        },
+    };
+    var kpi_ctx = KpiCtx{ .backend = &backend, .metrics = &metrics };
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    try registerKpiSkills(&registry);
+
+    var sctx = SkillContext{ .allocator = a, .tenant_id = 2, .userdata = &kpi_ctx };
+    const res = try registry.dispatch("kpi.query", &sctx, .{ .object = blk: {
+        var o = std.json.ObjectMap{};
+        try putOwned(&o, a, "metric", .{ .string = try a.dupe(u8, "paid_revenue") });
+        break :blk o;
+    } });
+    defer freeValue(a, res);
+
+    try std.testing.expectEqual(@as(f64, 9000), res.object.get("value").?.float);
+}
+
+// Fail-closed: a metric that only declares a plain `sql` cannot be scoped, so
+// a dispatch carrying a tenant refuses instead of running the unscoped query
+// across tenants. The framework cannot tell which rows belong to the caller,
+// and guessing is how the metric answered across tenants before.
+test "kpi.query refuses a tenant-scoped dispatch without tenant_sql" {
+    const allocator = std.testing.allocator;
+    var client = sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    _ = try client.exec("CREATE TABLE orders (id INTEGER PRIMARY KEY, tenant_id INTEGER, amount INTEGER, status TEXT)", &.{});
+    _ = try client.exec("INSERT INTO orders (tenant_id, amount, status) VALUES (1, 100, 'paid'), (2, 9000, 'paid')", &.{});
+
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    const metrics = [_]KpiMetric{
+        .{
+            .name = "paid_revenue",
+            .description = "Revenue from paid orders",
+            .sql = "SELECT SUM(amount) AS value FROM orders WHERE status = 'paid'",
+        },
+    };
+    var kpi_ctx = KpiCtx{ .backend = &backend, .metrics = &metrics };
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    try registerKpiSkills(&registry);
+
+    var sctx = SkillContext{ .allocator = a, .tenant_id = 1, .userdata = &kpi_ctx };
+    try std.testing.expectError(error.TenantScopeRequired, registry.dispatch("kpi.query", &sctx, .{ .object = blk: {
+        var o = std.json.ObjectMap{};
+        try putOwned(&o, a, "metric", .{ .string = try a.dupe(u8, "paid_revenue") });
+        break :blk o;
+    } }));
 }

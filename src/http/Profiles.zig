@@ -24,7 +24,8 @@ const PrometheusMetrics = @import("../metrics/PrometheusMetrics.zig").Prometheus
 const HealthEndpointMod = @import("../core/HealthEndpoint.zig");
 const HealthEndpoint = HealthEndpointMod.HealthEndpoint;
 const tracingMiddleware = @import("../api/middleware/Tracing.zig").tracing;
-const dashboardRoutes = @import("Dashboard.zig").registerRoutes;
+const Dashboard = @import("Dashboard.zig");
+const dashboardRoutesWith = Dashboard.registerRoutesWith;
 
 pub const Server = server_mod.Server;
 
@@ -225,6 +226,9 @@ pub const ProductionProfileState = struct {
     health: ?HealthEndpoint = null,
     /// Backing storage for the readiness handler's endpoint pointer.
     health_ptr: ?*HealthEndpoint = null,
+    /// Data feed for the dashboard routes: the live server (route / middleware
+    /// counts) and, when `http.metrics` is on, the shared HttpMetricsCollector.
+    dashboard_source: Dashboard.DataSource = .{},
 
     pub fn init(allocator: std.mem.Allocator) ProductionProfileState {
         _ = allocator;
@@ -355,7 +359,11 @@ pub fn productionProfile(server: *Server, cfg: ProductionConfig, state: *Product
     // 5. Optional dashboard.
     if (cfg.dashboard) {
         var dash_group = server.group("");
-        try dashboardRoutes(&dash_group);
+        state.dashboard_source.server = server;
+        if (state.http_state.metrics_collector) |*c| {
+            state.dashboard_source.http_metrics = c;
+        }
+        try dashboardRoutesWith(&dash_group, &state.dashboard_source);
     }
 }
 
@@ -369,6 +377,45 @@ test "applyHttpDefaults wires security + obs middleware" {
 
     try applyHttpDefaults(&server, .{ .security_basics = true, .access_log = true, .metrics = true }, &state);
     try std.testing.expect(server.global_middleware.items.len >= 5);
+}
+
+test "productionProfile dashboard serves real counts" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(std.testing.io, allocator, 0);
+    defer server.deinit();
+
+    var profile = ProductionProfileState.init(allocator);
+    defer profile.deinit(allocator);
+
+    try productionProfile(&server, .{
+        .prometheus = false,
+        .health = true,
+        .dashboard = true,
+        .tracing = false,
+        .http = .{ .access_log = false, .metrics = true },
+    }, &profile);
+
+    const Testkit = @import("Testkit.zig");
+    var resp = try Testkit.dispatch(&server, .GET, "/api/dashboard/stats", null);
+    defer resp.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+
+    const StatsDoc = struct {
+        routes: usize,
+        middleware: usize,
+        http: ?struct { requests: u64, in_flight: u64 },
+    };
+    const parsed = try std.json.parseFromSlice(StatsDoc, allocator, resp.body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    // Dashboard's own 5 routes + the profile's health/metrics routes, counted
+    // live from the trie — never a hardcoded number.
+    try std.testing.expect(parsed.value.routes >= 5);
+    try std.testing.expect(parsed.value.middleware >= 4);
+    // The shared HttpMetricsCollector is wired in, so the http block exists.
+    // This very request sits in-flight inside the collector while the handler
+    // snapshots it — cumulative counts only see completed requests.
+    const http = parsed.value.http orelse return error.NoHttpBlock;
+    try std.testing.expectEqual(@as(u64, 1), http.in_flight);
 }
 
 test "ResilienceProfileState creates named breakers" {

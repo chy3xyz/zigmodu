@@ -3109,6 +3109,17 @@ pub const Server = struct {
         }
     }
 
+    /// Best-effort `setsockopt` through the raw libc call: every errno becomes
+    /// a debug log line, never a panic (see `tuneSocket` for why the posix
+    /// wrapper is not used here).
+    fn tuneSockOpt(fd: std.posix.socket_t, level: i32, optname: u32, value: []const u8, name: []const u8) void {
+        const rc = std.c.setsockopt(fd, level, optname, value.ptr, @intCast(value.len));
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => {},
+            else => |e| std.log.debug("[Server] setsockopt {s}: {}", .{ name, e }),
+        }
+    }
+
     /// Reduce kernel TCP buffer sizes for high-connection WebSocket workloads.
     /// Default: ~16KB recv + ~16KB send = 32KB/conn kernel memory.
     /// After: 2KB recv + 2KB send = 4KB/conn. Saves 28KB per connection.
@@ -3118,13 +3129,19 @@ pub const Server = struct {
         const rcvbuf: i32 = 2048;
         const sndbuf: i32 = 2048;
         const one: i32 = 1;
-        std.posix.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.RCVBUF, std.mem.asBytes(&rcvbuf)) catch |err| std.log.debug("[Server] setsockopt RCVBUF: {}", .{err});
-        std.posix.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.SNDBUF, std.mem.asBytes(&sndbuf)) catch |err| std.log.debug("[Server] setsockopt SNDBUF: {}", .{err});
-        std.posix.setsockopt(fd, std.c.IPPROTO.TCP, std.c.TCP.NODELAY, std.mem.asBytes(&one)) catch |err| std.log.debug("[Server] setsockopt TCP_NODELAY: {}", .{err});
+        // Raw `std.c.setsockopt`, not `std.posix.setsockopt`: stable 0.17's
+        // posix wrapper answers EINVAL with `unreachable` (posix.zig:1083),
+        // and accept churn produces EINVAL on macOS — a Debug panic a tuning
+        // best-effort must not be able to cause. Same pattern as
+        // `sockread.writeFull` (std.Io answers timed-out sends with
+        // unreachable too); failures land in the debug log.
+        tuneSockOpt(fd, std.c.SOL.SOCKET, std.c.SO.RCVBUF, std.mem.asBytes(&rcvbuf), "RCVBUF");
+        tuneSockOpt(fd, std.c.SOL.SOCKET, std.c.SO.SNDBUF, std.mem.asBytes(&sndbuf), "SNDBUF");
+        tuneSockOpt(fd, std.c.IPPROTO.TCP, std.c.TCP.NODELAY, std.mem.asBytes(&one), "TCP_NODELAY");
         // SO_KEEPALIVE only: idle/probe timings are the OS defaults (Linux and
         // macOS both idle 7200 s, probe every 75 s) — TCP_KEEPIDLE/TCP_KEEPINTVL
         // are not set, and the per-platform constant names differ.
-        std.posix.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.KEEPALIVE, std.mem.asBytes(&one)) catch |err| std.log.debug("[Server] setsockopt KEEPALIVE: {}", .{err});
+        tuneSockOpt(fd, std.c.SOL.SOCKET, std.c.SO.KEEPALIVE, std.mem.asBytes(&one), "KEEPALIVE");
     }
 
     /// Stop the server. Safe to call from any thread, including while

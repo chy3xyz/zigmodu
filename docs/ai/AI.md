@@ -57,6 +57,7 @@ defer result.deinit(allocator);
 | Tool calling + ReAct `Agent` | `chatWith` / `tool_calls` ↔ `SkillRegistry` |
 | 协作式 skill 超时 | `Tool.timeout_ms` / `Agent.tool_timeout_ms` + `checkDeadline` |
 | `chatStream` SSE | `HttpClient.requestStream` + `data:` delta；流式 `tool_calls` 累积；失败缓冲回退 |
+| `stream_sse` DeltaSse | `AgentHooks.on_delta` → SSE `data:` JSON 事件（content / reasoning / tool / done）；参考实现 `examples/ai-ops` |
 | Memory 复合键 + 落盘 | `saveToFile` / `loadFromFile` |
 | HttpClient 出站 | `http://` 池化；`https://` 经 `std.http.Client`（系统 CA + TLS 1.3；HTTPS `requestStream` 真增量读循环） |
 | Prometheus 指标 | `AiProvider.Metrics` / `AgentMetrics` / `TokenQuota.toPrometheusFormat` |
@@ -122,22 +123,30 @@ ai_chat_svc.setSystemPrompt("你是一个有用的助手");
 
 ## 完整 main.zig 示例
 
+生成的 `AiChatApi` 是 ComptimeRouter 模块（`pub const routes`，无 `registerRoutes`），
+用 `scope.mountAll` 挂到服务器：
+
 ```zig
 const std = @import("std");
 const zigmodu = @import("zigmodu");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
     const ai_chat = @import("modules/ai/chat/module.zig");
-    var backend = zigmodu.data.SqlxBackend.init(allocator, "sqlite://app.db");
+    var db_client = zigmodu.data.Client.init(allocator, io, .{
+        .driver = .sqlite,
+        .sqlite_path = "app.db",
+    });
+    defer db_client.deinit();
+    try db_client.connect();
+    var backend = zigmodu.data.SqlxBackend{ .allocator = allocator, .client = &db_client };
     var ai_chat_p = ai_chat.persistence.AiChatPersistence.init(backend);
     var ai_chat_svc = ai_chat.service.AiChatService.init(allocator, &ai_chat_p);
 
     // Provider
-    var http_client = zigmodu.http.HttpClient.init(allocator, std.testing.io, 10, 30000);
+    var http_client = zigmodu.http.HttpClient.init(allocator, io, 10, 30000);
     defer http_client.deinit();
     var ai_provider = ai_chat.provider.AiProvider.init(
         allocator, &http_client,
@@ -145,19 +154,26 @@ pub fn main() !void {
         "Bearer sk-your-key", "deepseek-v4-flash",
     );
     defer ai_provider.deinit();
-    try ai_provider.enableRateLimit(std.testing.io, 60);
+    try ai_provider.enableRateLimit(io, 60);
     ai_chat_svc.setProvider(&ai_provider);
     ai_chat_svc.setSystemPrompt("你是一个有用的助手");
 
     // Memory（可选）
-    var memory = zigmodu.ai.MemoryStore.init(allocator, std.testing.io);
+    var memory = zigmodu.ai.MemoryStore.init(allocator, io);
     defer memory.deinit();
     ai_chat_svc.setMemory(&memory);
 
-    // 服务器
-    var server = zigmodu.http.Server.init(allocator, std.testing.io, 8080);
+    // 服务器：scope.mountAll 挂模块（鉴权接线见 docs/reference/ROUTE_TABLE.md §7）
+    var server = zigmodu.http.Server.init(io, allocator, 8080);
+    defer server.deinit();
     var ai_chat_api = ai_chat.api.AiChatApi.init(&ai_chat_svc);
-    try ai_chat_api.registerRoutes(&server.root);
+    const AppState = struct {};
+    var app_state: AppState = .{};
+    var router = zigmodu.http.Router(AppState).init(io, allocator, &server, &app_state);
+    defer router.deinit();
+    try router.scope("").mountAll(.{
+        .{ .Mod = @TypeOf(ai_chat_api), .state = &ai_chat_api },
+    });
     try server.start();
 }
 ```
@@ -284,15 +300,49 @@ defer kr.asRetriever().free(allocator, chunks);
 
 ## 流式 vs 非流式
 
+### Scaffold ai_chat 模块（`--with-aichat`）
+
 ```zig
 // 非流式 — 直接返回完整 JSON
 const msg = try ai_chat_svc.send(conv_id, "你好", null);
 
-// 流式 SSE — 逐字输出
+// 流式 SSE — 逐字输出（对应生成的 POST /ai/chat/stream 路由）
 var sse = try zigmodu.http.SseWriter.init(ctx);
 const msg = try ai_chat_svc.send(conv_id, "讲个故事", &sse);
 try sse.done();
 ```
+
+### 框架层：Agent + `ai.stream_sse`（不经过 scaffold）
+
+`Agent.run` 的 ReAct 循环已经把 provider delta 推到 `hooks.on_delta`；
+`ai.stream_sse.DeltaSse(W)` 把这个回调直接桥接到 `SseWriter`/`SseRecorder`，
+每个 delta 一条 `data:` JSON 事件（union tag 即事件类型：content / reasoning /
+tool / done）。参考实现见 `examples/ai-ops`（`POST /api/ai/chat/stream`，
+含 in-process mock LLM 的端到端测试）：
+
+```zig
+var sse = try zigmodu.http.sse(ctx);
+var bridge = ai.stream_sse.DeltaSse(@TypeOf(sse)).init(allocator, &sse);
+agent.hooks.ctx = &bridge;
+agent.hooks.on_delta = @TypeOf(bridge).onDelta;
+
+var result = try agent.run(allocator, goal, &skill_ctx, 8);
+defer result.deinit(allocator);
+// 可选：delta 流之后发一个聚合答案信封
+try sse.sendData(try std.json.Stringify.valueAlloc(allocator, .{
+    .answer = result.answer, .steps = result.steps,
+}, .{}));
+try sse.done();
+```
+
+事件格式（`DeltaEvent`，`src/ai/stream_sse.zig`）：
+
+| `data:` 载荷 | 时机 |
+|---|---|
+| `{"content":{"delta":"Hel"}}` | 每个内容增量 |
+| `{"reasoning":{"delta":"…"}}` | 推理模型思维链增量 |
+| `{"tool":{"name":"lookup","arguments_delta":"{…"}}` | 流式 tool_calls 片段 |
+| `{"done":{}}` + SSE `event: done` | 上游 `[DONE]` |
 
 ## SSE API 参考
 
@@ -398,7 +448,7 @@ try scheduler.start();
 defer scheduler.stop();
 
 // 3) 打包能力（调度器 + 可排程任务白名单）并注册 schedule skills
-var sched_ctx = ai.ScheduleCtx{ .scheduler = &scheduler, .tasks = &tasks };
+var sched_ctx = ai.schedule.ScheduleCtx{ .scheduler = &scheduler, .tasks = &tasks };
 try ai.registerScheduleSkills(&registry);
 // 每次 dispatch/run 前：skill_ctx.userdata = @ptrCast(&sched_ctx)
 
@@ -409,12 +459,12 @@ try ai.registerScheduleSkills(&registry);
 ```
 
 内置业务 skill（`db.query` / `entity.lookup` / `entity.list`，只读参数化 SQL +
-实体白名单 + 租户隔离）见 [docs/AI_SKILLS.md](./AI_SKILLS.md)。
+实体白名单 + 租户隔离）见 [AI_SKILLS.md](./AI_SKILLS.md)。
 
 要点：
 
 - `Scheduler` 是线程化的：`start()` 起后台线程，每秒 tick 一次，按分钟粒度触发 cron 任务；`addJob` 与 `tick` 互斥保护，可随时加任务。
 - `schedule_job` 只接受**已注册任务名 + cron 表达式**；未知任务返回 `error.TaskNotFound`。
-- 另一个方向（cron → AI）：`Scheduler` 的 task 里直接同步调用 `AiProvider.chat/chatStream` 即可（如定时摘要）；注意 HTTP 出站在线程内的 io 使用约束（见 ZIGMODU_NOTES 第 3 条）。
+- 另一个方向（cron → AI）：`Scheduler` 的 task 里直接同步调用 `AiProvider.chat/chatStream` 即可（如定时摘要）；注意 HTTP 出站在线程内的 io 使用约束（见 [ZIGMODU_NOTES.md](../archive/status/ZIGMODU_NOTES.md) 第 3 条）。
 - `ScheduledTask.TaskScheduler`（旧占位实现）**已移除**；调度统一走
   `Scheduler`（线程化）与 `zigmodu.ai.registerScheduleSkills` 技能桥。

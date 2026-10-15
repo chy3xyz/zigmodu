@@ -90,6 +90,111 @@ noise.
    撤销（A-3 双 key 窗）、裸奧行为显式化——评审要求的「未实现能力清楚标注」已满足，
    无需新增。发布节奏（评审另一建议）亦已由批 158 的 S1 约定覆盖。
 
+### 第 175 批：LLM 流式 SSE 服务端接线——stream_sse 适配器 + ai-ops 示例 + scaffold 补 stream 路由（**破坏性：否；纯新增**）
+
+出站流式（`AiProvider.chatStream`，SSE `data:` 解析 + tool_calls 增量合并 + 缓冲回退）
+此前已完整；缺的是把 delta 推到浏览器的服务端组件。三处补齐：
+
+1. **New framework module `src/ai/stream_sse.zig`** (exported as
+   `zigmodu.ai.stream_sse`): `DeltaSse(W)` adapts `AgentHooks.on_delta` to any
+   SSE sink (`SseWriter` on a live socket, `SseRecorder` in tests). Each
+   `StreamDelta` becomes one `data:` JSON event whose union tag is the event
+   type (`content` / `reasoning` / `tool` / `done`); the terminal delta also
+   emits the SSE-level `done` event. Writer errors propagate to the agent
+   loop instead of being swallowed. Unit-tested (wire format, empty-fragment
+   skip, error propagation) and registered in `src/tests.zig`.
+2. **`examples/ai-ops` gains `POST /api/ai/chat/stream`**: JSON body
+   `{"message":"…"}` → agent run with the delta bridge → final
+   `{"answer","steps","model"}` envelope → `done`. Upstream is env-configured
+   (`AI_BASE_URL`, optional `AI_API_KEY` / `AI_MODEL`); without it the stream
+   never starts and the endpoint answers 503 with plain JSON. Two new tests:
+   end-to-end SSE against an in-process mock LLM over a real socket, plus the
+   503 path. (Test-hygiene fixes landed with them: the mock accepts on a stop
+   flag — a handler failure can no longer hang the join — and the raw
+   requests carry the correct 16-byte Content-Length; a short CL leaves an
+   unread byte that macOS turns into RST and the response is discarded.)
+3. **Scaffold `--with-aichat` api template now emits the documented
+   `POST /ai/chat/stream` route** (`streamMessage`): the tools blurb and
+   `docs/ai/AI.md` promised it, and `AiChatService.send`'s third parameter is
+   the `?*SseWriter` the stream writes to — but the generated `routes` array
+   never exposed it (`sse_mod` was imported unused). The handler validates
+   before `SseWriter.init` flushes the response head; afterwards errors ride
+   the stream (`sse.sendError`). Generator test pins the emitted route.
+4. **Docs**: `docs/ai/AI.md`「流式 vs 非流式」split into the scaffold
+   (`--with-aichat`) surface and the framework-level Agent + `stream_sse`
+   pattern, with the `DeltaEvent` wire-format table and a pointer to
+   `examples/ai-ops`; 能力状态 table gains the `stream_sse` row.
+5. **Pre-existing master fix: `tuneSocket` no longer panics under accept
+   churn on Zig 0.17.0 stable.** Stable std's `std.posix.setsockopt` answers
+   EINVAL with `unreachable` (std/posix.zig:1083), and churn produces EINVAL
+   on macOS — the connection fiber crashed the whole process from a
+   best-effort socket tuning. `Server.tuneSocket` now calls `std.c.setsockopt`
+   directly (same pattern as `sockread.writeFull`, whose std.Io counterpart
+   also panics on timeout errnos) and logs non-SUCCESS returns at debug
+   level. Fixes the permanently-red
+   `api.Server.test.stop() during accept churn…` on macOS + 0.17.0 stable
+   (verified failing on clean master before this change, green after).
+
+### 第 176 批：批 175 同类落差普查修复——scaffold P0 三件套 + Dashboard 真数据 + kpi 租户壳 + 文档死链清扫（**破坏性：否；scaffold 模板行为修正 + 文档对齐**）
+
+对「文档/模板承诺 ↔ 代码接线」做五域普查（AI/scaffold/HTTP/Runtime/示例文档），
+按批 175 同款样板修掉确认项：
+
+1. **scaffold `--with-events` 事件链真接线**：原状是 service 模板 `publish` 对 null
+   bus 静默丢弃 + 生成 main 的 EventBus 类型与各模块 Event union 不匹配 +
+   `shared/events.zig` 生成后无人 import（三连空转）。改为每模块自带
+   `<Module>Event` union（service.zig 内），生成 main 为每模块接一根类型匹配的
+   `ThreadSafeEventBus`；删掉无消费者的 shared/events.zig 生成。生成器测试钉住
+   接线。
+2. **scaffold `--with-websocket` 认证接线 + README 对齐**：`ImGateway.verifier`
+   改为 `setVerifier(ctx, fn)` 形态，`--with-auth` 生成块接
+   `im_gw.setVerifier(&app_sec, &wsBearerVerify)`（原来教消费方 `?userId=` 快速
+   开始而代码明确拒读、且无任何接线路径——快速开始 100% 失败）。README 改写为
+   如实描述（默认拒 upgrade、Bearer 接入、cleanup 只启动调一次、ext/ 已被禁用）。
+3. **scaffold `--with-aichat` 补真 `deleteConversation`**：原 handler 是
+   `_ = self; wrapSuccess` 假成功 stub；生成的 AiChatService 补
+   `deleteConversation(id) !bool`（真删 + 404 语义），handler 直通。
+4. **scaffold web4 模板租户/用户身份改走 JWT attr**：4 个 handler 从
+   `ctx.queryInt(i64, "tenantId", 0)`（客户端可篡改，违反自家 AGENTS.md 规则）
+   改为 `ctx.tenantId()` / `requireUserIdInt`；service 层补
+   `insertUnscoped` + `findByIdForTenant` / `findPageForTenant` 租户作用域。
+5. **b22 审计 pattern 扩展**（tools/zmodu/src/audit.zig）：从只认
+   `tenant_source = .query` 字面值扩到 `queryInt/queryStr` 取
+   tenantId/tenant_id/userId/user_id 的八种形状——旧 pattern 拦不住自家 web4
+   模板的违规形状，「生成器 + 审计」曾给虚假安全感。附正/反例测试。
+6. **`kpi.query` 租户 fail-closed**（src/ai/kpi.zig）：内置技能里最后一个没有
+   租户壳的。`KpiMetric` 新增 `tenant_sql`（单 `?` 占位符绑调用方租户）；
+   带租户 dispatch 只跑 `tenant_sql`，未声明即 `error.TenantScopeRequired`
+   拒答（对齐 approval_api tenantMatches 口径）。新测试覆盖跨租户隔离与拒答；
+   `AI_SKILLS.md` 说明同步。
+7. **Dashboard 数据真接线**（src/http/Dashboard.zig + Profiles.zig）：
+   `system_info` 此前全框架零写入者、`handleStats` 硬编码 routes=15/
+   middleware=8、HTML 广告不存在的 `/health/modules`。新增 `DataSource`
+   （server / http_metrics / modules 三个 feed），`registerRoutesWith` 把
+   feed 经 user_data 传入；stats 每次请求实时数 `listRoutes()` + 中间件链长，
+   接 metrics collector 时出 http 计数块；`productionProfile` 自动接 server +
+   collector。HTML 从坏掉的 HTMX hx-get（页面常年显示 `{d}` 占位符）改 Alpine
+   轮询真值。未接线时诚实报 0（假数据清零属行为修正）。导出口径写入
+   OBSERVABILITY.md。
+8. **`Clock.nowUs` 删除**（src/runtime/clock.zig）：死导出且语义错误
+   （毫秒 × 1000 冒充微秒），调用方会拿到垃圾 lateness 读数。
+9. **master 先存崩溃修复（批 175 已含）之后的文档清扫**：`docs/ai/AI.md`
+   完整 main 示例重写（原三处签名错误照抄编译不过：Server.init 实参序、
+   不存在的 registerRoutes、私有 server.root）；删除已随示例消失仍被文档
+   当作现状的 `GET /api/ai/runs` 陈述；examples ↔ docs 死链 26 处修复
+   （check-doc-paths 只查引用不查 markdown 链接，是门禁盲区，已人工复扫归零）；
+   zent 版本号三处对齐实际 pin v0.86.0（含「不再需要 sibling 检出」前提重写）；
+   tenant-mgmt README 失实声明修正（dashboard 占位如实标注、三条不存在的
+   api/dashboard 端点替换为真实端点、版本自述、中间件顺序、File Count 24→30）；
+   RUNTIME.md §8 指标数 25 → 37（13 通用 + 15 池化含公平性 6 + 9 阻塞池），
+   §12.10 历史数字加前向注；根 README gauges 31→37 自相矛盾修正。
+
+验证：tools/zmodu 全量测试（含 b22 新正反例、events/verifier 生成器断言）；
+框架 -Dtest-filter 分组（kpi 4/4、dashboard 8/8、Profiles 5/5、DocSnippet 9/9）；
+fmt / deadcode（基线内，Clock.nowUs 移除后可 --update 收缩）/ doc-paths 491 /
+version / tenant-scope / pool-guard / test-collection / check-api / check-production
+全绿；全量 test-fast 见提交时聚合行。
+
 ## [0.39.11] - 2026-10-12
 
 ### 第 154 批：文档数字漂移修正（死代码基线 / test artifact 数 / runtime gauge 数）（**破坏性：否**）

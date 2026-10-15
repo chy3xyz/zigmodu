@@ -31,13 +31,6 @@ pub const Clock = union(enum) {
         };
     }
 
-    pub fn nowUs(self: Clock) i64 {
-        return switch (self) {
-            .monotonic => Time.monotonicNowMilliseconds() * 1000,
-            .manual => |m| m.now_ms * 1000,
-        };
-    }
-
     /// Test-only handle. Production code should use `.monotonic`.
     pub const Manual = struct {
         now_ms: i64 = 0,
@@ -64,7 +57,6 @@ test "Clock: monotonic advances, manual only when told" {
     var manual = Clock.Manual{ .now_ms = 1_000 };
     const c = manual.clock();
     try std.testing.expectEqual(@as(i64, 1_000), c.nowMs());
-    try std.testing.expectEqual(@as(i64, 1_000_000), c.nowUs());
     manual.advance(500);
     try std.testing.expectEqual(@as(i64, 1_500), c.nowMs());
     manual.set(0);

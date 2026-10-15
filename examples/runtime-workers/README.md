@@ -19,7 +19,7 @@ runtime docs warn about is visible in its output.
 ## Which worker is pooled, and why that one
 
 Only **`audit`** — the fan-out target at the end of the `HotBus`, with a metrics
-sink next to it. `docs/RUNTIME.md` §12.5 draws the boundary:
+sink next to it. `docs/reference/RUNTIME.md` §12.5 draws the boundary:
 
 - **message-driven** (`pub const Message` + `handle`): a `run`-owned worker could
   never be pooled, because its own loop would occupy the pool thread it was
@@ -32,7 +32,7 @@ sink next to it. `docs/RUNTIME.md` §12.5 draws the boundary:
 
 `main` declares the pool with `withMaxPooledWorkers(1)` on the app builder. That
 declaration is not decoration: `.pooled` without one is refused at `spawn`, and
-the declared bound is what sizes the ready ring (`docs/RUNTIME.md` §12.10).
+the declared bound is what sizes the ready ring (`docs/reference/RUNTIME.md` §12.10).
 
 ## How you know the pool was really used
 
@@ -100,5 +100,5 @@ instead of a sleep. `dropped_full` counts messages the *feed* could not enqueue;
 the marker itself is sent with `sendBlocking` so it cannot be the one that is
 dropped.
 
-Runtime concepts and their contracts: [`docs/RUNTIME.md`](../../docs/RUNTIME.md).
+Runtime concepts and their contracts: [`docs/reference/RUNTIME.md`](../../docs/reference/RUNTIME.md).
 The next stage of this pipeline lives in [`examples/alpha-engine`](../alpha-engine/).

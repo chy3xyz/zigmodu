@@ -1,8 +1,8 @@
 # Multi-Tenant Management System — ZigModu Best Practice Demo
 
-A complete multi-tenant SaaS management system built with **ZigModu v0.25.0** / **Zig 0.17**, demonstrating framework best practices. This is the **flagship runnable example** (see `scripts/ci-integration.sh`).
+A complete multi-tenant SaaS management system built with **ZigModu v0.39.11** / **Zig 0.17**, demonstrating framework best practices. This is the **flagship runnable example** (see `scripts/ci-integration.sh`).
 
-> **多租户是可选项。** 本示例演示 Tenant → JWT → DataPermission 中间链 + 表级 `tenant_id` 隔离。单租户应用可省略租户中间件，见 [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md) § Multi-Tenancy (Optional) 与 [`examples/basic/`](../basic/)。
+> **多租户是可选项。** 本示例演示 Tenant → JWT → DataPermission 中间链 + 表级 `tenant_id` 隔离。单租户应用可省略租户中间件，见 [`docs/reference/ARCHITECTURE.md`](../../docs/reference/ARCHITECTURE.md) § Multi-Tenancy (Optional) 与 [`examples/basic/`](../basic/)。
 
 ## Architecture
 
@@ -44,14 +44,14 @@ src/modules/
 | **Module System** | 3 modules, each with 6 standardized files |
 | **Comptime Generics** | `TenantService(comptime Persistence: type)` |
 | **Tenant Isolation** | All queries scoped by `tenant_id`; tenant context from JWT `aud` or `X-Tenant-ID` header (never URL query) |
-| **Error Handling** | RFC 7807 Problem Details via `zigmodu.sendProblem()` |
+| **Error Handling** | 统一错误信封 `ctx.sendErrorResponse(code, 0, msg)`；新应用默认 RFC 7807（`http.useRfc7807Errors` + `http.respondErr`） |
 | **Middleware Chain** | JWT(+role→perm) → Tenant resolution → ModuleGate → PermissionGate(rbac) → DataPermission |
-| **API Versioning** | `/api/v1/` prefix with RouteGroup |
+| **API Versioning** | `/api/v1/` prefix via `router.scope("/api/v1")` |
 | **ComptimeRouter** | All 3 modules: `routes` + `mountAll`; catalog drives JWT/ModuleGate/PermissionGate |
 | **RBAC** | `RolePermissionTable` (or `CatalogPermDb` for SQLite): JWT role → permission codes |
 | **OpenAPI** | Live `openApiFromCatalog` → `GET /openapi.json` |
 | **Health Probes** | `/health/live` for K8s liveness |
-| **Dashboard** | Interactive HTMX + Alpine.js + TailwindCSS dashboard at `/dashboard` |
+| **Dashboard** | `/dashboard` 占位文本路由；`productionProfile` 内建仪表盘本示例显式关闭（`.dashboard = false`） |
 | **Business Enums** | Type-safe `TenantTier`, `UserRole`, `SubscriptionStatus` |
 | **Lifecycle** | `scanModules` → `validateModules` → `startAll` / `stopAll` |
 | **Dependency Injection** | Persistence → Service → API chain assembly |
@@ -68,7 +68,7 @@ export HTTP_PORT=18080
 export JWT_SECRET=dev-secret          # HS256 signing key (AppSecurity + wall clock)
 export TENANT_MGMT_SQLITE=:memory:   # or path to file
 
-# 3. Run (sqlite-only by default via -Ddb=; see docs/SQLX_DRIVERS.md)
+# 3. Run (sqlite-only by default via -Ddb=; see docs/guide/SQLX_DRIVERS.md)
 zig build -Ddb=sqlite run
 # → Server starts on http://localhost:18080
 
@@ -121,11 +121,11 @@ Tenant context comes from JWT `aud` or the `X-Tenant-ID` header (never `?tenant_
 ### System
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/health/live` | K8s liveness probe |
-| `GET` | `/dashboard` | Interactive monitor dashboard |
-| `GET` | `/api/dashboard/modules` | Module list JSON |
-| `GET` | `/api/dashboard/stats` | System statistics JSON |
-| `GET` | `/api/dashboard/system` | System info JSON |
+| `GET` | `/health/live` | K8s liveness probe（productionProfile 挂出） |
+| `GET` | `/health/ready` | Readiness probe（productionProfile 挂出） |
+| `GET` | `/metrics` | Prometheus 黄金信号（productionProfile 挂出） |
+| `GET` | `/openapi.json` | OpenAPI live from catalog |
+| `GET` | `/dashboard` | 占位文本路由（非交互仪表盘） |
 
 ## Production Deployment
 
@@ -133,7 +133,7 @@ Tenant context comes from JWT `aud` or the `X-Tenant-ID` header (never `?tenant_
 # Docker
 docker compose -f ../../docker-compose.yml up -d
 
-# Or standalone binary (sqlite-only — see docs/SQLX_DRIVERS.md)
+# Or standalone binary (sqlite-only — see docs/guide/SQLX_DRIVERS.md)
 zig build -Doptimize=ReleaseSafe -Ddb=sqlite
 ./zig-out/bin/tenant-mgmt
 ```
@@ -141,14 +141,18 @@ zig build -Doptimize=ReleaseSafe -Ddb=sqlite
 ## File Count
 
 ```
-24 files total:
-  6 files/tenant module    (model, persistence, service, api, module, root)
+30 files total (excluding .DS_Store):
+  6 files/tenant module       (model, persistence, service, api, module, root)
   6 files/user module
   6 files/subscription module
-  1 business enums
-  1 middleware
+  2 db wiring                 (src/db/backend.zig, src/db/schema.zig)
+  1 business enums            (src/business/enums.zig)
+  1 middleware                (src/middleware/root.zig)
   1 main.zig
-  1 build.zig + build.zig.zon
+  1 tests.zig                 (module graph + routed catalog)
+  1 build.zig + 1 build.zig.zon
   1 init.sql
   1 README.md
+  1 .env.example
+  1 .zmodu/audit-baseline.json
 ```

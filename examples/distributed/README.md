@@ -15,7 +15,7 @@ the cross-node pub/sub transport.
 
 The cluster stack (membership, election, `ClusterView` read path, deployment
 checklist) lives in the framework and is documented in
-[`docs/DISTRIBUTED.md`](../../docs/DISTRIBUTED.md). This example is the
+[`docs/reference/DISTRIBUTED.md`](../../docs/reference/DISTRIBUTED.md). This example is the
 smallest thing that exercises the bus, not a cluster you can run.
 
 ## Multi-node topology — and why it does not start
@@ -38,7 +38,7 @@ the topology:
 Raft transport is a stub (`sendVoteRequest` is an empty function,
 `sendAppendEntries` always returns `false`), so `raft_cluster_size > 1` makes
 `start()` return `error.RaftTransportUnavailable` instead of electing a leader
-nobody voted for (`docs/DISTRIBUTED.md`, section on the fail-closed multi-node
+nobody voted for (`docs/reference/DISTRIBUTED.md`, section on the fail-closed multi-node
 start — the English summary of the same rule is under *Multi-node* in its
 production checklist). Two supported ways out:
 

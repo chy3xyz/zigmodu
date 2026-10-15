@@ -418,16 +418,17 @@ var bridge = try zigmodu.runtime.Runtime.MetricsBridge(PrometheusMetrics).init(&
 metrics.setScrapeHook(@TypeOf(bridge).sample, &bridge);
 ```
 
-它注册 **25** 条 `zigmodu_runtime_*` 指标：通用的 13 条（`workers` / `running` / `messages_sent` /
+它注册 **37** 条 `zigmodu_runtime_*` 指标：通用的 13 条（`workers` / `running` / `messages_sent` /
 `messages_received` / **`messages_dropped`** / **`messages_discarded_on_stop`** / `handler_errors` /
 `timer_fires` / **`timers_discarded`** / **`timer_deliveries_dropped`** / **`timer_lag_ms`** /
 **`supervised_stops`** / **`group_restarts`**（后两条是 §14 的监督读数）），
-加上池化执行（§12）的 9 条：
+加上池化执行（§12）的 15 条：
 `pool_declared` / `pool_threads` / `pool_ready_len` / `pool_claimed` / `pool_dispatches` /
 `pool_ready_push_failures`（上表 6 条）+ 就绪环分档那 3 条
-`pool_ready_len_low` / `pool_ready_len_normal` / `pool_ready_len_high`，
-再加上**阻塞池**那 9 条（同名加 `blocking_` 前缀；
-没声明阻塞池时读 0，见 §12）。计数口径 = 唯一 gauge 名字（`grep -o '"zigmodu_runtime_[a-z_0-9]*"' src/runtime/*.zig | sort -u | wc -l`）。名字里没有 `_total` 后缀是刻意的：这些是**抓取时采样**的快照，
+`pool_ready_len_low` / `pool_ready_len_normal` / `pool_ready_len_high` + 公平性那 6 条
+`pool_wait_max_ms_{high,normal,low}` / `pool_starvation_events_{high,normal,low}`（§12.17，只测 CPU 池），
+再加上**阻塞池**那 9 条（同名加 `blocking_` 前缀，主 6 条 + 分档 3 条，无公平性读数；
+没声明阻塞池时读 0，见 §12）。计数口径 = 唯一 gauge 名字（`grep -o '"zigmodu_runtime_[a-z_0-9]*"' src/runtime/*.zig | sort -u | wc -l`，当前输出 37）。名字里没有 `_total` 后缀是刻意的：这些是**抓取时采样**的快照，
 所以走 gauge 而不是 counter（`PrometheusMetrics.Counter` 没有 `set`）。
 
 `supervised_stops` 与 `messages_discarded_on_stop` 是**两条曲线**：前者是"一个成员被框架停掉了"
@@ -447,7 +448,9 @@ metrics.setScrapeHook(@TypeOf(bridge).sample, &bridge);
 worker 先停（邮箱关闭）、定时器随后到点，于是它跳一次 —— 而 `messages_dropped` 不动，因为没有任何
 生产者在挨背压。持续增长则是另一回事：目标邮箱长期满着，定时器在往一个跟不上的 worker 上投活儿。
 
-**池的 9 条读什么**（下表列主 6 条，分档那 3 条 `pool_ready_len_{low,normal,high}` 是就绪环深度的健康分位；§12.10 那句"`zigmodu_runtime_*` 里没有池的指标"已经作废）：
+**池的 15 条读什么**（下表列主 6 条；分档那 3 条 `pool_ready_len_{low,normal,high}` 是就绪环深度的健康分位；
+公平性 6 条 `pool_wait_max_ms_*` / `pool_starvation_events_*` 见 §12 引言的第 158 批注；
+§12.10 那句"`zigmodu_runtime_*` 里没有池的指标"已经作废）：
 
 | 指标 | 含义 | 怎么读 |
 |------|------|--------|
@@ -458,7 +461,7 @@ worker 先停（邮箱关闭）、定时器随后到点，于是它跳一次 —
 | `pool_dispatches` | 池线程跑过的批次总数 | **有 `.pooled` spawn 却是 0 = 那些 worker 从没到过池线程** |
 | `pool_ready_push_failures` | 等过整个自旋/让出预算的 push 数（每次调用计一次；token **未丢**，随后睡眠重试到落地） | **必须恒为 0**。见 §5 第 4 条与 §12.18：这不是背压也不是丢 token，是宿主把出队窗口持有者抢占了 ~100ms 以上 |
 
-没有池的 runtime 这 9 条**报 0 而不是缺行**：`pool_declared=0` 本身就是"这里没人声明过池"的答案，
+没有池的 runtime 这 15 条**报 0 而不是缺行**：`pool_declared=0` 本身就是"这里没人声明过池"的答案，
 仪表盘不必为它写特例。
 
 **为什么必须有这一步**：`messages_dropped` 与 `timer_lag_ms` 只在这里出现 —— 邮箱打满、定时器被饿死
@@ -804,8 +807,9 @@ B 仍然被服务，只是要等 A 那一批跑干。所以小 batch 换吞吐�
   `b.withMaxPooledWorkers(4).withBlockingThreads(2, 7)`（参数是 `blocking_threads` 与
   `max_blocking_workers`，与 `Config` 上的字段同名）。**不声明就没有阻塞池**：`.blocking` 在 `spawn`
   时被拒，与 `.pooled` 缺 `max_pooled_workers` 是同一种拒绝（§12.8 D2）。
-- **可观测性**：`MetricsBridge` 为阻塞池发布**同样六条**独立指标
-  （`zigmodu_runtime_blocking_pool_*`），与 CPU 池的六条并列。没声明阻塞池时它们是 0 ——
+- **可观测性**：`MetricsBridge` 为阻塞池发布**同样 9 条**独立指标
+  （主 6 条 + 就绪环分档 3 条，`zigmodu_runtime_blocking_pool_*`；公平性 6 条只测 CPU 池），
+  与 CPU 池的并列。没声明阻塞池时它们是 0 ——
   "这个 app 没有阻塞池"是仪表盘能画出来的答案，不是一条缺失的线。读侧对应 `blockingPoolStats()`。
   注意 `pool_threads` 是**正在跑的**线程数（声明后仍为 0，直到第一条 `.blocking` spawn 把池拉起来），
   **声明的宽度**看 `max_pooled_workers`（= `blocking_threads`/`max_blocking_workers` 里那个上界）。
@@ -1053,7 +1057,8 @@ dedicated 加"抽干后再停"，两者都是会动到 D5 那条回执出口的�
    并在 `dispatched == 0` / `push_failures != 0` 时**以非零退出码失败** —— 也就是说这一环不再是
    "编译过就算数"，而是每次 `zig build run` 都验证一遍：单测过 ≠ 真跑过。
    （`audit.state.kept` 在池化后仍是**运行中**的瞬时读数，不要当全量。）
-2. **池进了 Prometheus**：§8 的那 9 条 `zigmodu_runtime_pool_*`。`pool_dispatches` 是"池真的被用了"
+2. **池进了 Prometheus**：§8 的那批 `zigmodu_runtime_pool_*`（Phase 1 时 9 条，第 158 批
+   加公平性后 15 条，见 §12 引言注）。`pool_dispatches` 是"池真的被用了"
    的远程可读证据，`pool_ready_push_failures` 是"必须恒 0"的契约读数。
 3. **`zmodu runtime` 认识了池的两种写法**：`.max_pooled_workers = N` 与 `withMaxPooledWorkers(N)`
    各报一条带 `file:line` 的事实，外加"有几条 spawn 写了 `.mode = .pooled`"。仍然只报看得见的事实：

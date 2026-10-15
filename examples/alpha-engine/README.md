@@ -207,10 +207,10 @@ cross-module file import fails there too.
 ## Scope
 
 - Runtime concepts (mailboxes, backpressure, timers, supervision, HotBus):
-  [`docs/RUNTIME.md`](../../docs/RUNTIME.md)
+  [`docs/reference/RUNTIME.md`](../../docs/reference/RUNTIME.md)
 - Agent authority, the two guard axes, and the proposal pipeline:
-  [`docs/AGENT_RUNTIME.md`](../../docs/AGENT_RUNTIME.md)
+  [`docs/reference/AGENT_RUNTIME.md`](../../docs/reference/AGENT_RUNTIME.md)
 - Module boundaries and the five-file layout:
-  [`docs/MODULITH.md`](../../docs/MODULITH.md)
+  [`docs/guide/MODULITH.md`](../../docs/guide/MODULITH.md)
 - The smaller fan-out + supervision companion example:
   [`examples/runtime-workers`](../runtime-workers/)

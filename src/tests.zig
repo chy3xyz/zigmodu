@@ -283,6 +283,7 @@ test "compile all source files" {
     _ = @import("ai/module.zig");
     _ = @import("ai/skill.zig");
     _ = @import("ai/agent.zig");
+    _ = @import("ai/stream_sse.zig");
     _ = @import("ai/schedule.zig");
     _ = @import("ai/business.zig");
     _ = @import("ai/actions.zig");

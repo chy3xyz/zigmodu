@@ -78,6 +78,9 @@ pub const default_system_prompt = @import("agent.zig").default_system_prompt;
 pub const AgentResult = @import("agent.zig").AgentResult;
 /// Run callbacks: per-step, per-tool-call, and on-error hooks.
 pub const AgentHooks = @import("agent.zig").AgentHooks;
+/// `AgentHooks.on_delta` → SSE adapter: streamed deltas as `data:` JSON events
+/// on an `SseWriter`/`SseRecorder` (see `examples/ai-ops` for the handler).
+pub const stream_sse = @import("stream_sse.zig");
 /// Per-agent counters: runs, steps, tool calls, errors, denials, budget.
 pub const AgentMetrics = @import("agent.zig").AgentMetrics;
 /// Hook that decides whether a specific tool call may execute.

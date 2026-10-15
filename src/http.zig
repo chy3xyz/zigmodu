@@ -378,6 +378,10 @@ pub const IdempotencyConfig = @import("http/Idempotency.zig").IdempotencyConfig;
 pub const SystemInfo = @import("http/Dashboard.zig").SystemInfo;
 /// Registers the dashboard routes on a router.
 pub const dashboardRoutes = @import("http/Dashboard.zig").registerRoutes;
+/// Registers the dashboard routes with a real data feed (`DataSource`).
+pub const dashboardRoutesWith = @import("http/Dashboard.zig").registerRoutesWith;
+/// Data feed for the dashboard (server / http metrics / module rows).
+pub const DashboardDataSource = @import("http/Dashboard.zig").DataSource;
 /// Sends an RFC 7807 problem document.
 pub const sendProblem = @import("http/ProblemDetails.zig").sendProblem;
 /// Same, with an explicit `type` URI.

@@ -65,7 +65,7 @@
 
 | Skill | 说明 | 注册 |
 |-------|------|------|
-| `kpi.query` | 查询应用注册的经营指标（`KpiCtx` 按名 + 可租户隔离） | `ai.kpi.registerKpiSkills` |
+| `kpi.query` | 查询应用注册的经营指标（`KpiCtx` 按名）；带 `tenant_id` 的 dispatch 只跑 `KpiMetric.tenant_sql`（单 `?` 绑租户），未声明则拒答（fail-closed，不回未隔离值） | `ai.kpi.registerKpiSkills` |
 | `approval.request` | 经应用注册的审批链提交审批（subject + amount），转人工入队 | `ai.approval_api.registerApprovalRequestSkills` |
 | `notification.send` | 向具名渠道投递通知（webhook / sink / outbox），渠道白名单 | `ai.notify.registerNotifySkills` |
 

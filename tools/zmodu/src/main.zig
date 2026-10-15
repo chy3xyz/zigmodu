@@ -1880,9 +1880,10 @@ fn generateAgentsMd(allocator: std.mem.Allocator, project_name: []const u8) ![]c
         \\src/shared/
         \\├── types.zig        # cross-module types
         \\├── errors.zig       # unified error codes
-        \\├── events.zig       # EventBus event catalog
         \\└── response.zig     # uniform API response wrapper
         \\```
+        \\(Event types live in each module's service.zig as `<Module>Event` —
+        \\ main.zig wires one `ThreadSafeEventBus` per module.)
         \\
         \\## Verify after every change:
         \\```zig build && zig build test```
@@ -6553,30 +6554,10 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
     defer allocator.free(shared_response_path);
     try safeWrite(io, allocator, shared_response_path, shared_response, gen_opts);
 
-    // shared/events.zig — event type catalog
-    if (gen_opts.enable_events) {
-        var evt_buf: std.ArrayList(u8) = .empty;
-        defer evt_buf.deinit(allocator);
-        try evt_buf.appendSlice(allocator,
-            \\//! Shared event catalog — typed events for cross-module messaging.
-            \\//! Used with zigmodu.EventBus(Event) for publish/subscribe.
-            \\pub const Event = union(enum) {
-            \\
-        );
-        for (module_names.items) |mod_name| {
-            const pascal = try toPascalCase(allocator, mod_name);
-            defer allocator.free(pascal);
-            try evt_buf.print(allocator, "    {s}Created: struct {{ id: i64 }},\n", .{pascal});
-            try evt_buf.print(allocator, "    {s}Updated: struct {{ id: i64 }},\n", .{pascal});
-            try evt_buf.print(allocator, "    {s}Deleted: struct {{ id: i64 }},\n", .{pascal});
-        }
-        try evt_buf.appendSlice(allocator, "};\n");
-        const shared_events = try evt_buf.toOwnedSlice(allocator);
-        defer allocator.free(shared_events);
-        const shared_events_path = try allocator.print("{s}/events.zig", .{shared_dir});
-        defer allocator.free(shared_events_path);
-        try safeWrite(io, allocator, shared_events_path, shared_events, gen_opts);
-    }
+    // No shared/events.zig: each module ships its own `<Module>Event` union in
+    // service.zig (the publish() call sites use), and main.zig wires one
+    // typed ThreadSafeEventBus per module. A second, unused catalog file
+    // drifted from both and confused more than it helped.
 
     // 11. Generate .env.example
     const env_example =
@@ -6839,6 +6820,13 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
         \\    pub fn init(b: data.SqlxBackend) AiChatPersistence { return .{ .backend = b, .orm = .{ .backend = b } }; }
         \\    pub fn convRepo(self: *AiChatPersistence) data.Repository(model.AiConversation) { return .{ .orm = &self.orm }; }
         \\    pub fn msgRepo(self: *AiChatPersistence) data.Repository(model.AiMessage) { return .{ .orm = &self.orm }; }
+        \\    /// Messages belong to their conversation: bulk-delete them first so
+        \\    /// a deleted conversation leaves no orphaned history behind.
+        \\    pub fn deleteMessagesByConversation(self: *AiChatPersistence, conv_id: i64) !u64 {
+        \\        var args = [_]data.sqlx.Value{.{ .int = conv_id }};
+        \\        const res = try self.backend.exec("DELETE FROM ai_message WHERE conversation_id = ?", &args);
+        \\        return res.rows_affected;
+        \\    }
         \\};
     , gen_opts);
 
@@ -6999,6 +6987,13 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
         \\        var repo = self.persistence.convRepo();
         \\        return try repo.insert(.{ .id = null, .title = title, .created_at = 0, .updated_at = 0 });
         \\    }
+        \\    /// Delete a conversation and its messages. Returns false when the id
+        \\    /// matched nothing, so the caller answers 404 instead of a hollow success.
+        \\    pub fn deleteConversation(self: *AiChatService, id: i64) !bool {
+        \\        _ = try self.persistence.deleteMessagesByConversation(id);
+        \\        var repo = self.persistence.convRepo();
+        \\        return (try repo.deleteByIdReturning(id)) > 0;
+        \\    }
         \\    pub fn validateMessage(_: *AiChatService, content: []const u8) !void { if (content.len == 0) return error.ValidationFailed; }
         \\};
     , gen_opts);
@@ -7024,6 +7019,7 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
         \\
         \\    pub const routes = [_]http.RouteSpec(State){
         \\        .{ .method = .POST, .path = "send", .handler = sendMessage },
+        \\        .{ .method = .POST, .path = "stream", .handler = streamMessage },
         \\        .{ .method = .GET, .path = "conversations", .handler = listConversations },
         \\        .{ .method = .GET, .path = "messages", .handler = listMessages },
         \\        .{ .method = .POST, .path = "conversations", .handler = createConversation },
@@ -7036,6 +7032,21 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
         \\        if (conv_id == 0) { try R.wrapErr(ctx, .validation_failed, "missing conversationId"); return; }
         \\        const result = self.service.send(conv_id, content, null) catch { try R.wrapErr(ctx, .server_error, "AI error"); return; };
         \\        try R.wrapOk(ctx, result);
+        \\    }
+        \\    /// SSE streaming: `SseWriter.init` flushes the response head, so from
+        \\    /// there on errors can only ride the stream (`sse.sendError`), no
+        \\    /// longer the JSON envelope. Validation therefore happens before it.
+        \\    fn streamMessage(ctx: *http.Context, self: *State) !void {
+        \\        const content = ctx.body orelse { try R.wrapErr(ctx, .validation_failed, "empty body"); return; };
+        \\        const conv_id = ctx.queryInt(i64, "conversationId", 0);
+        \\        if (conv_id == 0) { try R.wrapErr(ctx, .validation_failed, "missing conversationId"); return; }
+        \\        var sse = try sse_mod.SseWriter.init(ctx);
+        \\        _ = self.service.send(conv_id, content, &sse) catch {
+        \\            try sse.sendError("AI error");
+        \\            try sse.done();
+        \\            return;
+        \\        };
+        \\        try sse.done();
         \\    }
         \\    fn listConversations(ctx: *http.Context, self: *State) !void {
         \\        const page = ctx.queryInt(usize, "pageNo", 1);
@@ -7056,7 +7067,13 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
         \\        try R.wrapOk(ctx, conv);
         \\    }
         \\    fn deleteConversation(ctx: *http.Context, self: *State) !void {
-        \\        _ = self;
+        \\        const id = ctx.queryInt(i64, "id", 0);
+        \\        if (id == 0) { try R.wrapErr(ctx, .validation_failed, "missing id"); return; }
+        \\        const deleted = self.service.deleteConversation(id) catch {
+        \\            try R.wrapErr(ctx, .server_error, "delete failed");
+        \\            return;
+        \\        };
+        \\        if (!deleted) { try R.wrapErr(ctx, .not_found, "not found"); return; }
         \\        try R.wrapSuccess(ctx);
         \\    }
         \\};
@@ -7459,10 +7476,12 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
     defer allocator.free(mp);
     try safeWrite(io, allocator, mp,
         \\pub const Web4Identity = struct { pub const sql_table_name: []const u8 = "web4_identity";
+        \\    pub const sql_tenant_column: ?[]const u8 = "tenant_id";
         \\    id: ?i64 = null, tenant_id: i64, user_id: i64, did: []const u8, did_doc: []const u8,
         \\    public_key: []const u8, created_at: i64,
         \\};
         \\pub const Web4Invoice = struct { pub const sql_table_name: []const u8 = "web4_invoice";
+        \\    pub const sql_tenant_column: ?[]const u8 = "tenant_id";
         \\    id: ?i64 = null, tenant_id: i64, invoice_id: []const u8, payee_did: []const u8,
         \\    amount: i64, currency: []const u8, status: []const u8 = "pending",
         \\    tx_hash: ?[]const u8 = null, created_at: i64, paid_at: ?i64 = null,
@@ -7489,18 +7508,21 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
         \\pub const Web4Service = struct { persistence: *persistence.Web4Persistence, allocator: std.mem.Allocator, io: std.Io,
         \\    pub fn init(p: *persistence.Web4Persistence, a: std.mem.Allocator, i: std.Io) Web4Service { return .{ .persistence = p, .allocator = a, .io = i }; }
         \\    pub fn createIdentity(self: *Web4Service, tenant_id: i64, user_id: i64) !model.Web4Identity {
-        \\        var did_key = zigmodu.web4.DidKey.generate(self.allocator, self.io);
+        \\        var did_key = try zigmodu.web4.DidKey.generate(self.allocator, self.io);
         \\        const doc = try did_key.document(self.allocator); defer self.allocator.free(doc);
         \\        var repo = self.persistence.identityRepo();
-        \\        return try repo.insert(.{ .id = null, .tenant_id = tenant_id, .user_id = user_id, .did = did_key.did, .did_doc = doc, .public_key = "ed25519", .created_at = 0 });
+        \\        // tenant_id rides in from the verified JWT attr, so the
+        \\        // explicit Unscoped insert is the sanctioned shape (same
+        \\        // contract as the SQL scaffold's createXByTenant).
+        \\        return try repo.insertUnscoped(.{ .id = null, .tenant_id = tenant_id, .user_id = user_id, .did = did_key.did, .did_doc = doc, .public_key = "ed25519", .created_at = 0 });
         \\    }
         \\    pub fn createInvoice(self: *Web4Service, tenant_id: i64, amount: i64, currency: []const u8, payee_did: []const u8) !model.Web4Invoice {
         \\        var repo = self.persistence.invoiceRepo();
         \\        const inv_id = try self.allocator.print( "inv-{d}", .{@as(i64, @intCast(@intFromPtr(self)))}); defer self.allocator.free(inv_id);
-        \\        return try repo.insert(.{ .id = null, .tenant_id = tenant_id, .invoice_id = inv_id, .payee_did = payee_did, .amount = amount, .currency = currency, .created_at = 0 });
+        \\        return try repo.insertUnscoped(.{ .id = null, .tenant_id = tenant_id, .invoice_id = inv_id, .payee_did = payee_did, .amount = amount, .currency = currency, .created_at = 0 });
         \\    }
-        \\    pub fn getIdentity(self: *Web4Service, tenant_id: i64, user_id: i64) !?model.Web4Identity { var repo = self.persistence.identityRepo(); _ = tenant_id; return try repo.findById(user_id); }
-        \\    pub fn getInvoices(self: *Web4Service, tenant_id: i64, page: usize, size: usize) !zigmodu.data.orm.PageResult(model.Web4Invoice) { _ = tenant_id; var repo = self.persistence.invoiceRepo(); return try repo.findPage(page, size); }
+        \\    pub fn getIdentity(self: *Web4Service, tenant_id: i64, user_id: i64) !?model.Web4Identity { var repo = self.persistence.identityRepo(); return try repo.findByIdForTenant("tenant_id", tenant_id, user_id); }
+        \\    pub fn getInvoices(self: *Web4Service, tenant_id: i64, page: usize, size: usize) !zigmodu.data.orm.PageResult(model.Web4Invoice) { var repo = self.persistence.invoiceRepo(); return try repo.findPageForTenant("tenant_id", tenant_id, page, size); }
         \\};
     , gen_opts);
 
@@ -7531,14 +7553,20 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
         \\    };
         \\
         \\    fn createIdentity(ctx: *http.Context, self: *State) !void {
-        \\        const tid = ctx.queryInt(i64, "tenantId", 0);
-        \\        const uid = ctx.queryInt(i64, "userId", 0);
+        \\        const tid = (try requireTenant(ctx)) orelse return;
+        \\        const uid = ctx.userIdInt(i64) orelse {
+        \\            try R.wrapErr(ctx, .unauthorized, "user required");
+        \\            return;
+        \\        };
         \\        const ident = self.service.createIdentity(tid, uid) catch { try R.wrapErr(ctx, .server_error, "DID creation failed"); return; };
         \\        try R.wrapOk(ctx, ident);
         \\    }
         \\    fn getIdentity(ctx: *http.Context, self: *State) !void {
-        \\        const tid = ctx.queryInt(i64, "tenantId", 0);
-        \\        const uid = ctx.queryInt(i64, "userId", 0);
+        \\        const tid = (try requireTenant(ctx)) orelse return;
+        \\        const uid = ctx.userIdInt(i64) orelse {
+        \\            try R.wrapErr(ctx, .unauthorized, "user required");
+        \\            return;
+        \\        };
         \\        if (try self.service.getIdentity(tid, uid)) |i| {
         \\            try R.wrapOk(ctx, i);
         \\        } else {
@@ -7546,18 +7574,33 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
         \\        }
         \\    }
         \\    fn createInvoice(ctx: *http.Context, self: *State) !void {
-        \\        const tid = ctx.queryInt(i64, "tenantId", 0);
+        \\        const tid = (try requireTenant(ctx)) orelse return;
         \\        const amt = ctx.queryInt(i64, "amount", 0);
         \\        const cur = ctx.queryStr("currency", "usdc");
         \\        const inv = self.service.createInvoice(tid, amt, cur, "did:key:z...") catch { try R.wrapErr(ctx, .server_error, "invoice failed"); return; };
         \\        try R.wrapOk(ctx, inv);
         \\    }
         \\    fn listInvoices(ctx: *http.Context, self: *State) !void {
-        \\        const tid = ctx.queryInt(i64, "tenantId", 0);
+        \\        const tid = (try requireTenant(ctx)) orelse return;
         \\        const page = ctx.queryInt(usize, "pageNo", 1);
         \\        const size = ctx.queryInt(usize, "pageSize", 10);
         \\        const r = try self.service.getInvoices(tid, page, size);
         \\        try R.wrapList(ctx, r);
+        \\    }
+        \\
+        \\    /// The caller's tenant: the `tenant_id` attr the JWT catalog
+        \\    /// middleware writes from the token's `aud` claim (`ctx.tenantId()`),
+        \\    /// never a query parameter — a client controls the URL and could
+        \\    /// otherwise read any tenant's identities and invoices.
+        \\    fn requireTenant(ctx: *http.Context) !?i64 {
+        \\        const raw = ctx.tenantId() orelse {
+        \\            try R.wrapErr(ctx, .unauthorized, "tenant required");
+        \\            return null;
+        \\        };
+        \\        return std.fmt.parseInt(i64, raw, 10) catch {
+        \\            try R.wrapErr(ctx, .unauthorized, "tenant required");
+        \\            return null;
+        \\        };
         \\    }
         \\};
     , gen_opts);
@@ -7594,8 +7637,8 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
         \\const std = @import("std"); const testing = std.testing; const zigmodu = @import("zigmodu"); const model = @import("model.zig");
         \\test "Web4Identity defaults" { const i = model.Web4Identity{ .id = null, .tenant_id = 1, .user_id = 1, .did = "did:key:z6Mk...", .did_doc = "{}", .public_key = "ed25519", .created_at = 0 }; try testing.expectEqual(@as(i64, 1), i.tenant_id); }
         \\test "Web4Invoice defaults" { const inv = model.Web4Invoice{ .id = null, .tenant_id = 1, .invoice_id = "inv-1", .payee_did = "did:key:z...", .amount = 1000000, .currency = "usdc", .created_at = 0 }; try testing.expectEqualStrings("pending", inv.status); }
-        \\test "DID generate and resolve" { const did = zigmodu.web4.DidKey.generate(testing.allocator, testing.io); defer testing.allocator.free(did.did); const doc = try did.document(testing.allocator); defer testing.allocator.free(doc); try testing.expect(std.mem.indexOf(u8, doc, "did:key:z") != null); }
-        \\test "DID sign verify roundtrip" { var did = zigmodu.web4.DidKey.generate(testing.allocator, testing.io); defer testing.allocator.free(did.did); const sig = try did.sign(testing.allocator, "test"); defer testing.allocator.free(sig); try testing.expect(try did.verify("test", sig)); }
+        \\test "DID generate and resolve" { var did = try zigmodu.web4.DidKey.generate(testing.allocator, testing.io); defer testing.allocator.free(did.did); const doc = try did.document(testing.allocator); defer testing.allocator.free(doc); try testing.expect(std.mem.indexOf(u8, doc, "did:key:z") != null); }
+        \\test "DID sign verify roundtrip" { var did = try zigmodu.web4.DidKey.generate(testing.allocator, testing.io); defer testing.allocator.free(did.did); const sig = try did.sign(testing.allocator, "test"); defer testing.allocator.free(sig); try testing.expect(try did.verify("test", sig)); }
         \\test "x402 invoice fields" { const inv = zigmodu.web4.x402.Invoice{ .id = "inv-1", .payee_did = "did:key:z...", .amount = 500000, .currency = .usdc, .deadline = 0, .description = "test" }; try testing.expectEqual(@as(u64, 500000), inv.amount); }
         \\test "x402 payment fail-closed" { const proof = zigmodu.web4.x402.PaymentProof{ .tx_hash = "0xabc", .invoice_id = "inv-1" }; try testing.expect(!zigmodu.web4.x402.verifyPayment(proof)); try testing.expect(zigmodu.web4.x402.verifyWith(zigmodu.web4.x402.verifyPaymentAllowAll, proof)); }
     , gen_opts);
@@ -7606,12 +7649,12 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
     if (!fileExists(io, wr)) try safeWrite(io, allocator, wr,
         \\# Web4 Module — DID + x402
         \\## Identity (DID)
-        \\- POST /web4/identity?tenantId=N&userId=N — create did:key identity
-        \\- GET /web4/identity?tenantId=N&userId=N — get identity
+        \\- POST /web4/identity — create did:key identity for the JWT-authenticated user (tenant + user come from the token)
+        \\- GET /web4/identity — get own identity
         \\- DID resolver: `zigmodu.web4.resolve("did:key:z...")`
         \\## Monetization (x402)
-        \\- POST /web4/invoice?tenantId=N&amount=N&currency=usdc — create invoice
-        \\- GET /web4/invoices?tenantId=N — list invoices
+        \\- POST /web4/invoice?amount=N&currency=usdc — create invoice for the caller's tenant
+        \\- GET /web4/invoices — list the caller's tenant invoices
         \\- Middleware: pass x402-tx-hash + x402-invoice-id headers; inject PaymentVerifier (default fail-closed)
         \\## VC (Verifiable Credentials)
         \\- issueCredential(issuer, claims) — sign with Ed25519
@@ -7712,9 +7755,9 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
             \\5. Client receives real-time push. If offline, message persists in DB for later pull.
             \\
             \\### Connect to WebSocket
-            \\1. `GET /im/ws?userId=123` with `Upgrade: websocket` header
+            \\1. `GET /admin-api/im/ws` with `Upgrade: websocket` and an `Authorization: Bearer <jwt>` header — the gateway refuses the upgrade unless the token verifies (docs/reference/RUNTIME.md §12.14)
             \\2. Server handshake (RFC 6455) → `onConnect()` returns `WsSession` pointer
-            \\3. `WsSession` registered in `ConnectionRegistry` with `user_id=123`
+            \\3. `WsSession` registered in `ConnectionRegistry` under the verified user id
             \\4. Read loop: text **and binary** frames → `onMessage(..., kind)`; ping → pong; close → `onClose()` cleanup
             \\
             \\## REST API
@@ -7723,7 +7766,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
             \\|--------|------|-------------|
             \\| `POST` | `/admin-api/im/send` | Send a message (pushes to online user) |
             \\| `GET` | `/admin-api/im/messages?conversationId=N&pageNo=1&pageSize=20` | List messages in conversation |
-            \\| `GET` | `/admin-api/im/conversations?userId=N&pageNo=1&pageSize=10` | List conversations for user |
+            \\| `GET` | `/admin-api/im/conversations?pageNo=1&pageSize=10` | List conversations of the authenticated user |
             \\
             \\### Request: POST /im/send
             \\```json
@@ -7741,9 +7784,9 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
             \\
             \\## WebSocket
             \\
-            \\**Endpoint:** `ws://host:port/admin-api/im/ws?userId=123`
+            \\**Endpoint:** `ws://host:port/admin-api/im/ws`
             \\
-            \\**Authentication in production:** Replace `?userId=` with JWT token in query or cookie. Override `onConnect()` in `ext/` to validate the token before accepting.
+            \\**Authentication:** send the JWT as `Authorization: Bearer <token>`. `--with-auth` scaffolds already wire `im_gw.setVerifier(&app_sec, &wsBearerVerify)` in main.zig; without auth, call `setVerifier` with your own token check before any client can connect — the default (no verifier) refuses every upgrade.
             \\
             \\**Frames:**
             \\| Opcode | Direction | Purpose |
@@ -7756,7 +7799,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
             \\
             \\**Ping/Pong:** Server responds to ping frames automatically. No application-level heartbeat needed.
             \\
-            \\**Cleanup:** Stale connections removed by `ImGateway.cleanup()` (call every ~30s via cron/timer).
+            \\**Cleanup:** stale connections are reaped by `ImGateway.cleanup()`. The scaffold calls it once at startup; schedule it yourself (cron/timer, ~every 30 s) for continuous reaping — there is no background sweeper.
             \\
             \\## Module Structure
             \\
@@ -7770,11 +7813,9 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
             \\├── api.zig           # REST handlers
             \\├── gateway.zig       # WS upgrade + ConnectionRegistry
             \\├── relay.zig         # Online message delivery
-            \\├── tests.zig         # Integration tests
-            \\└── ext/
-            \\    ├── service.zig   # Custom business logic (survives regeneration)
-            \\    └── api.zig       # Custom endpoints (survives regeneration)
+            \\└── tests.zig         # Integration tests
             \\```
+            \\Custom logic goes straight into the generated files (marked `//! @initialized by zmodu — AI may modify`); regenerate with `zmodu scaffold --force` and review the `.gen.new` diffs.
             \\
             \\## Configuration
             \\
@@ -8288,10 +8329,8 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
         \\    registry: ConnectionRegistry,
         \\    msg_handler: ?MsgHandler = null,
         \\    msg_ctx: ?*anyopaque = null,
-        \\    /// Verifies a bearer token into a user id. **Null by default**, deliberately:
-        \\    /// with nothing wired in, `accept` refuses every upgrade rather than
-        \\    /// trusting a client-supplied id (docs/reference/RUNTIME.md §12.14). See `verifyBearer`.
-        \\    verifier: ?*const fn (token: []const u8) ?u64 = null,
+        \\    verifier: ?*const fn (ctx: *anyopaque, token: []const u8) ?u64 = null,
+        \\    verifier_ctx: ?*anyopaque = null,
         \\
         \\    pub fn init(allocator: std.mem.Allocator, io: std.Io) ImGateway {
         \\        return .{ .allocator = allocator, .io = io, .registry = ConnectionRegistry.init(allocator, io) };
@@ -8305,27 +8344,26 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
         \\    }
         \\    pub fn cleanup(self: *ImGateway) usize { return self.registry.tickAndCleanup(3); }
         \\
-        \\    /// Resolves the connecting user from the bearer token, or null to refuse.
+        \\    /// Resolves the connecting user from the bearer token, or null to
+        \\    /// refuse. `verifier_ctx` is whatever `setVerifier` handed in
+        \\    /// (the scaffold passes `*zigmodu.security.AppSecurity`).
         \\    ///
-        \\    /// **Null unless a verifier is wired in**, and that default is the point:
-        \\    /// this gateway cannot guess an identity safely, so the unwired state
-        \\    /// refuses instead of trusting what the client sent.
-        \\    ///
-        \\    /// Wire it where the gateway is constructed (`--with-auth` apps already
-        \\    /// have one):
-        \\    ///
-        \\    ///     gateway.verifier = struct {{
-        \\    ///         fn v(token: []const u8) ?u64 {{
-        \\    ///             const claims = app_sec.verifyToken(token) catch return null;
-        \\    ///             return std.fmt.parseInt(u64, claims.sub, 10) catch null;
-        \\    ///         }}
-        \\    ///     }}.v;
-        \\    fn verifyBearer(self: *ImGateway, ctx: *http.Context) ?u64 {{
-        \\        const verifier = self.verifier orelse return null;
+        \\    /// **Null unless wired**, and that default is the point: this gateway
+        \\    /// cannot guess an identity safely, so the unwired state refuses every
+        \\    /// upgrade instead of trusting what the client sent
+        \\    /// (docs/reference/RUNTIME.md §12.14). `--with-auth` scaffolds wire
+        \\    /// `im_gw.setVerifier(&app_sec, &wsBearerVerify)` in main.zig.
+        \\    pub fn setVerifier(self: *ImGateway, ctx: *anyopaque, v: *const fn (ctx: *anyopaque, token: []const u8) ?u64) void {
+        \\        self.verifier_ctx = ctx;
+        \\        self.verifier = v;
+        \\    }
+        \\    fn verifyBearer(self: *ImGateway, ctx: *http.Context) ?u64 {
+        \\        const v = self.verifier orelse return null;
+        \\        const vctx = self.verifier_ctx orelse return null;
         \\        const header = ctx.header("authorization") orelse return null;
         \\        if (header.len <= 7 or !std.ascii.eqlIgnoreCase(header[0..7], "Bearer ")) return null;
-        \\        return verifier(header[7..]);
-        \\    }}
+        \\        return v(vctx, header[7..]);
+        \\    }
         \\
         \\    /// Shared by legacy `register` and ComptimeRouter `ws_routes`.
         \\    pub fn accept(self: *ImGateway, ctx: *http.Context, raw_framer: *anyopaque) ?*anyopaque {
@@ -9606,6 +9644,22 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
 
     try buf.appendSlice(allocator, "\n");
 
+    if (sopts.with_auth and sopts.with_websocket) {
+        // The gateway's verifier is a bare fn pointer (no closures in Zig), so
+        // the AppSecurity pointer travels as the ctx argument.
+        try buf.appendSlice(allocator,
+            \\/// WS bearer verifier: the same AppSecurity the HTTP JWT middleware
+            \\/// uses, so a token that opens an API route also opens a socket.
+            \\fn wsBearerVerify(sec_ptr: *anyopaque, token: []const u8) ?u64 {
+            \\    const sec: *zigmodu.security.AppSecurity = @ptrCast(@alignCast(sec_ptr));
+            \\    const claims = sec.module.verifyToken(token) catch return null;
+            \\    return std.fmt.parseInt(u64, claims.sub, 10) catch null;
+            \\}
+            \\
+            \\
+        );
+    }
+
     try buf.appendSlice(allocator,
         \\pub fn main(init: std.process.Init) !void {
         \\    const allocator = init.gpa;
@@ -9667,6 +9721,18 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
             try buf.print(allocator, "    var {s}_svc = {s}_mod.service.{s}Service.init(&{s}_p);\n", .{ var_name, var_name, pascal, var_name });
         } else {
             try buf.print(allocator, "    var {s}_svc = {s}.service.{s}Service.init(&{s}_p);\n", .{ var_name, var_name, pascal, var_name });
+        }
+        if (sopts.with_events) {
+            // Each module publishes its own union type, so each gets its own
+            // bus; without this wiring `service.publish(...)` drops events on
+            // the floor (the bus pointer stays null).
+            if (isZigReserved(var_name)) {
+                try buf.print(allocator, "    var {s}_events = zigmodu.ThreadSafeEventBus({s}_mod.service.{s}Event).init(allocator, init.io);\n", .{ var_name, var_name, pascal });
+            } else {
+                try buf.print(allocator, "    var {s}_events = zigmodu.ThreadSafeEventBus({s}.service.{s}Event).init(allocator, init.io);\n", .{ var_name, var_name, pascal });
+            }
+            try buf.print(allocator, "    defer {s}_events.deinit();\n", .{var_name});
+            try buf.print(allocator, "    {s}_svc.withEvents(&{s}_events);\n", .{ var_name, var_name });
         }
     }
     try buf.appendSlice(allocator, "\n    // -- API --\n");
@@ -9813,6 +9879,17 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
             \\
             \\
         );
+        if (sopts.with_websocket) {
+            // The WS upgrade answers before router.match (and before any
+            // middleware), so the gateway checks the bearer token itself —
+            // with the same AppSecurity the HTTP JWT middleware uses.
+            try buf.appendSlice(allocator,
+                \\
+                \\    // WS identity: same verifier as the HTTP JWT middleware.
+                \\    im_gw.setVerifier(&app_sec, &wsBearerVerify);
+                \\
+            );
+        }
     } else {
         try buf.appendSlice(allocator,
             \\    try server.addMiddleware(try zigmodu.http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
@@ -9923,9 +10000,8 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
         \\
     );
     // ── Capability flags ──
-    if (sopts.with_events) {
-        try buf.appendSlice(allocator, "\n    // -- EventBus (thread-safe; handlers publish concurrently) --\n    var event_bus = zigmodu.ThreadSafeEventBus(struct { id: i64 }).init(allocator, init.io);\n    defer event_bus.deinit();\n");
-    }
+    // (--with-events buses are created next to each service above; there is
+    // no global bus to wire here.)
 
     if (sopts.with_resilience) {
         try buf.appendSlice(allocator, "\n    // -- Resilience --\n    var breaker = try zigmodu.CircuitBreaker.init(allocator, \"db\", .{ .failure_threshold = 5, .success_threshold = 2, .timeout_seconds = 30, .half_open_max_calls = 3 });\n    defer breaker.deinit();\n    var limiter = try zigmodu.RateLimiter.init(allocator, \"api\", 1000, 100);\n    defer limiter.deinit();\n");
@@ -10500,6 +10576,167 @@ test "generateScaffoldMainZig mounts plugins via ComptimeRouter" {
     try std.testing.expect(std.mem.indexOf(u8, code, "permissionGateWith(&catalog_slot, .{ .mode = .rbac })") != null);
     try std.testing.expect(std.mem.indexOf(u8, code, "RolePermissionTable") != null);
     try std.testing.expect(std.mem.indexOf(u8, code, "permissionGate(&catalog_slot)") == null);
+}
+
+test "generateAiChatModule emits the documented SSE stream route" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &path_buf);
+
+    try generateAiChatModule(io, allocator, path_buf[0..dir_len], .{});
+
+    const api_file = try tmp.dir.openFile(io, "src/modules/ai/chat/api.zig", .{});
+    defer api_file.close(io);
+    const size: usize = @intCast(try api_file.length(io));
+    const api = try allocator.alloc(u8, size);
+    defer allocator.free(api);
+    _ = try api_file.readPositionalAll(io, api, 0);
+
+    // The template blurb (tools) and docs/ai/AI.md both promise
+    // POST /ai/chat/stream, and AiChatService.send's third parameter is the
+    // ?*SseWriter the stream writes to — the generated API must expose it.
+    try std.testing.expect(std.mem.indexOf(u8, api, ".{ .method = .POST, .path = \"stream\", .handler = streamMessage }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, api, "var sse = try sse_mod.SseWriter.init(ctx);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, api, "self.service.send(conv_id, content, &sse)") != null);
+}
+
+test "generateAiChatModule implements deleteConversation end to end" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &path_buf);
+
+    try generateAiChatModule(io, allocator, path_buf[0..dir_len], .{});
+
+    const read = struct {
+        fn file(dir: std.Io.Dir, alloc: std.mem.Allocator, ioo: std.Io, rel: []const u8) ![]u8 {
+            const f = try dir.openFile(ioo, rel, .{});
+            defer f.close(ioo);
+            const size: usize = @intCast(try f.length(ioo));
+            const content = try alloc.alloc(u8, size);
+            _ = try f.readPositionalAll(ioo, content, 0);
+            return content;
+        }
+    }.file;
+    const api = try read(tmp.dir, allocator, io, "src/modules/ai/chat/api.zig");
+    defer allocator.free(api);
+    const svc = try read(tmp.dir, allocator, io, "src/modules/ai/chat/service.zig");
+    defer allocator.free(svc);
+    const per = try read(tmp.dir, allocator, io, "src/modules/ai/chat/persistence.zig");
+    defer allocator.free(per);
+
+    // The README-documented `DELETE …/conversations?id=N` must actually delete:
+    // messages first (no orphaned history), then the conversation, and a
+    // missing id answers 404 instead of the old `_ = self; wrapSuccess` stub.
+    try std.testing.expect(std.mem.indexOf(u8, api, "_ = self;\n        try R.wrapSuccess(ctx);") == null);
+    try std.testing.expect(std.mem.indexOf(u8, api, "self.service.deleteConversation(id)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, svc, "pub fn deleteConversation(self: *AiChatService, id: i64) !bool") != null);
+    try std.testing.expect(std.mem.indexOf(u8, svc, "deleteMessagesByConversation(id)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, per, "DELETE FROM ai_message WHERE conversation_id = ?") != null);
+}
+
+test "generateWeb4Module takes tenant and user from the JWT, not the query" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &path_buf);
+
+    try generateWeb4Module(io, allocator, path_buf[0..dir_len], .{});
+
+    const read = struct {
+        fn file(dir: std.Io.Dir, alloc: std.mem.Allocator, ioo: std.Io, rel: []const u8) ![]u8 {
+            const f = try dir.openFile(ioo, rel, .{});
+            defer f.close(ioo);
+            const size: usize = @intCast(try f.length(ioo));
+            const content = try alloc.alloc(u8, size);
+            _ = try f.readPositionalAll(ioo, content, 0);
+            return content;
+        }
+    }.file;
+    const api = try read(tmp.dir, allocator, io, "src/modules/web4/api.zig");
+    defer allocator.free(api);
+    const svc = try read(tmp.dir, allocator, io, "src/modules/web4/service.zig");
+    defer allocator.free(svc);
+    const mod = try read(tmp.dir, allocator, io, "src/modules/web4/model.zig");
+    defer allocator.free(mod);
+    const tests = try read(tmp.dir, allocator, io, "src/modules/web4/tests.zig");
+    defer allocator.free(tests);
+
+    // b22: the tenant/user never come out of the URL…
+    try std.testing.expect(std.mem.indexOf(u8, api, "queryInt(i64, \"tenantId\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, api, "queryInt(i64, \"userId\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, api, "requireTenant(ctx)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, api, "ctx.userIdInt(i64)") != null);
+    // …the repository calls honour the tenant…
+    try std.testing.expect(std.mem.indexOf(u8, svc, "findByIdForTenant(\"tenant_id\", tenant_id, user_id)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, svc, "findPageForTenant(\"tenant_id\", tenant_id, page, size)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mod, "pub const sql_tenant_column: ?[]const u8 = \"tenant_id\";") != null);
+    // …and the generated code compiles (DidKey.generate returns an error union).
+    try std.testing.expect(std.mem.indexOf(u8, svc, "var did_key = try zigmodu.web4.DidKey.generate(self.allocator, self.io);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tests, "var did = try zigmodu.web4.DidKey.generate(testing.allocator, testing.io);") != null);
+}
+
+test "generateScaffoldMainZig wires per-module event buses and the WS verifier" {
+    const a = std.testing.allocator;
+    const names = [_][]const u8{"users"};
+    const code = try generateScaffoldMainZig(a, "demo", &names, .{
+        .sql_path = null,
+        .project_name = "demo",
+        .out_dir = ".",
+        .force = false,
+        .dry_run = false,
+        .with_events = true,
+        .with_websocket = true,
+        .with_auth = true,
+    });
+    defer a.free(code);
+
+    // --with-events: each service gets its own typed bus, so publish() has a
+    // real sink; the old anonymous `struct { id: i64 }` bus matched no module
+    // union and was dead code.
+    try std.testing.expect(std.mem.indexOf(u8, code, "var users_events = zigmodu.ThreadSafeEventBus(users.service.UsersEvent).init(allocator, init.io);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "users_svc.withEvents(&users_events);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "ThreadSafeEventBus(struct { id: i64 })") == null);
+    // --with-auth + --with-websocket: the gateway's bearer check uses the same
+    // AppSecurity as the HTTP JWT middleware.
+    try std.testing.expect(std.mem.indexOf(u8, code, "fn wsBearerVerify(sec_ptr: *anyopaque, token: []const u8) ?u64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "im_gw.setVerifier(&app_sec, &wsBearerVerify);") != null);
+}
+
+test "generateImModule gateway takes a ctx-carrying verifier" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &path_buf);
+
+    try generateImModule(io, allocator, path_buf[0..dir_len], .{});
+
+    const f = try tmp.dir.openFile(io, "src/modules/im/gateway.zig", .{});
+    defer f.close(io);
+    const size: usize = @intCast(try f.length(io));
+    const gateway = try allocator.alloc(u8, size);
+    defer allocator.free(gateway);
+    _ = try f.readPositionalAll(io, gateway, 0);
+
+    // The verifier carries its context explicitly (Zig has no closures), and
+    // the doc example must show single braces — `{{` survived into generated
+    // sources until `zig fmt` rewrote it into a pointless nested block.
+    try std.testing.expect(std.mem.indexOf(u8, gateway, "pub fn setVerifier(self: *ImGateway, ctx: *anyopaque, v: *const fn (ctx: *anyopaque, token: []const u8) ?u64) void") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gateway, "return v(vctx, header[7..]);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gateway, "{{") == null);
 }
 
 // A generator has to emit the same bytes for the same input. The fingerprint is

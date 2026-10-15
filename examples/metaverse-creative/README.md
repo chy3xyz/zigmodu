@@ -4,7 +4,7 @@
 **业务不变**：身份仍以 **DID** 为键（注册 / 声誉 / 验证 / 归属 / 访客），不拆成数字 ID 业务主键。  
 **P0 变现**：购买走 `PaymentIntent` 幂等 → 双分录 Ledger → OwnershipTransfer → Outbox（见 `settlement` 模块）。
 
-权威约定：[`docs/ZENT.md`](../../docs/ZENT.md)
+权威约定：[`docs/reference/ZENT.md`](../../docs/reference/ZENT.md)
 
 ## 跑通
 
