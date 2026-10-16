@@ -1,6 +1,18 @@
 # Changelog
 
-## [Unreleased]
+## [0.39.14] - 2026-10-16
+
+### 修复：life CLI 违规错误处理模式（`check-production` 门禁，**破坏性：否**）
+
+`zig build check` 的 check-production 扫描在批 182 新落地的 life CLI 中抓到
+16 处违规：`tools/zmodu/src/life.zig` 9 处 `catch unreachable`（bufPrint 定长
+缓冲）、`ci.zig` 2 处裸 `catch {}`、`main.zig` 1 处裸 `catch {}`，以及 1 处
+内联分配直接传入 fallible `append`。修法：路径/格式化辅助函数统一改传
+`error.NoSpaceLeft`（`issuePath`/`releasePath` 签名拓宽为 `![]const u8`，
+调用点 `try`）；`epochToIsoUtc` 保持 infallible，入口 clamp 到
+`0..253402300799` 使定长 20 字节格式化学理上不可失败，catch 分支放显式
+饱和兜底（`check-production` 禁 `catch unreachable`）；裸 catch 改为
+`catch return`。CLI 套件 157 passed / 0 failed 复验通过。
 
 ### 第 183 批：release 机制区分 tag 与 GitHub Release——tag 高频、Release 每周至多一次（**破坏性：否**）
 
