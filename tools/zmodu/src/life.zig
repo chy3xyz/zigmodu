@@ -52,6 +52,15 @@ fn nowSeconds(io: std.Io) i64 {
 }
 
 fn printOut(io: std.Io, comptime fmt: []const u8, args: anytype) void {
+    // Under `zig build test` the test binary's fd 1 is the build runner's
+    // --listen=- protocol channel. A raw stdout write desyncs that protocol:
+    // the runner stops parsing progress and reports the test as timed out
+    // (observed on CI — the four runAt tests each "hung" 300s while their
+    // captured stderr showed they had executed every step). CLI output is a
+    // production concern; the tests assert exit codes and file state, so
+    // dropping the print in test builds keeps both honest. stderr is a
+    // separate pipe in listen mode and stays live for diagnostics.
+    if (@import("builtin").is_test) return;
     var buf: [4096]u8 = undefined;
     var out_file = std.Io.File.stdout();
     var out_writer = out_file.writer(io, &buf);
