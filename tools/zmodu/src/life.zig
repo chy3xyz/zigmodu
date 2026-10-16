@@ -102,7 +102,7 @@ pub fn recordCi(io: std.Io, allocator: std.mem.Allocator, dir: []const u8, resul
         if (r.ok) continue;
         const fp_full = state.fingerprintHex(.ci, r.name, "", r.detail);
         var fp_buf: [71]u8 = undefined;
-        const fp = std.fmt.bufPrint(&fp_buf, "sha256:{s}", .{fp_full}) catch unreachable;
+        const fp = std.fmt.bufPrint(&fp_buf, "sha256:{s}", .{fp_full}) catch return error.NoSpaceLeft;
         const now = nowSeconds();
         var tbuf: [20]u8 = undefined;
         if (try findOpenByFingerprint(alloc, io, dir, fp)) |seq| {
@@ -138,8 +138,8 @@ pub fn recordCi(io: std.Io, allocator: std.mem.Allocator, dir: []const u8, resul
 // `.life/releases/<version>.md` — same frontmatter discipline as issues;
 // items_json rides as an escaped quoted frontmatter value.
 
-fn releasePath(buf: []u8, dir: []const u8, version: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, "{s}/.life/releases/{s}.md", .{ dir, version }) catch unreachable;
+fn releasePath(buf: []u8, dir: []const u8, version: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, "{s}/.life/releases/{s}.md", .{ dir, version }) catch return error.NoSpaceLeft;
 }
 
 fn formatRelease(alloc: std.mem.Allocator, rel: *const model.Release) ![]u8 {
@@ -224,7 +224,7 @@ fn parseRelease(alloc: std.mem.Allocator, text: []const u8) !model.Release {
 
 fn loadRelease(alloc: std.mem.Allocator, io: std.Io, dir: []const u8, version: []const u8) !?model.Release {
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = releasePath(&pbuf, dir, version);
+    const path = try releasePath(&pbuf, dir, version);
     const text = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, std.Io.Limit.limited(1 << 20)) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
@@ -234,10 +234,10 @@ fn loadRelease(alloc: std.mem.Allocator, io: std.Io, dir: []const u8, version: [
 
 fn saveRelease(alloc: std.mem.Allocator, io: std.Io, dir: []const u8, rel: *const model.Release) !void {
     var dbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const releases_dir = std.fmt.bufPrint(&dbuf, "{s}/.life/releases", .{dir}) catch unreachable;
+    const releases_dir = std.fmt.bufPrint(&dbuf, "{s}/.life/releases", .{dir}) catch return error.NoSpaceLeft;
     try std.Io.Dir.cwd().createDirPath(io, releases_dir);
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = releasePath(&pbuf, dir, rel.version);
+    const path = try releasePath(&pbuf, dir, rel.version);
     const text = try formatRelease(alloc, rel);
     const file = try std.Io.Dir.cwd().createFile(io, path, .{});
     defer file.close(io);
@@ -247,7 +247,7 @@ fn saveRelease(alloc: std.mem.Allocator, io: std.Io, dir: []const u8, rel: *cons
 fn listReleases(alloc: std.mem.Allocator, io: std.Io, dir: []const u8) ![]model.Release {
     var out = std.ArrayList(model.Release).empty;
     var dbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const releases_dir = std.fmt.bufPrint(&dbuf, "{s}/.life/releases", .{dir}) catch unreachable;
+    const releases_dir = std.fmt.bufPrint(&dbuf, "{s}/.life/releases", .{dir}) catch return error.NoSpaceLeft;
     var d = std.Io.Dir.cwd().openDir(io, releases_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return out.items,
         else => return err,
@@ -259,7 +259,9 @@ fn listReleases(alloc: std.mem.Allocator, io: std.Io, dir: []const u8) ![]model.
     defer names.deinit(alloc);
     while (try it.next(io)) |entry| {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".md")) continue;
-        try names.append(alloc, try alloc.dupe(u8, entry.name[0 .. entry.name.len - 3]));
+        const name = try alloc.dupe(u8, entry.name[0 .. entry.name.len - 3]);
+        errdefer alloc.free(name);
+        try names.append(alloc, name);
     }
     std.mem.sort([]const u8, names.items, {}, struct {
         fn lessThan(_: void, a: []const u8, b: []const u8) bool {
@@ -267,7 +269,7 @@ fn listReleases(alloc: std.mem.Allocator, io: std.Io, dir: []const u8) ![]model.
         }
     }.lessThan);
     for (names.items) |version| {
-        const text = try std.Io.Dir.cwd().readFileAlloc(io, releasePath(&pbuf, dir, version), alloc, std.Io.Limit.limited(1 << 20));
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, try releasePath(&pbuf, dir, version), alloc, std.Io.Limit.limited(1 << 20));
         try out.append(alloc, try parseRelease(alloc, text));
     }
     return out.items;
@@ -948,8 +950,11 @@ fn printUsage() void {
 // the caller's allocator — use an arena whose lifetime covers the Issue.
 
 pub fn epochToIsoUtc(buf: *[20]u8, epoch_secs: i64) []const u8 {
-    const days0 = @divFloor(epoch_secs, 86400);
-    var rem = @mod(epoch_secs, 86400);
+    // Clamp to the representable wire range so the fixed 20-byte format cannot
+    // fail (negative years would also trip the @intCast below in debug).
+    const e = std.math.clamp(epoch_secs, 0, 253402300799);
+    const days0 = @divFloor(e, 86400);
+    var rem = @mod(e, 86400);
     const hh: u64 = @intCast(@divFloor(rem, 3600));
     rem = @mod(rem, 3600);
     const mm: u64 = @intCast(@divFloor(rem, 60));
@@ -967,7 +972,13 @@ pub fn epochToIsoUtc(buf: *[20]u8, epoch_secs: i64) []const u8 {
     const year: u64 = @intCast(if (m <= 2) y + 1 else y);
     return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
         year, @as(u64, @intCast(m)), @as(u64, @intCast(d)), hh, mm, ss,
-    }) catch unreachable;
+    }) catch {
+        // Unreachable after the clamp; kept explicit (check-production bans
+        // `catch unreachable`). Saturate rather than truncate mid-field.
+        const fallback = "9999-12-31T23:59:59Z";
+        @memcpy(buf[0..fallback.len], fallback);
+        return buf[0..fallback.len];
+    };
 }
 
 pub fn isoToEpoch(s: []const u8) ?i64 {
@@ -1036,8 +1047,8 @@ pub fn jsonEscape(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
     return out.items;
 }
 
-fn issuePath(buf: []u8, dir: []const u8, seq: u32) []const u8 {
-    return std.fmt.bufPrint(buf, "{s}/.life/issues/LI-{d:0>4}.md", .{ dir, seq }) catch unreachable;
+fn issuePath(buf: []u8, dir: []const u8, seq: u32) ![]const u8 {
+    return std.fmt.bufPrint(buf, "{s}/.life/issues/LI-{d:0>4}.md", .{ dir, seq }) catch return error.NoSpaceLeft;
 }
 
 pub fn formatIssue(alloc: std.mem.Allocator, issue: *const model.Issue) ![]u8 {
@@ -1046,7 +1057,8 @@ pub fn formatIssue(alloc: std.mem.Allocator, issue: *const model.Issue) ![]u8 {
     try out.appendSlice(alloc, "---\n");
     try out.appendSlice(alloc, "id: LI-");
     var nbuf: [16]u8 = undefined;
-    try out.appendSlice(alloc, std.fmt.bufPrint(&nbuf, "{d:0>4}", .{issue.seq}) catch unreachable);
+    const seq_text = std.fmt.bufPrint(&nbuf, "{d:0>4}", .{issue.seq}) catch return error.NoSpaceLeft;
+    try out.appendSlice(alloc, seq_text);
     try out.append(alloc, '\n');
     try out.appendSlice(alloc, "title: ");
     try quoteValue(&out, alloc, issue.title);
@@ -1209,7 +1221,7 @@ pub fn parseIssue(alloc: std.mem.Allocator, text: []const u8) !model.Issue {
 
 fn loadIssue(alloc: std.mem.Allocator, io: std.Io, dir: []const u8, seq: u32) !?model.Issue {
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = issuePath(&pbuf, dir, seq);
+    const path = try issuePath(&pbuf, dir, seq);
     const text = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, std.Io.Limit.limited(1 << 20)) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
@@ -1219,10 +1231,10 @@ fn loadIssue(alloc: std.mem.Allocator, io: std.Io, dir: []const u8, seq: u32) !?
 
 fn saveIssue(alloc: std.mem.Allocator, io: std.Io, dir: []const u8, issue: *const model.Issue) !void {
     var dbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const issues_dir = std.fmt.bufPrint(&dbuf, "{s}/.life/issues", .{dir}) catch unreachable;
+    const issues_dir = std.fmt.bufPrint(&dbuf, "{s}/.life/issues", .{dir}) catch return error.NoSpaceLeft;
     try std.Io.Dir.cwd().createDirPath(io, issues_dir);
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = issuePath(&pbuf, dir, issue.seq);
+    const path = try issuePath(&pbuf, dir, issue.seq);
     const text = try formatIssue(alloc, issue);
     const file = try std.Io.Dir.cwd().createFile(io, path, .{});
     defer file.close(io);
@@ -1237,7 +1249,7 @@ fn issueSeqFromName(name: []const u8) ?u32 {
 fn listIssues(alloc: std.mem.Allocator, io: std.Io, dir: []const u8) ![]model.Issue {
     var out = std.ArrayList(model.Issue).empty;
     var dbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const issues_dir = std.fmt.bufPrint(&dbuf, "{s}/.life/issues", .{dir}) catch unreachable;
+    const issues_dir = std.fmt.bufPrint(&dbuf, "{s}/.life/issues", .{dir}) catch return error.NoSpaceLeft;
     var d = std.Io.Dir.cwd().openDir(io, issues_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return out.items,
         else => return err,
@@ -1248,7 +1260,7 @@ fn listIssues(alloc: std.mem.Allocator, io: std.Io, dir: []const u8) ![]model.Is
         if (entry.kind != .file) continue;
         const seq = issueSeqFromName(entry.name) orelse continue;
         var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-        const path = issuePath(&pbuf, dir, seq);
+        const path = try issuePath(&pbuf, dir, seq);
         const text = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, std.Io.Limit.limited(1 << 20));
         try out.append(alloc, try parseIssue(alloc, text));
     }

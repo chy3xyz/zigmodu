@@ -238,7 +238,7 @@ pub fn run(io: Io, allocator: std.mem.Allocator, args: []const []const u8) u8 {
         }
         if (any_failed) {
             life_mod.recordCi(io, allocator, dir, results.items) catch {
-                stdout.print("[life] ERROR: failed to record life issues\n", .{}) catch {};
+                stdout.print("[life] ERROR: failed to record life issues\n", .{}) catch return 1;
             };
         }
     }
@@ -279,7 +279,7 @@ fn recordStep(allocator: std.mem.Allocator, results: *std.ArrayList(life_mod.Ste
         allocator.free(d);
         return;
     };
-    results.append(allocator, .{ .name = name, .ok = ok, .detail = d }) catch {};
+    results.append(allocator, .{ .name = name, .ok = ok, .detail = d }) catch return;
 }
 
 fn jsonPassField(allocator: std.mem.Allocator, json: []const u8) !bool {

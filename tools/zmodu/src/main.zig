@@ -5262,7 +5262,7 @@ fn cmdLife(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !
         const msg = if (args.len > 2) args[2] else "evolution step";
         // Pre-existing defect: scaffold creates .life/tree, but a bare repo
         // running evolve first crashed on the missing directory — create it.
-        std.Io.Dir.cwd().createDirPath(io, ".life/tree") catch {};
+        try std.Io.Dir.cwd().createDirPath(io, ".life/tree");
         const tree_path = try allocator.print(".life/tree/{s}.md", .{version});
         defer allocator.free(tree_path);
         var buf: std.ArrayList(u8) = .empty;
