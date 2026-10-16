@@ -110,6 +110,38 @@ fn dirExists(b: *std.Build, path: []const u8) bool {
     return true;
 }
 
+/// Last-resort host detection via `pkg-config`: parse the first `-I` and every
+/// `-L` of the first `pc_name` that answers. Detection fallback ONLY — never
+/// combined with `use_pkg_config = .yes`: Zig 0.17.0 release promotes the
+/// duplicate searchlist entry (pkg-config's `-I` for a directory we already
+/// added as `-isystem`) from a warn-and-retry to a hard compile error, which
+/// turned every CI postgres/mysql job red after the 0.17.0 migration. Feeding
+/// the discovered paths through `addSystemIncludePath`/`-L` ourselves keeps
+/// exactly one spelling per directory; layouts the fixed candidate lists miss
+/// (macports, custom prefixes) stay reachable through their `.pc` file.
+fn pkgConfigPaths(b: *std.Build, pc_names: []const []const u8) ?CLibPaths {
+    for (pc_names) |name| {
+        var exit_code: u8 = 0;
+        const stdout = b.runAllowFail(
+            &[_][]const u8{ "pkg-config", "--cflags", "--libs", name },
+            &exit_code,
+            .ignore,
+        ) catch continue;
+        if (exit_code != 0) continue;
+        var paths: CLibPaths = .{};
+        var it = std.mem.tokenizeAny(u8, stdout, " \t\r\n");
+        while (it.next()) |tok| {
+            if (std.mem.startsWith(u8, tok, "-I") and tok.len > 2 and paths.include == null) {
+                paths.include = b.dupe(tok[2..]);
+            } else if (std.mem.startsWith(u8, tok, "-L") and tok.len > 2 and paths.libs.len < paths.libs.buf.len) {
+                paths.libs.add(b.dupe(tok[2..]));
+            }
+        }
+        if (paths.include != null or paths.libs.len > 0) return paths;
+    }
+    return null;
+}
+
 /// Library directories to add as `-L`, kept in search order. Four is exactly
 /// what `targetLibDirs` yields (multiarch `usr/lib`, multiarch `lib`,
 /// `usr/lib64`, `usr/lib`); a host build fills one. A value type rather than an
@@ -235,6 +267,9 @@ fn detectPqPaths(b: *std.Build, target: std.Build.ResolvedTarget) CLibPaths {
             }
         }
     }
+    // Fixed candidates missed (macports, custom prefix): ask pkg-config once
+    // and add the result ourselves so the dir is spelled a single way.
+    if (pkgConfigPaths(b, &.{ "libpq", "postgresql" })) |p| return p;
     return paths;
 }
 
@@ -308,6 +343,13 @@ fn detectMysqlPaths(b: *std.Build, target: std.Build.ResolvedTarget) CLibPaths {
             }
         }
     }
+    // Fixed candidates missed (macports, custom prefix): ask pkg-config once
+    // and add the result ourselves so the dir is spelled a single way.
+    if (pkgConfigPaths(b, &.{ "mysqlclient", "mariadb" })) |p| {
+        var found = p;
+        found.lib_name = mysqlLibName(b, &found.libs);
+        return found;
+    }
     return paths;
 }
 
@@ -368,13 +410,20 @@ fn hasDriverOverride(b: *std.Build) bool {
     return false;
 }
 
-/// `linkSystemLibrary` options. pkg-config describes the **build machine**
-/// (Homebrew's `mysqlclient.pc` names `/opt/homebrew/Cellar/mysql/…`) and Zig
-/// consults it whatever the target is — so on a foreign target it is turned
-/// off, or it hands the link the host's own `-I`/`-L` through a door the
-/// `detect*Paths` gate does not close.
+/// pkg-config is deliberately NOT consulted through `linkSystemLibrary`:
+/// Zig 0.17.0 release promotes the duplicate searchlist entry it produces
+/// (pkg-config's `-I/usr/include/postgresql` vs our own `-isystem` for the
+/// same directory) from a warn-and-retry to a hard compile error — that is
+/// what turned every CI postgres/mysql job red after the 0.17.0 migration.
+/// Host detection lives entirely in the `detect*Paths` functions (fixed
+/// candidates, then a pkg-config fallback they query themselves — see
+/// `pkgConfigPaths`), so every directory reaches the searchlist spelled
+/// exactly one way. pkg-config also describes the **build machine**, so a
+/// foreign target must never see it either — `.no` unconditionally.
 fn linkOpts(b: *std.Build, target: std.Build.ResolvedTarget) std.Build.Module.LinkSystemLibraryOptions {
-    return .{ .use_pkg_config = if (isHostTarget(b, target)) .yes else .no };
+    _ = b;
+    _ = target;
+    return .{ .use_pkg_config = .no };
 }
 
 fn addPaths(mod: *std.Build.Module, paths: CLibPaths) void {

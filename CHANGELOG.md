@@ -1,5 +1,22 @@
 # Changelog
 
+## [Unreleased]
+
+### 修复：CI 自 0.17.0 迁移后全红——pkg-config 与 detect 路径重复拼写搜索目录（**破坏性：否**）
+
+Zig 0.17.0 正式版把「同一目录既以 `-I`（pkg-config `--cflags libpq` 给出
+`-I/usr/include/postgresql`）又以 `-isystem`（`db_link.zig` 自己的
+`addSystemIncludePath`）进入搜索列表」从 dev 版的 warn-and-retry 升级为
+**硬编译错误**，导致 CI 所有 postgres/mysql/live 矩阵 job 的 test 件编译失败
+（v0.39.13 tag 起持续红）。修复：`examples/_shared/db_link.zig` 的
+`linkSystemLibrary` 统一 `use_pkg_config = .no`（pkg-config 本来就只描述构建机，
+foreign target 早已禁用），宿主检测仍由 `detect*Paths` 的固定候选目录负责；
+候选全miss 时（macports、自定义前缀）新增 `pkgConfigPaths` 兜底——自行
+`pkg-config --cflags --libs` 一次并把结果以 `-isystem`/`-L` 拼入，保证每个
+目录只有一种拼写。本地复现验证：设 `PKG_CONFIG_PATH` 指向 brew libpq 后
+`zig build -Ddb=postgres` 修复前必现冲突错误、修复后 0 冲突，`-Ddb=all` /
+`-Ddb=none` 同绿。
+
 ## [0.39.14] - 2026-10-16
 
 ### 修复：life CLI 违规错误处理模式（`check-production` 门禁，**破坏性：否**）
