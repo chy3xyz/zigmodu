@@ -464,6 +464,13 @@ filter 是**测试全限定名的子串**（形如 `core.cluster.RaftElection.te
 - 推 tag 前本地先过 `bash scripts/check-release-tag.sh`；CI 的 `release-verify`
   job 会在任何 `v*` tag push 时复核（tag == `build.zig.zon` version，且
   CHANGELOG 有条目）。两者任一失败 = 发布无效。
+- **Tag 与 GitHub Release 分节奏**（Zig 生态靠 git tag 做包 pin）：tag 是
+  高频可 pin 物——门禁全绿后随时 `bash scripts/release.sh <x.y.z> --tag-only --push`，
+  下游即可 pin 该版本（release-verify 对每个 pushed tag 照跑）；GitHub Release
+  是低频公告物（触发 ci.yml docker 构建）——**每周至多一次**（建议周一），对
+  已存在的 tag 补发：`bash scripts/release.sh --publish-release <x.y.z>`（只建
+  Release、不动树；tag 须已存在且已推 origin）。不带 `--tag-only` 的完整
+  release.sh 调用 = tag + Release 一起发，等同于 `--tag-only` 后再 publish。
 - 业务项目发布前置门禁：`zmodu ci`（build + fmt + verify + audit + deadcode + **doctor**，共 **6 步**）。
 
 ### 发布节奏（第 158 批起强制）
@@ -504,6 +511,7 @@ filter 是**测试全限定名的子串**（形如 `core.cluster.RaftElection.te
 - x402 fail-closed；OTLP/Vault 已支持 HTTPS（系统 CA）。
 - zent **v0.94.0**（示例按此验证）与 `data.sqlx` 正交，勿混驱动/共享事务；版本行为差（`getOwned`/`insertMany` 双参/裁剪构建/`zent.scope`/junction 撞名/`ShardSet` 借用契约/`VarChar(n)`/`joinEdge` 受控 JOIN v1（FK 在本表的 From 边单语句内联，示例见 zent-modulith `feed3`；互指边须 base+wrapper 破环）/pgvector/`zent.walltime` 公共墙钟（存库时间戳用它，时长用 `sql_logger.nowUs()`）/`ownedCopy` 公开导出/`migrateSchemaInTx` 调用方持有事务/PG 扩展预检 `MissingPostgresExtension` 等）全在 `docs/reference/ZENT.md`「版本口径」与 §14。两条实测陷阱：① `deinitRow(s)` 只用于**驱动扫描出来**的行——`getOwned` 这类带 allocator 返回的要用 `deinitRowWith(allocator, &e)`，配错 = 跨分配器 free 打死进程（`zmodu audit` b23 拦）；② 改依赖 pin 后先 `rm -rf .zig-cache`——增量缓存会沿用旧 fetch 模块（实测"编译通过"却跑旧版本）。
 - SQLx 选择性链接：`-Ddb=` / `.db=`，默认 `all`；框架测试勿收窄；见 `docs/guide/SQLX_DRIVERS.md`。
+- `zmodu life` issue/release：`.life/` markdown 存储（`LI-%04d.md` frontmatter）；core 状态机在 `src/life/`（14 迁移、必填字段强制、终态无出边），CLI 经 `life_core` 模块 import 共享；`zmodu ci --life` 把失败门禁按 fingerprint 去重自动开单；spec：`docs/superpowers/specs/2026-10-16-life-issue-release-design.md`（P1 已落地）。
 - WS：`WsMessageFn` 含 `WsFrameKind`；fiber/io_uring 分发 text+binary（OpenIM protobuf OK）。
 - CI：`bash scripts/ci-integration.sh`（tenant-mgmt + stress + shopdemo，`-Ddb=sqlite`）。
 - Runtime 监督树（v0.31，`docs/reference/RUNTIME.md` §14）：`rt.spawnGroup(policy)` + `Supervision.group`；重建是**原地** `deinit`+`init`（同线程同循环，handle 不换、邮箱不关）。声明 `run` 的 worker 进会重建的组 = spawn 报 `NotRestartable`。**多了一个"接收者可以回来"的理由**：`Mailbox.wake` / `recvWakeable` —— 成员必须在**读 `restart_requested` 之前**取 epoch，落在这两步之间的 `wake()` 否则会丢（`stop()` 靠关邮箱唤醒，重启不能关邮箱）。

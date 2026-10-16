@@ -589,7 +589,8 @@ zig build zmodu && ./zig-out/bin/zmodu runtime examples/alpha-engine   # static 
 zig build benchmark                 # benchmarks (the ratchet lives in scripts/check-bench.sh)
 zig build docs                      # generate docs
 HTTP_PORT=18080 bash scripts/ci-integration.sh   # integration probes (needs curl)
-bash scripts/release.sh X.Y.Z --push             # cut a release (bumps every version ref, gates, tags)
+bash scripts/release.sh X.Y.Z --tag-only --push   # cut a gated tag (bumps every version ref, gates, tags; no GitHub Release)
+bash scripts/release.sh --publish-release X.Y.Z   # weekly: create the GitHub Release for an existing tag
 
 # Docker
 docker compose up -d                             # full stack (PG + Redis + Vault + Jaeger)

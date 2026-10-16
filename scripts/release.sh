@@ -2,22 +2,105 @@
 # One-shot release: bump the package version everywhere, run all quality
 # gates, then commit + tag (+ push with --push).
 #
+# Tag vs GitHub Release — two cadences, one script:
+#   * Zig packages pin by git tag, so tags are the frequent artifact: cut one
+#     whenever gated work should be consumable (`--tag-only` skips the
+#     GitHub Release; release-verify still gates every pushed tag).
+#   * A GitHub Release is the announcement artifact (fires ci.yml's
+#     `release: published` docker build): keep it infrequent — e.g. weekly —
+#     via `--publish-release`, which only creates the Release for an
+#     existing tag and changes nothing else.
+#
 # Note: .fingerprint is the package's permanent identity — Zig docs say it is
 # generated once and never changes (changing it has security/trust
 # implications). release.sh intentionally leaves it untouched.
 #
-# Usage: scripts/release.sh <x.y.z> [--push]
+# Usage:
+#   scripts/release.sh <x.y.z> [--push] [--tag-only]   cut a gated tag (+ release unless --tag-only)
+#   scripts/release.sh --publish-release <x.y.z> [--push]   create the GitHub Release for an existing tag
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-VERSION="${1:-}"
+# Create the GitHub Release for an already-pushed tag from its CHANGELOG
+# section. Not fatal when it cannot happen here: the tag is the source of
+# truth (release-verify still gates it), so a missing `gh` or a failed create
+# degrades to the printed manual commands instead of a failed release.
+create_github_release() {
+    local ver="$1"
+    if ! command -v gh >/dev/null 2>&1; then
+        echo "gh CLI not found — create the GitHub Release by hand (the tag is already pushed):"
+        echo "  bash scripts/release-notes.sh $ver > /tmp/notes-v$ver.md"
+        echo "  gh release create v$ver --verify-tag --notes-file /tmp/notes-v$ver.md"
+        return 0
+    fi
+    if gh release view "v$ver" >/dev/null 2>&1; then
+        echo "release: GitHub Release v$ver already exists — skipping create"
+        return 0
+    fi
+    local notes
+    notes="$(mktemp -t zm-release-notes.XXXXXX)"
+    if bash scripts/release-notes.sh "$ver" > "$notes" && [ -s "$notes" ]; then
+        if gh release create "v$ver" --verify-tag --notes-file "$notes"; then
+            echo "release: GitHub Release v$ver created — the ci.yml release job now"
+            echo "  builds and attaches zigmodu-v$ver-linux-x86_64.tar.gz (+ .sha256)."
+        else
+            echo "WARN: gh release create failed; create the release by hand:" >&2
+            echo "  bash scripts/release-notes.sh $ver > /tmp/notes-v$ver.md" >&2
+            echo "  gh release create v$ver --verify-tag --notes-file /tmp/notes-v$ver.md" >&2
+        fi
+    else
+        echo "WARN: no CHANGELOG section extracted for $ver; create the release by hand:" >&2
+        echo "  gh release create v$ver --verify-tag --generate-notes" >&2
+    fi
+    rm -f "$notes"
+}
+
+VERSION=""
 PUSH=0
-if [ "${2:-}" = "--push" ]; then PUSH=1; fi
+TAG_ONLY=0
+MODE="release"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --push) PUSH=1 ;;
+        --tag-only) TAG_ONLY=1 ;;
+        --publish-release) MODE="publish" ;;
+        [0-9]*.[0-9]*.[0-9]*) VERSION="$1" ;;
+        *)
+            echo "usage: scripts/release.sh <x.y.z> [--push] [--tag-only] | --publish-release <x.y.z> [--push]"
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+if [ "$MODE" = "publish" ]; then
+    if [ -z "$VERSION" ]; then
+        echo "usage: scripts/release.sh --publish-release <x.y.z> [--push]"
+        exit 2
+    fi
+    if ! git rev-parse "v$VERSION" >/dev/null 2>&1; then
+        echo "FAIL: tag v$VERSION does not exist locally — cut it first:"
+        echo "  bash scripts/release.sh $VERSION --tag-only --push"
+        exit 1
+    fi
+    if [ "$PUSH" = "1" ]; then
+        git push origin "v$VERSION"
+        echo "pushed v$VERSION"
+    fi
+    # The tag must be on the remote before --verify-tag can resolve it.
+    if ! git ls-remote --exit-code --tags origin "v$VERSION" >/dev/null 2>&1; then
+        echo "FAIL: tag v$VERSION is not on origin yet — push it first:"
+        echo "  git push origin v$VERSION"
+        exit 1
+    fi
+    create_github_release "$VERSION"
+    exit 0
+fi
 
 case "$VERSION" in
     [0-9]*.[0-9]*.[0-9]*) ;;
     *)
-        echo "usage: scripts/release.sh <x.y.z> [--push]"
+        echo "usage: scripts/release.sh <x.y.z> [--push] [--tag-only] | --publish-release <x.y.z> [--push]"
         exit 2
         ;;
 esac
@@ -178,38 +261,18 @@ if [ "$PUSH" = "1" ]; then
     git push origin "v$VERSION"
     echo "pushed master + v$VERSION"
 
-    # 6. GitHub Release: create it from this version's CHANGELOG section.
-    #    Publishing the release fires ci.yml's `release: published` trigger, so
-    #    the docker + release jobs build zigmodu-v$VERSION-linux-x86_64.tar.gz
-    #    and its .sha256 companion and attach both — until this was automated,
-    #    a pushed tag waited for someone to open the Releases page by hand.
-    #    Not fatal when it cannot happen here: the tag is the source of truth
-    #    (release-verify still gates it), so a missing `gh` or a failed create
-    #    degrades to the printed manual commands instead of a failed release.
-    if command -v gh >/dev/null 2>&1; then
-        if gh release view "v$VERSION" >/dev/null 2>&1; then
-            echo "release: GitHub Release v$VERSION already exists — skipping create"
-        else
-            NOTES="$(mktemp -t zm-release-notes.XXXXXX)"
-            if bash scripts/release-notes.sh "$VERSION" > "$NOTES" && [ -s "$NOTES" ]; then
-                if gh release create "v$VERSION" --verify-tag --notes-file "$NOTES"; then
-                    echo "release: GitHub Release v$VERSION created — the ci.yml release job now"
-                    echo "  builds and attaches zigmodu-v$VERSION-linux-x86_64.tar.gz (+ .sha256)."
-                else
-                    echo "WARN: gh release create failed; create the release by hand:" >&2
-                    echo "  bash scripts/release-notes.sh $VERSION > /tmp/notes-v$VERSION.md" >&2
-                    echo "  gh release create v$VERSION --verify-tag --notes-file /tmp/notes-v$VERSION.md" >&2
-                fi
-            else
-                echo "WARN: no CHANGELOG section extracted for $VERSION; create the release by hand:" >&2
-                echo "  gh release create v$VERSION --verify-tag --generate-notes" >&2
-            fi
-            rm -f "$NOTES"
-        fi
+    # 6. GitHub Release (skipped with --tag-only): publishing the release fires
+    #    ci.yml's `release: published` trigger, so the docker + release jobs
+    #    build zigmodu-v$VERSION-linux-x86_64.tar.gz and its .sha256 companion
+    #    and attach both. Tags are the frequent, pinnable artifact; the Release
+    #    is the weekly announcement — cut it later for any existing tag with:
+    #      bash scripts/release.sh --publish-release <x.y.z>
+    if [ "$TAG_ONLY" = "1" ]; then
+        echo "release: tag v$VERSION pushed (tag-only; no GitHub Release)."
+        echo "  publish the weekly release later with:"
+        echo "    bash scripts/release.sh --publish-release $VERSION"
     else
-        echo "gh CLI not found — create the GitHub Release by hand (the tag is already pushed):"
-        echo "  bash scripts/release-notes.sh $VERSION > /tmp/notes-v$VERSION.md"
-        echo "  gh release create v$VERSION --verify-tag --notes-file /tmp/notes-v$VERSION.md"
+        create_github_release "$VERSION"
     fi
 
     # The tag push only runs release-verify (tag == package version). The real

@@ -1,5 +1,56 @@
 # Changelog
 
+## [Unreleased]
+
+### 第 183 批：release 机制区分 tag 与 GitHub Release——tag 高频、Release 每周至多一次（**破坏性：否**）
+
+Zig packages pin by git tag, so the tag is the frequent, pinnable artifact
+and the GitHub Release (which fires ci.yml's docker build) is the weekly
+announcement. `scripts/release.sh` now separates the two cadences:
+
+1. **`scripts/release.sh <x.y.z> --tag-only --push`** — the frequent path:
+   full bump + gates + commit + annotated tag + push, but no GitHub
+   Release. `release-verify` still gates every pushed tag.
+2. **`scripts/release.sh --publish-release <x.y.z> [--push]`** — the weekly
+   path: creates the GitHub Release (CHANGELOG notes via `release-notes.sh`)
+   for an existing tag only; asserts the tag exists locally and on origin,
+   changes nothing else. Extracted `create_github_release()` so both paths
+   share one implementation (previously inline in the push branch).
+3. A bare `release.sh <x.y.z> --push` remains tag + Release together
+   (equivalent to `--tag-only` then `--publish-release`). New two-mode arg
+   parsing; usage text updated. AGENTS.md「Release 流程」documents the
+   cadence rule: tags anytime after gates, GitHub Release at most weekly
+   (Monday suggested).
+
+### 第 182 批：life 系统 Phase 1 落地——core 状态机 + `.life/` 文件存储 + `zmodu life issue/release` CLI + `zmodu ci --life` 钩子（**破坏性：否**）
+
+Phase 1 of the life spec (`docs/superpowers/specs/2026-10-16-life-issue-release-design.md`):
+the AI-agent-era issue & release governance system.
+
+1. **Shared core** (`src/life/`, exported as `zigmodu.life`): data model +
+   14-transition state machine with required-field validation (heysen-proven
+   semantics — validate the transition, then the fields, mutate nothing on
+   rejection; terminal states `closed/duplicate/rejected` have no out-edges),
+   sha256 fingerprints. The CLI consumes the same core via a third explicit
+   module import (`life_core`, same dual-wiring pattern as `module_graph`), so
+   the future Phase-2 module adapter cannot drift from `zmodu life`.
+2. **File adapter** (`zmodu life issue new|list|show|transition|comment`,
+   `release draft|publish`, `sync`): issues as `.life/issues/LI-%04d.md`
+   frontmatter markdown (quoted+escaped values, ISO-8601, `## Repro` and
+   `## Comments` sections; audit comment on every transition), releases as
+   `.life/releases/<version>.md`. Seq is scan-derived from filenames, not a
+   counter file (spec §4.2 updated: stateless, self-healing).
+3. **`zmodu ci --life`**: failing gates record as dedup'd issues — one issue
+   per failing step, fingerprint `sha256(ci|step|detail)`; a repeat failure
+   appends a `still failing` comment to the open issue instead of opening a
+   new one. Side-channel only — never changes ci's exit code.
+4. **Release loop**: `release draft <version>` selects window issues
+   (`updated_at` after the latest `published`, status fixed/verified/closed)
+   and splices the matching `## [version]` CHANGELOG section; `publish` is
+   immutable (re-draft refused) and renders `life.json` + `atom.xml` feeds.
+   `zmodu life evolve` now creates `.life/tree/` when missing (pre-existing
+   defect fix).
+
 ## [0.39.13] - 2026-10-16
 
 ### 第 181 批：zent v0.92.0 → v0.94.0 适配——两示例 pin + 文档口径（**破坏性：否**）
