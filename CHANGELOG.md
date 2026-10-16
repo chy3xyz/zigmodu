@@ -1,5 +1,30 @@
 # Changelog
 
+## [Unreleased]
+
+### 修复：life 测试在 build runner `--listen=-` 下"超时"（**破坏性：否**）
+
+`zmodu life` 的四个 `runAt` 测试在 CI 的 `zig build test`（build runner
+`--listen=-` 协议）下被全部六个测试 job 报 300s 超时，而抓取的 stderr 显示
+测试完整执行了每一步。根因：life CLI 的 `printOut` 直接向 fd 1 写输出——
+`--listen=-` 模式下 fd 1 是测试二进制与 build runner 的**协议通道**，裸写
+令协议流失步，runner 永远收不到完成消息。life 于 10-16 落地、此前未走过
+CI 的 runner 路径；本地独立直跑无协议层，看门狗兜底因此一直显示为绿。
+修复：`printOut` 在 `builtin.is_test` 下静默返回（测试断言退出码与文件
+状态，不依赖 stdout 文本；生产 CLI 行为不变）。已在 CI 同款容器
+（ubuntu 24.04 aarch64 + Zig 0.17.0 官方 + listen runner）A/B 验证：
+原版 152 pass / 4 timeout（复现 CI 签名），修复版 156 pass / 3 skip /
+0 timeout。
+
+### 修复：`check-test-collection.sh` 在看门狗兜底路径下静默退出（**破坏性：否**）
+
+`set -o pipefail` 下对兜底日志（无 `Build Summary:` 行，只有
+`zm-test-guard` 横幅）跑未加 `|| true` 保护的 `grep`，管道非零即被
+`set -e` 杀掉——门实际通过却零输出退出 1，发布流程在第 3 次尝试中因此
+失败。三行 grep 全部补上 `|| true`，并在兜底路径回显守卫横幅作为
+"门真实执行过"的证据。
+
+
 ## [0.39.15] - 2026-10-16
 
 ### 工具链韧性：`zig build test` 挂起看门狗 + 独立二进制兜底（**破坏性：否**）
