@@ -14,6 +14,9 @@ test "compile all source files" {
     _ = @import("api/Server.zig");
     _ = @import("api/ComptimeRouter.zig");
 
+    // Life (issue/release governance core)
+    _ = @import("life/model.zig");
+
     // Application
     _ = @import("Application.zig");
 
