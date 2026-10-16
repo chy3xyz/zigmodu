@@ -16,6 +16,7 @@ test "compile all source files" {
 
     // Life (issue/release governance core)
     _ = @import("life/model.zig");
+    _ = @import("life/state.zig");
 
     // Application
     _ = @import("Application.zig");
