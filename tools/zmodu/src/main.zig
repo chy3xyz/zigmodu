@@ -39,6 +39,7 @@ const runtime_mod = @import("runtime.zig");
 const ci_mod = @import("ci.zig");
 const saas_mod = @import("saas.zig");
 const market_mod = @import("market.zig");
+const life_mod = @import("life.zig");
 const test_collection = @import("test_collection");
 
 // ==== §1  Options & CLI helpers ====
@@ -549,7 +550,7 @@ fn printUsage() void {
         \\  config          Generate ExternalizedConfig validator boilerplate
         \\  test <module>   Generate integration test scaffolding
         \\  plugin         List/manage stub plugins (migration gap filler)
-        \\  life           Project evolutionary memory (tree, fingerprint, evolve)
+        \\  life           Issue & release tracking + evolutionary memory (.life/)
         \\  upgrade        Upgrade zmodu to latest (git pull + zig build)
         \\  mcp            Start MCP server (for AI agent integration)
         \\  verify [dir]   Verify project compiles and has correct structure (--json; -h for the module layout rule)
@@ -962,6 +963,7 @@ test "cli submodule coverage gates (saas + market + audit + doctor + verify)" {
     // Without this, verify.zig's tests are not part of the test graph at all
     // (nothing else in it is referenced from a test) and silently never run.
     _ = @import("verify.zig");
+    _ = @import("life.zig");
     // Same reason: nothing in `incremental.zig` is referenced from a test, so
     // its tests (including the manifest OOM scan) were never collected.
     _ = @import("incremental.zig");
@@ -5213,7 +5215,15 @@ fn cmdOrm(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
 
 fn cmdLife(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len == 0) {
-        std.log.info("usage: zmodu life <tree|fingerprint|evolve>", .{});
+        std.log.info("usage: zmodu life <issue|release|sync|tree|fingerprint|evolve>", .{});
+        return;
+    }
+    if (std.mem.eql(u8, args[0], "issue") or
+        std.mem.eql(u8, args[0], "release") or
+        std.mem.eql(u8, args[0], "sync"))
+    {
+        const code = life_mod.run(io, allocator, args);
+        if (code != 0) std.process.exit(code);
         return;
     }
     if (std.mem.eql(u8, args[0], "tree")) {
@@ -5264,7 +5274,7 @@ fn cmdLife(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !
         std.log.info("evolved: {s} → .life/tree/{s}.md", .{ msg, version });
         return;
     }
-    std.log.info("usage: zmodu life <tree|fingerprint|evolve [version] [message]>", .{});
+    std.log.info("usage: zmodu life <issue|release|sync|tree|fingerprint|evolve [version] [message]>", .{});
 }
 
 fn cmdPlugin(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
