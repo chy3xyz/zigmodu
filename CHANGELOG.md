@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.39.16] - 2026-10-17
 
 ### 修复：life 测试在 build runner `--listen=-` 下"超时"（**破坏性：否**）
 
