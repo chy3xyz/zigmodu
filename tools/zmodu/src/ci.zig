@@ -12,29 +12,44 @@ const verify_mod = @import("verify.zig");
 const audit_mod = @import("audit.zig");
 const deadcode_mod = @import("deadcode.zig");
 const doctor_mod = @import("doctor.zig");
+const life_mod = @import("life.zig");
 
 pub const usage =
-    \\Usage: zmodu ci [dir]
+    \\Usage: zmodu ci [dir] [--life]
     \\
     \\One-shot quality gate: zig build + zig fmt --check + verify + audit + deadcode + doctor.
     \\
     \\Options:
+    \\  --life       record failing gates as life issues (.life/issues/, dedup'd by fingerprint)
     \\  -h, --help   show this help
     \\
 ;
 
 pub fn run(io: Io, allocator: std.mem.Allocator, args: []const []const u8) u8 {
     var dir: []const u8 = ".";
+    var life_enabled = false;
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             writeOut(io, usage) catch return 1;
             return 0;
+        }
+        if (std.mem.eql(u8, arg, "--life")) {
+            life_enabled = true;
+            continue;
         }
         if (arg.len > 0 and arg[0] == '-') return 2;
         dir = arg;
     }
 
     var failed = false;
+    var results = std.ArrayList(life_mod.StepResult).empty;
+    defer results.deinit(allocator);
+    var owned = std.ArrayList([]const u8).empty;
+    defer {
+        for (owned.items) |p| allocator.free(p);
+        owned.deinit(allocator);
+    }
+
     var out_buf: [4096]u8 = undefined;
     var out_file = Io.File.stdout();
     var out_writer = out_file.writer(io, &out_buf);
@@ -49,6 +64,7 @@ pub fn run(io: Io, allocator: std.mem.Allocator, args: []const []const u8) u8 {
         .stdout_limit = .limited(8 * 1024 * 1024),
         .stderr_limit = .limited(8 * 1024 * 1024),
     }) catch |err| {
+        recordStep(allocator, &results, &owned, "compile", false, @errorName(err));
         stdout.print("[compile] ERROR: cannot run `zig build`: {s}\n", .{@errorName(err)}) catch return 1;
         stdout.flush() catch return 1;
         return 1;
@@ -58,6 +74,7 @@ pub fn run(io: Io, allocator: std.mem.Allocator, args: []const []const u8) u8 {
         allocator.free(build_res.stderr);
     }
     const build_ok = build_res.term.success();
+    recordStep(allocator, &results, &owned, "compile", build_ok, if (build_ok) "zig build" else firstLine(build_res.stderr));
     if (build_ok) {
         stdout.print("[compile] PASS (zig build)\n", .{}) catch return 1;
     } else {
@@ -87,6 +104,7 @@ pub fn run(io: Io, allocator: std.mem.Allocator, args: []const []const u8) u8 {
             .stdout_limit = .limited(8 * 1024 * 1024),
             .stderr_limit = .limited(8 * 1024 * 1024),
         }) catch |err| {
+            recordStep(allocator, &results, &owned, "fmt", false, @errorName(err));
             stdout.print("[fmt] ERROR: cannot run `zig fmt --check`: {s}\n", .{@errorName(err)}) catch return 1;
             stdout.flush() catch return 1;
             return 1;
@@ -96,6 +114,7 @@ pub fn run(io: Io, allocator: std.mem.Allocator, args: []const []const u8) u8 {
             allocator.free(fmt_res.stderr);
         }
         const fmt_ok = fmt_res.term.success();
+        recordStep(allocator, &results, &owned, "fmt", fmt_ok, if (fmt_ok) "zig fmt --check" else firstLine(fmt_res.stderr));
         if (fmt_ok) {
             stdout.print("[fmt] PASS (zig fmt --check)\n", .{}) catch return 1;
         } else {
@@ -110,6 +129,7 @@ pub fn run(io: Io, allocator: std.mem.Allocator, args: []const []const u8) u8 {
 
     // 3. verify (structure/imports, in-process).
     const report = verify_mod.verifyProject(allocator, io, dir) catch |err| {
+        recordStep(allocator, &results, &owned, "verify", false, @errorName(err));
         stdout.print("[verify] ERROR: {s}\n", .{@errorName(err)}) catch return 1;
         stdout.flush() catch return 1;
         return 1;
@@ -127,6 +147,7 @@ pub fn run(io: Io, allocator: std.mem.Allocator, args: []const []const u8) u8 {
         allocator.free(report.warnings);
         allocator.free(report.summary);
     }
+    recordStep(allocator, &results, &owned, "verify", report.pass, report.summary);
     if (report.pass) {
         stdout.print("[verify] PASS ({s})\n", .{report.summary}) catch return 1;
     } else {
@@ -137,12 +158,14 @@ pub fn run(io: Io, allocator: std.mem.Allocator, args: []const []const u8) u8 {
 
     // 4. audit (best-practice rules, in-process).
     const audit_json = audit_mod.auditJsonFor(io, allocator, dir) catch |err| {
+        recordStep(allocator, &results, &owned, "audit", false, @errorName(err));
         stdout.print("[audit] ERROR: {s}\n", .{@errorName(err)}) catch return 1;
         stdout.flush() catch return 1;
         return 1;
     };
     defer allocator.free(audit_json);
     const audit_pass = jsonPassField(allocator, audit_json) catch false;
+    recordStep(allocator, &results, &owned, "audit", audit_pass, if (audit_pass) "audit" else firstLine(audit_json));
     if (audit_pass) {
         stdout.print("[audit] PASS\n", .{}) catch return 1;
     } else {
@@ -172,9 +195,11 @@ pub fn run(io: Io, allocator: std.mem.Allocator, args: []const []const u8) u8 {
     if (dc_paths.items.len > 1) {
         const dc_code = deadcode_mod.run(io, allocator, dc_paths.items);
         if (dc_code == 0) {
+            recordStep(allocator, &results, &owned, "deadcode", true, "deadcode");
             stdout.print("[deadcode] PASS\n", .{}) catch return 1;
         } else if (dc_code == 1) {
             failed = true;
+            recordStep(allocator, &results, &owned, "deadcode", false, "dead declarations found");
             stdout.print("[deadcode] FAIL (dead declarations found)\n", .{}) catch return 1;
         } else {
             stdout.print("[deadcode] SKIP ({d})\n", .{dc_code}) catch return 1;
@@ -190,12 +215,31 @@ pub fn run(io: Io, allocator: std.mem.Allocator, args: []const []const u8) u8 {
     {
         const doc_code = doctor_mod.run(io, allocator, &.{dir});
         if (doc_code == 0) {
+            recordStep(allocator, &results, &owned, "doctor", true, "doctor");
             stdout.print("[doctor] PASS (no cycles, no unacknowledged entanglement)\n", .{}) catch return 1;
         } else if (doc_code == 1) {
             failed = true;
+            recordStep(allocator, &results, &owned, "doctor", false, "architecture health");
             stdout.print("[doctor] FAIL (architecture health)\n", .{}) catch return 1;
         } else {
             stdout.print("[doctor] SKIP ({d})\n", .{doc_code}) catch return 1;
+        }
+    }
+
+    // --life: failing gates become life issues (dedup'd by fingerprint). This
+    // is a side-channel record — it must never change ci's own exit code.
+    if (life_enabled) {
+        var any_failed = false;
+        for (results.items) |r| {
+            if (!r.ok) {
+                any_failed = true;
+                break;
+            }
+        }
+        if (any_failed) {
+            life_mod.recordCi(io, allocator, dir, results.items) catch {
+                stdout.print("[life] ERROR: failed to record life issues\n", .{}) catch {};
+            };
         }
     }
 
@@ -221,6 +265,21 @@ fn dirExists(io: Io, path: []const u8) bool {
     var d = Dir.cwd().openDir(io, path, .{}) catch return false;
     d.close(io);
     return true;
+}
+
+fn firstLine(s: []const u8) []const u8 {
+    const end = std.mem.indexOfScalar(u8, s, '\n') orelse s.len;
+    const line = std.mem.trim(u8, s[0..end], " \t\r");
+    return if (line.len > 200) line[0..200] else line;
+}
+
+fn recordStep(allocator: std.mem.Allocator, results: *std.ArrayList(life_mod.StepResult), owned: *std.ArrayList([]const u8), name: []const u8, ok: bool, detail: []const u8) void {
+    const d = allocator.dupe(u8, detail) catch return;
+    owned.append(allocator, d) catch {
+        allocator.free(d);
+        return;
+    };
+    results.append(allocator, .{ .name = name, .ok = ok, .detail = d }) catch {};
 }
 
 fn jsonPassField(allocator: std.mem.Allocator, json: []const u8) !bool {

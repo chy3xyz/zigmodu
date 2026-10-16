@@ -91,6 +91,55 @@ fn findOpenByFingerprint(alloc: std.mem.Allocator, io: std.Io, dir: []const u8, 
     return null;
 }
 
+pub const StepResult = struct {
+    name: []const u8,
+    ok: bool,
+    detail: []const u8,
+};
+
+/// Record failing CI steps as life issues (spec §6 "CI 钩子"): one issue per
+/// failing step, dedup'd by sha256(source|step|detail) — a repeat failure
+/// appends a comment to the still-open issue instead of opening a new one.
+pub fn recordCi(io: std.Io, allocator: std.mem.Allocator, dir: []const u8, results: []const StepResult) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    for (results) |r| {
+        if (r.ok) continue;
+        const fp_full = state.fingerprintHex(.ci, r.name, "", r.detail);
+        var fp_buf: [71]u8 = undefined;
+        const fp = std.fmt.bufPrint(&fp_buf, "sha256:{s}", .{fp_full}) catch unreachable;
+        const now = nowSeconds();
+        var tbuf: [20]u8 = undefined;
+        if (try findOpenByFingerprint(alloc, io, dir, fp)) |seq| {
+            var iss = (try loadIssue(alloc, io, dir, seq)).?;
+            const text = try std.fmt.allocPrint(alloc, "still failing: {s}", .{r.detail});
+            try appendComment(alloc, &iss, now, "agent:ci", text);
+            iss.updated_at = now;
+            try saveIssue(alloc, io, dir, &iss);
+            printOut(io, "life: LI-{d:0>4} comment added (recurring {s} failure)", .{ seq, r.name });
+            continue;
+        }
+        const seq = try nextSeq(alloc, io, dir);
+        const title = try std.fmt.allocPrint(alloc, "[ci] {s} FAIL", .{r.name});
+        const repro = try std.fmt.allocPrint(alloc, "command: zmodu ci\ndetail: {s}\ntimestamp: {s}", .{ r.detail, epochToIsoUtc(&tbuf, now) });
+        var iss = model.Issue{
+            .seq = seq,
+            .title = title,
+            .source = .ci,
+            .priority = .p1,
+            .category = .bug,
+            .reporter = "agent:ci",
+            .fingerprint = try alloc.dupe(u8, fp),
+            .repro_lines = repro,
+            .created_at = now,
+            .updated_at = now,
+        };
+        try saveIssue(alloc, io, dir, &iss);
+        printOut(io, "life: LI-{d:0>4} created ({s} failure)", .{ seq, r.name });
+    }
+}
+
 fn cmdIssue(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8, dir: []const u8) u8 {
     if (args.len == 0) {
         std.log.info("usage: zmodu life issue <new|list|show|transition|comment>", .{});
@@ -975,4 +1024,36 @@ test "transition validates and audits, rejected leaves file unchanged" {
     try std.testing.expectEqual(model.Status.closed, iss.status);
     try std.testing.expectEqualStrings("abc123", iss.fix_ref);
     try std.testing.expect(iss.comments.len >= 5);
+}
+
+test "recordCi opens one issue and comments on recurrence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const failing = [_]StepResult{.{ .name = "audit", .ok = false, .detail = "b26 violation at src/x.zig:12" }};
+    try recordCi(io, alloc, dir, &failing);
+    var all = try listIssues(alloc, io, dir);
+    try std.testing.expectEqual(@as(usize, 1), all.len);
+    try std.testing.expectEqual(model.Source.ci, all[0].source);
+    try std.testing.expect(std.mem.startsWith(u8, all[0].title, "[ci] audit FAIL"));
+    try std.testing.expect(std.mem.startsWith(u8, all[0].fingerprint, "sha256:"));
+    // 同一失败签名再来一次 → 不开新单，只加 comment
+    try recordCi(io, alloc, dir, &failing);
+    all = try listIssues(alloc, io, dir);
+    try std.testing.expectEqual(@as(usize, 1), all.len);
+    try std.testing.expect(all[0].comments.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, all[0].comments[all[0].comments.len - 1].text, "still failing") != null);
+    // 不同签名 → 新单
+    const other = [_]StepResult{.{ .name = "audit", .ok = false, .detail = "different violation" }};
+    try recordCi(io, alloc, dir, &other);
+    try std.testing.expectEqual(@as(usize, 2), (try listIssues(alloc, io, dir)).len);
+    // 全过 → 不写
+    const passing = [_]StepResult{.{ .name = "audit", .ok = true, .detail = "audit" }};
+    try recordCi(io, alloc, dir, &passing);
+    try std.testing.expectEqual(@as(usize, 2), (try listIssues(alloc, io, dir)).len);
 }
