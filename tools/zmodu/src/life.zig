@@ -27,21 +27,336 @@ fn printErr(io: std.Io, comptime fmt: []const u8, args: anytype) void {
 }
 
 pub fn runAt(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8, dir: []const u8) u8 {
-    _ = allocator;
-    _ = dir;
     if (args.len == 0) {
         printUsage();
         return 2;
     }
-    if (std.mem.eql(u8, args[0], "issue") or
-        std.mem.eql(u8, args[0], "release") or
-        std.mem.eql(u8, args[0], "sync"))
-    {
-        printErr(io, "life: {s} not implemented yet", .{args[0]});
+    if (std.mem.eql(u8, args[0], "issue")) return cmdIssue(io, allocator, args[1..], dir);
+    if (std.mem.eql(u8, args[0], "release")) {
+        printErr(io, "life: release not implemented yet", .{});
+        return 1;
+    }
+    if (std.mem.eql(u8, args[0], "sync")) {
+        printErr(io, "life: sync not implemented yet", .{});
         return 1;
     }
     printUsage();
     return 2;
+}
+
+fn nowSeconds() i64 {
+    if (@import("builtin").os.tag == .windows) {
+        const li = std.os.windows.ntdll.RtlGetSystemTimePrecise();
+        const t: u64 = @bitCast(li);
+        return @intCast(t / 10000000 -| 11644473600);
+    }
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.REALTIME, &ts) == 0) {
+        return @intCast(@max(ts.sec, 0));
+    }
+    return 0;
+}
+
+fn printOut(io: std.Io, comptime fmt: []const u8, args: anytype) void {
+    var buf: [4096]u8 = undefined;
+    var out_file = std.Io.File.stdout();
+    var out_writer = out_file.writer(io, &buf);
+    const stdout = &out_writer.interface;
+    stdout.print(fmt, args) catch return;
+    stdout.writeAll("\n") catch return;
+    stdout.flush() catch return;
+}
+
+fn parseIssueId(s: []const u8) ?u32 {
+    var rest = s;
+    if (rest.len > 3 and std.ascii.startsWithIgnoreCase(rest, "LI-")) rest = rest[3..];
+    if (rest.len == 0 or rest.len > 9) return null;
+    for (rest) |ch| if (!std.ascii.isDigit(ch)) return null;
+    return std.fmt.parseInt(u32, rest, 10) catch null;
+}
+
+fn appendComment(alloc: std.mem.Allocator, issue: *model.Issue, now: i64, author: []const u8, text: []const u8) !void {
+    const next = try alloc.alloc(model.Comment, issue.comments.len + 1);
+    @memcpy(next[0..issue.comments.len], issue.comments);
+    next[issue.comments.len] = .{ .at = now, .author = author, .text = text };
+    issue.comments = next;
+}
+
+fn findOpenByFingerprint(alloc: std.mem.Allocator, io: std.Io, dir: []const u8, fp: []const u8) !?u32 {
+    if (fp.len == 0) return null;
+    const all = try listIssues(alloc, io, dir);
+    for (all) |iss| {
+        if (std.mem.eql(u8, iss.fingerprint, fp) and !state.isTerminal(iss.status)) return iss.seq;
+    }
+    return null;
+}
+
+fn cmdIssue(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8, dir: []const u8) u8 {
+    if (args.len == 0) {
+        std.log.info("usage: zmodu life issue <new|list|show|transition|comment>", .{});
+        return 2;
+    }
+    if (std.mem.eql(u8, args[0], "new")) return cmdIssueNew(io, allocator, args[1..], dir);
+    if (std.mem.eql(u8, args[0], "list")) return cmdIssueList(io, allocator, args[1..], dir);
+    if (std.mem.eql(u8, args[0], "show")) return cmdIssueShow(io, allocator, args[1..], dir);
+    if (std.mem.eql(u8, args[0], "comment")) return cmdIssueComment(io, allocator, args[1..], dir);
+    if (std.mem.eql(u8, args[0], "transition")) {
+        printErr(io, "life: issue transition not implemented yet", .{});
+        return 1;
+    }
+    std.log.info("usage: zmodu life issue <new|list|show|transition|comment>", .{});
+    return 2;
+}
+
+fn usageIssueNew() u8 {
+    std.log.info("usage: zmodu life issue new --title T [--category bug|feat|perf|ux|docs|other] [--priority P0-P3] [--source user|agent|ci|bench|stress] [--reporter R] [--fingerprint FP] [--repro K=V ...] [--body-file F]", .{});
+    return 2;
+}
+
+fn cmdIssueNew(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8, dir: []const u8) u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var title: ?[]const u8 = null;
+    var body_file: ?[]const u8 = null;
+    var category: model.Category = .bug;
+    var priority: model.Priority = .p2;
+    var source: model.Source = .user;
+    var reporter: []const u8 = "";
+    var fingerprint: []const u8 = "";
+    var repro = std.ArrayList(u8).empty;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--title")) {
+            i += 1;
+            if (i >= args.len) return usageIssueNew();
+            title = args[i];
+        } else if (std.mem.eql(u8, a, "--category")) {
+            i += 1;
+            if (i >= args.len) return usageIssueNew();
+            category = model.categoryFromString(args[i]) orelse {
+                printErr(io, "life: unknown category '{s}'", .{args[i]});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, a, "--priority")) {
+            i += 1;
+            if (i >= args.len) return usageIssueNew();
+            priority = model.priorityFromString(args[i]) orelse {
+                printErr(io, "life: unknown priority '{s}'", .{args[i]});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, a, "--source")) {
+            i += 1;
+            if (i >= args.len) return usageIssueNew();
+            source = model.sourceFromString(args[i]) orelse {
+                printErr(io, "life: unknown source '{s}'", .{args[i]});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, a, "--reporter")) {
+            i += 1;
+            if (i >= args.len) return usageIssueNew();
+            reporter = args[i];
+        } else if (std.mem.eql(u8, a, "--fingerprint")) {
+            i += 1;
+            if (i >= args.len) return usageIssueNew();
+            fingerprint = args[i];
+        } else if (std.mem.eql(u8, a, "--repro")) {
+            i += 1;
+            if (i >= args.len) return usageIssueNew();
+            repro.appendSlice(alloc, args[i]) catch return 1;
+            repro.append(alloc, '\n') catch return 1;
+        } else if (std.mem.eql(u8, a, "--body-file")) {
+            i += 1;
+            if (i >= args.len) return usageIssueNew();
+            body_file = args[i];
+        } else {
+            printErr(io, "life: unknown flag '{s}'", .{a});
+            return 2;
+        }
+    }
+    const t = title orelse return usageIssueNew();
+    var body: []const u8 = "";
+    if (body_file) |bf| {
+        body = std.Io.Dir.cwd().readFileAlloc(io, bf, alloc, std.Io.Limit.limited(1 << 20)) catch {
+            printErr(io, "life: cannot read body file '{s}'", .{bf});
+            return 1;
+        };
+    }
+    const seq = nextSeq(alloc, io, dir) catch {
+        printErr(io, "life: cannot scan {s}/.life/issues", .{dir});
+        return 1;
+    };
+    const now = nowSeconds();
+    var iss = model.Issue{
+        .seq = seq,
+        .title = t,
+        .body = body,
+        .category = category,
+        .source = source,
+        .priority = priority,
+        .reporter = reporter,
+        .fingerprint = fingerprint,
+        .repro_lines = std.mem.trim(u8, repro.items, "\n"),
+        .created_at = now,
+        .updated_at = now,
+    };
+    saveIssue(alloc, io, dir, &iss) catch {
+        printErr(io, "life: cannot write {s}/.life/issues/LI-{d:0>4}.md", .{ dir, seq });
+        return 1;
+    };
+    printOut(io, "LI-{d:0>4} created", .{seq});
+    return 0;
+}
+
+fn cmdIssueList(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8, dir: []const u8) u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var status: ?model.Status = null;
+    var source: ?model.Source = null;
+    var category: ?model.Category = null;
+    var json = false;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--status")) {
+            i += 1;
+            if (i >= args.len) return 2;
+            status = model.statusFromString(args[i]);
+        } else if (std.mem.eql(u8, a, "--source")) {
+            i += 1;
+            if (i >= args.len) return 2;
+            source = model.sourceFromString(args[i]);
+        } else if (std.mem.eql(u8, a, "--category")) {
+            i += 1;
+            if (i >= args.len) return 2;
+            category = model.categoryFromString(args[i]);
+        } else if (std.mem.eql(u8, a, "--json")) {
+            json = true;
+        } else {
+            printErr(io, "life: unknown flag '{s}'", .{a});
+            return 2;
+        }
+    }
+    const all = listIssues(alloc, io, dir) catch {
+        printErr(io, "life: cannot list {s}/.life/issues", .{dir});
+        return 1;
+    };
+    var matched: usize = 0;
+    var json_out = std.ArrayList(u8).empty;
+    if (json) json_out.appendSlice(alloc, "[") catch return 1;
+    for (all) |iss| {
+        if (status) |s| if (iss.status != s) continue;
+        if (source) |s| if (iss.source != s) continue;
+        if (category) |c| if (iss.category != c) continue;
+        matched += 1;
+        if (json) {
+            if (matched > 1) json_out.appendSlice(alloc, ",") catch return 1;
+            const t = jsonEscape(alloc, iss.title) catch return 1;
+            json_out.appendSlice(alloc, std.fmt.allocPrint(alloc, "{{\"id\":\"LI-{d:0>4}\",\"title\":\"{s}\",\"status\":\"{s}\",\"priority\":\"{s}\",\"source\":\"{s}\"}}", .{
+                iss.seq, t, model.statusToString(iss.status), model.priorityToString(iss.priority), model.sourceToString(iss.source),
+            }) catch return 1) catch return 1;
+        } else {
+            printOut(io, "LI-{d:0>4} [{s}] ({s}, {s}) {s}", .{
+                iss.seq, model.statusToString(iss.status), model.priorityToString(iss.priority), model.sourceToString(iss.source), iss.title,
+            });
+        }
+    }
+    if (json) {
+        json_out.appendSlice(alloc, "]") catch return 1;
+        printOut(io, "{s}", .{json_out.items});
+    }
+    if (matched == 0 and !json) printOut(io, "(no issues)", .{});
+    return 0;
+}
+
+fn cmdIssueShow(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8, dir: []const u8) u8 {
+    if (args.len != 1) {
+        std.log.info("usage: zmodu life issue show <LI-0001>", .{});
+        return 2;
+    }
+    const seq = parseIssueId(args[0]) orelse {
+        printErr(io, "life: bad issue id '{s}'", .{args[0]});
+        return 2;
+    };
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const iss = (loadIssue(arena.allocator(), io, dir, seq) catch return 1) orelse {
+        printErr(io, "life: LI-{d:0>4} not found", .{seq});
+        return 1;
+    };
+    var tbuf: [20]u8 = undefined;
+    printOut(io, "LI-{d:0>4} [{s}] ({s}, {s}, {s})", .{
+        iss.seq, model.statusToString(iss.status), model.priorityToString(iss.priority), model.sourceToString(iss.source), model.categoryToString(iss.category),
+    });
+    printOut(io, "  title: {s}", .{iss.title});
+    if (iss.assignee.len > 0) printOut(io, "  assignee: {s}", .{iss.assignee});
+    if (iss.reporter.len > 0) printOut(io, "  reporter: {s}", .{iss.reporter});
+    if (iss.fix_ref.len > 0) printOut(io, "  fix_ref: {s}  resolution: {s}", .{ iss.fix_ref, iss.resolution });
+    if (iss.fingerprint.len > 0) printOut(io, "  fingerprint: {s}", .{iss.fingerprint});
+    printOut(io, "  created: {s}  updated: {s}", .{ epochToIsoUtc(&tbuf, iss.created_at), epochToIsoUtc(&tbuf, iss.updated_at) });
+    if (iss.body.len > 0) printOut(io, "\n{s}", .{iss.body});
+    if (iss.repro_lines.len > 0) printOut(io, "\n## Repro\n{s}", .{iss.repro_lines});
+    for (iss.comments) |c| {
+        printOut(io, "- {s} {s}: {s}", .{ epochToIsoUtc(&tbuf, c.at), c.author, c.text });
+    }
+    return 0;
+}
+
+fn cmdIssueComment(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8, dir: []const u8) u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var seq: ?u32 = null;
+    var body: ?[]const u8 = null;
+    var by: []const u8 = "unknown";
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.startsWith(u8, a, "--")) {
+            if (std.mem.eql(u8, a, "--body")) {
+                i += 1;
+                if (i >= args.len) return 2;
+                body = args[i];
+            } else if (std.mem.eql(u8, a, "--by")) {
+                i += 1;
+                if (i >= args.len) return 2;
+                by = args[i];
+            } else {
+                printErr(io, "life: unknown flag '{s}'", .{a});
+                return 2;
+            }
+        } else {
+            if (seq != null) {
+                printErr(io, "life: unexpected argument '{s}'", .{a});
+                return 2;
+            }
+            seq = parseIssueId(a);
+            if (seq == null) {
+                printErr(io, "life: bad issue id '{s}'", .{a});
+                return 2;
+            }
+        }
+    }
+    const s = seq orelse {
+        std.log.info("usage: zmodu life issue comment <LI-0001> --body B [--by A]", .{});
+        return 2;
+    };
+    const b = body orelse {
+        std.log.info("usage: zmodu life issue comment <LI-0001> --body B [--by A]", .{});
+        return 2;
+    };
+    var iss = (loadIssue(alloc, io, dir, s) catch return 1) orelse {
+        printErr(io, "life: LI-{d:0>4} not found", .{s});
+        return 1;
+    };
+    const now = nowSeconds();
+    appendComment(alloc, &iss, now, by, b) catch return 1;
+    iss.updated_at = now;
+    saveIssue(alloc, io, dir, &iss) catch return 1;
+    return 0;
 }
 
 fn printUsage() void {
@@ -392,7 +707,7 @@ test "usage on empty args returns 2" {
     const dir_len = try tmp.dir.realPath(io, &path_buf);
     const dir = path_buf[0..dir_len];
     try std.testing.expectEqual(@as(u8, 2), runAt(io, arena.allocator(), &.{}, dir));
-    try std.testing.expectEqual(@as(u8, 1), runAt(io, arena.allocator(), &.{"issue"}, dir));
+    try std.testing.expectEqual(@as(u8, 2), runAt(io, arena.allocator(), &.{"issue"}, dir));
     try std.testing.expectEqual(@as(u8, 2), runAt(io, arena.allocator(), &.{"bogus"}, dir));
 }
 
@@ -475,4 +790,34 @@ test "jsonEscape covers control chars" {
     defer arena.deinit();
     const got = try jsonEscape(arena.allocator(), "a\"b\\c\nd\re\tf");
     try std.testing.expectEqualStrings("a\\\"b\\\\c\\nd\\re\\tf", got);
+}
+
+test "issue lifecycle via runAt: new, comment, list" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    try std.testing.expectEqual(@as(u8, 0), runAt(io, alloc, &.{ "issue", "new", "--title", "t1", "--reporter", "tester" }, dir));
+    try std.testing.expectEqual(@as(u8, 0), runAt(io, alloc, &.{ "issue", "comment", "LI-0001", "--by", "alice", "--body", "looks real" }, dir));
+    const iss = (try loadIssue(alloc, io, dir, 1)).?;
+    try std.testing.expectEqual(@as(usize, 1), iss.comments.len);
+    try std.testing.expectEqualStrings("alice", iss.comments[0].author);
+    try std.testing.expectEqualStrings("looks real", iss.comments[0].text);
+    try std.testing.expectEqual(@as(u8, 0), runAt(io, alloc, &.{ "issue", "list", "--json" }, dir));
+    try std.testing.expectEqual(@as(u8, 0), runAt(io, alloc, &.{ "issue", "list", "--status", "new" }, dir));
+    try std.testing.expectEqual(@as(u8, 0), runAt(io, alloc, &.{ "issue", "list", "--status", "fixed" }, dir));
+    // 缺 --title → usage
+    try std.testing.expectEqual(@as(u8, 2), runAt(io, alloc, &.{ "issue", "new" }, dir));
+    // 未知枚举值 → 2
+    try std.testing.expectEqual(@as(u8, 2), runAt(io, alloc, &.{ "issue", "new", "--title", "x", "--category", "bogus" }, dir));
+    // show 未存在 → 1
+    try std.testing.expectEqual(@as(u8, 1), runAt(io, alloc, &.{ "issue", "show", "LI-0099" }, dir));
+    // 第二个 issue 序号递增
+    try std.testing.expectEqual(@as(u8, 0), runAt(io, alloc, &.{ "issue", "new", "--title", "t2", "--fingerprint", "fp1" }, dir));
+    try std.testing.expectEqual(@as(?u32, 2), try findOpenByFingerprint(alloc, io, dir, "fp1"));
+    try std.testing.expect((try findOpenByFingerprint(alloc, io, dir, "nope")) == null);
 }
