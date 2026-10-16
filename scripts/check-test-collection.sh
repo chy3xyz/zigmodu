@@ -96,11 +96,18 @@ for row in "${GATES[@]}"; do
   pkg_dir="$(dirname "$build_zig")"
   # Two spelled-out commands rather than an args array: the macOS bash is 3.2,
   # where `"${arr[@]}"` on an empty array trips `set -u`.
+  # The forced run goes through zig-build-test-guarded.sh: the build runner's
+  # listen protocol can stall indefinitely on some hosts (known 0.17.0 macOS
+  # flake), and a gate that hangs forever protects nothing.
+  STATUS=0
   if [[ "$filter" != "-" ]]; then
-    (cd "$pkg_dir" && zig build test -Dtest-force-run=true "-Dtest-filter=$filter" --summary all) >"$log" 2>&1 && run_ok=1 || run_ok=0
+    bash scripts/zig-build-test-guarded.sh --dir "$pkg_dir" --timeout 1200 build test -Dtest-force-run=true "-Dtest-filter=$filter" --summary all >"$log" 2>&1 || STATUS=$?
   else
-    (cd "$pkg_dir" && zig build test -Dtest-force-run=true --summary all) >"$log" 2>&1 && run_ok=1 || run_ok=0
+    bash scripts/zig-build-test-guarded.sh --dir "$pkg_dir" --timeout 1200 build test -Dtest-force-run=true --summary all >"$log" 2>&1 || STATUS=$?
   fi
+  # 75 = the watchdog fired and the standalone fallback passed (the log
+  # carries the zm-test-guard banner). Both mean the gate really executed.
+  if [[ "$STATUS" -eq 0 || "$STATUS" -eq 75 ]]; then run_ok=1; else run_ok=0; fi
   if [[ "$run_ok" -eq 1 ]]; then
     grep -E 'Build Summary:' "$log" | tail -1 | sed "s|^|check-test-collection: ${pkg_dir}: |"
     grep -E 'test-collection gate:' "$log" | sed 's/^/check-test-collection: /' || true

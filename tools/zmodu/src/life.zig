@@ -38,17 +38,17 @@ pub fn runAt(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8,
     return 2;
 }
 
-fn nowSeconds() i64 {
+fn nowSeconds(io: std.Io) i64 {
     if (@import("builtin").os.tag == .windows) {
         const li = std.os.windows.ntdll.RtlGetSystemTimePrecise();
         const t: u64 = @bitCast(li);
         return @intCast(t / 10000000 -| 11644473600);
     }
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.REALTIME, &ts) == 0) {
-        return @intCast(@max(ts.sec, 0));
-    }
-    return 0;
+    // std.Io clock, not std.c/std.posix: life_core is also imported by build
+    // graphs whose test module does not link libc (standalone tools/zmodu),
+    // and 0.17 removed std.posix.clock_gettime.
+    const ts = std.Io.Clock.Timestamp.now(io, .real);
+    return @intCast(@divTrunc(ts.raw.nanoseconds, std.time.ns_per_s));
 }
 
 fn printOut(io: std.Io, comptime fmt: []const u8, args: anytype) void {
@@ -103,7 +103,7 @@ pub fn recordCi(io: std.Io, allocator: std.mem.Allocator, dir: []const u8, resul
         const fp_full = state.fingerprintHex(.ci, r.name, "", r.detail);
         var fp_buf: [71]u8 = undefined;
         const fp = std.fmt.bufPrint(&fp_buf, "sha256:{s}", .{fp_full}) catch return error.NoSpaceLeft;
-        const now = nowSeconds();
+        const now = nowSeconds(io);
         var tbuf: [20]u8 = undefined;
         if (try findOpenByFingerprint(alloc, io, dir, fp)) |seq| {
             var iss = (try loadIssue(alloc, io, dir, seq)).?;
@@ -488,7 +488,7 @@ fn cmdReleasePublish(io: std.Io, allocator: std.mem.Allocator, args: []const []c
         return 1;
     }
     rel.status = .published;
-    rel.published_at = nowSeconds();
+    rel.published_at = nowSeconds(io);
     saveRelease(alloc, io, dir, &rel) catch return 1;
     // Feeds: all published releases, newest first.
     const releases = listReleases(alloc, io, dir) catch return 1;
@@ -657,7 +657,7 @@ fn cmdIssueTransition(io: std.Io, allocator: std.mem.Allocator, args: []const []
     if (flag_fix_ref) |v| iss.fix_ref = v;
     if (flag_linked_id) |v| iss.linked_id = v;
     if (flag_note) |v| iss.internal_note = v;
-    const now = nowSeconds();
+    const now = nowSeconds(io);
     iss.updated_at = now;
     var audit = std.ArrayList(u8).empty;
     audit.appendSlice(alloc, "status ") catch return 1;
@@ -760,7 +760,7 @@ fn cmdIssueNew(io: std.Io, allocator: std.mem.Allocator, args: []const []const u
         printErr(io, "life: cannot scan {s}/.life/issues", .{dir});
         return 1;
     };
-    const now = nowSeconds();
+    const now = nowSeconds(io);
     var iss = model.Issue{
         .seq = seq,
         .title = t,
@@ -924,7 +924,7 @@ fn cmdIssueComment(io: std.Io, allocator: std.mem.Allocator, args: []const []con
         printErr(io, "life: LI-{d:0>4} not found", .{s});
         return 1;
     };
-    const now = nowSeconds();
+    const now = nowSeconds(io);
     appendComment(alloc, &iss, now, by, b) catch return 1;
     iss.updated_at = now;
     saveIssue(alloc, io, dir, &iss) catch return 1;

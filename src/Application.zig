@@ -627,6 +627,23 @@ fn warnAdvisoryGraphFindings(
 ) !void {
     if (max_dependencies == 0) return; // check disabled
 
+    // Allocation-free fast path: `validateModules` runs just before this and
+    // already refused to start on every fatal finding, so by the time control
+    // reaches here the only live advisory kind is sizing. Detect it with a
+    // plain scan — the clean case (the overwhelming majority of lifecycles)
+    // allocates nothing, keeping Application init/start inside the
+    // benchmark's alloc budget (the full `analyzeRuntime` below measured
+    // +3 alloc/op per lifecycle in the App-lifecycle x3K harness).
+    var any_over = false;
+    var scan = modules.modules.iterator();
+    while (scan.next()) |entry| {
+        if (entry.value_ptr.*.deps.len > max_dependencies) any_over = true;
+    }
+    if (!any_over) return;
+
+    // Sizing findings (rare): run the full owning analysis so the report is
+    // logged through the same ModuleGraph path the CLI uses, including any
+    // non-sizing kinds should the validate-before-warn ordering ever change.
     const nodes = try moduleGraphNodes(allocator, modules);
     defer allocator.free(nodes);
     var owned = try ModuleGraph.analyzeRuntime(allocator, nodes, .{

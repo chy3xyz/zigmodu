@@ -229,7 +229,14 @@ fi
 #        above already compiles and tests the framework itself.
 echo "-- gates --"
 zig fmt --check src tools examples
-ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test --summary all
+# 75 = the hang-watchdog fired and the standalone fallback passed (known
+# 0.17.0 macOS build-runner flake); both mean the suite really ran.
+GUARD_STATUS=0
+ZIG_GLOBAL_CACHE_DIR=.zig-global-cache bash scripts/zig-build-test-guarded.sh build test --summary all || GUARD_STATUS=$?
+if [[ "$GUARD_STATUS" -ne 0 && "$GUARD_STATUS" -ne 75 ]]; then
+  echo "release: test suite failed (exit $GUARD_STATUS)" >&2
+  exit "$GUARD_STATUS"
+fi
 bash scripts/check-deadcode.sh
 bash scripts/check-version.sh
 bash scripts/check-doc-paths.sh

@@ -172,7 +172,7 @@ jobs:
         # still failing fast on a hang.
         timeout-minutes: 25
         run: |
-          bash scripts/ci-run-logged.sh "$RUNNER_TEMP/test-output.log" zig build test --test-timeout 300s
+          bash scripts/ci-run-logged.sh "$RUNNER_TEMP/test-output.log" bash scripts/zig-build-test-guarded.sh --pass-on-fallback --timeout 1800 build test --test-timeout 300s
 
       # Placed *after* the suite on purpose: this step is the one that hangs on
       # the Linux runner today (5:13 against its own 5-minute bound, measured
@@ -411,6 +411,17 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - name: Cache Zig deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          # Same key as build-and-test: the cache is content-addressed, so the
+          # service/example jobs safely share it. Without this step each of
+          # them compiled the whole suite from cold (~20 min on 4 vCPU).
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: zig-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Setup Zig
         # mlugg/setup-zig@v1 builds old-pattern URLs (zig-<os>-<arch>) that
@@ -497,6 +508,17 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Cache Zig deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          # Same key as build-and-test: the cache is content-addressed, so the
+          # service/example jobs safely share it. Without this step each of
+          # them compiled the whole suite from cold (~20 min on 4 vCPU).
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: zig-${{ runner.os }}-${{ runner.arch }}-
       # No sibling zent checkout: zent-modulith pins zent via git tag in its
       # build.zig.zon (v0.33.0); the old actions/checkout into ../zent both
       # violated the workspace sandbox and pinned a stale v0.12.1-era commit.
@@ -584,6 +606,17 @@ jobs:
       (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))
     steps:
       - uses: actions/checkout@v4
+      - name: Cache Zig deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          # Same key as build-and-test: the cache is content-addressed, so the
+          # service/example jobs safely share it. Without this step each of
+          # them compiled the whole suite from cold (~20 min on 4 vCPU).
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: zig-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Setup Zig
         # mlugg/setup-zig@v1 builds old-pattern URLs (zig-<os>-<arch>) that
@@ -683,6 +716,17 @@ jobs:
           --health-retries 5
     steps:
       - uses: actions/checkout@v4
+      - name: Cache Zig deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          # Same key as build-and-test: the cache is content-addressed, so the
+          # service/example jobs safely share it. Without this step each of
+          # them compiled the whole suite from cold (~20 min on 4 vCPU).
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: zig-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Setup Zig
         # mlugg/setup-zig@v1 builds old-pattern URLs (zig-<os>-<arch>) that
@@ -730,7 +774,7 @@ jobs:
           PGPASSWORD: postgres
           PGDATABASE: postgres
         run: |
-          bash scripts/ci-run-logged.sh "$RUNNER_TEMP/pg-test.log" zig build test --test-timeout 300s
+          bash scripts/ci-run-logged.sh "$RUNNER_TEMP/pg-test.log" bash scripts/zig-build-test-guarded.sh --pass-on-fallback --timeout 1800 build test --test-timeout 300s
 
       - name: Upload test log on failure
         if: failure()
@@ -762,6 +806,17 @@ jobs:
           --health-retries 5
     steps:
       - uses: actions/checkout@v4
+      - name: Cache Zig deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          # Same key as build-and-test: the cache is content-addressed, so the
+          # service/example jobs safely share it. Without this step each of
+          # them compiled the whole suite from cold (~20 min on 4 vCPU).
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: zig-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Setup Zig
         # mlugg/setup-zig@v1 builds old-pattern URLs (zig-<os>-<arch>) that
@@ -801,7 +856,7 @@ jobs:
           # zigzero_test on 3306).
           ZMODU_TEST_MYSQL_URL: mysql://root:secret@127.0.0.1:3306/zigzero_test
         run: |
-          bash scripts/ci-run-logged.sh "$RUNNER_TEMP/mysql-test.log" zig build test --test-timeout 300s
+          bash scripts/ci-run-logged.sh "$RUNNER_TEMP/mysql-test.log" bash scripts/zig-build-test-guarded.sh --pass-on-fallback --timeout 1800 build test --test-timeout 300s
 
       - name: Upload mysql test log on failure
         if: failure()
@@ -848,6 +903,17 @@ jobs:
           KAFKA_CONTROLLER_QUORUM_VOTERS: 1@127.0.0.1:9093
     steps:
       - uses: actions/checkout@v4
+      - name: Cache Zig deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          # Same key as build-and-test: the cache is content-addressed, so the
+          # service/example jobs safely share it. Without this step each of
+          # them compiled the whole suite from cold (~20 min on 4 vCPU).
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: zig-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Setup Zig
         # mlugg/setup-zig@v1 builds old-pattern URLs (zig-<os>-<arch>) that
@@ -879,7 +945,7 @@ jobs:
           NATS_URL: nats://127.0.0.1:4222
           KAFKA_BOOTSTRAP: 127.0.0.1:9092
         run: |
-          bash scripts/ci-run-logged.sh "$RUNNER_TEMP/live-test.log" zig build test --test-timeout 300s
+          bash scripts/ci-run-logged.sh "$RUNNER_TEMP/live-test.log" bash scripts/zig-build-test-guarded.sh --pass-on-fallback --timeout 1800 build test --test-timeout 300s
 
       - name: Upload live-service test log on failure
         if: failure()

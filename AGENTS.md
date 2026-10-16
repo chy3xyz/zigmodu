@@ -422,6 +422,13 @@ bash scripts/test-fast.sh --force-run                               # 整跑，�
 bash scripts/test-fast.sh --help
 ```
 
+这三个入口（以及 `release.sh` 的全量测试门、`check-test-collection.sh` 的强制运行）
+都经过 `scripts/zig-build-test-guarded.sh`：部分 macOS 宿主上 0.17.0 正式版的
+build runner 会在 `--listen=-` 协议上死锁（maker 与测试二进制互等，0% CPU，`-j1`
+不能阻止）。看门狗超时后自动杀掉 runner 进程组、独立直跑本次编译出的测试二进制，
+日志找 `zm-test-guard:` 横幅；退出码 75 = 兜底通过。二进制独立跑挂起按真实产品
+缺陷计失败，不是环境问题。
+
 filter 是**测试全限定名的子串**（形如 `core.cluster.RaftElection.test.<测试名>`，见 `zm-test-runner:` 摘要行）。
 实现的机制是**运行期**过滤：`-Dtest-filter=` 给 `test` step 的每个 test artifact 装上
 `scripts/test-runner.zig`（`mode = .simple`），整套先编译、只有命中的才执行。

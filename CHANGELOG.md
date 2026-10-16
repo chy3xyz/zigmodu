@@ -2,6 +2,51 @@
 
 ## [Unreleased]
 
+### 工具链韧性：`zig build test` 挂起看门狗 + 独立二进制兜底（**破坏性：否**）
+
+部分宿主（macOS 27 与 Linux CI 容器均实测复现，Zig 0.17.0 正式版）上 build
+runner 经 `--listen=-` 协议编排测试二进制时会死锁：maker 四个线程 futex 等待、
+新起的测试二进制阻塞在 stdin `readv` 等一条永远不来的运行消息（`-j1` 不能阻止；
+同一二进制单独跑必过；此前 CI 上表现为无辜的 life 测试"300s 超时"）。发布流程
+被这个 flake 卡掉数小时之后，测试入口统一改走
+`scripts/zig-build-test-guarded.sh`：超过看门狗预算（默认 900s，CI 用 1800s）
+即杀掉 runner 进程组，把本次新编译的测试二进制逐一**独立直跑**（绕开 listen
+协议），按退出码裁决并合成 `zm-test-runner:` 计数字行——下游 `test-fast.sh` 的
+计数解析无需改动。退出码 0 = 正常通过，75 = 兜底通过（`--pass-on-fallback`
+时归 0 供 CI 布尔判定），1 = 失败；单个二进制独立跑挂起（600s）按**真实产品
+缺陷**计失败。已接线：`release.sh` 全量测试门、`check-test-collection.sh` 两个
+强制运行行、`test-fast.sh`、ci.yml 四个测试步骤（主矩阵 + postgres + mysql +
+live-services）。根因疑为 0.17.0 build runner 缺陷，待向上游报 issue。
+
+### 修复：基准 `App lifecycle x3K` alloc 回归 11.00 → 7.00/op（**破坏性：否**）
+
+批 179 把 `Application.validate()` 的 advisory 依赖上限检查改接全量
+`ModuleGraph.analyzeRuntime`（每次生命周期 +3 alloc/op：nodes dupe、cycle
+DFS 染色数组、findings 落盘），冲破基准棘轮预算 8.75（实测 11.00）——此前
+一直被 CI 编译错误掩盖，db_link 修复后才暴露为 Benchmark job 失败。改为
+零分配快路径：validateModules 已对所有致命发现拒绝启动，能通过它的模块图
+里唯一还活着的 advisory 种类就是超限，先纯扫描检测；确有超限时才回落到
+全量分析走完整报告与日志路径（含未来可能新增的非超限种类）。本地
+ReleaseFast 复跑确认 7.00/op，超限 advisory 回退路径测试 2/2 通过。
+
+### 修复：`tools/zmodu` 独立构建缺 libc 链接（life 墙钟，**破坏性：否**）
+
+批 182 的 `nowSeconds()` 用 `std.c.clock_gettime`（REALTIME），而
+`tools/zmodu` 独立 `zig build test`（check-test-collection 的 CLI 行即此路径）
+的 test 模块不链 libc → 硬编译错误；0.17 又已移除 `std.posix.clock_gettime`。
+改走 `std.Io.Clock.Timestamp.now(io, .real)`（与 `core/Time.zig` 的
+`wallClockSeconds` 同一 API，无 libc 依赖），签名改为 `nowSeconds(io)`，
+5 处调用点一并更新。
+
+### CI 提速：编译重的 job 补上 zig 缓存（**破坏性：否**）
+
+`test-postgres` / `test-mysql` / `test-live-services` / `examples` /
+`integration-full` / `lint` 六个 job 原先每次推送都从冷缓存全量编译
+（失败运行里实测 ~20 分钟才编译到出错点），而 `build-and-test` 早有
+`actions/cache@v4`（key `zig-os-arch-hash(build.zig.zon)`，内容寻址安全共享）。
+现在这些 job 复用同一把 key：首个完成者存、其余恢复，编译从 ~20 分钟降到
+分钟级。服务 job 的 `timeout-minutes: 30` 裕度同步恢复。
+
 ### 修复：CI 自 0.17.0 迁移后全红——pkg-config 与 detect 路径重复拼写搜索目录（**破坏性：否**）
 
 Zig 0.17.0 正式版把「同一目录既以 `-I`（pkg-config `--cflags libpq` 给出

@@ -132,16 +132,24 @@ else
 fi
 START=$SECONDS
 set +e
+GUARD_TIMEOUT=900
 if [[ -n "$COUNT_ONLY" ]]; then
   echo "test-fast: --count — zig output goes to the log; stdout carries only the count line" >&2
-  zig "${ARGS[@]}" >"$LOG" 2>&1
+  bash scripts/zig-build-test-guarded.sh --timeout "$GUARD_TIMEOUT" "${ARGS[@]}" >"$LOG" 2>&1
   STATUS=$?
 else
-  zig "${ARGS[@]}" 2>&1 | tee "$LOG"
+  bash scripts/zig-build-test-guarded.sh --timeout "$GUARD_TIMEOUT" "${ARGS[@]}" 2>&1 | tee "$LOG"
   STATUS=${PIPESTATUS[0]}
 fi
 set -e
 ELAPSED=$((SECONDS - START))
+
+# 75 = the hang watchdog fired and the standalone fallback passed the suite;
+# the streamed log carries the zm-test-guard banner and per-binary rows.
+if [[ $STATUS -eq 75 ]]; then
+  echo "test-fast: note — the run completed through the hang-watchdog fallback (zm-test-guard banner in the log above)" >&2
+  STATUS=0
+fi
 
 if [[ $STATUS -ne 0 ]]; then
   echo "test-fast: FAILED — zig build test exited $STATUS (${ELAPSED}s)" >&2
