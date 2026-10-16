@@ -113,17 +113,17 @@ pub fn fingerprintHex(source: model.Source, rule: []const u8, file: []const u8, 
 
 test "transition matrix matches spec" {
     const legal = [_][2]model.Status{
-        .{ .new, .triaged },          .{ .triaged, .confirmed },   .{ .triaged, .needs_info },
-        .{ .needs_info, .triaged },   .{ .triaged, .duplicate },   .{ .triaged, .rejected },
-        .{ .confirmed, .rejected },   .{ .confirmed, .triaged },   .{ .confirmed, .fixed },
-        .{ .fixed, .verified },       .{ .fixed, .confirmed },     .{ .verified, .closed },
+        .{ .new, .triaged },        .{ .triaged, .confirmed }, .{ .triaged, .needs_info },
+        .{ .needs_info, .triaged }, .{ .triaged, .duplicate }, .{ .triaged, .rejected },
+        .{ .confirmed, .rejected }, .{ .confirmed, .triaged }, .{ .confirmed, .fixed },
+        .{ .fixed, .verified },     .{ .fixed, .confirmed },   .{ .verified, .closed },
         .{ .verified, .fixed },
     };
     for (legal) |pair| try std.testing.expect(transitionReq(pair[0], pair[1]) != null);
     const illegal = [_][2]model.Status{
-        .{ .closed, .new },      .{ .duplicate, .triaged }, .{ .rejected, .fixed },
-        .{ .new, .fixed },       .{ .triaged, .verified },  .{ .verified, .confirmed },
-        .{ .closed, .closed },  .{ .new, .new },           .{ .fixed, .triaged },
+        .{ .closed, .new },           .{ .duplicate, .triaged }, .{ .rejected, .fixed },
+        .{ .new, .fixed },            .{ .triaged, .verified },  .{ .verified, .confirmed },
+        .{ .closed, .closed },        .{ .new, .new },           .{ .fixed, .triaged },
         .{ .needs_info, .confirmed },
     };
     for (illegal) |pair| try std.testing.expect(transitionReq(pair[0], pair[1]) == null);

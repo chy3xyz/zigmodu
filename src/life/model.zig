@@ -104,7 +104,7 @@ pub const Release = struct {
 fn enumFromString(comptime T: type, s: []const u8) ?T {
     const info = @typeInfo(T).@"enum";
     inline for (info.field_names, info.field_values) |name, value| {
-        if (std.mem.eql(u8, s, name)) return @enumFromInt(value);
+        if (std.mem.eql(u8, s, name)) return @fromBackingInt(@intCast(value));
     }
     return null;
 }

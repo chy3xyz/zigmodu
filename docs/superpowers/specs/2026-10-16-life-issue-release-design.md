@@ -76,7 +76,7 @@ confirmed → triaged（回滚，internal_note, life:triage）
 
 ### 4.2 其他 core 件
 
-- **ID**：`LI-<seq>`（每 store 单调递增；file adapter 用 `.life/seq` 计数文件，module 用 AUTOINCREMENT + `public_id` UNIQUE）。
+- **ID**：`LI-<seq>`（每 store 单调递增；file adapter 扫描 `.life/issues/LI-*.md` 文件名派生 max+1——**无计数文件**，无状态可腐化，`sync` 校验连续性；module 用 AUTOINCREMENT + `public_id` UNIQUE）。
 - **reproBlock**：`{version, git_sha, route?, platform?, command?, output_excerpt?}`（key:value 行格式，file 形态为 body 末尾 `## Repro` 段；module 形态为 `context` JSON 列）。CI 来源自动填充，用户提交时由调用方附带。
 - **fingerprint 去重**：`sha256(source|rule|normalized_message|file)`，仅 `source ∈ {ci, bench, stress}` 使用；命中同 fingerprint 且未关闭的 issue → 追加 comment（带新出现的 sha/输出），不开新单。
 - **since 圈定**：release 草稿默认 `since_at = 上一条 published 的 published_at`，圈定窗口内 `status ∈ {fixed, verified, closed}` 的 issue 进入 items。
@@ -231,7 +231,7 @@ draft → publish                        # published 不可变；要改 = archiv
 
 | Phase | 内容 | 验收 |
 |---|---|---|
-| **P1** | core（状态机/校验/ID/reproBlock/since/fingerprint）+ file adapter + CLI 子命令 + CI 钩子 | core 单测：迁移矩阵穷尽、必填字段、终态无出边、回滚合法、fingerprint 去重、since 窗口；本仓库自吃狗粮——下一批外部反馈以 `LI-*` 文件落库；模拟门禁失败验证自动开单 + 去重 comment；`zmodu life sync` 自检绿 |
+| **P1** ✅ 2026-10-16 | core（状态机/校验/ID/reproBlock/since/fingerprint）+ file adapter + CLI 子命令 + CI 钩子 | 已落地（批 182）：core 单测 4 项（迁移矩阵/必填字段/修≠判权限拆分/fingerprint）、CLI 11 项 tmpDir 集成测试（生命周期/转换校验/CI 去重/release 窗口与不可变/feed/sync）+ 临时目录端到端冒烟；seq 按扫描派生实现（§4.2 已回填此偏差） |
 | **P2** | module adapter（SQL/routes/权限/MCP/Dashboard）+ audit b27 | tenant-mgmt 示例接线最小演示路由；Testkit 断言：持 `life:fix` 的 token 推不动 verified（结构强制实测）；audience 过滤越权 404；published 不可变 |
 | **P3** | 公布出口完善：atom/JSON feed + webhook 示例（examples/ 一个 life-feed 演示） | feed 通过 zdoc 渲染验证；webhook 示例 e2e 收到 `life.release.published` |
 
