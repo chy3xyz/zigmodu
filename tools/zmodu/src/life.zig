@@ -100,11 +100,129 @@ fn cmdIssue(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8, 
     if (std.mem.eql(u8, args[0], "list")) return cmdIssueList(io, allocator, args[1..], dir);
     if (std.mem.eql(u8, args[0], "show")) return cmdIssueShow(io, allocator, args[1..], dir);
     if (std.mem.eql(u8, args[0], "comment")) return cmdIssueComment(io, allocator, args[1..], dir);
-    if (std.mem.eql(u8, args[0], "transition")) {
-        printErr(io, "life: issue transition not implemented yet", .{});
-        return 1;
-    }
+    if (std.mem.eql(u8, args[0], "transition")) return cmdIssueTransition(io, allocator, args[1..], dir);
     std.log.info("usage: zmodu life issue <new|list|show|transition|comment>", .{});
+    return 2;
+}
+
+fn cmdIssueTransition(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8, dir: []const u8) u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var seq: ?u32 = null;
+    var target: ?model.Status = null;
+    var by: []const u8 = "unknown";
+    var flag_assignee: ?[]const u8 = null;
+    var flag_resolution: ?[]const u8 = null;
+    var flag_fix_ref: ?[]const u8 = null;
+    var flag_linked_id: ?[]const u8 = null;
+    var flag_note: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.startsWith(u8, a, "--")) {
+            if (std.mem.eql(u8, a, "--by")) {
+                i += 1;
+                if (i >= args.len) return usageIssueTransition();
+                by = args[i];
+            } else if (std.mem.eql(u8, a, "--assignee")) {
+                i += 1;
+                if (i >= args.len) return usageIssueTransition();
+                flag_assignee = args[i];
+            } else if (std.mem.eql(u8, a, "--resolution")) {
+                i += 1;
+                if (i >= args.len) return usageIssueTransition();
+                flag_resolution = args[i];
+            } else if (std.mem.eql(u8, a, "--fix-ref")) {
+                i += 1;
+                if (i >= args.len) return usageIssueTransition();
+                flag_fix_ref = args[i];
+            } else if (std.mem.eql(u8, a, "--linked-id")) {
+                i += 1;
+                if (i >= args.len) return usageIssueTransition();
+                flag_linked_id = args[i];
+            } else if (std.mem.eql(u8, a, "--note")) {
+                i += 1;
+                if (i >= args.len) return usageIssueTransition();
+                flag_note = args[i];
+            } else {
+                printErr(io, "life: unknown flag '{s}'", .{a});
+                return 2;
+            }
+        } else if (seq == null) {
+            seq = parseIssueId(a);
+            if (seq == null) {
+                printErr(io, "life: bad issue id '{s}'", .{a});
+                return 2;
+            }
+        } else if (target == null) {
+            target = model.statusFromString(a);
+            if (target == null) {
+                printErr(io, "life: unknown status '{s}'", .{a});
+                return 2;
+            }
+        } else {
+            printErr(io, "life: unexpected argument '{s}'", .{a});
+            return 2;
+        }
+    }
+    const s = seq orelse return usageIssueTransition();
+    const to = target orelse return usageIssueTransition();
+
+    var iss = (loadIssue(alloc, io, dir, s) catch return 1) orelse {
+        printErr(io, "life: LI-{d:0>4} not found", .{s});
+        return 1;
+    };
+    // Prospective: the issue as it would look after this transition. The
+    // validator checks the matrix first, then required fields on this — a
+    // rejected validation must leave the file untouched (we save only after).
+    var prospective = iss;
+    if (flag_assignee) |v| prospective.assignee = v;
+    if (flag_resolution) |v| prospective.resolution = v;
+    if (flag_fix_ref) |v| prospective.fix_ref = v;
+    if (flag_linked_id) |v| prospective.linked_id = v;
+    if (flag_note) |v| prospective.internal_note = v;
+
+    state.validate(iss.status, to, &prospective) catch |err| {
+        switch (err) {
+            error.IllegalTransition => printErr(io, "life: transition {s} → {s} is not in the state machine (terminal states have no out-edges; see spec §4.1)", .{ model.statusToString(iss.status), model.statusToString(to) }),
+            error.MissingAssignee => printErr(io, "life: {s} → {s} requires --assignee", .{ model.statusToString(iss.status), model.statusToString(to) }),
+            error.MissingInternalNote => printErr(io, "life: {s} → {s} requires --note (internal_note)", .{ model.statusToString(iss.status), model.statusToString(to) }),
+            error.MissingLinkedId => printErr(io, "life: {s} → {s} requires --linked-id", .{ model.statusToString(iss.status), model.statusToString(to) }),
+            error.MissingResolution => printErr(io, "life: {s} → {s} requires --resolution", .{ model.statusToString(iss.status), model.statusToString(to) }),
+            error.MissingFixRef => printErr(io, "life: {s} → {s} requires --fix-ref (a verifiable deploy identifier, e.g. git sha)", .{ model.statusToString(iss.status), model.statusToString(to) }),
+        }
+        return 1;
+    };
+
+    const from = iss.status;
+    iss.status = to;
+    if (flag_assignee) |v| iss.assignee = v;
+    if (flag_resolution) |v| iss.resolution = v;
+    if (flag_fix_ref) |v| iss.fix_ref = v;
+    if (flag_linked_id) |v| iss.linked_id = v;
+    if (flag_note) |v| iss.internal_note = v;
+    const now = nowSeconds();
+    iss.updated_at = now;
+    var audit = std.ArrayList(u8).empty;
+    audit.appendSlice(alloc, "status ") catch return 1;
+    audit.appendSlice(alloc, model.statusToString(from)) catch return 1;
+    audit.appendSlice(alloc, " → ") catch return 1;
+    audit.appendSlice(alloc, model.statusToString(to)) catch return 1;
+    if (flag_note) |n| {
+        audit.appendSlice(alloc, " (note: ") catch return 1;
+        audit.appendSlice(alloc, n) catch return 1;
+        audit.appendSlice(alloc, ")") catch return 1;
+    }
+    appendComment(alloc, &iss, now, by, audit.items) catch return 1;
+    saveIssue(alloc, io, dir, &iss) catch return 1;
+    printOut(io, "LI-{d:0>4} {s} → {s}", .{ s, model.statusToString(from), model.statusToString(to) });
+    return 0;
+}
+
+fn usageIssueTransition() u8 {
+    std.log.info("usage: zmodu life issue transition <LI-0001> <target> [--assignee A] [--resolution R] [--fix-ref F] [--linked-id ID] [--note N] [--by AGENT]", .{});
     return 2;
 }
 
@@ -820,4 +938,41 @@ test "issue lifecycle via runAt: new, comment, list" {
     try std.testing.expectEqual(@as(u8, 0), runAt(io, alloc, &.{ "issue", "new", "--title", "t2", "--fingerprint", "fp1" }, dir));
     try std.testing.expectEqual(@as(?u32, 2), try findOpenByFingerprint(alloc, io, dir, "fp1"));
     try std.testing.expect((try findOpenByFingerprint(alloc, io, dir, "nope")) == null);
+}
+
+test "transition validates and audits, rejected leaves file unchanged" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    try std.testing.expectEqual(@as(u8, 0), runAt(io, alloc, &.{ "issue", "new", "--title", "t", "--reporter", "r" }, dir));
+    // 缺 assignee → 拒绝且文件不变
+    try std.testing.expectEqual(@as(u8, 1), runAt(io, alloc, &.{ "issue", "transition", "LI-0001", "triaged", "--by", "a" }, dir));
+    try std.testing.expectEqual(model.Status.new, (try loadIssue(alloc, io, dir, 1)).?.status);
+    // 补齐后成功，且留下审计 comment
+    try std.testing.expectEqual(@as(u8, 0), runAt(io, alloc, &.{ "issue", "transition", "LI-0001", "triaged", "--assignee", "bob", "--by", "alice" }, dir));
+    var iss = (try loadIssue(alloc, io, dir, 1)).?;
+    try std.testing.expectEqual(model.Status.triaged, iss.status);
+    try std.testing.expectEqualStrings("bob", iss.assignee);
+    try std.testing.expect(std.mem.indexOf(u8, iss.comments[iss.comments.len - 1].text, "new → triaged") != null);
+    try std.testing.expectEqualStrings("alice", iss.comments[iss.comments.len - 1].author);
+    // 跳步非法（triaged → verified）
+    try std.testing.expectEqual(@as(u8, 1), runAt(io, alloc, &.{ "issue", "transition", "LI-0001", "verified", "--by", "qa" }, dir));
+    // 完整走到 fixed：confirmed → fixed 需要 resolution + fix_ref
+    try std.testing.expectEqual(@as(u8, 0), runAt(io, alloc, &.{ "issue", "transition", "LI-0001", "confirmed", "--by", "triage" }, dir));
+    try std.testing.expectEqual(@as(u8, 1), runAt(io, alloc, &.{ "issue", "transition", "LI-0001", "fixed", "--resolution", "r", "--by", "dev" }, dir));
+    try std.testing.expectEqual(@as(u8, 0), runAt(io, alloc, &.{ "issue", "transition", "LI-0001", "fixed", "--resolution", "root cause", "--fix-ref", "abc123", "--by", "dev" }, dir));
+    // fixed → verified（测试 agent 推）
+    try std.testing.expectEqual(@as(u8, 0), runAt(io, alloc, &.{ "issue", "transition", "LI-0001", "verified", "--by", "qa" }, dir));
+    // verified → closed 终态，终态无出边
+    try std.testing.expectEqual(@as(u8, 0), runAt(io, alloc, &.{ "issue", "transition", "LI-0001", "closed", "--by", "triage" }, dir));
+    try std.testing.expectEqual(@as(u8, 1), runAt(io, alloc, &.{ "issue", "transition", "LI-0001", "new", "--by", "a" }, dir));
+    iss = (try loadIssue(alloc, io, dir, 1)).?;
+    try std.testing.expectEqual(model.Status.closed, iss.status);
+    try std.testing.expectEqualStrings("abc123", iss.fix_ref);
+    try std.testing.expect(iss.comments.len >= 5);
 }
