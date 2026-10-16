@@ -32,14 +32,8 @@ pub fn runAt(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8,
         return 2;
     }
     if (std.mem.eql(u8, args[0], "issue")) return cmdIssue(io, allocator, args[1..], dir);
-    if (std.mem.eql(u8, args[0], "release")) {
-        printErr(io, "life: release not implemented yet", .{});
-        return 1;
-    }
-    if (std.mem.eql(u8, args[0], "sync")) {
-        printErr(io, "life: sync not implemented yet", .{});
-        return 1;
-    }
+    if (std.mem.eql(u8, args[0], "release")) return cmdRelease(io, allocator, args[1..], dir);
+    if (std.mem.eql(u8, args[0], "sync")) return cmdSync(io, allocator, args[1..], dir);
     printUsage();
     return 2;
 }
@@ -138,6 +132,415 @@ pub fn recordCi(io: std.Io, allocator: std.mem.Allocator, dir: []const u8, resul
         try saveIssue(alloc, io, dir, &iss);
         printOut(io, "life: LI-{d:0>4} created ({s} failure)", .{ seq, r.name });
     }
+}
+
+// ===================== release store =====================
+// `.life/releases/<version>.md` — same frontmatter discipline as issues;
+// items_json rides as an escaped quoted frontmatter value.
+
+fn releasePath(buf: []u8, dir: []const u8, version: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}/.life/releases/{s}.md", .{ dir, version }) catch unreachable;
+}
+
+fn formatRelease(alloc: std.mem.Allocator, rel: *const model.Release) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    var tbuf: [20]u8 = undefined;
+    var ibuf: [20]u8 = undefined;
+    try out.appendSlice(alloc, "---\nversion: ");
+    try quoteValue(&out, alloc, rel.version);
+    try out.appendSlice(alloc, "\ntitle: ");
+    try quoteValue(&out, alloc, rel.title);
+    try out.appendSlice(alloc, "\nstatus: ");
+    try out.appendSlice(alloc, model.releaseStatusToString(rel.status));
+    try out.appendSlice(alloc, "\naudience: ");
+    try out.appendSlice(alloc, model.audienceToString(rel.audience));
+    try out.appendSlice(alloc, "\nsource: ");
+    try quoteValue(&out, alloc, rel.source);
+    try out.appendSlice(alloc, "\nsince_at: ");
+    try out.appendSlice(alloc, epochToIsoUtc(&tbuf, rel.since_at));
+    try out.appendSlice(alloc, "\npublished_at: ");
+    if (rel.published_at > 0) {
+        try out.appendSlice(alloc, epochToIsoUtc(&ibuf, rel.published_at));
+    } else {
+        try out.appendSlice(alloc, "\"\"");
+    }
+    try out.appendSlice(alloc, "\ngit_sha: ");
+    try quoteValue(&out, alloc, rel.git_sha);
+    try out.appendSlice(alloc, "\nitems_json: ");
+    try quoteValue(&out, alloc, rel.items_json);
+    try out.appendSlice(alloc, "\n---\n\n");
+    try out.appendSlice(alloc, rel.summary);
+    try out.append(alloc, '\n');
+    return out.items;
+}
+
+fn parseRelease(alloc: std.mem.Allocator, text: []const u8) !model.Release {
+    var rel = model.Release{ .version = "", .title = "" };
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    const first = lines.next() orelse return error.BadReleaseFile;
+    if (!std.mem.eql(u8, std.mem.trimEnd(u8, first, "\r"), "---")) return error.BadReleaseFile;
+    var in_frontmatter = true;
+    var summary = std.ArrayList(u8).empty;
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trimEnd(u8, line_raw, "\r");
+        if (in_frontmatter) {
+            if (std.mem.eql(u8, line, "---")) {
+                in_frontmatter = false;
+                continue;
+            }
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.BadReleaseFile;
+            const key = std.mem.trim(u8, line[0..colon], " \t");
+            const raw = line[colon + 1 ..];
+            if (std.mem.eql(u8, key, "version")) {
+                rel.version = try unquoteValue(alloc, raw);
+            } else if (std.mem.eql(u8, key, "title")) {
+                rel.title = try unquoteValue(alloc, raw);
+            } else if (std.mem.eql(u8, key, "status")) {
+                rel.status = model.releaseStatusFromString(std.mem.trim(u8, raw, " \t")) orelse return error.BadReleaseFile;
+            } else if (std.mem.eql(u8, key, "audience")) {
+                rel.audience = model.audienceFromString(std.mem.trim(u8, raw, " \t")) orelse return error.BadReleaseFile;
+            } else if (std.mem.eql(u8, key, "source")) {
+                rel.source = try unquoteValue(alloc, raw);
+            } else if (std.mem.eql(u8, key, "since_at")) {
+                rel.since_at = isoToEpoch(std.mem.trim(u8, raw, " \t")) orelse return error.BadReleaseFile;
+            } else if (std.mem.eql(u8, key, "published_at")) {
+                const v = std.mem.trim(u8, raw, " \t");
+                rel.published_at = if (std.mem.eql(u8, v, "\"\"")) 0 else (isoToEpoch(v) orelse return error.BadReleaseFile);
+            } else if (std.mem.eql(u8, key, "git_sha")) {
+                rel.git_sha = try unquoteValue(alloc, raw);
+            } else if (std.mem.eql(u8, key, "items_json")) {
+                rel.items_json = try unquoteValue(alloc, raw);
+            }
+            continue;
+        }
+        try summary.appendSlice(alloc, line);
+        try summary.append(alloc, '\n');
+    }
+    if (in_frontmatter) return error.BadReleaseFile;
+    if (rel.version.len == 0) return error.BadReleaseFile;
+    rel.summary = std.mem.trim(u8, summary.items, "\n");
+    return rel;
+}
+
+fn loadRelease(alloc: std.mem.Allocator, io: std.Io, dir: []const u8, version: []const u8) !?model.Release {
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = releasePath(&pbuf, dir, version);
+    const text = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, std.Io.Limit.limited(1 << 20)) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    return try parseRelease(alloc, text);
+}
+
+fn saveRelease(alloc: std.mem.Allocator, io: std.Io, dir: []const u8, rel: *const model.Release) !void {
+    var dbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const releases_dir = std.fmt.bufPrint(&dbuf, "{s}/.life/releases", .{dir}) catch unreachable;
+    try std.Io.Dir.cwd().createDirPath(io, releases_dir);
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = releasePath(&pbuf, dir, rel.version);
+    const text = try formatRelease(alloc, rel);
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, text);
+}
+
+fn listReleases(alloc: std.mem.Allocator, io: std.Io, dir: []const u8) ![]model.Release {
+    var out = std.ArrayList(model.Release).empty;
+    var dbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const releases_dir = std.fmt.bufPrint(&dbuf, "{s}/.life/releases", .{dir}) catch unreachable;
+    var d = std.Io.Dir.cwd().openDir(io, releases_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return out.items,
+        else => return err,
+    };
+    defer d.close(io);
+    var it = d.iterate();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    var names = std.ArrayList([]const u8).empty;
+    defer names.deinit(alloc);
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".md")) continue;
+        try names.append(alloc, try alloc.dupe(u8, entry.name[0 .. entry.name.len - 3]));
+    }
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+    for (names.items) |version| {
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, releasePath(&pbuf, dir, version), alloc, std.Io.Limit.limited(1 << 20));
+        try out.append(alloc, try parseRelease(alloc, text));
+    }
+    return out.items;
+}
+
+/// Extract the `## [<version>]` section (or `## [Unreleased]` when version is
+/// empty) from a CHANGELOG-style file; null when the heading is absent.
+fn changelogSection(alloc: std.mem.Allocator, io: std.Io, path: []const u8, version: []const u8) !?[]const u8 {
+    const text = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, std.Io.Limit.limited(8 * 1024 * 1024)) catch return null;
+    var heading_buf: [128]u8 = undefined;
+    const wanted = if (version.len == 0)
+        "## [Unreleased]"
+    else
+        std.fmt.bufPrint(&heading_buf, "## [{s}]", .{version}) catch return null;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var in_section = false;
+    var out = std.ArrayList(u8).empty;
+    while (lines.next()) |line| {
+        if (!in_section) {
+            if (std.mem.startsWith(u8, line, wanted)) {
+                in_section = true;
+            }
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "## [")) break;
+        try out.appendSlice(alloc, line);
+        try out.append(alloc, '\n');
+    }
+    if (!in_section) return null;
+    return std.mem.trim(u8, out.items, "\n");
+}
+
+fn sinceWindowStart(releases: []const model.Release) i64 {
+    var since: i64 = 0;
+    for (releases) |rel| {
+        if (rel.status == .published and rel.published_at > since) since = rel.published_at;
+    }
+    return since;
+}
+
+fn renderFeedJson(alloc: std.mem.Allocator, releases: []const model.Release) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    var tbuf: [20]u8 = undefined;
+    try out.appendSlice(alloc, "{\"releases\":[");
+    var first_item = true;
+    for (releases) |rel| {
+        if (rel.status != .published) continue;
+        if (!first_item) try out.appendSlice(alloc, ",");
+        first_item = false;
+        const t = try jsonEscape(alloc, rel.title);
+        const s = try jsonEscape(alloc, rel.summary);
+        try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{{\"version\":\"{s}\",\"title\":\"{s}\",\"summary\":\"{s}\",\"published_at\":\"{s}\"}}", .{
+            rel.version, t, s, epochToIsoUtc(&tbuf, rel.published_at),
+        }));
+    }
+    try out.appendSlice(alloc, "]}");
+    return out.items;
+}
+
+fn renderFeedAtom(alloc: std.mem.Allocator, releases: []const model.Release, base_url: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    var tbuf: [20]u8 = undefined;
+    try out.appendSlice(alloc, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<feed xmlns=\"http://www.w3.org/2005/Atom\">\n<title>Release notes</title>\n");
+    try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "<id>{s}/</id>\n<link href=\"{s}/\"/>\n", .{ base_url, base_url }));
+    for (releases) |rel| {
+        if (rel.status != .published) continue;
+        const t = try xmlEscape(alloc, rel.title);
+        const s = try xmlEscape(alloc, rel.summary);
+        try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "<entry><title>{s}</title><id>{s}/{s}</id><updated>{s}</updated><content type=\"html\">{s}</content></entry>\n", .{
+            t, base_url, rel.version, epochToIsoUtc(&tbuf, rel.published_at), s,
+        }));
+    }
+    try out.appendSlice(alloc, "</feed>\n");
+    return out.items;
+}
+
+fn xmlEscape(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    for (s) |ch| {
+        switch (ch) {
+            '&' => try out.appendSlice(alloc, "&amp;"),
+            '<' => try out.appendSlice(alloc, "&lt;"),
+            '>' => try out.appendSlice(alloc, "&gt;"),
+            else => try out.append(alloc, ch),
+        }
+    }
+    return out.items;
+}
+
+fn cmdRelease(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8, dir: []const u8) u8 {
+    if (args.len == 0) {
+        std.log.info("usage: zmodu life release <draft|publish>", .{});
+        return 2;
+    }
+    if (std.mem.eql(u8, args[0], "draft")) return cmdReleaseDraft(io, allocator, args[1..], dir);
+    if (std.mem.eql(u8, args[0], "publish")) return cmdReleasePublish(io, allocator, args[1..], dir);
+    std.log.info("usage: zmodu life release <draft|publish>", .{});
+    return 2;
+}
+
+fn cmdReleaseDraft(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8, dir: []const u8) u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var version: ?[]const u8 = null;
+    var title: ?[]const u8 = null;
+    var changelog: []const u8 = "./CHANGELOG.md";
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--title")) {
+            i += 1;
+            if (i >= args.len) return usageReleaseDraft();
+            title = args[i];
+        } else if (std.mem.eql(u8, a, "--changelog")) {
+            i += 1;
+            if (i >= args.len) return usageReleaseDraft();
+            changelog = args[i];
+        } else if (std.mem.startsWith(u8, a, "--")) {
+            printErr(io, "life: unknown flag '{s}'", .{a});
+            return 2;
+        } else if (version == null) {
+            version = a;
+        } else {
+            printErr(io, "life: unexpected argument '{s}'", .{a});
+            return 2;
+        }
+    }
+    const v = version orelse return usageReleaseDraft();
+    if (loadRelease(alloc, io, dir, v) catch return 1) |existing| {
+        if (existing.status == .published) {
+            printErr(io, "life: release {s} is published — immutable; archive and re-draft instead", .{v});
+            return 1;
+        }
+    }
+    const issues = listIssues(alloc, io, dir) catch return 1;
+    const releases = listReleases(alloc, io, dir) catch return 1;
+    const since = sinceWindowStart(releases);
+    var items = std.ArrayList(u8).empty;
+    items.appendSlice(alloc, "[") catch return 1;
+    var count: usize = 0;
+    for (issues) |iss| {
+        switch (iss.status) {
+            .fixed, .verified, .closed => {},
+            else => continue,
+        }
+        if (iss.updated_at <= since) continue;
+        count += 1;
+        if (count > 1) items.appendSlice(alloc, ",") catch return 1;
+        const t = jsonEscape(alloc, iss.title) catch return 1;
+        const item = std.fmt.allocPrint(alloc, "{{\"kind\":\"fix\",\"scope\":\"\",\"text\":\"{s}\",\"issueIds\":[\"LI-{d:0>4}\"]}}", .{ t, iss.seq }) catch return 1;
+        items.appendSlice(alloc, item) catch return 1;
+    }
+    items.appendSlice(alloc, "]") catch return 1;
+    const summary = (changelogSection(alloc, io, changelog, v) catch null) orelse "";
+    const rel = model.Release{
+        .version = v,
+        .title = title orelse v,
+        .summary = summary,
+        .items_json = items.items,
+        .since_at = since,
+    };
+    saveRelease(alloc, io, dir, &rel) catch return 1;
+    printOut(io, "release {s} drafted: {d} issue(s) since {s}", .{ v, count, blk: {
+        var b: [20]u8 = undefined;
+        break :blk if (since > 0) epochToIsoUtc(&b, since) else "beginning";
+    } });
+    if (summary.len == 0) printOut(io, "(no {s} section found in {s}; summary empty)", .{ v, changelog });
+    return 0;
+}
+
+fn usageReleaseDraft() u8 {
+    std.log.info("usage: zmodu life release draft <version> [--title T] [--changelog PATH]", .{});
+    return 2;
+}
+
+fn cmdReleasePublish(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8, dir: []const u8) u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var version: ?[]const u8 = null;
+    var feed_dir: []const u8 = ".life/feed";
+    var base_url: []const u8 = "https://example.com/releases";
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--feed-dir")) {
+            i += 1;
+            if (i >= args.len) return usageReleasePublish();
+            feed_dir = args[i];
+        } else if (std.mem.eql(u8, a, "--base-url")) {
+            i += 1;
+            if (i >= args.len) return usageReleasePublish();
+            base_url = args[i];
+        } else if (std.mem.startsWith(u8, a, "--")) {
+            printErr(io, "life: unknown flag '{s}'", .{a});
+            return 2;
+        } else if (version == null) {
+            version = a;
+        } else {
+            printErr(io, "life: unexpected argument '{s}'", .{a});
+            return 2;
+        }
+    }
+    const v = version orelse return usageReleasePublish();
+    var rel = (loadRelease(alloc, io, dir, v) catch return 1) orelse {
+        printErr(io, "life: release {s} not drafted yet", .{v});
+        return 1;
+    };
+    if (rel.status == .published) {
+        printOut(io, "release {s} already published", .{v});
+        return 0;
+    }
+    if (rel.status == .archived) {
+        printErr(io, "life: release {s} is archived — re-draft under a new version", .{v});
+        return 1;
+    }
+    rel.status = .published;
+    rel.published_at = nowSeconds();
+    saveRelease(alloc, io, dir, &rel) catch return 1;
+    // Feeds: all published releases, newest first.
+    const releases = listReleases(alloc, io, dir) catch return 1;
+    std.mem.sort(model.Release, releases, {}, struct {
+        fn lessThan(_: void, a: model.Release, b: model.Release) bool {
+            return a.published_at > b.published_at;
+        }
+    }.lessThan);
+    std.Io.Dir.cwd().createDirPath(io, feed_dir) catch return 1;
+    var fbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const json_path = std.fmt.bufPrint(&fbuf, "{s}/life.json", .{feed_dir}) catch return 1;
+    const feed_json = renderFeedJson(alloc, releases) catch return 1;
+    {
+        const f = std.Io.Dir.cwd().createFile(io, json_path, .{}) catch return 1;
+        defer f.close(io);
+        f.writeStreamingAll(io, feed_json) catch return 1;
+    }
+    const atom_path = std.fmt.bufPrint(&fbuf, "{s}/atom.xml", .{feed_dir}) catch return 1;
+    const feed_atom = renderFeedAtom(alloc, releases, base_url) catch return 1;
+    {
+        const f = std.Io.Dir.cwd().createFile(io, atom_path, .{}) catch return 1;
+        defer f.close(io);
+        f.writeStreamingAll(io, feed_atom) catch return 1;
+    }
+    printOut(io, "release {s} published → {s}/life.json + atom.xml", .{ v, feed_dir });
+    return 0;
+}
+
+fn usageReleasePublish() u8 {
+    std.log.info("usage: zmodu life release publish <version> [--feed-dir DIR] [--base-url URL]", .{});
+    return 2;
+}
+
+fn cmdSync(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8, dir: []const u8) u8 {
+    _ = args;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const issues = listIssues(alloc, io, dir) catch {
+        printErr(io, "life: sync cannot scan {s}/.life/issues", .{dir});
+        return 1;
+    };
+    for (issues, 0..) |iss, idx| {
+        if (iss.seq != idx + 1) {
+            printErr(io, "life: sync found a sequence gap (expected LI-{d:0>4})", .{idx + 1});
+            return 1;
+        }
+    }
+    const releases = listReleases(alloc, io, dir) catch {
+        printErr(io, "life: sync cannot scan {s}/.life/releases", .{dir});
+        return 1;
+    };
+    printOut(io, "life: sync OK — {d} issue(s), {d} release(s)", .{ issues.len, releases.len });
+    return 0;
 }
 
 fn cmdIssue(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8, dir: []const u8) u8 {
@@ -1056,4 +1459,77 @@ test "recordCi opens one issue and comments on recurrence" {
     const passing = [_]StepResult{.{ .name = "audit", .ok = true, .detail = "audit" }};
     try recordCi(io, alloc, dir, &passing);
     try std.testing.expectEqual(@as(usize, 2), (try listIssues(alloc, io, dir)).len);
+}
+
+test "release draft/publish: since window, immutability, feeds" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    // 造一个走完 fixed → verified 的 issue
+    try std.testing.expectEqual(@as(u8, 0), runAt(io, alloc, &.{ "issue", "new", "--title", "fixed bug", "--reporter", "r" }, dir));
+    try std.testing.expectEqual(@as(u8, 0), runAt(io, alloc, &.{ "issue", "transition", "LI-0001", "triaged", "--assignee", "a", "--by", "t" }, dir));
+    try std.testing.expectEqual(@as(u8, 0), runAt(io, alloc, &.{ "issue", "transition", "LI-0001", "confirmed", "--by", "t" }, dir));
+    try std.testing.expectEqual(@as(u8, 0), runAt(io, alloc, &.{ "issue", "transition", "LI-0001", "fixed", "--resolution", "r", "--fix-ref", "abc123", "--by", "dev" }, dir));
+    try std.testing.expectEqual(@as(u8, 0), runAt(io, alloc, &.{ "issue", "transition", "LI-0001", "verified", "--by", "qa" }, dir));
+    // draft 圈定窗口内 verified issue
+    try std.testing.expectEqual(@as(u8, 0), runAt(io, alloc, &.{ "release", "draft", "v9.9.9", "--title", "test release" }, dir));
+    const draft = (try loadRelease(alloc, io, dir, "v9.9.9")).?;
+    try std.testing.expectEqual(model.ReleaseStatus.draft, draft.status);
+    try std.testing.expect(std.mem.indexOf(u8, draft.items_json, "LI-0001") != null);
+    // publish 写 feed
+    try std.testing.expectEqual(@as(u8, 0), runAt(io, alloc, &.{ "release", "publish", "v9.9.9", "--feed-dir", dir }, dir));
+    const published = (try loadRelease(alloc, io, dir, "v9.9.9")).?;
+    try std.testing.expectEqual(model.ReleaseStatus.published, published.status);
+    try std.testing.expect(published.published_at > 0);
+    const feed = try std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.allocPrint(alloc, "{s}/life.json", .{dir}), alloc, std.Io.Limit.limited(1 << 20));
+    try std.testing.expect(std.mem.indexOf(u8, feed, "v9.9.9") != null);
+    const atom = try std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.allocPrint(alloc, "{s}/atom.xml", .{dir}), alloc, std.Io.Limit.limited(1 << 20));
+    try std.testing.expect(std.mem.indexOf(u8, atom, "<feed") != null);
+    // published 不可变：再 draft 拒绝
+    try std.testing.expectEqual(@as(u8, 1), runAt(io, alloc, &.{ "release", "draft", "v9.9.9", "--title", "again" }, dir));
+    // 重复 publish 幂等
+    try std.testing.expectEqual(@as(u8, 0), runAt(io, alloc, &.{ "release", "publish", "v9.9.9", "--feed-dir", dir }, dir));
+    // 第二个 release 的 since 窗口只算新 published 之后的
+    try std.testing.expectEqual(@as(u8, 0), runAt(io, alloc, &.{ "release", "draft", "v9.9.10" }, dir));
+    const second = (try loadRelease(alloc, io, dir, "v9.9.10")).?;
+    try std.testing.expectEqualStrings("[]", second.items_json);
+    try std.testing.expect(second.since_at == published.published_at);
+    // sync 绿
+    try std.testing.expectEqual(@as(u8, 0), runAt(io, alloc, &.{"sync"}, dir));
+}
+
+test "changelogSection extracts heading and stops at next section" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const cl_path = try std.fmt.allocPrint(alloc, "{s}/CHANGELOG.md", .{dir});
+    try tmp.dir.writeFile(io, .{ .sub_path = "CHANGELOG.md", .data =
+        \\# Changelog
+        \\
+        \\## [Unreleased]
+        \\
+        \\### batch X
+        \\stuff
+        \\
+        \\## [1.0.0] - 2026-01-01
+        \\
+        \\first release
+        \\
+    });
+    const unrel = (try changelogSection(alloc, io, cl_path, "")).?;
+    try std.testing.expect(std.mem.indexOf(u8, unrel, "batch X") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unrel, "first release") == null);
+    const v100 = (try changelogSection(alloc, io, cl_path, "1.0.0")).?;
+    try std.testing.expect(std.mem.indexOf(u8, v100, "first release") != null);
+    try std.testing.expect((try changelogSection(alloc, io, cl_path, "9.9.9")) == null);
 }
