@@ -37,6 +37,17 @@ pub fn build(b: *std.Build) void {
     });
     zmodu_mod.addImport("module_graph", graph_mod);
 
+    // Life governance core (../../src/life.zig) — the issue state machine and
+    // validators, one implementation shared between the framework and the CLI
+    // (`zmodu life issue/...` runs the same `zigmodu.life` core the Phase-2
+    // module adapter will). Pure std, no framework types.
+    const life_core_mod = b.createModule(.{
+        .root_source_file = b.path("../../src/life.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zmodu_mod.addImport("life_core", life_core_mod);
+
     // Test-collection gate (src/test/TestCollection.zig) — one implementation,
     // shared with the framework's build.zig, so `cd tools/zmodu && zig build
     // test` checks the same tree the root build compiles.

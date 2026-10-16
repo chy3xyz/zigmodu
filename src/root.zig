@@ -33,6 +33,8 @@ pub const api = @import("api/Module.zig");
 pub const ZigModuError = @import("core/Error.zig").ZigModuError;
 /// Time helpers (`std.time.*` moved in Zig 0.17; use these instead).
 pub const Time = @import("core/Time.zig");
+
+pub const life = @import("life.zig");
 /// An error plus context (code, message, source, timestamp).
 pub const ErrorContext = @import("core/Error.zig").ErrorContext;
 /// Callback invoked with an `ErrorContext` to log or report a failure.

@@ -319,6 +319,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     zmodu_cli_mod.addImport("module_graph", cli_graph_mod);
+    // Life governance core — same shared-module pattern as module_graph above.
+    const cli_life_core_mod = b.createModule(.{
+        .root_source_file = b.path("src/life.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zmodu_cli_mod.addImport("life_core", cli_life_core_mod);
     // Test-collection gate (src/test/TestCollection.zig). Shared as a module so
     // the CLI and the framework run one implementation of the check — the CLI
     // tests the same tree shape in `cd tools/zmodu && zig build test`.
