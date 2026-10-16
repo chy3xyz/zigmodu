@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.39.15] - 2026-10-16
 
 ### 工具链韧性：`zig build test` 挂起看门狗 + 独立二进制兜底（**破坏性：否**）
 
@@ -61,6 +61,18 @@ foreign target 早已禁用），宿主检测仍由 `detect*Paths` 的固定候�
 目录只有一种拼写。本地复现验证：设 `PKG_CONFIG_PATH` 指向 brew libpq 后
 `zig build -Ddb=postgres` 修复前必现冲突错误、修复后 0 冲突，`-Ddb=all` /
 `-Ddb=none` 同绿。
+
+### 依赖：zent v0.94.0 → v0.95.0（**破坏性：否**）
+
+两个 zent 示例（`zent-modulith` / `metaverse-creative`）的 pin 升到
+[v0.95.0](https://github.com/chy3xyz/zent/releases/tag/v0.95.0)。该版本对消费方
+为 additive + 修复：PG-wire 部分目录服务器（HeliosDB Nano 类）的三处读改为发送前
+按 `pg_am`/`pg_proc`/`pg_extension` 目录门控（缺目录降级 warn + 跳过比较，不再整盘
+拒绝迁移）；修复三个自管理迁移入口的事务双重释放（commit 后错误路径二次释放真实
+句柄 = UAF/segfault）。错误集增 `IndexCatalogUnavailable`/`ForeignKeyCatalogUnavailable`，
+仅影响穷尽 `switch` 的消费方。本仓库验证：`zent-modulith` 清缓存重建 + smoke 44/0
+无泄漏、`metaverse-creative` `zig build demo` `demo_ok`；`docs/reference/ZENT.md` 版本
+口径与 §14 升级表已同步。
 
 ## [0.39.14] - 2026-10-16
 

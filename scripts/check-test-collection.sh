@@ -109,7 +109,13 @@ for row in "${GATES[@]}"; do
   # carries the zm-test-guard banner). Both mean the gate really executed.
   if [[ "$STATUS" -eq 0 || "$STATUS" -eq 75 ]]; then run_ok=1; else run_ok=0; fi
   if [[ "$run_ok" -eq 1 ]]; then
-    grep -E 'Build Summary:' "$log" | tail -1 | sed "s|^|check-test-collection: ${pkg_dir}: |"
+    # All three greps are `|| true`-guarded: under the hang-watchdog fallback
+    # (exit 75) the log carries zm-test-guard/zm-test-runner banners instead
+    # of a "Build Summary:" line, and an unguarded grep under
+    # `set -o pipefail` would kill this script silently at exactly that line
+    # (a gate that passed would read as a release failure with zero output).
+    grep -E 'Build Summary:' "$log" | tail -1 | sed "s|^|check-test-collection: ${pkg_dir}: |" || true
+    grep -E 'zm-test-guard:|zm-test-runner:' "$log" | tail -2 | sed 's/^/check-test-collection: /' || true
     grep -E 'test-collection gate:' "$log" | sed 's/^/check-test-collection: /' || true
   else
     echo "check-test-collection: the test-collection gate failed in ${pkg_dir}:" >&2

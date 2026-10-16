@@ -115,6 +115,57 @@ echo "zig-build-test-guarded: watchdog fired after $((SECONDS - START))s — fal
 CANDIDATE_DIRS=("$REPO_ROOT/.zig-cache/o" "$REPO_ROOT/tools/zmodu/.zig-cache/o")
 [[ "$RUN_DIR" != "$REPO_ROOT" && "$RUN_DIR" != "$PWD" ]] && CANDIDATE_DIRS+=("$RUN_DIR/.zig-cache/o")
 
+# A shared checkout's .zig-cache can hold foreign-format artifacts (a Linux
+# container mounted over the repo, a cross-compile). Executing one fails with
+# "cannot execute binary file" and must not count as a test failure — filter
+# by the host's executable magic before running anything.
+HOST_MAGIC=""
+case "$(uname -s)" in
+  Darwin) HOST_MAGIC="cf fa ed fe" ;; # Mach-O 64, little-endian
+  Linux)  HOST_MAGIC="7f 45 4c 46" ;; # ELF
+esac
+
+# Native-format candidates for the standalone harvest. Zig prunes .zig-cache/o
+# LRU-style, so binaries from an earlier attempt may be gone — callers must
+# not assume this lists anything.
+native_candidates() {
+  find "${CANDIDATE_DIRS[@]}" -maxdepth 2 -type f -name test -mmin -90 2>/dev/null | while IFS= read -r bin; do
+    [[ -x "$bin" ]] || continue
+    magic="$(od -An -tx1 -N4 "$bin" 2>/dev/null | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//')"
+    [[ -z "$HOST_MAGIC" || "$magic" == "$HOST_MAGIC" ]] && printf '%s\n' "$bin"
+  done
+}
+
+# If the killed pass left no native binaries behind (cache pruning between
+# attempts, or the hang hit before the run phase materialized them), force
+# one cached rebuild: compiles replay from cache and re-materialize the
+# binaries within minutes, then the run phase either completes — verdict
+# direct — or stalls again and leaves the binaries for the harvest.
+if [[ -z "$(native_candidates | head -1)" ]]; then
+  {
+    echo "zm-test-guard: no fresh native test binaries under .zig-cache/o (cache"
+    echo "zm-test-guard: pruning or an early hang) — forcing one cached rebuild to"
+    echo "zm-test-guard: re-materialize the artifacts before the standalone run."
+  } >>"$LOG"
+  START2=$SECONDS
+  cd "$RUN_DIR"
+  zig "${ARGS[@]}" >>"$LOG" 2>&1 &
+  ZPID2=$!
+  HUNG2=0
+  while kill -0 "$ZPID2" 2>/dev/null; do
+    if (( SECONDS - START2 > 420 )); then HUNG2=1; break; fi
+    sleep 5
+  done
+  if (( HUNG2 == 0 )); then
+    wait "$ZPID2"; STATUS2=$?
+    kill "$TAIL_PID" 2>/dev/null
+    exit "$STATUS2"
+  fi
+  kill -- "-$ZPID2" 2>/dev/null || kill "$ZPID2" 2>/dev/null
+  sleep 2
+  echo "zm-test-guard: rebuild stalled too — its compile materialized the binaries; harvesting." >>"$LOG"
+fi
+
 PASS_TOTAL=0
 SKIP_TOTAL=0
 FAIL_TOTAL=0
@@ -186,7 +237,7 @@ while IFS= read -r bin; do
   echo "zm-test-runner: selected $(( ${passed:-0} + ${skipped:-0} + ${failed:-0} )) of $(( ${passed:-0} + ${skipped:-0} + ${failed:-0} )) tests (${NAME}): ${passed:-0} passed; ${skipped:-0} skipped; ${failed:-0} failed; 0 leaked." >>"$LOG"
   echo "zm-test-guard: standalone ${NAME}: ${passed:-0} passed; ${skipped:-0} skipped; ${failed:-0} failed (${BSTATUS})" >>"$LOG"
   rm -f "$BLOG"
-done < <(find "${CANDIDATE_DIRS[@]}" -maxdepth 2 -type f -name test -mmin -90 2>/dev/null | sort -r)
+done < <(native_candidates | sort -r)
 
 if (( BIN_COUNT == 0 )); then
   echo "zm-test-guard: FALLBACK COULD NOT RUN — no test binaries newer than 90m under .zig-cache/o" >>"$LOG"
