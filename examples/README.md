@@ -30,7 +30,7 @@ curl http://127.0.0.1:18090/health/live
 
 ## ZigModu × zent (`examples/zent-modulith`)
 
-**Orthogonal ORM demo** — ZigModu `http.Server` + [zent](https://github.com/chy3xyz/zent) schema-as-code Client/migrate. zent is pinned by git tag in `build.zig.zon` (`v0.95.0`); a sibling `../zent` checkout is only for developing zent itself. Practices: [`docs/reference/ZENT.md`](../docs/reference/ZENT.md).
+**Orthogonal ORM demo** — ZigModu `http.Server` + [zent](https://github.com/chy3xyz/zent) schema-as-code Client/migrate. zent is pinned by git tag in `build.zig.zon` (`snap-2026-10-18`); a sibling `../zent` checkout is only for developing zent itself. Practices: [`docs/reference/ZENT.md`](../docs/reference/ZENT.md).
 
 ```bash
 cd examples/zent-modulith && HTTP_PORT=18100 zig build run

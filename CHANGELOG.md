@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### 依赖：zent → `snap-2026-10-18`（v0.95.0 + 三个未发批次，**破坏性：否**）
+
+zent 的每日 `snap-YYYY-MM-DD` 标签就是给消费方钉"今日已验证 main"的（见 zent
+`docs/RELEASING.md`），本次两示例（`zent-modulith` / `metaverse-creative`）的 pin
+从 `v0.95.0` 升到该快照。内容：① 新增公开
+`sql_dialect.translatePlaceholdersAlloc(dialect, allocator, sql)`——裸 `?` 语句在
+PG 上需要先翻译（fluent builder 无需；引号/注释/dollar-quoted 原样跳过）；② 迁移
+helper 的 comptime 配额按图规模缩放（154 表图不再撞 50_000 上限）；③ 跨图边不再
+**猜**外键表名——目标不在 `infos` 里时约束不发并 warn（PG 上猜错会拒绝整条
+`CREATE TABLE`），全图迁移 DDL 逐字节不变。本仓库两示例无 raw SQL、均一次迁移
+全图，无代码动作。验证：`zent-modulith` 清缓存重建 + smoke 44/0 无泄漏、
+`metaverse-creative` `zig build demo` `demo_ok`。
+
 ### 404 提示可被自定义渲染器取用（`ctx.notFoundHint()`）（**破坏性：否**）
 
 `did-you-mean` 提示此前只在**内置** 404 body 里出现：一旦应用安装
