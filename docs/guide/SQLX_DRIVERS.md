@@ -21,6 +21,19 @@ exe_mod.addImport("zigmodu", zigmodu_dep.module("zigmodu"));
 
 不必在应用 `build.zig` 里手写 `linkSystemLibrary("sqlite3")`：zigmodu 根 `build.zig` 会按 `.db=` 链接。
 
+同一次 `b.dependency("zigmodu", .{ .db = … })` 也决定了 zigmodu 自己的 `build_options`
+（`enable_sqlite` / `enable_postgres` / `enable_mysql`）。这三项是 **zigmodu 模块内部**
+的编译期开关：应用侧 `exe_mod.addImport("build_options", 自己的 options 模块)` 只作用于
+应用自己的编译单元，**不会**改变依赖被链接的方式。两者同名不代表同一模块——应用自己的
+`build_options` 与 zigmodu 的 `build_options` 在依赖形态下是两个独立模块。想改链路，
+唯一的旋钮是 `.db=`，不要试图把自定义 options 模块 `addImport` 到 `zigmodu_dep.module("zigmodu")` 上。
+
+**纯框架嵌入（数据层不在 `data.sqlx`）用 `.db = "none"`。** 应用只用 zigmodu 的
+HTTP / Application / Runtime，数据库走 zent 或别的栈时，`.db = "none"` 是最小形态：
+三个驱动的 `translate-c` 全跳过、不链任何客户端库（部署机不需要 MariaDB/libpq 头文件），
+`data.sqlx` 编成 stub——误用 `data.Client.open` 得到的是 `error.DriverNotEnabled`，
+不是动态链接器错误。代价为零：没有代码引用驱动时本来就不会实例化它们。
+
 `zmodu scaffold` / `zmodu new` 生成的 `build.zig` 已写入 `.db=`；`--from-db` 按 DSN 推断（见 §6）。
 
 ---
@@ -30,6 +43,7 @@ exe_mod.addImport("zigmodu", zigmodu_dep.module("zigmodu"));
 | 值 | 效果 |
 |----|------|
 | `all`（**默认**） | sqlite + postgres + mysql |
+| `none` / `off` | 不链任何驱动（sqlx 走 stub，`DriverNotEnabled`）——纯框架嵌入 / 无 DB 二进制 |
 | `sqlite` | 仅 libsqlite3 |
 | `postgres` / `postgresql` / `pg` | 仅 libpq |
 | `mysql` / `mariadb` | 仅 libmysqlclient |
@@ -152,6 +166,7 @@ zent 使用自己的 SQLite / 驱动栈，与 `data.sqlx` **正交**（见 [ZENT
 ## 10. 检查清单
 
 - [ ] 应用 `b.dependency("zigmodu", .{ .db = "…" })` 与真实 DSN 一致  
+- [ ] 数据层不在 `data.sqlx`（zent / 其他栈）→ `.db = "none"`；只用框架的 HTTP/Application 层时不要顺手链三库  
 - [ ] 生产镜像只安装对应客户端库（sqlite 系统库 / libpq / mysqlclient）  
 - [ ] CI 应用构建使用收窄 `-Ddb=`；框架 PR 测试保持 `all`  
 - [ ] 误开未链接驱动时能收到 `DriverNotEnabled`（而非动态链接器错误）  
@@ -218,6 +233,10 @@ CI 的 `windows-cross` job 就是照这个约束写的：`zig build -Ddb=none -D
 
 - **只有 `target` 就是构建机时才探主机**——按 `b.graph.host` 的解析三元组比较，不是
   `target.query.isNative()`：在 aarch64 Mac 上显式写 `-Dtarget=aarch64-macos` 仍算主机构建。
+- **主机构建在 Linux 上按候选表探测库目录**：多架构目录（`/usr/lib/<triple>`、`/lib/<triple>`）
+  优先，然后 `/usr/lib64`、`/usr/lib`、`/lib64`、`/lib`，**只加真实存在的目录**。此前写死
+  Debian 拼法（`/usr/lib/x86_64-linux-gnu`），在 RHEL 系（Alibaba Cloud Linux 实测）每次构建都
+  交一个不存在的 `-L`，链接器报 `unable to open library directory … FileNotFound`。
 - **主机探测也包含 pkg-config**。`linkSystemLibrary` 默认会跑
   `pkg-config --cflags --libs mysqlclient`，而 Homebrew 的 `mysqlclient.pc` 写的正是
   `/opt/homebrew/Cellar/mysql/9.3.0/{include,lib}`；它对**任何**目标都会跑，所以外来目标上

@@ -142,12 +142,13 @@ fn pkgConfigPaths(b: *std.Build, pc_names: []const []const u8) ?CLibPaths {
     return null;
 }
 
-/// Library directories to add as `-L`, kept in search order. Four is exactly
-/// what `targetLibDirs` yields (multiarch `usr/lib`, multiarch `lib`,
-/// `usr/lib64`, `usr/lib`); a host build fills one. A value type rather than an
-/// allocation, so a detection never has to touch the build arena.
+/// Library directories to add as `-L`, kept in search order. Six is exactly
+/// what `hostLibDirs`/`targetLibDirs` can yield (multiarch `usr/lib` + `lib`,
+/// `usr/lib64`, `usr/lib`, `lib64`, `lib`); a host build fills one or two. A
+/// value type rather than an allocation, so a detection never has to touch the
+/// build arena.
 const LibDirs = struct {
-    buf: [4][]const u8 = undefined,
+    buf: [6][]const u8 = undefined,
     len: usize = 0,
 
     fn slice(self: *const LibDirs) []const []const u8 {
@@ -177,6 +178,26 @@ fn targetLibDirs(b: *std.Build, target: std.Build.ResolvedTarget, root: []const 
     }
     dirs.addIfExists(b, b.fmt("{s}/usr/lib64", .{root}));
     dirs.addIfExists(b, b.fmt("{s}/usr/lib", .{root}));
+    return dirs;
+}
+
+/// The build host's library directories, in search order — the same candidate
+/// set as `targetLibDirs` without a root. Debian/Ubuntu keep their libraries
+/// in the multiarch directory, RHEL/SUSE in `usr/lib64`; detection used to
+/// hard-code the Debian spelling, so on Alibaba Cloud Linux (RHEL family) every
+/// build passed a `-L` for a directory that does not exist and the linker
+/// answered `unable to open library directory: FileNotFound`. Only directories
+/// that exist are returned, so the flag set is also quieter.
+fn hostLibDirs(b: *std.Build, host: std.Target) LibDirs {
+    var dirs: LibDirs = .{};
+    if (multiarchTriple(host.cpu.arch)) |triple| {
+        dirs.addIfExists(b, b.fmt("/usr/lib/{s}", .{triple}));
+        dirs.addIfExists(b, b.fmt("/lib/{s}", .{triple}));
+    }
+    dirs.addIfExists(b, "/usr/lib64");
+    dirs.addIfExists(b, "/usr/lib");
+    dirs.addIfExists(b, "/lib64");
+    dirs.addIfExists(b, "/lib");
     return dirs;
 }
 
@@ -253,7 +274,6 @@ fn detectPqPaths(b: *std.Build, target: std.Build.ResolvedTarget) CLibPaths {
             return paths;
         }
     } else if (host_target.os.tag == .linux) {
-        const lib_dir = if (host_target.cpu.arch == .aarch64) "/usr/lib/aarch64-linux-gnu" else "/usr/lib/x86_64-linux-gnu";
         const candidates = &[_][]const u8{
             "/usr/include/postgresql",
             "/usr/include/pgsql",
@@ -262,7 +282,7 @@ fn detectPqPaths(b: *std.Build, target: std.Build.ResolvedTarget) CLibPaths {
         for (candidates) |c| {
             if (dirExists(b, c)) {
                 paths.include = c;
-                paths.libs.add(lib_dir);
+                paths.libs = hostLibDirs(b, host_target);
                 return paths;
             }
         }
@@ -328,7 +348,6 @@ fn detectMysqlPaths(b: *std.Build, target: std.Build.ResolvedTarget) CLibPaths {
             }
         }
     } else if (host_target.os.tag == .linux) {
-        const lib_dir = if (host_target.cpu.arch == .aarch64) "/usr/lib/aarch64-linux-gnu" else "/usr/lib/x86_64-linux-gnu";
         const candidates = &[_][]const u8{
             "/usr/include/mariadb",
             "/usr/include/mysql",
@@ -337,7 +356,7 @@ fn detectMysqlPaths(b: *std.Build, target: std.Build.ResolvedTarget) CLibPaths {
         for (candidates) |c| {
             if (dirExists(b, c)) {
                 paths.include = c;
-                paths.libs.add(lib_dir);
+                paths.libs = hostLibDirs(b, host_target);
                 paths.lib_name = mysqlLibName(b, &paths.libs);
                 return paths;
             }

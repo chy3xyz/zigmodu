@@ -383,6 +383,14 @@ pub const Context = struct {
     /// already given up. `ctx.sqlContext()` is the one-line bridge.
     deadline_ms: ?i64 = null,
 
+    /// Did-you-mean suggestion computed for a 404 (e.g.
+    /// "Not Found; did you mean /v1/merchant/orders/submit"), or null when no
+    /// registered route was one case-flip away. The built-in 404 body embeds
+    /// the same string; a custom `default_404` renderer reads it through
+    /// `notFoundHint()` so installing one no longer discards the hint.
+    /// Allocated in the request arena — valid for this request only.
+    not_found_hint: ?[]const u8 = null,
+
     /// Per-request arena — eliminates ~20 heap allocs per request.
     /// Removed nested arena in Zig 0.17: ArenaAllocator.free() is no-op,
     /// so inner arena deinit never returned memory to outer arena, causing OOM.
@@ -408,6 +416,14 @@ pub const Context = struct {
         self.freeStringMap(&self.attributes);
         self.freeStringMap(&self.response_headers);
         if (self.form) |*f| f.deinit();
+        self.not_found_hint = null;
+    }
+
+    /// The did-you-mean suggestion for a 404, or null when none was found.
+    /// A custom `default_404` renderer calls this to keep the hint inside its
+    /// own envelope; the built-in 404 body already carries the same text.
+    pub fn notFoundHint(self: *const Context) ?[]const u8 {
+        return self.not_found_hint;
     }
 
     fn freeStringMap(self: *Context, map: *std.StringHashMap([]const u8)) void {
@@ -3054,13 +3070,15 @@ pub const Server = struct {
         if (!ctx.responded) {
             // Same fallback order as connFiber's production 404 (this entry
             // point also serves the H2 dispatch path): a custom default_404
-            // owns the response; only the built-in body gets the hint.
+            // owns the response, but the hint is computed first either way and
+            // published on the context so that renderer can keep it.
+            var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+            defer arena.deinit();
+            const message = self.notFoundMessage(arena.allocator(), ctx.method, ctx.path) catch "Not Found";
+            if (!std.mem.eql(u8, message, "Not Found")) ctx.not_found_hint = message;
             if (self.default_404) |nf| {
                 nf(ctx) catch |err| std.log.err("[Server] default_404 handler failed: {}", .{err});
             } else {
-                var arena = std.heap.ArenaAllocator.init(ctx.allocator);
-                defer arena.deinit();
-                const message = self.notFoundMessage(arena.allocator(), ctx.method, ctx.path) catch "Not Found";
                 try ctx.sendError(404, message);
             }
         }
@@ -3099,11 +3117,10 @@ pub const Server = struct {
     /// segments equal the request's ignoring case — exact spellings skipped (a
     /// 404 means none is registered) and `{param}`/`*` segments treated as
     /// wildcards. Returns the full 404 message ("Not Found; did you mean
-    /// {path}") allocated in `alloc`, or the plain "Not Found". Under an
-    /// installed RFC 7807 renderer the hint rides in the message, i.e. the
-    /// problem's `detail` field — the renderer hook receives only the message
-    /// string, so there is no separate hint injection point without changing
-    /// the hook's signature.
+    /// {path}") allocated in `alloc`, or the plain "Not Found".
+    /// Both 404 paths publish a non-trivial result on `ctx.not_found_hint`, so
+    /// a custom `default_404` renderer (native envelope, RFC 7807, …) can keep
+    /// the hint via `ctx.notFoundHint()` instead of losing it.
     fn notFoundMessage(self: *const Server, alloc: std.mem.Allocator, method: Method, path: []const u8) ![]const u8 {
         const routes = try self.router.listRoutes(alloc);
         defer {
@@ -3934,11 +3951,14 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                 }.h, server.global_middleware.items) catch |err| std.log.err("[Server] global middleware before 404: {}", .{err});
             }
             if (!ctx.responded) {
+                // The scan is paid only by 404s and rides the request arena.
+                // It runs even when a custom renderer owns the response, so the
+                // renderer can read the hint through `ctx.notFoundHint()`.
+                const message = server.notFoundMessage(arena_alloc, request.method, request.path) catch "Not Found";
+                if (!std.mem.eql(u8, message, "Not Found")) ctx.not_found_hint = message;
                 if (server.default_404) |nf| {
                     nf(&ctx) catch |err| std.log.err("[Server] default_404 handler failed: {}", .{err});
                 } else {
-                    // The scan is paid only by 404s and rides the request arena.
-                    const message = server.notFoundMessage(arena_alloc, request.method, request.path) catch "Not Found";
                     ctx.sendError(404, message) catch |err| std.log.err("[Server] failed to send 404: {}", .{err});
                 }
             }

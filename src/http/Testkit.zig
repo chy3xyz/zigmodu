@@ -492,6 +492,57 @@ test "dispatch unmatched route respects default_404" {
     try std.testing.expectEqualStrings("custom-missing", resp.body);
 }
 
+test "dispatch 404 did-you-mean survives a RouteGroup prefix mount" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(std.testing.io, allocator, 0);
+    defer server.deinit();
+
+    // The shape a consumer reports: deep prefix mount, request capitalised by
+    // a front-end path helper (`Submit` vs `submit`).
+    var g = server.group("/v1/merchant");
+    try g.post("/orders/submit", struct {
+        fn handle(ctx: *Context) !void {
+            try ctx.text(200, "ok");
+        }
+    }.handle, null);
+
+    var resp = try dispatch(&server, .POST, "/v1/merchant/orders/Submit", null);
+    defer resp.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 404), resp.status_code);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "did you mean /v1/merchant/orders/submit") != null);
+}
+
+test "default_404 can render the did-you-mean hint itself" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(std.testing.io, allocator, 0);
+    defer server.deinit();
+
+    try server.addRoute(.{
+        .method = .POST,
+        .path = "/v1/merchant/orders/submit",
+        .handler = struct {
+            fn handle(ctx: *Context) !void {
+                try ctx.text(200, "ok");
+            }
+        }.handle,
+    });
+
+    const Custom = struct {
+        fn notFound(ctx: *Context) !void {
+            // The hint rides on the Context for custom renderers, which own
+            // the 404 body and would otherwise never see `notFoundMessage`.
+            const hint = ctx.notFoundHint() orelse "Not Found";
+            try ctx.text(404, hint);
+        }
+    };
+    server.default_404 = Custom.notFound;
+
+    var resp = try dispatch(&server, .POST, "/v1/merchant/orders/Submit", null);
+    defer resp.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 404), resp.status_code);
+    try std.testing.expectEqualStrings("Not Found; did you mean /v1/merchant/orders/submit", resp.body);
+}
+
 test "tenantMiddleware sets attr" {
     const allocator = std.testing.allocator;
     var server = Server.init(std.testing.io, allocator, 0);

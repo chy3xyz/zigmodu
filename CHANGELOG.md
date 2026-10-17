@@ -1,5 +1,37 @@
 # Changelog
 
+## [Unreleased]
+
+### 404 提示可被自定义渲染器取用（`ctx.notFoundHint()`）（**破坏性：否**）
+
+`did-you-mean` 提示此前只在**内置** 404 body 里出现：一旦应用安装
+`default_404`（ThinkPHP/native 信封、RFC 7807 等），提示根本不会生成，
+消费者看到的是裸 404。现在两条 404 路径（connFiber 与 handleForTest/H2）
+都先算出提示并发布到 `ctx.not_found_hint`，自定义渲染器通过
+`ctx.notFoundHint()` 读取即可保留，无需改 hook 签名。前缀挂载
+（`RouteGroup` / ComptimeRouter `mountAll`）下注册表存的是完整路径，
+提示本就能命中——新增回归测试把「前缀挂载 + 大小写错位」和
+「default_404 自渲染提示」两条都钉住。扫描成本仍只由 404 支付。
+
+### 修复：Linux 主机构建探测库目录写死 Debian 拼法（**破坏性：否**）
+
+`examples/_shared/db_link.zig` 的 `detectPqPaths` / `detectMysqlPaths` 在
+Linux 主机分支写死 `/usr/lib/{x86_64,aarch64}-linux-gnu`——RHEL 系
+（Alibaba Cloud Linux 实测）该目录不存在，每次构建都交一个坏 `-L`：
+`unable to open library directory … FileNotFound`。改为候选表
+（多架构 `usr/lib`、`lib` → `usr/lib64` → `usr/lib` → `lib64` → `lib`），
+**只加真实存在的目录**；Debian/Ubuntu 行为不变，RHEL/SUSE 自然命中
+`/usr/lib64`。
+
+### 文档：`.db = "none"` 确立为纯框架嵌入形态 + build_options 契约（**破坏性：否**）
+
+`docs/guide/SQLX_DRIVERS.md` 新增：数据层不在 `data.sqlx`（zent 等）时
+用 `.db = "none"`——三个驱动的 translate-c 全跳过、不链任何客户端库，
+误用 `data.Client.open` 得到 `DriverNotEnabled` 而非链接器错误；同时写明
+`b.dependency(..., .{ .db = … })` 是依赖形态下**唯一**的链路旋钮，
+应用侧 `addImport("build_options", …)` 只作用于应用自己的模块，不会改变
+依赖的编译方式（两个同名 `build_options` 是独立模块）。
+
 ## [0.39.16] - 2026-10-17
 
 ### 修复：life 测试在 build runner `--listen=-` 下"超时"（**破坏性：否**）
