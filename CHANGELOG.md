@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### 依赖：zent → v0.96.0（**破坏性：否**；错误集增长）
+
+两示例的 pin 从 `snap-2026-10-18` 升到正式发布 **v0.96.0**，快照里的三个批次随
+此版发布，另加一条行为变化：
+
+- **逐语句 savepoint**：迁移的每条计划语句在 PG/SQLite 上包在 savepoint 里，
+  服务端拒绝时只回滚该语句、warn 点名 SQL，返回新
+  `error.MigrationStatementRejected`（已分类错误原样保留）。穷尽 `switch` 迁移
+  入口错误集的消费方需加一条 arm；本仓库两示例不穷尽该错误集，无动作。
+- 裸 SQL `?` 占位符翻译（`translatePlaceholdersAlloc`）、迁移 helper 的 comptime
+  配额按图规模缩放、跨图边不再猜外键（全图迁移 DDL 不变）——见 §14 v0.96 行。
+- 新增 PG-wire CI 门禁（`scripts/check-pg-wire.sh` + 失败测试名基线）与跨编译
+  跳过驱动的指名 warn；对本仓库无动作。
+
+验证：`zent-modulith` 清缓存重建 + smoke 44/0 无泄漏、`metaverse-creative`
+`zig build demo` `demo_ok`。
+
 ### 修复：迁移执行层发送前剥 SQL 注释（**破坏性：否**）
 
 `MigrationRunner.run` 的分句器 `splitSqlStatements` 会**跳过**注释来找语句

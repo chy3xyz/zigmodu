@@ -1,6 +1,6 @@
 # zent-modulith — ZigModu + zent
 
-Demonstrates **ZigModu** (Application / HTTP / **ComptimeRouter**) with **[zent](https://github.com/chy3xyz/zent)** snap-2026-10-18 (v0.95.0 + unreleased batches) as the schema-as-code data layer (demos span v0.21–v0.95 capabilities).
+Demonstrates **ZigModu** (Application / HTTP / **ComptimeRouter**) with **[zent](https://github.com/chy3xyz/zent)** v0.96.0 as the schema-as-code data layer (demos span v0.21–v0.96 capabilities).
 
 See framework guides: [`docs/reference/ZENT.md`](../../docs/reference/ZENT.md) · [`docs/reference/ROUTE_TABLE.md`](../../docs/reference/ROUTE_TABLE.md).
 
@@ -9,7 +9,7 @@ See framework guides: [`docs/reference/ZENT.md`](../../docs/reference/ZENT.md) �
 
 - Zig ≥ 0.17
 - No sibling checkout needed: `build.zig.zon` pins the released tag
-  `snap-2026-10-18` via `git+https` (fetched by the build). For local development
+  `v0.96.0` via `git+https` (fetched by the build). For local development
   against a sibling checkout, replace it with
   `.zent = .{ .path = "../../../zent" }`.
 
