@@ -97,6 +97,104 @@ fn dollarQuoteTagLen(sql: []const u8, pos: usize) ?usize {
     return null;
 }
 
+/// Remove SQL comments from one statement before it reaches a driver.
+///
+/// The splitter already has to know where comments are (a `;` inside one must
+/// not end the statement), but it deliberately kept them in the emitted text —
+/// so a migration file's header comment or an inline `-- note` was sent to the
+/// server as part of the DDL. Comments are legal SQL and most servers take
+/// them; a server that does not (HeliosDB, observed by a consumer) fails the
+/// whole migration on the first one.
+///
+/// Stripping happens after splitting, at the last point that can still tell a
+/// comment from the things that merely look like one:
+///   - `-- …` and `/* … */` outside literals become **one space** (so
+///     `a/*x*/b` does not turn into `ab`);
+///   - MySQL executable comments `/*! … */` and optimizer hints `/*+ … */`
+///     are copied verbatim — they are SQL, not commentary;
+///   - single-quoted strings (`''` escape), double-quoted identifiers and
+///     dollar-quoted bodies are copied byte for byte (`'-- not a comment'`
+///     keeps its text).
+fn stripSqlComments(allocator: std.mem.Allocator, sql: []const u8) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < sql.len) {
+        switch (sql[i]) {
+            '\'' => {
+                const start = i;
+                i += 1;
+                while (i < sql.len) {
+                    if (sql[i] == '\'') {
+                        if (i + 1 < sql.len and sql[i + 1] == '\'') {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                try out.appendSlice(allocator, sql[start..i]);
+            },
+            '"' => {
+                const start = i;
+                i += 1;
+                while (i < sql.len and sql[i] != '"') i += 1;
+                if (i < sql.len) i += 1;
+                try out.appendSlice(allocator, sql[start..i]);
+            },
+            '$' => {
+                if (dollarQuoteTagLen(sql, i)) |tag_len| {
+                    const start = i;
+                    const tag = sql[i .. i + tag_len];
+                    i += tag_len;
+                    if (std.mem.indexOfPos(u8, sql, i, tag)) |close| {
+                        i = close + tag.len;
+                    } else {
+                        i = sql.len;
+                    }
+                    try out.appendSlice(allocator, sql[start..i]);
+                } else {
+                    try out.append(allocator, sql[i]);
+                    i += 1;
+                }
+            },
+            '-' => {
+                if (i + 1 < sql.len and sql[i + 1] == '-') {
+                    while (i < sql.len and sql[i] != '\n') i += 1;
+                    try out.append(allocator, ' ');
+                } else {
+                    try out.append(allocator, sql[i]);
+                    i += 1;
+                }
+            },
+            '/' => {
+                if (i + 1 < sql.len and sql[i + 1] == '*') {
+                    const executable = i + 2 < sql.len and (sql[i + 2] == '!' or sql[i + 2] == '+');
+                    const start = i;
+                    i += 2;
+                    while (i + 1 < sql.len and !(sql[i] == '*' and sql[i + 1] == '/')) i += 1;
+                    i = @min(i + 2, sql.len);
+                    if (executable) {
+                        try out.appendSlice(allocator, sql[start..i]);
+                    } else {
+                        try out.append(allocator, ' ');
+                    }
+                } else {
+                    try out.append(allocator, sql[i]);
+                    i += 1;
+                }
+            },
+            else => {
+                try out.append(allocator, sql[i]);
+                i += 1;
+            },
+        }
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
 /// Database migration entry
 pub const MigrationEntry = struct {
     /// Version number (timestamp format: YYYYMMDDHHMMSS)
@@ -386,7 +484,13 @@ pub const MigrationRunner = struct {
             }
             var mig_ok = true;
             for (stmts) |stmt| {
-                const trimmed = std.mem.trim(u8, stmt, " \t\r\n");
+                // Comments are legal SQL, but a server that rejects them
+                // (HeliosDB) turned a header comment into a failed migration.
+                // Strip here — after splitting, before exec — and drop chunks
+                // that were only commentary.
+                const stripped = try stripSqlComments(self.allocator, stmt);
+                defer self.allocator.free(stripped);
+                const trimmed = std.mem.trim(u8, stripped, " \t\r\n");
                 if (trimmed.len == 0) continue;
                 _ = client.exec(trimmed, &.{}) catch |err| {
                     // The only skippable failure is a redundant `ALTER TABLE …
@@ -923,6 +1027,114 @@ test "splitSqlStatements dollar-tag and parameter placeholder" {
     try std.testing.expect(std.mem.indexOf(u8, stmts[0], "BEGIN EXECUTE 'x;y'; END;") != null);
     // $1 is a parameter placeholder, not a dollar-quote tag.
     try std.testing.expectEqualStrings("SELECT $1", stmts[1]);
+}
+
+test "stripSqlComments drops comments, keeps literals and executable comments" {
+    const allocator = std.testing.allocator;
+
+    // Header + inline line comment; the comment inside the string literal is
+    // text, not a comment.
+    {
+        const sql =
+            \\-- migration header
+            \\CREATE TABLE t (a TEXT DEFAULT '-- not a comment', b INT /* inline */);
+        ;
+        const got = try stripSqlComments(allocator, sql);
+        defer allocator.free(got);
+        try std.testing.expect(std.mem.indexOf(u8, got, "-- migration header") == null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "not a comment") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "inline") == null);
+        // The block comment became a space, not nothing: tokens on either side
+        // must not fuse.
+        try std.testing.expect(std.mem.indexOf(u8, got, "b INT ") != null);
+    }
+
+    // MySQL executable comments and optimizer hints are SQL: kept verbatim.
+    {
+        const sql = "/*!40101 SET NAMES utf8 */ SELECT /*+ MAX_EXECUTION_TIME(1000) */ 1";
+        const got = try stripSqlComments(allocator, sql);
+        defer allocator.free(got);
+        try std.testing.expectEqualStrings(sql, got);
+    }
+
+    // Dollar-quoted bodies keep their `--` and `/* */` text.
+    {
+        const sql = "CREATE FUNCTION f() RETURNS void AS $$ -- keep /* this */ $$ LANGUAGE plpgsql";
+        const got = try stripSqlComments(allocator, sql);
+        defer allocator.free(got);
+        try std.testing.expectEqualStrings(sql, got);
+    }
+
+    // A statement that was only commentary becomes empty (the caller skips it).
+    {
+        const got = try stripSqlComments(allocator, "-- only a note\n/* and a block */");
+        defer allocator.free(got);
+        try std.testing.expectEqual(@as(usize, 0), std.mem.trim(u8, got, " \t\r\n").len);
+    }
+}
+
+test "MigrationRunner sends statements without comments" {
+    const allocator = std.testing.allocator;
+    const sqlx = @import("../sqlx/sqlx.zig");
+
+    const Recording = struct {
+        allocator: std.mem.Allocator,
+        statements: std.ArrayList([]const u8) = .empty,
+
+        fn deinit(self: *@This()) void {
+            for (self.statements.items) |s| self.allocator.free(s);
+            self.statements.deinit(self.allocator);
+        }
+        pub fn exec(self: *@This(), sql: []const u8, args: []const sqlx.Value) !sqlx.ExecResult {
+            _ = args;
+            try self.statements.append(self.allocator, try self.allocator.dupe(u8, sql));
+            return .{};
+        }
+        pub fn queryRows(self: *@This(), comptime T: type, sql: []const u8, args: []const sqlx.Value) !MockRows(T) {
+            _ = self;
+            _ = sql;
+            _ = args;
+            return .{};
+        }
+    };
+
+    var runner = MigrationRunner.init(allocator);
+    defer runner.deinit();
+    try runner.addMigration(20260101000000, "comments everywhere",
+        \\-- header note
+        \\CREATE TABLE t (a INT); /* trailing */
+        \\-- between statements
+        \\INSERT INTO t VALUES (1); -- after
+        \\-- only a comment
+        \\;
+        \\SELECT 'x;y' /* keep the ; inside the literal */;
+    );
+
+    var client = Recording{ .allocator = allocator };
+    defer client.deinit();
+    try runner.run(&client);
+
+    var migration_statements: usize = 0;
+    for (client.statements.items) |s| {
+        // Only statements that came from the migration file: the generated
+        // history DDL and the history INSERT are comment-free by construction.
+        if (std.mem.indexOf(u8, s, "_zigmodu_migrations") != null) continue;
+        migration_statements += 1;
+        try std.testing.expect(std.mem.indexOf(u8, s, "--") == null);
+        try std.testing.expect(std.mem.indexOf(u8, s, "/*") == null);
+    }
+    // Three executable statements: CREATE, INSERT, SELECT. The comment-only
+    // chunk (`-- after` + the standalone note before the bare `;`) and the
+    // trailing block comment never reach the client.
+    try std.testing.expectEqual(@as(usize, 3), migration_statements);
+    // The quoted semicolon survived (the splitter and the stripper both let
+    // literals through untouched); the history INSERT is the last statement, so
+    // the whole recording is searched rather than its tail.
+    var saw_literal = false;
+    for (client.statements.items) |s| {
+        if (std.mem.indexOf(u8, s, "'x;y'") != null) saw_literal = true;
+    }
+    try std.testing.expect(saw_literal);
 }
 
 test "MigrationRunner rejects duplicate versions" {
