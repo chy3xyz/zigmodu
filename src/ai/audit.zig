@@ -12,6 +12,12 @@ pub const AuditKind = enum {
     run_max_steps,
 };
 
+/// Sentinel for "this run carried no identity". Distinct from `0`, which is a
+/// real tenant/user id in some deployments: the old `orelse 0` at the call
+/// sites made an unidentified run indistinguishable from tenant 0, so an
+/// operator reading the trail could not tell "no identity" from "tenant zero".
+pub const unscoped_identity: i64 = -1;
+
 pub const AuditEvent = struct {
     kind: AuditKind,
     tool_name: []const u8 = "",
@@ -19,6 +25,12 @@ pub const AuditEvent = struct {
     tenant_id: i64 = 0,
     user_id: i64 = 0,
     at_ms: i64 = 0,
+
+    /// Whether both halves of the identity are known. A security event without
+    /// one is still recorded (dropping it would be worse), but it says so.
+    pub fn isScoped(self: AuditEvent) bool {
+        return self.tenant_id != unscoped_identity and self.user_id != unscoped_identity;
+    }
 };
 
 /// What a record's text fields become when their copies cannot be allocated.
@@ -342,4 +354,19 @@ test "snapshot hands back its copies when an allocation fails" {
         }
     };
     try std.testing.checkAllAllocationFailures(a, Scan.run, .{&log});
+}
+
+test "AuditEvent.isScoped separates 'no identity' from tenant zero" {
+    const scoped = AuditEvent{ .kind = .tool_ok, .tenant_id = 1, .user_id = 2 };
+    try std.testing.expect(scoped.isScoped());
+    // Tenant zero is a real scope in some deployments; it is *not* the
+    // sentinel, so it must still read as scoped.
+    const tenant_zero = AuditEvent{ .kind = .tool_ok, .tenant_id = 0, .user_id = 2 };
+    try std.testing.expect(tenant_zero.isScoped());
+    const anonymous = AuditEvent{
+        .kind = .tool_denied,
+        .tenant_id = unscoped_identity,
+        .user_id = unscoped_identity,
+    };
+    try std.testing.expect(!anonymous.isScoped());
 }

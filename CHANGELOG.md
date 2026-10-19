@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### 完善：RAG 检索带 scope、审计匿名语义、审批列表权限码（**行为变化：审批列表需要 `approval:decide`**）
+
+- **`Retriever.retrieveScopedFn`（additive）**：检索回调的 scope 形态，`Agent`
+  在带身份的运行里优先调用并传入 `Scope{tenant_id, user_id}`；未设置而运行带
+  身份时打**一条**进程级警告（共享索引无法由框架过滤，静默信任无 scope 形态
+  就是跨租户上下文泄漏）。无身份运行继续走原 `retrieveFn`，行为不变。
+- **审计匿名语义**：`audit.unscoped_identity = -1` 取代 agent 调用点的
+  `orelse 0`——"没有身份"不再与"租户 0"混同；`AuditEvent.isScoped()` 供读取方
+  区分。`0` 作为真实租户 id 仍视为已 scoped。
+- **审批列表权限**：`GET /approvals/pending` 现在带 `permission = "approval:decide"`
+  （与 approve/reject 同码：能看到待审批项就能看到 run_id 与金额）。消费方若只
+  依赖"登录即可列出"，需要在 catalog 里给对应角色补 `approval:decide`；只读
+  审计场景应使用独立角色/端点，而不是放宽 decide。
+- 文档：`AI_DEV_GUIDE.md` 安全清单、`AGENT_RUNTIME.md`「身份 ≠ 鉴权」同步。
+
 ### 安全：AI 租户作用域收敛（**行为变化：审批 API 无 scope 从"列全部"改为 403**）
 
 - **`ai.SkillContext.fromHttp(ctx)`**：HTTP 边界的官方构造入口——只从 JWT

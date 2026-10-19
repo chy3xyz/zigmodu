@@ -204,6 +204,9 @@ try ai.agent_worker.post(ctx.allocator, 32, worker, goal_text, tenant_id, user_i
   `tenant_id` / `permissions`）构造；缺失或非数字直接报错（`TenantRequired` /
   `UserRequired` / `Malformed*`），不读 header/body、不把缺字段当租户 0。
   `requireTenant()` / `requireIdentity()` 供"必须带租户/身份才能继续"的路径自检。
+  审计里没有身份的运行记 `audit.unscoped_identity`（`-1`），与"租户 0"区分
+  （`AuditEvent.isScoped()`）；RAG 的 `Retriever.retrieveScopedFn` 收到同一套
+  `Scope`，共享索引必须用它过滤。
 - **多智能体编排**（谁指挥谁、跨 agent 的预算分配）不在这一层。
 - **Agent 的 State / Event subscriptions / Lifecycle** 仍未做：状态在 app 侧（worker 的 `handle` 无状态），
   订阅是主动拉（`ai.trigger`），没有 agent 级的 start/stop。

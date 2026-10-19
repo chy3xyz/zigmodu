@@ -10,13 +10,40 @@ pub const RetrievedChunk = struct {
     source: []const u8 = "",
 };
 
+/// Who a retrieval runs for. The framework forwards the run's identity so an
+/// implementation can partition (one collection per tenant, a mandatory
+/// metadata filter) instead of hoping a shared index never leaks: retrieval is
+/// the one place where a missing filter returns another tenant's documents as
+/// *context for the model*, which no downstream check can undo.
+pub const Scope = struct {
+    tenant_id: ?i64 = null,
+    user_id: ?i64 = null,
+
+    pub fn scoped(self: Scope) bool {
+        return (self.tenant_id orelse 0) != 0;
+    }
+};
+
 /// Application-supplied retriever. Framework does not ship a vector DB.
 pub const Retriever = struct {
     ptr: *anyopaque,
     retrieveFn: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, top_k: usize) anyerror![]RetrievedChunk,
     freeFn: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chunks: []RetrievedChunk) void = defaultFree,
+    /// Scope-aware form. Set this when the index is shared between tenants;
+    /// `Agent` prefers it and passes the run's identity. Without it, a run that
+    /// **has** an identity falls back to `retrieveFn` and logs one warning per
+    /// process — the framework cannot filter an index it does not own, and
+    /// silently trusting the unscoped form is how cross-tenant context leaks.
+    retrieveScopedFn: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, scope: Scope, query: []const u8, top_k: usize) anyerror![]RetrievedChunk = null,
 
     pub fn retrieve(self: Retriever, allocator: std.mem.Allocator, query: []const u8, top_k: usize) ![]RetrievedChunk {
+        return self.retrieveFn(self.ptr, allocator, query, top_k);
+    }
+
+    /// Scoped retrieval: uses the scope-aware callback when present, otherwise
+    /// falls back to the unscoped one (see `retrieveScopedFn`).
+    pub fn retrieveScoped(self: Retriever, allocator: std.mem.Allocator, scope: Scope, query: []const u8, top_k: usize) ![]RetrievedChunk {
+        if (self.retrieveScopedFn) |f| return f(self.ptr, allocator, scope, query, top_k);
         return self.retrieveFn(self.ptr, allocator, query, top_k);
     }
 
@@ -192,4 +219,49 @@ test "KeywordRetriever retrieve and format" {
     const ctx = try KeywordRetriever.formatContext(a, chunks);
     defer a.free(ctx);
     try std.testing.expect(std.mem.indexOf(u8, ctx, "Order 42") != null);
+}
+
+test "Retriever.retrieveScoped prefers the scoped callback and passes the scope" {
+    const A = struct {
+        var saw_tenant: ?i64 = null;
+        fn unscoped(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: usize) anyerror![]RetrievedChunk {
+            return error.UnscopedCalled;
+        }
+        fn scoped(_: *anyopaque, allocator: std.mem.Allocator, scope: Scope, _: []const u8, _: usize) anyerror![]RetrievedChunk {
+            saw_tenant = scope.tenant_id;
+            const out = try allocator.alloc(RetrievedChunk, 1);
+            out[0] = .{ .text = try allocator.dupe(u8, "doc") };
+            return out;
+        }
+    };
+    var instance: A = .{};
+    const r = Retriever{
+        .ptr = &instance,
+        .retrieveFn = A.unscoped,
+        .retrieveScopedFn = A.scoped,
+    };
+    const chunks = try r.retrieveScoped(std.testing.allocator, .{ .tenant_id = 7, .user_id = 42 }, "q", 1);
+    defer r.free(std.testing.allocator, chunks);
+    try std.testing.expectEqual(@as(?i64, 7), A.saw_tenant);
+}
+
+test "Retriever.retrieveScoped falls back to the unscoped form when no scoped callback exists" {
+    const A = struct {
+        fn unscoped(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: usize) anyerror![]RetrievedChunk {
+            const out = try allocator.alloc(RetrievedChunk, 1);
+            out[0] = .{ .text = try allocator.dupe(u8, "fallback") };
+            return out;
+        }
+    };
+    var instance: A = .{};
+    const r = Retriever{ .ptr = &instance, .retrieveFn = A.unscoped };
+    const chunks = try r.retrieveScoped(std.testing.allocator, .{ .tenant_id = 7 }, "q", 1);
+    defer r.free(std.testing.allocator, chunks);
+    try std.testing.expectEqualStrings("fallback", chunks[0].text);
+}
+
+test "Scope.scoped treats the zero default as unscoped" {
+    try std.testing.expect(!(Scope{}).scoped());
+    try std.testing.expect(!(Scope{ .tenant_id = 0 }).scoped());
+    try std.testing.expect((Scope{ .tenant_id = 1 }).scoped());
 }

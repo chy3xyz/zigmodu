@@ -303,7 +303,11 @@ pub fn ApprovalApi(comptime QueueT: type) type {
         pub const State = Self;
 
         pub const routes = [_]http.RouteSpec(State){
-            .{ .method = .GET, .path = "pending", .handler = listPending },
+            // Listing is as sensitive as deciding (it carries run ids and
+            // amounts); the same gate covers both, so "may decide" implies
+            // "may see". A read-only auditor needs a separate code, not a
+            // tenant-wide listing.
+            .{ .method = .GET, .path = "pending", .handler = listPending, .meta = .{ .permission = "approval:decide" } },
             .{ .method = .POST, .path = "{id}/approve", .handler = approve, .meta = .{ .permission = "approval:decide" } },
             .{ .method = .POST, .path = "{id}/reject", .handler = reject, .meta = .{ .permission = "approval:decide" } },
         };

@@ -67,6 +67,16 @@ pub const ToolApproval = enum {
 };
 
 /// Optional observation hooks (metrics / tracing / logs / approval).
+/// One warning per process: a scoped run on a retriever without the scoped
+/// callback means the index cannot be filtered by the framework, and a shared
+/// index answering across tenants is how RAG context leaks into another
+/// tenant's prompt.
+var warned_unscoped_retriever = std.atomic.Value(bool).init(false);
+fn warnUnscopedRetriever(agent_name: []const u8) void {
+    if (warned_unscoped_retriever.swap(true, .monotonic)) return;
+    std.log.warn("[Agent:{s}] a tenant-scoped run uses a retriever without retrieveScopedFn; the framework cannot filter a shared index — set Retriever.retrieveScopedFn", .{agent_name});
+}
+
 pub const AgentHooks = struct {
     ctx: ?*anyopaque = null,
     on_step: ?*const fn (ctx: ?*anyopaque, step: usize, tool_calls: usize) void = null,
@@ -296,7 +306,7 @@ pub const Agent = struct {
         if (max_steps == 0) return error.InvalidMaxSteps;
         _ = self.metrics.runs.fetchAdd(1, .monotonic);
         if (self.audit) |log| {
-            log.record(.run_start, "", goal, skill_ctx.tenant_id orelse 0, skill_ctx.user_id orelse 0);
+            log.record(.run_start, "", goal, skill_ctx.tenant_id orelse audit_mod.unscoped_identity, skill_ctx.user_id orelse audit_mod.unscoped_identity);
         }
         const started_ms = @import("../core/Time.zig").monotonicNowMilliseconds();
 
@@ -316,7 +326,16 @@ pub const Agent = struct {
 
         var system_content: []const u8 = self.system_prompt;
         if (self.retriever) |r| {
-            if (r.retrieve(allocator, goal, self.retrieve_top_k)) |chunks| {
+            const retrieval_scope = retriever_mod.Scope{
+                .tenant_id = skill_ctx.tenant_id,
+                .user_id = skill_ctx.user_id,
+            };
+            if (retrieval_scope.scoped() and r.retrieveScopedFn == null) warnUnscopedRetriever(self.name);
+            const retrieved = if (retrieval_scope.scoped())
+                r.retrieveScoped(allocator, retrieval_scope, goal, self.retrieve_top_k)
+            else
+                r.retrieve(allocator, goal, self.retrieve_top_k);
+            if (retrieved) |chunks| {
                 defer r.free(allocator, chunks);
                 if (chunks.len > 0) {
                     const ctx_block = try retriever_mod.KeywordRetriever.formatContext(allocator, chunks);
@@ -419,7 +438,7 @@ pub const Agent = struct {
             defer self.provider.freeResponse(&resp);
 
             if (self.quota) |q| {
-                try q.record(skill_ctx.tenant_id orelse 0, resp.prompt_tokens, resp.completion_tokens);
+                try q.record(skill_ctx.tenant_id orelse audit_mod.unscoped_identity, resp.prompt_tokens, resp.completion_tokens);
             }
 
             _ = self.metrics.steps.fetchAdd(1, .monotonic);
@@ -428,7 +447,7 @@ pub const Agent = struct {
             if (resp.tool_calls.len == 0) {
                 if (self.hooks.on_finish) |cb| cb(self.hooks.ctx, steps + 1, false);
                 if (self.audit) |log| {
-                    log.record(.run_finish, "", resp.content, skill_ctx.tenant_id orelse 0, skill_ctx.user_id orelse 0);
+                    log.record(.run_finish, "", resp.content, skill_ctx.tenant_id orelse audit_mod.unscoped_identity, skill_ctx.user_id orelse audit_mod.unscoped_identity);
                 }
                 try self.recordRunAudit(allocator, skill_ctx, steps + 1, started_ms, if (budget_stopped) "budget_exhausted" else if (canceled_stopped) "canceled" else "completed", if (resp.model.len > 0) resp.model else null);
                 // Each of these three is owned until the `return` hands them
@@ -492,7 +511,7 @@ pub const Agent = struct {
                             _ = self.metrics.tool_denied.fetchAdd(1, .monotonic);
                             if (self.hooks.on_tool) |tcb| tcb(self.hooks.ctx, tc.name, false);
                             if (self.audit) |log| {
-                                log.record(.tool_denied, tc.name, @tagName(decision), skill_ctx.tenant_id orelse 0, skill_ctx.user_id orelse 0);
+                                log.record(.tool_denied, tc.name, @tagName(decision), skill_ctx.tenant_id orelse audit_mod.unscoped_identity, skill_ctx.user_id orelse audit_mod.unscoped_identity);
                             }
                             // Machine-readable reason so the model can pivot
                             // (a denied `execute` is a cue to propose).
@@ -520,7 +539,7 @@ pub const Agent = struct {
                         _ = self.metrics.tool_denied.fetchAdd(1, .monotonic);
                         if (self.hooks.on_tool) |tcb| tcb(self.hooks.ctx, tc.name, false);
                         if (self.audit) |log| {
-                            log.record(.tool_denied, tc.name, "denied", skill_ctx.tenant_id orelse 0, skill_ctx.user_id orelse 0);
+                            log.record(.tool_denied, tc.name, "denied", skill_ctx.tenant_id orelse audit_mod.unscoped_identity, skill_ctx.user_id orelse audit_mod.unscoped_identity);
                         }
                         const err_s = try appendOwnedString(allocator, &owned_strs, "{\"error\":\"ToolDenied\"}");
                         const tid = try appendOwnedString(allocator, &owned_strs, tc.id);
@@ -555,7 +574,7 @@ pub const Agent = struct {
                     _ = self.metrics.tool_errors.fetchAdd(1, .monotonic);
                     if (self.hooks.on_tool) |cb| cb(self.hooks.ctx, tc.name, false);
                     if (self.audit) |log| {
-                        log.record(.tool_err, tc.name, @errorName(err), skill_ctx.tenant_id orelse 0, skill_ctx.user_id orelse 0);
+                        log.record(.tool_err, tc.name, @errorName(err), skill_ctx.tenant_id orelse audit_mod.unscoped_identity, skill_ctx.user_id orelse audit_mod.unscoped_identity);
                     }
                     const err_s = try appendTakenString(
                         allocator,
@@ -573,7 +592,7 @@ pub const Agent = struct {
 
                 if (self.hooks.on_tool) |cb| cb(self.hooks.ctx, tc.name, true);
                 if (self.audit) |log| {
-                    log.record(.tool_ok, tc.name, "", skill_ctx.tenant_id orelse 0, skill_ctx.user_id orelse 0);
+                    log.record(.tool_ok, tc.name, "", skill_ctx.tenant_id orelse audit_mod.unscoped_identity, skill_ctx.user_id orelse audit_mod.unscoped_identity);
                 }
                 // The handler built this value with `ctx.allocator`, which is
                 // not necessarily the allocator this run was handed
@@ -594,7 +613,7 @@ pub const Agent = struct {
         _ = self.metrics.max_steps_hits.fetchAdd(1, .monotonic);
         if (self.hooks.on_finish) |cb| cb(self.hooks.ctx, steps, true);
         if (self.audit) |log| {
-            log.record(.run_max_steps, "", "max_steps exceeded", skill_ctx.tenant_id orelse 0, skill_ctx.user_id orelse 0);
+            log.record(.run_max_steps, "", "max_steps exceeded", skill_ctx.tenant_id orelse audit_mod.unscoped_identity, skill_ctx.user_id orelse audit_mod.unscoped_identity);
         }
         try self.recordRunAudit(allocator, skill_ctx, steps, started_ms, "max_steps", null);
         const timeout_msg = try allocator.dupe(u8, "Agent stopped: max_steps exceeded");

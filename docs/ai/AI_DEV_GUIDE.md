@@ -219,7 +219,8 @@ server，`tools/list` 自动从注册表推导参数 schema，并列出注册表
 - [ ] handler 返回值全部 `ctx.allocator` 持有，调用方 `freeValue`
 - [ ] HTTP 边界一律用 `ai.SkillContext.fromHttp(ctx)`（attrs 取身份）；多租户应用用 `registerBusinessSkillsWith(..., .{ .db_query_tenant_column = "<列名>" })`（默认入口会让 `db.query` fail-closed），实体技能按实体声明的 `tenant_column` 隔离
 - [ ] 审批 API（`ai.approval_api.ApprovalApi`）的租户作用域来自**已验证的 `tenant_id` attr**；`X-Tenant-ID` 只有显式 `Config.allow_tenant_header = true` 才能顶替，且与 attr 冲突时 403。无作用域的请求现在是 403，**不再**列出全部租户
-- [ ] RAG（`Retriever`）接口暂无 scope 参数 —— 必须由应用实现方保证按租户分区/过滤，禁止"共享索引 + 相似度截断"当隔离
+- [ ] RAG（`Retriever`）实现按租户分区/过滤，禁止"共享索引 + 相似度截断"当隔离；共享索引请设置 `Retriever.retrieveScopedFn`——`Agent` 会把本次运行的 `tenant_id/user_id` 传进去，没设置而运行又带身份时会打**一条**进程级警告（框架无法过滤别人的索引）
+- [ ] 审批列表（`GET /approvals/pending`）与 approve/reject 共用 `approval:decide` 权限码；只读审计员需要单独的角色/端点，别给 decide
 - [ ] 长任务设 `deadline_ms` / `tool_timeout_ms` / `Budget`
 - [ ] 生产打开 `audit`（`AgentAuditLog` / `RunAuditStore`）与指标
 - [ ] LLM 决策「拿不准就转人工」，绝不静默批准（`ai.llm` 已内建该姿态）
