@@ -18,6 +18,15 @@
 - 文档：`docs/ai/AI_DEV_GUIDE.md` 的接入方式与安全清单、`AGENT_RUNTIME.md`
   的"身份 ≠ 鉴权"同步。
 
+### 测试：两处 flake 加固（**破坏性：否**）
+
+- `DocSnippets` 扫描文档代码块，`ctx.json(200, .{…})` 这类值形态会被判为
+  不可编译（正确形态是 `jsonStruct`）——本次 AI 文档示例按检测器修正。
+- `timer_wheel` 的 aged-lookup 比值测试把每窗口的取样从 3 次提到 9 次：
+  macOS CI runner 上一次 best-of-3 仍越过 3x 界（索引无 tombstone），
+  取样窗口只有几百微秒，连续撞调度停顿是噪声而非回归；被测 bug 是
+  10–15x 且永久，九窗口全部超界仍会失败。
+
 ## [0.39.18] - 2026-10-18
 
 ### 依赖：zent → v0.96.0（**破坏性：否**；错误集增长）

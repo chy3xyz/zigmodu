@@ -1041,7 +1041,13 @@ test "Wheel scheduleWithId keeps the caller's id (the runtime mints its own)" {
 /// is running anything else.
 fn missProbeNs(wheel: anytype, count: usize) !f64 {
     var best: f64 = std.math.inf(f64);
-    for (0..3) |_| {
+    // Nine windows, not three: each window is a few hundred microseconds, and a
+    // loaded macOS CI runner (2026-10-19: the aged window's best of three was
+    // still over 3x the fresh one while the index was a tombstone-free
+    // `AutoArrayHashMap`) can put a scheduler stall in all of a handful of them.
+    // A healthy index answers at its floor in at least one of nine; the bug this
+    // guards against cost 10-15x *permanently*, so it still fails every window.
+    for (0..9) |_| {
         var hits: usize = 0;
         const t0 = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
         for (0..count) |i| {

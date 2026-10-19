@@ -184,7 +184,7 @@ defer wf_result.deinit();
 fn runAgent(ctx: *http.Context, self: *State) !void {
     const sctx = try ai.SkillContext.fromHttp(ctx);   // 失败即拒绝，不猜
     var result = try self.agent.run(ctx.allocator, goal, &sctx, 8);
-    try ctx.json(200, .{ .answer = result.answer });
+    try ctx.jsonStruct(200, .{ .answer = result.answer });
 }
 ```
 
