@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### 新增：`ai.rag` 检索链路 + `ai.ops` 命名空间别名（**破坏性：否**）
+
+- **`ai.rag`**：`chunkText`（UTF-8 安全、重叠、优先空白断句）、`VectorIndex`
+  （条目标记 tenant，`search` 只返回同租户；未带租户的检索只看到全局条目，
+  fail-closed）、`IndexRetriever`（把应用的 `EmbedFn` 接到
+  `Retriever.retrieveScopedFn`，`Agent` 自动传运行 scope）。此前 RAG 只有接口：
+  切片、索引隔离、scope 传递都要每个消费方自造一遍。
+- **`ai.ops` 命名空间别名**：业务运营模块（alerts/kpi/recon/refund/ticket/sla/
+  risk/diagnose/reporter/notify/approval*/business/actions/admin/bridge/trigger/
+  schedule）可用 `ai.ops.*` 引用以标明归属；原 `ai.alerts` 等路径不变。
+  核心（Agent/skill/provider/workflow/guard/budget/memory/retriever/quota）不依赖它们。
+- 文档：`AI_DEV_GUIDE.md` 新增 RAG 小节，边界小节给出 `ai.ops` 别名。
+
 ### 完善：持久化 token 账本 + MCP `tools/list` 可过滤（**行为变化：默认入口仍不过滤**）
 
 - **`RunAuditStore` 记录 token**：新增 `prompt_tokens` / `completion_tokens` 列

@@ -183,3 +183,42 @@ pub const TokenQuota = @import("quota.zig").TokenQuota;
 pub const estimateTokens = @import("tokenizer.zig").estimateTokens;
 /// Token estimate for a whole chat history (message list).
 pub const estimateMessages = @import("tokenizer.zig").estimateMessages;
+
+/// Business-operations extensions.
+///
+/// These modules know concrete table shapes and bind `data.sqlx` directly
+/// (`alerts` / `kpi` / `recon` / `refund` / `ticket` / `sla` / `risk` /
+/// `diagnose` / `reporter` / `notify` / `approval*` / `business` / `actions` /
+/// `admin` / `bridge` / `trigger` / `schedule`). The core (`Agent`, `skill`,
+/// `provider`, `workflow`, `guard`, `budget`, `memory`, `retriever`, `quota`,
+/// `context`, the supply layer) does **not** depend on any of them.
+///
+/// The aliases are for reading and for new code: existing `ai.alerts` paths
+/// keep working. Treat everything under `ops` as replaceable by your own
+/// domain — do not build infrastructure on it.
+pub const ops = struct {
+    pub const business = @import("business.zig");
+    pub const actions = @import("actions.zig");
+    pub const admin = @import("admin.zig");
+    pub const alerts = @import("alerts.zig");
+    pub const kpi = @import("kpi.zig");
+    pub const recon = @import("recon.zig");
+    pub const refund = @import("refund.zig");
+    pub const ticket = @import("ticket.zig");
+    pub const sla = @import("sla.zig");
+    pub const risk = @import("risk.zig");
+    pub const diagnose = @import("diagnose.zig");
+    pub const reporter = @import("reporter.zig");
+    pub const notify = @import("notify.zig");
+    pub const approval = @import("approval.zig");
+    pub const approval_api = @import("approval_api.zig");
+    pub const approval_store = @import("approval_store.zig");
+    pub const bridge = @import("bridge.zig");
+    pub const trigger = @import("trigger.zig");
+    pub const schedule = @import("schedule.zig");
+};
+
+/// RAG building blocks: UTF-8-safe chunking, an in-memory vector index that
+/// enforces tenant scope, and a `Retriever` over it. Embeddings come from the
+/// application (see `rag.EmbedFn`); the index never invents vectors.
+pub const rag = @import("rag.zig");

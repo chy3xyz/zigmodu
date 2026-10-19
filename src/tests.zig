@@ -281,6 +281,7 @@ test "compile all source files" {
     _ = @import("http/Sse.zig");
     _ = @import("ai/ai.zig");
     _ = @import("ai/http.zig");
+    _ = @import("ai/rag.zig");
     _ = @import("ai/provider.zig");
     _ = @import("ai/key_pool.zig");
     _ = @import("ai/cooldown_store.zig");

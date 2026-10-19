@@ -228,6 +228,20 @@ server，`tools/list` 自动从注册表推导参数 schema，并列出注册表
   `Agent.tool_result_limit_bytes`（默认 32 KiB，超出打 truncation 标记）；自定义
   handler 不要把外部文本拼进 system prompt，需要更多内容就让查询自己收窄
 
+### RAG（检索增强）
+
+`ai.rag` 覆盖链路里最容易漏的三段：
+
+- **`chunkText`**：UTF-8 安全、带重叠、优先在空白处断句。手工 `text[i..i+800]`
+  会把一个汉字切成两半，模型看到的上下文从第一个字节就坏了。
+- **`VectorIndex`**：条目按 tenant 存储，`search` 只返回**同租户**的条目；不带租户的
+  检索只看到未带租户的全局条目，绝不"看到全部"（fail-closed，同审批队列）。
+- **`IndexRetriever`**：把应用提供的 `EmbedFn`（嵌入模型是 provider 专属的 HTTP 调用，
+  框架不代劳）接到 `Retriever.retrieveScopedFn`，`Agent` 自动传本次运行的 scope。
+
+写入侧按 `index.add(.{ .tenant_id = … }, id, text, source, vector)` 存；向量维度
+不一致直接 `error.DimensionMismatch`，不做截断/补零。
+
 ### 核心与扩展的边界
 
 `zigmodu.ai` 里有两类模块，改动时别混：
@@ -235,9 +249,11 @@ server，`tools/list` 自动从注册表推导参数 schema，并列出注册表
 - **核心**（`Agent` / `skill` / `provider` / `workflow` / `guard` / `budget` / `memory` /
   `retriever` / `quota` / `context` / 供给层）：不知道任何业务名词，只依赖
   `SkillContext`。`ai.http` 只是把请求转成上下文的适配器，核心不 import HTTP。
-- **ops 扩展**（`alerts` / `kpi` / `recon` / `refund` / `ticket` / `sla` / `risk` /
-  `diagnose` / `reporter` / `notify` / `approval*` / `business` / `actions`）：直接绑定
-  `data.sqlx` 与具体表结构，按你的业务改写或整体替换；不要把它们当作"AI 基础设施"复用。
+- **ops 扩展**（`ai.ops.*`：`alerts` / `kpi` / `recon` / `refund` / `ticket` /
+  `sla` / `risk` / `diagnose` / `reporter` / `notify` / `approval*` / `business` /
+  `actions` / `admin` / `bridge` / `trigger` / `schedule`）：直接绑定 `data.sqlx` 与
+  具体表结构，按你的业务改写或整体替换；不要把它们当作"AI 基础设施"复用。原有
+  `ai.alerts` 等路径不变，`ai.ops.*` 只是标明归属的别名。
 
 ## 8. 观测与调试
 
