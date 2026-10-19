@@ -30,6 +30,7 @@
 //! Declaring a rule that cannot be enforced is worse than not declaring it.
 
 const std = @import("std");
+const EvalQuota = @import("EvalQuota.zig");
 
 /// One node of the graph, materialised from a module's `info`.
 pub const Node = struct {
@@ -283,10 +284,10 @@ fn CyclePath(comptime max_nodes: usize) type {
 /// DFS with colours (0 = unvisited, 1 = on stack, 2 = done). Returns the cycle
 /// path (`a -> b -> a`) when one exists, `len == 0` otherwise.
 fn findCycle(nodes: []const Node) CyclePath(nodes.len) {
-    // The DFS + name lookups are O(modules² · name_len) comptime branches;
-    // large catalogs (17+ modules with multi-dep graphs) exceed the default
-    // 1000 backwards-branch budget.
-    @setEvalBranchQuota(100_000);
+    // The DFS + name lookups are O(modules² · name_len) comptime branches, so
+    // the budget scales with the graph instead of being a fixed number a
+    // 200-module app outgrows (see `EvalQuota`).
+    @setEvalBranchQuota(EvalQuota.forUnits(nodes.len));
     if (nodes.len == 0) return .{};
 
     var colour: [nodes.len]u8 = @splat(0);

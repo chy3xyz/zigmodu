@@ -1,7 +1,7 @@
 //! Production security bundle: `SecurityModule` wired to `std.Io` wall clock + HTTP middleware helpers.
 
 const std = @import("std");
-const api = @import("../api/Server.zig");
+const types = @import("../http/types.zig");
 const http_middleware = @import("../api/Middleware.zig");
 const SecurityModule = @import("SecurityModule.zig").SecurityModule;
 const AuthMiddleware = @import("AuthMiddleware.zig");
@@ -21,7 +21,7 @@ pub const AppSecurity = struct {
         };
     }
 
-    pub fn jwtMiddleware(self: *AppSecurity) api.Middleware {
+    pub fn jwtMiddleware(self: *AppSecurity) types.Middleware {
         return http_middleware.jwtAuthWithSecurity(&self.module);
     }
 
@@ -33,7 +33,7 @@ pub const AppSecurity = struct {
     /// Permissions stay empty — use `rbacJwtMiddlewareWithPermissions` when
     /// requirePermission() checks are in the chain. Read auth via
     /// `security.auth.getAuth(ctx)` / `ctx.authInfo(Rbac.AuthInfo)`.
-    pub fn rbacJwtMiddleware(self: *AppSecurity, allocator: std.mem.Allocator) !api.Middleware {
+    pub fn rbacJwtMiddleware(self: *AppSecurity, allocator: std.mem.Allocator) !types.Middleware {
         return AuthMiddleware.jwtAuth(&self.module, allocator);
     }
 
@@ -44,7 +44,7 @@ pub const AppSecurity = struct {
         self: *AppSecurity,
         allocator: std.mem.Allocator,
         loader: AuthMiddleware.PermissionLoader,
-    ) !api.Middleware {
+    ) !types.Middleware {
         return AuthMiddleware.jwtAuthWithPermissions(&self.module, allocator, loader);
     }
 

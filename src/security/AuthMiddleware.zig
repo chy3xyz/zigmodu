@@ -1,5 +1,5 @@
 const std = @import("std");
-const api = @import("../api/Server.zig");
+const types = @import("../http/types.zig");
 const SecurityModule = @import("SecurityModule.zig").SecurityModule;
 const Rbac = @import("Rbac.zig");
 
@@ -26,7 +26,7 @@ pub const PermissionLoader = *const fn (allocator: std.mem.Allocator, auth: *Rba
 ///
 /// NOTE: `AuthInfo.permissions` stays empty with this variant, so requirePermission()
 /// will always deny. Use `jwtAuthWithPermissions` when permission checks are needed.
-pub fn jwtAuth(security: *SecurityModule, allocator: std.mem.Allocator) !api.Middleware {
+pub fn jwtAuth(security: *SecurityModule, allocator: std.mem.Allocator) !types.Middleware {
     const Store = struct {
         security: *SecurityModule,
         allocator: std.mem.Allocator,
@@ -39,7 +39,7 @@ pub fn jwtAuth(security: *SecurityModule, allocator: std.mem.Allocator) !api.Mid
 
     return .{
         .func = struct {
-            fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
+            fn mw(ctx: *types.Context, next: types.HandlerFn, user_data: ?*anyopaque) anyerror!void {
                 const st: *const Store = @ptrCast(@alignCast(user_data.?));
                 try runJwtAuth(ctx, next, st.security, st.allocator, null);
             }
@@ -51,7 +51,7 @@ pub fn jwtAuth(security: *SecurityModule, allocator: std.mem.Allocator) !api.Mid
 /// JWT authentication + RBAC permission loading. Same as `jwtAuth`, but invokes
 /// `loader` after token verification to populate `AuthInfo.permissions`, making
 /// requirePermission/requireAnyPermission/requireAllPermissions functional.
-pub fn jwtAuthWithPermissions(security: *SecurityModule, allocator: std.mem.Allocator, loader: PermissionLoader) !api.Middleware {
+pub fn jwtAuthWithPermissions(security: *SecurityModule, allocator: std.mem.Allocator, loader: PermissionLoader) !types.Middleware {
     const Store = struct {
         security: *SecurityModule,
         allocator: std.mem.Allocator,
@@ -62,7 +62,7 @@ pub fn jwtAuthWithPermissions(security: *SecurityModule, allocator: std.mem.Allo
 
     return .{
         .func = struct {
-            fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
+            fn mw(ctx: *types.Context, next: types.HandlerFn, user_data: ?*anyopaque) anyerror!void {
                 const st: *const Store = @ptrCast(@alignCast(user_data.?));
                 try runJwtAuth(ctx, next, st.security, st.allocator, st.loader);
             }
@@ -72,8 +72,8 @@ pub fn jwtAuthWithPermissions(security: *SecurityModule, allocator: std.mem.Allo
 }
 
 fn runJwtAuth(
-    ctx: *api.Context,
-    next: api.HandlerFn,
+    ctx: *types.Context,
+    next: types.HandlerFn,
     security: *SecurityModule,
     allocator: std.mem.Allocator,
     loader: ?PermissionLoader,
@@ -98,7 +98,7 @@ fn runJwtAuth(
     // and the real fault would never surface.
     //
     // The same classification, by the same error names, is what
-    // `api.Middleware.noteVerifyFailure` does for the catalog/backend path
+    // `types.Middleware.noteVerifyFailure` does for the catalog/backend path
     // (private there, so it cannot be shared); this is its counterpart for the
     // legacy middleware. Enumerating the token's errors rather than ours means
     // an error added to `verifyToken` later surfaces as a 5xx — the safe
@@ -197,10 +197,10 @@ fn runJwtAuth(
 
 /// Permission middleware — must run after jwtAuth.
 /// `perm` is captured at comptime (use a string literal).
-pub fn requirePermission(comptime perm: []const u8) api.Middleware {
+pub fn requirePermission(comptime perm: []const u8) types.Middleware {
     return .{
         .func = struct {
-            fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
+            fn mw(ctx: *types.Context, next: types.HandlerFn, _: ?*anyopaque) anyerror!void {
                 const auth = getAuth(ctx) orelse {
                     try ctx.sendErrorResponse(403, 403, "Authentication required before permission check");
                     return;
@@ -217,10 +217,10 @@ pub fn requirePermission(comptime perm: []const u8) api.Middleware {
 }
 
 /// Require any of the given permissions (comptime list of string literals).
-pub fn requireAnyPermission(comptime perms: []const []const u8) api.Middleware {
+pub fn requireAnyPermission(comptime perms: []const []const u8) types.Middleware {
     return .{
         .func = struct {
-            fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
+            fn mw(ctx: *types.Context, next: types.HandlerFn, _: ?*anyopaque) anyerror!void {
                 const auth = getAuth(ctx) orelse {
                     try ctx.sendErrorResponse(403, 403, "Authentication required before permission check");
                     return;
@@ -237,10 +237,10 @@ pub fn requireAnyPermission(comptime perms: []const []const u8) api.Middleware {
 }
 
 /// Require all of the given permissions (comptime list of string literals).
-pub fn requireAllPermissions(comptime perms: []const []const u8) api.Middleware {
+pub fn requireAllPermissions(comptime perms: []const []const u8) types.Middleware {
     return .{
         .func = struct {
-            fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
+            fn mw(ctx: *types.Context, next: types.HandlerFn, _: ?*anyopaque) anyerror!void {
                 const auth = getAuth(ctx) orelse {
                     try ctx.sendErrorResponse(403, 403, "Authentication required before permission check");
                     return;
@@ -258,11 +258,11 @@ pub fn requireAllPermissions(comptime perms: []const []const u8) api.Middleware 
 
 /// Read AuthInfo set by `jwtAuth` / `jwtAuthWithPermissions` / `rbacJwtMiddleware*`.
 /// Only `ctx.auth_info` — never cast `user_data` (may be ComptimeRouter State).
-pub fn getAuth(ctx: *api.Context) ?*Rbac.AuthInfo {
+pub fn getAuth(ctx: *types.Context) ?*Rbac.AuthInfo {
     return ctx.authInfo(Rbac.AuthInfo);
 }
 
-fn testPutBearerAuth(ctx: *api.Context, token: []const u8) !void {
+fn testPutBearerAuth(ctx: *types.Context, token: []const u8) !void {
     const k = try ctx.allocator.dupe(u8, "authorization");
     errdefer ctx.allocator.free(k);
     const v = try ctx.allocator.print("Bearer {s}", .{token});
@@ -276,7 +276,7 @@ test "jwtAuthWithPermissions loads permissions and passes requirePermission" {
     const token = try sec.generateTokenWithTenant("42", &.{"7"}, "1");
     defer allocator.free(token);
 
-    var ctx = try api.Context.init(allocator, .GET, "/tenants");
+    var ctx = try types.Context.init(allocator, .GET, "/tenants");
     defer ctx.deinit();
     try testPutBearerAuth(&ctx, token);
 
@@ -291,7 +291,7 @@ test "jwtAuthWithPermissions loads permissions and passes requirePermission" {
             try auth.permissions.put(try alloc.dupe(u8, "tenant:read"), true);
         }
 
-        fn handler(c: *api.Context) anyerror!void {
+        fn handler(c: *types.Context) anyerror!void {
             const auth = getAuth(c) orelse return error.MissingAuth;
             if (!auth.hasPermission("tenant:read")) return error.PermissionDenied;
             handler_reached = true;
@@ -302,7 +302,7 @@ test "jwtAuthWithPermissions loads permissions and passes requirePermission" {
 
     // Chain: jwtAuthWithPermissions → requirePermission → handler
     const Chain = struct {
-        fn permThenHandler(c: *api.Context) anyerror!void {
+        fn permThenHandler(c: *types.Context) anyerror!void {
             const perm_mw = requirePermission("tenant:read");
             try perm_mw.func(c, S.handler, perm_mw.user_data);
         }
@@ -322,13 +322,13 @@ test "jwtAuth without loader leaves permissions empty (requirePermission denies)
     const token = try sec.generateTokenWithTenant("42", &.{}, "1");
     defer allocator.free(token);
 
-    var ctx = try api.Context.init(allocator, .GET, "/tenants");
+    var ctx = try types.Context.init(allocator, .GET, "/tenants");
     defer ctx.deinit();
     try testPutBearerAuth(&ctx, token);
 
     const S = struct {
         var denied: bool = false;
-        fn checkPerms(c: *api.Context) anyerror!void {
+        fn checkPerms(c: *types.Context) anyerror!void {
             const auth = getAuth(c) orelse return error.MissingAuth;
             denied = !auth.hasPermission("tenant:read");
         }
@@ -348,7 +348,7 @@ test "jwtAuth preserves ComptimeRouter user_data State" {
     const RouteState = struct { n: i32 };
     var state = RouteState{ .n = 99 };
 
-    var ctx = try api.Context.init(allocator, .GET, "/page");
+    var ctx = try types.Context.init(allocator, .GET, "/page");
     defer ctx.deinit();
     ctx.user_data = @ptrCast(&state);
     try testPutBearerAuth(&ctx, token);
@@ -356,7 +356,7 @@ test "jwtAuth preserves ComptimeRouter user_data State" {
     const S = struct {
         var saw_state: i32 = 0;
         var saw_auth: bool = false;
-        fn handler(c: *api.Context) anyerror!void {
+        fn handler(c: *types.Context) anyerror!void {
             const st = c.userData(RouteState) orelse return error.MissingRouteState;
             saw_state = st.n;
             saw_auth = getAuth(c) != null;
@@ -377,7 +377,7 @@ test "jwtAuth answers 5xx, not 401, when verification fails on our side" {
     const token = try sec.generateTokenWithTenant("42", &.{}, "1");
     defer allocator.free(token);
 
-    var ctx = try api.Context.init(allocator, .GET, "/tenants");
+    var ctx = try types.Context.init(allocator, .GET, "/tenants");
     defer ctx.deinit();
     try testPutBearerAuth(&ctx, token);
 
@@ -388,7 +388,7 @@ test "jwtAuth answers 5xx, not 401, when verification fails on our side" {
 
     const S = struct {
         var reached: bool = false;
-        fn handler(_: *api.Context) anyerror!void {
+        fn handler(_: *types.Context) anyerror!void {
             reached = true;
         }
     };
@@ -410,12 +410,12 @@ test "jwtAuth still answers 401 for a token that is genuinely bad" {
 
     const S = struct {
         var reached: bool = false;
-        fn handler(_: *api.Context) anyerror!void {
+        fn handler(_: *types.Context) anyerror!void {
             reached = true;
         }
     };
 
-    var ctx_bad = try api.Context.init(allocator, .GET, "/tenants");
+    var ctx_bad = try types.Context.init(allocator, .GET, "/tenants");
     defer ctx_bad.deinit();
     try testPutBearerAuth(&ctx_bad, foreign);
     const mw = try jwtAuth(&sec, allocator);
@@ -428,7 +428,7 @@ test "jwtAuth still answers 401 for a token that is genuinely bad" {
     const expired = try expiring.generateTokenWithTenant("42", &.{}, "1");
     defer allocator.free(expired);
 
-    var ctx_expired = try api.Context.init(allocator, .GET, "/tenants");
+    var ctx_expired = try types.Context.init(allocator, .GET, "/tenants");
     defer ctx_expired.deinit();
     try testPutBearerAuth(&ctx_expired, expired);
     const mw2 = try jwtAuth(&expiring, allocator);
@@ -449,7 +449,7 @@ test "each jwtAuth keeps its own security module" {
 
     const S = struct {
         var reached: bool = false;
-        fn handler(_: *api.Context) anyerror!void {
+        fn handler(_: *types.Context) anyerror!void {
             reached = true;
         }
     };
@@ -457,7 +457,7 @@ test "each jwtAuth keeps its own security module" {
     // A token signed with A's secret must verify against A's middleware — the
     // two middlewares may not share one `stored_security`, or the last one built
     // would decide for both (cross-instance identity confusion).
-    var ctx_a = try api.Context.init(allocator, .GET, "/tenants");
+    var ctx_a = try types.Context.init(allocator, .GET, "/tenants");
     defer ctx_a.deinit();
     try testPutBearerAuth(&ctx_a, token_a);
     try mw_a.func(&ctx_a, S.handler, mw_a.user_data);
@@ -466,7 +466,7 @@ test "each jwtAuth keeps its own security module" {
 
     // …and B's rejects it.
     S.reached = false;
-    var ctx_b = try api.Context.init(allocator, .GET, "/tenants");
+    var ctx_b = try types.Context.init(allocator, .GET, "/tenants");
     defer ctx_b.deinit();
     try testPutBearerAuth(&ctx_b, token_a);
     try mw_b.func(&ctx_b, S.handler, mw_b.user_data);

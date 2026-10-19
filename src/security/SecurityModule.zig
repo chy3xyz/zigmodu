@@ -1,7 +1,7 @@
 const std = @import("std");
 const crypto = std.crypto;
 const Time = @import("../core/Time.zig");
-const api = @import("../api/Server.zig");
+const types = @import("../http/types.zig");
 const JwksKeyRing = @import("JwksKeyRing.zig").JwksKeyRing;
 const PasswordEncoder = @import("PasswordEncoder.zig").PasswordEncoder;
 
@@ -426,7 +426,7 @@ pub fn authRateLimitMiddleware(
     allocator: std.mem.Allocator,
     max_attempts: u32,
     window_seconds: u32,
-) !api.Middleware {
+) !types.Middleware {
     const limiter = try allocator.create(@import("../resilience/RateLimiter.zig").RateLimiter);
     limiter.* = try @import("../resilience/RateLimiter.zig").RateLimiter.init(
         allocator,
@@ -435,7 +435,7 @@ pub fn authRateLimitMiddleware(
         max_attempts / window_seconds,
     );
     const S = struct {
-        fn handler(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
+        fn handler(ctx: *types.Context, next: types.HandlerFn, user_data: ?*anyopaque) anyerror!void {
             const lim: *@import("../resilience/RateLimiter.zig").RateLimiter = @ptrCast(@alignCast(user_data orelse return error.InternalError));
             if (!lim.tryAcquire()) {
                 ctx.setHeader("Retry-After", "60") catch |err| std.log.err("[RateLimit] setHeader failed: {}", .{err});

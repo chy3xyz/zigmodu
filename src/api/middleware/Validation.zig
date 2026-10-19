@@ -149,7 +149,7 @@ pub const Validation = struct {
 /// the array is only representable in the legacy envelope.
 fn sendStructuredErrors(ctx: anytype, code: i32, violations: FieldValidation.Violations) !void {
     const first = violations.firstMessage();
-    if (api.error_renderer) |render| {
+    if (api.errorRenderer()) |render| {
         return render(ctx, 422, first);
     }
 

@@ -1419,7 +1419,7 @@ shard 锁）被无限期占住。设了超时后写返回 `error.WriteTimeout` �
 而不是排队堆积。
 
 **WebSocket 关停**（读方向，同一形状的另一半）：握手后不发帧、也不挂断的客户端，
-让连接 fiber 停在一个裸 `read` 上（`im/WsFramer.zig` → `core/sockread.zig` 的
+让连接 fiber 停在一个裸 `read` 上（`http/WsFramer.zig` → `core/sockread.zig` 的
 `readSome`）；而 `start()` 退出时要 `conn_group.await` 这些 fiber，`stop()` 只负责
 把 `running` 置 false —— 于是**关停时长由对端决定**。现在 `stop()` 会对登记过的 WS
 连接调 `sockread.wakeBlockedSyscall`（= `shutdown(SHUT_RDWR)`），被 park 的读立刻

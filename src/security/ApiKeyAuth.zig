@@ -35,7 +35,7 @@ pub const ApiKeyConfig = struct {
 ///
 /// Returns `error.SlotPoolExhausted` when the comptime-sized pool is full —
 /// raise `max_key_auth_instances`.
-pub fn apiKeyAuth(config: ApiKeyAuthConfig) error{SlotPoolExhausted}!api.MiddlewareFn {
+pub fn apiKeyAuth(config: ApiKeyAuthConfig) error{SlotPoolExhausted}!types.MiddlewareFn {
     return key_auth_middlewares[try Instances.pool.claim(.{ .static_keys = config })];
 }
 
@@ -53,13 +53,13 @@ pub const ApiKeyAuthConfig = struct {
 ///
 /// Returns `error.SlotPoolExhausted` when the comptime-sized pool is full —
 /// raise `max_key_auth_instances`.
-pub fn apiKeyAuthWithLoader(config: ApiKeyLoaderConfig) error{SlotPoolExhausted}!api.MiddlewareFn {
+pub fn apiKeyAuthWithLoader(config: ApiKeyLoaderConfig) error{SlotPoolExhausted}!types.MiddlewareFn {
     return key_auth_middlewares[try Instances.pool.claim(.{ .loader = config })];
 }
 
 /// Number of independently configured key-auth middlewares one process may build.
 ///
-/// `api.MiddlewareFn` is a bare `*const fn(ctx, next, user_data)` and the call
+/// `types.MiddlewareFn` is a bare `*const fn(ctx, next, user_data)` and the call
 /// shape above (`.func = apiKeyAuth(cfg)`) leaves `user_data` null, so the config
 /// cannot ride along on it — a Zig function pointer carries no context. Each
 /// factory call therefore claims one slot in `Instances` and returns that slot's
@@ -68,7 +68,7 @@ pub fn apiKeyAuthWithLoader(config: ApiKeyLoaderConfig) error{SlotPoolExhausted}
 /// A function-level `var` (the shape this replaced) is process-wide instead: the
 /// second `apiKeyAuth` would retarget the first middleware too, so keys issued
 /// for one instance would open another instance's routes. Returning an
-/// `api.Middleware` (which carries `user_data`, the shape `securityHeaders` uses)
+/// `types.Middleware` (which carries `user_data`, the shape `securityHeaders` uses)
 /// would fix it without a bound, but that is a source-breaking change to a
 /// public signature — the bound is the price of leaving it alone.
 ///
@@ -105,7 +105,7 @@ pub fn instancesClaimed() usize {
 
 fn KeyAuthTrampoline(comptime slot: usize) type {
     return struct {
-        fn handler(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
+        fn handler(ctx: *types.Context, next: types.HandlerFn, user_data: ?*anyopaque) anyerror!void {
             _ = user_data;
 
             const store = Instances.pool.get(slot) orelse {
@@ -139,15 +139,15 @@ fn KeyAuthTrampoline(comptime slot: usize) type {
     };
 }
 
-fn deny(ctx: *api.Context, config: ApiKeyConfig) !void {
+fn deny(ctx: *types.Context, config: ApiKeyConfig) !void {
     try ctx.sendErrorResponse(config.unauthorized_status, config.unauthorized_status, config.unauthorized_message);
 }
 
 /// One distinct function pointer per slot — the identity a bare fn pointer cannot
 /// otherwise carry. Every entry reads a different slot, so they are not
 /// interchangeable and no optimizer may fold them into one.
-const key_auth_middlewares: [max_key_auth_instances]api.MiddlewareFn = blk: {
-    var table: [max_key_auth_instances]api.MiddlewareFn = undefined;
+const key_auth_middlewares: [max_key_auth_instances]types.MiddlewareFn = blk: {
+    var table: [max_key_auth_instances]types.MiddlewareFn = undefined;
     for (0..max_key_auth_instances) |i| table[i] = KeyAuthTrampoline(i).handler;
     break :blk table;
 };
@@ -173,7 +173,7 @@ pub const ApiKeyLoaderConfig = struct {
     /// Recommended change, not made here: widen this to
     /// `*const fn ([]const u8) anyerror!bool` and answer 500 when the loader
     /// returns an error, matching `PermissionLoader` and
-    /// `CatalogPermissionLoader`, which are already fallible. `api.MiddlewareFn`
+    /// `CatalogPermissionLoader`, which are already fallible. `types.MiddlewareFn`
     /// is a bare function pointer, so there is no way to accept both shapes
     /// (an optional second field would be a second way to wire the same thing,
     /// and only one of them could be correct); widening the type breaks every
@@ -183,7 +183,7 @@ pub const ApiKeyLoaderConfig = struct {
 };
 
 /// Extracts the API key from the Context (header first, then query parameter)
-fn extractApiKey(ctx: *api.Context, config: ApiKeyConfig) ?[]const u8 {
+fn extractApiKey(ctx: *types.Context, config: ApiKeyConfig) ?[]const u8 {
     // 1. Read from the request header
     if (ctx.header(config.header_name)) |val| {
         return if (val.len > 0) val else null;
@@ -224,7 +224,7 @@ fn validateKey(key: []const u8, allowed_keys: []const []const u8) bool {
 ///
 /// Zig 0.17's `std.crypto.timing_safe.eql` only accepts arrays/vectors, so the
 /// slice loop is spelled out here — the same shape as the CSRF check in
-/// `api.Middleware` and `security.PasswordEncoder`.
+/// `types.Middleware` and `security.PasswordEncoder`.
 ///
 /// One length is still free: the `!=` below returns immediately, so this leaks
 /// how long the stored key is, not how much of a guess matches. That is
@@ -273,7 +273,7 @@ pub const ApiKeyGenerator = struct {
     }
 };
 
-const api = @import("../api/Server.zig");
+const types = @import("../http/types.zig");
 
 // ─────────────────────────────────────────────────
 // Tests
@@ -402,7 +402,7 @@ test "ApiKeyConfig defaults" {
 }
 
 /// Request header whose key/value are owned by the context (freed by `deinit`).
-fn testPutHeader(ctx: *api.Context, name: []const u8, value: []const u8) !void {
+fn testPutHeader(ctx: *types.Context, name: []const u8, value: []const u8) !void {
     const k = try ctx.allocator.dupe(u8, name);
     errdefer ctx.allocator.free(k);
     const v = try ctx.allocator.dupe(u8, value);
@@ -412,7 +412,7 @@ fn testPutHeader(ctx: *api.Context, name: []const u8, value: []const u8) !void {
 
 const Reached = struct {
     var value: bool = false;
-    fn handler(_: *api.Context) anyerror!void {
+    fn handler(_: *types.Context) anyerror!void {
         value = true;
     }
 };
@@ -428,7 +428,7 @@ test "each apiKeyAuth keeps its own key list" {
     const mw_b = try apiKeyAuth(.{ .keys = &.{"key2"} });
 
     Reached.value = false;
-    var ctx_foreign = try api.Context.init(allocator, .GET, "/thing");
+    var ctx_foreign = try types.Context.init(allocator, .GET, "/thing");
     defer ctx_foreign.deinit();
     try testPutHeader(&ctx_foreign, "X-API-Key", "key2");
     try mw_a(&ctx_foreign, Reached.handler, null);
@@ -437,7 +437,7 @@ test "each apiKeyAuth keeps its own key list" {
 
     // A's own key still passes.
     Reached.value = false;
-    var ctx_own = try api.Context.init(allocator, .GET, "/thing");
+    var ctx_own = try types.Context.init(allocator, .GET, "/thing");
     defer ctx_own.deinit();
     try testPutHeader(&ctx_own, "X-API-Key", "key1");
     try mw_a(&ctx_own, Reached.handler, null);
@@ -446,7 +446,7 @@ test "each apiKeyAuth keeps its own key list" {
 
     // …and B is not loosened by A either.
     Reached.value = false;
-    var ctx_b = try api.Context.init(allocator, .GET, "/thing");
+    var ctx_b = try types.Context.init(allocator, .GET, "/thing");
     defer ctx_b.deinit();
     try testPutHeader(&ctx_b, "X-API-Key", "key1");
     try mw_b(&ctx_b, Reached.handler, null);
@@ -470,7 +470,7 @@ test "each apiKeyAuthWithLoader keeps its own loader" {
     const mw_b = try apiKeyAuthWithLoader(.{ .loader = Loaders.onlyKey2 });
 
     Reached.value = false;
-    var ctx_foreign = try api.Context.init(allocator, .GET, "/thing");
+    var ctx_foreign = try types.Context.init(allocator, .GET, "/thing");
     defer ctx_foreign.deinit();
     try testPutHeader(&ctx_foreign, "X-API-Key", "key2");
     try mw_a(&ctx_foreign, Reached.handler, null);
@@ -478,14 +478,14 @@ test "each apiKeyAuthWithLoader keeps its own loader" {
     try std.testing.expect(!Reached.value);
 
     Reached.value = false;
-    var ctx_own = try api.Context.init(allocator, .GET, "/thing");
+    var ctx_own = try types.Context.init(allocator, .GET, "/thing");
     defer ctx_own.deinit();
     try testPutHeader(&ctx_own, "X-API-Key", "key1");
     try mw_a(&ctx_own, Reached.handler, null);
     try std.testing.expect(Reached.value);
 
     Reached.value = false;
-    var ctx_b = try api.Context.init(allocator, .GET, "/thing");
+    var ctx_b = try types.Context.init(allocator, .GET, "/thing");
     defer ctx_b.deinit();
     try testPutHeader(&ctx_b, "X-API-Key", "key1");
     try mw_b(&ctx_b, Reached.handler, null);

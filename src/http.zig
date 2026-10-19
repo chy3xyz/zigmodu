@@ -14,24 +14,28 @@ const server_mod = @import("api/Server.zig");
 pub const http_server = server_mod;
 /// The HTTP server: routing, middleware chain, listener, graceful shutdown.
 pub const Server = server_mod.Server;
+/// Request/response types live in their own module (see `http/types.zig`):
+/// middleware helpers and `security/` depend on these, not on the server
+/// implementation.
+const types = @import("http/types.zig");
 /// Per-request handle: params, headers, body, response writers, attrs.
-pub const Context = server_mod.Context;
+pub const Context = types.Context;
 /// Legacy route registration with per-group middleware (prefer ComptimeRouter).
 pub const RouteGroup = server_mod.RouteGroup;
 /// One registered route (method, path, handler, middleware).
-pub const Route = server_mod.Route;
+pub const Route = types.Route;
 /// Middleware entry: a function plus optional `user_data` passed to it.
-pub const Middleware = server_mod.Middleware;
+pub const Middleware = types.Middleware;
 /// Handler signature: `fn (*Context) anyerror!void`.
-pub const HandlerFn = server_mod.HandlerFn;
+pub const HandlerFn = types.HandlerFn;
 /// HTTP method enum (GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS).
-pub const Method = server_mod.Method;
+pub const Method = types.Method;
 /// Read-only description of a registered route (for dashboards, OpenAPI).
 pub const RouteInfo = server_mod.RouteInfo;
 /// Typed request identity + typed Context getters (M5/M11).
-pub const Identity = server_mod.Identity;
+pub const Identity = types.Identity;
 /// Response envelope dialect for `ctx.ok/fail/unauth/paginated` (M6).
-pub const EnvelopeDialect = server_mod.EnvelopeDialect;
+pub const EnvelopeDialect = types.EnvelopeDialect;
 
 /// Comptime / generic route table (see `docs/reference/ROUTE_TABLE.md`).
 pub const comptime_router = @import("api/ComptimeRouter.zig");
@@ -54,7 +58,7 @@ pub const WsCloseFn = server_mod.WsCloseFn;
 /// Frame kind handed to `on_message`: text (0x1) or binary (0x2).
 pub const WsFrameKind = server_mod.WsFrameKind;
 /// Frame writer: `writeText`/`writeBinary`, plus `isWritable()` for slow peers.
-pub const WsFramer = @import("im/WsFramer.zig").WsFramer;
+pub const WsFramer = @import("http/WsFramer.zig").WsFramer;
 /// Comptime-typed handler: `fn (ctx, *State)` with a known state type.
 pub const TypedHandler = comptime_router.TypedHandler;
 /// Adapts a typed handler into a plain `HandlerFn` bound to `State`.

@@ -276,6 +276,12 @@ jobs:
         # time. See src/test/TestCollection.zig.
         run: bash scripts/check-test-collection.sh
 
+      - name: Compile-time budget
+        # The enforced budget is `src/test/ComptimeBudget.zig` (256 routes must
+        # expand); this step adds the wall-clock/RSS numbers and fails only on a
+        # catastrophic regression. See docs/reference/COMPTIME.md.
+        run: bash scripts/check-comptime-budget.sh
+
       - name: Build framework examples
         # Keep this list identical to the `Build all examples` step of the
         # `examples` job below — the two drifted once (zent-modulith was built

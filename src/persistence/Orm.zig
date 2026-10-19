@@ -5,6 +5,7 @@
 //! satisfying the Backend trait can be plugged in at compile time.
 
 const std = @import("std");
+const EvalQuota = @import("../core/EvalQuota.zig");
 const sqlx = @import("../sqlx/sqlx.zig");
 const bulk = @import("../sqlx/Bulk.zig");
 const Time = @import("../core/Time.zig");
@@ -389,7 +390,7 @@ fn isNullableField(comptime T: type, comptime fname: []const u8) bool {
 }
 
 fn comptimeInsertArgCount(comptime fields: []const []const u8, comptime auto_ts: bool) usize {
-    @setEvalBranchQuota(100_000);
+    @setEvalBranchQuota(EvalQuota.forUnits(fields.len));
     comptime {
         var n: usize = 0;
         for (fields) |fname| {

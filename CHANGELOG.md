@@ -2,6 +2,69 @@
 
 ## [Unreleased]
 
+### 架构：正交收敛 + 编译期预算/契约三件套（**破坏性：否**）
+
+**正交收敛**（纯搬迁，公开 API 由 re-export 保持）：
+
+- HTTP 请求/响应类型（`Context`/`Middleware`/`HandlerFn`/`Method`/`Route`/
+  `Identity`/`EnvelopeDialect` 及其绑定辅助）→ `http/types.zig`。此前 `http/` 中间件
+  助手与整个 `security/` 层必须 import `api/Server.zig` 才能命名 `Context`——
+  同一层拆两目录互相依赖。`api/Server.zig` 与 `http.zig` 双 re-export，类型同一。
+- WS 分帧（`WsFramer`/`ws_uring`）→ `http/`，`Server` 不再依赖产品模块 `im/`。
+- `Module` 契约 → `core/Module.zig`（`api/Module.zig` 为 shim），消除最后一处
+  `core → api` 反向依赖。
+- 门禁同步：`FUZZ_ROOTS`（fuzz 根随文件迁移）、`ApiFreeze` 废弃表（5 个
+  `Context` 方法的声明位置）。
+
+**编译期预算**：
+
+- `core/EvalQuota.zig`：`base + per_unit × units` 的统一配额；接入
+  `ModuleScanner`（按模块数）、`ModuleGraph.findCycle`（按节点数）、
+  `Orm.comptimeInsertArgCount`（按字段数）。此前是写死的 100k/100k/2k。
+- `src/test/ComptimeBudget.zig`：**256 条路由**的 comptime mount 门禁——配额
+  或折叠复杂度回退时直接编不过；`scripts/check-comptime-budget.sh` 报告墙钟/RSS
+  （当前 40s / 209 MiB）并只对数量级回归（300s / 4 GiB）失败。已接入 release 门
+  与 CI 的 Lint job。
+
+**单一事实源**：
+
+- `ComptimeRouter` 新增 "catalog 与运行时 trie 一致" 测试：挂载后逐条比对
+  （catalog 缺失会让路由对 auth/OpenAPI 不可见，多余则广告一个 404）。
+
+**契约文档**：
+
+- `docs/reference/CONCURRENCY.md`：Worker/Mailbox、`std.Io.Group`、阻塞池、
+  TimerWheel、HotBus、分布式总线、并行 tool_calls 的选型表 + Replay 确定性
+  边界（消息/定时器/调度确定；外部 IO 不确定）+ 取消语义。
+- `docs/reference/COMPTIME.md`：配额规则（最内层获胜）、已接入点、预算证据与
+  回归排查。AGENTS 文档地图同步。
+## [Unreleased]
+
+### 架构：正交收敛（**破坏性：否**，一处公开符号搬迁）
+
+三处纯搬迁，目标是让依赖方向单向、让"HTTP 请求类型"不再住在服务器实现里：
+
+- **`Context` / `Middleware` / `HandlerFn` / `Method` / `Route` / `Identity` /
+  `EnvelopeDialect` → `http/types.zig`**。此前 `http/` 下的中间件助手与整个
+  `security/` 层必须 import `api/Server.zig` 才能命名 `Context`——同一个 HTTP
+  层被拆进两个目录并互相依赖。`api/Server.zig` 与 `http.zig` 都 re-export，
+  `zigmodu.http.Context` 与 `zigmodu.api.Server.Context` 仍是同一个类型。
+  纯中间件助手（AccessLog / HttpMetrics / Sse）与安全中间件实现
+  （AppSecurity / AuthMiddleware / ApiKeyAuth / SecurityModule）改为依赖
+  `http/types.zig`；`permissionMatches` 仍用 `security/Rbac.zig` 的纯表达式求值器
+  （该文件只 import std）。
+- **WS 分帧 → `http/WsFramer.zig` / `http/ws_uring.zig`**。`api/Server.zig` 不再
+  依赖产品模块 `im/`；`im.im` 继续 re-export，产品侧代码无需改动。
+- **`Module` 契约 → `core/Module.zig`**（`api/Module.zig` 变成 re-export shim）。
+  这是最后一处 `core → api` 反向依赖：core 的注册表要命名模块契约，却被迫
+  import API 层。`zigmodu.api.Module` 保持不变。
+- 仍保留的 `http → api` 边只有"服务器侧助手"（StaticFiles / Dashboard /
+  Profiles / Testkit / Http2Server）——它们确实要在 `*Server` 上注册路由，
+  属于合法的纵向依赖，不再是类型倒挂。
+- `Server.error_renderer` 变量随 Context 迁到 `types`，Server 侧改由
+  `Server.errorRenderer()` 读取（`setErrorRenderer` 等 API 不变）。
+## [Unreleased]
+
 ### 新增：Memory 接口 + 并行工具调用（opt-in，**破坏性：否**）
 
 - **`memory.Memory` 窄接口**：`Agent.memory_backend` 可接 Redis/DB 等共享记忆

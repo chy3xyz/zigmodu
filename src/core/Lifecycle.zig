@@ -171,7 +171,7 @@ test "startAll and stopAll order" {
     Ctx.idx = 0;
 
     const Base = struct {
-        pub const info = @import("../api/Module.zig").Module{
+        pub const info = @import("Module.zig").Module{
             .name = "base",
             .description = "Base",
             .dependencies = &.{},
@@ -184,7 +184,7 @@ test "startAll and stopAll order" {
     };
 
     const Middle = struct {
-        pub const info = @import("../api/Module.zig").Module{
+        pub const info = @import("Module.zig").Module{
             .name = "middle",
             .description = "Middle",
             .dependencies = &.{"base"},
@@ -197,7 +197,7 @@ test "startAll and stopAll order" {
     };
 
     const Top = struct {
-        pub const info = @import("../api/Module.zig").Module{
+        pub const info = @import("Module.zig").Module{
             .name = "top",
             .description = "Top",
             .dependencies = &.{"middle"},
@@ -228,7 +228,7 @@ test "stopAll reverse dependency order" {
     Ctx.idx = 0;
 
     const Base = struct {
-        pub const info = @import("../api/Module.zig").Module{
+        pub const info = @import("Module.zig").Module{
             .name = "base-s",
             .description = "B",
             .dependencies = &.{},
@@ -240,7 +240,7 @@ test "stopAll reverse dependency order" {
         }
     };
     const Middle = struct {
-        pub const info = @import("../api/Module.zig").Module{
+        pub const info = @import("Module.zig").Module{
             .name = "middle-s",
             .description = "M",
             .dependencies = &.{"base-s"},
@@ -252,7 +252,7 @@ test "stopAll reverse dependency order" {
         }
     };
     const Top = struct {
-        pub const info = @import("../api/Module.zig").Module{
+        pub const info = @import("Module.zig").Module{
             .name = "top-s",
             .description = "T",
             .dependencies = &.{"middle-s"},
@@ -287,7 +287,7 @@ test "startAllWith passes ModuleContext to initWith modules" {
     };
 
     const Eventful = struct {
-        pub const info = @import("../api/Module.zig").Module{
+        pub const info = @import("Module.zig").Module{
             .name = "eventful",
             .description = "Uses ModuleContext",
             .dependencies = &.{},
@@ -330,7 +330,7 @@ test "startAllWith falls back to init when module declares both hooks" {
     };
 
     const Both = struct {
-        pub const info = @import("../api/Module.zig").Module{
+        pub const info = @import("Module.zig").Module{
             .name = "both-hooks",
             .description = "Declares init and initWith",
             .dependencies = &.{},
@@ -374,7 +374,7 @@ test "initWith-only module fails to start without a context" {
     const allocator = std.testing.allocator;
 
     const OnlyCtx = struct {
-        pub const info = @import("../api/Module.zig").Module{
+        pub const info = @import("Module.zig").Module{
             .name = "only-ctx",
             .description = "initWith only",
             .dependencies = &.{},

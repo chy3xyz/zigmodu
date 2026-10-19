@@ -11,7 +11,8 @@
 | 新模块 / HTTP API | 本文 Critical Rules + `docs/reference/ROUTE_TABLE.md` §1–4、§7 |
 | JWT / 多门户 / RBAC | `docs/reference/ROUTE_TABLE.md` §7.1 + `docs/guide/BEST_PRACTICES.md`「JWT / 多端身份」 |
 | model / Tx / service | `docs/guide/MODULE_LAYERS.md` |
-| Day-1 并发 / 反模式 | `docs/guide/MODULITH.md` |
+| Day-1 并发 / 反模式 | `docs/guide/MODULITH.md` · 并发模型选型与确定性边界：`docs/reference/CONCURRENCY.md` |
+| 编译期预算（quota / 构建成本） | `docs/reference/COMPTIME.md` |
 | 模块间事件 / DI 注入 | `docs/guide/EVENTS_DI.md`（`initWith(ctx)` + `app.eventBus` + freeze） |
 | 多租户列名 | `docs/reference/ARCHITECTURE.md` § Multi-Tenancy |
 | zent ORM（电商/社交主推组合） | `docs/reference/ZENT.md`（勿与 sqlx 混事务；§4.8 场景能力矩阵） |

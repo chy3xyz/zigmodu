@@ -1220,7 +1220,7 @@ always did. You do not have to do anything for either half; a rejected connectio
 gets a close frame and its `on_close` call, the same as any other refusal.
 
 **ws_uring 环境边界（A-7 定界）。** 本节是 `setWsUring` 背后那条 io_uring 路径
-（`src/im/ws_uring.zig`）的权威验证边界：哪里测过、哪里没测过、为什么、什么情况下
+（`src/http/ws_uring.zig`）的权威验证边界：哪里测过、哪里没测过、为什么、什么情况下
 结论会改变。
 
 *非 Linux 的实际行为（以代码为准）*：不是运行时回落，也不是 `error.Unsupported` ——

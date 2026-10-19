@@ -38,7 +38,7 @@
 ## 1. 真实发现
 
 ### 1.1 高 —— `WsFramer.handshake` 把未校验长度的 `Sec-WebSocket-Key` memcpy 进 128 字节栈缓冲
-`src/im/WsFramer.zig:49-52`（调用点 `src/api/Server.zig:2766-2771`）
+`src/http/WsFramer.zig:49-52`（调用点 `src/api/Server.zig:2766-2771`）
 
 证据：
 ```zig
@@ -124,7 +124,7 @@ pub fn cleanup(self: *ImGateway) usize { return self.registry.tickAndCleanup(3);
 所以池被抽干这件事测不出来。
 
 ### 1.5 中 —— 未掩码的客户端帧被接受（RFC 6455 §5.1 要求服务端必须断开）
-`src/im/WsFramer.zig:87, 100-112`；`src/im/ws_uring.zig:198, 213-233`
+`src/http/WsFramer.zig:87, 100-112`；`src/http/ws_uring.zig:198, 213-233`
 ```zig
 const masked = (header[1] & 0x80) != 0;   // 读到了
 ...
@@ -139,7 +139,7 @@ if (masked) { for (buf[0..payload_len], 0..) |*b, i| b.* ^= mask_key[i % 4]; }  
 实际危害是"服务端接受了一段本应被判非法的字节流"：跨协议/中间设备缓存混淆类问题所需要的那个缺口。
 
 ### 1.6 中 —— FIN / 分片 / 控制帧约束 / RSV / UTF-8 / 关闭码：全部不校验
-`src/im/WsFramer.zig:86, 105, 114`；`src/im/ws_uring.zig:197, 236-253`；`src/api/Server.zig:2807-2819`
+`src/http/WsFramer.zig:86, 105, 114`；`src/http/ws_uring.zig:197, 236-253`；`src/api/Server.zig:2807-2819`
 
 - FIN 位从不读：`const opcode = header[0] & 0x0F;`（`WsFramer.zig:86`）丢掉了 `0x80`；`0x70`（RSV1-3）同样不看。
   → 一条 FIN=0 的起始帧 payload 被当作**完整消息**交给 `on_message`（`Server.zig:2811`）。
@@ -154,7 +154,7 @@ if (masked) { for (buf[0..payload_len], 0..) |*b, i| b.* ^= mask_key[i % 4]; }  
 要利用它：任何能完成升级的客户端。这些单独看多为协议违规；1.6 的分片语义是最有实际后果的一条（静默截断）。
 
 ### 1.7 高（潜在，当前不可达）—— `ws_uring` 的 64-bit 长度无上界，`frame_total` 可整数溢出
-`src/im/ws_uring.zig:208, 218, 275-278`
+`src/http/ws_uring.zig:208, 218, 275-278`
 ```zig
 payload_len = @intCast(std.mem.readInt(u64, buf[2..10], .big));  // :208  64 位平台上 @intCast 是恒等
 ...
@@ -208,7 +208,7 @@ const frame_total = header_len + mask_offset + payload_len;       // :218  10 + 
 ## 4. 我读了什么 / 我没读什么
 
 **读了**：
-- `src/im/WsFramer.zig`（全文 211 行，帧解析 + 握手 + 写帧）、`src/im/ws_uring.zig`（全文 296 行，io_uring 解析器）、
+- `src/http/WsFramer.zig`（全文 211 行，帧解析 + 握手 + 写帧）、`src/http/ws_uring.zig`（全文 296 行，io_uring 解析器）、
   `src/im/ConnectionRegistry.zig`（全文 441 行，含全部测试）、`src/im/BufferPool.zig`（全文）、`src/core/sockread.zig:1-80`。
 - `src/api/Server.zig`：WS 升级块与读循环 `:2745-2820`、`WsRoute`/配置字段 `:187-225, 2098-2123`、`HeaderLimits` `:1405-1450`、
   WS 测试 `:4080-4159`。

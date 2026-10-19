@@ -245,7 +245,7 @@ FUZZ_ROOTS=(
   src/http/Http2.zig
   src/http/HttpClient.zig
   src/http/Multipart.zig
-  src/im/ws_uring.zig
+  src/http/ws_uring.zig
   src/scheduler/Cron.zig
   src/security/SecurityModule.zig
   src/util/csv.zig

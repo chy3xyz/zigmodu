@@ -184,10 +184,10 @@ pub const AccessLogger = struct {
 };
 
 /// Access-log middleware: records method/path/status and elapsed time per request.
-pub fn accessLogMiddleware(logger: *AccessLogger) api.MiddlewareFn {
+pub fn accessLogMiddleware(logger: *AccessLogger) types.MiddlewareFn {
     _ = logger;
     const S = struct {
-        fn handler(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
+        fn handler(ctx: *types.Context, next: types.HandlerFn, user_data: ?*anyopaque) anyerror!void {
             const log: *AccessLogger = @ptrCast(@alignCast(user_data orelse return error.InternalError));
 
             const start = Time.monotonicNowSeconds();
@@ -232,7 +232,7 @@ pub fn accessLogMiddleware(logger: *AccessLogger) api.MiddlewareFn {
     return S.handler;
 }
 
-const api = @import("../api/Server.zig");
+const types = @import("types.zig");
 
 // ─────────────────────────────────────────────────
 // Tests

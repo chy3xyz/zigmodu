@@ -391,7 +391,7 @@ test "SseWriter sendMultiLine format" {
 }
 
 test "lastEventId reads lowercase header" {
-    const Context = @import("../api/Server.zig").Context;
+    const Context = @import("types.zig").Context;
     const allocator = std.testing.allocator;
     var ctx = try Context.init(allocator, .GET, "events");
     defer ctx.deinit();
@@ -575,7 +575,7 @@ test "a HEAD request to an SSE handler writes no event bytes" {
 }
 
 test "markSseResponse sets streaming so Server skips buffered rewrite" {
-    const Context = @import("../api/Server.zig").Context;
+    const Context = @import("types.zig").Context;
     const allocator = std.testing.allocator;
     var ctx = try Context.init(allocator, .GET, "events");
     defer ctx.deinit();

@@ -2,10 +2,11 @@ const std = @import("std");
 const ApplicationModules = @import("./Module.zig").ApplicationModules;
 const ModuleInfo = @import("./Module.zig").ModuleInfo;
 const ModuleContext = @import("ModuleContext.zig").ModuleContext;
+const EvalQuota = @import("EvalQuota.zig");
 
 /// Compile-time module scanner that extracts module metadata and performs topological sort
 pub fn scanModules(allocator: std.mem.Allocator, comptime modules: anytype) !ApplicationModules {
-    @setEvalBranchQuota(100000);
+    @setEvalBranchQuota(EvalQuota.forUnits(modules.len));
     var app_modules = ApplicationModules.init(allocator);
 
     // 1. Register all modules first (runtime registration for backward compat)
@@ -101,7 +102,7 @@ test "scanModules extracts metadata" {
     const allocator = std.testing.allocator;
 
     const MockModule = struct {
-        pub const info = @import("../api/Module.zig").Module{
+        pub const info = @import("Module.zig").Module{
             .name = "mock",
             .description = "Mock module for testing",
             .dependencies = &.{},
@@ -125,7 +126,7 @@ test "scanModules optional init/deinit" {
     const allocator = std.testing.allocator;
 
     const NoLifecycle = struct {
-        pub const info = @import("../api/Module.zig").Module{
+        pub const info = @import("Module.zig").Module{
             .name = "nolife",
             .description = "No lifecycle",
             .dependencies = &.{},
@@ -144,7 +145,7 @@ test "scanModules preserves runtime options" {
     const allocator = std.testing.allocator;
 
     const MockModule = struct {
-        pub const info = @import("../api/Module.zig").Module{
+        pub const info = @import("Module.zig").Module{
             .name = "runtime-mock",
             .description = "Runtime mock",
             .dependencies = &.{},

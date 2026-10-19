@@ -42,7 +42,7 @@ SELECT ... FROM users WHERE username = ?1 LIMIT 1
 
 **附带发现（std.Io 使用约束，2026-08-01 实测定性）**：**当同一个 Threaded io 被多个线程共享时，io 的 socket 读会永久阻塞——即使 `poll` 已返回可读、`MSG_PEEK` 也确认数据在内核缓冲**（macOS 实测：客户端裸读立刻返回 129 字节，io reader 的 `readv` 在同一 fd 上挂死）。影响面：
 
-- **fiber 模式 WebSocket 读**：`connFiber` 运行在 io worker 线程，`WsFramer.readFrame` 走 `io.operate(net_read)` → 读挂起 → `on_message` / ping/close 无响应、`on_close` 不触发；写路径（握手/welcome）正常。**已修复**：WS 两处读循环改为 `posix.poll + posix.read`（`im/WsFramer.zig`、`extensions/WebSocket.zig`），并新增端到端回归测试。
+- **fiber 模式 WebSocket 读**：`connFiber` 运行在 io worker 线程，`WsFramer.readFrame` 走 `io.operate(net_read)` → 读挂起 → `on_message` / ping/close 无响应、`on_close` 不触发；写路径（握手/welcome）正常。**已修复**：WS 两处读循环改为 `posix.poll + posix.read`（`http/WsFramer.zig`、`extensions/WebSocket.zig`），并新增端到端回归测试。
 - **全量审计（2026-08-01）**：同一风险（「写请求 → 阻塞等响应」的 io 读，多线程共享 io 下可能挂死）已统一收敛到新工具 `core/sockread.zig`（`readSome`/`readFull` = `posix.poll + posix.read`），覆盖：Redis 响应（16 处）、NATS（4 处）、Kafka `readExact`、`DistributedEventBus` 连接循环、`ClusterConnection.recv`（顺带修复 4 字节头可能半包的问题）、HttpClient `readResponse`/流式 body。**仍走 io 读但实测正常**（数据在 accept 时已就绪、非长阻塞）：HTTP 请求行读取（`Server.zig` `StreamReader`）、WebMonitor/WebSocket 升级请求读取、Http2Server 帧读取（复杂缓冲，留待验证）。
 - 同一线程内独占使用 io 时读写均正常（HttpClient 主线程对 python 服务 OK）；跨线程用裸 `posix.read` 也正常。
 - 结论：这是 zigmodu 0.14.17 所用 `std.Io`（Threaded）在多线程共享下的环境/实现限制，非迁移引入；**socket 读建议绕开 io、用裸 posix poll+read**（服务端 WS、HttpClient 超时均已采用该模式）。

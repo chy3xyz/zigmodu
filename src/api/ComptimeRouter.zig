@@ -1692,3 +1692,54 @@ test "catalog exportOpenApi: un-annotated output is byte-identical to the pre-an
 
     try std.testing.expectEqualStrings(unannotated_openapi_golden, json);
 }
+
+test "catalog and runtime trie agree for a mounted module set" {
+    const allocator = std.testing.allocator;
+    const AppState = struct {};
+    var app: AppState = .{};
+    var hits: u32 = 0;
+    var st_a = TestMod.State{ .hits = &hits };
+    var st_b: TestModB.State = .{};
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 18101 });
+    defer server.deinit();
+    var router = Router(AppState).init(std.testing.io, allocator, &server, &app);
+    defer router.deinit();
+    var admin = router.scope("/admin-api");
+    try admin.mountAll(.{
+        .{ .Mod = TestMod, .state = &st_a },
+        .{ .Mod = TestModB, .state = &st_b },
+    });
+    var catalog = try router.finish();
+    defer catalog.deinit();
+
+    // Both sides are derived from the same comptime specs; this walks them and
+    // fails if one derivation drifts (a route registered in the trie but
+    // missing from the catalog would be invisible to auth/OpenAPI audiences,
+    // and the reverse would advertise a route that answers 404).
+    const trie = try server.listRoutes(allocator);
+    defer {
+        for (trie) |r| {
+            allocator.free(r.method);
+            allocator.free(r.path);
+        }
+        allocator.free(trie);
+    }
+
+    var matched: usize = 0;
+    for (catalog.entries) |entry| {
+        if (entry.is_ws or entry.is_sse) continue;
+        var found = false;
+        for (trie) |r| {
+            if (!std.mem.eql(u8, r.method, @tagName(entry.method))) continue;
+            const trie_path = std.mem.trimStart(u8, r.path, "/");
+            if (std.mem.eql(u8, trie_path, entry.path)) {
+                found = true;
+                break;
+            }
+        }
+        try std.testing.expect(found);
+        matched += 1;
+    }
+    try std.testing.expect(matched > 0);
+}

@@ -2,7 +2,7 @@
 //! Holds the bulkhead, rate limiter, circuit breaker, and optional worker pool for one module.
 
 const std = @import("std");
-const api = @import("../api/Module.zig");
+const api = @import("Module.zig");
 const Bulkhead = @import("../resilience/Bulkhead.zig").Bulkhead;
 const RateLimiter = @import("../resilience/RateLimiter.zig").RateLimiter;
 const CircuitBreaker = @import("../resilience/CircuitBreaker.zig").CircuitBreaker;

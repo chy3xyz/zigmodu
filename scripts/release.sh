@@ -243,6 +243,7 @@ bash scripts/check-doc-paths.sh
 bash scripts/check-tenant-scope.sh
 bash scripts/check-pool-guard.sh
 bash scripts/check-test-collection.sh
+bash scripts/check-comptime-budget.sh
 zig build check-api
 zig build check
 

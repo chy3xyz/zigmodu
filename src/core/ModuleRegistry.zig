@@ -5,7 +5,7 @@ const std = @import("std");
 const ApplicationModules = @import("Module.zig").ApplicationModules;
 const ModuleInfo = @import("Module.zig").ModuleInfo;
 const ModuleRuntime = @import("ModuleRuntime.zig").ModuleRuntime;
-const api = @import("../api/Module.zig");
+const api = @import("Module.zig");
 
 pub const ModuleRegistry = struct {
     const Self = @This();

@@ -6,10 +6,10 @@ const SpinLock = @import("../core/SpinLock.zig").SpinLock;
 /// Usage:
 ///   var collector = HttpMetricsCollector.init();
 ///   server.addMiddleware(.{ .func = httpMetricsMiddleware(&collector) });
-pub fn httpMetricsMiddleware(collector: *HttpMetricsCollector) api.MiddlewareFn {
+pub fn httpMetricsMiddleware(collector: *HttpMetricsCollector) types.MiddlewareFn {
     _ = collector;
     const S = struct {
-        fn handler(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
+        fn handler(ctx: *types.Context, next: types.HandlerFn, user_data: ?*anyopaque) anyerror!void {
             const c: *HttpMetricsCollector = @ptrCast(@alignCast(user_data orelse return error.InternalError));
             const start = @import("../core/Time.zig").monotonicNowSeconds();
 
@@ -179,7 +179,7 @@ pub const HttpMetricsCollector = struct {
     }
 };
 
-const api = @import("../api/Server.zig");
+const types = @import("types.zig");
 
 // ─────────────────────────────────────────────────
 // Tests
