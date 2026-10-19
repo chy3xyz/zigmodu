@@ -28,6 +28,13 @@ pub const Tool = struct {
     /// before dispatch. **Default `execute`** (the most restricted): a tool that
     /// forgot to declare itself can never be granted by a read-only policy.
     action: guard_mod.Action = .execute,
+    /// Whether the handler may run **concurrently with other parallel_safe
+    /// tools** of the same step (`Agent.parallel_tool_calls`). Default false:
+    /// a handler that captures process state, writes through a single
+    /// connection, or touches `ctx.userdata` mutably is not safe, and the
+    /// agent batches all-or-nothing — one unsafe tool keeps the step
+    /// sequential.
+    parallel_safe: bool = false,
     /// Handler: receives context + JSON value of arguments, returns JSON result.
     handler: *const fn (ctx: *SkillContext, args: std.json.Value) anyerror!std.json.Value,
 };
@@ -307,6 +314,7 @@ pub const SkillRegistry = struct {
             .timeout_ms = tool.timeout_ms,
             .required_permission = tool.required_permission,
             .action = tool.action,
+            .parallel_safe = tool.parallel_safe,
             .handler = tool.handler,
         };
     }

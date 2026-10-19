@@ -219,7 +219,11 @@ pub const Spec = struct {
     /// tool that passes the allowlist. Prefer setting it; check `isGuarded`.
     guard: ?*guard_mod.Guard = null,
     /// Long-term memory recalled into the system message (tenant+user scoped).
+    /// `memory_backend` takes precedence when set.
     memory: ?*memory_mod.MemoryStore = null,
+    /// Pluggable memory backend (Redis/DB, or `MemoryStore.toMemory()`); when
+    /// set it is consulted instead of `memory`.
+    memory_backend: ?memory_mod.Memory = null,
     memory_prefix: []const u8 = "",
     memory_limit: usize = 8,
     budget: ?*Budget = null,
@@ -228,6 +232,8 @@ pub const Spec = struct {
     tool_timeout_ms: ?u64 = null,
     /// Cap on one tool result's serialized bytes (untrusted envelope included).
     tool_result_limit_bytes: usize = default_tool_result_limit_bytes,
+    /// See `Agent.io`: required for `parallel_safe` batches to run concurrently.
+    io: ?std.Io = null,
     retriever: ?Retriever = null,
     context: ?*ContextManager = null,
     audit: ?*AgentAuditLog = null,
@@ -241,12 +247,14 @@ pub const Spec = struct {
             .system_prompt = self.system_prompt,
             .guard = self.guard,
             .memory = self.memory,
+            .memory_backend = self.memory_backend,
             .memory_prefix = self.memory_prefix,
             .memory_limit = self.memory_limit,
             .budget = self.budget,
             .allowlist = self.allowlist,
             .tool_timeout_ms = self.tool_timeout_ms,
             .tool_result_limit_bytes = self.tool_result_limit_bytes,
+            .io = self.io,
             .retriever = self.retriever,
             .context = self.context,
             .audit = self.audit,
@@ -299,6 +307,8 @@ pub const Agent = struct {
     /// nothing is injected at all (`memory.recallBlockAlloc` — 0 means "any" to
     /// `recall`, which would cross tenants).
     memory: ?*memory_mod.MemoryStore = null,
+    /// Pluggable backend (see `Spec.memory_backend`); takes precedence.
+    memory_backend: ?memory_mod.Memory = null,
     /// Only recall logical keys with this prefix (e.g. `"user:"`). Empty = all.
     memory_prefix: []const u8 = "",
     /// Cap on facts injected per run.
@@ -309,6 +319,10 @@ pub const Agent = struct {
     /// Cap on one tool result's serialized bytes; the model sees a truncation
     /// marker past it (see `default_tool_result_limit_bytes`).
     tool_result_limit_bytes: usize = default_tool_result_limit_bytes,
+    /// Scheduler handle for concurrent tool calls. `null` = always sequential;
+    /// even with it set, a step runs in parallel only when every call's tool
+    /// declares `parallel_safe` (all-or-nothing, so behaviour is predictable).
+    io: ?std.Io = null,
     hooks: AgentHooks = .{},
     metrics: AgentMetrics = .{},
     audit: ?*AgentAuditLog = null,
@@ -387,27 +401,14 @@ pub const Agent = struct {
         // long-term facts about this identity ride along with the retrieved
         // documents. It never widens the scope: without a non-zero tenant and
         // user on the run, nothing is injected (see `memory.recallBlockAlloc`).
-        if (self.memory) |mem| {
-            const block: ?[]u8 = memory_mod.MemoryStore.recallBlockAlloc(
-                mem,
+        if (try self.memoryBlock(allocator, skill_ctx)) |b| {
+            _ = try appendTakenString(allocator, &owned_strs, b);
+            const merged = try appendTakenString(
                 allocator,
-                skill_ctx.tenant_id,
-                skill_ctx.user_id,
-                self.memory_prefix,
-                self.memory_limit,
-            ) catch |err| blk: {
-                std.log.warn("[Agent:{s}] memory recall failed: {}", .{ self.name, err });
-                break :blk null;
-            };
-            if (block) |b| {
-                _ = try appendTakenString(allocator, &owned_strs, b);
-                const merged = try appendTakenString(
-                    allocator,
-                    &owned_strs,
-                    try allocator.print("{s}\n\n{s}", .{ system_content, b }),
-                );
-                system_content = merged;
-            }
+                &owned_strs,
+                try allocator.print("{s}\n\n{s}", .{ system_content, b }),
+            );
+            system_content = merged;
         }
 
         try messages.append(allocator, .{ .role = "system", .content = system_content });
@@ -534,7 +535,9 @@ pub const Agent = struct {
                 .tool_calls = tc_copy,
             });
 
-            for (tc_copy) |tc| {
+            if (self.parallelEligible(tc_copy)) {
+                try self.runToolCallsParallel(allocator, skill_ctx, tc_copy, &messages, &owned_strs);
+            } else for (tc_copy) |tc| {
                 _ = self.metrics.tool_calls.fetchAdd(1, .monotonic);
 
                 // Authority first: the guard decides what this agent may do at
@@ -608,7 +611,16 @@ pub const Agent = struct {
                     break :blk parsed.value;
                 };
 
-                const result = self.registry.dispatchWith(tc.name, skill_ctx, args_val, .{
+                // Per-call arena + context copy: the handler's result lives in
+                // an arena this call owns (the request arena the run was handed
+                // is not thread-safe, and `dispatchWith` writes `deadline_ms`
+                // into the context it is given). The serialized text is copied
+                // into the run's list before the arena is released.
+                var call_arena = std.heap.ArenaAllocator.init(allocator);
+                defer call_arena.deinit();
+                var call_ctx = skill_ctx.*;
+                call_ctx.allocator = call_arena.allocator();
+                const result = self.registry.dispatchWith(tc.name, &call_ctx, args_val, .{
                     .allowlist = self.allowlist,
                     .timeout_ms = self.tool_timeout_ms,
                 }) catch |err| {
@@ -635,12 +647,10 @@ pub const Agent = struct {
                 if (self.audit) |log| {
                     log.record(.tool_ok, tc.name, "", skill_ctx.tenant_id orelse audit_mod.unscoped_identity, skill_ctx.user_id orelse audit_mod.unscoped_identity);
                 }
-                // The handler built this value with `ctx.allocator`, which is
-                // not necessarily the allocator this run was handed
-                // (`Workflow.runStep` passes the workflow's own allocator to
-                // `Agent.run` while the handler follows `SkillContext`) — freeing
-                // it with the wrong one is an invalid free.
-                defer skill_mod.freeValue(skill_ctx.allocator, result);
+                // `result` (and everything under it) is owned by `call_arena`;
+                // only the serialized copy is kept. No per-value free — the
+                // arena releases the whole tree, which is also why the old
+                // "freed with the wrong allocator" hazard cannot recur here.
                 const result_s = try appendTakenString(allocator, &owned_strs, try formatToolResult(allocator, self.tool_result_limit_bytes, result));
                 const tid = try appendOwnedString(allocator, &owned_strs, tc.id);
                 try messages.append(allocator, .{
@@ -659,6 +669,154 @@ pub const Agent = struct {
         try self.recordRunAudit(allocator, skill_ctx, steps, started_ms, "max_steps", null, prompt_tokens_total, completion_tokens_total);
         const timeout_msg = try allocator.dupe(u8, "Agent stopped: max_steps exceeded");
         return .{ .answer = timeout_msg, .steps = steps, .owned_answer = true, .budget_exhausted = budget_stopped, .canceled = canceled_stopped };
+    }
+
+    /// All-or-nothing: a step runs concurrently only when every call targets a
+    /// tool that declares `parallel_safe` (and the agent has an io). One unsafe
+    /// tool keeps the whole step sequential — predictable, and it avoids
+    /// interleaving two calls that share `userdata` or a single DB connection.
+    fn parallelEligible(self: *Agent, calls: []const AiProvider.ToolCall) bool {
+        if (self.io == null or calls.len < 2) return false;
+        for (calls) |tc| {
+            const tool = self.registry.get(tc.name) orelse return false;
+            if (!tool.parallel_safe) return false;
+        }
+        return true;
+    }
+
+    /// Run one step's `parallel_safe` calls concurrently.
+    ///
+    /// Authority (guard) and per-run approval are decided **sequentially,
+    /// before** anything is spawned: the guard's counters are plain integers
+    /// and the hook is caller code that was never promised concurrency. Results
+    /// are appended to the message list in call order after the join, so the
+    /// transcript stays exactly what the sequential path produces.
+    fn runToolCallsParallel(
+        self: *Agent,
+        allocator: std.mem.Allocator,
+        skill_ctx: *SkillContext,
+        calls: []const AiProvider.ToolCall,
+        messages: *std.ArrayList(AiProvider.ChatMsg),
+        owned_strs: *std.ArrayList([]const u8),
+    ) !void {
+        const io = self.io.?;
+        const State = struct {
+            call: ?*ParallelCall = null,
+            /// Set when the call was refused before dispatch: `guard` carries
+            /// the decision tag, `hook` is the per-run approval saying no.
+            denial: ?union(enum) { guard: []const u8, hook } = null,
+        };
+        const states = try allocator.alloc(State, calls.len);
+        defer {
+            for (states) |st| {
+                const call = st.call orelse continue;
+                call.arena.deinit();
+                allocator.destroy(call);
+            }
+            allocator.free(states);
+        }
+        for (states) |*st| st.* = .{};
+
+        var group = std.Io.Group.init;
+        for (calls, 0..) |tc, i| {
+            _ = self.metrics.tool_calls.fetchAdd(1, .monotonic);
+
+            if (self.guard) |g| {
+                if (self.registry.get(tc.name)) |tool| {
+                    const decision = g.check(tool.action, tc.name, 0);
+                    if (decision != .allowed) {
+                        states[i].denial = .{ .guard = @tagName(decision) };
+                        continue;
+                    }
+                }
+            }
+            if (self.hooks.on_tool_request) |cb| {
+                if (cb(self.hooks.ctx, tc.name, tc.arguments) == .deny) {
+                    states[i].denial = .{ .hook = {} };
+                    continue;
+                }
+            }
+
+            const call = try allocator.create(ParallelCall);
+            call.* = .{
+                .registry = self.registry,
+                .allowlist = self.allowlist,
+                .timeout_ms = self.tool_timeout_ms,
+                .tc = tc,
+                .args = undefined,
+                .ctx = skill_ctx.*,
+                .arena = std.heap.ArenaAllocator.init(allocator),
+            };
+            call.ctx.allocator = call.arena.allocator();
+            call.args = parseArgsIn(call.arena.allocator(), tc.arguments);
+            states[i].call = call;
+            group.async(io, parallelTask, .{call});
+        }
+        try group.await(io);
+
+        for (calls, 0..) |tc, i| {
+            if (states[i].denial) |d| {
+                _ = self.metrics.tool_denied.fetchAdd(1, .monotonic);
+                if (self.hooks.on_tool) |cb| cb(self.hooks.ctx, tc.name, false);
+                if (self.audit) |log| {
+                    log.record(.tool_denied, tc.name, switch (d) {
+                        .guard => |tag| tag,
+                        .hook => "denied",
+                    }, skill_ctx.tenant_id orelse audit_mod.unscoped_identity, skill_ctx.user_id orelse audit_mod.unscoped_identity);
+                }
+                const content = switch (d) {
+                    .guard => |tag| try appendTakenString(allocator, owned_strs, try allocator.print("{{\"error\":\"ToolDenied\",\"reason\":\"{s}\"}}", .{tag})),
+                    .hook => try appendOwnedString(allocator, owned_strs, "{\"error\":\"ToolDenied\"}"),
+                };
+                const tid = try appendOwnedString(allocator, owned_strs, tc.id);
+                try messages.append(allocator, .{ .role = "tool", .tool_call_id = tid, .content = content });
+                continue;
+            }
+
+            const call = states[i].call.?;
+            if (call.err) |err| {
+                _ = self.metrics.tool_errors.fetchAdd(1, .monotonic);
+                if (self.hooks.on_tool) |cb| cb(self.hooks.ctx, tc.name, false);
+                if (self.audit) |log| {
+                    log.record(.tool_err, tc.name, @errorName(err), skill_ctx.tenant_id orelse audit_mod.unscoped_identity, skill_ctx.user_id orelse audit_mod.unscoped_identity);
+                }
+                const content = try appendTakenString(allocator, owned_strs, try allocator.print("{{\"error\":\"{s}\"}}", .{@errorName(err)}));
+                const tid = try appendOwnedString(allocator, owned_strs, tc.id);
+                try messages.append(allocator, .{ .role = "tool", .tool_call_id = tid, .content = content });
+                continue;
+            }
+
+            if (self.hooks.on_tool) |cb| cb(self.hooks.ctx, tc.name, true);
+            if (self.audit) |log| {
+                log.record(.tool_ok, tc.name, "", skill_ctx.tenant_id orelse audit_mod.unscoped_identity, skill_ctx.user_id orelse audit_mod.unscoped_identity);
+            }
+            const content = try appendTakenString(allocator, owned_strs, try formatToolResult(allocator, self.tool_result_limit_bytes, call.result.?));
+            const tid = try appendOwnedString(allocator, owned_strs, tc.id);
+            try messages.append(allocator, .{ .role = "tool", .tool_call_id = tid, .content = content });
+        }
+    }
+
+    /// Recall the facts block for this run, from the pluggable backend when
+    /// one is configured and from the built-in store otherwise. Returns an
+    /// owned string (freed by the caller's arena/list) or null when nothing is
+    /// recalled; a backend error is logged and treated as "no facts" — memory
+    /// is context, not a gate.
+    fn memoryBlock(self: *Agent, allocator: std.mem.Allocator, skill_ctx: *SkillContext) !?[]u8 {
+        const backend: ?memory_mod.Memory = self.memory_backend orelse blk: {
+            const store = self.memory orelse break :blk null;
+            break :blk store.toMemory();
+        };
+        const mem = backend orelse return null;
+        return mem.recallBlockAlloc(
+            allocator,
+            skill_ctx.tenant_id,
+            skill_ctx.user_id,
+            self.memory_prefix,
+            self.memory_limit,
+        ) catch |err| blk: {
+            std.log.warn("[Agent:{s}] memory recall failed: {}", .{ self.name, err });
+            break :blk null;
+        };
     }
 
     fn recordRunAudit(
@@ -690,6 +848,43 @@ pub const Agent = struct {
         });
     }
 };
+
+/// One call of a parallel batch. Everything the task touches lives here: the
+/// registry is read-only during dispatch, the context is a per-call copy (a
+/// concurrent `dispatchWith` writes `deadline_ms`), and the arena owns the
+/// handler's result until the batch is joined.
+const ParallelCall = struct {
+    registry: *SkillRegistry,
+    allowlist: ?[]const []const u8,
+    timeout_ms: ?u64,
+    tc: AiProvider.ToolCall,
+    args: std.json.Value,
+    ctx: SkillContext,
+    arena: std.heap.ArenaAllocator,
+    result: ?std.json.Value = null,
+    err: ?anyerror = null,
+};
+
+fn parallelTask(st: *ParallelCall) void {
+    st.result = st.registry.dispatchWith(st.tc.name, &st.ctx, st.args, .{
+        .allowlist = st.allowlist,
+        .timeout_ms = st.timeout_ms,
+    }) catch |err| {
+        st.err = err;
+        return;
+    };
+}
+
+/// Parse tool-call arguments in `arena`; a malformed payload becomes `{}`,
+/// exactly as the sequential path treats it (the handler then reports the
+/// missing arguments itself).
+fn parseArgsIn(arena: std.mem.Allocator, arguments: []const u8) std.json.Value {
+    if (arguments.len == 0 or std.mem.eql(u8, arguments, "{}")) return .{ .object = .{} };
+    const parsed = std.json.parseFromSlice(std.json.Value, arena, arguments, .{}) catch return .{ .object = .{} };
+    // The arena owns the parsed tree; no deinit needed (and the value must
+    // outlive this function).
+    return parsed.value;
+}
 
 /// Deep-copy `calls` (each `id`/`name`/`arguments` owns its bytes) and append
 /// the slice to `list`, which is released by a `defer` — so a slice must never
@@ -921,10 +1116,15 @@ test "Agent.run executes a full tool-call loop against a mock provider" {
         .description = "pong",
         .parameters = &.{},
         .handler = struct {
-            fn h(_: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+            // The documented contract: everything in the result is allocated
+            // with `ctx.allocator` (the per-call arena), never with an
+            // allocator the handler captured elsewhere. This handler used the
+            // test's allocator and leaked once the framework stopped calling
+            // `freeValue` on the handler's behalf.
+            fn h(ctx: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
                 State.pinged += 1;
                 var obj = std.json.ObjectMap{};
-                try obj.put(allocator, try allocator.dupe(u8, "ok"), .{ .bool = true });
+                try obj.put(ctx.allocator, try ctx.allocator.dupe(u8, "ok"), .{ .bool = true });
                 return .{ .object = obj };
             }
         }.h,
@@ -1301,4 +1501,167 @@ test "formatToolResult wraps short results and marks truncation" {
         try std.testing.expect(std.unicode.utf8ValidateSlice(out[open_end..marker_at]));
         try std.testing.expect(std.mem.indexOf(u8, out, "truncated") != null);
     }
+}
+
+test "Agent.memoryBlock prefers the backend, falls back, and fails closed" {
+    const allocator = std.testing.allocator;
+    const Fake = struct {
+        fn recall(_: *anyopaque, a: std.mem.Allocator, tenant: ?i64, _: ?i64, _: []const u8, _: usize) anyerror!?[]u8 {
+            if ((tenant orelse 0) != 7) return null;
+            const copy = try a.dupe(u8, "Facts you remember about this user:\n- k = v\n");
+            return @as(?[]u8, copy);
+        }
+        fn boom(_: *anyopaque, _: std.mem.Allocator, _: ?i64, _: ?i64, _: []const u8, _: usize) anyerror!?[]u8 {
+            return error.BackendDown;
+        }
+    };
+    var tag_byte: u8 = 0;
+    var sctx = SkillContext{ .allocator = allocator, .tenant_id = 7, .user_id = 42 };
+
+    // Backend wins when configured.
+    var agent = Agent{ .provider = undefined, .registry = undefined, .memory_backend = .{ .ptr = &tag_byte, .recallBlockFn = Fake.recall } };
+    const from_backend = try agent.memoryBlock(allocator, &sctx);
+    defer if (from_backend) |b| allocator.free(b);
+    try std.testing.expect(from_backend != null);
+    try std.testing.expect(std.mem.indexOf(u8, from_backend.?, "k = v") != null);
+
+    // …including when a concrete store is also attached (backend takes
+    // precedence, it is the shared one in a multi-replica deployment).
+    var store = memory_mod.MemoryStore.init(allocator, std.testing.io);
+    defer store.deinit();
+    try store.remember("user:pref:lang", "from-store", 7, 42);
+    agent.memory = &store;
+    const still_backend = try agent.memoryBlock(allocator, &sctx);
+    defer if (still_backend) |b| allocator.free(b);
+    try std.testing.expect(std.mem.indexOf(u8, still_backend.?, "k = v") != null);
+    try std.testing.expect(std.mem.indexOf(u8, still_backend.?, "from-store") == null);
+
+    // Fallback: no backend → the attached store answers.
+    agent.memory_backend = null;
+    const from_store = try agent.memoryBlock(allocator, &sctx);
+    defer if (from_store) |b| allocator.free(b);
+    try std.testing.expect(from_store != null);
+    try std.testing.expect(std.mem.indexOf(u8, from_store.?, "from-store") != null);
+
+    // Fail-closed: a zero tenant does not reach the backend at all.
+    sctx.tenant_id = 0;
+    try std.testing.expectEqual(@as(?[]u8, null), try agent.memoryBlock(allocator, &sctx));
+
+    // A backend error is logged (warn) and read as "no facts".
+    agent.memory_backend = .{ .ptr = &tag_byte, .recallBlockFn = Fake.boom };
+    sctx.tenant_id = 7;
+    try std.testing.expectEqual(@as(?[]u8, null), try agent.memoryBlock(allocator, &sctx));
+}
+
+test "parallelEligible is all-or-nothing and needs an io" {
+    const allocator = std.testing.allocator;
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    const H = struct {
+        fn h(_: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+            return .{ .bool = true };
+        }
+    };
+    try registry.register(.{ .name = "safe", .description = "", .parameters = &.{}, .action = .read, .parallel_safe = true, .handler = H.h });
+    try registry.register(.{ .name = "unsafe", .description = "", .parameters = &.{}, .action = .read, .handler = H.h });
+
+    var agent = Agent{ .provider = undefined, .registry = &registry };
+    const safe_calls = [_]AiProvider.ToolCall{
+        .{ .id = "1", .name = "safe", .arguments = "{}" },
+        .{ .id = "2", .name = "safe", .arguments = "{}" },
+    };
+    // No io → never parallel, even for two safe calls.
+    try std.testing.expect(!agent.parallelEligible(&safe_calls));
+
+    agent.io = std.testing.io;
+    try std.testing.expect(agent.parallelEligible(&safe_calls));
+    // A single call is not a batch.
+    try std.testing.expect(!agent.parallelEligible(safe_calls[0..1]));
+    // One unsafe tool keeps the whole step sequential.
+    const mixed = [_]AiProvider.ToolCall{
+        .{ .id = "1", .name = "safe", .arguments = "{}" },
+        .{ .id = "2", .name = "unsafe", .arguments = "{}" },
+    };
+    try std.testing.expect(!agent.parallelEligible(&mixed));
+    // An unknown tool is not proven safe.
+    const unknown = [_]AiProvider.ToolCall{
+        .{ .id = "1", .name = "safe", .arguments = "{}" },
+        .{ .id = "2", .name = "nope", .arguments = "{}" },
+    };
+    try std.testing.expect(!agent.parallelEligible(&unknown));
+}
+
+test "parallel batch overlaps sleeps and keeps call order" {
+    const allocator = std.testing.allocator;
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    const H = struct {
+        fn slow(ctx: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+            std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(200), .awake) catch {};
+            return .{ .string = try ctx.allocator.dupe(u8, "ok") };
+        }
+    };
+    try registry.register(.{ .name = "a", .description = "", .parameters = &.{}, .action = .read, .parallel_safe = true, .handler = H.slow });
+    try registry.register(.{ .name = "b", .description = "", .parameters = &.{}, .action = .read, .parallel_safe = true, .handler = H.slow });
+
+    var agent = Agent{ .provider = undefined, .registry = &registry, .io = std.testing.io };
+    const calls = [_]AiProvider.ToolCall{
+        .{ .id = "id-a", .name = "a", .arguments = "{}" },
+        .{ .id = "id-b", .name = "b", .arguments = "{}" },
+    };
+    var messages = std.ArrayList(AiProvider.ChatMsg).empty;
+    defer messages.deinit(allocator);
+    var owned = std.ArrayList([]const u8).empty;
+    defer {
+        for (owned.items) |item| allocator.free(item);
+        owned.deinit(allocator);
+    }
+    var sctx = SkillContext{ .allocator = allocator, .tenant_id = 1, .user_id = 2 };
+
+    const started = @import("../core/Time.zig").monotonicNowMilliseconds();
+    try agent.runToolCallsParallel(allocator, &sctx, &calls, &messages, &owned);
+    const elapsed = @import("../core/Time.zig").monotonicNowMilliseconds() - started;
+
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+    try std.testing.expectEqualStrings("id-a", messages.items[0].tool_call_id.?);
+    try std.testing.expectEqualStrings("id-b", messages.items[1].tool_call_id.?);
+    // Sequential would be ~400 ms; the margin is wide enough for a loaded CI
+    // runner while still failing if the calls run one after the other.
+    try std.testing.expect(elapsed < 340);
+}
+
+test "parallel batch appends denials in call order and still runs the allowed call" {
+    const allocator = std.testing.allocator;
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    const H = struct {
+        fn h(ctx: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+            return .{ .string = try ctx.allocator.dupe(u8, "ran") };
+        }
+    };
+    try registry.register(.{ .name = "denied_tool", .description = "", .parameters = &.{}, .action = .read, .parallel_safe = true, .handler = H.h });
+    try registry.register(.{ .name = "allowed_tool", .description = "", .parameters = &.{}, .action = .read, .parallel_safe = true, .handler = H.h });
+
+    var guard = guard_mod.Guard.init(.{ .allow = &.{"allowed_tool"} });
+    var agent = Agent{ .provider = undefined, .registry = &registry, .io = std.testing.io, .guard = &guard };
+    const calls = [_]AiProvider.ToolCall{
+        .{ .id = "id-1", .name = "denied_tool", .arguments = "{}" },
+        .{ .id = "id-2", .name = "allowed_tool", .arguments = "{}" },
+    };
+    var messages = std.ArrayList(AiProvider.ChatMsg).empty;
+    defer messages.deinit(allocator);
+    var owned = std.ArrayList([]const u8).empty;
+    defer {
+        for (owned.items) |item| allocator.free(item);
+        owned.deinit(allocator);
+    }
+    var sctx = SkillContext{ .allocator = allocator };
+    try agent.runToolCallsParallel(allocator, &sctx, &calls, &messages, &owned);
+
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+    try std.testing.expectEqualStrings("id-1", messages.items[0].tool_call_id.?);
+    try std.testing.expect(std.mem.indexOf(u8, messages.items[0].content, "ToolDenied") != null);
+    try std.testing.expectEqualStrings("id-2", messages.items[1].tool_call_id.?);
+    try std.testing.expect(std.mem.indexOf(u8, messages.items[1].content, "ran") != null);
+    try std.testing.expectEqual(@as(u64, 1), guard.denied_not_listed);
 }

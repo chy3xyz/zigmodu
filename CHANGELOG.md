@@ -1,5 +1,23 @@
 # Changelog
 
+## [Unreleased]
+
+### 新增：Memory 接口 + 并行工具调用（opt-in，**破坏性：否**）
+
+- **`memory.Memory` 窄接口**：`Agent.memory_backend` 可接 Redis/DB 等共享记忆
+  （`MemoryStore.toMemory()` 适配内置实现），未设置时行为不变；`Agent.memory`
+  保留。接口只有 `recallBlockAlloc`（Agent 唯一用到的能力），写/忘/淘汰仍归实现。
+  回归：`memoryBlock` 优先 backend、回退 store、backend 报错按"无记忆"处理、
+  零身份不触达 backend。
+- **并行 tool_calls（opt-in）**：`Spec.io` + `Tool.parallel_safe`，**全有或全无**
+  ——批次里任一工具未声明就整批串行。Guard/审批 hook 在 spawn 前串行执行，
+  结果在 join 后按原顺序回填；每个调用有独立上下文副本与 arena（`dispatchWith`
+  会写 `deadline_ms`，请求 arena 非线程安全）。契约：`parallel_safe` handler 必须
+  线程安全且用 `ctx.allocator` 分配结果；共享 `userdata`/单连接 DB 工具不要声明。
+- **per-call arena**：串行路径也改用每次 dispatch 一个 arena，handler 结果由 arena
+  整体释放（`freeValue` 不再由 Agent 调用）——消除跨分配器释放的隐患。
+- 测试：6 条（Memory 2、并行 3、时序/顺序/拒绝），并行测试用 200ms sleep 验证重叠。
+
 ## [0.39.19] - 2026-10-19
 
 ### 新增：`ai.rag` 检索链路 + `ai.ops` 命名空间别名（**破坏性：否**）

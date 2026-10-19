@@ -13,6 +13,41 @@ pub const MemoryEntry = struct {
     last_accessed_at: i64 = 0,
 };
 
+/// The narrow interface `Agent` needs from a memory store: the recall block for
+/// one identity. Writing, forgetting, persistence and eviction stay with the
+/// implementation — this is deliberately not a full CRUD surface, so a
+/// Redis/DB backend only has to answer the one question the run asks.
+///
+/// Implementations must be safe to call from the thread that runs the agent
+/// (recall happens once, before the first LLM step, so concurrency is not a
+/// requirement).
+pub const Memory = struct {
+    ptr: *anyopaque,
+    recallBlockFn: *const fn (
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        tenant_id: ?i64,
+        user_id: ?i64,
+        prefix: []const u8,
+        limit: usize,
+    ) anyerror!?[]u8,
+
+    /// The facts block for `tenant_id` + `user_id`, or null when the identity
+    /// is missing/zero or nothing was stored. Same fail-closed contract as
+    /// `MemoryStore.recallBlockAlloc` (0 means "any" to a raw query, so it must
+    /// never reach one).
+    pub fn recallBlockAlloc(
+        self: Memory,
+        allocator: std.mem.Allocator,
+        tenant_id: ?i64,
+        user_id: ?i64,
+        prefix: []const u8,
+        limit: usize,
+    ) !?[]u8 {
+        return self.recallBlockFn(self.ptr, allocator, tenant_id, user_id, prefix, limit);
+    }
+};
+
 /// Thread-safe in-memory store. Map keys are composite `tenant\x1fuser\x1flogical`
 /// so the same logical key can coexist for different tenants/users.
 ///
@@ -42,6 +77,23 @@ pub const MemoryStore = struct {
             .entries = entries,
             .mutex = std.Io.Mutex.init,
         };
+    }
+
+    /// Adapt this store to the narrow `Memory` interface (`Agent.memory_backend`).
+    pub fn toMemory(self: *MemoryStore) Memory {
+        return .{ .ptr = self, .recallBlockFn = struct {
+            fn f(
+                ptr: *anyopaque,
+                allocator: std.mem.Allocator,
+                tenant_id: ?i64,
+                user_id: ?i64,
+                prefix: []const u8,
+                limit: usize,
+            ) anyerror!?[]u8 {
+                const store: *MemoryStore = @ptrCast(@alignCast(ptr));
+                return store.recallBlockAlloc(allocator, tenant_id, user_id, prefix, limit);
+            }
+        }.f };
     }
 
     pub fn deinit(self: *MemoryStore) void {
@@ -1438,4 +1490,22 @@ test "recall and dumpJson report a canceled lock wait as error.Canceled" {
     DumpRead.seen = null;
     try readUnderCanceledLockWait(MemoryStore, &store, &store.mutex, io, DumpRead.read);
     try std.testing.expectEqual(@as(?anyerror, error.Canceled), DumpRead.seen);
+}
+
+test "MemoryStore.toMemory forwards and stays fail-closed on zero identity" {
+    const allocator = std.testing.allocator;
+    var store = MemoryStore.init(allocator, std.testing.io);
+    defer store.deinit();
+    try store.remember("user:pref:lang", "zh", 7, 42);
+
+    const mem = store.toMemory();
+    const block = try mem.recallBlockAlloc(allocator, 7, 42, "user:", 8);
+    defer if (block) |b| allocator.free(b);
+    try std.testing.expect(block != null);
+    try std.testing.expect(std.mem.indexOf(u8, block.?, "zh") != null);
+
+    // `0` means "any" to a raw recall, so the interface must answer nothing
+    // rather than cross tenants.
+    try std.testing.expectEqual(@as(?[]u8, null), try mem.recallBlockAlloc(allocator, 0, 42, "", 8));
+    try std.testing.expectEqual(@as(?[]u8, null), try mem.recallBlockAlloc(allocator, null, null, "", 8));
 }

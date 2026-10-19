@@ -242,6 +242,17 @@ server，`tools/list` 自动从注册表推导参数 schema，并列出注册表
 写入侧按 `index.add(.{ .tenant_id = … }, id, text, source, vector)` 存；向量维度
 不一致直接 `error.DimensionMismatch`，不做截断/补零。
 
+### 并行工具调用（opt-in）
+
+模型一个回合常常给出多个互不依赖的调用（多个检索/查询）。默认仍然串行；要并行需要两件事：
+
+- `Agent`/`Spec` 设置 `io`（`std.Io`）；
+- **每个**被并行的工具声明 `parallel_safe = true`。
+
+**全有或全无**：一个回合里只要有一个工具没声明，整批串行——不做部分并行，行为可预测。Guard / 审批 hook 在 spawn **之前**串行执行（Guard 的计数不是原子量、hook 是调用方代码）；结果在 join 之后按 tool_call 原顺序回填消息，`on_tool` 与审计也在此时按序记录。
+
+写 `parallel_safe = true` 的契约：handler 必须线程安全，且**结果里的一切都用 `ctx.allocator` 分配**。Agent 给每个调用一份独立的上下文副本与 arena（`dispatchWith` 会写 `deadline_ms`，请求 arena 也不是线程安全的），join 后只保留序列化文本。共享的 `userdata` / `backend_ptr` 仍由你保证并发安全——单连接 DB 工具不要标 `parallel_safe`。
+
 ### 核心与扩展的边界
 
 `zigmodu.ai` 里有两类模块，改动时别混：
