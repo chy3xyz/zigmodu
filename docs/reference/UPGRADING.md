@@ -102,6 +102,24 @@
 门禁自己 `@import` 弃用文件并**真调** `notEmpty`、`validateStruct`、`email`、`validateStructCollect`，
 加上 `src/api/Extract.zig` / `src/api/middleware/Validation.zig` 这两条链一起编译、并由门禁各真调一次）。
 
+### `RouteGroup`（运行时路由组）：保留，但新代码不再推荐
+
+`api/Server.zig` 的 `RouteGroup`（`server.group(prefix).get/post/...`）没有删除计划，
+现有应用无需改动。新模块请用 `ComptimeRouter`：
+
+```zig
+pub const routes = [_]http.RouteSpec(State){
+    .{ .method = .GET, .path = "{id}", .handler = get, .meta = .{ .auth = .jwt } },
+};
+// 挂载：router.scope("/api").mountAll(.{ .{ .Mod = OrderApi, .state = &st } })
+```
+
+差别不在写法，而在**元数据位置**：`RouteMeta` 让 auth/permission/roles/OpenAPI 与
+handler 同处一张 comptime 表，重复路径在 `finish()` 前就会失败，`Testkit.auditAuthCoverage`
+也能直接审计；`RouteGroup` 的这些信息散在中间件链与调用点。混用两者时，路由表
+（catalog）只覆盖 `ComptimeRouter` 挂载的部分——这是 `auditAuthCoverage` 只对
+catalog 生效的原因。
+
 ### 已移除（记录，不是承诺）
 
 `Simplified` 整块入口**已经不在了**，所以它不在上面的表里：`不早于 1.0` 是对**还在**的别名做的承诺，

@@ -15,6 +15,21 @@
   首个请求才以 400 出现。空列表 = 不检查（向后兼容）。文档见
   `docs/guide/SQLX_DRIVERS.md` §3.1。
 
+### 完善：用量聚合 + MCP 默认最小暴露 + RouteGroup 弃用说明（**行为变化：MCP 列表默认过滤**）
+
+- **`RunAuditStore.aggregate(allocator, out, tenant_id, since_ms)`**：按
+  `(kind, model)` 聚合持久化的 token 用量（`UsageRow{prompt,completion,runs}`），
+  支持租户与时间窗过滤。`list` 回答"跑了什么"，`aggregate` 回答"花了多少"——
+  账单/租户报表直接基于它，不再扫原始行。
+- **MCP `tools/list` 默认按会话权限过滤**：`serveStdio` 只广告
+  `ctx_template.permissions` 能调用的技能（列出不可调用的工具只会引导客户撞
+  `PermissionDenied`）。`serveStdioFiltered` 保留显式 allowlist/权限控制；
+  `permissions = null` 恢复旧的全量列表。`toMcpTools` 仍是不带上下文时的不过滤
+  渲染原语。
+- **`RouteGroup` 标注 legacy**：代码 doc 与 `UPGRADING.md` 新增说明与迁移示例
+  （`ComptimeRouter` + `RouteMeta`），不删 API、不改变行为。文档同时点明
+  `auditAuthCoverage` 只覆盖 catalog（即 ComptimeRouter 挂载部分）的原因。
+
 ### 完善：模块状态生命周期 + 并行工具上限（**破坏性：否**）
 
 - **`ModuleContext.state(T)` / `stateWith` / `stateGet`**：按 **(模块名, 类型)** 键控、

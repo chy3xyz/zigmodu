@@ -55,10 +55,11 @@ cd ../.. && python3 scripts/mcp-client-test.py examples/mcp-server/zig-out/bin/m
 
 - 技能保留 `required_permission` 门控：MCP 会话的 `SkillContext.permissions`
   决定可调用的管理/审批技能 —— 拒绝发生在 `tools/call`（`SkillRegistry.dispatch`），**不在** `tools/list`；
-- **`tools/list` 可过滤**：`ai.mcp.serveStdioFiltered(..., .{ .allowlist = ..., .permissions = ctx.permissions })`
-  只广告 allowlist 内、且 `required_permission` 已授予的技能（`toMcpToolsFiltered` 同语义）。
-  `serveStdio` / `toMcpTools` 保持**不过滤**（向后兼容）——对外暴露时请用带 filter 的入口；
-  `permissions = null` 表示"不按权限过滤"，空切片表示"该会话没有任何权限"（会隐藏管理类技能）。
+- **`tools/list` 默认按会话权限过滤**：`serveStdio` 现在只广告 `ctx_template.permissions`
+  能调用的技能（fail-closed，列出来也只会得到 `PermissionDenied`）。需要显式控制时用
+  `serveStdioFiltered(..., .{ .allowlist = ..., .permissions = ... })`；`permissions = null`
+  恢复"不按权限过滤"，空切片表示"该会话没有任何权限"。
+- `toMcpTools`（不带 ctx）仍是不过滤的渲染原语，用于离线导出/对比。
 - 租户隔离：`ctx_template.tenant_id` 贯穿所有分发。**但隔离由各个技能自己落实** ——
   `entity.*` 看实体声明的 `tenant_column`，`db.query` 看 `BusinessSkillsConfig.db_query_tenant_column`。
   有 `tenant_id` 而没声明列时 `db.query` 是 **`error.TenantScopeUnavailable`（拒绝，不是不过滤）**：

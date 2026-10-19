@@ -184,6 +184,67 @@ pub const RunAuditStore = struct {
         });
     }
 
+    /// One billing/usage bucket: a `(kind, model)` pair within the optional
+    /// tenant / time window. `model` is always an owned string (empty when the
+    /// runs did not record one).
+    pub const UsageRow = struct {
+        kind: RunKind,
+        model: []const u8,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        runs: u64,
+    };
+
+    /// Aggregate persisted token usage. This is the query a tenant statement
+    /// or a cost dashboard needs; `list` answers "what ran", this answers "how
+    /// much did it cost", per tenant and model.
+    pub fn aggregate(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        out: *std.ArrayList(UsageRow),
+        tenant_id: ?i64,
+        since_ms: ?i64,
+    ) !void {
+        try sqlx.validateIdentifier(self.table);
+        var where = std.ArrayList(u8).empty;
+        defer where.deinit(allocator);
+        var args = std.ArrayList(sqlx.Value).empty;
+        defer args.deinit(allocator);
+        var first = true;
+        if (tenant_id) |tid| {
+            try where.appendSlice(allocator, "tenant_id = ?");
+            try args.append(allocator, .{ .int = tid });
+            first = false;
+        }
+        if (since_ms) |ts| {
+            if (!first) try where.appendSlice(allocator, " AND ");
+            try where.appendSlice(allocator, "created_at >= ?");
+            try args.append(allocator, .{ .int = ts });
+        }
+
+        const base = "SELECT kind, model, SUM(prompt_tokens) AS prompt_tokens, SUM(completion_tokens) AS completion_tokens, COUNT(*) AS runs FROM ";
+        const sql = if (where.items.len > 0)
+            try allocator.print("{s}{s} WHERE {s} GROUP BY kind, model ORDER BY kind, model", .{ base, self.table, where.items })
+        else
+            try allocator.print("{s}{s} GROUP BY kind, model ORDER BY kind, model", .{ base, self.table });
+        defer allocator.free(sql);
+
+        var cursor = try self.backend.client.queryCursorEx(sql, args.items, .{});
+        defer cursor.deinit();
+        while (try cursor.next()) |row| {
+            const kind = std.meta.stringToEnum(RunKind, row.get("kind").?.string) orelse .workflow;
+            const model = try allocator.dupe(u8, if (row.get("model")) |m| m.string else "");
+            errdefer allocator.free(model);
+            try out.append(allocator, .{
+                .kind = kind,
+                .model = model,
+                .prompt_tokens = if (row.get("prompt_tokens")) |v| @intCast(v.int) else 0,
+                .completion_tokens = if (row.get("completion_tokens")) |v| @intCast(v.int) else 0,
+                .runs = @intCast(row.get("runs").?.int),
+            });
+        }
+    }
+
     pub fn count(self: *Self) !usize {
         try sqlx.validateIdentifier(self.table);
         const sql = try self.allocator.print("SELECT COUNT(*) AS n FROM {s}", .{self.table});
@@ -374,4 +435,34 @@ test "RunAuditStore persists token usage and upgrades a legacy table" {
     try std.testing.expectEqual(@as(usize, 1), out.items.len);
     try std.testing.expectEqual(@as(u64, 120), out.items[0].prompt_tokens);
     try std.testing.expectEqual(@as(u64, 30), out.items[0].completion_tokens);
+}
+
+test "RunAuditStore aggregates token usage per tenant, kind and model" {
+    const allocator = std.testing.allocator;
+    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    var store = RunAuditStore.init(allocator, &backend);
+    try store.migrate();
+
+    try store.record(.{ .run_id = "a1", .kind = .agent, .status = "ok", .tenant_id = 1, .steps = 1, .duration_ms = 1, .model = "m1", .prompt_tokens = 100, .completion_tokens = 20 });
+    try store.record(.{ .run_id = "a2", .kind = .agent, .status = "ok", .tenant_id = 1, .steps = 1, .duration_ms = 1, .model = "m1", .prompt_tokens = 50, .completion_tokens = 10 });
+    try store.record(.{ .run_id = "a3", .kind = .agent, .status = "ok", .tenant_id = 1, .steps = 1, .duration_ms = 1, .model = "m2", .prompt_tokens = 7, .completion_tokens = 3 });
+    try store.record(.{ .run_id = "b1", .kind = .agent, .status = "ok", .tenant_id = 2, .steps = 1, .duration_ms = 1, .model = "m1", .prompt_tokens = 999, .completion_tokens = 1 });
+
+    var rows = std.ArrayList(RunAuditStore.UsageRow).empty;
+    defer {
+        for (rows.items) |r| allocator.free(r.model);
+        rows.deinit(allocator);
+    }
+    try store.aggregate(allocator, &rows, 1, null);
+    try std.testing.expectEqual(@as(usize, 2), rows.items.len);
+    // Ordered by kind, model: m1 then m2, tenant 1 only.
+    try std.testing.expectEqualStrings("m1", rows.items[0].model);
+    try std.testing.expectEqual(@as(u64, 150), rows.items[0].prompt_tokens);
+    try std.testing.expectEqual(@as(u64, 30), rows.items[0].completion_tokens);
+    try std.testing.expectEqual(@as(u64, 2), rows.items[0].runs);
+    try std.testing.expectEqualStrings("m2", rows.items[1].model);
+    try std.testing.expectEqual(@as(u64, 7), rows.items[1].prompt_tokens);
 }

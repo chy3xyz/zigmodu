@@ -68,6 +68,13 @@ pub const renderTransportError = types.renderTransportError;
 
 /// HTTP method
 /// Route group helper to prefix paths.
+///
+/// **Legacy** (not removed): new modules declare `pub const routes` and mount
+/// them with `http.Router.scope(prefix).mountAll(...)` (`ComptimeRouter`),
+/// which keeps auth/permission/OpenAPI metadata in one comptime table and
+/// validates duplicate paths at build/finish time. `RouteGroup` stays for
+/// existing apps and for routes registered at runtime. See
+/// `docs/reference/UPGRADING.md` → "RouteGroup".
 pub const RouteGroup = struct {
     server: *Server,
     prefix: []const u8,

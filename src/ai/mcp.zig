@@ -168,7 +168,14 @@ pub fn serveStdio(
     registry: *SkillRegistry,
     ctx_template: SkillContext,
 ) !void {
-    return serveStdioFiltered(io, allocator, registry, ctx_template, .{});
+    // Fail-closed: advertise only the skills this session's context can
+    // actually call. Listing a tool whose `required_permission` the session
+    // lacks only teaches the client to call it and get `PermissionDenied`.
+    // `serveStdioFiltered` remains for an explicit allowlist (or `.{ .permissions
+    // = null }` to restore the unfiltered listing).
+    return serveStdioFiltered(io, allocator, registry, ctx_template, .{
+        .permissions = ctx_template.permissions,
+    });
 }
 
 /// `serveStdio` with a `tools/list` filter — pass the permissions the session's
