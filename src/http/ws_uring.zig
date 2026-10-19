@@ -4,7 +4,6 @@ const builtin = @import("builtin");
 // io_uring opcode constants — defined locally because std.os.linux
 // does not expose them on all architectures (e.g. aarch64).
 const IORING_OP_READ: u8 = 22;
-const IORING_OP_WRITE: u8 = 23;
 
 const linux = if (builtin.target.os.tag == .linux) std.os.linux else struct {
     pub const fd_t = i32;

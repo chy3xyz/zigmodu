@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+### 完善：结构化工具错误 + 启动驱动自检（**破坏性：否**）
+
+- **`SkillContext.fail(code, message, retryable)`**：handler 返回结构化失败；
+  Agent 回填 `{"error":{"code","message","retryable"}}`。框架已知错误
+  （`PermissionDenied`/`ToolNotFound`/`ToolTimeout`/`InvalidArguments`/
+  `TenantScopeUnavailable`…）映射为稳定 code，未知错误保留 `{"error":"Name"}`
+  旧形状。`dispatchWith` 每次调用前清空 `failure`，跨调用不串味。测试：handler
+  失败透传、已知错误映射、未知错误回退、failure 清理。
+- **`Application.Config.expect_drivers`**：启动时校验声明的驱动是否编译进来
+  （`-Ddb=`），缺失即 `error.DriverNotEnabled` 并点名驱动——此前这类失配要等到
+  首个请求才以 400 出现。空列表 = 不检查（向后兼容）。文档见
+  `docs/guide/SQLX_DRIVERS.md` §3.1。
+
+### 完善：模块状态生命周期 + 并行工具上限（**破坏性：否**）
+
+- **`ModuleContext.state(T)` / `stateWith` / `stateGet`**：按 **(模块名, 类型)** 键控、
+  生命周期等于 `Application` 实例的状态槽。模块不再需要文件级 `pub var` +
+  手工复位——多相位验收、多 app 测试、热重载不再串味。`stop()` 不拆槽位
+  （模块 `deinit` 仍可读），`Application.deinit()` 在模块停止后按创建逆序调用
+  `T.deinit`（若声明）并释放。裸 harness 返回 `error.ModuleStateUnavailable`。
+  测试：同类型跨模块隔离、同模块幂等、逆序拆除计数、stop/deinit 时序。
+- **`Spec.max_parallel_tools`**（默认 8，0 = 不限）：并行 tool_calls 按波次执行，
+  一波 `await` 完再开下一波。此前一个回合的调用会一次性全部 spawn，慢工具
+  之外的资源上限只取决于模型输出。测试用 cap=1 断言并发峰值恒为 1。
+- 文档：`MODULITH.md` 新增「模块状态」小节（含 do/don't），AGENTS 生命周期
+  代码块补一条，`AI_DEV_GUIDE.md` 并行小节补上限说明。
+
 ### 架构：正交收敛 + 编译期预算/契约三件套（**破坏性：否**）
 
 **正交收敛**（纯搬迁，公开 API 由 re-export 保持）：
@@ -38,32 +65,11 @@
   边界（消息/定时器/调度确定；外部 IO 不确定）+ 取消语义。
 - `docs/reference/COMPTIME.md`：配额规则（最内层获胜）、已接入点、预算证据与
   回归排查。AGENTS 文档地图同步。
-## [Unreleased]
-
-### 架构：正交收敛（**破坏性：否**，一处公开符号搬迁）
-
-三处纯搬迁，目标是让依赖方向单向、让"HTTP 请求类型"不再住在服务器实现里：
-
-- **`Context` / `Middleware` / `HandlerFn` / `Method` / `Route` / `Identity` /
-  `EnvelopeDialect` → `http/types.zig`**。此前 `http/` 下的中间件助手与整个
-  `security/` 层必须 import `api/Server.zig` 才能命名 `Context`——同一个 HTTP
-  层被拆进两个目录并互相依赖。`api/Server.zig` 与 `http.zig` 都 re-export，
-  `zigmodu.http.Context` 与 `zigmodu.api.Server.Context` 仍是同一个类型。
-  纯中间件助手（AccessLog / HttpMetrics / Sse）与安全中间件实现
-  （AppSecurity / AuthMiddleware / ApiKeyAuth / SecurityModule）改为依赖
-  `http/types.zig`；`permissionMatches` 仍用 `security/Rbac.zig` 的纯表达式求值器
-  （该文件只 import std）。
-- **WS 分帧 → `http/WsFramer.zig` / `http/ws_uring.zig`**。`api/Server.zig` 不再
-  依赖产品模块 `im/`；`im.im` 继续 re-export，产品侧代码无需改动。
-- **`Module` 契约 → `core/Module.zig`**（`api/Module.zig` 变成 re-export shim）。
-  这是最后一处 `core → api` 反向依赖：core 的注册表要命名模块契约，却被迫
-  import API 层。`zigmodu.api.Module` 保持不变。
 - 仍保留的 `http → api` 边只有"服务器侧助手"（StaticFiles / Dashboard /
   Profiles / Testkit / Http2Server）——它们确实要在 `*Server` 上注册路由，
   属于合法的纵向依赖，不再是类型倒挂。
 - `Server.error_renderer` 变量随 Context 迁到 `types`，Server 侧改由
   `Server.errorRenderer()` 读取（`setErrorRenderer` 等 API 不变）。
-## [Unreleased]
 
 ### 新增：Memory 接口 + 并行工具调用（opt-in，**破坏性：否**）
 
@@ -275,7 +281,6 @@ CI 的 runner 路径；本地独立直跑无协议层，看门狗兜底因此一
 `set -e` 杀掉——门实际通过却零输出退出 1，发布流程在第 3 次尝试中因此
 失败。三行 grep 全部补上 `|| true`，并在兜底路径回显守卫横幅作为
 "门真实执行过"的证据。
-
 
 ## [0.39.15] - 2026-10-16
 
@@ -1340,7 +1345,6 @@ PR #3 修订版 head 上复跑 `2319/2382` 全绿（少2 = 删掉的测试及其
 `wal_test*` 2,612 个目录 + `tmp` 与 7 个工具状态目录。现存的自建目录：
 `docs/` · `examples/` · `scripts/` · `src/` · `tools/`（+ `.github/`）——
 全部有名可指。
-
 
 **顺带记录一个既有缺陷（不是本次引入，未修）**：
 `tools/zsaas/scripts/check-gen.mjs` 自检报 `MISSING src/libs/zmoduApi.ts`。
@@ -5392,7 +5396,6 @@ try std.testing.expect(precise.p50_ns <= coarse.p50_ns + lateness_p50_bound_ns);
 行、`--summary all` 的输出、以及失败时的产物转储），不是步骤列表里的一抹红。原因查清后删掉这个 flag。
 （夜间 job 因此在 2026-09-25 第一次**四步全绿**：soak / cluster soak / runtime stress / fuzz。）
 
-
 ### 第 44 批：弃用表收口（补 5 行 + 把两个"整模块横幅"另立一类，并查出其中一个是**活的**）、`WebSocketMonitor.stop()` 不再等满一个 sleep 周期、并给 `start()` 补上缺失的幂等守卫（**破坏性：否**）
 
 全量 `-Ddb=all` **2021/2079（58 skipped，0 failed）**；`WebSocket` 19/19（含 2 条新增）、`ApiFreeze` 14/14（9 → 14）、`im.` 47/47；抽查的示例（含改动过的两个）全绿；fmt / check / check-api / check-deadcode 全绿。
@@ -7821,7 +7824,6 @@ body 没编码"的响应。红证据：把 `compressResponse` 挖空 → 12 条�
 或同一工作树里的另一个代理）会互相 `deleteFile` 拆台——这正解释了并行时偶发的
 `TwoPhaseCommit: in-doubt` / `sqlite prepared statement` 失败。两处改为**按 pid 唯一**并保留了前后清理。
 
-
 ### soak 的 RSS 增长查明：**是测试分配器这条探针**，不是集群；门禁改成有意义的（**破坏性：否**）
 
 困扰几轮的"RSS 随流量线性增长"有了确定性根因：`std.testing.allocator`（SafeAllocator）在**每次
@@ -7909,7 +7911,6 @@ RSS 预算从 128 收紧到 **48 MiB**（原来它是"量 Zig 调试 arena"的�
 `AGENTS.md` 与 `docs/ROUTE_TABLE.md` 的背压表补上 h2 一行：h2 跟随 H1 的限额/超时、**没有独立旋钮**，
 并标出"空闲超时与头列预算对 h2 是新行为"。
 
-
 ### 第 3 组：sqlx 游标所有权/闸门、两处配置串号、CSRF/CSP、web4 顺序与时钟、x402 台账语义（**破坏性：否**，含一处 fail-open 修复）
 
 **x402：`store` 明确为「幂等台账」，校验回归 verifier（fail-open → fail-closed）**
@@ -7975,7 +7976,6 @@ deadcode 全绿；`examples/web4` 的测试（含新 strict 门 403 断言）通
 **未做**：`X-Forwarded-Host` 的信任边界（需要 trusted-proxy 名单）；CSRF token 签名（会改 wire 形状）；
 PG 抽干改用 `PQcancel`（需要新增 libpq 绑定）；游标路径对熔断器/指标"隐形"
 （`queryCursorExPrimary` 不记 success/failure）；`queryScalar` 的 struct 分支仍是 `queryRow` 语义。
-
 
 ### 协议面加固：HTTP/2 三条「未认证单包打崩进程」、HPACK UAF、sqlx 两条 P0、challenge 弱熵（**破坏性：否**）
 
@@ -8045,7 +8045,6 @@ h2 仍缺"完整 dispatch 链路"的端到端用例（现有 4 条走内置 404 
 验证：全量 `-Ddb=all` **1645/1667（22 skipped，0 failed）**；`zig build check`/`check-version`/deadcode/
 fmt/yaml 全绿；`zig build soak-cluster` 通过（RSS max 66 MiB，预算 128）。
 
-
 ### 修 CI 红：`poll(&.{})` 在 Linux 上 EFAULT 直接 ABRT；`check-api` 在无 rg 的主机上失败（**破坏性：否**）
 
 推 `93c4e18` 后 master 红了两个 job，两条都出在上一批改动里：
@@ -8070,7 +8069,6 @@ CI 那次构建的 codegen 下触发，所以"先红"这一步只有 CI 的栈�
 两种都不对。现在门禁**优先 rg、回退 `grep -Rn --include='*.zig'`，只有两者都不存在才失败**：
 门禁要的是"真的搜过"，用哪个工具是实现细节。**红/绿都验过**：造一个含字面
 `zigmodu.http_server` 的 fixture，有 rg 与无 rg 两条路径都 exit 1 并打出报文；清理后 exit 0。
-
 
 
 ### zent 升到 v0.76.2：两个示例改 pin，并采用 0.76.0 的按驱动裁剪（**破坏性：否**）
@@ -8102,7 +8100,6 @@ CI 那次构建的 codegen 下触发，所以"先红"这一步只有 CI 的栈�
 省下的两条与 SQLite 那条（~597 MiB）**并行**，各 ~23 s / 30 MiB，只有它们在某些主机上成为
 主项时才明显（上游给的数是每驱动 ~26 s / ~590 MB）。示例里保留了这两个选项，因为它表述的是
 "这个示例链哪些驱动"这一事实，而不是因为在本机量到了收益；注释与 `docs/ZENT.md` 都按实测写的。
-
 
 
 ### HTTP 服务端加固：长响应头曾静默丢整个响应、body 阶段零超时、读错误被吞（**破坏性：否**，行为修复 + 两个新配置/错误值）
@@ -8210,7 +8207,6 @@ CI 那次构建的 codegen 下触发，所以"先红"这一步只有 CI 的栈�
   +55 MiB，二分测试给不出干净归因（单独加 runtime/supervisor 是 34 MiB、单独加
   `RaftElection` 是 74 MiB，都在基线自身的 42–70 波动范围内），需要堆剖析才能定论。
 
-
 ### 跨编译可带 sqlite：`SQLITE_INCLUDE` / `SQLITE_LIB` 覆盖 + 跨编译口径落文档（**破坏性：否**）
 
 `examples/_shared/db_link.zig` 原先只给 postgres/mysql 留了环境变量覆盖，sqlite 是裸
@@ -8279,7 +8275,6 @@ PG 无参路径走 `PQexec`（libpq 简单查询会执行整串多语句），�
 给 `docs/dev/` 的 22 份评审/评估/路线草稿加了索引：哪些仍生效、哪份被哪份取代、
 哪些路径被源码按字面引用（不能改）。`docs/README.md` 已链接它——**提交时必须同时
 `git add`，否则干净 clone 里是断链**。
-
 
 ### DLQ 自身无锁：并发 `push` / `purgeExpired` / `requeue` 是纯竞态（**破坏性：否**，行为修复）
 
@@ -8780,7 +8775,6 @@ payload 原样作为**数据**送达，而文档里只有**一个** `source` 字
 **未做**：`ConcurrentError` 的拒绝分支仍无用例 —— `testing.io` 的 `concurrent_limit` 是 unlimited，
 **树内构造不出来**，这是"不可测"而不是"没测"。
 
-
 ### `ClusterServer` 改为并发分发（handler 签名变更）；入站 AppendEntries 设界（**破坏性：是**）
 
 **① accept 环此前在**自己的线程上内联跑 handler**：一个慢对端会**串行占用整个入站**（前面那次只修了
@@ -8822,7 +8816,6 @@ payload 原样作为**数据**送达，而文档里只有**一个** `source` 字
 **未做**：`ConcurrentError` 的拒绝分支没有用例（`testing.io` 的 `concurrent_limit` 是 unlimited，
 触发不到）；真正的身份绑定（每节点凭证 + 握手）仍 open。
 
-
 ### `sockread` 的超时设置会 **panic** 而不是 warn（AF_UNIX）；以及总线 §14 的五条（**破坏性：是**）
 
 **① `setRecvTimeout` / `setSendTimeout` 的 `catch` 是死代码。**
@@ -8845,7 +8838,6 @@ AF_UNIX socket** 上返回 `EINVAL`（对端活着 → `SUCCESS`，对端已关 
 > （`expected 0, found 1`）。**另需如实说明**：在**共享 PSK** 下 `identityKey` 相对"直接 MAC 整段 json"
 > 并无额外安全性 —— 拿到 secret 的人可以推导任何节点的 key；真正的身份绑定需要**每节点各自的凭证**
 > （握手），这条仍 open。
-
 
 ### `DistributedEventBus` 入站：真 JSON 解析 · 按身份派生密钥 · 序号防重放 · 写锁 · 空闲上界（**破坏性：是**）
 
@@ -8883,7 +8875,6 @@ AF_UNIX socket** 上返回 `EINVAL`（对端活着 → `SUCCESS`，对端已关 
 
 **没有行为红**：修复前后池的状态完全一样（旧代码也是什么都不做），变的是那条警告；
 用例是钉子不是复现，测试注释里这么标了。
-
 
 ### WebSocket ②：io_uring 那条解析路径不再"编译不过所以安全"，握手补上 RFC 6455 §4.2.1（**破坏性：是**）
 
@@ -9470,7 +9461,6 @@ if (conn_id == 0) { self.allocator.destroy(session); return null; }   // ← 把
 **未做 / 未验证**：⑤ 里"一个进程跑两个 server"的**双实例场景没有构造用例**（改动的正确性来自
 "与同文件那四个一致"这一构造性论证）；只在 SQLite 上跑过 ⑦ 的 SQL 形态（本机无 PG/MySQL）。
 
-
 ### **Breaking**：CSPRNG 换成 `std.Io.randomSecure` + `db.query` 的租户边界（安全审计的中危 ⑥ 与 ④）
 
 **⑥ API key / 密码盐 / uuid 的种子熵不够。** 原种子是「毫秒 + 常量 42 + 栈地址 + 毫秒×1000」，
@@ -9513,7 +9503,6 @@ SELECT * FROM ( <模型原样 SQL> ) AS _zt_tenant_scope WHERE _zt_tenant_scope.
 
 **未验证**：只在 `:memory:` SQLite 上跑过（本机无 PG/MySQL）；`Uring`/`Dispatch` 的 `randomSecure`
 只读了 std 源码，没在 Linux/Windows 上跑。
-
 
 ### **Breaking**：HTTP 请求边界加固（fail-closed）—— 安全审计的高危 ②
 
@@ -9562,7 +9551,6 @@ SELECT * FROM ( <模型原样 SQL> ) AS _zt_tenant_scope WHERE _zt_tenant_scope.
 
 **顺带报告一处既有地雷**（**未动**）：`Server.zig` 的 `RequestParser.parse` 是死代码，而且**本来就编译不过**
 （给 5 参的 `parseAfterRequestLine` 传 4 个参数 —— 正因如此可以断定它从未被分析过）。
-
 
 ### **Breaking**：WebSocket 路由的 auth 声明改为**编译期强制**（且只能是 `.public`）
 

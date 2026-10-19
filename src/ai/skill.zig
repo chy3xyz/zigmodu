@@ -39,6 +39,16 @@ pub const Tool = struct {
     handler: *const fn (ctx: *SkillContext, args: std.json.Value) anyerror!std.json.Value,
 };
 
+/// Structured failure a handler can hand back instead of a bare error name.
+/// `code` is stable and machine-readable (the model can branch on it),
+/// `message` is for the model/operator, `retryable` says whether the same call
+/// has a chance on a retry (rate limit / timeout) or must change arguments.
+pub const ToolFailure = struct {
+    code: []const u8,
+    message: []const u8 = "",
+    retryable: bool = false,
+};
+
 /// Context in which a skill executes. Carries tenant + user identity.
 pub const SkillContext = struct {
     allocator: std.mem.Allocator,
@@ -54,6 +64,9 @@ pub const SkillContext = struct {
     permissions: []const []const u8 = &.{},
     /// Absolute deadline from `Time.monotonicNowMilliseconds()`; set by dispatch.
     deadline_ms: ?i64 = null,
+    /// Set by `fail()` for this dispatch only; dispatch clears it before each
+    /// handler so a stale failure cannot leak into the next call.
+    failure: ?ToolFailure = null,
 
     pub fn expired(self: *const SkillContext) bool {
         const d = self.deadline_ms orelse return false;
@@ -62,6 +75,24 @@ pub const SkillContext = struct {
 
     pub fn checkDeadline(self: *const SkillContext) !void {
         if (self.expired()) return error.ToolTimeout;
+    }
+
+    /// Return a structured failure:
+    ///
+    /// ```zig
+    /// if (rate_limited) return ctx.fail("rate_limited", "try again later", true);
+    /// ```
+    ///
+    /// `code`/`message` must outlive the dispatch (a literal or memory in
+    /// `ctx.allocator`, which is the per-call arena).
+    pub fn fail(
+        self: *SkillContext,
+        code: []const u8,
+        message: []const u8,
+        retryable: bool,
+    ) error{ToolFailed} {
+        self.failure = .{ .code = code, .message = message, .retryable = retryable };
+        return error.ToolFailed;
     }
 
     /// Fail closed for anything that acts on tenant-scoped data: a context
@@ -621,6 +652,9 @@ pub const SkillRegistry = struct {
         self.mutex.unlock(self.io);
         locked = false;
 
+        // A failure belongs to one call: clear it before the handler so the
+        // caller cannot read the previous dispatch's code.
+        ctx.failure = null;
         const prev_deadline = ctx.deadline_ms;
         defer ctx.deadline_ms = prev_deadline;
         const started = Time.monotonicNowMilliseconds();
@@ -1370,4 +1404,31 @@ test "SkillContext.requireTenant and requireIdentity refuse the zero default" {
     // `0` is not "the default tenant" — it is the absence of one.
     sctx.tenant_id = 0;
     try std.testing.expectError(error.TenantRequired, sctx.requireIdentity());
+}
+
+test "SkillContext.fail records a structured failure for one dispatch" {
+    const allocator = std.testing.allocator;
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    const H = struct {
+        fn failing(ctx: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+            return ctx.fail("rate_limited", "try later", true);
+        }
+        fn ok(_: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+            return .{ .bool = true };
+        }
+    };
+    try registry.register(.{ .name = "failing", .description = "", .parameters = &.{}, .handler = H.failing });
+    try registry.register(.{ .name = "ok", .description = "", .parameters = &.{}, .handler = H.ok });
+
+    var ctx = SkillContext{ .allocator = allocator };
+    try std.testing.expectError(error.ToolFailed, registry.dispatch("failing", &ctx, .{ .object = .{} }));
+    try std.testing.expect(ctx.failure != null);
+    try std.testing.expectEqualStrings("rate_limited", ctx.failure.?.code);
+    try std.testing.expectEqual(true, ctx.failure.?.retryable);
+
+    // The next dispatch clears it: a stale failure must not leak.
+    const value = try registry.dispatch("ok", &ctx, .{ .object = .{} });
+    freeValue(allocator, value);
+    try std.testing.expect(ctx.failure == null);
 }

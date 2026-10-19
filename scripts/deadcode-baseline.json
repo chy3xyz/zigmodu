@@ -134,24 +134,10 @@
       "parent": null
     },
     {
-      "file": "src/http/Dashboard.zig",
-      "line": 7,
-      "kind": "constant",
-      "name": "HandlerFn",
-      "parent": null
-    },
-    {
       "file": "src/http/Http2Server.zig",
       "line": 2332,
       "kind": "function",
       "name": "readFrame",
-      "parent": null
-    },
-    {
-      "file": "src/im/ws_uring.zig",
-      "line": 7,
-      "kind": "constant",
-      "name": "IORING_OP_WRITE",
       "parent": null
     },
     {
@@ -170,28 +156,28 @@
     },
     {
       "file": "src/persistence/Orm.zig",
-      "line": 187,
+      "line": 188,
       "kind": "function",
       "name": "structToBackendArgs",
       "parent": null
     },
     {
       "file": "src/persistence/Orm.zig",
-      "line": 197,
+      "line": 198,
       "kind": "function",
       "name": "structToBackendArgsWithId",
       "parent": null
     },
     {
       "file": "src/persistence/Orm.zig",
-      "line": 563,
+      "line": 564,
       "kind": "function",
       "name": "buildSelectPage",
       "parent": null
     },
     {
       "file": "src/persistence/Orm.zig",
-      "line": 573,
+      "line": 574,
       "kind": "function",
       "name": "buildCount",
       "parent": null
@@ -212,14 +198,14 @@
     },
     {
       "file": "tools/zmodu/src/main.zig",
-      "line": 2250,
+      "line": 2253,
       "kind": "function",
       "name": "hasUncommittedChanges",
       "parent": null
     },
     {
       "file": "tools/zmodu/src/main.zig",
-      "line": 2331,
+      "line": 2334,
       "kind": "function",
       "name": "writeFileGen",
       "parent": null

@@ -80,6 +80,20 @@ var client = try data.Client.open(allocator, io, .{ .driver = .postgres, .host =
 
 ---
 
+### 3.1 启动自检：`expect_drivers`
+
+构建期 `-Ddb=` 与运行期配置是两处声明。声明应用实际会用的驱动，让不匹配在
+**启动**暴露，而不是首个请求返回 400（`DriverNotEnabled`）：
+
+```zig
+var app = try builder.withName("shop").build(.{ Order, Payment });
+// 或在 Application.init 的 Config 里：
+//   .expect_drivers = &.{ .postgres }
+```
+
+`Application.start()` 逐个检查 `sqlx.DriverFeatures.isEnabled`，缺一个就
+`error.DriverNotEnabled` 并点名是哪个驱动。默认空 = 不检查（向后兼容）。
+
 ## 4. 测试约定（重要）
 
 | 场景 | `-Ddb=` |

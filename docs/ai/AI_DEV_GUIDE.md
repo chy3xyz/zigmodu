@@ -160,6 +160,7 @@ defer wf_result.deinit();
 | 参数声明 | `Param{ name, type, description, required }` → 自动映射 JSON Schema（function calling） |
 | 返回值所有权 | handler 结果树里**所有 key 与字符串**用 `ctx.allocator` dupe；调用方 `ai.freeValue` 深释放 |
 | 权限 | `required_permission` 设置权限码；`SkillContext.permissions` 不含则 `error.PermissionDenied` |
+| 结构化失败 | handler 内 `return ctx.fail("rate_limited", "try later", true)`；Agent 回填 `{"error":{"code","message","retryable"}}`，模型可据此重试/换参。框架已知错误（`PermissionDenied`/`ToolTimeout`/`InvalidArguments`…）自动映射为稳定 code，未知错误保留 `{"error":"Name"}` |
 | 白名单 | `Agent.allowlist` / `dispatchWith(.{ .allowlist })` 二次收口 |
 | 超时 | handler 循环内 `ctx.checkDeadline()`；框架另有返回后超时检查（非抢占） |
 | 租户 | `SkillContext.tenant_id` 贯穿；隔离**由各技能自己落实**：实体类看实体声明的 `tenant_column`，`db.query` 看 `BusinessSkillsConfig.db_query_tenant_column`（没声明 → `error.TenantScopeUnavailable`，拒绝而非不过滤） |
@@ -249,7 +250,7 @@ server，`tools/list` 自动从注册表推导参数 schema，并列出注册表
 - `Agent`/`Spec` 设置 `io`（`std.Io`）；
 - **每个**被并行的工具声明 `parallel_safe = true`。
 
-**全有或全无**：一个回合里只要有一个工具没声明，整批串行——不做部分并行，行为可预测。Guard / 审批 hook 在 spawn **之前**串行执行（Guard 的计数不是原子量、hook 是调用方代码）；结果在 join 之后按 tool_call 原顺序回填消息，`on_tool` 与审计也在此时按序记录。
+**全有或全无**：一个回合里只要有一个工具没声明，整批串行——不做部分并行，行为可预测。并发上限由 `Spec.max_parallel_tools` 控制（默认 8，0 = 不限）：批次按波次执行，一波 `await` 完再开下一波，慢工具自然形成背压。Guard / 审批 hook 在 spawn **之前**串行执行（Guard 的计数不是原子量、hook 是调用方代码）；结果在 join 之后按 tool_call 原顺序回填消息，`on_tool` 与审计也在此时按序记录。
 
 写 `parallel_safe = true` 的契约：handler 必须线程安全，且**结果里的一切都用 `ctx.allocator` 分配**。Agent 给每个调用一份独立的上下文副本与 arena（`dispatchWith` 会写 `deadline_ms`，请求 arena 也不是线程安全的），join 后只保留序列化文本。共享的 `userdata` / `backend_ptr` 仍由你保证并发安全——单连接 DB 工具不要标 `parallel_safe`。
 

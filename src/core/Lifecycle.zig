@@ -40,7 +40,7 @@ pub fn startAllWith(modules: *ApplicationModules, ctx: ?*ModuleContext) !void {
 
         std.log.debug("Starting module: {s}", .{module_name});
         if (module.init_ctx_fn) |init_ctx| {
-            const c = ctx orelse {
+            const base = ctx orelse {
                 if (module.init_fn) |init| {
                     init(module.ptr) catch |err| {
                         std.log.err("Failed to start module '{s}': {s}", .{ module_name, @errorName(err) });
@@ -52,7 +52,13 @@ pub fn startAllWith(modules: *ApplicationModules, ctx: ?*ModuleContext) !void {
                 std.log.warn("Module '{s}' declares only initWith(ctx) but no ModuleContext was provided", .{module_name});
                 return ZigModuError.ModuleInitializationFailed;
             };
-            init_ctx(module.ptr, c) catch |err| {
+            // A per-module copy: `ctx.state()` keys on `module_name`, and a
+            // module must not be able to read another module's slot by
+            // retaining the shared context. The copy is borrowed — init code
+            // must not store the pointer.
+            var module_ctx = base.*;
+            module_ctx.module_name = module_name;
+            init_ctx(module.ptr, &module_ctx) catch |err| {
                 std.log.err("Failed to start module '{s}': {s}", .{ module_name, @errorName(err) });
                 return ZigModuError.ModuleInitializationFailed;
             };

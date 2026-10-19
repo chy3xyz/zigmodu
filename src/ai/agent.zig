@@ -198,7 +198,46 @@ fn formatToolResult(allocator: std.mem.Allocator, limit: usize, result: std.json
     });
 }
 
-/// Default identity for a hand-built `Agent{}` and for `Spec.build`.
+/// Structured tool-error payload for the model.
+///
+/// A handler that called `ctx.fail(...)` gets exactly what it asked for; a
+/// framework-known error (`PermissionDenied`, `ToolNotFound`, `ToolTimeout`, …)
+/// is mapped to a stable code so the model can branch without parsing Zig
+/// error names. Anything else keeps the legacy `{"error":"Name"}` shape — an
+/// unknown error is still reported, never swallowed.
+fn formatToolError(allocator: std.mem.Allocator, err: anyerror, failure: ?skill_mod.ToolFailure) ![]const u8 {
+    const Payload = struct {
+        @"error": struct { code: []const u8, message: []const u8, retryable: bool },
+    };
+    if (failure) |f| {
+        return std.json.Stringify.valueAlloc(allocator, Payload{ .@"error" = .{
+            .code = f.code,
+            .message = f.message,
+            .retryable = f.retryable,
+        } }, .{});
+    }
+    const mapped: ?struct { code: []const u8, retryable: bool } = switch (err) {
+        error.PermissionDenied => .{ .code = "permission_denied", .retryable = false },
+        error.ToolNotFound => .{ .code = "tool_not_found", .retryable = false },
+        error.ToolNotAllowed => .{ .code = "tool_not_allowed", .retryable = false },
+        error.InvalidArguments => .{ .code = "invalid_arguments", .retryable = true },
+        error.ToolTimeout => .{ .code = "timeout", .retryable = true },
+        error.BackendNotConfigured => .{ .code = "backend_not_configured", .retryable = false },
+        error.TenantScopeUnavailable => .{ .code = "tenant_scope_unavailable", .retryable = false },
+        error.PermissionDeniedUnknown => .{ .code = "permission_denied", .retryable = false },
+        else => null,
+    };
+    if (mapped) |m| {
+        return std.json.Stringify.valueAlloc(allocator, Payload{ .@"error" = .{
+            .code = m.code,
+            .message = @errorName(err),
+            .retryable = m.retryable,
+        } }, .{});
+    }
+    return allocator.print("{{\"error\":\"{s}\"}}", .{@errorName(err)});
+}
+
+/// Default identity for a hand-built `Agent{}` and for `Spec.build`./// Default identity for a hand-built `Agent{}` and for `Spec.build`.
 pub const default_system_prompt = "You are a helpful agent. Prefer tools for factual lookups. When finished, reply with the final answer only.";
 
 /// One declarative place to answer "what is this agent, and what may it do".
@@ -234,6 +273,8 @@ pub const Spec = struct {
     tool_result_limit_bytes: usize = default_tool_result_limit_bytes,
     /// See `Agent.io`: required for `parallel_safe` batches to run concurrently.
     io: ?std.Io = null,
+    /// Cap on concurrent tool calls per step (0 = no cap; see `Agent`).
+    max_parallel_tools: usize = 8,
     retriever: ?Retriever = null,
     context: ?*ContextManager = null,
     audit: ?*AgentAuditLog = null,
@@ -255,6 +296,7 @@ pub const Spec = struct {
             .tool_timeout_ms = self.tool_timeout_ms,
             .tool_result_limit_bytes = self.tool_result_limit_bytes,
             .io = self.io,
+            .max_parallel_tools = self.max_parallel_tools,
             .retriever = self.retriever,
             .context = self.context,
             .audit = self.audit,
@@ -323,6 +365,10 @@ pub const Agent = struct {
     /// even with it set, a step runs in parallel only when every call's tool
     /// declares `parallel_safe` (all-or-nothing, so behaviour is predictable).
     io: ?std.Io = null,
+    /// Upper bound on tool calls in flight at once (0 = no cap). A model can
+    /// emit twenty calls in one turn; spawning twenty fibers for them is a
+    /// resource decision, so the batch runs in waves of this size.
+    max_parallel_tools: usize = 8,
     hooks: AgentHooks = .{},
     metrics: AgentMetrics = .{},
     audit: ?*AgentAuditLog = null,
@@ -632,7 +678,7 @@ pub const Agent = struct {
                     const err_s = try appendTakenString(
                         allocator,
                         &owned_strs,
-                        try allocator.print("{{\"error\":\"{s}\"}}", .{@errorName(err)}),
+                        try formatToolError(allocator, err, call_ctx.failure),
                     );
                     const tid = try appendOwnedString(allocator, &owned_strs, tc.id);
                     try messages.append(allocator, .{
@@ -717,7 +763,6 @@ pub const Agent = struct {
         }
         for (states) |*st| st.* = .{};
 
-        var group = std.Io.Group.init;
         for (calls, 0..) |tc, i| {
             _ = self.metrics.tool_calls.fetchAdd(1, .monotonic);
 
@@ -750,9 +795,25 @@ pub const Agent = struct {
             call.ctx.allocator = call.arena.allocator();
             call.args = parseArgsIn(call.arena.allocator(), tc.arguments);
             states[i].call = call;
-            group.async(io, parallelTask, .{call});
         }
-        try group.await(io);
+
+        // Waves, not one burst: `max_parallel_tools` bounds how many handlers
+        // run at once (0 = unbounded). A wave's `await` also means a slow tool
+        // delays the next wave, which is the intended backpressure.
+        const cap = if (self.max_parallel_tools == 0) calls.len else self.max_parallel_tools;
+        var next: usize = 0;
+        while (next < calls.len) {
+            var group = std.Io.Group.init;
+            var spawned: usize = 0;
+            while (next < calls.len and spawned < cap) {
+                const i = next;
+                next += 1;
+                const call = states[i].call orelse continue;
+                group.async(io, parallelTask, .{call});
+                spawned += 1;
+            }
+            if (spawned > 0) try group.await(io);
+        }
 
         for (calls, 0..) |tc, i| {
             if (states[i].denial) |d| {
@@ -780,7 +841,7 @@ pub const Agent = struct {
                 if (self.audit) |log| {
                     log.record(.tool_err, tc.name, @errorName(err), skill_ctx.tenant_id orelse audit_mod.unscoped_identity, skill_ctx.user_id orelse audit_mod.unscoped_identity);
                 }
-                const content = try appendTakenString(allocator, owned_strs, try allocator.print("{{\"error\":\"{s}\"}}", .{@errorName(err)}));
+                const content = try appendTakenString(allocator, owned_strs, try formatToolError(allocator, err, call.ctx.failure));
                 const tid = try appendOwnedString(allocator, owned_strs, tc.id);
                 try messages.append(allocator, .{ .role = "tool", .tool_call_id = tid, .content = content });
                 continue;
@@ -1664,4 +1725,91 @@ test "parallel batch appends denials in call order and still runs the allowed ca
     try std.testing.expectEqualStrings("id-2", messages.items[1].tool_call_id.?);
     try std.testing.expect(std.mem.indexOf(u8, messages.items[1].content, "ran") != null);
     try std.testing.expectEqual(@as(u64, 1), guard.denied_not_listed);
+}
+
+test "parallel batch honours max_parallel_tools (cap 1 serialises)" {
+    const allocator = std.testing.allocator;
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    const H = struct {
+        var active: std.atomic.Value(usize) = .init(0);
+        var peak: std.atomic.Value(usize) = .init(0);
+
+        fn slow(ctx: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+            const now = active.fetchAdd(1, .monotonic) + 1;
+            var cur = peak.load(.monotonic);
+            while (now > cur) {
+                cur = peak.cmpxchgWeak(cur, now, .monotonic, .monotonic) orelse break;
+            }
+            std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(40), .awake) catch {};
+            _ = active.fetchSub(1, .monotonic);
+            return .{ .string = try ctx.allocator.dupe(u8, "ok") };
+        }
+    };
+    try registry.register(.{ .name = "slow", .description = "", .parameters = &.{}, .action = .read, .parallel_safe = true, .handler = H.slow });
+
+    var agent = Agent{
+        .provider = undefined,
+        .registry = &registry,
+        .io = std.testing.io,
+        .max_parallel_tools = 1,
+    };
+    const calls = [_]AiProvider.ToolCall{
+        .{ .id = "1", .name = "slow", .arguments = "{}" },
+        .{ .id = "2", .name = "slow", .arguments = "{}" },
+        .{ .id = "3", .name = "slow", .arguments = "{}" },
+        .{ .id = "4", .name = "slow", .arguments = "{}" },
+    };
+    var messages = std.ArrayList(AiProvider.ChatMsg).empty;
+    defer messages.deinit(allocator);
+    var owned = std.ArrayList([]const u8).empty;
+    defer {
+        for (owned.items) |item| allocator.free(item);
+        owned.deinit(allocator);
+    }
+    var sctx = SkillContext{ .allocator = allocator };
+
+    try agent.runToolCallsParallel(allocator, &sctx, &calls, &messages, &owned);
+    try std.testing.expectEqual(@as(usize, 4), messages.items.len);
+    // A cap of one means the handlers never overlap, however they are
+    // scheduled — the assertion is independent of runner speed.
+    try std.testing.expectEqual(@as(usize, 1), H.peak.load(.monotonic));
+}
+
+test "formatToolError: handler failure, mapped error, and unknown error" {
+    const allocator = std.testing.allocator;
+
+    // A handler's own structured failure is passed through verbatim.
+    {
+        const out = try formatToolError(allocator, error.ToolFailed, .{
+            .code = "rate_limited",
+            .message = "try later",
+            .retryable = true,
+        });
+        defer allocator.free(out);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, out, .{});
+        defer parsed.deinit();
+        const err = parsed.value.object.get("error").?.object;
+        try std.testing.expectEqualStrings("rate_limited", err.get("code").?.string);
+        try std.testing.expectEqualStrings("try later", err.get("message").?.string);
+        try std.testing.expectEqual(true, err.get("retryable").?.bool);
+    }
+
+    // A framework-known error maps to a stable code.
+    {
+        const out = try formatToolError(allocator, error.PermissionDenied, null);
+        defer allocator.free(out);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, out, .{});
+        defer parsed.deinit();
+        const err = parsed.value.object.get("error").?.object;
+        try std.testing.expectEqualStrings("permission_denied", err.get("code").?.string);
+        try std.testing.expectEqual(false, err.get("retryable").?.bool);
+    }
+
+    // Anything else keeps the legacy shape — reported, not swallowed.
+    {
+        const out = try formatToolError(allocator, error.OutOfMemory, null);
+        defer allocator.free(out);
+        try std.testing.expectEqualStrings("{\"error\":\"OutOfMemory\"}", out);
+    }
 }

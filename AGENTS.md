@@ -271,6 +271,9 @@ pub fn init() !void {}   // deps before dependents
 pub fn deinit() void {}  // reverse order
 ```
 
+模块状态用 `initWith(ctx)` + `ctx.state(T)`（按 Application 实例键控，deinit 时逆序拆除），
+**不要**用文件级 `pub var`——它跨 app 实例存活，多相位验收/多 app 测试会读到上一轮的值。
+
 ### Error handling
 - Use `ZigModuError` from `zmodu.ZigModuError` (NOT raw `error{...}`)
 - Log errors — never **swallow** a failure you depend on. `catch {}` on an I/O or DB call whose result the rest of the code needs is a violation (audit `b10`); on *best-effort cleanup* — `errdefer` teardown, a `rollback` you can no longer act on, `sendError` writing to an already-failing response — the original error is what matters and the cleanup failure is secondary, so a bare `catch {}` is idiomatic there. **但两条链的口径不同，别只看这一条**：`zmodu audit` 的 b10 豁免是**整行子串匹配** `errdefer` / `rollback` / `sendError`（行尾注释、`self.rollback_cmd`、`self.sendError_queue.peek()` 这类同名列同样会被豁免——实测如此），`// audit: ignore b10` 也必须与该行同处一行；而 `zig build check` 的 hot-path catch 扫描（`scripts/check-production.sh`）**不豁免这三类、也没有 ignore 标记**，在它 `ENFORCED_PREFIXES` 下的生产代码里写这三种形状照样判红。要两边都过就按扫描器的口径写：`catch |err|` + 非空 body（清理场景可以只降级成 debug 日志）。

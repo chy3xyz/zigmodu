@@ -15,6 +15,8 @@ const EventRegistry = @import("core/EventRegistry.zig").EventRegistry;
 const rt_mod = @import("runtime.zig");
 const ModuleGraph = @import("core/ModuleGraph.zig");
 const ModuleContext = @import("core/ModuleContext.zig").ModuleContext;
+const ModuleState = @import("core/ModuleState.zig").ModuleState;
+const sqlx = @import("sqlx/sqlx.zig");
 const Container = @import("di/Container.zig").Container;
 
 /// Atomic flag for graceful shutdown coordination (set by signal handler).
@@ -78,6 +80,9 @@ pub const Application = struct {
     /// `runtime()` call and shut down by `stop()`. Null means "this app never
     /// used it" — the module lifecycle is unchanged either way.
     runtime_state: ?*rt_mod.Runtime = null,
+    /// Per-Application module state slots (`ctx.state(T)`), torn down after the
+    /// modules stop so a module's `deinit` can still read its state.
+    module_states: ModuleState,
 
     pub const State = enum {
         initialized,
@@ -88,6 +93,10 @@ pub const Application = struct {
 
     pub const Config = struct {
         name: []const u8 = "app",
+        /// Drivers the app actually uses. `start()` refuses to boot when one of
+        /// them was not compiled in (`-Ddb=`), so a misconfigured deploy fails
+        /// at startup instead of the first query (which surfaced as a 400).
+        expect_drivers: []const sqlx.Driver = &.{},
         validate_on_start: bool = true,
         auto_generate_docs: bool = false,
         docs_path: ?[]const u8 = null,
@@ -156,12 +165,14 @@ pub const Application = struct {
                 .pool_threads = options.pool_threads,
                 .blocking_threads = options.blocking_threads,
                 .max_blocking_workers = options.max_blocking_workers,
+                .expect_drivers = options.expect_drivers,
             },
             .state = .initialized,
             .shutdown_hooks = std.ArrayList(*const fn () void).empty,
             .registry = registry,
             .events = EventRegistry.init(allocator, io),
             .services = Container.init(allocator),
+            .module_states = ModuleState.init(allocator),
         };
     }
 
@@ -176,6 +187,8 @@ pub const Application = struct {
             self.runtime_state = null;
         }
         if (self.registry) |*r| r.deinit();
+        // After the modules: a module's `deinit` may still read its state.
+        self.module_states.deinit();
         self.events.deinit();
         self.services.deinit();
         self.modules.deinit();
@@ -208,6 +221,16 @@ pub const Application = struct {
             try self.validate();
         }
 
+        // Compiled-driver self-check: the build option and the runtime plan are
+        // two different places, and the gap used to appear as a 400 on the
+        // first request rather than at boot.
+        for (self.config.expect_drivers) |driver| {
+            if (!sqlx.DriverFeatures.isEnabled(driver)) {
+                std.log.err("Application '{s}' expects the {s} driver, but it was not compiled in (check -Ddb=)", .{ self.config.name, @tagName(driver) });
+                return error.DriverNotEnabled;
+            }
+        }
+
         // Generate docs if configured
         if (self.config.auto_generate_docs) {
             if (self.config.docs_path) |path| {
@@ -223,6 +246,7 @@ pub const Application = struct {
             .io = self.io,
             .events = &self.events,
             .services = &self.services,
+            .states = &self.module_states,
             .runtime_provider = .{ .ctx = self, .get = provideRuntime },
         };
         try Lifecycle.startAllWith(&self.modules, &module_ctx);
@@ -405,6 +429,8 @@ pub const ApplicationBuilder = struct {
     pending_services: std.ArrayList(PendingService),
     /// Compile-time module-graph check (see `ModuleGraph`), on by default.
     comptime_graph_check: bool = true,
+    /// Drivers `Application.start()` must find compiled in (see `Config`).
+    expect_drivers: []const sqlx.Driver = &.{},
     /// Advisory threshold for "this module depends on too much". Defaults to
     /// `ModuleGraph.Limits.max_dependencies` (the comptime check's limit).
     max_dependencies: usize = (ModuleGraph.Limits{}).max_dependencies,
@@ -577,6 +603,7 @@ pub const ApplicationBuilder = struct {
                 .pool_threads = self.pool_threads,
                 .blocking_threads = self.blocking_threads,
                 .max_blocking_workers = self.max_blocking_workers,
+                .expect_drivers = self.expect_drivers,
             },
         );
         errdefer app.deinit();
@@ -1373,4 +1400,65 @@ test "Application: no withBlockingThreads means no blocking pool at all" {
     try std.testing.expectEqual(@as(usize, 0), rt.stats().workers);
 
     app.stop();
+}
+
+test "per-app module state: isolated slots per module and torn down after modules" {
+    const allocator = std.testing.allocator;
+
+    const Slot = struct {
+        n: usize = 0,
+        var deinits: usize = 0;
+        pub fn deinit(self: *@This()) void {
+            _ = self;
+            deinits += 1;
+        }
+    };
+    const Probe = struct {
+        var a_ptr: ?*Slot = null;
+        var b_ptr: ?*Slot = null;
+    };
+
+    const A = struct {
+        pub const info = api.Module{ .name = "a", .description = "a" };
+        pub fn initWith(ctx: *ModuleContext) !void {
+            const st = try ctx.state(Slot);
+            st.n = 1;
+            Probe.a_ptr = st;
+        }
+        pub fn deinit() void {}
+    };
+    const B = struct {
+        pub const info = api.Module{ .name = "b", .description = "b" };
+        pub fn initWith(ctx: *ModuleContext) !void {
+            const st = try ctx.state(Slot);
+            st.n = 2;
+            Probe.b_ptr = st;
+        }
+        pub fn deinit() void {}
+    };
+
+    var app = try Application.init(std.testing.io, allocator, "state-test", .{ A, B }, .{});
+    try app.start();
+    // Same type, different module names → different slots, each with its value.
+    try std.testing.expect(Probe.a_ptr != null and Probe.b_ptr != null);
+    try std.testing.expect(Probe.a_ptr.? != Probe.b_ptr.?);
+    try std.testing.expectEqual(@as(usize, 1), Probe.a_ptr.?.n);
+    try std.testing.expectEqual(@as(usize, 2), Probe.b_ptr.?.n);
+    try std.testing.expectEqual(@as(usize, 2), app.module_states.count());
+
+    app.stop();
+    // `stop` leaves the slots alive: a module's deinit may still read them.
+    try std.testing.expectEqual(@as(usize, 0), Slot.deinits);
+    app.deinit();
+    try std.testing.expectEqual(@as(usize, 2), Slot.deinits);
+}
+
+test "expect_drivers: a compiled driver passes the startup self-check" {
+    const allocator = std.testing.allocator;
+    var app = try Application.init(std.testing.io, allocator, "drivers", .{}, .{
+        .expect_drivers = &.{.sqlite},
+    });
+    defer app.deinit();
+    try app.start();
+    try std.testing.expectEqual(Application.State.started, app.getState());
 }

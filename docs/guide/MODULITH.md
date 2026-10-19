@@ -197,6 +197,31 @@ pub fn main() !void {
 
 ---
 
+## 6.5 模块状态：按 Application 实例，而不是文件级全局
+
+`pub var` 状态会跨 `Application` 实例存活：多相位验收（replay → live）、
+测试里连续起多个 app、热重载，都会读到上一轮的值。用 `initWith` 的
+`ModuleContext` 拿按实例键控的槽位：
+
+```zig
+const BookState = struct {
+    open_orders: usize = 0,
+    pub fn deinit(self: *@This()) void { _ = self; } // 可选：app 拆除时调用
+};
+
+pub fn initWith(ctx: *zmodu.core.ModuleContext) !void {
+    const st = try ctx.state(BookState);   // 本 app 内首次创建；之后同一指针
+    st.open_orders = 0;
+}
+```
+
+- 键是 **(模块名, 类型)**：两个模块用同一类型得到两个槽位；同一模块重复调用得到同一指针。
+- 生命周期 = `Application`：`stop()` 不拆（模块 `deinit` 仍可读），
+  `Application.deinit()` 在模块停止之后按创建逆序调用 `T.deinit`（若声明）并释放。
+- `T{}` 必须可构造；否则用 `ctx.stateWith(T, value)`。`ctx.stateGet(T)` 只取不建。
+- 裸 `ModuleContext`（没有 Application 的测试 harness）没有槽位，`state()` 返回
+  `error.ModuleStateUnavailable`。
+
 ## 7. 第一周 Checklist
 
 - [ ] 域模块五文件布局 + `info.dependencies`

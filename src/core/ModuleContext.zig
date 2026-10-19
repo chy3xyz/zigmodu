@@ -10,6 +10,7 @@ const std = @import("std");
 const EventRegistry = @import("EventRegistry.zig").EventRegistry;
 const Container = @import("../di/Container.zig").Container;
 const rt_mod = @import("../runtime.zig");
+const ModuleState = @import("ModuleState.zig").ModuleState;
 
 pub const ModuleContext = struct {
     allocator: std.mem.Allocator,
@@ -20,6 +21,13 @@ pub const ModuleContext = struct {
     /// it is frozen after all modules have started, after which `get` is a
     /// lock-free read safe for concurrent handlers.
     services: *Container,
+    /// The module this context was built for. Set by `Lifecycle.startAllWith`
+    /// before each `initWith`; it scopes `state()` slots and must not be
+    /// retained past startup.
+    module_name: []const u8 = "",
+    /// Per-Application module state slots (see `ModuleState`). Null in a bare
+    /// harness that did not build an Application.
+    states: ?*ModuleState = null,
     /// Access to the app's execution runtime (workers / mailboxes / timers).
     /// Supplied by the host; a bare `Lifecycle.startAllWith` harness leaves it
     /// null, and then `runtime()` returns `error.RuntimeUnavailable`.
@@ -41,6 +49,24 @@ pub const ModuleContext = struct {
     /// Typed service lookup (see `Container.get`).
     pub fn service(self: *ModuleContext, comptime T: type, name: []const u8) ?*T {
         return self.services.get(T, name);
+    }
+
+    /// This module's state slot for `T`, created once per Application.
+    /// `T{}` must be constructible; use `stateWith` otherwise.
+    pub fn state(self: *ModuleContext, comptime T: type) !*T {
+        return self.stateWith(T, .{});
+    }
+
+    /// Like `state`, with an explicit initial value (used only on creation).
+    pub fn stateWith(self: *ModuleContext, comptime T: type, initial: T) !*T {
+        const reg = self.states orelse return error.ModuleStateUnavailable;
+        return reg.getOrCreate(T, self.module_name, initial);
+    }
+
+    /// An already-created slot, or null. Never allocates a new one.
+    pub fn stateGet(self: *ModuleContext, comptime T: type) ?*T {
+        const reg = self.states orelse return null;
+        return reg.get(T, self.module_name);
     }
 
     /// The app's execution runtime — spawn a worker from `initWith` and let the

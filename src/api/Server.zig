@@ -32,11 +32,8 @@ const Http2 = @import("../http/Http2.zig");
 const Http2Tls = @import("../http/Http2Tls.zig");
 const Hpack = @import("../http/Hpack.zig");
 const GrpcServiceRegistry = @import("../extensions/GrpcTransport.zig").GrpcServiceRegistry;
-const Rbac = @import("../security/Rbac.zig");
 const Time = @import("../core/Time.zig");
 const sockread = @import("../core/sockread.zig");
-const sqlx = @import("../sqlx/sqlx.zig");
-const ModuleLogger = @import("../log/ModuleLogger.zig").ModuleLogger;
 
 // ---- Types moved to `http/types.zig` (re-exported for compatibility) ----
 const types = @import("../http/types.zig");
@@ -50,7 +47,6 @@ pub const Identity = types.Identity;
 pub const EnvelopeDialect = types.EnvelopeDialect;
 pub const FieldSource = types.FieldSource;
 pub const Context = types.Context;
-const parseValue = types.parseValue;
 const isTchar = types.isTchar;
 const validateResponseField = types.validateResponseField;
 const headerLookup = types.headerLookup;
@@ -58,8 +54,6 @@ const max_response_header_value_bytes = types.max_response_header_value_bytes;
 const response_head_buffer_bytes = types.response_head_buffer_bytes;
 const getStatusText = types.getStatusText;
 const deepCopy = types.deepCopy;
-const namesEquivalent = types.namesEquivalent;
-const findLooseField = types.findLooseField;
 pub const ErrorRendererFn = types.ErrorRendererFn;
 pub const TransportErrorFn = types.TransportErrorFn;
 pub const TransportErrorBody = types.TransportErrorBody;
@@ -688,7 +682,6 @@ test "percentDecode decodes query values" {
     try std.testing.expectEqualStrings("hello", plain);
 }
 
-const Multipart = @import("../http/Multipart.zig");
 const Params = @import("../http/Params.zig").Params;
 
 const ParsedRequest = struct {
