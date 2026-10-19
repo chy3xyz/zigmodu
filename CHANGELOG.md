@@ -1,5 +1,23 @@
 # Changelog
 
+## [Unreleased]
+
+### 安全：AI 租户作用域收敛（**行为变化：审批 API 无 scope 从"列全部"改为 403**）
+
+- **`ai.SkillContext.fromHttp(ctx)`**：HTTP 边界的官方构造入口——只从 JWT
+  中间件写的 attrs（`user_id` / `tenant_id` / `permissions`）取值，缺失或非数字
+  返回 `TenantRequired` / `UserRequired` / `MalformedTenant` / `MalformedUser`
+  而不是静默的 `null`/`0`；权限 CSV 拆分并挂到请求 allocator。配套
+  `requireTenant()` / `requireIdentity()` 供必须带身份的路径自检。
+- **审批 API 的租户来源修复**：`ApprovalApi` 原先把 `X-Tenant-ID` 当作用域，
+  且无 header 时 `tenant_id = null` 会**列出所有租户**的待审批项（含可用于
+  resolve 的 `run_id`）。现在：已验证的 `tenant_id` attr 为准；header 与 attr
+  冲突 → 403；无任何已验证作用域 → 403（除非显式
+  `Config.allow_tenant_header = true` 的网关形态）。`approve/reject` 同样只
+  在所属租户内解析，跨租户请求答 404 且条目保持 pending。
+- 文档：`docs/ai/AI_DEV_GUIDE.md` 的接入方式与安全清单、`AGENT_RUNTIME.md`
+  的"身份 ≠ 鉴权"同步。
+
 ## [0.39.18] - 2026-10-18
 
 ### 依赖：zent → v0.96.0（**破坏性：否**；错误集增长）

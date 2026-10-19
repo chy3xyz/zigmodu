@@ -177,10 +177,22 @@ defer wf_result.deinit();
 
 ## 6. 接入方式
 
-**HTTP（ComptimeRouter）**：handler 里组装 `SkillContext` 后调
-`agent.run` / `wf.run`，把 `result.answer` 用 `ctx.json` 返回；权限来自 JWT
-中间件写的 attrs（`user_id` / `tenant_id` / `permissions`）——`SkillContext`
-的 `tenant_id` 就是从它取的，参考 `examples/ai-ops` 的接线。
+**HTTP（ComptimeRouter）**：handler 里用 **`ai.SkillContext.fromHttp(ctx)`**
+构造上下文后调 `agent.run` / `wf.run`，把 `result.answer` 用 `ctx.json` 返回：
+
+```zig
+fn runAgent(ctx: *http.Context, self: *State) !void {
+    const sctx = try ai.SkillContext.fromHttp(ctx);   // 失败即拒绝，不猜
+    var result = try self.agent.run(ctx.allocator, goal, &sctx, 8);
+    try ctx.json(200, .{ .answer = result.answer });
+}
+```
+
+它只从 JWT 中间件写的 **attrs**（`user_id` / `tenant_id` / `permissions`）取值，
+**不读** header / body；缺失或非数字即 `error.TenantRequired` / `UserRequired` /
+`MalformedTenant` — fail-closed，避免"少传一个字段 = 租户 0"。权限码按 CSV 拆好，
+内存挂在 `ctx.allocator`（请求 arena），只在该请求内有效。单租户 / 无身份场景请显式
+写 `SkillContext{…}` 字面量，不要靠 fromHttp 猜。
 
 **cron**：
 
@@ -205,7 +217,9 @@ server，`tools/list` 自动从注册表推导参数 schema，并列出注册表
 - [ ] `guard.allow`（空 = 什么都不放行）+ `Agent.allowlist`（null = 全部注册工具）两处都只列业务需要的技能；`admin.*` 不要注册进暴露面
 - [ ] 写操作技能设 `required_permission` + 事务性 outbox + 幂等键（`run_id`）
 - [ ] handler 返回值全部 `ctx.allocator` 持有，调用方 `freeValue`
-- [ ] `SkillContext.tenant_id` 从请求/JWT 注入；多租户应用用 `registerBusinessSkillsWith(..., .{ .db_query_tenant_column = "<列名>" })`（默认入口会让 `db.query` fail-closed），实体技能按实体声明的 `tenant_column` 隔离
+- [ ] HTTP 边界一律用 `ai.SkillContext.fromHttp(ctx)`（attrs 取身份）；多租户应用用 `registerBusinessSkillsWith(..., .{ .db_query_tenant_column = "<列名>" })`（默认入口会让 `db.query` fail-closed），实体技能按实体声明的 `tenant_column` 隔离
+- [ ] 审批 API（`ai.approval_api.ApprovalApi`）的租户作用域来自**已验证的 `tenant_id` attr**；`X-Tenant-ID` 只有显式 `Config.allow_tenant_header = true` 才能顶替，且与 attr 冲突时 403。无作用域的请求现在是 403，**不再**列出全部租户
+- [ ] RAG（`Retriever`）接口暂无 scope 参数 —— 必须由应用实现方保证按租户分区/过滤，禁止"共享索引 + 相似度截断"当隔离
 - [ ] 长任务设 `deadline_ms` / `tool_timeout_ms` / `Budget`
 - [ ] 生产打开 `audit`（`AgentAuditLog` / `RunAuditStore`）与指标
 - [ ] LLM 决策「拿不准就转人工」，绝不静默批准（`ai.llm` 已内建该姿态）

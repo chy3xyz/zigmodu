@@ -15,14 +15,51 @@ const freeValue = @import("skill.zig").freeValue;
 const skill = @import("skill.zig");
 const json_shape = @import("json_shape.zig");
 
-/// `X-Tenant-ID` as a scope. Absent means the caller did not scope the request
-/// (the queue then answers with everything it holds); **present but
-/// unparseable** is a malformed request, not a missing scope. Reading it as
-/// `null` turned `X-Tenant-ID: abc` into an unscoped listing — a typo away
-/// from crossing tenants.
-fn parseTenantHeader(ctx: *http.Context) error{MalformedTenant}!?i64 {
-    const h = ctx.header("X-Tenant-ID") orelse return null;
-    return std.fmt.parseInt(i64, h, 10) catch error.MalformedTenant;
+/// HTTP surface configuration for `ApprovalApi`.
+pub const Config = struct {
+    /// Let `X-Tenant-ID` scope the queue **when the request carries no
+    /// verified `tenant_id` attribute** (a gateway that mints the header
+    /// after authenticating). Off by default. The header never overrides a
+    /// verified attribute — a disagreement is `403`, and a request with
+    /// neither is `403` rather than "every tenant".
+    allow_tenant_header: bool = false,
+};
+
+/// Scope the approval queue by the **verified** identity, never by client
+/// input alone.
+///
+/// The catalog JWT middleware writes `tenant_id` as a request attribute, and
+/// that is the scope this API answers. `X-Tenant-ID` is client-supplied: a
+/// header that disagrees with the verified attribute is a **mismatch**
+/// (`403`), not an override — the header can never widen or move the scope.
+/// It can *substitute* only when no attribute exists **and** the deployment
+/// opted in (`Config.allow_tenant_header`), which is for gateways that mint the
+/// header after authenticating the request.
+///
+/// Absent scope is `error.TenantRequired`. The queue used to answer an
+/// unscoped caller with every tenant's rows (`requested == null` matched all),
+/// so one missing header was a cross-tenant listing — including the `run_id`s
+/// needed to resolve someone else's escalation.
+fn requestTenant(
+    ctx: *http.Context,
+    config: Config,
+) error{ MalformedTenant, TenantRequired, TenantMismatch }!i64 {
+    const claimed: ?i64 = if (ctx.header("X-Tenant-ID")) |h|
+        std.fmt.parseInt(i64, h, 10) catch return error.MalformedTenant
+    else
+        null;
+
+    if (ctx.tenantId()) |attr| {
+        const verified = std.fmt.parseInt(i64, attr, 10) catch return error.MalformedTenant;
+        if (claimed) |c| {
+            if (c != verified) return error.TenantMismatch;
+        }
+        return verified;
+    }
+    if (config.allow_tenant_header) {
+        if (claimed) |c| return c;
+    }
+    return error.TenantRequired;
 }
 
 pub const PendingApproval = struct {
@@ -241,13 +278,26 @@ pub fn registerApprovalRequestSkills(registry: *SkillRegistry) !void {
     });
 }
 
+/// The response for a scope that cannot be established: missing and
+/// mismatched scopes are refusals (`403`) rather than a silent "everything",
+/// and a malformed value is a bad request (`400`).
+fn rejectScope(ctx: *http.Context, err: anyerror) !void {
+    switch (err) {
+        error.MalformedTenant => try ctx.json(400, "{\"err\":\"malformed tenant scope\"}"),
+        error.TenantMismatch => try ctx.json(403, "{\"err\":\"X-Tenant-ID does not match the authenticated tenant\"}"),
+        else => try ctx.json(403, "{\"err\":\"tenant scope required (verified tenant_id attribute)\"}"),
+    }
+}
+
 /// ComptimeRouter module exposing a human approval queue. `QueueT` is either
 /// `ApprovalQueue` (in-memory) or `PersistentApprovalQueue` (SQL-backed) —
 /// both implement `push` / `listPending` / `resolve` / `count`.
 pub fn ApprovalApi(comptime QueueT: type) type {
     return struct {
         const Self = @This();
+
         queue: *QueueT,
+        config: Config = .{},
         pub const module_name = "approvals";
         pub const nest = .{"approvals"};
         pub const State = Self;
@@ -269,8 +319,8 @@ pub fn ApprovalApi(comptime QueueT: type) type {
                 }
                 items.deinit(ctx.allocator);
             }
-            const tenant_id = parseTenantHeader(ctx) catch {
-                try ctx.json(400, "{\"err\":\"malformed X-Tenant-ID\"}");
+            const tenant_id = requestTenant(ctx, self.config) catch |err| {
+                try rejectScope(ctx, err);
                 return;
             };
             try self.queue.listPending(ctx.allocator, &items, tenant_id);
@@ -291,8 +341,8 @@ pub fn ApprovalApi(comptime QueueT: type) type {
 
         fn resolveOne(ctx: *http.Context, self: *State, approved: bool) !void {
             const id = try ctx.paramStr("id");
-            const tenant_id = parseTenantHeader(ctx) catch {
-                try ctx.json(400, "{\"err\":\"malformed X-Tenant-ID\"}");
+            const tenant_id = requestTenant(ctx, self.config) catch |err| {
+                try rejectScope(ctx, err);
                 return;
             };
             const resolved = try self.queue.resolve(id, tenant_id);
@@ -852,6 +902,9 @@ test "GET /approvals/pending escapes quotes in the pending rows" {
         .amount = 50000,
         .note = try allocator.dupe(u8, "needs \\ CFO"),
         .step_name = try allocator.dupe(u8, "finance"),
+        // The endpoint is tenant-scoped now (the verified attribute is the
+        // scope), so the row and the request must share one.
+        .tenant_id = 7,
     });
 
     const Api = ApprovalApi(ApprovalQueue);
@@ -860,6 +913,8 @@ test "GET /approvals/pending escapes quotes in the pending rows" {
     var app: AppState = .{};
     var server = @import("../api/Server.zig").Server.initWithConfig(std.testing.io, allocator, .{ .port = 18097 });
     defer server.deinit();
+    // What the catalog JWT middleware does in production.
+    try server.addMiddleware(@import("../http/Testkit.zig").tenantMiddleware("7"));
     var router = http.Router(AppState).init(std.testing.io, allocator, &server, &app);
     defer router.deinit();
     var root = router.scope("");
@@ -882,4 +937,121 @@ test "GET /approvals/pending escapes quotes in the pending rows" {
     try std.testing.expectEqual(@as(i64, 50000), row.get("amount").?.integer);
     try std.testing.expectEqualStrings("needs \\ CFO", row.get("note").?.string);
     try std.testing.expectEqualStrings("finance", row.get("step").?.string);
+}
+
+// ---- tenant scope of the HTTP surface -------------------------------------
+//
+// The queue itself is tenant-scoped (`listPending` / `resolve` take a tenant),
+// but the HTTP layer used to take that tenant from `X-Tenant-ID` alone and to
+// read "no header" as "no scope", which the queue then answered with every
+// tenant's rows. These tests pin the three rules: the verified attribute is
+// authoritative; a disagreement is a refusal; no verified scope is a refusal
+// unless a deployment opted into the gateway header.
+
+const testing_alloc = std.testing.allocator;
+
+fn pushPending(queue: *ApprovalQueue, run_id: []const u8, tenant_id: ?i64) !void {
+    try queue.push(.{
+        .run_id = try testing_alloc.dupe(u8, run_id),
+        .subject = try testing_alloc.dupe(u8, "subject"),
+        .amount = 100,
+        .note = try testing_alloc.dupe(u8, ""),
+        .step_name = try testing_alloc.dupe(u8, "step"),
+        .tenant_id = tenant_id,
+    });
+}
+
+test "approval API lists only the verified tenant's rows" {
+    var queue = ApprovalQueue.init(testing_alloc, std.testing.io);
+    defer queue.deinit();
+    try pushPending(&queue, "ap-7", 7);
+    try pushPending(&queue, "ap-9", 9);
+
+    const Api = ApprovalApi(ApprovalQueue);
+    var state = Api{ .queue = &queue };
+
+    var ctx = try http.Context.init(testing_alloc, .GET, "/approvals/pending");
+    defer ctx.deinit();
+    try ctx.setAttr("tenant_id", "7");
+
+    try Api.listPending(&ctx, &state);
+    try std.testing.expectEqual(@as(u16, 200), ctx.status_code);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.response_body.items, "ap-7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.response_body.items, "ap-9") == null);
+}
+
+test "approval API refuses a request that claims another tenant in the header" {
+    var queue = ApprovalQueue.init(testing_alloc, std.testing.io);
+    defer queue.deinit();
+    try pushPending(&queue, "ap-7", 7);
+    try pushPending(&queue, "ap-9", 9);
+
+    const Api = ApprovalApi(ApprovalQueue);
+    var state = Api{ .queue = &queue };
+
+    var ctx = try http.Context.init(testing_alloc, .GET, "/approvals/pending");
+    defer ctx.deinit();
+    try ctx.setAttr("tenant_id", "7");
+    try ctx.headers.put(try testing_alloc.dupe(u8, "x-tenant-id"), try testing_alloc.dupe(u8, "9"));
+
+    try Api.listPending(&ctx, &state);
+    // The header never moves the scope; a contradiction is refused outright
+    // rather than answered with either tenant's rows.
+    try std.testing.expectEqual(@as(u16, 403), ctx.status_code);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.response_body.items, "ap-") == null);
+}
+
+test "approval API refuses an unscoped request instead of listing every tenant" {
+    var queue = ApprovalQueue.init(testing_alloc, std.testing.io);
+    defer queue.deinit();
+    try pushPending(&queue, "ap-7", 7);
+
+    const Api = ApprovalApi(ApprovalQueue);
+    var state = Api{ .queue = &queue };
+
+    var ctx = try http.Context.init(testing_alloc, .GET, "/approvals/pending");
+    defer ctx.deinit();
+
+    try Api.listPending(&ctx, &state);
+    try std.testing.expectEqual(@as(u16, 403), ctx.status_code);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.response_body.items, "ap-7") == null);
+}
+
+test "approval API accepts the gateway header only when the deployment opts in" {
+    var queue = ApprovalQueue.init(testing_alloc, std.testing.io);
+    defer queue.deinit();
+    try pushPending(&queue, "ap-7", 7);
+    try pushPending(&queue, "ap-9", 9);
+
+    const Api = ApprovalApi(ApprovalQueue);
+    var state = Api{ .queue = &queue, .config = .{ .allow_tenant_header = true } };
+
+    var ctx = try http.Context.init(testing_alloc, .GET, "/approvals/pending");
+    defer ctx.deinit();
+    try ctx.headers.put(try testing_alloc.dupe(u8, "x-tenant-id"), try testing_alloc.dupe(u8, "9"));
+
+    try Api.listPending(&ctx, &state);
+    try std.testing.expectEqual(@as(u16, 200), ctx.status_code);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.response_body.items, "ap-9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.response_body.items, "ap-7") == null);
+}
+
+test "approval API cannot resolve another tenant's escalation" {
+    var queue = ApprovalQueue.init(testing_alloc, std.testing.io);
+    defer queue.deinit();
+    try pushPending(&queue, "ap-9", 9);
+
+    const Api = ApprovalApi(ApprovalQueue);
+    var state = Api{ .queue = &queue };
+
+    var ctx = try http.Context.init(testing_alloc, .POST, "/approvals/ap-9/approve");
+    defer ctx.deinit();
+    try ctx.setAttr("tenant_id", "7");
+    try ctx.params.put(try testing_alloc.dupe(u8, "id"), try testing_alloc.dupe(u8, "ap-9"));
+
+    try Api.approve(&ctx, &state);
+    // Resolve is scoped, so the id exists but not for this tenant: the API
+    // answers 404 (no existence oracle) and the item stays pending.
+    try std.testing.expectEqual(@as(u16, 404), ctx.status_code);
+    try std.testing.expectEqual(@as(usize, 1), queue.count());
 }
