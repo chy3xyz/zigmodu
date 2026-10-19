@@ -11,15 +11,15 @@
 //!     JSON (row-capped, read-only).
 
 const std = @import("std");
-const SqlxBackend = @import("../data.zig").SqlxBackend;
-const sqlx = @import("../data.zig").sqlx;
-const SkillRegistry = @import("skill.zig").SkillRegistry;
-const SkillContext = @import("skill.zig").SkillContext;
-const OutboxPublisher = @import("../messaging/OutboxPublisher.zig").OutboxPublisher;
+const SqlxBackend = @import("../../data.zig").SqlxBackend;
+const sqlx = @import("../../data.zig").sqlx;
+const SkillRegistry = @import("../skill.zig").SkillRegistry;
+const SkillContext = @import("../skill.zig").SkillContext;
+const OutboxPublisher = @import("../../messaging/OutboxPublisher.zig").OutboxPublisher;
 const business = @import("business.zig");
-const freeValue = @import("skill.zig").freeValue;
-const skill = @import("skill.zig");
-const json_shape = @import("json_shape.zig");
+const freeValue = @import("../skill.zig").freeValue;
+const skill = @import("../skill.zig");
+const json_shape = @import("../json_shape.zig");
 
 pub const max_report_rows: usize = 100;
 
@@ -568,7 +568,7 @@ test "command.execute hands back its event at every allocation point (OOM scan)"
     defer client.deinit();
     try client.connect();
     _ = try client.exec(
-        @import("test_fixtures.zig").outbox_table_sql,
+        @import("../test_fixtures.zig").outbox_table_sql,
         &.{},
     );
     var backend = SqlxBackend{ .allocator = allocator, .client = &client };
@@ -661,7 +661,7 @@ test "command.execute writes an idempotent outbox event" {
     defer client.deinit();
     try client.connect();
     _ = try client.exec(
-        @import("test_fixtures.zig").outbox_table_sql,
+        @import("../test_fixtures.zig").outbox_table_sql,
         &.{},
     );
     var backend = SqlxBackend{ .allocator = allocator, .client = &client };
@@ -739,7 +739,7 @@ test "command.execute outbox payload escapes quotes in the run id" {
     defer client.deinit();
     try client.connect();
     _ = try client.exec(
-        @import("test_fixtures.zig").outbox_table_sql,
+        @import("../test_fixtures.zig").outbox_table_sql,
         &.{},
     );
     var backend = SqlxBackend{ .allocator = allocator, .client = &client };

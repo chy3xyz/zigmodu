@@ -5,11 +5,11 @@
 //! the send gate is where a human-in-the-loop approval lives.
 
 const std = @import("std");
-const SqlxBackend = @import("../data.zig").SqlxBackend;
-const SkillContext = @import("skill.zig").SkillContext;
-const OutboxPublisher = @import("../messaging/OutboxPublisher.zig").OutboxPublisher;
-const reporter = @import("reporter.zig");
-const skill = @import("skill.zig");
+const SqlxBackend = @import("../../data.zig").SqlxBackend;
+const SkillContext = @import("../skill.zig").SkillContext;
+const OutboxPublisher = @import("../../messaging/OutboxPublisher.zig").OutboxPublisher;
+const reporter = @import("../reporter.zig");
+const skill = @import("../skill.zig");
 
 pub const ClassifyFn = *const fn (
     allocator: std.mem.Allocator,
@@ -111,11 +111,11 @@ pub const TicketFlow = struct {
 
 test "TicketFlow triages with context and writes to outbox" {
     const allocator = std.testing.allocator;
-    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
     _ = try client.exec(
-        @import("test_fixtures.zig").outbox_table_sql,
+        @import("../test_fixtures.zig").outbox_table_sql,
         &.{},
     );
     _ = try client.exec("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT, plan TEXT)", &.{});
@@ -161,11 +161,11 @@ test "TicketFlow triages with context and writes to outbox" {
 
 test "TicketFlow outbox payload escapes quotes in the drafted reply" {
     const allocator = std.testing.allocator;
-    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
     _ = try client.exec(
-        @import("test_fixtures.zig").outbox_table_sql,
+        @import("../test_fixtures.zig").outbox_table_sql,
         &.{},
     );
     var backend = SqlxBackend{ .allocator = allocator, .client = &client };

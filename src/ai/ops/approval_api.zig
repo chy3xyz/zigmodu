@@ -7,13 +7,13 @@
 //! consumer / a database when the queue must survive restarts.
 
 const std = @import("std");
-const http = @import("../http.zig");
-const approval = @import("approval.zig");
-const SkillContext = @import("skill.zig").SkillContext;
-const SkillRegistry = @import("skill.zig").SkillRegistry;
-const freeValue = @import("skill.zig").freeValue;
-const skill = @import("skill.zig");
-const json_shape = @import("json_shape.zig");
+const http = @import("../../http.zig");
+const approval = @import("../approval.zig");
+const SkillContext = @import("../skill.zig").SkillContext;
+const SkillRegistry = @import("../skill.zig").SkillRegistry;
+const freeValue = @import("../skill.zig").freeValue;
+const skill = @import("../skill.zig");
+const json_shape = @import("../json_shape.zig");
 
 /// HTTP surface configuration for `ApprovalApi`.
 pub const Config = struct {
@@ -511,10 +511,10 @@ const approval_api_mod = @This();
 // field's failure stranded the first field's key with it.
 test "approval.request hands back its response at every allocation point (OOM scan)" {
     const allocator = std.testing.allocator;
-    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
-    var backend = @import("../data.zig").SqlxBackend{ .allocator = allocator, .client = &client };
+    var backend = @import("../../data.zig").SqlxBackend{ .allocator = allocator, .client = &client };
 
     const Escalate = struct {
         fn policy(_: std.mem.Allocator, _: *SkillContext, _: []const u8, _: i64, _: usize, _: []const u8, _: []const u8, _: *[]const u8) anyerror!approval.ApprovalDecision {
@@ -594,14 +594,14 @@ test "ApprovalQueue push/resolve lifecycle" {
 
 test "queuedEscalation pushes escalated runs into the queue" {
     const allocator = std.testing.allocator;
-    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
     _ = try client.exec(
-        @import("test_fixtures.zig").outbox_table_sql,
+        @import("../test_fixtures.zig").outbox_table_sql,
         &.{},
     );
-    var backend = @import("../data.zig").SqlxBackend{ .allocator = allocator, .client = &client };
+    var backend = @import("../../data.zig").SqlxBackend{ .allocator = allocator, .client = &client };
 
     var queue = ApprovalQueue.init(allocator, std.testing.io);
     defer queue.deinit();
@@ -690,10 +690,10 @@ test "ApprovalApi mounts with both in-memory and persistent queues" {
     var mem_api = MemApi{ .queue = &mem_queue };
 
     // Persistent queue + API module.
-    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
-    var backend = @import("../data.zig").SqlxBackend{ .allocator = allocator, .client = &client };
+    var backend = @import("../../data.zig").SqlxBackend{ .allocator = allocator, .client = &client };
     var persistent = @import("approval_store.zig").PersistentApprovalQueue.init(allocator, &backend);
     try persistent.migrate();
     const PersApi = ApprovalApi(@import("approval_store.zig").PersistentApprovalQueue);
@@ -701,7 +701,7 @@ test "ApprovalApi mounts with both in-memory and persistent queues" {
 
     const AppState = struct {};
     var app: AppState = .{};
-    var server = @import("../api/Server.zig").Server.initWithConfig(std.testing.io, allocator, .{ .port = 18098 });
+    var server = @import("../../api/Server.zig").Server.initWithConfig(std.testing.io, allocator, .{ .port = 18098 });
     defer server.deinit();
     var router = http.Router(AppState).init(std.testing.io, allocator, &server, &app);
     defer router.deinit();
@@ -720,14 +720,14 @@ test "ApprovalApi mounts with both in-memory and persistent queues" {
 
 test "approval.request skill submits and reports the chain status" {
     const allocator = std.testing.allocator;
-    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
     _ = try client.exec(
-        @import("test_fixtures.zig").outbox_table_sql,
+        @import("../test_fixtures.zig").outbox_table_sql,
         &.{},
     );
-    var backend = @import("../data.zig").SqlxBackend{ .allocator = allocator, .client = &client };
+    var backend = @import("../../data.zig").SqlxBackend{ .allocator = allocator, .client = &client };
     var queue = ApprovalQueue.init(allocator, std.testing.io);
     defer queue.deinit();
 
@@ -915,19 +915,19 @@ test "GET /approvals/pending escapes quotes in the pending rows" {
     var api_state = Api{ .queue = &queue };
     const AppState = struct {};
     var app: AppState = .{};
-    var server = @import("../api/Server.zig").Server.initWithConfig(std.testing.io, allocator, .{ .port = 18097 });
+    var server = @import("../../api/Server.zig").Server.initWithConfig(std.testing.io, allocator, .{ .port = 18097 });
     defer server.deinit();
     // What the catalog JWT middleware does in production.
-    try server.addMiddleware(@import("../http/Testkit.zig").tenantMiddleware("7"));
+    try server.addMiddleware(@import("../../http/Testkit.zig").tenantMiddleware("7"));
     var router = http.Router(AppState).init(std.testing.io, allocator, &server, &app);
     defer router.deinit();
     var root = router.scope("");
     try root.mount(Api, &api_state);
-    var slot: @import("../api/ComptimeRouter.zig").CatalogSlot = .{};
+    var slot: @import("../../api/ComptimeRouter.zig").CatalogSlot = .{};
     defer slot.deinit();
     slot.set(try router.finish());
 
-    var resp = try @import("../http/Testkit.zig").dispatch(&server, .GET, "/approvals/pending", null);
+    var resp = try @import("../../http/Testkit.zig").dispatch(&server, .GET, "/approvals/pending", null);
     defer resp.deinit(allocator);
     try std.testing.expectEqual(@as(u16, 200), resp.status_code);
 

@@ -5,9 +5,9 @@
 //! memory version.
 
 const std = @import("std");
-const SqlxBackend = @import("../data.zig").SqlxBackend;
-const sqlx = @import("../data.zig").sqlx;
-const SkillContext = @import("skill.zig").SkillContext;
+const SqlxBackend = @import("../../data.zig").SqlxBackend;
+const sqlx = @import("../../data.zig").sqlx;
+const SkillContext = @import("../skill.zig").SkillContext;
 const approval_api = @import("approval_api.zig");
 
 pub const PendingApproval = approval_api.PendingApproval;
@@ -39,7 +39,7 @@ pub const PersistentApprovalQueue = struct {
 
     pub fn push(self: *Self, item: PendingApproval) !void {
         try sqlx.validateIdentifier(self.table);
-        const now = @import("../core/Time.zig").monotonicNowSeconds();
+        const now = @import("../../core/Time.zig").monotonicNowSeconds();
         if (item.tenant_id) |tid| {
             const sql = try self.allocator.print(
                 "INSERT INTO {s} (run_id, subject, amount, note, step_name, tenant_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
@@ -110,7 +110,7 @@ pub const PersistentApprovalQueue = struct {
     /// a row was updated.
     pub fn resolve(self: *Self, run_id: []const u8, tenant_id: ?i64) !bool {
         try sqlx.validateIdentifier(self.table);
-        const now = @import("../core/Time.zig").monotonicNowSeconds();
+        const now = @import("../../core/Time.zig").monotonicNowSeconds();
         const sql = if (tenant_id) |tid| try self.allocator.print(
             "UPDATE {s} SET status = 1, updated_at = ? WHERE run_id = ? AND tenant_id = {d} AND status = 0",
             .{ self.table, tid },
@@ -164,7 +164,7 @@ pub fn queuedEscalationPersistent(
 // reach the driver.
 test "PersistentApprovalQueue.listPending hands back its rows at every allocation point (OOM scan)" {
     const allocator = std.testing.allocator;
-    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
     var backend = SqlxBackend{ .allocator = allocator, .client = &client };
@@ -195,7 +195,7 @@ test "PersistentApprovalQueue.listPending hands back its rows at every allocatio
 
 test "PersistentApprovalQueue push, list and resolve across queries" {
     const allocator = std.testing.allocator;
-    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
     var backend = SqlxBackend{ .allocator = allocator, .client = &client };
@@ -240,7 +240,7 @@ test "PersistentApprovalQueue push, list and resolve across queries" {
 
 test "PersistentApprovalQueue rejects a table name that is not a plain identifier" {
     const allocator = std.testing.allocator;
-    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
     var backend = SqlxBackend{ .allocator = allocator, .client = &client };

@@ -16,13 +16,13 @@
 //! context and no declaration the query is *refused*, never run unscoped.
 
 const std = @import("std");
-const SqlxBackend = @import("../data.zig").SqlxBackend;
-const sqlx = @import("../data.zig").sqlx;
-const SkillRegistry = @import("skill.zig").SkillRegistry;
-const SkillContext = @import("skill.zig").SkillContext;
-const freeValue = @import("skill.zig").freeValue;
-const putJsonField = @import("skill.zig").putJsonField;
-const json_shape = @import("json_shape.zig");
+const SqlxBackend = @import("../../data.zig").SqlxBackend;
+const sqlx = @import("../../data.zig").sqlx;
+const SkillRegistry = @import("../skill.zig").SkillRegistry;
+const SkillContext = @import("../skill.zig").SkillContext;
+const freeValue = @import("../skill.zig").freeValue;
+const putJsonField = @import("../skill.zig").putJsonField;
+const json_shape = @import("../json_shape.zig");
 
 pub const max_rows: usize = 100;
 pub const default_limit: usize = 20;

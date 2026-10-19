@@ -3,6 +3,7 @@
 //! is written to the outbox for audit and downstream automation.
 
 const std = @import("std");
+const ports = @import("ports.zig");
 const SqlxBackend = @import("../data.zig").SqlxBackend;
 const SkillContext = @import("skill.zig").SkillContext;
 const OutboxPublisher = @import("../messaging/OutboxPublisher.zig").OutboxPublisher;
@@ -18,8 +19,8 @@ pub const RiskRule = struct {
     args: []const sqlx.Value = &.{},
 };
 
-pub const RiskLevel = enum { low, medium, high };
-pub const RiskDecision = enum { approve, reject, escalate };
+pub const RiskLevel = ports.RiskLevel;
+pub const RiskDecision = ports.RiskDecision;
 
 /// Optional final decision callback (wire to an LLM or policy); defaults to
 /// thresholds when null.
@@ -31,12 +32,7 @@ pub const DecideFn = *const fn (
     level: RiskLevel,
 ) anyerror!RiskDecision;
 
-pub const RiskResult = struct {
-    subject: []const u8,
-    score: i32,
-    level: RiskLevel,
-    decision: RiskDecision,
-};
+pub const RiskResult = ports.RiskResult;
 
 pub const RiskReview = struct {
     allocator: std.mem.Allocator,
@@ -96,6 +92,21 @@ pub const RiskReview = struct {
         }
 
         return .{ .subject = subject, .score = score, .level = level, .decision = decision };
+    }
+
+    /// Narrow view for `proposal` (see `ports.RiskPort`).
+    pub fn toPort(self: *RiskReview) ports.RiskPort {
+        return .{ .ptr = self, .reviewFn = struct {
+            fn f(
+                ptr: *anyopaque,
+                allocator: std.mem.Allocator,
+                ctx: *SkillContext,
+                subject: []const u8,
+            ) anyerror!ports.RiskResult {
+                const engine: *RiskReview = @ptrCast(@alignCast(ptr));
+                return engine.review(allocator, ctx, subject);
+            }
+        }.f };
     }
 };
 

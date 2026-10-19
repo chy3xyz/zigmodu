@@ -5,11 +5,11 @@
 //! into `ai.notify`) and the outbox (`ai.sla`) for audit/automation.
 
 const std = @import("std");
-const SqlxBackend = @import("../data.zig").SqlxBackend;
-const SkillContext = @import("skill.zig").SkillContext;
-const OutboxPublisher = @import("../messaging/OutboxPublisher.zig").OutboxPublisher;
-const skill = @import("skill.zig");
-const Time = @import("../core/Time.zig");
+const SqlxBackend = @import("../../data.zig").SqlxBackend;
+const SkillContext = @import("../skill.zig").SkillContext;
+const OutboxPublisher = @import("../../messaging/OutboxPublisher.zig").OutboxPublisher;
+const skill = @import("../skill.zig");
+const Time = @import("../../core/Time.zig");
 
 pub const SlaLevel = enum { warn, breach };
 
@@ -89,11 +89,11 @@ pub const SlaTracker = struct {
 
 test "SlaTracker fires warn before deadline and breach after" {
     const allocator = std.testing.allocator;
-    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
     _ = try client.exec(
-        @import("test_fixtures.zig").outbox_table_sql,
+        @import("../test_fixtures.zig").outbox_table_sql,
         &.{},
     );
     var backend = SqlxBackend{ .allocator = allocator, .client = &client };
@@ -141,11 +141,11 @@ test "SlaTracker fires warn before deadline and breach after" {
 
 test "SlaTracker outbox payload escapes quotes in the item text" {
     const allocator = std.testing.allocator;
-    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
     _ = try client.exec(
-        @import("test_fixtures.zig").outbox_table_sql,
+        @import("../test_fixtures.zig").outbox_table_sql,
         &.{},
     );
     var backend = SqlxBackend{ .allocator = allocator, .client = &client };

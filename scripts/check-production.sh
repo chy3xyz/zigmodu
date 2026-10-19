@@ -259,6 +259,26 @@ if [[ "$found" != "$want" ]]; then
   exit 1
 fi
 
+# The AI core drives approval / risk / diagnosis through `ai/ports.zig`. A
+# top-level import of the concrete engines in these files re-couples them; a
+# test-scoped import (indented) is fine — tests may construct the real engine.
+for f in src/ai/agent.zig src/ai/skill.zig src/ai/workflow.zig src/ai/llm.zig src/ai/proposal.zig; do
+  if hits="$(grep -nE '^const [A-Za-z_]+ = @import\("(approval|risk|diagnose|reporter)\.zig"\);' "$f" || true)" && [[ -n "$hits" ]]; then
+    echo "check-production: $f imports a concrete orchestration engine at top level (use ai/ports.zig):" >&2
+    echo "$hits" >&2
+    exit 1
+  fi
+done
+
+# The AI core must not import the ops package: the ops layer binds
+# `data.sqlx` and concrete business tables, the core does not. `ai.zig` is the
+# barrel that re-exports both; anything under `src/ai/ops/` may import anywhere.
+if offenders="$(grep -rn '@import("ops/' src/ai --include='*.zig' 2>/dev/null | grep -v '^src/ai/ai.zig:' | grep -v '^src/ai/ops/' || true)" && [[ -n "$offenders" ]]; then
+  echo "check-production: a core AI file imports the ops package:" >&2
+  echo "$offenders" >&2
+  exit 1
+fi
+
 if [[ "$warned" -gt 0 ]]; then
   echo "check-production: OK (${warned} warning(s) in not-yet-enforced paths)"
 else

@@ -228,3 +228,25 @@ test "order service publishes created event" {
 | 运行期中途 `container.register(...)` | 启动期完成注册；运行期注册会 `ContainerFrozen` |
 
 向后兼容：只声明 `init()` 的模块行为不变；DI/事件接入是增量 opt-in，不要求一次性改完。
+
+## 声明式接线：`withServices`
+
+`withService(T, name, ptr)` 一个个注册在模块多的时候很啰嗦；同一份 tuple 一次写完：
+
+```zig
+var db: Db = .{ .connected = true };
+var cache: Cache = .{};
+
+var b = zmodu.builder(allocator, io);
+defer b.deinit();
+_ = try b.withServices(.{
+    .{ .name = "db", .instance = &db },
+    .{ .name = "cache", .instance = &cache },
+});
+var app = try b.build(.{ OrderModule, UserModule });
+```
+
+类型从指针推断（`@TypeOf(entry.instance.*)`），注册语义与 `withService` 完全一致：
+**借用**，实例必须比 Application 活得久，`builder.deinit()` 释放登记表。
+`initWith(ctx)` 里用 `ctx.service(Db, "db")` 取回；启动完成后容器 `freeze()`，
+并发读无锁。

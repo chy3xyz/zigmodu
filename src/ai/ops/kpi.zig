@@ -4,12 +4,12 @@
 //! semantics stay app-owned. A programmatic `Kpi.query` is also exposed.
 
 const std = @import("std");
-const SqlxBackend = @import("../data.zig").SqlxBackend;
-const sqlx = @import("../data.zig").sqlx;
-const SkillRegistry = @import("skill.zig").SkillRegistry;
-const SkillContext = @import("skill.zig").SkillContext;
-const freeValue = @import("skill.zig").freeValue;
-const skill = @import("skill.zig");
+const SqlxBackend = @import("../../data.zig").SqlxBackend;
+const sqlx = @import("../../data.zig").sqlx;
+const SkillRegistry = @import("../skill.zig").SkillRegistry;
+const SkillContext = @import("../skill.zig").SkillContext;
+const freeValue = @import("../skill.zig").freeValue;
+const skill = @import("../skill.zig");
 
 /// A named business metric. `sql` must return exactly one row; `value_column`
 /// selects the numeric value.

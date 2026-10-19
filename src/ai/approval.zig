@@ -8,6 +8,7 @@
 //! subject/amount/request description, never policy logic.
 
 const std = @import("std");
+const ports = @import("ports.zig");
 const SqlxBackend = @import("../data.zig").SqlxBackend;
 const SkillContext = @import("skill.zig").SkillContext;
 const SkillRegistry = @import("skill.zig").SkillRegistry;
@@ -17,13 +18,11 @@ const skill = @import("skill.zig");
 const freeValue = @import("skill.zig").freeValue;
 
 /// What happened at one approval step.
-pub const ApprovalDecision = enum { approved, escalated, rejected };
+pub const ApprovalDecision = ports.ApprovalDecision;
 
 /// One step in the chain. `name` is caller-owned (e.g. "line manager",
 /// "finance").
-pub const ApprovalStep = struct {
-    name: []const u8,
-};
+pub const ApprovalStep = ports.ApprovalStep;
 
 /// A resolved step: the decision plus an optional human note. The note is
 /// owned by the approval chain and freed by `ApprovalResult.deinit`.
@@ -33,7 +32,7 @@ pub const ApprovalEntry = struct {
     note: []const u8 = "",
 };
 
-pub const ApprovalStatus = enum { approved, pending_human, rejected };
+pub const ApprovalStatus = ports.ApprovalStatus;
 
 /// Policy hook: the app decides each step (wire to an LLM, RBAC matrix, or
 /// rule engine). On approval the chain advances; on escalation the chain stops
@@ -164,6 +163,25 @@ pub const ApprovalFlow = struct {
             .status = status,
             .entries = owned_entries,
         };
+    }
+
+    /// Narrow view for `workflow` / `proposal` (see `ports.ApprovalPort`).
+    pub fn toPort(self: *ApprovalFlow) ports.ApprovalPort {
+        return .{ .ptr = self, .submitFn = struct {
+            fn f(
+                ptr: *anyopaque,
+                allocator: std.mem.Allocator,
+                ctx: *SkillContext,
+                subject: []const u8,
+                amount: i64,
+                steps: []const ports.ApprovalStep,
+            ) anyerror!ports.ApprovalStatus {
+                const flow: *ApprovalFlow = @ptrCast(@alignCast(ptr));
+                var res = try flow.submit(allocator, ctx, subject, amount, steps);
+                defer res.deinit(allocator);
+                return res.status;
+            }
+        }.f };
     }
 
     fn writeOutbox(

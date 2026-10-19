@@ -8,7 +8,13 @@ pub const TokenQuota = struct {
     mutex: std.Io.Mutex,
     /// tenant_id → bucket
     buckets: std.AutoHashMap(i64, Bucket),
+    /// (tenant, user) → bucket. The tenant bucket stays the outer bound; a
+    /// per-user limit narrows it without replacing it (`tryConsumeFor` checks
+    /// both before consuming either).
+    user_buckets: std.AutoHashMap(UserKey, Bucket),
     default_limit: usize,
+
+    pub const UserKey = struct { tenant_id: i64, user_id: i64 };
 
     pub const Bucket = struct {
         limit: usize,
@@ -21,13 +27,72 @@ pub const TokenQuota = struct {
             .io = io,
             .mutex = .init,
             .buckets = std.AutoHashMap(i64, Bucket).init(allocator),
+            .user_buckets = std.AutoHashMap(UserKey, Bucket).init(allocator),
             .default_limit = if (default_limit == 0) 1_000_000 else default_limit,
         };
     }
 
     pub fn deinit(self: *TokenQuota) void {
         self.buckets.deinit();
+        self.user_buckets.deinit();
         self.* = undefined;
+    }
+
+    pub fn setUserLimit(self: *TokenQuota, tenant_id: i64, user_id: i64, limit: usize) !void {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+        const key = UserKey{ .tenant_id = tenant_id, .user_id = user_id };
+        const gop = try self.user_buckets.getOrPut(key);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{ .limit = limit, .used = 0 };
+        } else {
+            gop.value_ptr.limit = limit;
+        }
+    }
+
+    /// Consume against **both** the tenant and the (tenant, user) bucket.
+    /// The check happens before either counter moves, so a refusal leaves both
+    /// untouched. A user without an explicit limit inherits `default_limit`.
+    pub fn tryConsumeFor(self: *TokenQuota, tenant_id: i64, user_id: i64, tokens: usize) !void {
+        if (tokens == 0) return;
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+
+        const tenant = try self.bucketFor(&self.buckets, tenant_id);
+        const key = UserKey{ .tenant_id = tenant_id, .user_id = user_id };
+        const user = try self.bucketFor(&self.user_buckets, key);
+        if (tenant.used + tokens > tenant.limit) return error.QuotaExceeded;
+        if (user.used + tokens > user.limit) return error.QuotaExceeded;
+        tenant.used += tokens;
+        user.used += tokens;
+    }
+
+    pub fn recordFor(self: *TokenQuota, tenant_id: i64, user_id: i64, prompt_tokens: usize, completion_tokens: usize) !void {
+        try self.tryConsumeFor(tenant_id, user_id, prompt_tokens +| completion_tokens);
+    }
+
+    pub fn userUsed(self: *TokenQuota, tenant_id: i64, user_id: i64) usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const key = UserKey{ .tenant_id = tenant_id, .user_id = user_id };
+        const b = self.user_buckets.get(key) orelse return 0;
+        return b.used;
+    }
+
+    pub fn userRemaining(self: *TokenQuota, tenant_id: i64, user_id: i64) usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const key = UserKey{ .tenant_id = tenant_id, .user_id = user_id };
+        const used_now = if (self.user_buckets.get(key)) |b| b.used else 0;
+        const limit = if (self.user_buckets.get(key)) |b| b.limit else self.default_limit;
+        return if (used_now >= limit) 0 else limit - used_now;
+    }
+
+    /// Shared bucket lookup for either map (generic over the key type).
+    fn bucketFor(self: *TokenQuota, map: anytype, key: anytype) !*Bucket {
+        const gop = try map.getOrPut(key);
+        if (!gop.found_existing) gop.value_ptr.* = .{ .limit = self.default_limit, .used = 0 };
+        return gop.value_ptr;
     }
 
     pub fn setLimit(self: *TokenQuota, tenant_id: i64, limit: usize) !void {
@@ -265,4 +330,29 @@ test "setLimit, tryConsume and toPrometheusFormat report a canceled lock wait as
     PromRead.seen = null;
     try readUnderCanceledLockWait(TokenQuota, &q, &q.mutex, io, PromRead.read);
     try std.testing.expectEqual(@as(?anyerror, error.Canceled), PromRead.seen);
+}
+
+test "per-user quota narrows the tenant bound and refuses atomically" {
+    const allocator = std.testing.allocator;
+    var q = TokenQuota.init(allocator, std.testing.io, 100);
+    defer q.deinit();
+
+    try q.setLimit(1, 10);
+    try q.setUserLimit(1, 42, 5);
+
+    // Over the user limit: neither counter moves.
+    try std.testing.expectError(error.QuotaExceeded, q.tryConsumeFor(1, 42, 6));
+    try std.testing.expectEqual(@as(usize, 0), q.used(1));
+    try std.testing.expectEqual(@as(usize, 0), q.userUsed(1, 42));
+
+    try q.tryConsumeFor(1, 42, 4);
+    try std.testing.expectEqual(@as(usize, 4), q.userUsed(1, 42));
+    try std.testing.expectEqual(@as(usize, 4), q.used(1));
+    try std.testing.expectEqual(@as(usize, 1), q.userRemaining(1, 42));
+
+    // A different user has their own bucket, still bounded by the tenant.
+    try q.tryConsumeFor(1, 43, 5);
+    try std.testing.expectEqual(@as(usize, 9), q.used(1));
+    try std.testing.expectError(error.QuotaExceeded, q.tryConsumeFor(1, 43, 2));
+    try std.testing.expectEqual(@as(usize, 9), q.used(1));
 }

@@ -6,10 +6,10 @@
 //! trigger's own outbox writeback, forming a closed loop.
 
 const std = @import("std");
-const SqlxBackend = @import("../data.zig").SqlxBackend;
-const SkillContext = @import("skill.zig").SkillContext;
+const SqlxBackend = @import("../../data.zig").SqlxBackend;
+const SkillContext = @import("../skill.zig").SkillContext;
 const trigger_mod = @import("trigger.zig");
-const consumer_mod = @import("../messaging/OutboxConsumer.zig");
+const consumer_mod = @import("../../messaging/OutboxConsumer.zig");
 
 pub const BridgeStats = struct {
     matched: usize,
@@ -34,7 +34,7 @@ pub const OutboxWorkflowBridge = struct {
     routes: []const BridgeRoute,
     /// When set, the matched topic is written back to the outbox with the
     /// bridge's outcome (in addition to the trigger's own writeback).
-    outbox: ?*@import("../messaging/OutboxPublisher.zig").OutboxPublisher = null,
+    outbox: ?*@import("../../messaging/OutboxPublisher.zig").OutboxPublisher = null,
     matched_count: usize = 0,
     fired_count: usize = 0,
     failed_count: usize = 0,
@@ -91,11 +91,11 @@ pub const OutboxWorkflowBridge = struct {
 
 test "OutboxWorkflowBridge routes events into a trigger run" {
     const allocator = std.testing.allocator;
-    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
     _ = try client.exec(
-        @import("test_fixtures.zig").outbox_table_sql,
+        @import("../test_fixtures.zig").outbox_table_sql,
         &.{},
     );
     _ = try client.exec(

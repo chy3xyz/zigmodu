@@ -5,25 +5,17 @@
 //! to the outbox (`ai.diagnose`) for audit and downstream automation.
 
 const std = @import("std");
+const ports = @import("ports.zig");
 const SqlxBackend = @import("../data.zig").SqlxBackend;
 const SkillContext = @import("skill.zig").SkillContext;
 const OutboxPublisher = @import("../messaging/OutboxPublisher.zig").OutboxPublisher;
 const reporter = @import("reporter.zig");
 const skill = @import("skill.zig");
 
-pub const AnomalyCase = struct {
-    /// Source: "alert" | "recon" | "sla" | "app".
-    source: []const u8,
-    subject: []const u8,
-    severity: enum { info, warning, critical },
-    description: []const u8,
-};
+pub const AnomalyCase = ports.AnomalyCase;
 
 /// Evidence gathered for the case (one per configured query).
-pub const EvidenceBlock = struct {
-    name: []const u8,
-    markdown: []const u8,
-};
+pub const EvidenceBlock = ports.EvidenceBlock;
 
 /// Diagnostic callback: produces likely causes + recommended actions. Returned
 /// strings must be allocated in `allocator` (the flow takes ownership and

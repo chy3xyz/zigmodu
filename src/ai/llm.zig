@@ -9,9 +9,8 @@ const provider_mod = @import("provider.zig");
 const SkillContext = @import("skill.zig").SkillContext;
 const freeValue = @import("skill.zig").freeValue;
 const putJsonField = @import("skill.zig").putJsonField;
-const diagnose_mod = @import("diagnose.zig");
-const approval_mod = @import("approval.zig");
-const risk_mod = @import("risk.zig");
+const ports = @import("ports.zig");
+
 const json_shape = @import("json_shape.zig");
 
 pub const AiProvider = provider_mod.AiProvider;
@@ -119,8 +118,8 @@ pub fn buildContext(pc: *LlmPolicyCtx, allocator: std.mem.Allocator) ![]const u8
 pub fn llmDiagnose(
     allocator: std.mem.Allocator,
     ctx: *SkillContext,
-    case: diagnose_mod.AnomalyCase,
-    evidence: []const diagnose_mod.EvidenceBlock,
+    case: ports.AnomalyCase,
+    evidence: []const ports.EvidenceBlock,
     out_causes: *std.ArrayList([]const u8),
     out_actions: *std.ArrayList([]const u8),
     out_summary: *[]const u8,
@@ -191,7 +190,7 @@ pub fn llmApprove(
     step_name: []const u8,
     _context_block: []const u8,
     out_note: *[]const u8,
-) anyerror!approval_mod.ApprovalDecision {
+) anyerror!ports.ApprovalDecision {
     const pc: *LlmPolicyCtx = @ptrCast(@alignCast(ctx.userdata orelse return error.LlmNotConfigured));
     _ = _context_block;
     const rag_block = try buildContext(pc, allocator);
@@ -229,8 +228,8 @@ pub fn llmRiskDecide(
     ctx: *SkillContext,
     subject: []const u8,
     score: i32,
-    level: risk_mod.RiskLevel,
-) anyerror!risk_mod.RiskDecision {
+    level: ports.RiskLevel,
+) anyerror!ports.RiskDecision {
     const pc: *LlmPolicyCtx = @ptrCast(@alignCast(ctx.userdata orelse return error.LlmNotConfigured));
     const context_block = try buildContext(pc, allocator);
     defer if (context_block.len > 0) allocator.free(context_block);
@@ -358,7 +357,7 @@ test "buildContext injects retrieved policy chunks into the approval prompt" {
     const decision = try llmApprove(allocator, &ctx, "order-1", 150000, 0, "finance", "", &note);
     defer allocator.free(note);
     defer allocator.free(Capture.seen_prompt);
-    try std.testing.expectEqual(approval_mod.ApprovalDecision.escalated, decision);
+    try std.testing.expectEqual(ports.ApprovalDecision.escalated, decision);
     try std.testing.expect(std.mem.indexOf(u8, Capture.seen_prompt, "approval policy: large orders above 100000 always need CFO approval.") != null);
     try std.testing.expect(std.mem.indexOf(u8, Capture.seen_prompt, "approval-policy") != null);
 }
@@ -369,7 +368,7 @@ test "llmApprove approves with a canned model response" {
     var ctx = SkillContext{ .allocator = allocator, .userdata = &policy_ctx };
     var note: []const u8 = "";
     const decision = try llmApprove(allocator, &ctx, "order-1", 9000, 0, "finance", "context", &note);
-    try std.testing.expectEqual(approval_mod.ApprovalDecision.approved, decision);
+    try std.testing.expectEqual(ports.ApprovalDecision.approved, decision);
     try std.testing.expectEqualStrings("ok by policy", note);
     allocator.free(note);
 }
@@ -385,7 +384,7 @@ test "llmApprove falls back to escalate when the model fails" {
     var ctx = SkillContext{ .allocator = allocator, .userdata = &policy_ctx };
     var note: []const u8 = "";
     const decision = try llmApprove(allocator, &ctx, "order-1", 9000, 0, "finance", "", &note);
-    try std.testing.expectEqual(approval_mod.ApprovalDecision.escalated, decision);
+    try std.testing.expectEqual(ports.ApprovalDecision.escalated, decision);
     try std.testing.expect(std.mem.indexOf(u8, note, "escalated") != null);
     allocator.free(note);
 }
@@ -437,7 +436,7 @@ test "llmDiagnose parses summary, causes and actions" {
     }
     var summary: []const u8 = "";
     defer if (summary.len > 0) allocator.free(summary);
-    const evidence = [_]diagnose_mod.EvidenceBlock{};
+    const evidence = [_]ports.EvidenceBlock{};
     try llmDiagnose(allocator, &ctx, .{ .source = "alert", .subject = "orders", .severity = .critical, .description = "spike" }, &evidence, &causes, &actions, &summary);
     try std.testing.expectEqualStrings("gateway rejected", summary);
     try std.testing.expectEqual(@as(usize, 1), causes.items.len);
@@ -471,7 +470,7 @@ test "llmDiagnose hands back its out-parameters at every allocation point (OOM s
             }
             var summary: []const u8 = "";
             defer if (summary.len > 0) a.free(summary);
-            const evidence = [_]diagnose_mod.EvidenceBlock{};
+            const evidence = [_]ports.EvidenceBlock{};
             try llmDiagnose(
                 a,
                 &ctx,
@@ -517,7 +516,7 @@ test "a model reply of the wrong shape escalates instead of aborting the process
         // `.approved` is unreachable for every one of these: a reply the policy
         // cannot read is a policy that did not run, and reading it unguarded
         // aborted the process before this fallback could be reached.
-        try std.testing.expectEqual(approval_mod.ApprovalDecision.escalated, decision);
+        try std.testing.expectEqual(ports.ApprovalDecision.escalated, decision);
         if (note.len > 0) allocator.free(note);
     }
 }
@@ -533,7 +532,7 @@ test "the risk and reflection gates fail closed on a wrong-shaped reply" {
         var policy_ctx = LlmPolicyCtx{ .json_fn = replyFn(text) };
         var ctx = SkillContext{ .allocator = allocator, .userdata = &policy_ctx };
         try std.testing.expect(!try llmVerify(&ctx, "goal", "output", allocator));
-        try std.testing.expectEqual(risk_mod.RiskDecision.escalate, try llmRiskDecide(allocator, &ctx, "order-1", 60, .medium));
+        try std.testing.expectEqual(ports.RiskDecision.escalate, try llmRiskDecide(allocator, &ctx, "order-1", 60, .medium));
     }
 }
 
@@ -551,7 +550,7 @@ test "llmDiagnose reports a wrong-shaped reply as an error rather than aborting"
         var causes = std.ArrayList([]const u8).empty;
         var actions = std.ArrayList([]const u8).empty;
         var summary: []const u8 = "";
-        const evidence = [_]diagnose_mod.EvidenceBlock{};
+        const evidence = [_]ports.EvidenceBlock{};
         try std.testing.expectError(error.MalformedLlmResponse, llmDiagnose(
             allocator,
             &ctx,
@@ -619,7 +618,7 @@ test "llmApprove works end-to-end against a mock OpenAI endpoint" {
     var note: []const u8 = "";
     const decision = try llmApprove(allocator, &ctx, "order-1", 100, 0, "ops", "", &note);
     defer if (note.len > 0) allocator.free(note);
-    try std.testing.expectEqual(approval_mod.ApprovalDecision.approved, decision);
+    try std.testing.expectEqual(ports.ApprovalDecision.approved, decision);
     try std.testing.expectEqualStrings("ok by mock", note);
 }
 

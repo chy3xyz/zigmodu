@@ -2,6 +2,59 @@
 
 ## [Unreleased]
 
+### 架构：编排原语接口化（`ai/ports.zig`，**破坏性：是**——两处字段类型）
+
+核心（`workflow` / `proposal` / `llm`）此前直接 import 具体引擎
+（`approval` / `risk` / `diagnose`）。现在只依赖 `ai/ports.zig`：
+
+- 值类型集中到 ports：`ApprovalDecision` / `ApprovalStatus` / `ApprovalStep` /
+  `RiskLevel` / `RiskDecision` / `RiskResult` / `AnomalyCase` / `EvidenceBlock`；
+  具体引擎用别名 re-export，**类型仍是同一个**。
+- 行为接口：`ports.ApprovalPort`（`submit` 返回状态）与 `ports.RiskPort`
+  （`review` 返回 `RiskResult`）。具体引擎提供 `toPort()` 适配器。
+- **破坏性**：`Workflow.approval_flow` 从 `?*ApprovalFlow` 改为
+  `?ports.ApprovalPort`；`Pipeline.risk` / `.approval` 同理。迁移一行：
+  `wf.approval_flow = flow.toPort();`、`p.risk = review.toPort();`。
+  `approval_steps` 的类型是别名，赋值不用改。
+- `check-production.sh` 新增门禁：五个核心文件顶层出现
+  `@import("approval|risk|diagnose|reporter.zig")` 即失败（测试块内的 import 允许）。
+
+## [Unreleased]
+
+### 架构：AI ops 独立成包（**破坏性：否**，一处注册入口迁移）
+
+`src/ai/ops/` 收纳 15 个直接绑定 `data.sqlx` 与具体表结构的业务模块
+（business / actions / admin / alerts / kpi / recon / refund / ticket / sla /
+notify / bridge / trigger / schedule / approval_api / approval_store）。
+
+- **核心不再 import ops**：`skill.zig` 里的内置技能注册（`registerBuiltinCatalog`）
+  连同它的两个审计测试一起搬到 `ai.ops.builtin`——核心注册表不再为了一个便利函数
+  依赖整个业务层。`check-production.sh` 新增门禁：`src/ai/` 的核心文件出现
+  `@import("ops/…")` 即失败。
+- 顶层别名（`ai.alerts`、`ai.business` …）全部保留，消费方路径不变；新增
+  `ai.ops.builtin.registerBuiltinCatalog(&registry)` 作为内置技能的显式入口
+  （此前是 `skill.zig` 的私有函数）。
+- **仍未解耦**（已在文档写清）：`workflow → approval`、`proposal/llm → risk`、
+  `llm → diagnose`、`approval/diagnose → reporter`。这些模块是编排原语而非业务
+  报表，解耦需要把策略/审批以接口注入，属于下一步设计，不在本批。
+
+## [Unreleased]
+
+### 新增：embedding 客户端 + 声明式 DI + per-user 配额（**破坏性：否**）
+
+- **`ai.embedding.OpenAiEmbeddings`**：OpenAI 兼容 `/embeddings` 客户端——批量输入、
+  可选 `dimensions`、响应校验（数量不符 `EmbeddingCountMismatch`、维度不一致
+  `EmbeddingDimensionMismatch`）。`Adapter` 直接满足 `Retriever` 需要的 `EmbedFn`，
+  与 `ai.rag.IndexRetriever` 组合即完成 RAG 写入→检索链路；request/response 编解码
+  有独立测试（不依赖网络）。
+- **`ApplicationBuilder.withServices(.{ .{ .name = "db", .instance = &db }, … })`**：
+  一份 comptime tuple 完成多服务注册，类型由指针推断，语义与 `withService` 相同
+  （借用、builder 释放登记表）。DI 指南补了示例。
+- **`TokenQuota` per-user 维度**：`setUserLimit` / `tryConsumeFor` / `recordFor` /
+  `userUsed` / `userRemaining`。租户额度仍是外边界；`tryConsumeFor` 先检查两级上限
+  再同时扣减，拒绝时两侧计数都不动。
+## [Unreleased]
+
 ### 完善：结构化工具错误 + 启动驱动自检（**破坏性：否**）
 
 - **`SkillContext.fail(code, message, retryable)`**：handler 返回结构化失败；

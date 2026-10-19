@@ -98,9 +98,9 @@ AI 侧、集群侧）的实测结果：builder 绑定、worker 归 app、不手�
   `tools/list` 目前**是缺口，不是既有能力**」
 - ✅ **最容易踩的一条**：内置技能全部落在 `.action` 默认值 `.execute` 上（全 `src/` 只有 1 处显式
   `.action =`，还是测试）—— 按 `AGENT_RUNTIME.md` 的推荐配法会拒掉所有内置技能，且启动期不报警
-  （2026-09-18 修：内置技能逐个显式声明类别（`src/ai/business.zig:106/154/202`、`src/ai/kpi.zig:61`、
-  `src/ai/notify.zig:126`、`src/ai/schedule.zig:47/71/109/130`、`src/ai/admin.zig:107/134/160/184/209/253/274`、
-  `src/ai/actions.zig:66/83/221/304`、`src/ai/approval_api.zig:133`、`src/ai/approval.zig:248`），
+  （2026-09-18 修：内置技能逐个显式声明类别（`src/ai/ops/business.zig:106/154/202`、`src/ai/ops/kpi.zig:61`、
+  `src/ai/ops/notify.zig:126`、`src/ai/ops/schedule.zig:47/71/109/130`、`src/ai/ops/admin.zig:107/134/160/184/209/253/274`、
+  `src/ai/ops/actions.zig:66/83/221/304`、`src/ai/ops/approval_api.zig:133`、`src/ai/approval.zig:248`），
   并有测试 `builtin skills declare their action class`（`src/ai/skill.zig:545`）；盲区本身由
   `SkillRegistry.auditPolicy` + `PolicyHealth.isInert()/hasClassBlindSpot()` 补齐（`src/ai/skill.zig:99,242`，
   测试 `:567/:608`）——`Guard.isInert()` 仍只看 `allow.len`（`src/ai/guard.zig:87`），但注册表侧现在能报出
@@ -241,9 +241,9 @@ CI 构建 15 项 + `zmsaas/backend`。
    的转发；`business/admin/schedule/notify/mcp` 的技能全落 `.execute`（`skill.zig:30`）。按 `AGENT_RUNTIME.md` §二 推荐配
    `allow = 读工具 + allow_execute = false` 会**全拒**，而 `guard.zig:87` 的 `isInert()` 只看 `allow.len` → 不报警。
    改：读类工具补 `.action = .read|.propose`；`isInert()` 纳入类别维度。
-   （2026-09-18 修：内置技能逐个显式声明类别 —— `src/ai/business.zig:106/154/202`、`src/ai/kpi.zig:61`、
-   `src/ai/notify.zig:126`、`src/ai/schedule.zig:47/71/109/130`、`src/ai/admin.zig:107/134/160/184/209/253/274`、
-   `src/ai/actions.zig:66/83/221/304`、`src/ai/approval_api.zig:133`、`src/ai/approval.zig:248`；
+   （2026-09-18 修：内置技能逐个显式声明类别 —— `src/ai/ops/business.zig:106/154/202`、`src/ai/ops/kpi.zig:61`、
+   `src/ai/ops/notify.zig:126`、`src/ai/ops/schedule.zig:47/71/109/130`、`src/ai/ops/admin.zig:107/134/160/184/209/253/274`、
+   `src/ai/ops/actions.zig:66/83/221/304`、`src/ai/ops/approval_api.zig:133`、`src/ai/approval.zig:248`；
    类别维度的盲区改由注册表侧补：`SkillRegistry.auditPolicy` + `PolicyHealth.isInert()/hasClassBlindSpot()`
    （`src/ai/skill.zig:99,242`）会列名"被类别闸门拒掉"的工具，测试见 `:545` / `:608`。
    `Guard.isInert()` 本身仍只看 `allow.len`（`src/ai/guard.zig:87`），故这一条的"改"按 `PolicyHealth` 落地）

@@ -6,12 +6,12 @@
 //! targets stay app-owned; the LLM only supplies recipient/title/body).
 
 const std = @import("std");
-const SqlxBackend = @import("../data.zig").SqlxBackend;
-const SkillContext = @import("skill.zig").SkillContext;
-const SkillRegistry = @import("skill.zig").SkillRegistry;
-const skill = @import("skill.zig");
-const OutboxPublisher = @import("../messaging/OutboxPublisher.zig").OutboxPublisher;
-const HttpClient = @import("../http/HttpClient.zig").HttpClient;
+const SqlxBackend = @import("../../data.zig").SqlxBackend;
+const SkillContext = @import("../skill.zig").SkillContext;
+const SkillRegistry = @import("../skill.zig").SkillRegistry;
+const skill = @import("../skill.zig");
+const OutboxPublisher = @import("../../messaging/OutboxPublisher.zig").OutboxPublisher;
+const HttpClient = @import("../../http/HttpClient.zig").HttpClient;
 
 /// A named delivery channel. Caller owns the strings and the callback.
 pub const NotificationChannel = struct {
@@ -207,11 +207,11 @@ const SinkState = struct {
 
 test "NotificationHub delivers to sink and outbox fallback" {
     const allocator = std.testing.allocator;
-    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
     _ = try client.exec(
-        @import("test_fixtures.zig").outbox_table_sql,
+        @import("../test_fixtures.zig").outbox_table_sql,
         &.{},
     );
     var backend = SqlxBackend{ .allocator = allocator, .client = &client };
@@ -239,11 +239,11 @@ test "NotificationHub delivers to sink and outbox fallback" {
 
 test "NotificationHub webhook posts to loopback server" {
     const allocator = std.testing.allocator;
-    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    if (!@import("../../test/NetworkProbe.zig").available()) return error.SkipZigTest;
     // `-Ddb=none` unlinks sqlite: `client.connect()` below fails fast with
     // DriverNotEnabled — which used to leave the accept thread blocked and
     // `defer th.join()` hanging the whole suite forever. Skip instead.
-    if (!@import("../data.zig").sqlx.DriverFeatures.sqlite) return error.SkipZigTest;
+    if (!@import("../../data.zig").sqlx.DriverFeatures.sqlite) return error.SkipZigTest;
 
     const server_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
     var server = try server_addr.listen(std.testing.io, .{ .reuse_address = true });
@@ -294,7 +294,7 @@ test "NotificationHub webhook posts to loopback server" {
     var url_buf: [128]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/hook", .{port});
 
-    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
     var backend = SqlxBackend{ .allocator = allocator, .client = &client };
@@ -314,7 +314,7 @@ test "NotificationHub webhook posts to loopback server" {
 
 test "notification.send payload escapes quotes and backslashes in the message text" {
     const allocator = std.testing.allocator;
-    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
     var backend = SqlxBackend{ .allocator = allocator, .client = &client };
@@ -369,7 +369,7 @@ test "notification.send payload escapes quotes and backslashes in the message te
 // the `put` argument was stranded whenever the map refused the field.
 test "notification.send hands back its report at every allocation point (OOM scan)" {
     const allocator = std.testing.allocator;
-    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
     var backend = SqlxBackend{ .allocator = allocator, .client = &client };

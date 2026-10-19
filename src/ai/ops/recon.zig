@@ -5,10 +5,10 @@
 //! report. Pair with `zigmodu.ai.trigger` for scheduled reconciliation.
 
 const std = @import("std");
-const SqlxBackend = @import("../data.zig").SqlxBackend;
-const SkillContext = @import("skill.zig").SkillContext;
-const OutboxPublisher = @import("../messaging/OutboxPublisher.zig").OutboxPublisher;
-const sqlx = @import("../data.zig").sqlx;
+const SqlxBackend = @import("../../data.zig").SqlxBackend;
+const SkillContext = @import("../skill.zig").SkillContext;
+const OutboxPublisher = @import("../../messaging/OutboxPublisher.zig").OutboxPublisher;
+const sqlx = @import("../../data.zig").sqlx;
 
 pub const ReconDiffKind = enum { missing_in_target, extra_in_source, mismatch };
 
@@ -351,7 +351,7 @@ test "ReconCheck detects missing, extra and mismatched rows" {
     defer client.deinit();
     try client.connect();
     _ = try client.exec(
-        @import("test_fixtures.zig").outbox_table_sql,
+        @import("../test_fixtures.zig").outbox_table_sql,
         &.{},
     );
     _ = try client.exec("CREATE TABLE src_orders (id INTEGER PRIMARY KEY, amount INTEGER)", &.{});

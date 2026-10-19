@@ -237,8 +237,19 @@ server，`tools/list` 自动从注册表推导参数 schema，并列出注册表
   会把一个汉字切成两半，模型看到的上下文从第一个字节就坏了。
 - **`VectorIndex`**：条目按 tenant 存储，`search` 只返回**同租户**的条目；不带租户的
   检索只看到未带租户的全局条目，绝不"看到全部"（fail-closed，同审批队列）。
-- **`IndexRetriever`**：把应用提供的 `EmbedFn`（嵌入模型是 provider 专属的 HTTP 调用，
-  框架不代劳）接到 `Retriever.retrieveScopedFn`，`Agent` 自动传本次运行的 scope。
+- **`IndexRetriever`**：把应用提供的 `EmbedFn`（嵌入模型是 provider 专属的 HTTP 调用）
+  接到 `Retriever.retrieveScopedFn`，`Agent` 自动传本次运行的 scope。
+- **`ai.embedding.OpenAiEmbeddings`**：OpenAI 兼容的 `/embeddings` 客户端（批量、
+  `dimensions` 可裁剪、响应校验：数量/维度不一致直接拒绝）。`Adapter` 就是可用的
+  `EmbedFn`：
+
+  ```zig
+  var emb = ai.embedding.OpenAiEmbeddings{ .allocator = alloc, .http = &client,
+      .endpoint = "https://api.openai.com/v1/embeddings", .api_key = key };
+  var adapter = ai.embedding.Adapter{ .impl = &emb };
+  var index_retriever = ai.rag.IndexRetriever{ .index = &index, .embed_ctx = &adapter,
+      .embed_fn = ai.embedding.Adapter.embed };
+  ```
 
 写入侧按 `index.add(.{ .tenant_id = … }, id, text, source, vector)` 存；向量维度
 不一致直接 `error.DimensionMismatch`，不做截断/补零。
@@ -261,11 +272,26 @@ server，`tools/list` 自动从注册表推导参数 schema，并列出注册表
 - **核心**（`Agent` / `skill` / `provider` / `workflow` / `guard` / `budget` / `memory` /
   `retriever` / `quota` / `context` / 供给层）：不知道任何业务名词，只依赖
   `SkillContext`。`ai.http` 只是把请求转成上下文的适配器，核心不 import HTTP。
-- **ops 扩展**（`ai.ops.*`：`alerts` / `kpi` / `recon` / `refund` / `ticket` /
-  `sla` / `risk` / `diagnose` / `reporter` / `notify` / `approval*` / `business` /
-  `actions` / `admin` / `bridge` / `trigger` / `schedule`）：直接绑定 `data.sqlx` 与
-  具体表结构，按你的业务改写或整体替换；不要把它们当作"AI 基础设施"复用。原有
-  `ai.alerts` 等路径不变，`ai.ops.*` 只是标明归属的别名。
+- **ops 扩展**（`src/ai/ops/`，经 `ai.ops.*` 引用）：`business` / `actions` /
+  `admin` / `alerts` / `kpi` / `recon` / `refund` / `ticket` / `sla` / `notify` /
+  `bridge` / `trigger` / `schedule` / `approval_api` / `approval_store`。它们直接
+  绑定 `data.sqlx` 与具体表结构，按你的业务改写或整体替换。**核心不 import 它们**
+  （`check-production.sh` 门禁）：内置技能注册也搬到了
+  `ai.ops.builtin.registerBuiltinCatalog(&registry)`，`skill.zig` 不再为了一个便利
+  函数依赖整个 ops 包。原有 `ai.alerts` 等顶层路径仍可用。
+  `approval` / `risk` / `diagnose` / `reporter` 仍在 `src/ai/` 根目录，但**核心
+  （`agent`/`skill`/`workflow`/`llm`/`proposal`）只依赖 `ai/ports.zig`**：
+  `ports.ApprovalPort` / `RiskPort` 是行为接口，值类型（`ApprovalStatus`、
+  `RiskResult`、`EvidenceBlock`…）也在那里；具体引擎用适配器接入：
+
+  ```zig
+  var flow = ai.approval.ApprovalFlow.init(allocator, &backend, policy);
+  wf.approval_flow = flow.toPort();
+  p.risk = review.toPort();
+  ```
+
+  `check-production.sh` 会拒绝核心文件顶层 `@import` 这四个具体引擎（测试块内
+  的 import 允许，测试本来就要构造真实引擎）。
 
 ## 8. 观测与调试
 

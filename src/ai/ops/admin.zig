@@ -13,13 +13,13 @@
 //!     (framework never implements business user/tenant logic).
 
 const std = @import("std");
-const SqlxBackend = @import("../data.zig").SqlxBackend;
-const SkillRegistry = @import("skill.zig").SkillRegistry;
-const SkillContext = @import("skill.zig").SkillContext;
-const run_audit = @import("run_audit.zig");
-const freeValue = @import("skill.zig").freeValue;
-const putJsonField = @import("skill.zig").putJsonField;
-const json_shape = @import("json_shape.zig");
+const SqlxBackend = @import("../../data.zig").SqlxBackend;
+const SkillRegistry = @import("../skill.zig").SkillRegistry;
+const SkillContext = @import("../skill.zig").SkillContext;
+const run_audit = @import("../run_audit.zig");
+const freeValue = @import("../skill.zig").freeValue;
+const putJsonField = @import("../skill.zig").putJsonField;
+const json_shape = @import("../json_shape.zig");
 
 pub const CacheHandle = struct {
     name: []const u8,
@@ -414,7 +414,7 @@ test "admin.config.set respects the mutable whitelist" {
 
 test "admin.audit.export lists runs with filters" {
     const allocator = std.testing.allocator;
-    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
     var backend = SqlxBackend{ .allocator = allocator, .client = &client };
@@ -584,7 +584,7 @@ test "admin.config.get hands back its tree at every allocation point (OOM scan)"
 // `RunAuditStore.list` itself.
 test "admin.audit.export hands back its tree at every allocation point (OOM scan)" {
     const allocator = std.testing.allocator;
-    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
     var backend = SqlxBackend{ .allocator = allocator, .client = &client };

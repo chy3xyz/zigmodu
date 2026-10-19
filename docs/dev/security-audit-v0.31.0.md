@@ -106,7 +106,7 @@ if (filter) |f| { sql.appendSlice(" AND "); sql.appendSlice(f.clause); }   // fi
 
 ---
 
-### ④ 中 — `src/ai/business.zig:104-150` — `db.query` 技能对 agent 开放任意 SELECT，**没有**租户过滤（同文件的 `entity.*` 有）
+### ④ 中 — `src/ai/ops/business.zig:104-150` — `db.query` 技能对 agent 开放任意 SELECT，**没有**租户过滤（同文件的 `entity.*` 有）
 
 证据：`db.query` 的全部校验是
 ```zig

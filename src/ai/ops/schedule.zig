@@ -7,12 +7,12 @@
 //! execution" posture (see docs/ai/AI.md).
 
 const std = @import("std");
-const Scheduler = @import("../scheduler/Cron.zig").Scheduler;
-const Expression = @import("../scheduler/Cron.zig").Expression;
-const SkillRegistry = @import("skill.zig").SkillRegistry;
-const SkillContext = @import("skill.zig").SkillContext;
-const freeValue = @import("skill.zig").freeValue;
-const skill = @import("skill.zig");
+const Scheduler = @import("../../scheduler/Cron.zig").Scheduler;
+const Expression = @import("../../scheduler/Cron.zig").Expression;
+const SkillRegistry = @import("../skill.zig").SkillRegistry;
+const SkillContext = @import("../skill.zig").SkillContext;
+const freeValue = @import("../skill.zig").freeValue;
+const skill = @import("../skill.zig");
 
 /// ObjectMap does not copy keys and deinit does not free them; results must
 /// own every key so `freeValue` can release them.
@@ -25,7 +25,7 @@ fn putOwned(obj: *std.json.ObjectMap, allocator: std.mem.Allocator, key: []const
     errdefer allocator.free(k);
     try obj.put(allocator, k, value);
 }
-const Time = @import("../core/Time.zig");
+const Time = @import("../../core/Time.zig");
 
 /// A named, schedulable task the LLM may attach to a cron expression.
 pub const ScheduledTask = struct {

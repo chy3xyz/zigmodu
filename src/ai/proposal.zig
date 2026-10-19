@@ -17,8 +17,7 @@
 
 const std = @import("std");
 const guard_mod = @import("guard.zig");
-const risk_mod = @import("risk.zig");
-const approval_mod = @import("approval.zig");
+const ports = @import("ports.zig");
 const SkillContext = @import("skill.zig").SkillContext;
 
 /// Where a proposal ended up.
@@ -66,9 +65,9 @@ pub const Proposal = struct {
 pub const Outcome = struct {
     verdict: Verdict,
     /// Present once the risk stage ran (borrows `Proposal` strings).
-    risk: ?risk_mod.RiskResult = null,
+    risk: ?ports.RiskResult = null,
     /// Present once the approval chain ran.
-    approval_status: ?approval_mod.ApprovalStatus = null,
+    approval_status: ?ports.ApprovalStatus = null,
 
     pub fn executed(self: Outcome) bool {
         return self.verdict == .executed;
@@ -82,11 +81,11 @@ pub const Pipeline = struct {
     /// Optional risk engine. Without it the pipeline still refuses to execute
     /// unless the policy says `allow_execute` — the risk stage is what turns a
     /// bare refusal into an informed one.
-    risk: ?*risk_mod.RiskReview = null,
+    risk: ?ports.RiskPort = null,
     /// Optional human chain, consulted when risk escalates. Without it an
     /// escalation is a hard stop: an agent never approves itself.
-    approval: ?*approval_mod.ApprovalFlow = null,
-    approval_steps: []const approval_mod.ApprovalStep = &.{},
+    approval: ?ports.ApprovalPort = null,
+    approval_steps: []const ports.ApprovalStep = &.{},
 
     pub fn init(guard: *guard_mod.Guard, executor: ExecutorFn) Pipeline {
         return .{ .guard = guard, .executor = executor };
@@ -101,8 +100,8 @@ pub const Pipeline = struct {
         }
 
         const subject = p.subject orelse p.payload;
-        var risk_result: ?risk_mod.RiskResult = null;
-        var approval_status: ?approval_mod.ApprovalStatus = null;
+        var risk_result: ?ports.RiskResult = null;
+        var approval_status: ?ports.ApprovalStatus = null;
 
         // Risk runs *before* the execute check on purpose: a refused execution
         // should still carry a verdict someone can act on.
@@ -114,10 +113,9 @@ pub const Pipeline = struct {
                 .approve => {},
                 .escalate => {
                     const flow = self.approval orelse return .{ .verdict = .needs_human, .risk = r };
-                    var res = try flow.submit(allocator, ctx, subject, p.amount, self.approval_steps);
-                    defer res.deinit(allocator);
-                    approval_status = res.status;
-                    switch (res.status) {
+                    const status = try flow.submit(allocator, ctx, subject, p.amount, self.approval_steps);
+                    approval_status = status;
+                    switch (status) {
                         .rejected => return .{ .verdict = .risk_rejected, .risk = r, .approval_status = approval_status },
                         .pending_human => return .{ .verdict = .needs_human, .risk = r, .approval_status = approval_status },
                         .approved => {},
@@ -182,7 +180,7 @@ fn approveAllPolicy(
     _: []const u8,
     _: []const u8,
     _: *[]const u8,
-) anyerror!approval_mod.ApprovalDecision {
+) anyerror!ports.ApprovalDecision {
     return .approved;
 }
 
@@ -247,6 +245,7 @@ test "Pipeline: execution needs the policy's second switch, and a failure is rep
 }
 
 test "Pipeline: risk rejects or escalates before the executor is reached" {
+    const risk_mod = @import("risk.zig");
     const allocator = std.testing.allocator;
     TestExec.reset();
 
@@ -271,7 +270,7 @@ test "Pipeline: risk rejects or escalates before the executor is reached" {
     var hot = risk_mod.RiskReview.init(allocator, &backend);
     hot.rules = &hot_rules;
     var p1 = Pipeline.init(&guard, TestExec.run);
-    p1.risk = &hot;
+    p1.risk = hot.toPort();
     const out1 = try p1.submit(allocator, &ctx, .{ .action = "order.submit", .payload = "order-1" });
     try std.testing.expectEqual(Verdict.risk_rejected, out1.verdict);
     try std.testing.expectEqual(risk_mod.RiskLevel.high, out1.risk.?.level);
@@ -282,17 +281,17 @@ test "Pipeline: risk rejects or escalates before the executor is reached" {
     var warm = risk_mod.RiskReview.init(allocator, &backend);
     warm.rules = &warm_rules;
     var p2 = Pipeline.init(&guard, TestExec.run);
-    p2.risk = &warm;
+    p2.risk = warm.toPort();
     const out2 = try p2.submit(allocator, &ctx, .{ .action = "order.submit", .payload = "order-2" });
     try std.testing.expectEqual(Verdict.needs_human, out2.verdict);
     try std.testing.expectEqual(risk_mod.RiskLevel.medium, out2.risk.?.level);
-    try std.testing.expectEqual(@as(?approval_mod.ApprovalStatus, null), out2.approval_status);
+    try std.testing.expectEqual(@as(?ports.ApprovalStatus, null), out2.approval_status);
     try std.testing.expectEqual(@as(usize, 0), TestExec.calls);
 
     // Clean score → approve → now the execute stage may run.
     var clean = risk_mod.RiskReview.init(allocator, &backend);
     var p3 = Pipeline.init(&guard, TestExec.run);
-    p3.risk = &clean;
+    p3.risk = clean.toPort();
     const out3 = try p3.submit(allocator, &ctx, .{ .action = "order.submit", .payload = "order-3", .amount = 200 });
     try std.testing.expectEqual(Verdict.executed, out3.verdict);
     try std.testing.expectEqual(risk_mod.RiskLevel.low, out3.risk.?.level);
@@ -300,6 +299,8 @@ test "Pipeline: risk rejects or escalates before the executor is reached" {
 }
 
 test "Pipeline: an approval chain is what turns an escalation into execution" {
+    const risk_mod = @import("risk.zig");
+    const approval_mod = @import("approval.zig");
     const allocator = std.testing.allocator;
     TestExec.reset();
 
@@ -324,23 +325,23 @@ test "Pipeline: an approval chain is what turns an escalation into execution" {
     // escalation stays pending — nothing runs on the model's say-so.
     var human_chain = approval_mod.ApprovalFlow.init(allocator, &backend, approval_mod.defaultPolicy);
     var p1 = Pipeline.init(&guard, TestExec.run);
-    p1.risk = &warm;
-    p1.approval = &human_chain;
+    p1.risk = warm.toPort();
+    p1.approval = human_chain.toPort();
     p1.approval_steps = &steps;
     const out1 = try p1.submit(allocator, &ctx, .{ .action = "order.submit", .payload = "order-1", .amount = 5000 });
     try std.testing.expectEqual(Verdict.needs_human, out1.verdict);
-    try std.testing.expectEqual(@as(?approval_mod.ApprovalStatus, .pending_human), out1.approval_status);
+    try std.testing.expectEqual(@as(?ports.ApprovalStatus, .pending_human), out1.approval_status);
     try std.testing.expectEqual(@as(usize, 0), TestExec.calls);
 
     // A chain that actually approves (an app-owned policy) is the one path that
     // reaches the executor after an escalation.
     var approving_chain = approval_mod.ApprovalFlow.init(allocator, &backend, approveAllPolicy);
     var p2 = Pipeline.init(&guard, TestExec.run);
-    p2.risk = &warm;
-    p2.approval = &approving_chain;
+    p2.risk = warm.toPort();
+    p2.approval = approving_chain.toPort();
     p2.approval_steps = &steps;
     const out2 = try p2.submit(allocator, &ctx, .{ .action = "order.submit", .payload = "order-2", .amount = 5000 });
     try std.testing.expectEqual(Verdict.executed, out2.verdict);
-    try std.testing.expectEqual(@as(?approval_mod.ApprovalStatus, .approved), out2.approval_status);
+    try std.testing.expectEqual(@as(?ports.ApprovalStatus, .approved), out2.approval_status);
     try std.testing.expectEqual(@as(usize, 1), TestExec.calls);
 }

@@ -17,6 +17,7 @@
 //! Every section carries a matching `// ==== §N ... ====` anchor — `grep "§4"` jumps there.
 
 const std = @import("std");
+const ports = @import("ports.zig");
 const provider_mod = @import("provider.zig");
 const skill_mod = @import("skill.zig");
 const agent_mod = @import("agent.zig");
@@ -167,7 +168,7 @@ pub const Workflow = struct {
     metrics: ?*WorkflowMetrics = null,
     /// Approval flow used by `.approval` steps (required when such a step
     /// exists).
-    approval_flow: ?*@import("approval.zig").ApprovalFlow = null,
+    approval_flow: ?ports.ApprovalPort = null,
     /// Optional durable run-audit store; every run / resume writes one row.
     audit: ?*@import("run_audit.zig").RunAuditStore = null,
 
@@ -724,10 +725,9 @@ pub const Workflow = struct {
             },
             .approval => |s| blk: {
                 const flow = self.approval_flow orelse return error.ApprovalFlowRequired;
-                const steps = [_]@import("approval.zig").ApprovalStep{.{ .name = step.name }};
-                var result = try flow.submit(allocator, ctx, s.subject, s.amount, &steps);
-                defer result.deinit(allocator);
-                switch (result.status) {
+                const steps = [_]ports.ApprovalStep{.{ .name = step.name }};
+                const status = try flow.submit(allocator, ctx, s.subject, s.amount, &steps);
+                switch (status) {
                     .approved => break :blk .{ .output = try allocator.dupe(u8, "approved") },
                     .rejected => return error.ApprovalRejected,
                     .pending_human => break :blk .{ .output = try allocator.dupe(u8, "pending_human"), .pending_human = true },
@@ -972,7 +972,7 @@ test "workflow approval step gates on human decision" {
         .{ .name = "review", .kind = .{ .approval = .{ .subject = "order-1", .amount = 100 } } },
     };
     var ok_wf = Workflow.init(&registry, &ok_steps);
-    ok_wf.approval_flow = &flow;
+    ok_wf.approval_flow = flow.toPort();
     var ok_result = try ok_wf.run(allocator, &ctx);
     defer ok_result.deinit();
     try std.testing.expectEqual(RunStatus.completed, ok_result.status);
@@ -982,7 +982,7 @@ test "workflow approval step gates on human decision" {
         .{ .name = "review", .kind = .{ .approval = .{ .subject = "order-2", .amount = 99999 } } },
     };
     var gate_wf = Workflow.init(&registry, &gate_steps);
-    gate_wf.approval_flow = &flow;
+    gate_wf.approval_flow = flow.toPort();
     var gate_result = try gate_wf.run(allocator, &ctx);
     defer gate_result.deinit();
     try std.testing.expectEqual(RunStatus.pending_human, gate_result.status);
@@ -1025,7 +1025,7 @@ test "workflow approval gate resumes after the human approves" {
         .{ .name = "publish", .kind = .{ .skill = .{ .name = "ping", .args = .{ .object = .{} } } } },
     };
     var wf = Workflow.init(&registry, &steps);
-    wf.approval_flow = &flow;
+    wf.approval_flow = flow.toPort();
     wf.wal = &wal;
     wf.run_id = "run-approval";
 
@@ -1072,7 +1072,7 @@ test "workflow approval gate stops a DAG run at pending_human" {
         .{ .name = "publish", .kind = .{ .skill = .{ .name = "ping", .args = .{ .object = .{} } } }, .depends_on = &.{"gate"} },
     };
     var wf = Workflow.init(&registry, &steps);
-    wf.approval_flow = &flow;
+    wf.approval_flow = flow.toPort();
     wf.io = std.testing.io;
     var result = try wf.run(allocator, &ctx);
     defer result.deinit();

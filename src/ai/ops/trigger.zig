@@ -8,14 +8,14 @@
 //!   consumers / pollers.
 
 const std = @import("std");
-const SkillContext = @import("skill.zig").SkillContext;
-const SqlxBackend = @import("../data.zig").SqlxBackend;
-const OutboxPublisher = @import("../messaging/OutboxPublisher.zig").OutboxPublisher;
-const Scheduler = @import("../scheduler/Cron.zig").Scheduler;
-const Expression = @import("../scheduler/Cron.zig").Expression;
-const sqlx = @import("../data.zig").sqlx;
-const skill = @import("skill.zig");
-const Time = @import("../core/Time.zig");
+const SkillContext = @import("../skill.zig").SkillContext;
+const SqlxBackend = @import("../../data.zig").SqlxBackend;
+const OutboxPublisher = @import("../../messaging/OutboxPublisher.zig").OutboxPublisher;
+const Scheduler = @import("../../scheduler/Cron.zig").Scheduler;
+const Expression = @import("../../scheduler/Cron.zig").Expression;
+const sqlx = @import("../../data.zig").sqlx;
+const skill = @import("../skill.zig");
+const Time = @import("../../core/Time.zig");
 
 pub const TriggerResult = struct {
     ok: bool,
@@ -161,7 +161,7 @@ test "trigger writes run outcome to the outbox" {
     try sqlx_client.connect();
     // migrationSql() is MySQL-flavored; mirror the same columns for SQLite.
     _ = try sqlx_client.exec(
-        @import("test_fixtures.zig").outbox_table_sql,
+        @import("../test_fixtures.zig").outbox_table_sql,
         &.{},
     );
 
@@ -228,7 +228,7 @@ test "trigger outbox payload escapes quotes in the run outcome" {
     defer sqlx_client.deinit();
     try sqlx_client.connect();
     _ = try sqlx_client.exec(
-        @import("test_fixtures.zig").outbox_table_sql,
+        @import("../test_fixtures.zig").outbox_table_sql,
         &.{},
     );
 

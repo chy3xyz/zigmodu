@@ -104,18 +104,18 @@ pub const AuditEvent = @import("audit.zig").AuditEvent;
 pub const AuditKind = @import("audit.zig").AuditKind;
 
 /// A named task the schedule skills may schedule (name + callback).
-pub const ScheduledTask = @import("schedule.zig").ScheduledTask;
+pub const ScheduledTask = @import("ops/schedule.zig").ScheduledTask;
 /// Registers the cron-backed `schedule.*` skills on a registry.
-pub const registerScheduleSkills = @import("schedule.zig").registerScheduleSkills;
+pub const registerScheduleSkills = @import("ops/schedule.zig").registerScheduleSkills;
 /// AI ⇄ cron bridge: schedule agent/workflow runs through the cron scheduler.
-pub const schedule = @import("schedule.zig");
+pub const schedule = @import("ops/schedule.zig");
 
 /// Built-in business skills to register on an agent (order/user/…).
-pub const business = @import("business.zig");
+pub const business = @import("ops/business.zig");
 /// Write-operation skills — app-registered, whitelisted mutations.
-pub const actions = @import("actions.zig");
+pub const actions = @import("ops/actions.zig");
 /// Admin/ops skills — off by default; add them to an agent explicitly.
-pub const admin = @import("admin.zig");
+pub const admin = @import("ops/admin.zig");
 /// Exposes registered skills as MCP tools for Claude/Codex-style clients.
 pub const mcp = @import("mcp.zig");
 /// Token budget shared across an agent run or the steps of a workflow.
@@ -131,7 +131,7 @@ pub const run_audit = @import("run_audit.zig");
 /// Renders a skill registry as skills-catalog JSON or OpenAPI 3.0.
 pub const skill_export = @import("skill_export.zig");
 /// Unifies cron/event/webhook sources into one "run this agent" entry point.
-pub const trigger = @import("trigger.zig");
+pub const trigger = @import("ops/trigger.zig");
 /// Planner splits a goal into subtasks, runs them concurrently, aggregates.
 pub const hierarchy = @import("hierarchy.zig");
 /// Conversation context: estimate tokens, compact long histories.
@@ -141,33 +141,37 @@ pub const AgentHandle = @import("handle.zig").AgentHandle;
 /// Runs configured SQL and renders a Markdown business report.
 pub const reporter = @import("reporter.zig");
 /// Periodic SQL alert rules — any rule returning rows raises an alert.
-pub const alerts = @import("alerts.zig");
+pub const alerts = @import("ops/alerts.zig");
 /// Ticket triage: classify, draft a reply, gate it, write the outcome.
-pub const ticket = @import("ticket.zig");
+pub const ticket = @import("ops/ticket.zig");
 /// Refund flow with Saga-style compensation (execute → notify → compensate).
-pub const refund = @import("refund.zig");
+pub const refund = @import("ops/refund.zig");
 /// Risk review: SQL rules score a subject → approve / reject / escalate.
 pub const risk = @import("risk.zig");
 /// Reconciliation checks: diff a source SQL snapshot against a target one.
-pub const recon = @import("recon.zig");
+pub const recon = @import("ops/recon.zig");
 /// Multi-level approval chains decided by per-step policies.
 pub const approval = @import("approval.zig");
 /// Human approval queue plus its HTTP API for escalated runs.
-pub const approval_api = @import("approval_api.zig");
+pub const approval_api = @import("ops/approval_api.zig");
 /// SQL-backed approval queue, so escalations survive restarts.
-pub const approval_store = @import("approval_store.zig");
+pub const approval_store = @import("ops/approval_store.zig");
 /// LLM-backed default policies for the diagnosis/approval/risk flows.
 pub const llm = @import("llm.zig");
 /// Notification hub: webhooks, custom sinks, delivery fan-out.
-pub const notify = @import("notify.zig");
+pub const notify = @import("ops/notify.zig");
 /// Named KPI metrics (SQL → value) exposed to the `kpi.query` skill.
-pub const kpi = @import("kpi.zig");
+pub const kpi = @import("ops/kpi.zig");
 /// SLA deadlines on business items with escalating reminders.
-pub const sla = @import("sla.zig");
+pub const sla = @import("ops/sla.zig");
 /// Anomaly diagnosis: gather SQL evidence for a detected anomaly.
 pub const diagnose = @import("diagnose.zig");
 /// Outbox → workflow bridge: routes outbox events into `trigger` runs.
-pub const bridge = @import("bridge.zig");
+pub const bridge = @import("ops/bridge.zig");
+
+/// OpenAI-compatible embeddings client (batched), plus the `EmbedFn` adapter
+/// `ai.rag.IndexRetriever` needs.
+pub const embedding = @import("embedding.zig");
 
 /// Retrieval interface for RAG context (bring your own embedding store).
 pub const Retriever = @import("retriever.zig").Retriever;
@@ -197,25 +201,28 @@ pub const estimateMessages = @import("tokenizer.zig").estimateMessages;
 /// keep working. Treat everything under `ops` as replaceable by your own
 /// domain — do not build infrastructure on it.
 pub const ops = struct {
-    pub const business = @import("business.zig");
-    pub const actions = @import("actions.zig");
-    pub const admin = @import("admin.zig");
-    pub const alerts = @import("alerts.zig");
-    pub const kpi = @import("kpi.zig");
-    pub const recon = @import("recon.zig");
-    pub const refund = @import("refund.zig");
-    pub const ticket = @import("ticket.zig");
-    pub const sla = @import("sla.zig");
+    pub const business = @import("ops/business.zig");
+    pub const actions = @import("ops/actions.zig");
+    pub const admin = @import("ops/admin.zig");
+    pub const alerts = @import("ops/alerts.zig");
+    pub const kpi = @import("ops/kpi.zig");
+    pub const recon = @import("ops/recon.zig");
+    pub const refund = @import("ops/refund.zig");
+    pub const ticket = @import("ops/ticket.zig");
+    pub const sla = @import("ops/sla.zig");
     pub const risk = @import("risk.zig");
     pub const diagnose = @import("diagnose.zig");
     pub const reporter = @import("reporter.zig");
-    pub const notify = @import("notify.zig");
+    pub const notify = @import("ops/notify.zig");
     pub const approval = @import("approval.zig");
-    pub const approval_api = @import("approval_api.zig");
-    pub const approval_store = @import("approval_store.zig");
-    pub const bridge = @import("bridge.zig");
-    pub const trigger = @import("trigger.zig");
-    pub const schedule = @import("schedule.zig");
+    pub const approval_api = @import("ops/approval_api.zig");
+    pub const approval_store = @import("ops/approval_store.zig");
+    pub const bridge = @import("ops/bridge.zig");
+    pub const trigger = @import("ops/trigger.zig");
+    pub const schedule = @import("ops/schedule.zig");
+    /// Convenience registration of every built-in business skill (moved out of
+    /// `skill.zig` with the ops package).
+    pub const builtin = @import("ops/builtin.zig");
 };
 
 /// RAG building blocks: UTF-8-safe chunking, an in-memory vector index that

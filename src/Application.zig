@@ -562,6 +562,26 @@ pub const ApplicationBuilder = struct {
     /// The instance is caller-owned (stack or externally managed) and must
     /// outlive the application; modules retrieve it in `initWith(ctx)` via
     /// `ctx.service(T, name)`.
+    /// Register several borrowed services in one comptime declaration:
+    ///
+    /// ```zig
+    /// _ = try b.withServices(.{
+    ///     .{ .name = "db", .instance = &db },
+    ///     .{ .name = "cache", .instance = &cache },
+    /// });
+    /// ```
+    ///
+    /// Each entry's type is taken from the pointer, so the same `withService`
+    /// path runs (borrowed registry entry, freed by the builder on deinit).
+    /// Instances must be mutable pointers that outlive the Application.
+    pub fn withServices(self: *ApplicationBuilder, entries: anytype) !*ApplicationBuilder {
+        inline for (entries) |entry| {
+            const T = @TypeOf(entry.instance.*);
+            _ = try self.withService(T, entry.name, entry.instance);
+        }
+        return self;
+    }
+
     pub fn withService(self: *ApplicationBuilder, comptime T: type, name: []const u8, instance: *T) !*ApplicationBuilder {
         const owned_name = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(owned_name);
@@ -1461,4 +1481,24 @@ test "expect_drivers: a compiled driver passes the startup self-check" {
     defer app.deinit();
     try app.start();
     try std.testing.expectEqual(Application.State.started, app.getState());
+}
+
+test "withServices registers a declarative tuple before build" {
+    const allocator = std.testing.allocator;
+    const Db = struct { n: u8 = 1 };
+    const Cache = struct { hit: bool = false };
+    var db: Db = .{};
+    var cache: Cache = .{ .hit = true };
+
+    var b = ApplicationBuilder.init(allocator, std.testing.io);
+    defer b.deinit();
+    _ = try b.withServices(.{
+        .{ .name = "db", .instance = &db },
+        .{ .name = "cache", .instance = &cache },
+    });
+    var app = try b.build(.{});
+    defer app.deinit();
+    try app.start();
+    try std.testing.expectEqual(&db, app.services.get(Db, "db").?);
+    try std.testing.expectEqual(&cache, app.services.get(Cache, "cache").?);
 }
