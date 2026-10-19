@@ -15,6 +15,10 @@
   冲突 → 403；无任何已验证作用域 → 403（除非显式
   `Config.allow_tenant_header = true` 的网关形态）。`approve/reject` 同样只
   在所属租户内解析，跨租户请求答 404 且条目保持 pending。
+- 示例：`examples/ai-ops` 的端到端演示给运行上下文加了租户/用户身份
+  （`tenant_id = 1, user_id = 42`），直接调用 approve 的测试路径补上
+  `tenant_id` attr——旧的"无 header 即无作用域、可审批任何租户"路径已按
+  上面的规则关闭。
 - 文档：`docs/ai/AI_DEV_GUIDE.md` 的接入方式与安全清单、`AGENT_RUNTIME.md`
   的"身份 ≠ 鉴权"同步。
 

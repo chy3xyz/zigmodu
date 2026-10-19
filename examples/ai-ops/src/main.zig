@@ -156,7 +156,10 @@ fn runDemo(allocator: std.mem.Allocator, io: std.Io, verbose: bool, serve: bool,
 
     var backend = zigmodu.data.SqlxBackend{ .allocator = allocator, .client = &client };
     var outbox = zigmodu.outbox.OutboxPublisher.init(allocator, .{ .max_retries = 3 });
-    var ctx = ai.SkillContext{ .allocator = allocator };
+    // A run has an identity: the escalated approval carries this tenant, and
+    // the HTTP API resolves only inside it (an unscoped escalation is invisible
+    // to every scoped request by design).
+    var ctx = ai.SkillContext{ .allocator = allocator, .tenant_id = 1, .user_id = 42 };
 
     var approval_queue = ai.approval_store.PersistentApprovalQueue.init(allocator, &backend);
     try approval_queue.migrate();
@@ -304,6 +307,9 @@ fn runDemo(allocator: std.mem.Allocator, io: std.Io, verbose: bool, serve: bool,
         var matched = server.router.match(allocator, .POST, "/api/approvals/order-2/approve") orelse return error.RouteNotFound;
         var http_ctx = try http.Context.init(allocator, .POST, "/api/approvals/order-2/approve");
         defer http_ctx.deinit();
+        // What the catalog JWT middleware writes in production: the API answers
+        // inside the verified tenant, never from an X-Tenant-ID header.
+        try http_ctx.setAttr("tenant_id", "1");
         http_ctx.user_data = matched.route.user_data;
         var pit = matched.params.iterator();
         // `RouteParams.iterator` yields `Entry{ key, value }` by value (the
