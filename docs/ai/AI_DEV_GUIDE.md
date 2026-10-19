@@ -245,7 +245,10 @@ server，`tools/list` 自动从注册表推导参数 schema，并列出注册表
   + `TokenQuota` 为一份 Prometheus 文档（挂指针 + 名字，一个 `/metrics` 端点
   即可覆盖整个 AI 栈）。
 - `zigmodu.ai.run_audit.RunAuditStore`：workflow / agent / approval 运行历史
-  （`GET /api/ai/runs`，租户隔离）。
+  （`GET /api/ai/runs`，租户隔离）。每行现在带 **`prompt_tokens` /
+  `completion_tokens`**（`Agent` 自动累计；`recordRunWithUsage` 供自定义入口），
+  是一份**持久化**的用量账本——内存里的 `TokenQuota` 重启即失真，账单/租户
+  结算应以这张表为准。旧表由 `migrate()` 自动补列（查 catalog，不产生错误日志）。
 - `mgr.listProviders(io, allocator)`：每个 provider/key 的 status / failures /
   调用计数快照；`enableKey` / `enableProvider` 人工介入。
 - 无模型调试：`LlmPolicyCtx.json_fn` 注入 fake JSON（`examples/llm-policies`），

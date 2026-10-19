@@ -17,9 +17,56 @@ const freeValue = @import("skill.zig").freeValue;
 const putJsonField = @import("skill.zig").putJsonField;
 const json_shape = @import("json_shape.zig");
 
+/// Which skills `tools/list` may advertise.
+///
+/// The registry is the boundary an external client sees, and `tools/list` used
+/// to publish **everything** — `admin.*` included — leaving the only defence
+/// in the docs ("do not register them here"). A listing is an exposure of its
+/// own (names, descriptions, parameter schemas), so the filter is applied
+/// before anything is rendered:
+///   - `allowlist`: when set, only those names are listed;
+///   - `permissions`: a tool whose `required_permission` is not granted is not
+///     listed (asking for it would only answer `PermissionDenied`).
+/// Empty filter = list everything (the previous behaviour).
+pub const ToolFilter = struct {
+    allowlist: ?[]const []const u8 = null,
+    /// Permissions the session actually carries. `null` means "do not filter
+    /// by permission" (the legacy `toMcpTools` shape); an **empty slice** is a
+    /// real answer — the session has none, so permission-gated skills are
+    /// hidden. Keep the two apart: collapsing them is how "no permissions"
+    /// would read as "unfiltered".
+    permissions: ?[]const []const u8 = null,
+
+    fn allows(self: ToolFilter, tool: @import("skill.zig").Tool) bool {
+        if (self.allowlist) |al| {
+            var ok = false;
+            for (al) |n| {
+                if (std.mem.eql(u8, n, tool.name)) {
+                    ok = true;
+                    break;
+                }
+            }
+            if (!ok) return false;
+        }
+        if (tool.required_permission) |need| {
+            const granted = self.permissions orelse return true;
+            for (granted) |have| {
+                if (std.mem.eql(u8, have, need)) return true;
+            }
+            return false;
+        }
+        return true;
+    }
+};
+
 /// Render the registry as the MCP `tools/list` result
-/// (`{"tools":[{name,description,inputSchema}]}`).
+/// (`{"tools":[{name,description,inputSchema}]}`), unfiltered.
 pub fn toMcpTools(registry: *SkillRegistry, allocator: std.mem.Allocator) ![]u8 {
+    return toMcpToolsFiltered(registry, allocator, .{});
+}
+
+/// Same rendering, restricted to the skills `filter` allows.
+pub fn toMcpToolsFiltered(registry: *SkillRegistry, allocator: std.mem.Allocator, filter: ToolFilter) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -41,6 +88,7 @@ pub fn toMcpTools(registry: *SkillRegistry, allocator: std.mem.Allocator) ![]u8 
 
     for (names.items) |nm| {
         const tool = registry.get(nm) orelse continue;
+        if (!filter.allows(tool)) continue;
         var props = std.json.ObjectMap{};
         var required = std.json.Array.init(a);
         for (tool.parameters) |p| {
@@ -120,6 +168,18 @@ pub fn serveStdio(
     registry: *SkillRegistry,
     ctx_template: SkillContext,
 ) !void {
+    return serveStdioFiltered(io, allocator, registry, ctx_template, .{});
+}
+
+/// `serveStdio` with a `tools/list` filter — pass the permissions the session's
+/// `ctx_template` actually carries to stop advertising skills it cannot call.
+pub fn serveStdioFiltered(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    registry: *SkillRegistry,
+    ctx_template: SkillContext,
+    filter: ToolFilter,
+) !void {
     var stdin_buf: [65536]u8 = undefined;
     var stdin_file = std.Io.File.stdin();
     var stdin_reader = stdin_file.reader(io, &stdin_buf);
@@ -142,7 +202,7 @@ pub fn serveStdio(
         const line = line_buf[0..n];
 
         var ctx = ctx_template;
-        const resp = serveLine(allocator, registry, &ctx, line) catch |err| {
+        const resp = serveLine(allocator, registry, &ctx, filter, line) catch |err| {
             const e = try rpcError(allocator, null, -32603, @errorName(err));
             defer allocator.free(e);
             try stdout.writeAll(e);
@@ -162,6 +222,7 @@ fn serveLine(
     allocator: std.mem.Allocator,
     registry: *SkillRegistry,
     ctx: *SkillContext,
+    filter: ToolFilter,
     line: []const u8,
 ) ![]const u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch {
@@ -199,7 +260,7 @@ fn serveLine(
         return rpcSuccess(allocator, a, id, .{ .object = info });
     } else if (std.mem.eql(u8, method, "tools/list")) {
         var list = std.json.ObjectMap{};
-        const tools = try toMcpTools(registry, a);
+        const tools = try toMcpToolsFiltered(registry, a, filter);
         defer a.free(tools);
         var parsed_tools = try std.json.parseFromSlice(std.json.Value, a, tools, .{});
         defer parsed_tools.deinit();
@@ -276,14 +337,14 @@ test "a peer line of the wrong shape is answered, not fatal" {
     // Valid JSON that is not a request object, and an object whose `method` is
     // not a string: both used to abort the server on a union-tag mismatch.
     inline for (.{ "123", "[]", "\"x\"", "{\"method\":5}" }) |line| {
-        const resp = try serveLine(allocator, &registry, &ctx, line);
+        const resp = try serveLine(allocator, &registry, &ctx, .{}, line);
         defer allocator.free(resp);
         try std.testing.expect(std.mem.indexOf(u8, resp, "-32600") != null);
     }
 
     // `params` is peer-authored too: a wrong shape is a parameter error, which
     // is also what keeps it out of the -32603 the stdio loop uses for failures.
-    const resp = try serveLine(allocator, &registry, &ctx, "{\"method\":\"tools/call\",\"id\":1,\"params\":\"x\"}");
+    const resp = try serveLine(allocator, &registry, &ctx, .{}, "{\"method\":\"tools/call\",\"id\":1,\"params\":\"x\"}");
     defer allocator.free(resp);
     try std.testing.expect(std.mem.indexOf(u8, resp, "-32602") != null);
 }
@@ -299,7 +360,7 @@ test "an RPC error answer hands back its tree at every allocation point (OOM sca
 
     const Scan = struct {
         fn run(a: std.mem.Allocator, reg: *SkillRegistry, c: *SkillContext) !void {
-            const resp = try serveLine(a, reg, c, "not json");
+            const resp = try serveLine(a, reg, c, .{}, "not json");
             defer a.free(resp);
             try std.testing.expect(std.mem.indexOf(u8, resp, "-32700") != null);
         }
@@ -385,4 +446,55 @@ test "handleToolCall hands back its content tree at every allocation point (OOM 
         }
     };
     try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{ &registry, params });
+}
+
+test "toMcpToolsFiltered hides skills the session cannot call" {
+    const allocator = std.testing.allocator;
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+
+    const H = struct {
+        fn h(_: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+            return .{ .bool = true };
+        }
+    };
+    try registry.register(.{ .name = "kpi.query", .description = "read kpi", .parameters = &.{}, .action = .read, .handler = H.h });
+    try registry.register(.{ .name = "admin.reset", .description = "reset", .parameters = &.{}, .action = .execute, .required_permission = "admin:write", .handler = H.h });
+
+    // Unfiltered: both, as before.
+    const all = try toMcpTools(&registry, allocator);
+    defer allocator.free(all);
+    try std.testing.expect(std.mem.indexOf(u8, all, "\"kpi.query\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "\"admin.reset\"") != null);
+
+    // Permission filter: the admin skill is not advertised at all.
+    const filtered = try toMcpToolsFiltered(&registry, allocator, .{ .permissions = &.{"approval:decide"} });
+    defer allocator.free(filtered);
+    try std.testing.expect(std.mem.indexOf(u8, filtered, "\"kpi.query\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filtered, "\"admin.reset\"") == null);
+
+    // Allowlist filter: only the named skill.
+    const allowed = try toMcpToolsFiltered(&registry, allocator, .{ .allowlist = &.{"admin.reset"}, .permissions = &.{"admin:write"} });
+    defer allocator.free(allowed);
+    try std.testing.expect(std.mem.indexOf(u8, allowed, "\"kpi.query\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed, "\"admin.reset\"") != null);
+}
+
+test "serveLine tools/list applies the filter" {
+    const allocator = std.testing.allocator;
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    const H = struct {
+        fn h(_: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+            return .{ .bool = true };
+        }
+    };
+    try registry.register(.{ .name = "kpi.query", .description = "read", .parameters = &.{}, .action = .read, .handler = H.h });
+    try registry.register(.{ .name = "admin.reset", .description = "reset", .parameters = &.{}, .action = .execute, .required_permission = "admin:write", .handler = H.h });
+
+    var ctx = SkillContext{ .allocator = allocator, .permissions = &.{} };
+    const resp = try serveLine(allocator, &registry, &ctx, .{ .permissions = &.{} }, "{\"method\":\"tools/list\",\"id\":1}");
+    defer allocator.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"kpi.query\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"admin.reset\"") == null);
 }

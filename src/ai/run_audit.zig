@@ -21,6 +21,11 @@ pub const RunAuditEntry = struct {
     duration_ms: i64 = 0,
     /// Actual model that served the run (empty when unknown / not captured).
     model: ?[]const u8 = null,
+    /// Tokens the provider reported for this run. A durable ledger, unlike the
+    /// in-memory `TokenQuota`: billing and tenant statements can be computed
+    /// from these rows even after a restart.
+    prompt_tokens: u64 = 0,
+    completion_tokens: u64 = 0,
 };
 
 pub const RunAuditStore = struct {
@@ -41,20 +46,22 @@ pub const RunAuditStore = struct {
     pub fn migrate(self: *Self) !void {
         try sqlx.validateIdentifier(self.table);
         const sql = try self.allocator.print(
-            "CREATE TABLE IF NOT EXISTS {s} (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, tenant_id INTEGER, steps INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, model TEXT)",
+            "CREATE TABLE IF NOT EXISTS {s} (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, tenant_id INTEGER, steps INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, model TEXT, prompt_tokens INTEGER NOT NULL DEFAULT 0, completion_tokens INTEGER NOT NULL DEFAULT 0)",
             .{self.table},
         );
         defer self.allocator.free(sql);
         _ = try self.backend.exec(sql, &.{});
-        // Existing installs predate the `model` column (CREATE IF NOT EXISTS
-        // does not add columns). Probe first (fresh tables already have it),
-        // then best-effort ALTER for legacy tables.
-        const probe = try self.allocator.print("SELECT model FROM {s} LIMIT 0", .{self.table});
-        defer self.allocator.free(probe);
-        if (self.backend.exec(probe, &.{})) |_| {
-            // column already exists
-        } else |_| {
-            const alter = try self.allocator.print("ALTER TABLE {s} ADD COLUMN model TEXT", .{self.table});
+        // Existing installs predate later columns (CREATE IF NOT EXISTS does not
+        // add columns). Probe each one (fresh tables already have them), then
+        // best-effort ALTER for legacy tables.
+        const legacy_columns = [_]struct { name: []const u8, ddl: []const u8 }{
+            .{ .name = "model", .ddl = "TEXT" },
+            .{ .name = "prompt_tokens", .ddl = "INTEGER NOT NULL DEFAULT 0" },
+            .{ .name = "completion_tokens", .ddl = "INTEGER NOT NULL DEFAULT 0" },
+        };
+        for (legacy_columns) |col| {
+            if (try self.columnExists(col.name)) continue;
+            const alter = try self.allocator.print("ALTER TABLE {s} ADD COLUMN {s} {s}", .{ self.table, col.name, col.ddl });
             defer self.allocator.free(alter);
             _ = self.backend.exec(alter, &.{}) catch |err| {
                 std.log.debug("[ai.run_audit] best-effort legacy column add failed ({s})", .{@errorName(err)});
@@ -62,11 +69,33 @@ pub const RunAuditStore = struct {
         }
     }
 
+    /// Whether `column` exists on the audit table.
+    ///
+    /// This used to be `SELECT <column> FROM <table> LIMIT 0`: a missing column
+    /// is a prepare error, and the driver logs every prepare error at err
+    /// level, which the test suite's log gate counts as a failure — probing a
+    /// legacy table turned an upgrade into a red suite. Ask the catalog
+    /// instead, per dialect; nothing here is an error path.
+    fn columnExists(self: *Self, column: []const u8) !bool {
+        const sql = switch (self.backend.client.config.driver) {
+            .sqlite => "SELECT COUNT(*) AS n FROM pragma_table_info(?) WHERE name = ?",
+            .postgres => "SELECT COUNT(*) AS n FROM information_schema.columns WHERE table_name = ? AND column_name = ?",
+            else => "SELECT COUNT(*) AS n FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?",
+        };
+        var cursor = try self.backend.client.queryCursorEx(sql, &.{
+            .{ .string = self.table },
+            .{ .string = column },
+        }, .{});
+        defer cursor.deinit();
+        const row = (try cursor.next()) orelse return false;
+        return (row.get("n") orelse return false).int > 0;
+    }
+
     pub fn record(self: *Self, entry: RunAuditEntry) !void {
         try sqlx.validateIdentifier(self.table);
         const now = Time.monotonicNowSeconds();
         const sql = try self.allocator.print(
-            "INSERT INTO {s} (run_id, kind, status, tenant_id, steps, duration_ms, created_at, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO {s} (run_id, kind, status, tenant_id, steps, duration_ms, created_at, model, prompt_tokens, completion_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             .{self.table},
         );
         defer self.allocator.free(sql);
@@ -79,6 +108,8 @@ pub const RunAuditStore = struct {
             .{ .int = entry.duration_ms },
             .{ .int = now },
             if (entry.model) |m| .{ .string = m } else .null,
+            .{ .int = @intCast(entry.prompt_tokens) },
+            .{ .int = @intCast(entry.completion_tokens) },
         });
     }
 
@@ -110,10 +141,10 @@ pub const RunAuditStore = struct {
         }
 
         const sql = if (where.items.len > 0) try allocator.print(
-            "SELECT run_id, kind, status, tenant_id, steps, duration_ms, model FROM {s} WHERE {s} ORDER BY id DESC LIMIT {d}",
+            "SELECT run_id, kind, status, tenant_id, steps, duration_ms, model, prompt_tokens, completion_tokens FROM {s} WHERE {s} ORDER BY id DESC LIMIT {d}",
             .{ self.table, where.items, limit },
         ) else try allocator.print(
-            "SELECT run_id, kind, status, tenant_id, steps, duration_ms, model FROM {s} ORDER BY id DESC LIMIT {d}",
+            "SELECT run_id, kind, status, tenant_id, steps, duration_ms, model, prompt_tokens, completion_tokens FROM {s} ORDER BY id DESC LIMIT {d}",
             .{ self.table, limit },
         );
         defer allocator.free(sql);
@@ -148,6 +179,8 @@ pub const RunAuditStore = struct {
             .steps = @intCast(row.get("steps").?.int),
             .duration_ms = row.get("duration_ms").?.int,
             .model = model,
+            .prompt_tokens = if (row.get("prompt_tokens")) |v| @intCast(v.int) else 0,
+            .completion_tokens = if (row.get("completion_tokens")) |v| @intCast(v.int) else 0,
         });
     }
 
@@ -272,4 +305,73 @@ pub fn recordRun(
         .duration_ms = duration_ms,
     });
     _ = allocator;
+}
+
+/// Record a run together with the provider-reported token usage. `recordRun`
+/// stays the token-less convenience form (workflow steps do not necessarily
+/// call a model).
+pub fn recordRunWithUsage(
+    store: *RunAuditStore,
+    ctx: *SkillContext,
+    run_id: []const u8,
+    kind: RunKind,
+    status: []const u8,
+    steps: usize,
+    duration_ms: i64,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    model: ?[]const u8,
+) !void {
+    try store.record(.{
+        .run_id = run_id,
+        .kind = kind,
+        .status = status,
+        .tenant_id = ctx.tenant_id,
+        .steps = steps,
+        .duration_ms = duration_ms,
+        .model = model,
+        .prompt_tokens = prompt_tokens,
+        .completion_tokens = completion_tokens,
+    });
+}
+
+test "RunAuditStore persists token usage and upgrades a legacy table" {
+    const allocator = std.testing.allocator;
+    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    // Shape written by an older zigmodu: no model / token columns.
+    _ = try client.exec(
+        "CREATE TABLE ai_run_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, tenant_id INTEGER, steps INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)",
+        &.{},
+    );
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    var store = RunAuditStore.init(allocator, &backend);
+    // migrate() must ALTER the missing columns in, not silently skip them.
+    try store.migrate();
+    try store.record(.{
+        .run_id = "r-tokens",
+        .kind = .agent,
+        .status = "completed",
+        .tenant_id = 7,
+        .steps = 2,
+        .duration_ms = 50,
+        .model = "deepseek-chat",
+        .prompt_tokens = 120,
+        .completion_tokens = 30,
+    });
+
+    var out = std.ArrayList(RunAuditEntry).empty;
+    defer {
+        for (out.items) |e| {
+            allocator.free(e.run_id);
+            allocator.free(e.status);
+            if (e.model) |m| allocator.free(m);
+        }
+        out.deinit(allocator);
+    }
+    try store.list(allocator, &out, .agent, 7, 10);
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
+    try std.testing.expectEqual(@as(u64, 120), out.items[0].prompt_tokens);
+    try std.testing.expectEqual(@as(u64, 30), out.items[0].completion_tokens);
 }

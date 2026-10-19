@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### 完善：持久化 token 账本 + MCP `tools/list` 可过滤（**行为变化：默认入口仍不过滤**）
+
+- **`RunAuditStore` 记录 token**：新增 `prompt_tokens` / `completion_tokens` 列
+  （旧表由 `migrate()` 自动补列），`Agent` 每次运行累计 provider 报告的用量并写入；
+  新增 `recordRunWithUsage(...)` 供自定义入口。这是**持久化**的用量账本——内存
+  `TokenQuota` 重启即失真，账单/租户结算应以审计表为准。补列改为查
+  `pragma_table_info` / `information_schema`（旧实现用 `SELECT <col>` 探测，
+  缺列时的 prepare 错误会触发测试套件的 err 日志门禁）。
+- **MCP `tools/list` 过滤**：新增 `ai.mcp.ToolFilter` + `toMcpToolsFiltered` +
+  `serveStdioFiltered` —— 只广告 allowlist 内、且 `required_permission` 已授予的
+  技能。`toMcpTools` / `serveStdio` 保持不过滤（向后兼容）；`permissions = null`
+  表示不按权限过滤，空切片才是"该会话没有权限"。
+- 文档：`AI_DEV_GUIDE.md` §8、`MCP.md`「安全」同步。
+
 ### 架构：批 A —— 核心/扩展边界收敛 + 工具结果输入侧防线（**破坏性：否**，一处 API 迁移）
 
 - **`ai.SkillContext.fromHttp` → `ai.http.skillContext(ctx)`**：适配器移出核心

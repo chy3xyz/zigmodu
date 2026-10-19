@@ -55,9 +55,10 @@ cd ../.. && python3 scripts/mcp-client-test.py examples/mcp-server/zig-out/bin/m
 
 - 技能保留 `required_permission` 门控：MCP 会话的 `SkillContext.permissions`
   决定可调用的管理/审批技能 —— 拒绝发生在 `tools/call`（`SkillRegistry.dispatch`），**不在** `tools/list`；
-- **`tools/list` 不过滤**：`ai.mcp.toMcpTools` 列出注册表里的**全部**技能（含 `admin.*`）。
-  按 allowlist / 权限裁剪 `tools/list` 目前**是缺口，不是既有能力** —— 要藏管理类技能，
-  只能先别把它们注册进暴露给 MCP 的那个 registry；
+- **`tools/list` 可过滤**：`ai.mcp.serveStdioFiltered(..., .{ .allowlist = ..., .permissions = ctx.permissions })`
+  只广告 allowlist 内、且 `required_permission` 已授予的技能（`toMcpToolsFiltered` 同语义）。
+  `serveStdio` / `toMcpTools` 保持**不过滤**（向后兼容）——对外暴露时请用带 filter 的入口；
+  `permissions = null` 表示"不按权限过滤"，空切片表示"该会话没有任何权限"（会隐藏管理类技能）。
 - 租户隔离：`ctx_template.tenant_id` 贯穿所有分发。**但隔离由各个技能自己落实** ——
   `entity.*` 看实体声明的 `tenant_column`，`db.query` 看 `BusinessSkillsConfig.db_query_tenant_column`。
   有 `tenant_id` 而没声明列时 `db.query` 是 **`error.TenantScopeUnavailable`（拒绝，不是不过滤）**：

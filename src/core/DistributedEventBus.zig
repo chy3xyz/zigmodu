@@ -6027,25 +6027,34 @@ test "peer key revocation closes the live connection and refuses the re-handshak
     const key_b: [32]u8 = @splat(0xb2);
     const topic = "a3.revoke";
 
+    // Fresh ports per run: `start(port)` binds without SO_REUSEADDR, so a
+    // previous run of *this* test leaves its accepted connections in
+    // TIME_WAIT on 20250/20251 and the next run fails `AddressInUse` (observed
+    // 4/5 locally). The product behaviour (a fixed port must be free) is
+    // correct; the test is what must not reuse one.
+    const now_ms: u64 = @intCast(@import("../core/Time.zig").monotonicNowMilliseconds());
+    const port_a: u16 = @intCast(40_000 + now_ms % 5_000);
+    const port_b: u16 = @intCast(45_000 + now_ms % 5_000);
+
     var received: usize = 0;
     var bus_a = try framedBus(allocator, "node-a", topic, &received);
     defer bus_a.deinit();
     bus_a.setOwnKey(key_a);
     try bus_a.setPeerKey("node-b", key_b);
-    try bus_a.start(20250);
+    try bus_a.start(port_a);
     defer bus_a.stop();
 
     var bus_b = try DistributedEventBus.init(allocator, io, "node-b");
     defer bus_b.deinit();
     bus_b.setOwnKey(key_b);
     try bus_b.setPeerKey("node-a", key_a);
-    try bus_b.start(20251);
+    try bus_b.start(port_b);
     defer bus_b.stop();
 
     // Both directions bound: b dials a (a's inbound fiber binds "node-b"), and
     // a dials b, so a's *registry* holds a live connection to node-b too.
-    try bus_b.connectToNode("node-a", try std.Io.net.IpAddress.parseIp4("127.0.0.1", 20250));
-    try bus_a.connectToNode("node-b", try std.Io.net.IpAddress.parseIp4("127.0.0.1", 20251));
+    try bus_b.connectToNode("node-a", try std.Io.net.IpAddress.parseIp4("127.0.0.1", port_a));
+    try bus_a.connectToNode("node-b", try std.Io.net.IpAddress.parseIp4("127.0.0.1", port_b));
     try std.testing.expectEqual(@as(usize, 1), bus_a.getNodeCount());
     try std.testing.expect(bus_a.nodes.items[0].socket != null);
 
@@ -6076,7 +6085,7 @@ test "peer key revocation closes the live connection and refuses the re-handshak
     // A re-handshake is refused at bindInbound for the same reason (no key on
     // record): the fresh dial is registered for routing but never connected.
     bus_b.disconnectNode("node-a");
-    try bus_b.connectToNode("node-a", try std.Io.net.IpAddress.parseIp4("127.0.0.1", 20250));
+    try bus_b.connectToNode("node-a", try std.Io.net.IpAddress.parseIp4("127.0.0.1", port_a));
     try std.testing.expectEqual(@as(usize, 1), bus_b.getNodeCount());
     try std.testing.expect(bus_b.nodes.items[0].socket == null);
 }

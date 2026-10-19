@@ -427,6 +427,11 @@ pub const Agent = struct {
         }
 
         var steps: usize = 0;
+        // Provider-reported usage, accumulated per LLM step for the durable
+        // run-audit row (the in-memory `TokenQuota` cannot answer a bill after
+        // a restart).
+        var prompt_tokens_total: u64 = 0;
+        var completion_tokens_total: u64 = 0;
         var budget_stopped = false;
         var canceled_stopped = false;
         var span: ?*DistributedTracer.Span = null;
@@ -471,6 +476,8 @@ pub const Agent = struct {
             var resp = try self.provider.chatStream(messages.items, .{ .tools_json = tools_json }, &delta_bridge, DeltaBridge.onDelta);
             defer self.provider.freeResponse(&resp);
 
+            prompt_tokens_total += @intCast(resp.prompt_tokens);
+            completion_tokens_total += @intCast(resp.completion_tokens);
             if (self.quota) |q| {
                 try q.record(skill_ctx.tenant_id orelse audit_mod.unscoped_identity, resp.prompt_tokens, resp.completion_tokens);
             }
@@ -483,7 +490,7 @@ pub const Agent = struct {
                 if (self.audit) |log| {
                     log.record(.run_finish, "", resp.content, skill_ctx.tenant_id orelse audit_mod.unscoped_identity, skill_ctx.user_id orelse audit_mod.unscoped_identity);
                 }
-                try self.recordRunAudit(allocator, skill_ctx, steps + 1, started_ms, if (budget_stopped) "budget_exhausted" else if (canceled_stopped) "canceled" else "completed", if (resp.model.len > 0) resp.model else null);
+                try self.recordRunAudit(allocator, skill_ctx, steps + 1, started_ms, if (budget_stopped) "budget_exhausted" else if (canceled_stopped) "canceled" else "completed", if (resp.model.len > 0) resp.model else null, prompt_tokens_total, completion_tokens_total);
                 // Each of these three is owned until the `return` hands them
                 // over; the `errdefer`s fire only if a later dupe fails, so a
                 // failure cannot drop the ones already allocated.
@@ -649,7 +656,7 @@ pub const Agent = struct {
         if (self.audit) |log| {
             log.record(.run_max_steps, "", "max_steps exceeded", skill_ctx.tenant_id orelse audit_mod.unscoped_identity, skill_ctx.user_id orelse audit_mod.unscoped_identity);
         }
-        try self.recordRunAudit(allocator, skill_ctx, steps, started_ms, "max_steps", null);
+        try self.recordRunAudit(allocator, skill_ctx, steps, started_ms, "max_steps", null, prompt_tokens_total, completion_tokens_total);
         const timeout_msg = try allocator.dupe(u8, "Agent stopped: max_steps exceeded");
         return .{ .answer = timeout_msg, .steps = steps, .owned_answer = true, .budget_exhausted = budget_stopped, .canceled = canceled_stopped };
     }
@@ -662,6 +669,8 @@ pub const Agent = struct {
         started_ms: i64,
         status: []const u8,
         model: ?[]const u8,
+        prompt_tokens: u64,
+        completion_tokens: u64,
     ) !void {
         const store = self.audit_store orelse return;
         const now_ms = @import("../core/Time.zig").monotonicNowMilliseconds();
@@ -676,6 +685,8 @@ pub const Agent = struct {
             .steps = steps,
             .model = model,
             .duration_ms = now_ms - started_ms,
+            .prompt_tokens = prompt_tokens,
+            .completion_tokens = completion_tokens,
         });
     }
 };
@@ -835,7 +846,7 @@ test "Agent recordRunAudit persists agent runs" {
         .audit_store = &store,
     };
     var sctx = SkillContext{ .allocator = allocator, .tenant_id = 3 };
-    try agent.recordRunAudit(allocator, &sctx, 4, @import("../core/Time.zig").monotonicNowMilliseconds(), "completed", "deepseek-chat");
+    try agent.recordRunAudit(allocator, &sctx, 4, @import("../core/Time.zig").monotonicNowMilliseconds(), "completed", "deepseek-chat", 120, 30);
 
     try std.testing.expectEqual(@as(usize, 1), try store.count());
     var entries = std.ArrayList(run_audit_mod.RunAuditEntry).empty;
