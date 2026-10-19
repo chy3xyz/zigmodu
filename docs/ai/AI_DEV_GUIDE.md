@@ -177,12 +177,12 @@ defer wf_result.deinit();
 
 ## 6. 接入方式
 
-**HTTP（ComptimeRouter）**：handler 里用 **`ai.SkillContext.fromHttp(ctx)`**
+**HTTP（ComptimeRouter）**：handler 里用 **`ai.http.skillContext(ctx)`**
 构造上下文后调 `agent.run` / `wf.run`，把 `result.answer` 用 `ctx.json` 返回：
 
 ```zig
 fn runAgent(ctx: *http.Context, self: *State) !void {
-    const sctx = try ai.SkillContext.fromHttp(ctx);   // 失败即拒绝，不猜
+    const sctx = try ai.http.skillContext(ctx);   // 失败即拒绝，不猜
     var result = try self.agent.run(ctx.allocator, goal, &sctx, 8);
     try ctx.jsonStruct(200, .{ .answer = result.answer });
 }
@@ -217,13 +217,27 @@ server，`tools/list` 自动从注册表推导参数 schema，并列出注册表
 - [ ] `guard.allow`（空 = 什么都不放行）+ `Agent.allowlist`（null = 全部注册工具）两处都只列业务需要的技能；`admin.*` 不要注册进暴露面
 - [ ] 写操作技能设 `required_permission` + 事务性 outbox + 幂等键（`run_id`）
 - [ ] handler 返回值全部 `ctx.allocator` 持有，调用方 `freeValue`
-- [ ] HTTP 边界一律用 `ai.SkillContext.fromHttp(ctx)`（attrs 取身份）；多租户应用用 `registerBusinessSkillsWith(..., .{ .db_query_tenant_column = "<列名>" })`（默认入口会让 `db.query` fail-closed），实体技能按实体声明的 `tenant_column` 隔离
+- [ ] HTTP 边界一律用 `ai.http.skillContext(ctx)`（attrs 取身份）；多租户应用用 `registerBusinessSkillsWith(..., .{ .db_query_tenant_column = "<列名>" })`（默认入口会让 `db.query` fail-closed），实体技能按实体声明的 `tenant_column` 隔离
 - [ ] 审批 API（`ai.approval_api.ApprovalApi`）的租户作用域来自**已验证的 `tenant_id` attr**；`X-Tenant-ID` 只有显式 `Config.allow_tenant_header = true` 才能顶替，且与 attr 冲突时 403。无作用域的请求现在是 403，**不再**列出全部租户
 - [ ] RAG（`Retriever`）实现按租户分区/过滤，禁止"共享索引 + 相似度截断"当隔离；共享索引请设置 `Retriever.retrieveScopedFn`——`Agent` 会把本次运行的 `tenant_id/user_id` 传进去，没设置而运行又带身份时会打**一条**进程级警告（框架无法过滤别人的索引）
 - [ ] 审批列表（`GET /approvals/pending`）与 approve/reject 共用 `approval:decide` 权限码；只读审计员需要单独的角色/端点，别给 decide
 - [ ] 长任务设 `deadline_ms` / `tool_timeout_ms` / `Budget`
 - [ ] 生产打开 `audit`（`AgentAuditLog` / `RunAuditStore`）与指标
 - [ ] LLM 决策「拿不准就转人工」，绝不静默批准（`ai.llm` 已内建该姿态）
+- [ ] 工具结果是**不可信输入**：框架默认用 `[untrusted tool output …]` 包裹并截断到
+  `Agent.tool_result_limit_bytes`（默认 32 KiB，超出打 truncation 标记）；自定义
+  handler 不要把外部文本拼进 system prompt，需要更多内容就让查询自己收窄
+
+### 核心与扩展的边界
+
+`zigmodu.ai` 里有两类模块，改动时别混：
+
+- **核心**（`Agent` / `skill` / `provider` / `workflow` / `guard` / `budget` / `memory` /
+  `retriever` / `quota` / `context` / 供给层）：不知道任何业务名词，只依赖
+  `SkillContext`。`ai.http` 只是把请求转成上下文的适配器，核心不 import HTTP。
+- **ops 扩展**（`alerts` / `kpi` / `recon` / `refund` / `ticket` / `sla` / `risk` /
+  `diagnose` / `reporter` / `notify` / `approval*` / `business` / `actions`）：直接绑定
+  `data.sqlx` 与具体表结构，按你的业务改写或整体替换；不要把它们当作"AI 基础设施"复用。
 
 ## 8. 观测与调试
 

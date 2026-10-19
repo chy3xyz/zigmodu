@@ -200,7 +200,7 @@ try ai.agent_worker.post(ctx.allocator, 32, worker, goal_text, tenant_id, user_i
 - **Risk 的规则**（`RiskRule.sql` + 分值）与 **Execution 的实现**（`ExecutorFn`）：框架给顺序和骨架，
   内容由业务填。
 - **身份 ≠ 鉴权**：`SkillContext` 的 tenant / user 是"代表谁运行"，权限依旧由 `security/` 决定。
-  HTTP 边界用 `ai.SkillContext.fromHttp(ctx)` 从**已验证的 attrs**（`user_id` /
+  HTTP 边界用 `ai.http.skillContext(ctx)` 从**已验证的 attrs**（`user_id` /
   `tenant_id` / `permissions`）构造；缺失或非数字直接报错（`TenantRequired` /
   `UserRequired` / `Malformed*`），不读 header/body、不把缺字段当租户 0。
   `requireTenant()` / `requireIdentity()` 供"必须带租户/身份才能继续"的路径自检。

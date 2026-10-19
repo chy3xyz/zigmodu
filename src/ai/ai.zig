@@ -1,3 +1,8 @@
+/// HTTP → AI adapters (`ai.http.skillContext(ctx)`): build a verified
+/// `SkillContext` at the request boundary. Separate from `skill.zig` so the
+/// core registry does not depend on the HTTP domain.
+pub const http = @import("http.zig");
+
 /// A callable skill (tool) an LLM can invoke by name.
 pub const Tool = @import("skill.zig").Tool;
 /// One tool parameter: type + description, rendered to JSON Schema.

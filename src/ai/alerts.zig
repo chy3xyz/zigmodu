@@ -77,7 +77,7 @@ test "BusinessAlert raises alerts for violation rows" {
     defer client.deinit();
     try client.connect();
     _ = try client.exec(
-        "CREATE TABLE event_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, payload TEXT, status INTEGER DEFAULT 0, tenant_id INTEGER, retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 5, created_at INTEGER, updated_at INTEGER, error_message TEXT)",
+        @import("test_fixtures.zig").outbox_table_sql,
         &.{},
     );
     _ = try client.exec("CREATE TABLE orders (id INTEGER PRIMARY KEY, status TEXT)", &.{});

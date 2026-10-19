@@ -161,7 +161,7 @@ test "trigger writes run outcome to the outbox" {
     try sqlx_client.connect();
     // migrationSql() is MySQL-flavored; mirror the same columns for SQLite.
     _ = try sqlx_client.exec(
-        "CREATE TABLE event_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, payload TEXT, status INTEGER DEFAULT 0, tenant_id INTEGER, retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 5, created_at INTEGER, updated_at INTEGER, error_message TEXT)",
+        @import("test_fixtures.zig").outbox_table_sql,
         &.{},
     );
 
@@ -228,7 +228,7 @@ test "trigger outbox payload escapes quotes in the run outcome" {
     defer sqlx_client.deinit();
     try sqlx_client.connect();
     _ = try sqlx_client.exec(
-        "CREATE TABLE event_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, payload TEXT, status INTEGER DEFAULT 0, tenant_id INTEGER, retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 5, created_at INTEGER, updated_at INTEGER, error_message TEXT)",
+        @import("test_fixtures.zig").outbox_table_sql,
         &.{},
     );
 
