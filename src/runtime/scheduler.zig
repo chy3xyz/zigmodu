@@ -1838,6 +1838,15 @@ fn tokenId(item: Ready) usize {
 /// failing case costs milliseconds, not minutes.
 const ring_retry_budget: usize = 1 << 20;
 
+/// After the spin budget is exhausted, how long a push may keep retrying with
+/// `Thread.yield` before it is declared refused. Spin counts alone cannot tell
+/// "the ring is stuck" from "the consumer is descheduled": on an oversubscribed
+/// CI runner (ubuntu-24.04-arm, 2026-10-19) a producer burned the whole
+/// 1 << 20 spins while no consumer had the CPU, reported `push_failures`, and
+/// the run failed as `token 19785 came out 0 times`. Yielding is what lets the
+/// consumer run; the deadline is what still bounds a genuinely stuck ring.
+const ring_retry_deadline_ns: i96 = 5 * std.time.ns_per_s;
+
 /// How long a *test* producer waits for room in a mailbox before it counts the
 /// message as refused backpressure. Same purpose as `ring_retry_budget`, and it
 /// keeps the live runs carrying traffic instead of bouncing off the mailbox
@@ -1930,9 +1939,23 @@ test "scheduler: a hammered ring hands every token to exactly one consumer" {
             for (0..n) |k| {
                 const item = numberedToken(base + k);
                 var spins: usize = 0;
+                var give_up_after: ?i96 = null;
                 while (!r.tryPush(item)) {
                     spins += 1;
-                    if (spins > ring_retry_budget) {
+                    if (spins <= ring_retry_budget) {
+                        std.atomic.spinLoopHint();
+                        continue;
+                    }
+                    // Past the fast path the consumer may simply not have been
+                    // scheduled: yield, and decide by wall clock rather than by
+                    // a spin count a descheduled host can exhaust for us.
+                    const now = std.Io.Clock.Timestamp.now(std.testing.io, .awake).raw.nanoseconds;
+                    const deadline = give_up_after orelse blk: {
+                        const d = now + ring_retry_deadline_ns;
+                        give_up_after = d;
+                        break :blk d;
+                    };
+                    if (now > deadline) {
                         // Stop at the first give-up: a ring that refuses a push
                         // for this long is already the finding, and hammering it
                         // for the rest of the batch would only make the failure
@@ -1941,7 +1964,7 @@ test "scheduler: a hammered ring hands every token to exactly one consumer" {
                         _ = done.fetchAdd(1, .acq_rel);
                         return;
                     }
-                    std.atomic.spinLoopHint();
+                    std.Thread.yield() catch {};
                 }
             }
             _ = done.fetchAdd(1, .acq_rel);

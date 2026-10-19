@@ -30,6 +30,11 @@
   macOS CI runner 上一次 best-of-3 仍越过 3x 界（索引无 tombstone），
   取样窗口只有几百微秒，连续撞调度停顿是噪声而非回归；被测 bug 是
   10–15x 且永久，九窗口全部超界仍会失败。
+- `scheduler` 的 hammered-ring 压测：producer 在纯自旋预算耗尽后改为
+  `Thread.yield()` + **5 秒墙钟**判失败。ubuntu-24.04-arm runner 上
+  消费线程被完全剥夺 CPU 时，1 << 20 次自旋可以在它拿到时间片前烧完，
+  被误报为 `push_failures`（token 19785 came out 0 times）；yield 让
+  消费者有机会运行，墙钟仍能界定真正卡死的 ring。
 
 ## [0.39.18] - 2026-10-18
 
