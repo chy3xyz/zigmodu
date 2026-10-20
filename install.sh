@@ -15,10 +15,6 @@ NC='\033[0m' # No Color
 # Configuration
 ZMODU_REPO="${ZMODU_REPO:-https://github.com/chy3xyz/zmodu.git}"
 INSTALL_DIR="${ZMODU_INSTALL_DIR:-${HOME}/.zmodu}"
-# Keep an existing pre-rename install working instead of cloning a second copy.
-if [[ ! -d "$INSTALL_DIR" && -d "${HOME}/.zigmodu" ]]; then
-    INSTALL_DIR="${HOME}/.zigmodu"
-fi
 BIN_DIR="${HOME}/.local/bin"
 ZIG_MIN_VERSION="0.16.0"
 

@@ -324,7 +324,7 @@ fn nearestRank(sorted: []const f64, p: f64) f64 {
 /// Stall injection: the counter-proof that this section samples real per-batch
 /// times instead of deriving a distribution from the median.
 ///
-/// With `ZIGMODU_BENCH_INJECT_NS` set, every `ZIGMODU_BENCH_INJECT_EVERY`-th
+/// With `ZMODU_BENCH_INJECT_NS` set, every `ZMODU_BENCH_INJECT_EVERY`-th
 /// batch (40th by default — 25 of the 1000 samples) pays an extra busy-spin of
 /// that many nanoseconds, timed with the same clock and added to that batch's
 /// sample. The cadence is the point: 25 stalled samples are 2.5% of the
@@ -356,11 +356,11 @@ const LatencyInjector = struct {
     /// would otherwise look exactly like a sampler that cannot see a stall.
     fn fromEnv(environ: anytype) !LatencyInjector {
         var injector = LatencyInjector{};
-        if (environ.get("ZMODU_BENCH_INJECT_NS") orelse environ.get("ZIGMODU_BENCH_INJECT_NS")) |raw| {
+        if (environ.get("ZMODU_BENCH_INJECT_NS")) |raw| {
             injector.stall_ns = std.fmt.parseInt(i128, raw, 10) catch return error.BenchInvalidInjectNs;
             if (injector.stall_ns < 0) return error.BenchInvalidInjectNs;
         }
-        if (environ.get("ZMODU_BENCH_INJECT_EVERY") orelse environ.get("ZIGMODU_BENCH_INJECT_EVERY")) |raw| {
+        if (environ.get("ZMODU_BENCH_INJECT_EVERY")) |raw| {
             injector.every = std.fmt.parseInt(usize, raw, 10) catch return error.BenchInvalidInjectEvery;
         }
         return injector;
@@ -2314,7 +2314,7 @@ pub fn main(init: std.process.Init) !void {
     const latency_section_t0 = now();
     var latency = LatencyRun{ .allocator = a, .injector = try LatencyInjector.fromEnv(init.environ_map), .medians = &results };
     if (latency.injector.active()) {
-        std.debug.print("  !! latency injection ON (ZIGMODU_BENCH_INJECT_NS={d}, every {d}th batch): counter-proof\n     run, not a measurement of the framework — p50/p95 must stay put and p99 must move.\n", .{ latency.injector.stall_ns, latency.injector.every });
+        std.debug.print("  !! latency injection ON (ZMODU_BENCH_INJECT_NS={d}, every {d}th batch): counter-proof\n     run, not a measurement of the framework — p50/p95 must stay put and p99 must move.\n", .{ latency.injector.stall_ns, latency.injector.every });
     }
     std.debug.print("\n", .{});
     try latency.run("atomic RMW x10M", benchAtomicRmw, .{a}, 10_000_000);

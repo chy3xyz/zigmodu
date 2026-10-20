@@ -23,6 +23,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        // `wallClockSeconds` uses std.c.clock_gettime; Linux needs the libc
+        // link explicit (macOS links libSystem implicitly).
+        .link_libc = true,
     });
     zmodu_mod.addImport("build_options", build_options_mod);
 

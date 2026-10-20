@@ -45,7 +45,7 @@ services only after the boundary is proven — with the dependency rules enforce
 | [Status & readiness](docs/dev/v1.0-readiness-v0.35.md) | **What is proven and what is not** — dated, per item, with evidence (for the older self-scoring report, see [Evaluation Report](docs/archive/status/EVALUATION_REPORT.md)) |
 | [Examples](examples/) | Runnable example projects |
 | [Production deploy](examples/production-deploy/) | TLS sidecar (nginx/Envoy), k8s, systemd, Dockerfile, request-smuggling e2e |
-| [ZModu CLI](docs/guide/ZMODU_CLI_INTEGRATION.md) | Built-in codegen (`zig build zmodu`) |
+| [zmodu CLI](docs/guide/ZMODU_CLI_INTEGRATION.md) | Built-in codegen (`zig build zmodu`) |
 
 ## ✨ Features
 

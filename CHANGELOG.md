@@ -6,16 +6,17 @@
 
 - **包名与模块名**：`build.zig.zon` 的 `.name = .zmodu`，模块 `addModule("zmodu")`；
   消费方写 `@import("zmodu")`、`b.dependency("zmodu").module("zmodu")`。
-- **一版兼容垫片**：`addModule("zigmodu")` 仍存在（同一 root/imports），旧
-  `module("zigmodu")` 可继续解析到 v1.0；`ZIGMODU_*` 环境变量仍被读取（`ZMODU_*` 优先）。
+- **不保留旧名兼容**：`addModule("zigmodu")`、`@import("zigmodu")` 与 `ZIGMODU_*`
+  环境变量都已删除。外部项目少，这次按一次性改名处理：依赖键/模块名/import/env
+  一起改成 `zmodu`。
 - **包指纹随包名变化**：`0xde7987a02b121580`（Zig 在 `.name` 改变后强制要求新指纹）。
   依赖 hash 前缀由 `zigmodu-` 变为 `zmodu-`，消费方需要重新 `zig fetch`。
 - **有意不改的线上契约**：Prometheus 指标名 `zigmodu_*`、迁移表 `_zigmodu_migrations`、
   Raft 快照前缀 `zigmodu-raft-snapshot:`、模型字段 `zigmodu_ignore_tenant`。它们是
   仪表盘/既有库/落盘格式/应用代码的一部分，改名会静默破坏；留到 1.0 做双写/迁移。
 - 仓库与文档站：`chy3xyz/zmodu`（GitHub 对旧 URL 自动重定向），
-  `docs.yml --url-prefix zmodu`；`install.sh` 仓库地址、安装目录（保留旧 `~/.zigmodu`
-  探测）与 CLI 名同步。
+  `docs.yml --url-prefix zmodu`；`install.sh` 仓库地址、安装目录（`~/.zmodu`）与
+  CLI 名同步。
 - 顺带修复：`install.sh` 里一段重复的 `install_cli()` 片段导致整份脚本
   `bash -n` 失败——安装脚本此前跑不起来。
 

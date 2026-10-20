@@ -35,19 +35,6 @@ pub fn build(b: *std.Build) void {
 
     db_link.link(zmodu_mod, b, target, features);
 
-    // One-version compatibility: consumers that still write
-    // `dep.module("zigmodu")` / `@import("zigmodu")` keep compiling until
-    // v1.0. The canonical module is `zmodu`; this alias is intentionally
-    // identical (same root, same imports, same driver linkage).
-    const legacy_zmodu_mod = b.addModule("zigmodu", .{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    legacy_zmodu_mod.addImport("build_options", build_options_mod);
-    db_link.link(legacy_zmodu_mod, b, target, features);
-
     // Create example executable
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("examples/basic/src/main.zig"),

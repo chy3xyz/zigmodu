@@ -13,7 +13,7 @@
 //!
 //! Every section carries a matching `// ==== §N ... ====` anchor — `grep "==== §5"` jumps there.
 
-// ZModu - Code generation tool for zmodu
+// zmodu - Code generation tool for zmodu
 const std = @import("std");
 const build_options = @import("build_options");
 
@@ -533,7 +533,7 @@ fn parseCommand(cmd: []const u8) ?Command {
 
 fn printUsage() void {
     const usage =
-        \\ZModu - Code generation tool for zmodu
+        \\zmodu - Code generation tool for zmodu
         \\
         \\Usage:
         \\  zmodu <command> [options]

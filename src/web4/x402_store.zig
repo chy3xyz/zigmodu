@@ -510,14 +510,14 @@ test "X402Store reports a duplicate invoice id instead of a driver error" {
 /// The `CREATE TABLE` in `migrate` is SQLite's, so on PG/MySQL the ledger table
 /// is the application's to create — exactly the situation this probe exists for,
 /// and the only way to know that `information_schema` answers it there. Gating
-/// and connection variables follow the repo's real-server tests: `ZMODU_TEST_PG=1`（旧名 `ZIGMODU_TEST_PG` 仍读取）
+/// and connection variables follow the repo's real-server tests: `ZMODU_TEST_PG=1`
 /// for PostgreSQL (`core.DistributedLock`), `DB=mysql` for MySQL (`sqlx`), with
 /// the usual `PG*` / `MYSQL_*` overrides.
 fn probeCatalogColumn(comptime driver: sqlx.Driver) !void {
     const allocator = std.testing.allocator;
     if (!sqlx.DriverFeatures.isEnabled(driver)) return error.SkipZigTest;
     const gate = switch (driver) {
-        .postgres => std.c.getenv("ZMODU_TEST_PG") orelse std.c.getenv("ZIGMODU_TEST_PG"),
+        .postgres => std.c.getenv("ZMODU_TEST_PG"),
         .mysql => std.c.getenv("DB"),
         .sqlite => null,
     } orelse return error.SkipZigTest;

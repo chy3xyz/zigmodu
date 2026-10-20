@@ -29,8 +29,8 @@
 
 - 依赖键与模块：`build.zig.zon` 里 `.zmodu = .{ … }`；`b.dependency("zmodu", …).module("zmodu")`；
   源码 `@import("zmodu")`。
-- **一版兼容垫片**：本版本的 `build.zig` 仍声明模块 `zigmodu`（同一 root），所以只改
-  `@import` 也能渐进迁移；v1.0 删除该别名。`ZIGMODU_*` 环境变量仍被读取（`ZMODU_*` 优先）。
+- **不保留旧名**：模块 `zigmodu` 与 `ZIGMODU_*` 环境变量已删除。依赖键、模块名、
+  `@import`、env 前缀需一次改完（外部项目少，按一次性改名处理，避免长期双名）。
 - **包指纹变了**：`.fingerprint = 0xde7987a02b121580`（Zig 在包名变化后强制要求新值）；
   依赖 hash 前缀从 `zigmodu-` 变为 `zmodu-`，升级后必须重新 `zig fetch` 并更新 `.hash`。
 - **有意保留的线上契约**（改名不动）：Prometheus 指标 `zigmodu_*`、迁移表
@@ -38,8 +38,8 @@
   `zigmodu_ignore_tenant`。它们在仪表盘/既有数据库/落盘格式/应用代码里，静默改名会断，
   统一留到 1.0 做双写与迁移。
 - 仓库：`https://github.com/chy3xyz/zmodu`（旧 URL 由 GitHub 自动重定向）；文档站
-  `--url-prefix zmodu`；`install.sh` 的安装目录改为 `~/.zmodu`，但检测到旧的
-  `~/.zigmodu` 时继续沿用。
+  `--url-prefix zmodu`；`install.sh` 的安装目录为 `~/.zmodu`（旧的 `~/.zigmodu`
+  不再自动复用，移动或重装即可）。
 
 ## 弃用别名与删除计划
 

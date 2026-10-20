@@ -415,29 +415,24 @@ pub const ExternalizedConfig = struct {
 
 /// Environment variable config source; reads the `ZMODU_` prefixed variables.
 ///
-/// `ZIGMODU_` is still honoured for one release (the project was renamed from
-/// zmodu to zmodu): a property present under both prefixes takes the `ZMODU_`
-/// value. Deployments can migrate at their own pace without renaming env vars
-/// first.
+/// The `ZIGMODU_` prefix from before the rename is **not** read any more: the
+/// project renamed early, with few external consumers, so the break is a
+/// one-time rename rather than a permanently doubled surface.
 pub fn envVarLoader(allocator: std.mem.Allocator) !std.StringHashMap([]const u8) {
     var props = std.StringHashMap([]const u8).init(allocator);
 
-    const prefixes = [_][]const u8{ "ZMODU_", "ZIGMODU_" };
+    const prefix = "ZMODU_";
 
     var env_map = std.process.getEnvMap(allocator) catch return props;
     defer env_map.deinit();
 
-    for (prefixes) |prefix| {
-        var iter = env_map.iterator();
-        while (iter.next()) |entry| {
-            const key = entry.key_ptr.*;
-            if (!std.mem.startsWith(u8, key, prefix)) continue;
-            const prop_key = key[prefix.len..];
-            if (props.contains(prop_key)) continue; // new prefix wins
-            const k = try allocator.dupe(u8, prop_key);
-            const value = try allocator.dupe(u8, entry.value_ptr.*);
-            try props.put(k, value);
-        }
+    var iter = env_map.iterator();
+    while (iter.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (!std.mem.startsWith(u8, key, prefix)) continue;
+        const prop_key = try allocator.dupe(u8, key[prefix.len..]);
+        const value = try allocator.dupe(u8, entry.value_ptr.*);
+        try props.put(prop_key, value);
     }
 
     return props;
