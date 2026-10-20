@@ -1,0 +1,112 @@
+name: Release CLI + Homebrew tap
+
+# A published GitHub Release triggers this workflow, which:
+#   1. builds the `zmodu` CLI for macOS/Linux on arm64/x86_64 (Zig
+#      cross-compiles all four from one macOS runner),
+#   2. attaches the tarballs to the release,
+#   3. bumps `Formula/zmodu.rb` in chy3xyz/homebrew-tap (version + sha256).
+#
+# The tap is written with a deploy key scoped to that repository
+# (`HOMEBREW_TAP_DEPLOY_KEY`), the same pattern the zgix tap uses. Keeping
+# this out of ci.yml's release job means a tap/FTP problem cannot block the
+# framework artifacts, and a framework rebuild is not required to republish
+# the CLI.
+
+on:
+  release:
+    types: [published]
+  # Recovery/re-test path: re-run for an existing tag without cutting a new
+  # release (assets are overwritten; the tap update is idempotent).
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag (e.g. v0.42.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  cli-homebrew:
+    name: CLI assets + tap
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      ZIG_VERSION: 0.17.0
+      RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Setup Zig
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            arm64) ART="zig-aarch64-macos" ;;
+            *) ART="zig-x86_64-macos" ;;
+          esac
+          URL="https://ziglang.org/download/${ZIG_VERSION}/${ART}-${ZIG_VERSION}.tar.xz"
+          curl -fsSL "$URL" -o "$RUNNER_TEMP/zig.tar.xz"
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig"
+          echo "$RUNNER_TEMP/zig/${ART}-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: Build CLI for four platforms
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${RELEASE_TAG#v}"
+          mkdir -p dist
+          for target in aarch64-macos x86_64-macos x86_64-linux aarch64-linux; do
+            ( cd tools/zmodu
+              zig build "-Dtarget=${target}" -Doptimize=ReleaseSafe \
+                --prefix "${RUNNER_TEMP}/cli/${target}" )
+            arch="${target%%-*}"
+            os="${target#*-}"
+            tar -czf "dist/zmodu-${ver}-${arch}-${os}.tar.gz" \
+              -C "${RUNNER_TEMP}/cli/${target}/bin" zmodu
+          done
+          ( cd dist && shasum -a 256 ./*.tar.gz > SHA256SUMS )
+          cat dist/SHA256SUMS
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          # Re-running the workflow for the same tag replaces the assets
+          # instead of failing on duplicates.
+          tag_name: ${{ env.RELEASE_TAG }}
+          overwrite: true
+          files: dist/*.tar.gz
+
+      - name: Update homebrew-tap
+        shell: bash
+        env:
+          TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${TAP_DEPLOY_KEY:-}" ]]; then
+            echo "HOMEBREW_TAP_DEPLOY_KEY is not set; skipping tap update" >&2
+            exit 1
+          fi
+          ver="${RELEASE_TAG#v}"
+          key="$RUNNER_TEMP/zmodu_tap"
+          printf '%s\n' "$TAP_DEPLOY_KEY" > "$key"
+          chmod 600 "$key"
+          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+
+          rm -rf "$RUNNER_TEMP/tap"
+          git clone --depth 1 git@github.com:chy3xyz/homebrew-tap.git "$RUNNER_TEMP/tap"
+          python3 scripts/update-homebrew-formula.py \
+            "$RUNNER_TEMP/tap/Formula/zmodu.rb" "$ver" dist
+
+          cd "$RUNNER_TEMP/tap"
+          if git diff --quiet; then
+            echo "tap already at ${ver}"
+            exit 0
+          fi
+          git config user.name "zmodu-release-bot"
+          git config user.email "release-bot@users.noreply.github.com"
+          git commit -am "zmodu: ${ver}"
+          git push origin main
