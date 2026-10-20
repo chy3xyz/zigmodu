@@ -1,5 +1,20 @@
 # Changelog
 
+## [Unreleased]
+
+### 破坏性：移除 `zigmodu` 兼容 + 修复 CLI 的 Linux 构建
+
+- 删除 `build.zig` 的 `addModule("zigmodu")` 别名：`@import("zigmodu")` 与
+  `module("zigmodu")` 不再解析。
+- 删除 `ZIGMODU_*` 环境变量回退：`ExternalizedConfig` 只读 `ZMODU_`；
+  `ZMODU_TEST_PG` / `ZMODU_BENCH_INJECT_*` 同理；`install.sh` 不再复用 `~/.zigmodu`。
+- 迁移是一次性的：依赖键、模块名、`@import`、env 前缀全部改 `zmodu`，并重新
+  `zig fetch`（hash 前缀为 `zmodu-`）。
+- 修复 `tools/zmodu` 独立构建：CLI 调用 `std.c.clock_gettime`，但模块没有
+  `link_libc`，导致 `cd tools/zmodu && zig build` 在 Linux 上编译失败（macOS 隐式
+  链接 libSystem，只有 CI 的根构建掩盖了它）。补上后两个 Linux 架构都能交叉编译，
+  release 资产也因此可以预编译。
+
 ## [0.41.0] - 2026-10-20
 
 ### 项目改名：ZigModu → zmodu（**破坏性：是**）

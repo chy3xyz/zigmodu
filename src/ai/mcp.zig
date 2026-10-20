@@ -257,7 +257,7 @@ fn serveLine(
         var info = std.json.ObjectMap{};
         try putString(&info, a, "protocolVersion", "2024-11-05");
         try putString(&info, a, "name", "zmodu");
-        try putString(&info, a, "version", "0.41.0");
+        try putString(&info, a, "version", "0.42.0");
         try putString(&info, a, "serverInfo", "zmodu-ai");
         var capabilities = std.json.ObjectMap{};
         var tool_caps = std.json.ObjectMap{};
