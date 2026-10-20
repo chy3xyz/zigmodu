@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.42.0] - 2026-10-20
 
 ### 破坏性：移除 `zigmodu` 兼容 + 修复 CLI 的 Linux 构建
 
