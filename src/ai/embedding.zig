@@ -11,7 +11,6 @@
 
 const std = @import("std");
 const http_client = @import("../http/HttpClient.zig");
-const retriever = @import("retriever.zig");
 
 pub const OpenAiEmbeddings = struct {
     allocator: std.mem.Allocator,
