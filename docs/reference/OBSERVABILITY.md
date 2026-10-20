@@ -326,3 +326,12 @@ annotations:
    （harness 自身失败 / `push_failures` / 窗口内分配，违例 exit 1）；dispatch 量、RSS spread、
    shutdown 耗时这类宿主相关读数只打印中位数与 delta 不门禁（§12.15/§12.16 的同一条分工；
    `timers.dropped` 是背压语义不是契约，也只在漂移表里）。
+
+   **soak / soak-cluster 是同一条序列的另一半**：`SOAK_HISTORY` / `SOAK_CLUSTER_HISTORY`
+   各自在*通过*后追加一行（`kind` 区分；同样不含宿主时钟列），夜间写进同一个
+   `nightly-logs/`，所以一个 artifact 里现在是三条 commit→结果序列（stress + soak +
+   cluster soak）。本地用 `bash scripts/soak-record.sh [dir]`（默认仓库根，两个文件已
+   gitignore），读回用 `python3 scripts/soak_trend.py <a.jsonl> [<b.jsonl>] [--window N]`：
+   硬门只收**跨租户泄漏 / drain 后残留连接 / 同一采样两个 leader**（exit 1）；RSS、fd、
+   线程、耗时只打印中位数与 delta。失败的一晚不写行——"缺行"就是那一晚红了的信号，
+   原因看 `soak.log` / `soak-cluster.log`。

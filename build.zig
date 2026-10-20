@@ -399,6 +399,9 @@ pub fn build(b: *std.Build) void {
 
     const soak_tests = b.addTest(.{ .root_module = soak_mod });
     const run_soak = b.addRunArtifact(soak_tests);
+    // `SOAK_HISTORY` appends to a file: the run has an effect outside the
+    // build graph, so it must not be treated as a pure/cacheable step.
+    run_soak.has_side_effects = true;
     const soak_step = b.step("soak", "Run concurrency soak tests (N clients x M tenants)");
     soak_step.dependOn(&run_soak.step);
 
@@ -441,6 +444,33 @@ pub fn build(b: *std.Build) void {
     run_soak_cluster.has_side_effects = true;
     const soak_cluster_step = b.step("soak-cluster", "Run the 3-node cluster soak (raft + event bus, leader/fd/RSS invariants)");
     soak_cluster_step.dependOn(&run_soak_cluster.step);
+
+    // HTTP load generator (`zig build bench-http -- --proto h2c --conns 16 …`) —
+    // the dependency-free alternative to h2load/wrk for end-to-end numbers.
+    // It speaks h2c with the framework's own Http2 frame encoder, so it also
+    // exercises the wire format from the client side.
+    const bench_http_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench_http.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    bench_http_mod.addImport("zigmodu", zigmodu_mod);
+    // No `db_link`: this tool imports `zigmodu.http` only, so the SQL drivers
+    // are never analyzed — linking them would make every `bench-http`
+    // invocation pay a full Debug compile of three C drivers.
+
+    const bench_http_exe = b.addExecutable(.{
+        .name = "bench-http",
+        .root_module = bench_http_mod,
+    });
+    b.installArtifact(bench_http_exe);
+    const run_bench_http = b.addRunArtifact(bench_http_exe);
+    run_bench_http.addPassthruArgs();
+    // A cached run would print nothing on the second invocation.
+    run_bench_http.has_side_effects = true;
+    const bench_http_step = b.step("bench-http", "Run the HTTP load generator (h1/h2c): zig build bench-http -- --proto h2c --conns 16 --streams 16 --requests 100000");
+    bench_http_step.dependOn(&run_bench_http.step);
 
     // Cluster node harness (`zig build cluster-node`) — ONE cluster node as a
     // standalone process: ClusterBootstrap + RaftElection over a real TCP

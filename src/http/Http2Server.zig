@@ -304,6 +304,15 @@ const ConnWriter = struct {
     failed: ?WriteError = null,
 
     fn init(io: std.Io, stream: std.Io.net.Stream, timeout_ms: u32) ConnWriter {
+        // Arm the send bound **once per session**, not per write. `SO_SNDTIMEO`
+        // is fd-global, so the per-call arm/clear `writeFullBounded` does exists
+        // to protect *other* writers on the same fd; on an H2 connection this
+        // writer is the only one, and the socket is closed with the session.
+        // Measured on macOS loopback (`h2load -n 200000 -c 16 -m 16`, three
+        // alternating rounds): removing the two `setsockopt`s per flush took
+        // throughput from 103–109k to 125–130k req/s, and the server from
+        // ~217% to ~196% CPU under a 1M-request run.
+        if (timeout_ms != 0) @import("../core/sockread.zig").setSendTimeout(stream, timeout_ms);
         return .{ .io = io, .stream = stream, .timeout_ms = timeout_ms };
     }
 
@@ -344,16 +353,15 @@ const ConnWriter = struct {
         try self.writeFrame(.data, flags, stream_id, data);
     }
 
-    /// The session's only writer: raw syscalls, with the send bound armed and
-    /// cleared around each write.
+    /// The session's only writer: raw syscalls, with the send bound armed once
+    /// in `init`.
     ///
-    /// `std.Io`'s writer cannot express that bound — it answers a timed-out send
-    /// with `errnoBug`, which is `unreachable` — and this is the one place on an
-    /// H2 connection where bytes leave, so the bound is applied here rather than
-    /// once per connection (which would leave the socket armed for anything else
-    /// that ever writes to it).
+    /// `std.Io`'s writer cannot express the bound — it answers a timed-out send
+    /// with `errnoBug`, which is `unreachable` — so bytes leave through the raw
+    /// `writeFull`, which maps `EAGAIN` (the armed `SO_SNDTIMEO` expiring) to
+    /// `error.WriteTimeout` exactly as `writeFullBounded` did.
     fn writeDirect(self: *ConnWriter, data: []const u8) !void {
-        return @import("../core/sockread.zig").writeFullBounded(self.stream, data, self.timeout_ms) catch |err| {
+        return @import("../core/sockread.zig").writeFull(self.stream, data) catch |err| {
             self.failed = err;
             return err;
         };
@@ -613,6 +621,16 @@ fn serveSession(
         if (!outbound.pending.contains(1)) priority_tree.removeStream(1);
     }
 
+    // One frame buffer for the whole session, grown on demand. `readFramePrefetch`
+    // allocated and freed per frame — 2–4 allocator calls per request through the
+    // server's general-purpose allocator. Reuse is safe because a frame is fully
+    // handled before the next read: HEADERS is decoded in place, DATA is copied
+    // into the stream's body buffer (`appendData`), and nothing keeps the slice.
+    // Growth is demand-driven (never preallocated to `max_frame_size`), so a
+    // connection that only sees small frames keeps a small buffer.
+    var frame_scratch: []u8 = &.{};
+    defer if (frame_scratch.len > 0) allocator.free(frame_scratch);
+
     var frames: usize = 0;
     while (frames < opts.max_frames) : (frames += 1) {
         if (idle_timeout_ms > 0) {
@@ -633,13 +651,14 @@ fn serveSession(
             try writer.flush();
         }
 
-        const frame_buf = readFramePrefetch(
+        const frame_buf = readFrameInto(
             reader,
-            allocator,
             prefetch_buf,
             &prefetch_off,
             opts.inbound.max_frame_size,
             opts.inbound.max_inbound_bytes -| inbound_bytes,
+            &frame_scratch,
+            allocator,
         ) catch |err| switch (err) {
             error.ConnectionClosed => {
                 try outbound.drain(&writer, &priority_tree, &conn_flow, conn_max_frame_size, 0);
@@ -666,7 +685,6 @@ fn serveSession(
                 return;
             },
         };
-        defer allocator.free(frame_buf);
         last_progress_ms = Time.monotonicNowMilliseconds();
         inbound_bytes += frame_buf.len;
 
@@ -2363,6 +2381,37 @@ fn readFramePrefetch(
     @memcpy(buf[0..9], &hdr);
     if (header.length > 0) try readExactPrefetch(reader, prefetch, prefetch_off, buf[9..]);
     return buf;
+}
+
+/// Same parse and the same limits as `readFramePrefetch`, but into a
+/// caller-owned buffer (`scratch`) that the session keeps and grows on demand —
+/// one allocation instead of one per frame. The returned slice is valid until
+/// the caller reads the next frame.
+fn readFrameInto(
+    reader: *std.Io.Reader,
+    prefetch: []const u8,
+    prefetch_off: *usize,
+    max_frame_size: u24,
+    budget_remaining: usize,
+    scratch: *[]u8,
+    allocator: std.mem.Allocator,
+) ![]u8 {
+    var hdr: [9]u8 = undefined;
+    try readExactPrefetch(reader, prefetch, prefetch_off, &hdr);
+    const header = try Http2.FrameHeader.decode(&hdr);
+    if (header.length > max_frame_size) return error.FrameSizeExceeded;
+    const total = 9 + @as(usize, header.length);
+    if (total > budget_remaining) return error.BudgetExceeded;
+    if (total > scratch.len) {
+        // Grow (not shrink) so a session that once carried a large frame keeps
+        // one buffer; the ceiling is `max_frame_size + 9`, enforced above.
+        const grown = try allocator.alloc(u8, total);
+        if (scratch.len > 0) allocator.free(scratch.*);
+        scratch.* = grown;
+    }
+    @memcpy(scratch.*[0..9], &hdr);
+    if (header.length > 0) try readExactPrefetch(reader, prefetch, prefetch_off, scratch.*[9..total]);
+    return scratch.*[0..total];
 }
 
 fn readExact(io: std.Io, stream: std.Io.net.Stream, buf: []u8) !void {

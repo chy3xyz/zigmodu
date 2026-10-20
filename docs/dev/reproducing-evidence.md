@@ -80,6 +80,40 @@ python3 scripts/runtime_stress_trend.py runtime-stress-history.jsonl
 # 多晚的序列直接拼接再喂：cat a.jsonl b.jsonl | python3 scripts/runtime_stress_trend.py /dev/stdin
 ```
 
+同一次 artifact 里还有 `soak-history.jsonl` 与 `soak-cluster-history.jsonl`
+（`SOAK_HISTORY` / `SOAK_CLUSTER_HISTORY`），schema 同为 v1、用 `kind` 区分：
+
+```bash
+python3 scripts/soak_trend.py soak-history.jsonl soak-cluster-history.jsonl
+# 本地录一次：bash scripts/soak-record.sh .   （两个文件已 gitignore）
+```
+
+## 端到端请求曲线（原语 ≠ 请求）
+
+微基准（`bench-results.json`）量的是原语；"一次请求多快"要另跑一条：
+
+```bash
+bash scripts/bench-e2e.sh --requests 400 --json-out e2e.jsonl
+# 需要 python3 -m pip install h2；脚本自己起/停 examples/http-stress-test
+```
+
+同一条命令里比较 h1 keep-alive 与 h2c（同一 host、同一 handler），输出 schema-v1，
+带 commit 与宿主，可按 `kind: "http-e2e"` 累积成序列。脚本默认 **ReleaseFast**：
+Debug 下 h2 帧路径会被逐帧 `std.log.debug` 拖慢一个数量级（曾把 275 req/s 误读成框架缺陷）。
+ReleaseFast + `h2load` 的现状：h1 67.3k、h2c 125–130k（16 连接 × 16 流），同并发下单请求
+中位数 h2 208 µs vs h1 225 µs —— 方法与复盘见 `docs/dev/http-bench-method.md`。
+
+## 交给外部复现者：一个包装齐
+
+```bash
+bash scripts/repro-pack.sh --out /tmp /tmp/e2e.jsonl /tmp/soak.log
+# → /tmp/repro-<sha>-<utc>.tar.gz：commit/宿主/zig 指纹、build.zig.zon、
+#   bench 基线、dirty diff、附带的证据文件，以及 REPRODUCE.md（命令清单）
+```
+
+包不构成独立审计，但它让"在同一个 commit 上跑同样的命令"不需要先读 CI YAML。
+B-14 的判定标准不变：仍要一个**非本批 AI** 的复现记录。
+
 ## 复现时的口径说明（别踩坑）
 
 - **所有等待都是有界轮询**：hang 住 = 失败，不会永远卡住 CI——复现出 hang 本身就是有效证据。

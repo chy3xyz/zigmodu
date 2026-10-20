@@ -132,7 +132,7 @@ pub const State = struct {
         // would not be enough to trade even if the name were `order.submit`.
         self.guard = ai.Guard.init(.{ .allow = &.{api.action}, .allow_execute = false });
         self.pipeline = ai.ProposalPipeline.init(&self.guard, effect);
-        self.pipeline.risk = &self.review;
+        self.pipeline.risk = self.review.toPort();
         // No approval chain: an escalated proposal stays `needs_human`, and an
         // agent never approves itself (`docs/AGENT_RUNTIME.md` §四).
         self.pipeline.approval = null;

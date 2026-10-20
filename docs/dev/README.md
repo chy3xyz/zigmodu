@@ -7,7 +7,7 @@ exclude: true
 
 # `docs/dev/` — 文件索引
 
-17 份文件、约 5000 行，写于 **2026-04-23 → 2026-09-26** 的四个批次（另有 8 份已归档到
+26 份文件，写于 **2026-04-23 → 2026-10-20** 的五个批次（另有 8 份已归档到
 [`archive/2026-05-review/`](./archive/README.md)，约 1200 行）。这里是判断
 **"哪份还算数"** 与 **"哪份动不得"** 的唯一入口 —— 先看这张表，再打开具体文件。
 
@@ -19,7 +19,7 @@ grep -rn 'docs/dev/' --include='*.zig' --include='*.sh' --include='*.md' . | gre
 
 ---
 
-## 0. 硬约束：§1 那 16 份**不能移动**
+## 0. 硬约束：§1 那 17 份**不能移动**
 
 它们被 `src/**`、`scripts/**`、`docs/*.md`、`CHANGELOG.md` 按**字面路径**引用，
 而且多处带 `§N` 章节号（例如 `docs/dev/cluster-auth-design.md` §10）。改名或移动
@@ -45,6 +45,7 @@ grep -rn 'docs/dev/' --include='*.zig' --include='*.sh' --include='*.md' . | gre
 | `security-audit-ws.md` | 09-20 | 审计 ②：WebSocket 帧解析 / 握手 | `CHANGELOG.md` |
 | `final-assessment.md` | 05-11 | 第一轮的"最终"评估 | `CHANGELOG.md` |
 | `h2-pending-slices.md` | 09-26 | H2 响应体 > `max_pending_bytes` —— **已修**（现象/根因两层/修法/验收） | `CHANGELOG.md` |
+| `http-bench-method.md` | 10-20 | HTTP 端到端基准方法 + Debug 误判复盘 + h2 写路径优化（含未做的 h1 两项） | `docs/dev/reproducing-evidence.md` |
 
 ## 2. 已归档：`archive/2026-05-review/`（**2026-09-26 执行**）
 

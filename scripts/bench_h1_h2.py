@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
-"""Compare HTTP/1.1 keep-alive vs h2c prior-knowledge on the same ZigModu server."""
+"""Compare HTTP/1.1 keep-alive vs h2c prior-knowledge on the same ZigModu server.
+
+Measure against a **ReleaseFast** build (`bench-e2e.sh` does this by default).
+Debug is not a performance build: on the h2 path, per-frame `std.log.debug`
+alone costs an order of magnitude. This Python client is also a bottleneck past
+~13k req/s on one connection — for server ceilings use `h2load`/`wrk` and treat
+these numbers as a same-host ratio, not an absolute.
+"""
 
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import platform
 import socket
 import statistics
 import time
@@ -175,9 +185,33 @@ def main() -> None:
     ap.add_argument("--warmup", type=int, default=50)
     ap.add_argument("--h2-concurrency", type=int, default=32)
     ap.add_argument("--parallel-conns", type=int, default=16)
+    ap.add_argument(
+        "--json-out",
+        metavar="PATH",
+        help="write the run as JSON; a *.jsonl path appends one schema-v1 line "
+        "(the commit -> run series), anything else is overwritten",
+    )
     args = ap.parse_args()
 
     host, port, path = args.host, args.port, args.path
+
+    result = {
+        "v": 1,
+        "kind": "http-e2e",
+        "ts": int(time.time()),
+        "commit": os.environ.get("GIT_SHA", "unknown"),
+        "os": platform.system().lower(),
+        "arch": platform.machine().lower(),
+        "target": {"host": host, "port": port, "path": path},
+        "config": {
+            "requests": args.requests,
+            "warmup": args.warmup,
+            "h2_concurrency": args.h2_concurrency,
+            "parallel_conns": args.parallel_conns,
+        },
+        "latency": {},
+        "throughput": {},
+    }
 
     print(f"target http://{host}:{port}{path}")
     print(f"requests={args.requests} warmup={args.warmup} h2_concurrency={args.h2_concurrency}")
@@ -203,6 +237,12 @@ def main() -> None:
         samples_h2.append(t)
 
     def lat_line(name: str, xs: list[float]) -> None:
+        result["latency"][name] = {
+            "n": len(xs),
+            "avg_ms": round(statistics.mean(xs) * 1000, 3),
+            "p50_ms": round(pct(xs, 50) * 1000, 3),
+            "p99_ms": round(pct(xs, 99) * 1000, 3),
+        }
         print(
             f"{name:28} avg={statistics.mean(xs)*1000:7.2f}ms  "
             f"p50={pct(xs,50)*1000:7.2f}ms  p99={pct(xs,99)*1000:7.2f}ms"
@@ -218,6 +258,15 @@ def main() -> None:
     t1, ok1 = http11_pipeline_conn(host, port, path, n)
     t2, ok2 = h2c_serial(host, port, path, n)
     t3, ok3 = h2c_multiplex(host, port, path, n, concurrency=args.h2_concurrency)
+    result["throughput"]["h1_keepalive_serial"] = {
+        "requests": ok1, "req_per_s": round(ok1 / t1, 1), "elapsed_s": round(t1, 3),
+    }
+    result["throughput"]["h2c_serial"] = {
+        "requests": ok2, "req_per_s": round(ok2 / t2, 1), "elapsed_s": round(t2, 3),
+    }
+    result["throughput"]["h2c_multiplex"] = {
+        "requests": ok3, "req_per_s": round(ok3 / t3, 1), "elapsed_s": round(t3, 3),
+    }
     print(f"=== Throughput: single TCP connection ({n} requests) ===")
     print(f"{'HTTP/1.1 keep-alive serial':28} ok={ok1}  {ok1/t1:8.0f} req/s  ({t1:.3f}s)")
     print(f"{'h2c serial (conc=1)':28} ok={ok2}  {ok2/t2:8.0f} req/s  ({t2:.3f}s)")
@@ -242,11 +291,28 @@ def main() -> None:
                 _, k = f.result()
                 ok += k
         elapsed = time.perf_counter() - t0
+        result["throughput"][f"{label} ({args.parallel_conns} conns)"] = {
+            "requests": ok,
+            "req_per_s": round(ok / elapsed, 1),
+            "elapsed_s": round(elapsed, 3),
+            "connections": args.parallel_conns,
+        }
         print(f"{label:28} ok={ok}  {ok/elapsed:8.0f} req/s  ({elapsed:.3f}s, {args.parallel_conns} conns)")
 
     print(f"=== Throughput: {args.parallel_conns} parallel connections × {per} req ===")
     run_pool(h1_worker, "HTTP/1.1 keep-alive")
     run_pool(h2_worker, "h2c multiplex")
+
+    if args.json_out:
+        line = json.dumps(result, sort_keys=True)
+        if args.json_out.endswith(".jsonl"):
+            with open(args.json_out, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        else:
+            with open(args.json_out, "w", encoding="utf-8") as fh:
+                json.dump(result, fh, indent=2, sort_keys=True)
+                fh.write("\n")
+        print(f"\nwrote {args.json_out}")
 
 
 if __name__ == "__main__":

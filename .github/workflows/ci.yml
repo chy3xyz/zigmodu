@@ -1011,6 +1011,12 @@ jobs:
         # to widen the window, not to re-run the fast suite.
         # `tee` into the nightly log bundle; the default bash shell here runs
         # with `pipefail`, so the step's status stays the harness's.
+        # `SOAK_HISTORY` appends one schema-v1 JSON line per passing run, next
+        # to the runtime-stress series: the artifact is then commit -> result
+        # for all three harnesses, not just the runtime one.
+        env:
+          SOAK_HISTORY: ${{ runner.temp }}/nightly-logs/soak-history.jsonl
+          GIT_SHA: ${{ github.sha }}
         run: |
           mkdir -p "$RUNNER_TEMP/nightly-logs"
           zig build soak -Dsoak-clients=64 -Dsoak-iterations=200 2>&1 | tee "$RUNNER_TEMP/nightly-logs/soak.log"
@@ -1032,7 +1038,28 @@ jobs:
         # CHANGELOG entry for this batch.
         env:
           SOAK_CLUSTER_RSS_BUDGET_MIB: "192"
+          SOAK_CLUSTER_HISTORY: ${{ runner.temp }}/nightly-logs/soak-cluster-history.jsonl
+          GIT_SHA: ${{ github.sha }}
         run: zig build soak-cluster 2>&1 | tee "$RUNNER_TEMP/nightly-logs/soak-cluster.log"
+
+      - name: Soak trend (commit -> run series)
+        # Reads the two history files back the same way the runtime-stress
+        # series is read: hard gates (a recorded failure, a cross-tenant read,
+        # two leaders in one sample) exit non-zero; readings only print. A
+        # missing file means that harness skipped (no network probe), not a
+        # failure — the log says which.
+        run: |
+          files=()
+          for f in soak-history.jsonl soak-cluster-history.jsonl; do
+            if [[ -f "$RUNNER_TEMP/nightly-logs/$f" ]]; then
+              files+=("$RUNNER_TEMP/nightly-logs/$f")
+            fi
+          done
+          if (( ${#files[@]} )); then
+            python3 scripts/soak_trend.py "${files[@]}"
+          else
+            echo "soak_trend: no history files (both harnesses skipped?)"
+          fi
 
       - name: Runtime stress (supervision tree / pools / timers)
         # The runtime harness asserts the things a short single-threaded test

@@ -101,8 +101,12 @@ docs/modules.puml
 docs/modules.json
 docs/modules.md
 
-# runtime-stress history series (scripts/runtime-stress-record.sh default path)
+# runtime-stress / soak history series (scripts/*-record.sh default paths)
 runtime-stress-history.jsonl
+soak-history.jsonl
+soak-cluster-history.jsonl
+repro-packs/
+__pycache__/
 .soak/
 
 # Node — nothing in the repository uses npm any more (the documentation site

@@ -2,6 +2,71 @@
 
 ## [Unreleased]
 
+### 依赖：zent v0.96.0 → v0.97.0（**破坏性：否**）
+
+- 两示例（`zent-modulith` / `metaverse-creative`）的 `build.zig.zon` 改 pin 到
+  v0.97.0（annotated tag `73e3665` → commit `bd41f9c`）：url 里的 `ref` 与 `#commit`
+  一起改，`hash` 用 `zig fetch` 重取。
+- v0.97 是纯内部重构（包图 DAG：`src/base/`、`src/migrate.zig`+`src/migrate/`、
+  `src/services/`；`@setEvalBranchQuota` 收敛到 `base/budget.zig`），**导出路径不变**
+  （`zent.sql_dialect` / `zent.sql_schema` / `zent.runtime.log`），消费方零动作。
+- 验证（清缓存重建，避免增量缓存沿用旧 fetch 模块）：`zent-modulith` 构建 + smoke
+  **44/0 无泄漏**；`metaverse-creative` `zig build demo` → `demo_ok`、`balanced=true`。
+- 文档：`docs/reference/ZENT.md` 版本口径/§11 pin/§14 表补 0.97 行，示例 URL 同步；
+  `AGENTS.md` 的 zent 版本行同步。
+
+### 证据：soak 历史序列 + 端到端压测 + 复现包（**破坏性：否**）
+
+- **`SOAK_HISTORY` / `SOAK_CLUSTER_HISTORY`**：两个 harness 通过后各追加一行 schema-v1
+  JSON（`kind` 区分；带 commit、宿主、参数与读数；失败的一晚**不写行**，缺行即信号）。
+  夜间 CI 写进 `nightly-logs`，于是 `nightly-soak-<sha>` artifact 现在是三条
+  commit→结果序列（stress + soak + cluster soak）。读回：`scripts/soak_trend.py`
+  ——硬门只收跨租户泄漏 / drain 后残留连接 / 同一采样两个 leader；RSS、fd、线程、
+  耗时只打印中位数与 delta。本地一键 `bash scripts/soak-record.sh`。
+- **`scripts/bench-e2e.sh` + `bench_h1_h2.py --json-out`**：同一服务器、同一 handler 上
+  比 h1 keep-alive 与 h2c 的延迟/吞吐，输出 schema-v1（带 commit/宿主），可按宿主累积。
+  **默认 ReleaseFast 构建**（`--debug` 仅供调试）：首轮把 Debug 数字当成框架缺陷，复核后
+  是"Debug + 逐帧 `std.log.debug` + 弱 Python 客户端"三者叠加的假象——同代码
+  h1 10.2k→36.4k、h2c 275→13.5k req/s（Python 客户端），换成 `h2load` 后 h1 67.3k、
+  h2c 125–130k（16 连接 × 16 流），同并发下单请求中位数 h2 208 µs vs h1 225 µs。
+  方法与复盘见 `docs/dev/http-bench-method.md`。
+- **优化：h2 写路径每会话 arm 一次 `SO_SNDTIMEO`**（原先每次写 `setsockopt` 设值+清零）。
+  `ConnWriter` 是 H2 会话唯一的写者、socket 随会话关闭，没有遗留超时误伤别的写者的问题。
+  `h2load -n 200000 -c 16 -m 16` 交替 3 轮：**103–109k → 125–130k req/s（+18–20%）**，
+  服务器 CPU 约 217% → 196%；42 条 h2 测试（含写预算与失败后空 flush）全绿。
+- **h2 每帧的 `alloc/free` 改为会话内复用缓冲**（`readFrameInto`，按需增长、从不预分配到
+  `max_frame_size`）：每请求省 2–4 次分配。交替复测 118–124k → 125–133k（宿主抖动较大，
+  取中位趋势），无回退。复用边界写在调用点：HEADERS 就地解码、DATA 由 `appendData` 拷贝，
+  没有 handler 保留帧切片。
+- **h1 写路径的同款优化试过并回退**：连接级 `send_armed` + `BoundedWriter.initArmed`
+  全量测试绿，但 `wrk -c64` 交替 4 轮旧 72.4–73.4k / 新 72.4–75.3k——差异在噪声内，
+  不值得为它维护"socket 是否 armed"的跨函数不变量。
+- **h1 读路径的 `poll` + `read`：分析后决定不改。** `poll` 带的是绝对剩余预算，改
+  `SO_RCVTIMEO` 只省一次 syscall，但超时变成"每次读"计时，慢速 peer 最多能耗到 ~2×
+  预算；恢复绝对语义要每次读前 `setsockopt(remaining)`，省下的又花回去。结论与将来
+  若要做的形态（`read_deadline_mode` 配置项）写在 `docs/dev/http-bench-method.md`。
+- **`zig build bench-http`（`src/bench_http.zig`）**：零依赖压测客户端，h1 keep-alive 与
+  h2c prior-knowledge 两种模式，用框架自己的 `http.Http2` 编码帧。刻意逐帧两次 `read`，
+  单机约 65–75k req/s 就客户端饱和——用来跑门禁（同客户端历史对比）足够，测服务器上限
+  仍用 `h2load`。
+- **`scripts/check-bench-e2e.sh` + `scripts/bench-e2e-baseline.json`**：每协议跑 N 轮、
+  取中位，按 `os-arch` 基线比，低于 **0.6×** 才失败；客户端每连接先 `--warmup 20`。
+  同一二进制单轮能在 74k–127k 间摆动，单轮门禁不可用；中位 + 0.6× 是"能抓到腰斩、
+  不被噪声触发"的下限。脚本同时打印 Little's law 的预期 p50（在飞数 / 吞吐）。
+- **结论修正：h2 高并发排队延迟不是调度缺陷。** 125k req/s 时在飞 256，256/125000 =
+  2.05 ms（实测 1.4–1.8 ms）；66k 时 3.88 ms（实测 3.86 ms）。延迟就是并发深度换来的
+  排队，降它只能提吞吐或减在飞数。
+- **`scripts/repro-pack.sh`**：commit/宿主/zig 指纹、版本 pin、bench 基线、dirty diff、
+  附带证据文件与 `REPRODUCE.md` 命令清单打成一个 tarball，外部复现者不必先读 CI YAML。
+  B-14 的判定不变：仍要一个非本批 AI 的复现记录。
+- **`examples/alpha-engine`**：`ProposalPipeline.risk` 改接 `ai/ports.zig` 后示例仍赋
+  `&review`，ubuntu / macOS / arm 三个平台的 `Build framework examples` 均编译失败；
+  改为 `review.toPort()`。教训不是那一行，而是**示例不在 `zig build test` 的测试树里**，
+  单测全绿也抓不到——CI 里那道独立的示例构建步骤就是为此存在的。
+- **`soak` 的 run step 标 `has_side_effects`**（会写历史文件），避免被当作可缓存步骤。
+- **维护**：CHANGELOG 顶部四个重复的 `## [Unreleased]` 合并为一个——`release.sh`
+  明确要求恰好一个，多出来的会让下次发版直接拒绝（历史上曾因此在 `[0.33.0]` 里埋了六个）。
+
 ### 架构：编排原语接口化（`ai/ports.zig`，**破坏性：是**——两处字段类型）
 
 核心（`workflow` / `proposal` / `llm`）此前直接 import 具体引擎
@@ -18,8 +83,6 @@
   `approval_steps` 的类型是别名，赋值不用改。
 - `check-production.sh` 新增门禁：五个核心文件顶层出现
   `@import("approval|risk|diagnose|reporter.zig")` 即失败（测试块内的 import 允许）。
-
-## [Unreleased]
 
 ### 架构：AI ops 独立成包（**破坏性：否**，一处注册入口迁移）
 
@@ -38,8 +101,6 @@ notify / bridge / trigger / schedule / approval_api / approval_store）。
   `llm → diagnose`、`approval/diagnose → reporter`。这些模块是编排原语而非业务
   报表，解耦需要把策略/审批以接口注入，属于下一步设计，不在本批。
 
-## [Unreleased]
-
 ### 新增：embedding 客户端 + 声明式 DI + per-user 配额（**破坏性：否**）
 
 - **`ai.embedding.OpenAiEmbeddings`**：OpenAI 兼容 `/embeddings` 客户端——批量输入、
@@ -53,7 +114,6 @@ notify / bridge / trigger / schedule / approval_api / approval_store）。
 - **`TokenQuota` per-user 维度**：`setUserLimit` / `tryConsumeFor` / `recordFor` /
   `userUsed` / `userRemaining`。租户额度仍是外边界；`tryConsumeFor` 先检查两级上限
   再同时扣减，拒绝时两侧计数都不动。
-## [Unreleased]
 
 ### 完善：结构化工具错误 + 启动驱动自检（**破坏性：否**）
 

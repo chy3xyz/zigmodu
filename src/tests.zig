@@ -144,6 +144,10 @@ test "compile all source files" {
     _ = @import("http/Multipart.zig");
     _ = @import("http/UploadGuard.zig");
     _ = @import("test/ContractGate.zig");
+    // Shared by `soak.zig` / `soak_cluster.zig` (separate artifacts); imported
+    // here too so its own tests run in the library suite and the collection
+    // gate sees every `test` block under `src/`.
+    _ = @import("test/run_history.zig");
     _ = @import("test/DocsConsistency.zig");
     _ = @import("test/DocSnippets.zig");
     // Deprecation / API-freeze gate: the names docs/reference/UPGRADING.md and

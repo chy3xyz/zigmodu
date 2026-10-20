@@ -1,0 +1,18 @@
+{
+  "hosts": {
+    "darwin-arm64": {
+      "h1": {
+        "conns": 64,
+        "median_p50_us": 952,
+        "median_rps": 65092
+      },
+      "h2c": {
+        "conns": 16,
+        "median_p50_us": 3863,
+        "median_rps": 66094,
+        "streams": 16
+      }
+    }
+  },
+  "v": 1
+}

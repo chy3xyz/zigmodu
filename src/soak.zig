@@ -10,11 +10,17 @@
 //!   3. the connection counter returns to zero (no fd/slot leak).
 //!
 //! Usage: `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build soak`
+//!
+//! `SOAK_HISTORY=<path>` appends one schema-v1 JSON line per passing run, the
+//! same shape the nightly's `runtime-stress` series uses. The nightly writes
+//! it into the `nightly-logs` artifact, so the series is keyed by commit;
+//! `scripts/soak_trend.py` reads it back. A failed run writes nothing.
 
 const std = @import("std");
 const zigmodu = @import("zigmodu");
 const http = zigmodu.http;
 const build_options = @import("build_options");
+const history = @import("test/run_history.zig");
 
 const clients: usize = build_options.soak_clients;
 const iterations: usize = build_options.soak_iterations;
@@ -126,6 +132,7 @@ fn clientWorker(ctx: *ClientCtx) void {
 test "soak: N clients x M tenants — zero cross-tenant reads" {
     const allocator = std.testing.allocator;
     if (!zigmodu.NetworkProbe.available()) return error.SkipZigTest;
+    const started_ns = std.Io.Timestamp.now(std.testing.io, .awake).nanoseconds;
 
     registry = zigmodu.FrozenStringMap(i64).init(allocator);
     defer registry.deinit();
@@ -199,6 +206,31 @@ test "soak: N clients x M tenants — zero cross-tenant reads" {
     // No `server.stop()` here: it is a `defer` registered after the join, so it
     // has already run by the time this line is reached — and it is the reason a
     // failure *above* this line now exits instead of hanging.
+
+    writeHistory(@intCast(@divTrunc(std.Io.Timestamp.now(std.testing.io, .awake).nanoseconds - started_ns, std.time.ns_per_ms)));
+}
+
+/// One line for the nightly series. Stack buffers only: this runs under
+/// `std.testing.allocator`, and a history append must not show up in the leak
+/// reading it is recording. A write failure is a warning, never a test failure.
+fn writeHistory(duration_ms: i64) void {
+    const path = history.envPath("SOAK_HISTORY") orelse return;
+    var buf: [640]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    history.writeHeader(&w, std.testing.io, "soak") catch return;
+    w.print(",\"params\":{{\"clients\":{d},\"iterations\":{d}}},", .{ clients, iterations }) catch return;
+    w.print("\"result\":{{\"pass\":true,\"failures\":0,\"requests\":{d},\"connections_after\":0}},", .{
+        clients * iterations,
+    }) catch return;
+    w.print("\"duration_ms\":{d}}}\n", .{duration_ms}) catch return;
+    // No `std.debug.print` on success: the default test runner drives this
+    // artifact over the build system's listen protocol, and a line on stderr
+    // from inside a test makes the runner label a *passing* run
+    // "failed command" (measured before this comment existed). The file is the
+    // record; a lost append still warns, because that one is a real failure.
+    history.appendLine(std.testing.io, path, w.buffered()) catch |err| {
+        std.log.warn("[soak] history: append to {s} failed: {s}", .{ path, @errorName(err) });
+    };
 }
 
 const MapCtx = struct {

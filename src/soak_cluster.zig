@@ -89,7 +89,10 @@
 //! `SOAK_CLUSTER_RSS_BUDGET_MIB` (default 128; see the calibration note at the
 //! assertion), `SOAK_CLUSTER_THREAD_BUDGET` (default 2),
 //! `SOAK_CLUSTER_MAX_LEADER_TRANSITIONS` (default 3),
-//! `SOAK_CLUSTER_MIN_LEADER_PRESENCE_PCT` (default 90).
+//! `SOAK_CLUSTER_MIN_LEADER_PRESENCE_PCT` (default 90),
+//! `SOAK_CLUSTER_HISTORY` (path; appends one schema-v1 JSON line per passing
+//! run — the same series shape `RUNTIME_STRESS_HISTORY` uses, read by
+//! `scripts/soak_trend.py`).
 //!
 //! ## Reading a run that stops moving (heartbeats, and why they exist)
 //!
@@ -146,6 +149,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const zigmodu = @import("zigmodu");
 const build_options = @import("build_options");
+const history = @import("test/run_history.zig");
 
 const io = std.testing.io;
 const Time = zigmodu.time;
@@ -1504,6 +1508,7 @@ test "soak: 3-node cluster — raft + event bus, leader/fd/RSS invariants" {
     // stops the harness from measuring std's debug-info arena instead of itself.
     const allocator = soakAllocator();
     if (!zigmodu.NetworkProbe.available()) return error.SkipZigTest;
+    const started_ns = std.Io.Timestamp.now(io, .awake).nanoseconds;
 
     initThresholds();
     initSharedState();
@@ -2021,5 +2026,87 @@ test "soak: 3-node cluster — raft + event bus, leader/fd/RSS invariants" {
     // canary checks, so this replaces the runner's `0 leaked` line for this
     // test (which no longer uses `std.testing.allocator`). `SafeAllocator`'s
     // verdict is the leaked-allocation count.
-    try std.testing.expectEqual(@as(usize, 0), soak_gpa.deinit());
+    const leaked = soak_gpa.deinit();
+    appendClusterHistory(.{
+        .iterations = iterations,
+        .writers = node_count * publishers_per_node,
+        .samples = @intCast(samples),
+        .presence_pct = presence_pct,
+        .transitions = @intCast(transitions),
+        .two_leader_samples = @intCast(two_leader_samples),
+        .log_len = @intCast(log_lens[0]),
+        .appends = total_appends.load(.monotonic),
+        .rss_max_mib = if (rss_supported) rss_max / 1024 / 1024 else null,
+        .fd_max = if (fd_supported) fd_max else null,
+        .threads_max = if (threads_supported) th_max else null,
+        .rss_budget_mib = rss_budget_bytes / 1024 / 1024,
+        .fd_budget = fd_budget,
+        .thread_budget = thread_budget,
+        .duration_ms = @intCast(@divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds - started_ns, std.time.ns_per_ms)),
+    });
+    try std.testing.expectEqual(@as(usize, 0), leaked);
+}
+
+/// One line for the nightly series. Stack buffers only (the run's leak verdict
+/// has already been taken), and a write failure is a warning — a lost data
+/// point must not fail a run that passed its invariants.
+const HistoryRun = struct {
+    iterations: usize,
+    writers: usize,
+    samples: u64,
+    presence_pct: u64,
+    transitions: u64,
+    two_leader_samples: u64,
+    log_len: u64,
+    appends: u64,
+    rss_max_mib: ?u64,
+    fd_max: ?u64,
+    threads_max: ?u64,
+    rss_budget_mib: u64,
+    fd_budget: u64,
+    thread_budget: u64,
+    duration_ms: i64,
+};
+
+fn appendClusterHistory(run: HistoryRun) void {
+    const path = history.envPath("SOAK_CLUSTER_HISTORY") orelse return;
+
+    var rss_buf: [24]u8 = undefined;
+    const rss_json = if (run.rss_max_mib) |v|
+        std.fmt.bufPrint(&rss_buf, "{d}", .{v}) catch return
+    else
+        "null";
+    var fd_buf: [24]u8 = undefined;
+    const fd_json = if (run.fd_max) |v|
+        std.fmt.bufPrint(&fd_buf, "{d}", .{v}) catch return
+    else
+        "null";
+    var th_buf: [24]u8 = undefined;
+    const th_json = if (run.threads_max) |v|
+        std.fmt.bufPrint(&th_buf, "{d}", .{v}) catch return
+    else
+        "null";
+
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    history.writeHeader(&w, io, "soak-cluster") catch return;
+    w.print(",\"params\":{{\"iterations\":{d},\"writers\":{d},\"samples\":{d}}},", .{
+        run.iterations, run.writers, run.samples,
+    }) catch return;
+    w.print("\"result\":{{\"pass\":true,\"presence_pct\":{d},\"transitions\":{d},\"two_leader_samples\":{d},\"log_len\":{d},\"appends\":{d}}},", .{
+        run.presence_pct, run.transitions, run.two_leader_samples, run.log_len, run.appends,
+    }) catch return;
+    w.print("\"readings\":{{\"rss_max_mib\":{s},\"fd_max\":{s},\"threads_max\":{s}}},", .{
+        rss_json, fd_json, th_json,
+    }) catch return;
+    w.print("\"budgets\":{{\"rss_mib\":{d},\"fd\":{d},\"threads\":{d}}},\"duration_ms\":{d}}}\n", .{
+        run.rss_budget_mib, run.fd_budget, run.thread_budget, run.duration_ms,
+    }) catch return;
+
+    // Silent on success — the harness runs under the test runner's listen
+    // protocol, and stderr from inside a test makes the runner label a passing
+    // run "failed command". The file is the record.
+    history.appendLine(io, path, w.buffered()) catch |err| {
+        std.log.warn("[soak-cluster] history: append to {s} failed: {s}", .{ path, @errorName(err) });
+    };
 }
