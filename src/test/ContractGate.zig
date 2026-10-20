@@ -16,6 +16,7 @@
 //! ```
 
 const std = @import("std");
+const RouteRegistrar = @import("../api/RouteRegistrar.zig").RouteRegistrar;
 const http = @import("../http.zig");
 const ContractTestRunner = @import("ContractTest.zig").ContractTestRunner;
 const Contract = @import("ContractTest.zig").Contract;
@@ -40,7 +41,7 @@ test "contract gate: published shapes hold for every consumer" {
 
     var server = http.Server.init(std.testing.io, allocator, 0);
     defer server.deinit();
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("orders", listOrders, null);
     try group.get("orders/{id}", getOrder, null);
 

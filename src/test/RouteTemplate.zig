@@ -3,7 +3,7 @@
 //! Metrics labels must use `route_template`, never `path` — `path` carries ids
 //! and blows up Prometheus cardinality. That contract is only useful if *every*
 //! registration path fills the field, so this file pins both of them:
-//! `RouteGroup.get/post` (the common case) and a direct `Server.addRoute`
+//! `Scoped.get/post` (the common case) and a direct `Server.addRoute`
 //! (how infra endpoints such as `/metrics` are registered).
 //!
 //! A `route_template == null` read means the route matched nothing — e.g. a
@@ -11,6 +11,7 @@
 //! bucket. These tests distinguish the two.
 
 const std = @import("std");
+const RouteRegistrar = @import("../api/RouteRegistrar.zig").RouteRegistrar;
 const api = @import("../api/Server.zig");
 const cr = @import("../api/ComptimeRouter.zig");
 const Testkit = @import("../http/Testkit.zig");
@@ -41,13 +42,13 @@ const Capture = struct {
     }
 };
 
-test "route_template is filled for RouteGroup-registered routes" {
+test "route_template is filled for runtime-scope-registered routes" {
     const allocator = std.testing.allocator;
     defer Capture.reset(allocator);
 
     var server = api.Server.init(std.testing.io, allocator, 0);
     defer server.deinit();
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("orders/{id}", Capture.handler, null);
 
     var resp = try Testkit.dispatch(&server, .GET, "/orders/42", null);
@@ -66,7 +67,7 @@ test "route_template is filled for Server.addRoute (the /metrics shape)" {
     var server = api.Server.init(std.testing.io, allocator, 0);
     defer server.deinit();
     // `PrometheusMetrics.registerMetricsRoutePath` takes exactly this path:
-    // a direct addRoute, not a RouteGroup.
+    // a direct addRoute, not a runtime scope.
     try server.addRoute(.{ .method = .GET, .path = "/metrics", .handler = Capture.handler });
 
     var resp = try Testkit.dispatch(&server, .GET, "/metrics", null);
@@ -119,7 +120,7 @@ test "route_template is null only when nothing matched" {
 
     var server = api.Server.init(std.testing.io, allocator, 0);
     defer server.deinit();
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("known", Capture.handler, null);
 
     // Method mismatch: the handler never runs, so the label reads "no match".

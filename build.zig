@@ -241,11 +241,12 @@ pub fn build(b: *std.Build) void {
     // neither exists.
     const check_api_cmd = b.addSystemCommand(&.{
         "sh", "-c",
-        \\pattern='zigmodu\.http_server'
         \\if command -v rg >/dev/null 2>&1; then
-        \\  hits=$(rg -n "$pattern" examples/ || true)
+        \\  hits=$(rg -n 'zigmodu\.http_server' examples/ || true)
+        \\  gone=$(rg -n 'server\.group\(' src examples tools --glob '*.zig' || true)
         \\elif command -v grep >/dev/null 2>&1; then
-        \\  hits=$(grep -Rn --include='*.zig' "$pattern" examples/ || true)
+        \\  hits=$(grep -Rn --include='*.zig' 'zigmodu\.http_server' examples/ || true)
+        \\  gone=$(grep -Rn --include='*.zig' --exclude-dir=.zig-cache --exclude-dir=zig-pkg 'server\.group\(' src examples tools || true)
         \\else
         \\  echo "error: check-api needs ripgrep or grep on PATH" >&2
         \\  exit 1
@@ -253,6 +254,11 @@ pub fn build(b: *std.Build) void {
         \\if [ -n "$hits" ]; then
         \\  echo "error: examples/ must use zigmodu.http, not zigmodu.http_server" >&2
         \\  printf '%s\n' "$hits" >&2
+        \\  exit 1
+        \\fi
+        \\if [ -n "$gone" ]; then
+        \\  echo "error: RouteGroup was removed — register runtime routes with http.Router.scope(p).get/post/ws" >&2
+        \\  printf '%s\n' "$gone" >&2
         \\  exit 1
         \\fi
     });

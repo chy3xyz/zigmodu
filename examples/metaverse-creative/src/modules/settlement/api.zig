@@ -11,7 +11,7 @@ pub fn SettlementApi(comptime Service: type) type {
             return .{ .svc = svc };
         }
 
-        pub fn registerRoutes(self: *Self, group: *http.RouteGroup) !void {
+        pub fn registerRoutes(self: *Self, group: anytype) !void {
             try group.post("/purchase", purchase, @ptrCast(@alignCast(self)));
             try group.get("/reconcile", reconcile, @ptrCast(@alignCast(self)));
             try group.post("/outbox/drain", drain, @ptrCast(@alignCast(self)));

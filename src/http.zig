@@ -2,7 +2,7 @@
 //! Import directly: `const http = @import("zigmodu").http;`
 //!
 //! Canonical types (use these):
-//!   http.Server, http.Context, http.RouteGroup, http.Middleware, http.Route
+//!   http.Server, http.Context, http.Middleware, http.Route
 //!
 //! Deprecated: `http.http_server` — same module as above; removed from root in v0.14.0.
 //!   Prefer `http.Server` over `http.http_server.Server` or `zigmodu.http_server.Server`.
@@ -21,7 +21,6 @@ const types = @import("http/types.zig");
 /// Per-request handle: params, headers, body, response writers, attrs.
 pub const Context = types.Context;
 /// Legacy route registration with per-group middleware (prefer ComptimeRouter).
-pub const RouteGroup = server_mod.RouteGroup;
 /// One registered route (method, path, handler, middleware).
 pub const Route = types.Route;
 /// Middleware entry: a function plus optional `user_data` passed to it.

@@ -105,7 +105,12 @@ fn serveHttp(
     var wo_api = world.api.WorldApi(@TypeOf(wo_svc.*)).init(wo_svc);
     var st_api = settlement.api.SettlementApi(@TypeOf(st_svc.*)).init(st_svc);
 
-    var v1 = server.group("/api/v1");
+    // Runtime scope (see docs/reference/ROUTE_TABLE.md): trie + scope middleware,
+    // outside the comptime catalog like every runtime route.
+    var app_state: void = {};
+    var router = zigmodu.http.Router(void).init(io, allocator, &server, &app_state);
+    defer router.deinit();
+    var v1 = router.scope("/api/v1");
     try id_api.registerRoutes(&v1);
     try cr_api.registerRoutes(&v1);
     try wo_api.registerRoutes(&v1);

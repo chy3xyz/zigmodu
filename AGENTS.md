@@ -84,6 +84,7 @@ CI、`scripts/ci-*.sh`、本文件都用那个。`cd tools/zmodu && zig build` �
 | DO | DON'T |
 |----|--------|
 | `pub const routes` + `Router(State).scope.mountAll` | 新模块只写 `RouteGroup.get/post` 当默认 |
+| 运行时注册（插件/SSE/后台）：`router.scope(p).get/ws`（**不进 catalog**，勿用于需鉴权审计的路由） | `server.group(...)`（**已移除**，编译期就会失败） |
 | Path A：`jwtAuthFromCatalogWithPermissions` + `permissionGateWith(.rbac)` | 应用自签 PHP 形 JWT 再在 handler 里验一遍 |
 | `generateTokenWithTenant(sub, roles, aud)`；roles=门户粗身份 | 在核心 JwtPayload 加 `type` enum；JWT 塞全量菜单树 |
 | 自定义 `CatalogPermissionLoader(allocator, CatalogPermLoadInput)` 接业务表 | 三套门户 RBAC 硬塞进 `CatalogPermDb` |
@@ -244,7 +245,9 @@ const now_ms = Time.monotonicNowMilliseconds();
 - **Route state**: `ctx.state(T)` 取 ComptimeRouter `*State`（WS `on_connect`/`on_close`、legacy `RouteGroup` 回调同用）；缺 state 返 `error.NoRouteState`，别写 `@ptrCast(@alignCast(ctx.user_data orelse unreachable))`
 - **Extractors**: `extractPath` / `extractQuery` / `extractJson` / `extractJsonValidated`
 - **Errors**: `respondErr` + optional `setErrorMap`（RFC 7807）
-- **Scope MW**: `RouteGroup.use` / `Scoped.use` before mount
+- **Scope MW**: `Scoped.use` before mount（legacy `RouteGroup.use` 同理）
+- **Runtime routes**: `router.scope(prefix).get/post/ws` — trie + scope middleware, **not** in
+  catalog（`permissionGate`/OpenAPI/`auditAuthCoverage` 看不到）；`server.group` 已移除
 - **Testkit**: `dispatch`（`DispatchOptions.query` 传 percent-encoded 原样串，与 path 自带 `?…` 可共存）/ `signBearerToken` / `openMemorySqlite` / `SseRecorder`
 - **SSE**: `http.sse(ctx)`（设 `streaming`）+ `SseSpec`/`sse_routes` + `lastEventId`
 - **Profiles**: `applyHttpDefaults` + `applyResilienceDefaults`
@@ -356,14 +359,17 @@ pub fn OrderApi(comptime Service: type) type {
 //       → router.scope.mountAll(.{ order_api, ... }) → catalog_slot.set(try router.finish())
 ```
 
-### HTTP — Legacy RouteGroup（仅兼容旧代码）
+### HTTP — runtime routes（不进 catalog）
 
 ```zig
-try group.get("users/{id}", getUser, null); // 路径无前导 /
+var scope = router.scope("/api");
+try scope.get("users/{id}", getUser, null); // 路径无前导 /
 fn getUser(ctx: *http.Context) !void {
     const id = try ctx.paramInt(i64, "id");
     try ctx.jsonStruct(200, .{ .id = id }); // NOT sendSuccess/sendFail
 }
+// `server.group(...)` / `http.RouteGroup` 已移除；需要鉴权/OpenAPI/审计的路由
+// 必须走 `routes` 表。
 ```
 
 ### Database

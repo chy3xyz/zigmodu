@@ -16,6 +16,7 @@
 //!   defer allocator.free(token);
 
 const std = @import("std");
+const RouteRegistrar = @import("../api/RouteRegistrar.zig").RouteRegistrar;
 const server_mod = @import("../api/Server.zig");
 const AppSecurity = @import("../security/AppSecurity.zig").AppSecurity;
 const data = @import("../data.zig");
@@ -492,14 +493,14 @@ test "dispatch unmatched route respects default_404" {
     try std.testing.expectEqualStrings("custom-missing", resp.body);
 }
 
-test "dispatch 404 did-you-mean survives a RouteGroup prefix mount" {
+test "dispatch 404 did-you-mean survives a runtime-scope prefix mount" {
     const allocator = std.testing.allocator;
     var server = Server.init(std.testing.io, allocator, 0);
     defer server.deinit();
 
     // The shape a consumer reports: deep prefix mount, request capitalised by
     // a front-end path helper (`Submit` vs `submit`).
-    var g = server.group("/v1/merchant");
+    var g = RouteRegistrar.init(&server, "/v1/merchant");
     try g.post("/orders/submit", struct {
         fn handle(ctx: *Context) !void {
             try ctx.text(200, "ok");

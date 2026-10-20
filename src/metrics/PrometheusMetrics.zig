@@ -1173,7 +1173,7 @@ pub const PrometheusMetrics = struct {
     /// Same as `registerMetricsRoute` with a caller-chosen path.
     ///
     /// Accepted form: **a pointer** to anything with `addRoute(Route)` —
-    /// `*api.Server`. A `RouteGroup` does not qualify (it exposes `get`/`post`).
+    /// `*api.Server`. A runtime registrar does not qualify (it exposes `get`/`post`).
     pub fn registerMetricsRoutePath(self: *Self, server: anytype, path: []const u8) !void {
         const T = @TypeOf(server);
         if (@typeInfo(T) != .pointer or !@hasDecl(@typeInfo(T).pointer.child, "addRoute")) {

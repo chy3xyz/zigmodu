@@ -1365,7 +1365,7 @@ fn cmdNew(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
             \\- Module lifecycle: init() at startup → deinit() at shutdown (reverse order)
             \\- Dependencies: declared in module.zig info.dependencies
             \\- Health: registerHealthChecks() per module + HealthEndpoint in main.zig
-            \\- API: RESTful via http.RouteGroup, handlers use resolve(ctx) helper
+            \\- API: RESTful via Router.scope / ComptimeRouter routes, handlers use resolve(ctx) helper
             \\- ORM: data.Repository(T) returned by persistence Repo accessors
             \\- Events: typed EventBus(T) in service, publish() method
             \\
@@ -1904,7 +1904,7 @@ fn generateAgentsMd(allocator: std.mem.Allocator, project_name: []const u8) ![]c
         \\|------|------|-----|
         \\| Context | zigmodu.http.Context | Request/response |
         \\| Server | zigmodu.http.Server | HTTP server |
-        \\| RouteGroup | zigmodu.http.RouteGroup | Route registration |
+        \\| Router.scope | http.Router.scope(...).get/post/ws | Runtime route registration (outside catalog) |
         \\| SqlxBackend | zigmodu.data.SqlxBackend | DB backend |
         \\| Repository(T) | zigmodu.data.Repository(T) | Typed ORM repo |
         \\| HealthEndpoint | zigmodu.HealthEndpoint | Health checks |
@@ -6258,7 +6258,7 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
                 \\        return .{{ .ext = ext }};
                 \\    }}
                 \\
-                \\    pub fn registerRoutes(self: *{s}ApiExt, group: *zigmodu.http.RouteGroup) !void {{
+                \\    pub fn registerRoutes(self: *{s}ApiExt, group: anytype) !void {{
                 \\        const p = "/{s}";
                 \\        try group.get(p ++ "/page", hPage, @ptrCast(@alignCast(self)));
                 \\        try group.delete(p ++ "/delete-list", hDeleteList, @ptrCast(@alignCast(self)));
@@ -6649,7 +6649,7 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
         \\## Conventions
         \\- Domain imports: const http = zigmodu.http; const data = zigmodu.data;
         \\- Module lifecycle: init() → deinit() (reverse dependency order)
-        \\- API: RESTful via http.RouteGroup, handlers use resolve(ctx)
+        \\- API: RESTful via Router.scope / ComptimeRouter routes, handlers use resolve(ctx)
         \\- ORM: data.Repository(T) returned by persistence Repo accessors
         \\- Health: registerHealthChecks() + HealthEndpoint in main.zig
         \\
@@ -7120,7 +7120,7 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
             \\pub const AiChatApiExt = struct {
             \\    ext: *ext_svc.AiChatServiceExt;
             \\    pub fn init(ext: *ext_svc.AiChatServiceExt) AiChatApiExt { return .{ .ext = ext }; }
-            \\    pub fn registerRoutes(self: *AiChatApiExt, group: *zigmodu.http.RouteGroup) !void { _ = self; _ = group; }
+            \\    pub fn registerRoutes(self: *AiChatApiExt, group: anytype) !void { _ = self; _ = group; }
             \\};
         , gen_opts);
     } // if(false) — ext/ removed
@@ -7413,7 +7413,7 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
             \\const std = @import("std"); const zigmodu = @import("zigmodu"); const http = zigmodu.http; const R = @import("../../../../shared/response.zig"); const ext_svc = @import("service.zig");
             \\pub const AiAgentApiExt = struct { ext: *ext_svc.AiAgentServiceExt;
             \\    pub fn init(ext: *ext_svc.AiAgentServiceExt) AiAgentApiExt { return .{ .ext = ext }; }
-            \\    pub fn registerRoutes(self: *AiAgentApiExt, group: *zigmodu.http.RouteGroup) !void { _ = self; _ = group; }
+            \\    pub fn registerRoutes(self: *AiAgentApiExt, group: anytype) !void { _ = self; _ = group; }
             \\};
         , gen_opts);
     } // if(false) — ext/ removed
@@ -7638,7 +7638,7 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
             \\const std = @import("std"); const zigmodu = @import("zigmodu"); const http = zigmodu.http; const R = @import("../../../shared/response.zig"); const ext_svc = @import("service.zig");
             \\pub const Web4ApiExt = struct { ext: *ext_svc.Web4ServiceExt;
             \\    pub fn init(ext: *ext_svc.Web4ServiceExt) Web4ApiExt { return .{ .ext = ext }; }
-            \\    pub fn registerRoutes(self: *Web4ApiExt, group: *zigmodu.http.RouteGroup) !void { _ = self; _ = group; }
+            \\    pub fn registerRoutes(self: *Web4ApiExt, group: anytype) !void { _ = self; _ = group; }
             \\};
         , gen_opts);
     } // if(false) — ext/ removed
@@ -8350,8 +8350,8 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
         \\    }
         \\    pub fn deinit(self: *ImGateway) void { self.registry.deinit(); }
         \\    pub fn setMsgHandler(self: *ImGateway, handler: MsgHandler, ctx: *anyopaque) void { self.msg_handler = handler; self.msg_ctx = ctx; }
-        \\    /// Prefer ComptimeRouter `ImApi.ws_routes`; kept for manual RouteGroup wiring.
-        \\    pub fn register(self: *ImGateway, group: *http.RouteGroup, allocator: std.mem.Allocator) !void {
+        \\    /// Prefer ComptimeRouter `ImApi.ws_routes`; kept for manual runtime-scope wiring.
+        \\    pub fn register(self: *ImGateway, group: anytype, allocator: std.mem.Allocator) !void {
         \\        _ = allocator;
         \\        try group.ws("/im/ws", onConnect, onMessage, onClose, @ptrCast(@alignCast(self)));
         \\    }
@@ -8481,7 +8481,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
                 \\        return .{ .ext = ext };
                 \\    }
                 \\
-                \\    pub fn registerRoutes(self: *ImApi, group: *zigmodu.http.RouteGroup) !void {
+                \\    pub fn registerRoutes(self: *ImApi, group: anytype) !void {
                 \\        _ = self;
                 \\        _ = group;
                 \\        // Add custom IM routes here
@@ -9416,7 +9416,7 @@ fn cmdAdd(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
             \\pub const {s}ApiExt = struct {{
             \\    ext: *ext_svc.{s}ServiceExt;
             \\    pub fn init(e: *ext_svc.{s}ServiceExt) @This() {{ return .{{ .ext = e }}; }}
-            \\    pub fn registerRoutes(self: *@This(), group: *zigmodu.http.RouteGroup) !void {{ _ = self; _ = group; }}
+            \\    pub fn registerRoutes(self: *@This(), group: anytype) !void {{ _ = self; _ = group; }}
             \\}};
         , .{ mod_name, pascal_mod, pascal_mod, pascal_mod });
         defer allocator.free(ext_api);
@@ -9915,10 +9915,9 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
     }
 
     try buf.appendSlice(allocator,
-        \\    // Health (legacy RouteGroup — not part of module catalog)
-        \\    var health = server.group("/admin-api");
-        \\    try health.get("/health/live", healthLive, null);
-        \\    try health.get("/health/ready", healthReady, null);
+        \\    // Health (runtime routes — intentionally outside the module catalog)
+        \\    try server.addRoute(.{ .method = .GET, .path = "admin-api/health/live", .handler = healthLive });
+        \\    try server.addRoute(.{ .method = .GET, .path = "admin-api/health/ready", .handler = healthReady });
         \\
         \\    // -- Routes (ComptimeRouter) --
         \\    const AppState = struct {};

@@ -11,7 +11,7 @@ pub fn WorldApi(comptime Service: type) type {
             return .{ .svc = svc };
         }
 
-        pub fn registerRoutes(self: *Self, group: *http.RouteGroup) !void {
+        pub fn registerRoutes(self: *Self, group: anytype) !void {
             try group.post("/worlds", createWorld, @ptrCast(@alignCast(self)));
             try group.post("/worlds/feature", feature, @ptrCast(@alignCast(self)));
             try group.post("/worlds/visit", visit, @ptrCast(@alignCast(self)));

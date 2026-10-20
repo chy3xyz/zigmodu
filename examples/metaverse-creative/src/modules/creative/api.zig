@@ -12,7 +12,7 @@ pub fn CreativeApi(comptime Service: type) type {
             return .{ .svc = svc };
         }
 
-        pub fn registerRoutes(self: *Self, group: *http.RouteGroup) !void {
+        pub fn registerRoutes(self: *Self, group: anytype) !void {
             try group.post("/creatives", createDraft, @ptrCast(@alignCast(self)));
             try group.post("/creatives/publish", publish, @ptrCast(@alignCast(self)));
             try group.get("/creatives", listPublished, @ptrCast(@alignCast(self)));

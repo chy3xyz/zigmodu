@@ -697,7 +697,6 @@ pub fn stop(self: *Server) void
 pub fn deinit(self: *Server) void
 pub fn addMiddleware(self: *Server, mw: Middleware) !void
 pub fn addRoute(self: *Server, route: Route) !void
-pub fn group(self: *Server, prefix: []const u8) RouteGroup
 pub fn withGracefulDrain(self: *Server, counter: *std.atomic.Value(u64)) void
 ```
 
@@ -1179,7 +1178,6 @@ pub fn deinit(self: *Server) void
 
 pub fn addRoute(self: *Server, route: Route) !void
 
-pub fn group(self: *Server, prefix: []const u8) RouteGroup
 
 pub fn addMiddleware(self: *Server, mw: Middleware) !void
 
@@ -1485,7 +1483,8 @@ Group routes under a common prefix:
 
 ```zig
 
-var api = server.group("/api/v1");
+// router = http.Router(AppState); see ROUTE_TABLE §1
+var api = router.scope("/api/v1");
 
 try api.get("/users", handleUsers, null);
 
@@ -1621,7 +1620,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Route group with path params
 
-    var users = server.group("/api/users");
+    var users = router.scope("/api/users");
 
     try users.get("/{id}", struct {
 

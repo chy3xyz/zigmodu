@@ -5,6 +5,7 @@
 //! (same contract as `Context.startChunked`).
 
 const std = @import("std");
+const RouteRegistrar = @import("../api/RouteRegistrar.zig").RouteRegistrar;
 const sockread = @import("../core/sockread.zig");
 
 /// Read `Last-Event-ID` from the request (EventSource reconnect). Header keys are lowercase.
@@ -519,7 +520,7 @@ test "a HEAD request to an SSE handler writes no event bytes" {
         }
     }.h;
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("ev", everyWrite, null);
     try group.head("ev", everyWrite, null);
 

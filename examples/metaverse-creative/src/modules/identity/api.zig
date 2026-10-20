@@ -10,7 +10,7 @@ pub fn IdentityApi(comptime Service: type) type {
             return .{ .svc = svc };
         }
 
-        pub fn registerRoutes(self: *Self, group: *http.RouteGroup) !void {
+        pub fn registerRoutes(self: *Self, group: anytype) !void {
             try group.post("/creators", createCreator, @ptrCast(@alignCast(self)));
             try group.get("/creators", getCreator, @ptrCast(@alignCast(self)));
         }

@@ -7,6 +7,7 @@
 //!   try http.respondErr(ctx, err); // optional http.setErrorMap(...)
 
 const std = @import("std");
+const RouteRegistrar = @import("RouteRegistrar.zig").RouteRegistrar;
 const Server = @import("Server.zig");
 const ProblemDetails = @import("../http/ProblemDetails.zig").ProblemDetails;
 const FieldValidation = @import("../validation/FieldValidation.zig");
@@ -738,7 +739,7 @@ test "an upload endpoint refuses a renamed script with 415 (Testkit dispatch)" {
 
     var server = Server.Server.init(std.testing.io, allocator, 0);
     defer server.deinit();
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.post("upload", Upload.post, null);
 
     // The rename bypass, end to end: served as a real request, the response the

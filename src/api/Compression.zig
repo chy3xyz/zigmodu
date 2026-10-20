@@ -41,6 +41,7 @@
 //!   §4  Tests —— unit tests for the policy, end-to-end tests for the middleware
 
 const std = @import("std");
+const RouteRegistrar = @import("RouteRegistrar.zig").RouteRegistrar;
 const api = @import("Server.zig");
 
 const flate = std.compress.flate;
@@ -508,7 +509,7 @@ test "Compression: the registered middleware encodes on the server chain" {
     var server = api.Server.init(std.testing.io, allocator, 0);
     defer server.deinit();
     try server.addMiddleware(try compressionMiddleware(.{}));
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("items", handlerFor("application/json", &big_json), null);
 
     const headers = [_]Testkit.HeaderPair{.{ "accept-encoding", "gzip" }};

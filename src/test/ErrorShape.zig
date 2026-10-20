@@ -15,6 +15,7 @@
 //! which never responds produces the same shape as everything else.
 
 const std = @import("std");
+const RouteRegistrar = @import("../api/RouteRegistrar.zig").RouteRegistrar;
 const api = @import("../api/Server.zig");
 const mw = @import("../api/Middleware.zig");
 const cr = @import("../api/ComptimeRouter.zig");
@@ -178,7 +179,7 @@ test "server dispatch: unregistered path and uncaught handler error take the pro
 
     var server = api.Server.init(std.testing.io, allocator, 0);
     defer server.deinit();
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("live", Handlers.ok, null);
     try group.get("boom", Handlers.boom, null);
 

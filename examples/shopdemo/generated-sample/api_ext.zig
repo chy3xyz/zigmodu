@@ -1,6 +1,5 @@
 // order custom API endpoints — add business routes here.
 // Survives zmodu regeneration.
-const zigmodu = @import("zigmodu");
 const order_ext = @import("service_ext.zig");
 
 pub const OrderApiExt = struct {
@@ -10,7 +9,7 @@ pub const OrderApiExt = struct {
         return .{ .ext = ext };
     }
 
-    pub fn registerRoutes(self: *OrderApiExt, group: *zigmodu.http.RouteGroup) !void {
+    pub fn registerRoutes(self: *OrderApiExt, group: anytype) !void {
         _ = self;
         // Add custom routes:
         // try group.get("/order/custom", myHandler, @ptrCast(@alignCast(self)));

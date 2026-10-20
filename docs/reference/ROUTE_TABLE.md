@@ -39,6 +39,11 @@ try server.addMiddleware(try http.permissionGateWith(&slot, .{ .mode = .rbac }))
 **模块用 comptime `routes` 表声明路由；`mountAll(comptime modules, …)` 在编译期展开注册；`Router(State)` 泛型持有应用状态与 `std.Io`。**  
 运行期零反射；请求路径完全确定。
 
+确实需要运行时注册（插件、SSE 流、管理面板）时，用 `router.scope(prefix).get/post/…/ws`：
+路由进 trie 与作用域中间件链，但**不进 catalog**——`permissionGate`、OpenAPI 与
+`auditAuthCoverage` 都看不到它。需要这些能力就必须走 `routes` 表（或 `ws_routes` /
+`sse_routes`）。旧 `server.group(...)` 已移除；框架内部运行时注册走 `api/RouteRegistrar.zig`（不导出）。
+
 ---
 
 ## 2. 与「Axum 显式 mount」版的差别
@@ -557,7 +562,7 @@ const page = (try http.extractQuery(ctx, .{ .page = u32, .size = u32 })).page;
 const body = try http.extractJson(ctx, CreateDto) catch return;
 try http.respondErr(ctx, err);
 
-var g = try server.group("admin-api").use(myMiddleware);
+var scope = try router.scope("admin-api").use(myMiddleware); // 运行时注册面
 ```
 
 Extractors → `src/api/Extract.zig` · Testkit → `http.Testkit.dispatch`

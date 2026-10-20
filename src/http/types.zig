@@ -382,7 +382,7 @@ pub const Context = struct {
     }
 
     /// Typed route state: `user_data` carries the `*State` the route was
-    /// registered with (ComptimeRouter mounts, `RouteGroup` handlers, and the
+    /// registered with (ComptimeRouter mounts, runtime-scope handlers, and the
     /// WebSocket `on_connect` / `on_close` callbacks all reach it this way).
     ///
     /// Prefer this over spelling `@ptrCast(@alignCast(ctx.user_data orelse …))`

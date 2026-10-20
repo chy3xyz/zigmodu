@@ -70,7 +70,13 @@ pub fn main(init: std.process.Init) !void {
     defer server.deinit();
     server.withGracefulDrain(zigmodu.getInFlightCounter());
 
-    var v1 = server.group("/api/v1");
+    // Runtime scope: routes land in the trie and in the scope middleware
+    // chain. They are outside the comptime catalog (no auth metadata), which
+    // is the same contract `server.group` had.
+    var app_state: void = {};
+    var router = zigmodu.http.Router(void).init(io, allocator, &server, &app_state);
+    defer router.deinit();
+    var v1 = router.scope("/api/v1");
     try order_api.registerRoutes(&v1);
 
     try server.addRoute(.{

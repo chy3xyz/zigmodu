@@ -26,6 +26,7 @@
 //! Every section carries a matching `// ==== §N ... ====` anchor — `grep "§4"` jumps there.
 
 const std = @import("std");
+const RouteRegistrar = @import("RouteRegistrar.zig").RouteRegistrar;
 const api = @import("Server.zig");
 const Time = @import("../core/Time.zig");
 const SecurityModule = @import("../security/SecurityModule.zig").SecurityModule;
@@ -1980,7 +1981,7 @@ test "csrf blocks a cross-origin POST through the dispatch path" {
     var server = api.Server.init(std.testing.io, allocator, 0);
     defer server.deinit();
     try server.addMiddleware(try csrf());
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.post("orders", struct {
         fn h(ctx: *api.Context) anyerror!void {
             try ctx.jsonStruct(200, .{ .ok = true });
@@ -2020,7 +2021,7 @@ test "csrf signing holds through the dispatch path" {
     var server = api.Server.init(std.testing.io, allocator, 0);
     defer server.deinit();
     try server.addMiddleware(try csrfWith(.{ .sign_key = key }));
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.post("orders", struct {
         fn h(ctx: *api.Context) anyerror!void {
             try ctx.jsonStruct(200, .{ .ok = true });

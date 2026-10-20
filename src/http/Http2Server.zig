@@ -24,6 +24,7 @@
 //! Every section carries a matching `// ==== §N ... ====` anchor — `grep "§6"` jumps there.
 
 const std = @import("std");
+const RouteRegistrar = @import("../api/RouteRegistrar.zig").RouteRegistrar;
 const Http2 = @import("Http2.zig");
 const Hpack = @import("Hpack.zig");
 const Grpc = @import("../extensions/GrpcTransport.zig");
@@ -4000,7 +4001,7 @@ test "h2 server dispatches a registered route: handler body and content-type rea
     defer server.deinit();
     server.setHttp2Enabled(true);
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("h2hello", struct {
         fn h(ctx: *api_server.Context) anyerror!void {
             try ctx.jsonStruct(200, .{ .ok = true, .proto = "h2" });
@@ -4046,7 +4047,7 @@ test "h2 server runs route middleware against H2 request headers" {
     defer server.deinit();
     server.setHttp2Enabled(true);
 
-    var group = try (server.group("")).use(.{ .func = requireTenant });
+    var group = try (RouteRegistrar.init(&server, "")).use(.{ .func = requireTenant });
     try group.get("h2tenant", struct {
         fn h(ctx: *api_server.Context) anyerror!void {
             try ctx.text(200, "tenanted");
@@ -4111,7 +4112,7 @@ test "h2 server enforces Server.Config.max_body_size on the H2 path" {
     defer server.deinit();
     server.setHttp2Enabled(true);
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.post("h2echo", struct {
         fn h(ctx: *api_server.Context) anyerror!void {
             try ctx.text(200, "small ok");
@@ -4172,7 +4173,7 @@ test "h2 server arms ctx.io and the request budget on the dispatched Context" {
     defer server.deinit();
     server.setHttp2Enabled(true);
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("h2ctx", struct {
         fn h(ctx: *api_server.Context) anyerror!void {
             // The H1 dispatch arms `ctx.io` and `ctx.setDeadline(...)` before
@@ -4214,7 +4215,7 @@ test "h2 server answers 501 instead of framing a streaming handler's chunks as H
     defer server.deinit();
     server.setHttp2Enabled(true);
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("h2stream", struct {
         fn h(ctx: *api_server.Context) anyerror!void {
             // The H1 chunked API. On H2 `ctx.stream` is null, so the chunks
@@ -4260,7 +4261,7 @@ test "h2 server refuses an SSE handler rather than writing H1 event bytes into D
     defer server.deinit();
     server.setHttp2Enabled(true);
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("h2sse", struct {
         fn h(ctx: *api_server.Context) anyerror!void {
             var sse = try @import("../http.zig").sse(ctx);
@@ -4303,7 +4304,7 @@ test "h2 server fits the response block to the peer's SETTINGS_MAX_HEADER_LIST_S
     defer server.deinit();
     server.setHttp2Enabled(true);
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("h2peerlist", struct {
         fn h(ctx: *api_server.Context) anyerror!void {
             // RFC 9113 §6.5.2 accounting: 6 + 400 + 32 = 438 bytes, i.e. past a
@@ -4654,7 +4655,7 @@ test "h2 server sends a response larger than max_pending_bytes to a reading clie
     var server = api_server.Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h2-big" });
     defer server.deinit();
     server.setHttp2Enabled(true);
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("h2big", h2BigResponse, null);
 
     var running = try RunningServer.start(&server);
@@ -4703,7 +4704,7 @@ test "h2: a non-reading client is ended by the write budget, not by the pending 
     });
     defer server.deinit();
     server.setHttp2Enabled(true);
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("h2big", h2BigResponse, null);
 
     var running = try RunningServer.start(&server);

@@ -70,9 +70,9 @@ pub const ApiVersionExtractor = struct {
 
 /// API version route group — registers independent routes per version.
 ///
-/// Usage:
-///   var v1 = server.group("/api/v1");
-///   var v2 = server.group("/api/v2");
+/// Usage (runtime routes; `Router.scope` is the registration surface):
+///   var v1 = router.scope("/api/v1");
+///   var v2 = router.scope("/api/v2");
 ///   try v1.get("/users", handleUsersV1, null);
 ///   try v2.get("/users", handleUsersV2, null);
 pub const ApiVersionRouter = struct {

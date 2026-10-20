@@ -38,7 +38,7 @@ const AiConfig = struct {
     model: []const u8 = "demo-model",
 };
 
-/// Per-request state for `streamChatHandler` (legacy RouteGroup user_data).
+/// Per-request state for `streamChatHandler` (runtime-route user_data).
 const StreamState = struct {
     config: ?AiConfig,
 };
@@ -289,11 +289,12 @@ fn runDemo(allocator: std.mem.Allocator, io: std.Io, verbose: bool, serve: bool,
     var catalog = try router.finish();
     defer catalog.deinit();
 
-    // Streaming chat SSE (legacy RouteGroup — the approval API above is the
-    // comptime-router mount; both live on the same server).
+    // Streaming chat SSE: a runtime route on the same scope. It is
+    // deliberately *not* in the catalog (no auth metadata), which is the same
+    // caveat the legacy `server.group` path had.
     var stream_state = StreamState{ .config = ai_config };
-    var api_group = server.group("/api");
-    try api_group.post("ai/chat/stream", streamChatHandler, &stream_state);
+    var api_scope = router.scope("/api");
+    try api_scope.post("ai/chat/stream", streamChatHandler, &stream_state);
 
     if (verbose) {
         std.debug.print("6. queue    : {d} pending approval(s); API GET /api/approvals/pending  POST /api/approvals/{{id}}/approve|reject\n", .{try approval_queue.count(null)});
@@ -424,8 +425,12 @@ test "ai-ops streaming chat endpoint streams SSE deltas end to end" {
     var server = http.Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "ai-ops-stream-test" });
     defer server.deinit();
     var stream_state = StreamState{ .config = config };
-    var api_group = server.group("/api");
-    try api_group.post("ai/chat/stream", streamChatHandler, &stream_state);
+    try server.addRoute(.{
+        .method = .POST,
+        .path = "api/ai/chat/stream",
+        .handler = streamChatHandler,
+        .user_data = &stream_state,
+    });
     const th = try std.Thread.spawn(.{}, struct {
         fn run(srv: *http.Server) void {
             srv.start() catch |err| std.log.warn("[ai-ops stream test] accept loop ended: {s}", .{@errorName(err)});
@@ -468,8 +473,12 @@ test "ai-ops streaming endpoint without LLM answers 503 as JSON" {
     var server = http.Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "ai-ops-stream-503" });
     defer server.deinit();
     var stream_state = StreamState{ .config = null };
-    var api_group = server.group("/api");
-    try api_group.post("ai/chat/stream", streamChatHandler, &stream_state);
+    try server.addRoute(.{
+        .method = .POST,
+        .path = "api/ai/chat/stream",
+        .handler = streamChatHandler,
+        .user_data = &stream_state,
+    });
     const th = try std.Thread.spawn(.{}, struct {
         fn run(srv: *http.Server) void {
             srv.start() catch |err| std.log.warn("[ai-ops stream 503] accept loop ended: {s}", .{@errorName(err)});

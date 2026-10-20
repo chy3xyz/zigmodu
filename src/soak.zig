@@ -17,6 +17,7 @@
 //! `scripts/soak_trend.py` reads it back. A failed run writes nothing.
 
 const std = @import("std");
+const RouteRegistrar = @import("api/RouteRegistrar.zig").RouteRegistrar;
 const zigmodu = @import("zigmodu");
 const http = zigmodu.http;
 const build_options = @import("build_options");
@@ -149,7 +150,7 @@ test "soak: N clients x M tenants — zero cross-tenant reads" {
         .header_timeout_ms = 3000,
     });
     defer server.deinit();
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     var scoped = try group.use(http.Middleware{ .func = tenantMiddleware, .user_data = null });
     try scoped.get("data", tenantHandler, null);
 

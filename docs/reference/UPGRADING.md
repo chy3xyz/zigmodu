@@ -102,10 +102,10 @@
 门禁自己 `@import` 弃用文件并**真调** `notEmpty`、`validateStruct`、`email`、`validateStructCollect`，
 加上 `src/api/Extract.zig` / `src/api/middleware/Validation.zig` 这两条链一起编译、并由门禁各真调一次）。
 
-### `RouteGroup`（运行时路由组）：保留，但新代码不再推荐
+### `RouteGroup`：**已移除**（运行时注册改用 `Scoped`）
 
-`api/Server.zig` 的 `RouteGroup`（`server.group(prefix).get/post/...`）没有删除计划，
-现有应用无需改动。新模块请用 `ComptimeRouter`：
+`api/Server.zig` 的 `RouteGroup` 与 `Server.group()` 已删除（破坏性，见 CHANGELOG）。
+公开替代只有两个：
 
 ```zig
 pub const routes = [_]http.RouteSpec(State){
@@ -114,11 +114,28 @@ pub const routes = [_]http.RouteSpec(State){
 // 挂载：router.scope("/api").mountAll(.{ .{ .Mod = OrderApi, .state = &st } })
 ```
 
+```zig
+// 确实需要运行时注册（插件、管理面板、SSE 流）
+var scope = router.scope("/api");
+try scope.post("ai/chat/stream", streamHandler, &state);
+try scope.ws("im", onConnect, onMessage, onClose, null);
+```
+
+迁移（机械替换，方法名不变）：
+
+- `var g = server.group("/api");` → `var g = router.scope("/api");`
+- `g.get/post/put/delete/patch/head/options(...)` → 同名方法
+- `g.use(mw)` → `g.use(mw)`（`Scoped` 同名）
+- `g.ws(...)` → `g.ws(...)`
+
 差别不在写法，而在**元数据位置**：`RouteMeta` 让 auth/permission/roles/OpenAPI 与
 handler 同处一张 comptime 表，重复路径在 `finish()` 前就会失败，`Testkit.auditAuthCoverage`
-也能直接审计；`RouteGroup` 的这些信息散在中间件链与调用点。混用两者时，路由表
-（catalog）只覆盖 `ComptimeRouter` 挂载的部分——这是 `auditAuthCoverage` 只对
-catalog 生效的原因。
+也能直接审计。`Scoped` 的运行时方法（以及曾经的 `RouteGroup`）**不进 catalog**——
+权限门、OpenAPI、`auditAuthCoverage` 都看不到它们；需要这些能力就必须走 `routes` /
+`ws_routes` / `sse_routes`。
+
+框架内部的运行时注册（Dashboard / Profiles / StaticFiles / SSE）改用
+`src/api/RouteRegistrar.zig`：该文件不从 `http.zig` 导出，是内部实现，不是消费方 API。
 
 ### 已移除（记录，不是承诺）
 
@@ -1006,7 +1023,7 @@ const self: *MyApi = ctx.state(MyApi) catch return null;
 `user_data` 放的一直是 ComptimeRouter 的 `*State`（身份在另一个字段 `auth_info` 上）。
 `ctx.state(T)` 在缺 state 时返回具名错误 `error.NoRouteState`，而不是让
 `orelse unreachable` 在 ReleaseFast 下变成 UB。WS 的 `on_connect` / `on_close`
-与 legacy `RouteGroup` 回调同样适用。
+与运行时注册（`Scope`）的回调同样适用。
 
 ### 生成的 `catch {}` 改为带日志的忽略
 

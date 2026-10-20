@@ -14,9 +14,9 @@ pub const OrderApi = struct {
         return .{ .service = svc };
     }
 
-    /// Register all routes on a RouteGroup. Middleware chain:
+    /// Register all routes on a runtime scope (`router.scope(p)`). Middleware chain:
     ///   requestId → csrf → auth → handler
-    pub fn registerRoutes(self: *OrderApi, group: *http.RouteGroup) !void {
+    pub fn registerRoutes(self: *OrderApi, group: anytype) !void {
         try group.get("/orders", listZmoduOrders, @ptrCast(@alignCast(self)));
         try group.get("/orders/{id}", getZmoduOrder, @ptrCast(@alignCast(self)));
         try group.post("/orders", createZmoduOrder, @ptrCast(@alignCast(self)));

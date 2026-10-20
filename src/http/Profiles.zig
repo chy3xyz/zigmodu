@@ -14,6 +14,7 @@
 //!   const cb = res.breaker("payment").?;
 
 const std = @import("std");
+const RouteRegistrar = @import("../api/RouteRegistrar.zig").RouteRegistrar;
 const server_mod = @import("../api/Server.zig");
 const mw = @import("../api/Middleware.zig");
 const AccessLog = @import("AccessLog.zig");
@@ -358,7 +359,7 @@ pub fn productionProfile(server: *Server, cfg: ProductionConfig, state: *Product
 
     // 5. Optional dashboard.
     if (cfg.dashboard) {
-        var dash_group = server.group("");
+        var dash_group = RouteRegistrar.init(server, "");
         state.dashboard_source.server = server;
         if (state.http_state.metrics_collector) |*c| {
             state.dashboard_source.http_metrics = c;

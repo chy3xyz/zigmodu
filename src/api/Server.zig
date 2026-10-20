@@ -4,7 +4,7 @@
 //! Aligned with go-zero's rest package.
 //!
 //! STRUCTURE (monolith — intentionally NOT split; see docs/archive/status/PRODUCTION_ROADMAP.md):
-//!   §1  Method / Route / RouteGroup / WS callbacks —— routing declarations, middleware and listener types
+//!   §1  Method / Route / runtime registration / WS callbacks —— routing declarations, middleware and listener types
 //!   §2  Process-wide error renderers —— setErrorRenderer / setTransportErrorRenderer and the transport body
 //!   §3  Context —— request/response, arena, bindJson, streaming and parameter helpers
 //!   §4  HTTP/1.1 parsing —— StreamReader, RequestParser, ParsedRequest and header deadlines
@@ -23,6 +23,7 @@
 //!   - One PR per § block when possible; Context/connFiber changes need Middleware tests too.
 
 const std = @import("std");
+const RouteRegistrar = @import("RouteRegistrar.zig").RouteRegistrar;
 const PanicHook = @import("PanicHook.zig");
 const WsFramer = @import("../http/WsFramer.zig").WsFramer;
 const BufferPool = @import("../im/BufferPool.zig").BufferPool;
@@ -64,101 +65,7 @@ pub const setErrorRenderer = types.setErrorRenderer;
 pub const setTransportErrorRenderer = types.setTransportErrorRenderer;
 pub const renderTransportError = types.renderTransportError;
 
-// ==== §1  Method / Route / RouteGroup / WS callbacks ====
-
-/// HTTP method
-/// Route group helper to prefix paths.
-///
-/// **Legacy** (not removed): new modules declare `pub const routes` and mount
-/// them with `http.Router.scope(prefix).mountAll(...)` (`ComptimeRouter`),
-/// which keeps auth/permission/OpenAPI metadata in one comptime table and
-/// validates duplicate paths at build/finish time. `RouteGroup` stays for
-/// existing apps and for routes registered at runtime. See
-/// `docs/reference/UPGRADING.md` → "RouteGroup".
-pub const RouteGroup = struct {
-    server: *Server,
-    prefix: []const u8,
-    /// Scope-local middleware applied to routes registered through this group.
-    middleware: []const Middleware = &.{},
-
-    pub fn init(server: *Server, prefix: []const u8) RouteGroup {
-        return .{ .server = server, .prefix = prefix };
-    }
-
-    /// Append scope-local middleware (allocates on server; freed in Server.deinit).
-    pub fn use(self: RouteGroup, mw: Middleware) !RouteGroup {
-        const extended = try self.server.allocator.alloc(Middleware, self.middleware.len + 1);
-        @memcpy(extended[0..self.middleware.len], self.middleware);
-        extended[self.middleware.len] = mw;
-        try self.server.owned_route_mw.append(self.server.allocator, extended);
-        return .{
-            .server = self.server,
-            .prefix = self.prefix,
-            .middleware = extended,
-        };
-    }
-
-    fn joinPath(self: *const RouteGroup, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-        const pfx = std.mem.trim(u8, self.prefix, "/");
-        const rel = std.mem.trim(u8, path, "/");
-        if (pfx.len == 0) return allocator.dupe(u8, rel);
-        if (rel.len == 0) return allocator.dupe(u8, pfx);
-        return allocator.print("{s}/{s}", .{ pfx, rel });
-    }
-
-    fn add(self: *RouteGroup, method: Method, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
-        const full_path = try self.joinPath(self.server.allocator, path);
-        defer self.server.allocator.free(full_path);
-
-        try self.server.addRoute(.{
-            .method = method,
-            .path = full_path,
-            .handler = handler,
-            .middleware = self.middleware,
-            .user_data = user_data,
-        });
-    }
-
-    pub fn get(self: *RouteGroup, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
-        try self.add(.GET, path, handler, user_data);
-    }
-    pub fn post(self: *RouteGroup, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
-        try self.add(.POST, path, handler, user_data);
-    }
-    pub fn put(self: *RouteGroup, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
-        try self.add(.PUT, path, handler, user_data);
-    }
-    pub fn delete(self: *RouteGroup, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
-        try self.add(.DELETE, path, handler, user_data);
-    }
-    pub fn patch(self: *RouteGroup, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
-        try self.add(.PATCH, path, handler, user_data);
-    }
-    pub fn head(self: *RouteGroup, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
-        try self.add(.HEAD, path, handler, user_data);
-    }
-    pub fn options(self: *RouteGroup, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
-        try self.add(.OPTIONS, path, handler, user_data);
-    }
-
-    /// Register a WebSocket upgrade endpoint.
-    /// on_connect is called after successful handshake (user_data = route user_data).
-    /// on_message is called for each **text (0x1) or binary (0x2)** data frame.
-    /// on_close is called when the connection closes.
-    pub fn ws(self: *RouteGroup, path: []const u8, on_connect: WsConnectFn, on_message: WsMessageFn, on_close: WsCloseFn, user_data: ?*anyopaque) !void {
-        const full_path = try self.joinPath(self.server.allocator, path);
-        defer self.server.allocator.free(full_path);
-
-        const norm_path = if (full_path.len > 0 and full_path[0] == '/') full_path[1..] else full_path;
-        const dup_path = try self.server.allocator.dupe(u8, norm_path);
-        try self.server.ws_handlers.put(dup_path, .{
-            .on_connect = on_connect,
-            .on_message = on_message,
-            .on_close = on_close,
-            .user_data = user_data,
-        });
-    }
-};
+// ==== §1  Method / Route / WS callbacks ====
 
 /// WebSocket connect callback: called after successful handshake.
 /// Return session pointer (non-null accepts, null rejects).
@@ -1354,7 +1261,7 @@ pub const Server = struct {
     /// Connections a `stop()` wake pass actually shut down. Structural evidence
     /// that the drain was woken rather than merely asked to stop (read by tests).
     ws_woken_connections: std.atomic.Value(u64) = .init(0),
-    /// Allocated route-group / scoped middleware slices (RouteGroup.use, ComptimeRouter Scoped.use).
+    /// Allocated runtime-scope middleware slices (ComptimeRouter Scoped.use / RouteRegistrar.use).
     owned_route_mw: std.ArrayList([]const Middleware),
     /// Prior-knowledge HTTP/2 (h2c). When true, connFiber detects `PRI * HTTP/2.0` preface.
     enable_http2: bool = false,
@@ -1830,10 +1737,6 @@ pub const Server = struct {
         // drowned real errors, and ReleaseFast's default level is still .info.
         // The aggregate count lands in start()'s "listening" line instead.
         std.log.debug("ROUTE: {s} {s}", .{ @tagName(r.method), r.path });
-    }
-
-    pub fn group(self: *Server, prefix: []const u8) RouteGroup {
-        return RouteGroup.init(self, prefix);
     }
 
     /// List all registered routes (method + path pairs)
@@ -3211,7 +3114,7 @@ test "route group" {
     var server = Server.init(std.testing.io, allocator, 0);
     defer server.deinit();
 
-    var api_group = server.group("/api/v1");
+    var api_group = RouteRegistrar.init(&server, "/api/v1");
     try api_group.get("/users", struct {
         fn handle(ctx: *Context) anyerror!void {
             try ctx.json(200, "{\"users\":[]}");
@@ -3824,29 +3727,29 @@ test "queryInt parses valid integer" {
     try std.testing.expectEqual(@as(i64, 42), ctx.queryInt(i64, "missing", 42));
 }
 
-test "deep path matching with RouteGroup" {
+test "deep path matching with a runtime scope" {
     const allocator = std.testing.allocator;
     var server = Server.init(std.testing.io, allocator, 0);
     defer server.deinit();
 
-    // Simulate RouteGroup with deep prefix (exactly as user reports)
-    var dashboard_group = server.group("/test/overview/home");
+    // Simulate a runtime registrar with a deep prefix (exactly as user reports)
+    var dashboard_group = RouteRegistrar.init(&server, "/test/overview/home");
     try dashboard_group.get("/dashboard", struct {
         fn handle(_: *Context) anyerror!void {}
     }.handle, null);
 
-    var crm_group = server.group("/crm");
+    var crm_group = RouteRegistrar.init(&server, "/crm");
     try crm_group.get("/statistics", struct {
         fn handle(_: *Context) anyerror!void {}
     }.handle, null);
 
-    var insurance_group = server.group("/insurance");
+    var insurance_group = RouteRegistrar.init(&server, "/insurance");
     try insurance_group.get("/compensation-plan", struct {
         fn handle(_: *Context) anyerror!void {}
     }.handle, null);
 
     // Existing 2-segment path (control)
-    var customer_group = server.group("/customer");
+    var customer_group = RouteRegistrar.init(&server, "/customer");
     try customer_group.get("/summary", struct {
         fn handle(_: *Context) anyerror!void {}
     }.handle, null);
@@ -3855,23 +3758,23 @@ test "deep path matching with RouteGroup" {
     const m1 = server.router.match(allocator, .GET, "/test/overview/home/dashboard");
     if (m1 == null) @panic("route match failed: expected GET /test/overview/home/dashboard to resolve " ++
         "(registered as group(\"/test/overview/home\").get(\"/dashboard\")). Fix the prefix join in " ++
-        "RouteGroup.get / normalizeRoutePath, or correct the path asserted here.");
+        "runtime-scope get / normalizeRoutePath, or correct the path asserted here.");
 
     // Test: 2-segment path should match
     const m2 = server.router.match(allocator, .GET, "/customer/summary");
     if (m2 == null) @panic("route match failed: expected GET /customer/summary to resolve " ++
-        "(registered as group(\"/customer\").get(\"/summary\")). Fix RouteGroup prefix joining, " ++
+        "(registered as group(\"/customer\").get(\"/summary\")). Fix runtime-scope prefix joining, " ++
         "or correct the path asserted here.");
 
     // Test: 3-segment paths should match
     const m3 = server.router.match(allocator, .GET, "/crm/statistics");
     if (m3 == null) @panic("route match failed: expected GET /crm/statistics to resolve " ++
-        "(registered as group(\"/crm\").get(\"/statistics\")). Fix RouteGroup prefix joining, " ++
+        "(registered as group(\"/crm\").get(\"/statistics\")). Fix runtime-scope prefix joining, " ++
         "or correct the path asserted here.");
 
     const m4 = server.router.match(allocator, .GET, "/insurance/compensation-plan");
     if (m4 == null) @panic("route match failed: expected GET /insurance/compensation-plan to resolve " ++
-        "(registered as group(\"/insurance\").get(\"/compensation-plan\")). Fix RouteGroup prefix " ++
+        "(registered as group(\"/insurance\").get(\"/compensation-plan\")). Fix runtime-scope prefix " ++
         "joining, or correct the path asserted here.");
 
     // Params need no cleanup: a match borrows them.
@@ -3983,7 +3886,7 @@ test "WebSocket route path normalization handles leading slash variations" {
     var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 8080 });
     defer server.deinit();
 
-    var group = server.group("/app-api");
+    var group = RouteRegistrar.init(&server, "/app-api");
     try group.ws("/ws/im", (struct {
         fn connect(_: *Context, _: ?*anyopaque) ?*anyopaque {
             return null;
@@ -4057,7 +3960,7 @@ test "WebSocket fiber path receives client frames and fires on_close" {
 
     var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0 });
     defer server.deinit();
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.ws("ws", (struct {
         fn connect(_: *Context, _: ?*anyopaque) ?*anyopaque {
             return @ptrCast(&ws_e2e_state);
@@ -4195,7 +4098,7 @@ test "a response write is bounded: a non-reading peer cannot hold the connection
         .header_timeout_ms = 200,
     });
     defer server.deinit();
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("big", bigResponse, null);
 
     const th = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, struct {
@@ -4300,7 +4203,7 @@ test "response_write_timeout_ms = 0 keeps the unbounded write: only the client c
         .header_timeout_ms = 200,
     });
     defer server.deinit();
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("big", bigResponse, null);
 
     const th = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, struct {
@@ -4424,7 +4327,7 @@ test "a streaming response that never ended is terminated and the connection clo
         .response_write_timeout_ms = 1000,
     });
     defer server.deinit();
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("unfinished", unfinishedStreamHandler, null);
 
     var running = try TestServer.start(&server);
@@ -4494,7 +4397,7 @@ fn runFloodTest(handler: HandlerFn, request_path: []const u8, stream_marker: []c
         .header_timeout_ms = 200,
     });
     defer server.deinit();
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get(request_path, handler, null);
 
     var running = try TestServer.start(&server);
@@ -4610,7 +4513,7 @@ test "an HTTP/2 client that stops reading cannot hold the session: the write bud
     });
     defer server.deinit();
     server.setHttp2Enabled(true);
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("big", bigResponse, null);
 
     var running = try TestServer.start(&server);
@@ -4749,7 +4652,7 @@ test "a WebSocket push to a peer that stopped reading gets the write budget (ws 
         .response_write_timeout_ms = 200,
     });
     defer server.deinit();
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.ws("ws", (struct {
         fn connect(_: *Context, framer: ?*anyopaque) ?*anyopaque {
             ws_push_framer = @ptrCast(@alignCast(framer.?));
@@ -4850,7 +4753,7 @@ test "stop() ends a silent WebSocket client's fiber instead of waiting for the p
 
     var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0 });
     defer server.deinit();
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.ws("ws", (struct {
         fn connect(_: *Context, _: ?*anyopaque) ?*anyopaque {
             return @ptrCast(&ws_silent_state);
@@ -5142,7 +5045,7 @@ test "WebSocket upgrade: bad handshakes get 400 and no 101, a Connection token l
 
     var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0 });
     defer server.deinit();
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.ws("ws", (struct {
         fn connect(_: *Context, _: ?*anyopaque) ?*anyopaque {
             _ = ws_upgrade_state.connects.fetchAdd(1, .monotonic);
@@ -5247,7 +5150,7 @@ test "WebSocket fiber path delivers a frame larger than the 4 KiB read buffer" {
     defer server.deinit();
     server.setWsBufferPool(&pool);
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.ws("ws", (struct {
         fn connect(_: *Context, _: ?*anyopaque) ?*anyopaque {
             return @ptrCast(&ws_big_frame_state);
@@ -5359,7 +5262,7 @@ test "state(T) returns the route state and names the missing-state case" {
     const RouteState = struct { hits: u32 = 0 };
     var st = RouteState{};
 
-    // A route registered without state (legacy RouteGroup default) is an error,
+    // A route registered without state (runtime-registration default) is an error,
     // not an inline unreachable.
     try std.testing.expectError(error.NoRouteState, ctx.state(RouteState));
 
@@ -5747,7 +5650,7 @@ test "header deadline answers 408 and max_connections sheds the flood" {
         .header_timeout_ms = 300,
     });
     defer server.deinit();
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("ping", struct {
         fn h(ctx: *Context) anyerror!void {
             try ctx.jsonStruct(200, .{ .ok = true });
@@ -5830,7 +5733,7 @@ test "over-limit connections get 503 when configured" {
         .header_timeout_ms = 3000,
     });
     defer server.deinit();
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("ping", struct {
         fn h(ctx: *Context) anyerror!void {
             try ctx.jsonStruct(200, .{ .ok = true });
@@ -5883,7 +5786,7 @@ test "a chunked-bodied request is refused instead of becoming a second request" 
     });
     defer server.deinit();
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     const ping = struct {
         fn h(ctx: *Context) anyerror!void {
             try ctx.jsonStruct(200, .{ .ok = true });
@@ -5977,7 +5880,7 @@ test "WS write timeout disconnects a peer that stops reading" {
     });
     defer server.deinit();
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.ws("ws", (struct {
         fn connect(_: *Context, framer: *anyopaque) ?*anyopaque {
             // Copy by value: the pointer targets a connFiber stack local.
@@ -6545,7 +6448,7 @@ test "incomplete body is answered, not closed silently" {
         .header_timeout_ms = 2000,
     });
     defer server.deinit();
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.post("ping", struct {
         fn h(ctx: *Context) anyerror!void {
             try ctx.jsonStruct(200, .{ .ok = true });
@@ -6669,7 +6572,7 @@ test "a stalled body is answered with 408 once its budget is spent" {
         .body_timeout_ms = 200,
     });
     defer server.deinit();
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.post("ping", struct {
         fn h(ctx: *Context) anyerror!void {
             try ctx.jsonStruct(200, .{ .ok = true });
@@ -6723,7 +6626,7 @@ test "a 300-byte Origin is echoed in a response that reaches the client" {
     // A `*.example.com` suffix entry matches any prefix length, so the *client*
     // picks how long the echoed `Access-Control-Allow-Origin` becomes.
     try server.addMiddleware(try @import("Middleware.zig").cors(.{ .allow_origins = &.{"*.example.com"} }));
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("ping", struct {
         fn h(ctx: *Context) anyerror!void {
             try ctx.jsonStruct(200, .{ .ok = true });
@@ -6777,7 +6680,7 @@ test "a response header the server refuses is answered with 500, not dropped" {
         .header_timeout_ms = 2000,
     });
     defer server.deinit();
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("bad-header", struct {
         fn h(ctx: *Context) anyerror!void {
             // Written straight into the map: `setHeader` refuses this (and a
@@ -6998,7 +6901,7 @@ test "h2 adapter parity: a urlencoded form body is parsed like H1" {
     defer server.deinit();
     server.setHttp2Enabled(true);
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.post("h2form", struct {
         fn h(ctx: *Context) anyerror!void {
             try ctx.text(200, ctx.requestParam("name") orelse "MISSING");
@@ -7026,7 +6929,7 @@ test "h2 adapter parity: the form parser takes Server.Config.max_params too" {
     defer server.deinit();
     server.setHttp2Enabled(true);
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.post("h2formlimit", struct {
         fn h(ctx: *Context) anyerror!void {
             try ctx.text(200, ctx.requestParam("a") orelse "MISSING");
@@ -7144,7 +7047,7 @@ test "a request the server could not allocate room for is answered 500, not 400"
     var server = Server.initWithConfig(std.testing.io, trap.allocator(), .{ .port = 0, .name = "h1-parse-oom" });
     defer server.deinit();
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("h1parseoom", struct {
         fn h(ctx: *Context) anyerror!void {
             try ctx.text(200, "MISSING");
@@ -7172,7 +7075,7 @@ test "a urlencoded body over max_params is refused with 400, not served as an em
     var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .max_params = 2, .name = "h1-form-limit" });
     defer server.deinit();
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.post("h1formlimit", struct {
         fn h(ctx: *Context) anyerror!void {
             try ctx.text(200, ctx.requestParam("a") orelse "MISSING");
@@ -7214,7 +7117,7 @@ test "h2 adapter parity: the path rewriter runs before routing" {
         }
     }.rewrite);
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("ping", struct {
         fn h(ctx: *Context) anyerror!void {
             try ctx.text(200, "pong");
@@ -7252,7 +7155,7 @@ test "h2 adapter parity: the query string is split off the target and parsed" {
     defer server.deinit();
     server.setHttp2Enabled(true);
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("h2query", struct {
         fn h(ctx: *Context) anyerror!void {
             // `ctx.param` is the route placeholder; the query is the fallback
@@ -7305,7 +7208,7 @@ test "h2 adapter parity: the auth rate limiter answers 429 through the response 
     const mw = try @import("../security/SecurityModule.zig").authRateLimitMiddleware(arena.allocator(), 1, 60);
     try server.addMiddleware(mw);
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.post("h2login", struct {
         fn h(ctx: *Context) anyerror!void {
             try ctx.text(200, "ok");
@@ -7380,7 +7283,7 @@ test "h2 adapter parity: every response header the handler set reaches the wire"
     defer server.deinit();
     server.setHttp2Enabled(true);
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.post("h2headers", struct {
         fn h(ctx: *Context) anyerror!void {
             // The shapes an app loses when only `content-type` travels: a
@@ -7462,7 +7365,7 @@ test "h2 adapter parity: a response field past Config.header_limits is dropped, 
     defer server.deinit();
     server.setHttp2Enabled(true);
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.post("h2budget", struct {
         fn h(ctx: *Context) anyerror!void {
             try ctx.setHeader("X-Small", "1");
@@ -7625,7 +7528,7 @@ test "h2c upgrade: the request that carried the upgrade is answered as stream 1"
     defer server.deinit();
     server.setHttp2Enabled(true);
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("h2cup", struct {
         fn h(ctx: *Context) anyerror!void {
             try ctx.jsonStruct(200, .{ .ok = true, .proto = "h2c" });
@@ -7674,7 +7577,7 @@ test "h2c upgrade: the request's query string and fields reach the handler" {
     defer server.deinit();
     server.setHttp2Enabled(true);
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("h2cupq", struct {
         fn h(ctx: *Context) anyerror!void {
             const q = ctx.requestParam("b") orelse "MISSING";
@@ -7728,7 +7631,7 @@ test "h2c upgrade: the HTTP2-Settings payload is applied before the first respon
     defer server.deinit();
     server.setHttp2Enabled(true);
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("h2cbig", struct {
         fn h(ctx: *Context) anyerror!void {
             const big = try ctx.allocator.alloc(u8, big_len);
@@ -7765,7 +7668,7 @@ test "h2c upgrade: a HEADERS frame for stream 1 is refused, not dispatched twice
     defer server.deinit();
     server.setHttp2Enabled(true);
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("h2cupdup", struct {
         fn h(ctx: *Context) anyerror!void {
             try ctx.text(200, "served once");
@@ -7822,7 +7725,7 @@ test "h2c upgrade: an upgrade request body becomes stream 1's body" {
     defer server.deinit();
     server.setHttp2Enabled(true);
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("h2cbody", struct {
         fn h(ctx: *Context) anyerror!void {
             try ctx.text(200, ctx.body orelse "NOBODY");
@@ -7868,7 +7771,7 @@ test "h2c upgrade: a POST carrying a body is stream 1, and OPTIONS upgrades too"
     defer server.deinit();
     server.setHttp2Enabled(true);
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     // Neither RFC 7540 §3.2 nor RFC 9113 §3.2 names a method: the upgrade is a
     // connection property, and the request that carried it becomes stream 1
     // whatever it is. `POST` is the interesting one — the HTTP/1.1 request is
@@ -7946,7 +7849,7 @@ test "h2c upgrade: a HEAD request is answered with no body at all" {
     defer server.deinit();
     server.setHttp2Enabled(true);
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.head("h2chead", struct {
         fn h(ctx: *Context) anyerror!void {
             // The method the session seeded into `:method`/`st.method`, echoed
@@ -7998,7 +7901,7 @@ test "h2c upgrade: an HTTP2-Settings value that is not base64url is refused with
     defer server.deinit();
     server.setHttp2Enabled(true);
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("h2cbad", struct {
         fn h(ctx: *Context) anyerror!void {
             try ctx.text(200, "must not be reached");
@@ -8045,7 +7948,7 @@ test "h2c upgrade: base64url that is not a SETTINGS payload is refused with the 
     defer server.deinit();
     server.setHttp2Enabled(true);
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("h2cshort", struct {
         fn h(ctx: *Context) anyerror!void {
             try ctx.text(200, "must not be reached");
@@ -8191,7 +8094,7 @@ test "a handler's Content-Length is written once, not twice" {
     var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h1-content-length" });
     defer server.deinit();
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     // `StaticFiles` sets the field itself on the non-streamed path (the file
     // length), and that is the length the client has to see. `writeResponse`
     // used to append the server's own next to it, so the wire carried two
@@ -8287,7 +8190,7 @@ test "a response to HEAD carries the entity length and no body bytes" {
     var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h1-head-body" });
     defer server.deinit();
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.head("headbody", struct {
         fn h(ctx: *Context) anyerror!void {
             try ctx.text(200, "eleven byte");
@@ -8327,7 +8230,7 @@ test "a HEAD request to a streaming route puts no chunk bytes on the wire" {
     var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h1-head-stream" });
     defer server.deinit();
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     // Both methods take the same handler, so the method is the only variable
     // between the two exchanges below.
     try group.get("s", streamAlphaBeta, null);
@@ -8372,7 +8275,7 @@ test "a HEAD request refused before routing carries no error body" {
     var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h1-head-preflight" });
     defer server.deinit();
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("never", struct {
         fn h(ctx: *Context) anyerror!void {
             try ctx.text(200, "must not be reached");
@@ -8421,7 +8324,7 @@ test "a HEAD request whose response field the server refuses carries no error bo
     var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h1-head-refused" });
     defer server.deinit();
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     // A field name that is not `1*tchar` (RFC 9110 §5.6.2) — the bug
     // `writeResponse` refuses the whole response for, before a byte of it is
     // written. `setHeader` validates, so the map is filled the way the comment

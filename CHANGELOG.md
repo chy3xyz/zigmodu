@@ -1,5 +1,25 @@
 # Changelog
 
+## [Unreleased]
+
+### 路由：`RouteGroup` 移除，运行时注册收敛到 `Scoped`（**破坏性：是**）
+
+- **删除** `http.RouteGroup` 与 `Server.group()`。公开的运行时注册面是
+  `Router.scope(prefix)` 上的 `get` / `post` / `put` / `delete` / `patch` / `head` /
+  `options` / `ws`（阶段 A 已落地）。迁移表见
+  `docs/reference/UPGRADING.md` →「`RouteGroup`：已移除」。
+- **框架内部**的运行时注册（Dashboard / Profiles / StaticFiles / SSE）改走
+  `src/api/RouteRegistrar.zig`：该文件不从 `http.zig` 导出，不是消费方 API。
+- **门禁**：`check-api` 现在扫描 `src` / `examples` / `tools`，出现 `server.group(`
+  即失败；`ApiFreeze` 新增断言——`http.RouteGroup` 与 `Server.group` 不存在，
+  `Scoped` 的运行时方法存在（防止"删了又长回来"）。
+- **示例与脚手架**：shopdemo / metaverse-creative 的模块 `registerRoutes` 改收
+  `anytype`，由 `Router(void).scope(...)` 提供注册面；ai-ops 的两个流式测试改用
+  `server.addRoute`；zmodu 脚手架生成的 health 路由同样改 `addRoute`（不再依赖
+  已删除的 API）。
+- `Scoped` 的运行时方法**不进 catalog**：权限门、OpenAPI、`auditAuthCoverage`
+  看不到它们；需要这些能力必须用 `routes` / `ws_routes` / `sse_routes`。
+
 ## [0.39.20] - 2026-10-20
 
 ### 依赖：zent v0.96.0 → v0.97.0（**破坏性：否**）

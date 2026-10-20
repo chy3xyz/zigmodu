@@ -201,8 +201,8 @@ var source = zigmodu.http.Dashboard.DataSource{
     .http_metrics = &collector,              // 可选：stats.http 块
     .modules = &.{ .{ .name = "order", .desc = "Order module", .deps = 2 } }, // 从模块图填充
 };
-var group = server.group("");
-try zigmodu.http.Dashboard.registerRoutesWith(&group, &source);
+var scope = router.scope("");
+try zigmodu.http.Dashboard.registerRoutesWith(&scope, &source);
 ```
 
 `productionProfile` 已自动把 `server` 和 `HttpProfileState.metrics_collector`

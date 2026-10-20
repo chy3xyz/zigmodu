@@ -58,12 +58,11 @@ const Mount = struct {
     config: Config,
 };
 
-/// Serve files from `root_dir` (resolved against the process CWD) under the
-/// group's prefix by claiming its wildcard route (`GET <prefix>/*`).
+/// Serve files from `root_dir` (resolved against the process CWD) under
+/// `prefix` by claiming its wildcard route (`GET <prefix>/*`).
 ///
 /// ```zig
-/// var assets = server.group("/assets");
-/// try staticFiles(io, &assets, "public", .{});
+/// try staticFiles(io, &server, allocator, "/assets", "public", .{});
 /// ```
 pub fn staticFiles(io: std.Io, server: *api.Server, allocator: std.mem.Allocator, prefix: []const u8, root_dir: []const u8, config: Config) !void {
     try server.addMiddleware(try staticMiddleware(io, allocator, prefix, root_dir, config));

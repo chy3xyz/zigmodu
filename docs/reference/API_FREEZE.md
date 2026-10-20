@@ -26,7 +26,7 @@
 |---|---|---|
 | `zigmodu` 顶层 · 生命周期与模块契约 | `Application`, `ApplicationBuilder`, `builder`, `api`, `ModuleContext`, `ZigModuError`, `Result`, `Time`, `scanModules`, `ModuleInfo` | 引用（`RUNTIME.md:58`） |
 | `域别名`（opt-in 域） | `http`, `data`, `security`, `observability`, `runtime`, `ai`, `im`, `web4`, `outbox`, `cron`, `migration`, `datapermission` | 决定（别名本身是导入缝，改名=全员编译错） |
-| `http` · 路由与请求 | `http.Server`, `http.Context`, `http.RouteGroup`, `http.RouteSpec`, `http.RouteMeta`, `http.Router`, `http.CatalogSlot` | 引用（HTTP 在 `RUNTIME.md:58` 的"只增不改"名单里） |
+| `http` · 路由与请求 | `http.Server`, `http.Context`, `http.RouteSpec`, `http.RouteMeta`, `http.Router`, `http.CatalogSlot` | 引用（HTTP 在 `RUNTIME.md:58` 的"只增不改"名单里） |
 | `http` · extractor 与错误渲染 | `http.extractPath`, `http.extractQuery`, `http.extractJson`, `http.extractJsonValidated`, `http.extractMultipart`, `http.respondErr`, `http.setErrorMap`, `http.problemReject`, `http.useRfc7807Errors`, `http.productionProfile`, `http.sse`, `http.Testkit` | 引用（同上） |
 | `http` / `security` · 鉴权（Path A） | `http.jwtAuthFromCatalogWithPermissions`, `http.catalogLoaderFromTable`, `http.AuthBackend`, `http.jwtBackend`, `http.envelopeReject`, `http.permissionGateWith`, `http.tenantResolver`, `security.AppSecurity`, `security.PasswordEncoder`, `security.CatalogPermDb`, `security.JwksKeyRing` | 决定（`AGENTS.md` 把 Path A 定为默认接法；门禁只保证名字还在，签名准确性人工看） |
 | `data` · 数据层 | `data.Client`, `data.Repository`, `data.SqlxBackend`, `data.CrudService`, `data.CacheManager`, `data.MigrationRunner`, `data.sqlx`, `data.redis`, `data.orm`, `data.pool` | 决定 |

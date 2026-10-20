@@ -9,6 +9,7 @@
 //! Copy the shape into an app test: swap `downstream()` for a real client call.
 
 const std = @import("std");
+const RouteRegistrar = @import("../api/RouteRegistrar.zig").RouteRegistrar;
 const http = @import("../http.zig");
 const CircuitBreaker = @import("../resilience/CircuitBreaker.zig").CircuitBreaker;
 const RateLimiter = @import("../resilience/RateLimiter.zig").RateLimiter;
@@ -58,7 +59,7 @@ test "fault injection: outage opens the breaker, recovery closes it" {
 
     var server = http.Server.init(std.testing.io, allocator, 0);
     defer server.deinit();
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("proxy", Fault.handler, null);
 
     // ── Phase 1: dependency down ────────────────────────────────────────────
@@ -111,7 +112,7 @@ test "fault injection: rate limiter sheds excess load with 429" {
 
     var server = http.Server.init(std.testing.io, allocator, 0);
     defer server.deinit();
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try group.get("limited", Fault.limited, null);
 
     inline for (0..2) |_| {

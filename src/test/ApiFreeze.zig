@@ -429,6 +429,20 @@ fn replacementResolves(comptime target: []const u8) bool {
     return @hasDecl(zmodu, name);
 }
 
+test "removed: http.RouteGroup and Server.group are gone (runtime registration moved to Scoped)" {
+    const server_mod = @import("../api/Server.zig");
+    const comptime_router = @import("../api/ComptimeRouter.zig");
+
+    try std.testing.expect(!@hasDecl(http, "RouteGroup"));
+    try std.testing.expect(!@hasDecl(server_mod.Server, "group"));
+
+    // The replacement is the one the docs point at: Scoped carries the
+    // runtime registration surface, not a `group()` on the server.
+    try std.testing.expect(@hasDecl(comptime_router.Scoped(void), "get"));
+    try std.testing.expect(@hasDecl(comptime_router.Scoped(void), "post"));
+    try std.testing.expect(@hasDecl(comptime_router.Scoped(void), "ws"));
+}
+
 test "removed: the names off the root stay off, and their files are still compiled" {
     const allocator = std.testing.allocator;
 
@@ -1037,7 +1051,7 @@ const FREEZE_CATEGORIES = [_]FreezeCategory{
     .{
         .name = "HTTP · 路由与请求",
         .anchors = &.{
-            "http.Server",    "http.Context", "http.RouteGroup",  "http.RouteSpec",
+            "http.Server",    "http.Context", "http.RouteSpec",
             "http.RouteMeta", "http.Router",  "http.CatalogSlot",
         },
     },

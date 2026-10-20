@@ -14,7 +14,6 @@ pub const Method = server_mod.Method;
 pub const HandlerFn = server_mod.HandlerFn;
 pub const Context = server_mod.Context;
 pub const Server = server_mod.Server;
-pub const RouteGroup = server_mod.RouteGroup;
 pub const Middleware = server_mod.Middleware;
 pub const WsConnectFn = server_mod.WsConnectFn;
 pub const WsMessageFn = server_mod.WsMessageFn;
@@ -800,6 +799,48 @@ pub fn Scoped(comptime AppState: type) type {
             };
         }
 
+        // ── Runtime registration (`router.scope(p).get/…`) ───────────────
+        //
+        // The runtime-registration surface (`Scoped` replaced `server.group`),
+        // owns the catalog. Routes added here are *runtime* routes: they land
+        // in the trie and in the route middleware chain, but not in the
+        // catalog — so `permissionGate`/`openApiFromCatalog`/`auditAuthCoverage`
+        // do not see them (the runtime-route caveat). Use `mount`
+        // for anything that needs auth metadata.
+        pub fn get(self: *Self, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
+            try registerRoute(self.router.server, self.prefix, self.middleware, .GET, path, handler, user_data);
+        }
+        pub fn post(self: *Self, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
+            try registerRoute(self.router.server, self.prefix, self.middleware, .POST, path, handler, user_data);
+        }
+        pub fn put(self: *Self, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
+            try registerRoute(self.router.server, self.prefix, self.middleware, .PUT, path, handler, user_data);
+        }
+        pub fn delete(self: *Self, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
+            try registerRoute(self.router.server, self.prefix, self.middleware, .DELETE, path, handler, user_data);
+        }
+        pub fn patch(self: *Self, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
+            try registerRoute(self.router.server, self.prefix, self.middleware, .PATCH, path, handler, user_data);
+        }
+        pub fn head(self: *Self, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
+            try registerRoute(self.router.server, self.prefix, self.middleware, .HEAD, path, handler, user_data);
+        }
+        pub fn options(self: *Self, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
+            try registerRoute(self.router.server, self.prefix, self.middleware, .OPTIONS, path, handler, user_data);
+        }
+
+        /// Register a WebSocket upgrade endpoint on this scope.
+        pub fn ws(
+            self: *Self,
+            path: []const u8,
+            on_connect: WsConnectFn,
+            on_message: WsMessageFn,
+            on_close: WsCloseFn,
+            user_data: ?*anyopaque,
+        ) !void {
+            try registerWs(self.router.server, self.prefix, path, on_connect, on_message, on_close, user_data);
+        }
+
         /// Mount one modulith HTTP module: expands `Mod.routes` / optional `ws_routes` / `sse_routes`.
         pub fn mount(self: *Self, comptime Mod: type, state: *Mod.State) !void {
             validateModule(Mod);
@@ -807,15 +848,13 @@ pub fn Scoped(comptime AppState: type) type {
             const base = try joinPaths(self.router.allocator, &.{ self.prefix, nest_path });
             defer self.router.allocator.free(base);
 
-            var group = self.router.server.group(base);
-            group.middleware = self.middleware;
             const state_ptr: ?*anyopaque = state;
 
             inline for (Mod.routes) |spec| {
                 const auth = resolveAuth(spec.meta, self.router.default_auth);
                 const module = resolveModule(spec.meta, Mod.module_name);
                 const bridged = wrap(Mod.State, spec.handler);
-                try routeMethod(&group, spec.method, spec.path, bridged, state_ptr);
+                try registerRoute(self.router.server, base, self.middleware, spec.method, spec.path, bridged, state_ptr);
 
                 const full = try joinPaths(self.router.allocator, &.{ base, spec.path });
                 try self.router.catalog_buf.append(self.router.allocator, .{
@@ -839,7 +878,7 @@ pub fn Scoped(comptime AppState: type) type {
                     const auth = resolveAuth(spec.meta, self.router.default_auth);
                     const module = resolveModule(spec.meta, Mod.module_name);
                     const bridged = wrap(Mod.State, spec.handler);
-                    try group.get(spec.path, bridged, state_ptr);
+                    try registerRoute(self.router.server, base, self.middleware, .GET, spec.path, bridged, state_ptr);
 
                     const full = try joinPaths(self.router.allocator, &.{ base, spec.path });
                     try self.router.catalog_buf.append(self.router.allocator, .{
@@ -907,7 +946,7 @@ pub fn Scoped(comptime AppState: type) type {
                     const auth = resolveAuth(spec.meta, self.router.default_auth);
                     const module = resolveModule(spec.meta, Mod.module_name);
                     const ud = spec.user_data orelse state_ptr;
-                    try group.ws(spec.path, spec.on_connect, spec.on_message, spec.on_close, ud);
+                    try registerWs(self.router.server, base, spec.path, spec.on_connect, spec.on_message, spec.on_close, ud);
 
                     const full = try joinPaths(self.router.allocator, &.{ base, spec.path });
                     try self.router.catalog_buf.append(self.router.allocator, .{
@@ -935,17 +974,56 @@ pub fn Scoped(comptime AppState: type) type {
     };
 }
 
-/// Extension: RouteGroup method dispatch used by Scoped.mount (keeps Server.zig slim).
-fn routeMethod(self: *RouteGroup, method: Method, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
-    switch (method) {
-        .GET => try self.get(path, handler, user_data),
-        .POST => try self.post(path, handler, user_data),
-        .PUT => try self.put(path, handler, user_data),
-        .DELETE => try self.delete(path, handler, user_data),
-        .PATCH => try self.patch(path, handler, user_data),
-        .HEAD => try self.head(path, handler, user_data),
-        .OPTIONS => try self.options(path, handler, user_data),
-    }
+/// Join a runtime scope prefix with a route path (`/v1` + `ping` -> `v1/ping`).
+/// Same normalization the old `RouteGroup.joinPath` applied. Registration no
+/// longer goes through that type at all.
+fn scopedPath(allocator: std.mem.Allocator, prefix: []const u8, path: []const u8) ![]u8 {
+    const pfx = std.mem.trim(u8, prefix, "/");
+    const rel = std.mem.trim(u8, path, "/");
+    if (pfx.len == 0) return allocator.dupe(u8, rel);
+    if (rel.len == 0) return allocator.dupe(u8, pfx);
+    return allocator.print("{s}/{s}", .{ pfx, rel });
+}
+
+fn registerRoute(
+    server: *Server,
+    prefix: []const u8,
+    middleware: []const Middleware,
+    method: Method,
+    path: []const u8,
+    handler: HandlerFn,
+    user_data: ?*anyopaque,
+) !void {
+    const full = try scopedPath(server.allocator, prefix, path);
+    defer server.allocator.free(full);
+    try server.addRoute(.{
+        .method = method,
+        .path = full,
+        .handler = handler,
+        .middleware = middleware,
+        .user_data = user_data,
+    });
+}
+
+fn registerWs(
+    server: *Server,
+    prefix: []const u8,
+    path: []const u8,
+    on_connect: WsConnectFn,
+    on_message: WsMessageFn,
+    on_close: WsCloseFn,
+    user_data: ?*anyopaque,
+) !void {
+    const full = try scopedPath(server.allocator, prefix, path);
+    defer server.allocator.free(full);
+    const norm = if (full.len > 0 and full[0] == '/') full[1..] else full;
+    const dup = try server.allocator.dupe(u8, norm);
+    try server.ws_handlers.put(dup, .{
+        .on_connect = on_connect,
+        .on_message = on_message,
+        .on_close = on_close,
+        .user_data = user_data,
+    });
 }
 
 /// Shared by catalog middleware (http_middleware) for health/dashboard skips.
@@ -1039,6 +1117,61 @@ test "Router mount expands routes into catalog" {
     ctx.user_data = matched.?.route.user_data;
     try matched.?.route.handler(&ctx);
     try std.testing.expectEqual(@as(u32, 1), hits);
+}
+
+const RuntimeHandlers = struct {
+    fn route(ctx: *Context) anyerror!void {
+        _ = ctx;
+    }
+    fn mw(ctx: *Context, next: HandlerFn, ud: ?*anyopaque) anyerror!void {
+        _ = ud;
+        return next(ctx);
+    }
+    fn wsConnect(ctx: *Context, framer: *anyopaque) ?*anyopaque {
+        _ = ctx;
+        _ = framer;
+        return null;
+    }
+    fn wsMessage(session: ?*anyopaque, payload: []const u8, kind: WsFrameKind) void {
+        _ = session;
+        _ = payload;
+        _ = kind;
+    }
+    fn wsClose(session: ?*anyopaque) void {
+        _ = session;
+    }
+};
+
+test "Scoped registers runtime routes with scope middleware; catalog stays comptime-only" {
+    const AppState = struct {};
+    var app: AppState = .{};
+    var server = Server.initWithConfig(std.testing.io, std.testing.allocator, .{ .port = 0 });
+    defer server.deinit();
+    var router = Router(AppState).init(std.testing.io, std.testing.allocator, &server, &app);
+    defer router.deinit();
+
+    var scope = router.scope("/v1");
+    try scope.get("ping", RuntimeHandlers.route, null);
+
+    var guarded = try scope.use(.{ .func = RuntimeHandlers.mw, .user_data = null });
+    try guarded.post("things", RuntimeHandlers.route, null);
+
+    const plain = server.router.match(std.testing.allocator, .GET, "/v1/ping") orelse
+        return error.TestExpectedRoute;
+    try std.testing.expectEqual(@as(usize, 0), plain.route.middleware.len);
+
+    const guarded_match = server.router.match(std.testing.allocator, .POST, "/v1/things") orelse
+        return error.TestExpectedRoute;
+    try std.testing.expectEqual(@as(usize, 1), guarded_match.route.middleware.len);
+
+    try scope.ws("im", RuntimeHandlers.wsConnect, RuntimeHandlers.wsMessage, RuntimeHandlers.wsClose, null);
+    try std.testing.expect(server.ws_handlers.get("v1/im") != null);
+
+    // Runtime routes are deliberately outside the catalog: no auth metadata,
+    // no OpenAPI entry, no `auditAuthCoverage` coverage.
+    var catalog = try router.finish();
+    defer catalog.deinit();
+    try std.testing.expectEqual(@as(usize, 0), catalog.entries.len);
 }
 
 test "assertNoDupes accepts distinct nests" {

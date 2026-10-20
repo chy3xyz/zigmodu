@@ -25,6 +25,7 @@
 //!   * `events` — reserved, always 0: the HTTP layer has no event-bus feed.
 
 const std = @import("std");
+const RouteRegistrar = @import("../api/RouteRegistrar.zig").RouteRegistrar;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const Time = @import("../core/Time.zig");
@@ -89,8 +90,9 @@ pub const DataSource = struct {
 /// Register the dashboard routes.
 ///
 /// Accepted form: **a pointer** to anything with
-/// `get(path, handler, user_data)` — a `*RouteGroup` (e.g.
-/// `&server.group("")`) or a `*Scoped`. A bare `Server` does not have `get`.
+/// `get(path, handler, user_data)` — a `*Scoped` (e.g. `&router.scope("")`).
+/// A bare `Server` does not have `get`; runtime registration goes through
+/// `Router.scope(...)`, which is what the caller passes here.
 ///
 /// Equivalent to `registerRoutesWith(server_or_group, null)`: the JSON feeds
 /// serve `system_info` numbers and zero out every count that needs a live
@@ -106,7 +108,7 @@ pub fn registerRoutes(server_or_group: anytype) !void {
 pub fn registerRoutesWith(server_or_group: anytype, source: ?*DataSource) !void {
     const T = @TypeOf(server_or_group);
     if (@typeInfo(T) != .pointer or !@hasDecl(@typeInfo(T).pointer.child, "get")) {
-        @compileError("dashboardRoutes expects a *pointer* to something with `get(path, handler, user_data)` (e.g. `&server.group(\"\")`); got " ++ @typeName(T));
+        @compileError("dashboardRoutes expects a *pointer* to something with `get(path, handler, user_data)` (e.g. `&router.scope(\"\")` or `&RouteRegistrar.init(&server, \"\")`); got " ++ @typeName(T));
     }
     const opaque_source: ?*anyopaque = @ptrCast(source);
     // HTML page, served at both "/" and "/dashboard"
@@ -450,7 +452,7 @@ test "dashboard stats serve real route and middleware counts" {
     }.handle });
 
     var source = DataSource{ .server = &server };
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try registerRoutesWith(&group, &source);
 
     var resp = try Testkit.dispatch(&server, .GET, "/api/dashboard/stats", null);
@@ -484,7 +486,7 @@ test "dashboard stats include http counters when wired" {
     collector.recordRequest(500, 0.100);
 
     var source = DataSource{ .server = &server, .http_metrics = &collector };
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try registerRoutesWith(&group, &source);
 
     var resp = try Testkit.dispatch(&server, .GET, "/api/dashboard/stats", null);
@@ -507,7 +509,7 @@ test "dashboard without source reports honest zeros" {
     var server = Server.Server.init(std.testing.io, allocator, 0);
     defer server.deinit();
 
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try registerRoutes(&group);
 
     var resp = try Testkit.dispatch(&server, .GET, "/api/dashboard/stats", null);
@@ -533,7 +535,7 @@ test "dashboard modules endpoint renders wired entries with escaping" {
         .{ .name = "user", .desc = "Users & auth", .deps = 0 },
     };
     var source = DataSource{ .modules = &modules };
-    var group = server.group("");
+    var group = RouteRegistrar.init(&server, "");
     try registerRoutesWith(&group, &source);
 
     var resp = try Testkit.dispatch(&server, .GET, "/api/dashboard/modules", null);
