@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.41.0] - 2026-10-20
 
 ### 项目改名：ZigModu → zmodu（**破坏性：是**）
 

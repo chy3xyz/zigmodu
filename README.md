@@ -1,4 +1,4 @@
-# zmodu v0.40.0
+# zmodu v0.41.0
 
 **Compile-time modular application framework + worker-oriented execution runtime, for Zig 0.17.**
 
