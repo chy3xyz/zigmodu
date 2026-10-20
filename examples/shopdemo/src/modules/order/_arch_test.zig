@@ -2,16 +2,16 @@
 //! Verifies module contracts, dependency integrity, and naming conventions.
 
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 test "order - architecture: no self dependency" {
     const allocator = std.testing.allocator;
-    var modules = zigmodu.ApplicationModules.init(allocator);
+    var modules = zmodu.ApplicationModules.init(allocator);
     defer modules.deinit();
 
-    try modules.register(zigmodu.ModuleInfo.init("order", "order module", &.{}));
+    try modules.register(zmodu.ModuleInfo.init("order", "order module", &.{}));
 
-    var tester = zigmodu.ArchitectureTester.init(allocator, &modules);
+    var tester = zmodu.ArchitectureTester.init(allocator, &modules);
     defer tester.deinit();
 
     try tester.ruleNoSelfDependency();
@@ -20,12 +20,12 @@ test "order - architecture: no self dependency" {
 
 test "order - architecture: naming convention" {
     const allocator = std.testing.allocator;
-    var modules = zigmodu.ApplicationModules.init(allocator);
+    var modules = zmodu.ApplicationModules.init(allocator);
     defer modules.deinit();
 
-    try modules.register(zigmodu.ModuleInfo.init("order", "order module", &.{}));
+    try modules.register(zmodu.ModuleInfo.init("order", "order module", &.{}));
 
-    var tester = zigmodu.ArchitectureTester.init(allocator, &modules);
+    var tester = zmodu.ArchitectureTester.init(allocator, &modules);
     defer tester.deinit();
 
     try tester.ruleModuleNamingConvention();
@@ -34,12 +34,12 @@ test "order - architecture: naming convention" {
 
 test "order - architecture: dependency limit" {
     const allocator = std.testing.allocator;
-    var modules = zigmodu.ApplicationModules.init(allocator);
+    var modules = zmodu.ApplicationModules.init(allocator);
     defer modules.deinit();
 
-    try modules.register(zigmodu.ModuleInfo.init("order", "order module", &.{}));
+    try modules.register(zmodu.ModuleInfo.init("order", "order module", &.{}));
 
-    var tester = zigmodu.ArchitectureTester.init(allocator, &modules);
+    var tester = zmodu.ArchitectureTester.init(allocator, &modules);
     defer tester.deinit();
 
     try tester.ruleLimitedDependencies(10);

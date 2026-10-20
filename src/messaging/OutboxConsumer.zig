@@ -6,7 +6,7 @@
 //! left in the pending set, where it would block the queue silently. This
 //! closes the loop for the AI business tools (`ai.approval`, `ai.recon`,
 //! `ai.notify`, ...) whose outbox writebacks can be routed to handlers here
-//! (or paired with `zigmodu.ai.trigger`).
+//! (or paired with `zmodu.ai.trigger`).
 
 const std = @import("std");
 const SqlxBackend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend;

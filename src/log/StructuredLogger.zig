@@ -28,7 +28,7 @@ pub const LogLevel = enum(u8) {
 /// One line on stderr, then the caller carries on — a broken log sink must not
 /// take the process down.
 fn reportInternalFailure(what: []const u8, detail: []const u8, err: anyerror) void {
-    std.debug.print("zigmodu.StructuredLogger: {s} ({s}): {s}\n", .{ what, detail, @errorName(err) });
+    std.debug.print("zmodu.StructuredLogger: {s} ({s}): {s}\n", .{ what, detail, @errorName(err) });
 }
 
 /// Structured logger
@@ -270,10 +270,10 @@ test "StructuredLogger basic" {
     const allocator = std.testing.allocator;
 
     // Use a temp file instead of stdout to avoid corrupting test runner protocol
-    const tmp_file = try std.Io.Dir.cwd().createFile(std.testing.io, "zigmodu_test_log.tmp", .{});
+    const tmp_file = try std.Io.Dir.cwd().createFile(std.testing.io, "zmodu_test_log.tmp", .{});
     defer {
         tmp_file.close(std.testing.io);
-        std.Io.Dir.cwd().deleteFile(std.testing.io, "zigmodu_test_log.tmp") catch {};
+        std.Io.Dir.cwd().deleteFile(std.testing.io, "zmodu_test_log.tmp") catch {};
     }
 
     var logger = StructuredLogger.init(allocator, std.testing.io, .INFO, .{ .file = tmp_file });
@@ -289,10 +289,10 @@ test "StructuredLogger struct fields keys are owned" {
     // the entry deinit frees every key, and freeing a literal crashes.
     const allocator = std.testing.allocator;
 
-    const tmp_file = try std.Io.Dir.cwd().createFile(std.testing.io, "zigmodu_test_log.tmp", .{});
+    const tmp_file = try std.Io.Dir.cwd().createFile(std.testing.io, "zmodu_test_log.tmp", .{});
     defer {
         tmp_file.close(std.testing.io);
-        std.Io.Dir.cwd().deleteFile(std.testing.io, "zigmodu_test_log.tmp") catch {};
+        std.Io.Dir.cwd().deleteFile(std.testing.io, "zmodu_test_log.tmp") catch {};
     }
 
     var logger = StructuredLogger.init(allocator, std.testing.io, .DEBUG, .{ .file = tmp_file });

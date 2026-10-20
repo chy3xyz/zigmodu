@@ -248,7 +248,7 @@ pub const MigrationRunner = struct {
     /// twice. Default null = no guard (single instance / local dev).
     lock: ?DistributedLock.Lock = null,
     lock_ttl_ms: u64 = 300_000,
-    lock_name: []const u8 = "zigmodu:migration",
+    lock_name: []const u8 = "zmodu:migration",
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
@@ -1316,15 +1316,15 @@ test "migration: a second replica refuses to run while the lock is held" {
     // unexpired TTL): this replica must not touch the schema.
     var other = try DistributedLock.SqlLock(@TypeOf(db)).init(allocator, std.testing.io, &db, "zmodu_migration_lock", .sqlite);
     defer other.deinit();
-    try std.testing.expect(try other.lock().tryAcquire("zigmodu:migration", 300_000));
+    try std.testing.expect(try other.lock().tryAcquire("zmodu:migration", 300_000));
 
     try std.testing.expectError(error.MigrationLocked, runner.run(&db));
 
     // Lock free again → the migration applies and the slot is released.
-    other.lock().release("zigmodu:migration");
+    other.lock().release("zmodu:migration");
     try runner.run(&db);
     try std.testing.expectEqual(@as(usize, 1), runner.getAppliedCount());
-    try std.testing.expect(try other.lock().tryAcquire("zigmodu:migration", 300_000));
+    try std.testing.expect(try other.lock().tryAcquire("zmodu:migration", 300_000));
 
     // Idempotent: a second run with the history persisted is a no-op.
     runner.lock = null;

@@ -31,7 +31,7 @@ chmod 700 "$OUT"
 # ── CA ──────────────────────────────────────────────────────────────────────
 openssl genrsa -out "$OUT/ca.key" 4096 2>/dev/null
 openssl req -x509 -new -nodes -key "$OUT/ca.key" -sha256 -days 3650 \
-  -subj "/CN=zigmodu-cluster-sidecar-demo-ca" -out "$OUT/ca.crt"
+  -subj "/CN=zmodu-cluster-sidecar-demo-ca" -out "$OUT/ca.crt"
 
 # ── per-node certs (SAN carries the static compose IP; nginx verifies the
 #    peer name against it — the IP *is* the identity at this layer) ──────────

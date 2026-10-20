@@ -9,8 +9,8 @@
 //! Declared dependency `exec` is satisfied by type: this module is instantiated
 //! as `propose.Module(exec.Module)` and only ever spells `Exec.DeskInbox`.
 
-const runtime = @import("zigmodu").runtime;
-const zmodu = @import("zigmodu");
+const runtime = @import("zmodu").runtime;
+const zmodu = @import("zmodu");
 const ai = zmodu.ai;
 const c = @import("../../contracts.zig");
 const api = @import("api.zig");

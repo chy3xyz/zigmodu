@@ -11,13 +11,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Add zigmodu dependency
-    const zigmodu_dep = b.dependency("zigmodu", .{
+    // Add zmodu dependency
+    const zmodu_dep = b.dependency("zmodu", .{
         .target = target,
         .optimize = optimize,
         .db = "sqlite",
     });
-    exe_mod.addImport("zigmodu", zigmodu_dep.module("zigmodu"));
+    exe_mod.addImport("zmodu", zmodu_dep.module("zmodu"));
 
     const exe = b.addExecutable(.{
         .name = "runtime-workers",

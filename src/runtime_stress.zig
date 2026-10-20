@@ -124,9 +124,9 @@ fn stressAllocator() std.mem.Allocator {
     return stress_gpa.allocator();
 }
 const builtin = @import("builtin");
-const zigmodu = @import("zigmodu");
-const rtr = zigmodu.runtime;
-const Time = zigmodu.time;
+const zmodu = @import("zmodu");
+const rtr = zmodu.runtime;
+const Time = zmodu.time;
 const build_options = @import("build_options");
 
 // ── fixture constants ───────────────────────────────────────────────────────

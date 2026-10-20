@@ -1,16 +1,16 @@
-//! Lightweight middleware for ZigModu HTTP server.
+//! Lightweight middleware for zmodu HTTP server.
 //!
 //! Recommended production middleware chain (order matters):
 //!   recover → requestId → cors → jwtAuth → csrf → rateLimit → handler
 //!
 //! Example:
-//!   server.addMiddleware(zigmodu.http_middleware.recover());
-//!   server.addMiddleware(zigmodu.http_middleware.requestId());
-//!   server.addMiddleware(try zigmodu.http_middleware.cors(.{}));
-//!   server.addMiddleware(try zigmodu.http_middleware.jwtAuth("my-secret"));
+//!   server.addMiddleware(zmodu.http_middleware.recover());
+//!   server.addMiddleware(zmodu.http_middleware.requestId());
+//!   server.addMiddleware(try zmodu.http_middleware.cors(.{}));
+//!   server.addMiddleware(try zmodu.http_middleware.jwtAuth("my-secret"));
 //!   // Production (wall-clock exp): share a SecurityModule initialized with initWithIo
-//!   server.addMiddleware(zigmodu.http_middleware.jwtAuthWithSecurity(&sec));
-//!   server.addMiddleware(try zigmodu.http_middleware.csrf());
+//!   server.addMiddleware(zmodu.http_middleware.jwtAuthWithSecurity(&sec));
+//!   server.addMiddleware(try zmodu.http_middleware.csrf());
 //!
 //! STRUCTURE:
 //!   §1  Reject hooks & envelopes —— AuthRejectFn, defaultReject, problemReject, envelopeReject
@@ -1562,7 +1562,7 @@ pub const defaultCsp = "object-src 'none'; base-uri 'self'; frame-ancestors 'non
 /// referrer policy) — deliberately **without** a Content-Security-Policy.
 ///
 /// These are the headers that cannot change how a page renders, so they are
-/// safe to hand out as data (`zigmodu.security.defaultHeaders` aliases this
+/// safe to hand out as data (`zmodu.security.defaultHeaders` aliases this
 /// set). A CSP is the one header that *can* break a working site — inline
 /// `<script>`, CDN assets, `data:` images all stop loading under a policy that
 /// does not name them — so it is not imposed here; an application that wants a
@@ -3370,7 +3370,7 @@ test "jwtBackend reports an unknown kid as a server error, not as an anonymous r
     };
     const header_b64 = try child.b64(allocator, "{\"alg\":\"HS256\",\"typ\":\"JWT\",\"kid\":\"v9\"}");
     defer allocator.free(header_b64);
-    const payload_b64 = try child.b64(allocator, "{\"sub\":\"42\",\"iss\":\"zigmodu\",\"aud\":\"tenant-a\",\"exp\":4102444800,\"iat\":0,\"roles\":[],\"ver\":0}");
+    const payload_b64 = try child.b64(allocator, "{\"sub\":\"42\",\"iss\":\"zmodu\",\"aud\":\"tenant-a\",\"exp\":4102444800,\"iat\":0,\"roles\":[],\"ver\":0}");
     defer allocator.free(payload_b64);
     const token = try allocator.print("{s}.{s}.bm90LWEtc2lnbmF0dXJl", .{ header_b64, payload_b64 });
     defer allocator.free(token);

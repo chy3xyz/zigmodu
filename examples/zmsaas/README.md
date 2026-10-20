@@ -1,14 +1,14 @@
-# zmsaas — SaaS 业务框架参考工程（zigmodu 后端 + SolidStart 前端）
+# zmsaas — SaaS 业务框架参考工程（zmodu 后端 + SolidStart 前端）
 
-一个可直接运行的完整示例：**zigmodu 后端**（org 隔离的 `orders` 业务模块，
-由 `zmodu saas` 生成）+ **saas-solidjs 前端**（管理页 + `zmoduFetch` REST
+一个可直接运行的完整示例：**zmodu 后端**（org 隔离的 `orders` 业务模块，
+由 `zmodu saas` 生成）+ **saas-solidjs 前端**（管理页 + `ZmoduFetch` REST
 client，由 `tools/zsaas/scripts/gen-business.mjs` 生成）。
 
 ## 结构
 
 ```
 examples/zmsaas/
-├── backend/              # zigmodu 后端（原 saas-kit 形态）
+├── backend/              # zmodu 后端（原 saas-kit 形态）
 │   ├── build.zig / build.zig.zon / db_link.zig
 │   └── src/
 │       ├── main.zig      # 接线：sqlite + JWT/RBAC 中间件栈 + Router.mountAll
@@ -18,7 +18,7 @@ examples/zmsaas/
 │       └── modules/orders/  # zmodu saas 生成：model/persistence/service/api/module/root
 ├── frontend/             # saas-solidjs 前端（已排除 node_modules/.git/.output）
 │   └── src/
-│       ├── libs/apiClient.ts           # 类型化 zigmodu REST client（信封 + Bearer + 错误映射）
+│       ├── libs/apiClient.ts           # 类型化 zmodu REST client（信封 + Bearer + 错误映射）
 │       ├── components/data/            # 数据驱动收敛：DataTable.tsx + EntityForm.tsx
 │       ├── models/Orders.ts            # 实体类型 + 字段 schema（表/表单共用）
 │       └── routes/dashboard/orders/    # index.tsx CRUD 演示页（login → list → create/edit/delete）

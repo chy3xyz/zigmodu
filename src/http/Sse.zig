@@ -99,7 +99,7 @@ fn isHeadRequest(ctx: anytype) bool {
 /// Clients connect with EventSource API and auto-reconnect on disconnect.
 ///
 /// Usage:
-///   var sse = try zigmodu.http.sse(ctx);
+///   var sse = try zmodu.http.sse(ctx);
 ///   try sse.sendEvent("message", "hello");
 ///   try sse.sendEvent("update", json_data);
 ///   try sse.done();

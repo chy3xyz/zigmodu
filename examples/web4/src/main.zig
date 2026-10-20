@@ -10,10 +10,10 @@
 //! Test: zig build test
 
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
-const http = zigmodu.http;
-const web4 = zigmodu.web4;
+const http = zmodu.http;
+const web4 = zmodu.web4;
 
 pub fn main(init: std.process.Init) !void {
     try run(init.gpa, init.io, true);
@@ -21,15 +21,15 @@ pub fn main(init: std.process.Init) !void {
 
 fn run(allocator: std.mem.Allocator, io: std.Io, serve: bool) !void {
     // Production-grade stores: persisted invoices + one-time challenges.
-    var client = zigmodu.data.sqlx.Client.init(allocator, io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = zmodu.data.sqlx.Client.init(allocator, io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
-    var backend = zigmodu.data.SqlxBackend{ .allocator = allocator, .client = &client };
+    var backend = zmodu.data.SqlxBackend{ .allocator = allocator, .client = &client };
     var invoice_store = web4.x402_store.X402Store.init(allocator, &backend);
     try invoice_store.migrate();
     var challenge_store = web4.challenge.ChallengeStore.init(allocator, io);
     defer challenge_store.deinit();
-    var security = zigmodu.security.AppSecurity.init(allocator, io, .{ .jwt_secret = "web4-demo-secret" });
+    var security = zmodu.security.AppSecurity.init(allocator, io, .{ .jwt_secret = "web4-demo-secret" });
 
     var server = http.Server.init(io, allocator, 18089);
     defer server.deinit();
@@ -107,10 +107,10 @@ test "web4 x402 gate: 402 without proof, 200 with proof" {
     const AppState = struct {};
     var server = http.Server.initWithConfig(std.testing.io, allocator, .{ .port = 18089 });
     defer server.deinit();
-    var client = zigmodu.data.sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = zmodu.data.sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
-    var backend = zigmodu.data.SqlxBackend{ .allocator = allocator, .client = &client };
+    var backend = zmodu.data.SqlxBackend{ .allocator = allocator, .client = &client };
     var invoice_store = web4.x402_store.X402Store.init(allocator, &backend);
     try invoice_store.migrate();
     // x402 gate (dev verifier) + the same ledger under the default (rejecting)

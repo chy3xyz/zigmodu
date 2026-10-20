@@ -39,7 +39,7 @@
 
 ## P0 · 只读高价值（✅ 已落地）
 
-`zigmodu.ai.business.registerBusinessSkills(registry, comptime entities)`
+`zmodu.ai.business.registerBusinessSkills(registry, comptime entities)`
 （DB 经 `SkillContext.backend_ptr` 指向 `*data.SqlxBackend`）：
 
 > **多租户应用要换入口**：上面这个默认入口把 `db_query_tenant_column` 留成 `null`，
@@ -57,7 +57,7 @@
 | `entity.lookup` | 按主键查注册实体；白名单表名；配置 `tenant_column` 后自动按 `tenant_id` 过滤 |
 | `entity.list` | 等值过滤 + 行数上限 + 租户隔离 |
 
-调度闭环（`zigmodu.ai.registerScheduleSkills` + `ScheduleCtx`，`userdata` 传
+调度闭环（`zmodu.ai.registerScheduleSkills` + `ScheduleCtx`，`userdata` 传
 `*ScheduleCtx`）：`list_schedulable_tasks` / `schedule_job` / `list_jobs` /
 `cancel_job`。
 
@@ -69,13 +69,13 @@
 | `approval.request` | 经应用注册的审批链提交审批（subject + amount），转人工入队 | `ai.approval_api.registerApprovalRequestSkills` |
 | `notification.send` | 向具名渠道投递通知（webhook / sink / outbox），渠道白名单 | `ai.notify.registerNotifySkills` |
 
-技能目录可导出：`zigmodu.ai.skill_export.toSkillsJson / toOpenApi`
+技能目录可导出：`zmodu.ai.skill_export.toSkillsJson / toOpenApi`
 （应用侧可在运行时导出并挂成 HTTP 端点），或 `zmodu ai
 export-skills / openapi`（CLI，内置目录）。
 
 ## P1 · 业务动作（✅ 已落地，默认人机门 + 幂等）
 
-`zigmodu.ai.actions.registerWriteSkills / registerCommandSkills /
+`zmodu.ai.actions.registerWriteSkills / registerCommandSkills /
 registerReportSkills`（`userdata` 传对应 Ctx；`SkillContext.permissions` 需含
 权限码）：
 
@@ -87,7 +87,7 @@ registerReportSkills`（`userdata` 传对应 Ctx；`SkillContext.permissions` �
 
 ## P2 · 管理/运维（✅ 已落地，默认关闭）
 
-`zigmodu.ai.admin.registerAdminSkills`（`userdata` 传 `AdminCtx`；权限码
+`zmodu.ai.admin.registerAdminSkills`（`userdata` 传 `AdminCtx`；权限码
 `admin:cache` / `admin:config` / `admin:audit` / `admin:user` / `admin:tenant`；
 **必须显式加入 Agent allowlist 才可达**）：
 

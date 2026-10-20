@@ -3,7 +3,7 @@ const Application = @import("../Application.zig").Application;
 const EventBus = @import("../core/EventBus.zig").EventBus;
 const ModuleInfo = @import("../core/Module.zig").ModuleInfo;
 
-/// ModulithTest - Enhanced testing framework for ZigModu
+/// ModulithTest - Enhanced testing framework for zmodu
 /// Provides module isolation, event capture, and assertions
 ///
 /// Example:

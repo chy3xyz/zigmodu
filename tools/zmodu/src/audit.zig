@@ -2,7 +2,7 @@
 //!
 //! Two rule groups:
 //!   - architecture: module boundaries / naming / dependency hygiene,
-//!     mirroring `zigmodu.core.ArchitectureTester` (static source scan);
+//!     mirroring `zmodu.core.ArchitectureTester` (static source scan);
 //!   - business: anti-pattern lint over `src/modules/**` (handler SQL,
 //!     non-parameterized SQL, legacy/banned APIs, cross-module file imports).
 //!
@@ -31,7 +31,7 @@ const Dir = Io.Dir;
 pub const usage =
     \\Usage: zmodu audit [options] [dir]
     \\
-    \\Checks business code against ZigModu best practices:
+    \\Checks business code against zmodu best practices:
     \\  architecture  module self/circular deps, missing description, naming,
     \\                dependency limit, unknown/base-module dependencies
     \\  business      handler/model SQL, non-parameterized SQL, @ptrCast
@@ -1150,7 +1150,7 @@ fn lintFile(
         }
 
         // b6 — banned imports.
-        if (containsAny(line, &.{ "zigmodu.http_server", "zigmodu.orm.Orm", "zigmodu.PasswordEncoder" }) and !config.disabled.contains("b6")) {
+        if (containsAny(line, &.{ "zmodu.http_server", "zmodu.orm.Orm", "zmodu.PasswordEncoder" }) and !config.disabled.contains("b6")) {
             try pushViolation(violations, allocator, "b6", rel_path, idx, "banned import path — use canonical domain modules (http.zig/data.zig/security.zig)", .{});
         }
 
@@ -1195,20 +1195,20 @@ fn lintFile(
             !containsAny(line, &.{ "errdefer", "rollback", "sendError" }) and
             !config.disabled.contains("b10"))
         {
-            try pushViolation(violations, allocator, "b10", rel_path, idx, "empty catch block swallows errors — log and propagate (ZigModuError)", .{});
+            try pushViolation(violations, allocator, "b10", rel_path, idx, "empty catch block swallows errors — log and propagate (ZmoduError)", .{});
         }
         if (!config.disabled.contains("b10")) {
             const exempt = containsAny(line, &.{ "errdefer", "rollback", "sendError" });
             if (pending_catch_kw_line > 0) {
                 switch (catchBodyKind(trimmed)) {
-                    .empty => try pushViolation(violations, allocator, "b10", rel_path, pending_catch_kw_line, "empty catch block swallows errors — log and propagate (ZigModuError)", .{}),
+                    .empty => try pushViolation(violations, allocator, "b10", rel_path, pending_catch_kw_line, "empty catch block swallows errors — log and propagate (ZmoduError)", .{}),
                     .open => pending_catch_brace_line = pending_catch_kw_line,
                     .other => {},
                 }
                 pending_catch_kw_line = 0;
             } else if (pending_catch_brace_line > 0) {
                 if (std.mem.eql(u8, trimmed, "}") or std.mem.eql(u8, trimmed, "};")) {
-                    try pushViolation(violations, allocator, "b10", rel_path, pending_catch_brace_line, "empty catch block swallows errors — log and propagate (ZigModuError)", .{});
+                    try pushViolation(violations, allocator, "b10", rel_path, pending_catch_brace_line, "empty catch block swallows errors — log and propagate (ZmoduError)", .{});
                 }
                 pending_catch_brace_line = 0;
             }
@@ -2343,8 +2343,8 @@ pub fn renderMermaid(io: Io, allocator: std.mem.Allocator, project_dir: []const 
 test "audit extracts Module info from module.zig" {
     const allocator = std.testing.allocator;
     const content =
-        \\const zigmodu = @import("zigmodu");
-        \\pub const info = zigmodu.api.Module{
+        \\const zmodu = @import("zmodu");
+        \\pub const info = zmodu.api.Module{
         \\    .name = "order",
         \\    .description = "Order management",
         \\    .dependencies = &.{"user", "inventory"},
@@ -2432,7 +2432,7 @@ test "audit business lint flags anti-patterns" {
     try lintFile(allocator, "persistence.zig", "SELECT * FROM users WHERE status = 'active'\n", "src/modules/x/persistence.zig", &cfg, &violations);
     try lintFile(allocator, "service.zig", "const auth = @ptrCast(@alignCast(ctx.user_data));\n", "src/modules/x/service.zig", &cfg, &violations);
     try lintFile(allocator, "api.zig", "try sendFail(ctx, 500, \"x\");\n", "src/modules/x/api.zig", &cfg, &violations);
-    try lintFile(allocator, "root.zig", "const z = @import(\"zigmodu.http_server\");\n", "src/modules/x/root.zig", &cfg, &violations);
+    try lintFile(allocator, "root.zig", "const z = @import(\"zmodu.http_server\");\n", "src/modules/x/root.zig", &cfg, &violations);
     try lintFile(allocator, "service.zig", "var mu: std.Thread.Mutex = .init;\n", "src/modules/x/service.zig", &cfg, &violations);
     try lintFile(allocator, "service.zig", "const p = @import(\"../../modules/order/persistence.zig\");\n", "src/modules/x/service.zig", &cfg, &violations);
     try lintFile(allocator, "api.zig", "const auth = ctx.getHeader(\"Authorization\");\n", "src/modules/x/api.zig", &cfg, &violations);
@@ -2467,7 +2467,7 @@ test "audit business lint flags anti-patterns" {
     // b16 — two writes in one service method without a transaction.
     try lintFile(allocator, "service.zig", "pub fn ship(self: *@This(), org_id: i64, id: i64) !void {\n    try self.crud.update(.{ .id = id }, org_id);\n    try self.persistence.exec(\"UPDATE x SET y = ?\", &.{.{ .int = 1 }});\n}\n", "src/modules/x/service.zig", &cfg, &violations);
     // b16 negative — transact() marks the method transactional.
-    try lintFile(allocator, "service.zig", "pub fn atomic(self: *@This(), id: i64) !void {\n    return self.transact(void, struct {\n        fn f(tx: *zigmodu.data.sqlx.Transaction) zigmodu.ZigModuError!void {\n            _ = tx;\n            return {};\n        }\n    }.f);\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    try lintFile(allocator, "service.zig", "pub fn atomic(self: *@This(), id: i64) !void {\n    return self.transact(void, struct {\n        fn f(tx: *zmodu.data.sqlx.Transaction) zmodu.ZmoduError!void {\n            _ = tx;\n            return {};\n        }\n    }.f);\n}\n", "src/modules/x/service.zig", &cfg, &violations);
     // b17 — owned queryRow result never freed: only a field is returned,
     // the owned strings leak.
     try lintFile(allocator, "service.zig", "pub fn getProductId(self: *@This(), id: i64) !i64 {\n    const p = try self.db.queryRow(model.Product, \"SELECT * FROM products WHERE id = ?\", &.{.{ .int = id }});\n    return p.id;\n}\n", "src/modules/x/service.zig", &cfg, &violations);

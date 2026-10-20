@@ -10,14 +10,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const zigmodu_dep = b.dependency("zigmodu", .{
+    const zmodu_dep = b.dependency("zmodu", .{
         .target = target,
         .optimize = optimize,
         // The probe speaks HTTP and nothing else; no driver code is reachable
         // from it, so nothing driver-shaped is linked.
         .db = "none",
     });
-    exe_mod.addImport("zigmodu", zigmodu_dep.module("zigmodu"));
+    exe_mod.addImport("zmodu", zmodu_dep.module("zmodu"));
 
     const exe = b.addExecutable(.{
         .name = "smuggling-probe",

@@ -8,7 +8,7 @@
 //! dialect branch and is testable in memory:
 //!
 //! ```zig
-//! var sql_lock = zigmodu.scheduler.DistributedLock.SqlLock(@TypeOf(db)).init(
+//! var sql_lock = zmodu.scheduler.DistributedLock.SqlLock(@TypeOf(db)).init(
 //!     allocator, io, &db, "zmodu_lock",
 //! );
 //! defer sql_lock.deinit();
@@ -340,7 +340,7 @@ test "SqlLock rejects unsafe table identifiers" {
 }
 
 // Real-database coverage for the `.postgres` dialect. Opt-in via
-// `ZIGMODU_TEST_PG=1` (CI's `test-postgres` job sets it) plus optional
+// `ZMODU_TEST_PG=1`（旧名 `ZIGMODU_TEST_PG` 仍读取） (CI's `test-postgres` job sets it) plus optional
 // `PGHOST` / `PGPORT` / `PGUSER` / `PGPASSWORD` / `PGDATABASE`.
 //
 // The SQLite path above proves the algorithm; this proves the dialect string
@@ -348,7 +348,7 @@ test "SqlLock rejects unsafe table identifiers" {
 // on the server.
 test "SqlLock claims and reaps locks on a real PostgreSQL" {
     const allocator = std.testing.allocator;
-    const enabled = std.c.getenv("ZIGMODU_TEST_PG") orelse return error.SkipZigTest;
+    const enabled = std.c.getenv("ZMODU_TEST_PG") orelse std.c.getenv("ZIGMODU_TEST_PG") orelse return error.SkipZigTest;
     if (std.mem.eql(u8, std.mem.span(enabled), "0")) return error.SkipZigTest;
 
     const envVar = struct {

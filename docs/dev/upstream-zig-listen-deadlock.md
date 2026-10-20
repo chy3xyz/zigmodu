@@ -1,6 +1,6 @@
 # Upstream issue draft: `--listen=-` build-runner deadlock and fd-1 protocol desync (Zig 0.17.0)
 
-> Status: **draft** — not filed. Evidence collected while bringing ZigModu's CI
+> Status: **draft** — not filed. Evidence collected while bringing zmodu's CI
 > up on Zig 0.17.0 stable. Filed version should drop repo-specific paths.
 >
 > Related local artefacts: `scripts/zig-build-test-guarded.sh` (workaround),

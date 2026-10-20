@@ -6,7 +6,7 @@ const ArrayList = std.array_list.Managed;
 /// ║  DEPRECATED API                                                ║
 /// ║───────────────────────────────────────────────────────────────║
 /// ║  This API will be removed in a future version.                 ║
-/// ║  Please use: zigmodu.Application.init(...)                     ║
+/// ║  Please use: zmodu.Application.init(...)                     ║
 /// ╚═══════════════════════════════════════════════════════════════╝
 ///
 /// Simplified Module interface using VTable pattern
@@ -57,7 +57,7 @@ pub const Module = struct {
     }
 };
 
-/// DEPRECATED: Use zigmodu.Application instead
+/// DEPRECATED: Use zmodu.Application instead
 /// Auto-generate Module interface from implementation struct
 ///
 /// This API is deprecated and will be removed in a future version.
@@ -129,7 +129,7 @@ pub fn ModuleImpl(comptime T: type) type {
 /// ║  DEPRECATED API                                                ║
 /// ║───────────────────────────────────────────────────────────────║
 /// ║  This API will be removed in a future version.                 ║
-/// ║  Please use: zigmodu.Application.init(...)                     ║
+/// ║  Please use: zmodu.Application.init(...)                     ║
 /// ╚═══════════════════════════════════════════════════════════════╝
 ///
 /// Simplified Application container

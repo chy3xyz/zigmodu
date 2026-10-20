@@ -1,5 +1,5 @@
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 // ============================================
 // Example 2: Event-Driven Architecture
@@ -16,14 +16,14 @@ const OrderCreated = struct {
 
 // 订单模块 - 发布事件
 const OrderModule = struct {
-    pub const info = zigmodu.api.Module{
+    pub const info = zmodu.api.Module{
         .name = "order",
         .description = "Manages orders and publishes events",
         .dependencies = &.{},
     };
 
     // 事件总线将在启动时注入
-    var event_bus: ?*zigmodu.TypedEventBus(OrderCreated) = null;
+    var event_bus: ?*zmodu.TypedEventBus(OrderCreated) = null;
 
     pub fn init() !void {
         std.log.info("[order] Order module initialized", .{});
@@ -33,7 +33,7 @@ const OrderModule = struct {
         std.log.info("[order] Order module shut down", .{});
     }
 
-    pub fn setEventBus(bus: *zigmodu.TypedEventBus(OrderCreated)) void {
+    pub fn setEventBus(bus: *zmodu.TypedEventBus(OrderCreated)) void {
         event_bus = bus;
     }
 
@@ -59,7 +59,7 @@ const OrderModule = struct {
 
 // 库存模块 - 订阅订单事件
 const InventoryModule = struct {
-    pub const info = zigmodu.api.Module{
+    pub const info = zmodu.api.Module{
         .name = "inventory",
         .description = "Manages inventory and reacts to order events",
         .dependencies = &.{},
@@ -85,7 +85,7 @@ const InventoryModule = struct {
 
 // 支付模块 - 订阅订单事件
 const PaymentModule = struct {
-    pub const info = zigmodu.api.Module{
+    pub const info = zmodu.api.Module{
         .name = "payment",
         .description = "Processes payments when orders are created",
         .dependencies = &.{},
@@ -112,7 +112,7 @@ const PaymentModule = struct {
 
 // 通知模块 - 订阅多个事件
 const NotificationModule = struct {
-    pub const info = zigmodu.api.Module{
+    pub const info = zmodu.api.Module{
         .name = "notification",
         .description = "Sends notifications based on events",
         .dependencies = &.{},
@@ -134,11 +134,11 @@ const NotificationModule = struct {
 pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.page_allocator;
 
-    std.log.info("=== ZigModu Event-Driven Example ===", .{});
+    std.log.info("=== zmodu Event-Driven Example ===", .{});
     std.log.info("Demonstrates: EventBus, publish-subscribe pattern\n", .{});
 
     // 创建事件总线
-    var order_event_bus = zigmodu.TypedEventBus(OrderCreated).init(allocator);
+    var order_event_bus = zmodu.TypedEventBus(OrderCreated).init(allocator);
     defer order_event_bus.deinit();
 
     // 订阅事件处理器
@@ -152,7 +152,7 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("  - NotificationModule.onOrderCreated\n", .{});
 
     // 创建应用
-    var app = try zigmodu.Application.init(
+    var app = try zmodu.Application.init(
         init.io,
         allocator,
         "event-driven-shop",

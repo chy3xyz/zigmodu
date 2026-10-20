@@ -1,11 +1,11 @@
 //! HTTP domain: server, middleware, client, OpenAPI, utilities.
-//! Import directly: `const http = @import("zigmodu").http;`
+//! Import directly: `const http = @import("zmodu").http;`
 //!
 //! Canonical types (use these):
 //!   http.Server, http.Context, http.Middleware, http.Route
 //!
 //! Deprecated: `http.http_server` — same module as above; removed from root in v0.14.0.
-//!   Prefer `http.Server` over `http.http_server.Server` or `zigmodu.http_server.Server`.
+//!   Prefer `http.Server` over `http.http_server.Server` or `zmodu.http_server.Server`.
 
 const std = @import("std");
 

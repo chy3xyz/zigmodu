@@ -2,7 +2,7 @@ const std = @import("std");
 const ApplicationModules = @import("./Module.zig").ApplicationModules;
 const ModuleInfo = @import("./Module.zig").ModuleInfo;
 const ModuleContext = @import("ModuleContext.zig").ModuleContext;
-const ZigModuError = @import("./Error.zig").ZigModuError;
+const ZmoduError = @import("./Error.zig").ZmoduError;
 
 /// Classic startup path (no framework facilities handed to modules).
 pub fn startAll(modules: *ApplicationModules) !void {
@@ -44,13 +44,13 @@ pub fn startAllWith(modules: *ApplicationModules, ctx: ?*ModuleContext) !void {
                 if (module.init_fn) |init| {
                     init(module.ptr) catch |err| {
                         std.log.err("Failed to start module '{s}': {s}", .{ module_name, @errorName(err) });
-                        return ZigModuError.ModuleInitializationFailed;
+                        return ZmoduError.ModuleInitializationFailed;
                     };
                     started_count = idx + 1;
                     continue;
                 }
                 std.log.warn("Module '{s}' declares only initWith(ctx) but no ModuleContext was provided", .{module_name});
-                return ZigModuError.ModuleInitializationFailed;
+                return ZmoduError.ModuleInitializationFailed;
             };
             // A per-module copy: `ctx.state()` keys on `module_name`, and a
             // module must not be able to read another module's slot by
@@ -60,12 +60,12 @@ pub fn startAllWith(modules: *ApplicationModules, ctx: ?*ModuleContext) !void {
             module_ctx.module_name = module_name;
             init_ctx(module.ptr, &module_ctx) catch |err| {
                 std.log.err("Failed to start module '{s}': {s}", .{ module_name, @errorName(err) });
-                return ZigModuError.ModuleInitializationFailed;
+                return ZmoduError.ModuleInitializationFailed;
             };
         } else if (module.init_fn) |init| {
             init(module.ptr) catch |err| {
                 std.log.err("Failed to start module '{s}': {s}", .{ module_name, @errorName(err) });
-                return ZigModuError.ModuleInitializationFailed;
+                return ZmoduError.ModuleInitializationFailed;
             };
         }
         started_count = idx + 1;
@@ -146,7 +146,7 @@ fn visitModule(
 ) !void {
     if (temp_mark.contains(module_name)) {
         std.log.warn("Circular dependency detected: {s}", .{module_name});
-        return ZigModuError.CircularDependency;
+        return ZmoduError.CircularDependency;
     }
 
     if (visited.contains(module_name)) {
@@ -394,5 +394,5 @@ test "initWith-only module fails to start without a context" {
     var scanned = try @import("ModuleScanner.zig").scanModules(allocator, .{OnlyCtx});
     defer scanned.deinit();
 
-    try std.testing.expectError(ZigModuError.ModuleInitializationFailed, startAll(&scanned));
+    try std.testing.expectError(ZmoduError.ModuleInitializationFailed, startAll(&scanned));
 }

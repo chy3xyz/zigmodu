@@ -1,10 +1,10 @@
-# ZigModu Quick Start
+# zmodu Quick Start
 
-Get up and running with ZigModu in 5 minutes.
+Get up and running with zmodu in 5 minutes.
 
 ## Prerequisites
 
-ZigModu tracks Zig's **development** API (`std.process.Init`, `std.Io.Mutex`,
+zmodu tracks Zig's **development** API (`std.process.Init`, `std.Io.Mutex`,
 …), so a stable Zig release will not compile it. Install the exact dev build
 CI pins:
 
@@ -30,11 +30,11 @@ Create a new file `src/modules/user.zig`:
 
 ```zig
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 // `pub` matters: `main.zig` refers to it as `user.UserModule`.
 pub const UserModule = struct {
-    pub const info = zigmodu.api.Module{
+    pub const info = zmodu.api.Module{
         .name = "user",
         .description = "User management module",
         .dependencies = &.{},  // No dependencies
@@ -56,7 +56,7 @@ Create `src/main.zig`:
 
 ```zig
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 // Import your modules
 const user = @import("modules/user.zig");
@@ -66,19 +66,19 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     // Scan and register modules
-    var modules = try zigmodu.scanModules(allocator, .{user.UserModule});
+    var modules = try zmodu.scanModules(allocator, .{user.UserModule});
     defer modules.deinit();
 
     // Validate dependencies
-    try zigmodu.validateModules(&modules);
+    try zmodu.validateModules(&modules);
 
     // Generate documentation (optional)
-    try zigmodu.generateDocs(&modules, "modules.puml", allocator, io);
+    try zmodu.generateDocs(&modules, "modules.puml", allocator, io);
 
     // Build the application. Bind the builder first: its methods take `*Self`,
     // and a function-call temporary materialises as `*const` — so the chained
-    // one-liner `zigmodu.builder(…).build(…)` does not compile.
-    var b = zigmodu.builder(allocator, io);
+    // one-liner `zmodu.builder(…).build(…)` does not compile.
+    var b = zmodu.builder(allocator, io);
     defer b.deinit();
     var app = try b.build(.{user.UserModule});
     defer app.deinit();
@@ -104,9 +104,9 @@ placeholder `.fingerprint` and prints the exact value to paste in:
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         // Local checkout (what examples/basic uses — no `.hash` needed):
-        .zigmodu = .{ .path = "../zigmodu" },
+        .zmodu = .{ .path = "../zmodu" },
         // …or a tagged release; `zig fetch --save <url>` fills in `.hash`:
-        // .zigmodu = .{ .url = "git+https://github.com/chy3xyz/zigmodu?ref=v0.25.0" },
+        // .zmodu = .{ .url = "git+https://github.com/chy3xyz/zmodu?ref=v0.25.0" },
     },
     .paths = .{
         "build.zig",
@@ -129,7 +129,7 @@ pub fn build(b: *std.Build) void {
     // Which SQL drivers to link (default: sqlite only). `-Ddb=` overrides.
     const db_opt = b.option([]const u8, "db", "SQL drivers to link: all|sqlite|postgres|mysql (comma-list)") orelse "sqlite";
 
-    const zigmodu_dep = b.dependency("zigmodu", .{
+    const zmodu_dep = b.dependency("zmodu", .{
         .target = target,
         .optimize = optimize,
         .db = db_opt,
@@ -140,7 +140,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    exe_mod.addImport("zigmodu", zigmodu_dep.module("zigmodu"));
+    exe_mod.addImport("zmodu", zmodu_dep.module("zmodu"));
 
     const exe = b.addExecutable(.{
         .name = "myapp",
@@ -190,18 +190,18 @@ Fragment — `server` / `allocator` come from your own `main` (runnable wiring:
 
 ```zig
 // 1) one call: backpressure + security middleware + /metrics + /health/*
-var profile = zigmodu.http.ProductionProfileState.init(allocator);
+var profile = zmodu.http.ProductionProfileState.init(allocator);
 defer profile.deinit(allocator);
-try zigmodu.http.productionProfile(&server, .{
+try zmodu.http.productionProfile(&server, .{
     .max_connections = 4096,
     .header_timeout_ms = 10_000,
 }, &profile);            // ⚠️ before router.mountAll / server.addRoute
 
 // 2) panic attribution (root file)
-pub const panic = zigmodu.panicHook;
+pub const panic = zmodu.panicHook;
 ```
 
-3. Refuse to boot when misconfigured — `zigmodu.Preflight.run(...)`
+3. Refuse to boot when misconfigured — `zmodu.Preflight.run(...)`
    checks required env, placeholder JWT secrets, DB reachability, pending
    migrations and clock skew (see `docs/BEST_PRACTICES.md`「上线前预检」).
 4. TLS terminates at a sidecar/gateway — reference topology in

@@ -1,9 +1,9 @@
-//! Typed error handling — ZigModuError, ErrorContext, Result(T), HttpCode mapping.
+//! Typed error handling — ZmoduError, ErrorContext, Result(T), HttpCode mapping.
 
 const std = @import("std");
 const Time = @import("Time.zig");
 
-/// ZigModu unified error type — the framework's shared error vocabulary.
+/// zmodu unified error type — the framework's shared error vocabulary.
 ///
 /// This is a taxonomy, not a hot-path error set. Only the members whose doc says
 /// "Produced by" are actually returned by shipped framework code today; the rest
@@ -13,7 +13,7 @@ const Time = @import("Time.zig");
 /// Caller guidance: match the members you can really receive and keep an `else`
 /// arm — this set grows additively, and `toHttpCode` already folds everything
 /// unmapped into 500.
-pub const ZigModuError = error{
+pub const ZmoduError = error{
     // Module errors
     /// No module is registered under that name. Produced by `src/core/ModuleValidator.zig`. → 404.
     ModuleNotFound,
@@ -224,13 +224,13 @@ pub const ZigModuError = error{
 
 /// Error context
 pub const ErrorContext = struct {
-    error_code: ZigModuError,
+    error_code: ZmoduError,
     message: []const u8,
     source: ?[]const u8,
     timestamp: i64,
     stack_trace: ?[]const u8,
 
-    pub fn init(error_code: ZigModuError, message: []const u8) ErrorContext {
+    pub fn init(error_code: ZmoduError, message: []const u8) ErrorContext {
         return .{
             .error_code = error_code,
             .message = message,
@@ -249,7 +249,7 @@ pub const ErrorHandler = struct {
     handlers: std.ArrayList(HandlerEntry),
 
     const HandlerEntry = struct {
-        error_code: ZigModuError,
+        error_code: ZmoduError,
         handler: *const fn (ErrorContext) void,
     };
 
@@ -265,7 +265,7 @@ pub const ErrorHandler = struct {
         self.* = undefined;
     }
 
-    pub fn register(self: *Self, error_code: ZigModuError, handler: *const fn (ErrorContext) void) !void {
+    pub fn register(self: *Self, error_code: ZmoduError, handler: *const fn (ErrorContext) void) !void {
         try self.handlers.append(self.allocator, .{
             .error_code = error_code,
             .handler = handler,
@@ -317,12 +317,12 @@ pub fn Result(T: type) type {
 /// Error conversion helper
 pub fn toErrorContext(err: anyerror, message: []const u8) ErrorContext {
     const code = switch (err) {
-        error.OutOfMemory => ZigModuError.OutOfMemory,
-        error.FileNotFound => ZigModuError.ConfigFileNotFound,
-        error.ConnectionRefused => ZigModuError.ConnectionRefused,
-        error.ConnectionTimedOut => ZigModuError.ConnectionTimeout,
-        error.DriverNotEnabled => ZigModuError.DriverNotEnabled,
-        else => ZigModuError.UnknownError,
+        error.OutOfMemory => ZmoduError.OutOfMemory,
+        error.FileNotFound => ZmoduError.ConfigFileNotFound,
+        error.ConnectionRefused => ZmoduError.ConnectionRefused,
+        error.ConnectionTimedOut => ZmoduError.ConnectionTimeout,
+        error.DriverNotEnabled => ZmoduError.DriverNotEnabled,
+        else => ZmoduError.UnknownError,
     };
 
     return ErrorContext.init(code, message);
@@ -341,8 +341,8 @@ pub const HttpCode = enum(i32) {
     ServiceUnavailable = 503,
 };
 
-/// Map ZigModuError to HttpCode
-pub fn toHttpCode(err: ZigModuError) HttpCode {
+/// Map ZmoduError to HttpCode
+pub fn toHttpCode(err: ZmoduError) HttpCode {
     return switch (err) {
         error.ModuleNotFound, error.DependencyNotFound, error.CacheKeyNotFound, error.NotFound, error.ServiceNotFound, error.EventHandlerNotFound, error.ConfigFileNotFound => .NotFound,
 
@@ -380,8 +380,8 @@ pub fn toJson(allocator: std.mem.Allocator, err: ErrorResponse) ![]u8 {
     }
 }
 
-/// Convenience: create JSON from ZigModuError + message
-pub fn fromError(allocator: std.mem.Allocator, err: ZigModuError, message: []const u8) ![]u8 {
+/// Convenience: create JSON from ZmoduError + message
+pub fn fromError(allocator: std.mem.Allocator, err: ZmoduError, message: []const u8) ![]u8 {
     const resp = ErrorResponse{
         .code = @backingInt(toHttpCode(err)),
         .message = message,
@@ -392,7 +392,7 @@ pub fn fromError(allocator: std.mem.Allocator, err: ZigModuError, message: []con
 test "ErrorContext has real timestamp" {
     const ctx = ErrorContext.init(error.ModuleNotFound, "test");
     try std.testing.expect(ctx.timestamp > 0);
-    try std.testing.expectEqual(ZigModuError.ModuleNotFound, ctx.error_code);
+    try std.testing.expectEqual(ZmoduError.ModuleNotFound, ctx.error_code);
     try std.testing.expectEqualStrings("test", ctx.message);
 }
 
@@ -425,7 +425,7 @@ test "Result type ok and err" {
     const err_result = R{ .err = ErrorContext.init(error.ValidationFailed, "bad input") };
     try std.testing.expect(err_result.isErr());
     try std.testing.expect(!err_result.isOk());
-    try std.testing.expectEqual(ZigModuError.ValidationFailed, err_result.unwrapErr().error_code);
+    try std.testing.expectEqual(ZmoduError.ValidationFailed, err_result.unwrapErr().error_code);
 }
 
 test "toHttpCode mapping" {
@@ -458,6 +458,6 @@ test "fromError convenience" {
 
 test "toErrorContext maps known errors" {
     const ctx = toErrorContext(error.OutOfMemory, "allocation failed");
-    try std.testing.expectEqual(ZigModuError.OutOfMemory, ctx.error_code);
+    try std.testing.expectEqual(ZmoduError.OutOfMemory, ctx.error_code);
     try std.testing.expectEqualStrings("allocation failed", ctx.message);
 }

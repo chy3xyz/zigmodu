@@ -1,6 +1,6 @@
 //! Shared outbox INSERT for use inside a DB transaction.
-const zigmodu = @import("zigmodu");
-const data = zigmodu.data;
+const zmodu = @import("zmodu");
+const data = zmodu.data;
 
 /// Insert a pending outbox row (retry_count=0, max_retries=3).
 pub fn insertPending(

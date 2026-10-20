@@ -1,4 +1,4 @@
-const api = @import("zigmodu").api;
+const api = @import("zmodu").api;
 const std = @import("std");
 
 pub const info = api.Module{

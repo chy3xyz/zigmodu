@@ -1,4 +1,4 @@
-# ZigModu v0.7.0 — 产品级评估报告 v2
+# zmodu v0.7.0 — 产品级评估报告 v2
 
 **评估时间**: 2026-04-23T18:55 (CST)
 **框架版本**: v0.7.0 (commit `6ad0fa0`)
@@ -55,16 +55,16 @@
 
 | 文件 | 行号 | 上下文 | 严重度 |
 |------|------|--------|--------|
-| [StructuredLogger.zig](file:///Users/n0x/w4_proj/zig_ws/zigmodu/src/log/StructuredLogger.zig#L72) | 72 | 日志条目 timestamp | 🟡 中 — 影响日志可搜索性 |
-| [HealthEndpoint.zig](file:///Users/n0x/w4_proj/zig_ws/zigmodu/src/core/HealthEndpoint.zig#L94) | 94 | 健康检查响应 | 🟡 中 — 影响运维监控 |
-| [EventStore.zig](file:///Users/n0x/w4_proj/zig_ws/zigmodu/src/core/EventStore.zig#L70) | 70, 182 | 事件存储/快照 | 🟡 中 — 影响事件溯源排序 |
-| [EventLogger.zig](file:///Users/n0x/w4_proj/zig_ws/zigmodu/src/core/EventLogger.zig#L44) | 44 | 事件日志 | 🟡 中 — 影响审计追踪 |
-| [DistributedEventBus.zig](file:///Users/n0x/w4_proj/zig_ws/zigmodu/src/core/DistributedEventBus.zig#L138) | 138, 227 | 心跳/网络事件 | 🟢 低 — 仅网络层 |
-| [TransactionalEvent.zig](file:///Users/n0x/w4_proj/zig_ws/zigmodu/src/core/TransactionalEvent.zig#L152) | 152 | Outbox 条目 | 🟡 中 — 影响 Outbox 排序 |
-| [HotReloader.zig](file:///Users/n0x/w4_proj/zig_ws/zigmodu/src/core/HotReloader.zig#L248) | 248, 254 | 模块快照版本 | 🟢 低 |
-| [ClusterMembership.zig](file:///Users/n0x/w4_proj/zig_ws/zigmodu/src/core/ClusterMembership.zig#L466) | 466, 490 | 测试代码 | 🟢 低 — 仅测试 |
-| [MessageQueue.zig](file:///Users/n0x/w4_proj/zig_ws/zigmodu/src/messaging/MessageQueue.zig#L137) | 137, 169 | 测试代码 | 🟢 低 — 仅测试 |
-| [DistributedIntegrationTest.zig](file:///Users/n0x/w4_proj/zig_ws/zigmodu/src/core/cluster/DistributedIntegrationTest.zig#L87) | 87, 126, 274, 302, 313 | 测试代码 | 🟢 低 — 仅测试 |
+| [StructuredLogger.zig](file:///Users/n0x/w4_proj/zig_ws/zmodu/src/log/StructuredLogger.zig#L72) | 72 | 日志条目 timestamp | 🟡 中 — 影响日志可搜索性 |
+| [HealthEndpoint.zig](file:///Users/n0x/w4_proj/zig_ws/zmodu/src/core/HealthEndpoint.zig#L94) | 94 | 健康检查响应 | 🟡 中 — 影响运维监控 |
+| [EventStore.zig](file:///Users/n0x/w4_proj/zig_ws/zmodu/src/core/EventStore.zig#L70) | 70, 182 | 事件存储/快照 | 🟡 中 — 影响事件溯源排序 |
+| [EventLogger.zig](file:///Users/n0x/w4_proj/zig_ws/zmodu/src/core/EventLogger.zig#L44) | 44 | 事件日志 | 🟡 中 — 影响审计追踪 |
+| [DistributedEventBus.zig](file:///Users/n0x/w4_proj/zig_ws/zmodu/src/core/DistributedEventBus.zig#L138) | 138, 227 | 心跳/网络事件 | 🟢 低 — 仅网络层 |
+| [TransactionalEvent.zig](file:///Users/n0x/w4_proj/zig_ws/zmodu/src/core/TransactionalEvent.zig#L152) | 152 | Outbox 条目 | 🟡 中 — 影响 Outbox 排序 |
+| [HotReloader.zig](file:///Users/n0x/w4_proj/zig_ws/zmodu/src/core/HotReloader.zig#L248) | 248, 254 | 模块快照版本 | 🟢 低 |
+| [ClusterMembership.zig](file:///Users/n0x/w4_proj/zig_ws/zmodu/src/core/ClusterMembership.zig#L466) | 466, 490 | 测试代码 | 🟢 低 — 仅测试 |
+| [MessageQueue.zig](file:///Users/n0x/w4_proj/zig_ws/zmodu/src/messaging/MessageQueue.zig#L137) | 137, 169 | 测试代码 | 🟢 低 — 仅测试 |
+| [DistributedIntegrationTest.zig](file:///Users/n0x/w4_proj/zig_ws/zmodu/src/core/cluster/DistributedIntegrationTest.zig#L87) | 87, 126, 274, 302, 313 | 测试代码 | 🟢 低 — 仅测试 |
 
 **修复策略**: 生产代码中的 7 处应该改用 `Time.monotonicNowSeconds()`。测试代码中的 8 处可以保留 `0`（测试不依赖时间准确性）。
 
@@ -72,8 +72,8 @@
 
 | 文件 | 行 | 问题 |
 |------|-----|------|
-| [StructuredLogger.zig](file:///Users/n0x/w4_proj/zig_ws/zigmodu/src/log/StructuredLogger.zig#L164) | 164, 183 | `LogRotator.deinit()` 和 `rotate()` 硬编码 `std.testing.io` |
-| [StructuredLogger.zig](file:///Users/n0x/w4_proj/zig_ws/zigmodu/src/log/StructuredLogger.zig#L206) | 206 | `createFile` 调用缺少 `io` 参数（仅 1 参数） |
+| [StructuredLogger.zig](file:///Users/n0x/w4_proj/zig_ws/zmodu/src/log/StructuredLogger.zig#L164) | 164, 183 | `LogRotator.deinit()` 和 `rotate()` 硬编码 `std.testing.io` |
+| [StructuredLogger.zig](file:///Users/n0x/w4_proj/zig_ws/zmodu/src/log/StructuredLogger.zig#L206) | 206 | `createFile` 调用缺少 `io` 参数（仅 1 参数） |
 
 **影响**: LogRotator 在非测试环境无法使用，需要像 StructuredLogger 一样接受 `io: std.Io` 参数。
 
@@ -81,14 +81,14 @@
 
 | 文件 | 行 | 问题 |
 |------|-----|------|
-| [ModuleBoundary.zig](file:///Users/n0x/w4_proj/zig_ws/zigmodu/src/core/ModuleBoundary.zig#L166) | 166 | `.ptr = undefined` — 应该用新的 3 参数 `ModuleInfo.init()` |
+| [ModuleBoundary.zig](file:///Users/n0x/w4_proj/zig_ws/zmodu/src/core/ModuleBoundary.zig#L166) | 166 | `.ptr = undefined` — 应该用新的 3 参数 `ModuleInfo.init()` |
 
 ### P4: EventLogger 全局状态
 
 | 文件 | 行 | 问题 |
 |------|-----|------|
-| [EventLogger.zig](file:///Users/n0x/w4_proj/zig_ws/zigmodu/src/core/EventLogger.zig#L20) | 20 | `var event_id_counter: u64 = 1` — 全局可变状态，多实例共享 |
-| [EventLogger.zig](file:///Users/n0x/w4_proj/zig_ws/zigmodu/src/core/EventLogger.zig#L114) | 114 | `generateCorrelationId` 使用 `const id = 0` 硬编码 |
+| [EventLogger.zig](file:///Users/n0x/w4_proj/zig_ws/zmodu/src/core/EventLogger.zig#L20) | 20 | `var event_id_counter: u64 = 1` — 全局可变状态，多实例共享 |
+| [EventLogger.zig](file:///Users/n0x/w4_proj/zig_ws/zmodu/src/core/EventLogger.zig#L114) | 114 | `generateCorrelationId` 使用 `const id = 0` 硬编码 |
 
 ---
 
@@ -206,7 +206,7 @@ root.zig
 
 ## 💡 总结
 
-**ZigModu v0.7.0 已达到高产品级可用状态 (86/100)**。
+**zmodu v0.7.0 已达到高产品级可用状态 (86/100)**。
 
 - **核心模块** (Module/Lifecycle/DI/EventBus/Application) — **生产级就绪**
 - **数据层** (SQLx/Redis/ORM/Cache) — **生产级就绪** (SQLite 完整验证)

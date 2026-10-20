@@ -1,4 +1,4 @@
-# ZigModu v0.40.0
+# zmodu v0.40.0
 
 **编译期模块化应用框架 + worker 导向的执行运行时**，为 Zig **0.17.0** 打造。
 
@@ -19,8 +19,8 @@ comptime 轨道类型、手写队列、热路径上的分配是被**测试钉住
 
 [![Zig](https://img.shields.io/badge/Zig-0.17+-orange?style=flat-square)](https://ziglang.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/github/v/release/chy3xyz/zigmodu?style=flat-square)]()
-[![CI](https://github.com/chy3xyz/zigmodu/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/chy3xyz/zigmodu/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/github/v/release/chy3xyz/zmodu?style=flat-square)]()
+[![CI](https://github.com/chy3xyz/zmodu/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/chy3xyz/zmodu/actions/workflows/ci.yml)
 
 [English](README.md) | 中文
 
@@ -35,7 +35,7 @@ comptime 轨道类型、手写队列、热路径上的分配是被**测试钉住
 | [最佳实践](docs/guide/BEST_PRACTICES.md) | **两条平面**：架构演进、JWT / 多端身份清单、执行平面何时该上 |
 | [事件与 DI](docs/guide/EVENTS_DI.md) | `initWith(ctx)` + `app.eventBus` + 容器 freeze 最佳实践 |
 | [声明式路由](docs/reference/ROUTE_TABLE.md) | ComptimeRouter + catalog JWT/RBAC |
-| [ZigModu × zent](docs/reference/ZENT.md) | **电商/社交主推组合**：zent ORM 正交接入与最佳实践 |
+| [zmodu × zent](docs/reference/ZENT.md) | **电商/社交主推组合**：zent ORM 正交接入与最佳实践 |
 | [SQLx 驱动链接](docs/guide/SQLX_DRIVERS.md) | `-Ddb=` / `.db=` 选择性链接 |
 | [分布式](docs/reference/DISTRIBUTED.md) | 多实例、集群栈、fail-closed 启动 |
 | [Agent 运行时](docs/reference/AGENT_RUNTIME.md) | **Agent 默认不能直接交易**：`Guard` 两条轴 fail-closed（`execute` 二次开关 + `allow` 默认空） |
@@ -54,7 +54,7 @@ comptime 轨道类型、手写队列、热路径上的分配是被**测试钉住
 - **依赖验证** - 编译期依赖检查（缺失依赖、自依赖、环依赖都在启动时被拦）
 - **生命周期管理** - 自动初始化/清理；模块可声明 `initWith(ctx)` 接收框架设施
 - **依赖注入** - Application 内置类型安全容器：启动期注册（`withService` / 借用注册），`start()` 后 freeze，运行期无锁只读
-- **事件驱动** - Application 级 `EventRegistry` 只发放线程安全的按类型总线（`app.eventBus(T)`）；另含 Outbox（`zigmodu.outbox.*`）
+- **事件驱动** - Application 级 `EventRegistry` 只发放线程安全的按类型总线（`app.eventBus(T)`）；另含 Outbox（`zmodu.outbox.*`）
 
 **数据 / 传输 / 可观测 / 安全**
 - **数据** - SQLx（PG / MySQL / SQLite，选择性链接）、ORM Repository、Flyway 风格迁移、缓存、Redis、连接池
@@ -120,7 +120,7 @@ comptime 轨道类型、手写队列、热路径上的分配是被**测试钉住
 | 全量套件（`-Ddb=all`） | 8 个 artifact、2000+ 条测试 | `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test` |
 | **分配契约** | mailbox / ring / HotBus / `send` / 定时器热路径**精确 0 分配** | `src/runtime/alloc_contract_test.zig` |
 | 生产门禁 | 热路径无裸 `catch {}`、CSPRNG 来源、fuzz 声明与树一致 | `zig build check` |
-| API 门禁 | 示例必须走 `zigmodu.http` 规范入口 | `zig build check-api` |
+| API 门禁 | 示例必须走 `zmodu.http` 规范入口 | `zig build check-api` |
 | 死代码 ratchet | `src`+`tools` 基线 32（30 + 2）、`examples` 基线 0 | `bash scripts/check-deadcode.sh` |
 | 性能 ratchet | 32 条指标对 CI 基线 + 32 条分配预算 | `bash scripts/check-bench.sh` |
 | Soak（HTTP + 租户） | 跨租户泄漏、FrozenMap 并发、fd/slot 增长 | `zig build soak` |
@@ -142,9 +142,9 @@ comptime 轨道类型、手写队列、热路径上的分配是被**测试钉住
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         // 本地检出（examples/basic 就是这么写的，不需要 `.hash`）：
-        .zigmodu = .{ .path = "../zigmodu" },
+        .zmodu = .{ .path = "../zmodu" },
         // ……或用 tag 发布版；`.hash` 交给 `zig fetch --save <url>` 生成：
-        // .zigmodu = .{ .url = "git+https://github.com/chy3xyz/zigmodu?ref=v0.25.0" },
+        // .zmodu = .{ .url = "git+https://github.com/chy3xyz/zmodu?ref=v0.25.0" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }
@@ -153,7 +153,7 @@ comptime 轨道类型、手写队列、热路径上的分配是被**测试钉住
 再按实际用到的驱动收窄链接（依赖侧默认 `all`，会链三库）：
 
 ```zig
-const zigmodu_dep = b.dependency("zigmodu", .{
+const zigmodu_dep = b.dependency("zmodu", .{
     .target = target,
     .optimize = optimize,
     .db = db_opt, // 或 postgres | mysql | "sqlite,postgres" | all
@@ -187,11 +187,11 @@ zigup 0.17.0
 ```zig
 // src/modules/user.zig
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 // `pub` 是必须的：main.zig 里通过 `user.UserModule` 引用它。
 pub const UserModule = struct {
-    pub const info = zigmodu.api.Module{
+    pub const info = zmodu.api.Module{
         .name = "user",
         .description = "用户管理模块",
         .dependencies = &.{},
@@ -212,19 +212,19 @@ pub const UserModule = struct {
 ```zig
 // src/main.zig
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 const user = @import("modules/user.zig");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
-    var modules = try zigmodu.scanModules(allocator, .{user.UserModule});
+    var modules = try zmodu.scanModules(allocator, .{user.UserModule});
     defer modules.deinit();
 
-    try zigmodu.validateModules(&modules);
-    try zigmodu.startAll(&modules);
-    defer zigmodu.stopAll(&modules);
+    try zmodu.validateModules(&modules);
+    try zmodu.startAll(&modules);
+    defer zmodu.stopAll(&modules);
 
     std.log.info("应用启动成功！", .{});
 }
@@ -269,7 +269,7 @@ zig build run
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    ZigModu 应用                          │
+│                    zmodu 应用                          │
 │  ┌─────────────────────────────────────────────────────┐ │
 │  │                 模块系统                             │ │
 │  │  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐  │ │
@@ -290,7 +290,7 @@ zig build run
 ## 📁 项目结构
 
 ```
-zigmodu/
+zmodu/
 ├── src/
 │   ├── core/           # 核心框架
 │   │   ├── Module.zig
@@ -323,7 +323,7 @@ zigmodu/
 
 ## 🎯 渐进式演进
 
-ZigModu 沿**两条正交的轴**成长 —— 可以在一条上走而不动另一条，且两条都不需要拆服务：
+zmodu 沿**两条正交的轴**成长 —— 可以在一条上走而不动另一条，且两条都不需要拆服务：
 
 | 轴 | 阶段 | 你加什么 | 读哪份 |
 |----|------|----------|--------|
@@ -378,7 +378,7 @@ docker compose up -d
 欢迎贡献！先读 [CONTRIBUTING.md](CONTRIBUTING.md)；提交前把 CI 跑的东西跑一遍：
 
 ```bash
-git clone https://github.com/chy3xyz/zigmodu.git
+git clone https://github.com/chy3xyz/zmodu.git
 git checkout -b feature/my-feature
 ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test
 zig build check check-api && zig fmt --check src tools examples
@@ -392,4 +392,4 @@ MIT License - 查看 [LICENSE](LICENSE) 了解详情。
 
 - [Spring Modulith](https://github.com/spring-projects/spring-modulith) - 架构灵感
 - [Zig社区](https://ziglang.org/community/) - 语言生态
-- [贡献者](https://github.com/knot3bot/zigmodu/graphs/contributors) - 代码贡献
+- [贡献者](https://github.com/knot3bot/zmodu/graphs/contributors) - 代码贡献

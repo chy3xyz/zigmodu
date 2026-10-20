@@ -1,5 +1,5 @@
-const zigmodu = @import("zigmodu");
-const data = zigmodu.data;
+const zmodu = @import("zmodu");
+const data = zmodu.data;
 
 pub fn apply(client: *data.Client) !void {
     const ddl = [_][]const u8{
@@ -52,7 +52,7 @@ pub fn apply(client: *data.Client) !void {
     const existing = count_rows.rows[0].get("cnt").?.int;
     if (existing > 0) return;
 
-    const now: i64 = @intCast(zigmodu.time.monotonicNowSeconds());
+    const now: i64 = @intCast(zmodu.time.monotonicNowSeconds());
     const plans = [_]struct { name: []const u8, max_users: i32, max_storage: i64, price: f64 }{
         .{ .name = "free", .max_users = 5, .max_storage = 1_073_741_824, .price = 0 },
         .{ .name = "pro", .max_users = 50, .max_storage = 10_737_418_240, .price = 29.99 },

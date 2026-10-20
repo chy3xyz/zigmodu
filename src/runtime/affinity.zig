@@ -54,7 +54,7 @@
 //! of the same information.
 //!
 //! ```zig
-//! const runtime = @import("zigmodu").runtime;
+//! const runtime = @import("zmodu").runtime;
 //!
 //! // Linux: pins the *calling* thread. macOS/Windows: error.Unsupported.
 //! try runtime.pinCurrentThread(3);

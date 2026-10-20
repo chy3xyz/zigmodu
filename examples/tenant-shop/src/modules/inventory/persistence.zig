@@ -1,6 +1,6 @@
 const std = @import("std");
-const zigmodu = @import("zigmodu");
-const data = zigmodu.data;
+const zmodu = @import("zmodu");
+const data = zmodu.data;
 const model = @import("model.zig");
 
 pub fn InventoryPersistence(comptime Backend: type) type {

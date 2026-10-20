@@ -72,7 +72,7 @@
 ### 1. 模块化设计
 ```zig
 pub const AssetModule = struct {
-    pub const info = zigmodu.api.Module{
+    pub const info = zmodu.api.Module{
         .name = "asset",
         .dependencies = &.{"identity", "storage"},
     };
@@ -114,7 +114,7 @@ pub const AssetModule = struct {
 
 ```bash
 # 1. 进入目录
-cd /Users/cborli/ws_claws/zigmodu/examples/metaverse-creative
+cd /Users/cborli/ws_claws/zmodu/examples/metaverse-creative
 
 # 2. 运行演示
 zig build run
@@ -135,7 +135,7 @@ zig build run
 - ❌ 门槛高 → ✅ 资产组合创作
 
 ### 3. 技术实现
-- ZigModu 框架的实际应用
+- zmodu 框架的实际应用
 - 编译时安全的领域模型
 - 零成本抽象的事件系统
 - 清晰的模块依赖关系
@@ -191,7 +191,7 @@ zig build run
 ✅ **架构合理**：三层模块化设计
 ✅ **功能完整**：7个Phase完整流程
 ✅ **叙事生动**：创作者故事线
-✅ **技术先进**：ZigModu最佳实践
+✅ **技术先进**：zmodu最佳实践
 ✅ **商业可行**：多元变现模型
 
 这是一个**可直接运行、可扩展、可教学**的完整Demo！
@@ -199,6 +199,6 @@ zig build run
 ---
 
 **创建时间**: 2025-01-09
-**基于框架**: ZigModu v0.25.0
+**基于框架**: zmodu v0.25.0
 **完成度**: 100% (演示代码) / 80% (完整产品)
 **适用场景**: 教学演示 / 原型验证 / 架构参考

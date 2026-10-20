@@ -36,7 +36,7 @@ export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$ROOT/.zig-global-cache}"
 APP_PORT="${APP_PORT:-18290}"
 GW_PORT="${GW_PORT:-18291}"
 ENVOY_IMAGE="${ENVOY_IMAGE:-envoyproxy/envoy:v1.31.10}"
-PROJ="zigmodu-smuggle-envoy-$$"
+PROJ="zmodu-smuggle-envoy-$$"
 
 REQUIRE=0
 for arg in "$@"; do

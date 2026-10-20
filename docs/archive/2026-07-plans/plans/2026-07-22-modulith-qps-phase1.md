@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Introduce `ModuleRuntime` so every `zigmodu` module can own its own bulkhead, rate limiter, circuit breaker, and resource quota. This is the foundation for Modulith-scale QPS: failures and load spikes are contained inside the offending module instead of affecting the whole process.
+**Goal:** Introduce `ModuleRuntime` so every `zmodu` module can own its own bulkhead, rate limiter, circuit breaker, and resource quota. This is the foundation for Modulith-scale QPS: failures and load spikes are contained inside the offending module instead of affecting the whole process.
 
 **Architecture:** Extend `api.Module` with an optional `runtime` field. At application startup, `Application` builds a `ModuleRuntime` per module containing a `Bulkhead`, `RateLimiter`, and `CircuitBreaker` from the existing `resilience` package. Runtimes are stored in a new `core.ModuleRegistry` and are accessible by module name. The change is fully backward-compatible: modules without `runtime` continue to work exactly as before.
 

@@ -1,4 +1,4 @@
-//! Cluster peer discovery for ZigModu multi-node deployments.
+//! Cluster peer discovery for zmodu multi-node deployments.
 //!
 //! Supports:
 //! - Static peer list (simplest, most reliable)

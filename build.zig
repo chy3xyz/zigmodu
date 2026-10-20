@@ -23,17 +23,30 @@ pub fn build(b: *std.Build) void {
     db_link.addToOptions(build_options, features);
     const build_options_mod = build_options.createModule();
 
-    // Create and export the zigmodu module for dependent packages.
+    // Create and export the zmodu module for dependent packages.
     // Zig 0.17-dev.813: @cImport no longer implicitly links libc.
-    const zigmodu_mod = b.addModule("zigmodu", .{
+    const zmodu_mod = b.addModule("zmodu", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    zigmodu_mod.addImport("build_options", build_options_mod);
+    zmodu_mod.addImport("build_options", build_options_mod);
 
-    db_link.link(zigmodu_mod, b, target, features);
+    db_link.link(zmodu_mod, b, target, features);
+
+    // One-version compatibility: consumers that still write
+    // `dep.module("zigmodu")` / `@import("zigmodu")` keep compiling until
+    // v1.0. The canonical module is `zmodu`; this alias is intentionally
+    // identical (same root, same imports, same driver linkage).
+    const legacy_zmodu_mod = b.addModule("zigmodu", .{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    legacy_zmodu_mod.addImport("build_options", build_options_mod);
+    db_link.link(legacy_zmodu_mod, b, target, features);
 
     // Create example executable
     const exe_mod = b.createModule(.{
@@ -41,7 +54,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    exe_mod.addImport("zigmodu", zigmodu_mod);
+    exe_mod.addImport("zmodu", zmodu_mod);
 
     const exe = b.addExecutable(.{
         .name = "zigmodu-example",
@@ -196,7 +209,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    benchmark_mod.addImport("zigmodu", zigmodu_mod);
+    benchmark_mod.addImport("zmodu", zmodu_mod);
 
     const benchmark_exe = b.addExecutable(.{
         .name = "benchmark",
@@ -221,7 +234,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    docs_mod.addImport("zigmodu", zigmodu_mod);
+    docs_mod.addImport("zmodu", zmodu_mod);
 
     const docs_exe = b.addExecutable(.{
         .name = "docs",
@@ -295,7 +308,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    gen_jwt_mod.addImport("zigmodu", zigmodu_mod);
+    gen_jwt_mod.addImport("zmodu", zmodu_mod);
     const gen_jwt_exe = b.addExecutable(.{
         .name = "gen-jwt-token",
         .root_module = gen_jwt_mod,
@@ -399,7 +412,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    soak_mod.addImport("zigmodu", zigmodu_mod);
+    soak_mod.addImport("zmodu", zmodu_mod);
     soak_mod.addImport("build_options", soak_options_mod);
     db_link.link(soak_mod, b, target, features);
 
@@ -432,7 +445,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    soak_cluster_mod.addImport("zigmodu", zigmodu_mod);
+    soak_cluster_mod.addImport("zmodu", zmodu_mod);
     soak_cluster_mod.addImport("build_options", soak_cluster_options_mod);
     db_link.link(soak_cluster_mod, b, target, features);
 
@@ -461,7 +474,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    bench_http_mod.addImport("zigmodu", zigmodu_mod);
+    bench_http_mod.addImport("zmodu", zmodu_mod);
     // No `db_link`: this tool imports `zigmodu.http` only, so the SQL drivers
     // are never analyzed — linking them would make every `bench-http`
     // invocation pay a full Debug compile of three C drivers.
@@ -493,7 +506,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    cluster_node_mod.addImport("zigmodu", zigmodu_mod);
+    cluster_node_mod.addImport("zmodu", zmodu_mod);
     db_link.link(cluster_node_mod, b, target, features);
 
     const cluster_node_exe = b.addExecutable(.{
@@ -549,7 +562,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    stress_mod.addImport("zigmodu", zigmodu_mod);
+    stress_mod.addImport("zmodu", zmodu_mod);
     stress_mod.addImport("build_options", stress_options_mod);
     db_link.link(stress_mod, b, target, features);
 
@@ -611,7 +624,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    stress_smoke_mod.addImport("zigmodu", zigmodu_mod);
+    stress_smoke_mod.addImport("zmodu", zmodu_mod);
     stress_smoke_mod.addImport("build_options", stress_smoke_options_mod);
     db_link.link(stress_smoke_mod, b, target, features);
 
@@ -663,7 +676,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    soak_smoke_mod.addImport("zigmodu", zigmodu_mod);
+    soak_smoke_mod.addImport("zmodu", zmodu_mod);
     soak_smoke_mod.addImport("build_options", soak_smoke_options_mod);
     db_link.link(soak_smoke_mod, b, target, features);
 
@@ -695,7 +708,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    cluster_smoke_mod.addImport("zigmodu", zigmodu_mod);
+    cluster_smoke_mod.addImport("zmodu", zmodu_mod);
     cluster_smoke_mod.addImport("build_options", cluster_smoke_options_mod);
     db_link.link(cluster_smoke_mod, b, target, features);
 

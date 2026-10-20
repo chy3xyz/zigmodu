@@ -3,7 +3,7 @@
 //! Zig 0.17 `std.crypto.tls` exposes a **client** stack; there is no stdlib TLS
 //! server yet. Production HTTPS+h2 typically terminates TLS in a sidecar
 //! (nginx / Caddy / Envoy) with `alpn h2`, then forwards cleartext h2c or
-//! HTTP/1.1 to ZigModu.
+//! HTTP/1.1 to zmodu.
 //!
 //! This module documents the ALPN identity and provides a small config surface
 //! so apps can declare intent (`enable_alpn_h2`) without pretending server TLS
@@ -42,7 +42,7 @@ pub fn isHttp2Alpn(proto: []const u8) bool {
 /// Nginx / Caddy style snippet for operators (not executed).
 pub fn sidecarHint(allocator: std.mem.Allocator, listen_port: u16, backend_port: u16) ![]u8 {
     return allocator.print(
-        \\# Terminate TLS with ALPN h2, forward cleartext to ZigModu h2c/HTTP
+        \\# Terminate TLS with ALPN h2, forward cleartext to zmodu h2c/HTTP
         \\# listen {d} ssl http2;
         \\# proxy_pass http://127.0.0.1:{d};
     , .{ listen_port, backend_port });

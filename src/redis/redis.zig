@@ -1182,7 +1182,7 @@ test "redis concurrent incr" {
     defer redis.deinit();
     try redis.connect();
 
-    const key = "zigmodu_concurrent_incr_test";
+    const key = "zmodu_concurrent_incr_test";
     _ = redis.del(&[_][]const u8{key}) catch {};
 
     var threads: [threads_n]std.Thread = undefined;
@@ -1560,7 +1560,7 @@ test "redis concurrent incr on a single shared stream (pool_size = 1)" {
     defer r.deinit();
     try r.connect();
 
-    const key = "zigmodu:test:redis:single-stream";
+    const key = "zmodu:test:redis:single-stream";
     _ = r.del(&.{key}) catch {};
 
     const threads = try std.testing.allocator.alloc(std.Thread, threads_n);
@@ -1821,9 +1821,9 @@ test "redis: real server answers arrive as data (TTL -1, SETNX false)" {
     defer r.deinit();
     try r.connect();
 
-    const key = "zigmodu:test:redis:answers-are-data";
-    const lock_key = "zigmodu:test:redis:answers-are-data:lock";
-    const absent = "zigmodu:test:redis:definitely-absent";
+    const key = "zmodu:test:redis:answers-are-data";
+    const lock_key = "zmodu:test:redis:answers-are-data:lock";
+    const absent = "zmodu:test:redis:definitely-absent";
     _ = r.del(&.{ key, lock_key }) catch {};
 
     try r.set(key, "v", null);

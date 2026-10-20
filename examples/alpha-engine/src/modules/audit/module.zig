@@ -9,8 +9,8 @@
 //! Nothing here is on the critical path. `publish` never blocks, never
 //! allocates, and drops a full subscriber instead of waiting for it.
 
-const runtime = @import("zigmodu").runtime;
-const zmodu = @import("zigmodu");
+const runtime = @import("zmodu").runtime;
+const zmodu = @import("zmodu");
 const c = @import("../../contracts.zig");
 const api = @import("api.zig");
 const service = @import("service.zig");

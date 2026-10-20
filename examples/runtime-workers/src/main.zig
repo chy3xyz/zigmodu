@@ -42,7 +42,7 @@
 //! Run: `zig build run` (add `--summary all` to see the runtime stats table).
 
 const std = @import("std");
-const zmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 const runtime = zmodu.runtime;
 
 const Delta = struct { price: i64, qty: i64, bid: bool };

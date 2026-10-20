@@ -1,4 +1,4 @@
-//! `zmodu` — ZigModu's code generator, project scaffold and doctor CLI.
+//! `zmodu` — zmodu's code generator, project scaffold and doctor CLI.
 //!
 //! STRUCTURE:
 //!   §1  Options & CLI helpers —— Command / GenOptions / WrittenFiles / OrmCli, path & identifier safety predicates, cliLog
@@ -13,7 +13,7 @@
 //!
 //! Every section carries a matching `// ==== §N ... ====` anchor — `grep "==== §5"` jumps there.
 
-// ZModu - Code generation tool for ZigModu
+// ZModu - Code generation tool for zmodu
 const std = @import("std");
 const build_options = @import("build_options");
 
@@ -277,16 +277,16 @@ fn isSafeModuleDirName(name: []const u8) bool {
 /// Released tarball for `zmodu new` / `zmodu scaffold` projects. The tag is
 /// derived from `ZMODU_VERSION` (itself from `build.zig.zon`) so it can never
 /// drift from the framework release.
-const zigmodu_zon_url = "https://github.com/chy3xyz/zigmodu/archive/refs/tags/v" ++ ZMODU_VERSION ++ ".tar.gz";
+const zmodu_zon_url = "https://github.com/chy3xyz/zmodu/archive/refs/tags/v" ++ ZMODU_VERSION ++ ".tar.gz";
 
 /// Content-addressed package hash — Zig 0.17 requires an explicit `.hash` for
 /// URL dependencies, and the hash embeds the release version, so it is
 /// release-specific and must be refreshed together with `build.zig.zon`.
-/// Get it from `zig build --fetch` in a project using `zigmodu_zon_url`: the
+/// Get it from `zig build --fetch` in a project using `zmodu_zon_url`: the
 /// "expected .hash = ..." hint is printed verbatim. (`zig fetch <the same url>`
 /// prints the same string directly and is what was used for the last refresh —
 /// `--fetch` alone did not surface the hint unless the dependency was built.)
-const zigmodu_zon_hash = "zigmodu-0.39.16-U40vsyxCugCe22f1gw2GqH_bVjE4Wi-P2wfhdVcceQ6M";
+const zmodu_zon_hash = "zmodu-0.39.16-U40vsyxCugCe22f1gw2GqH_bVjE4Wi-P2wfhdVcceQ6M";
 
 comptime {
     // The pinned hash can only be computed **after** the tag for its version
@@ -296,22 +296,22 @@ comptime {
     // release itself (it blocked the release cut that introduced it). What is never acceptable is a
     // placeholder; the version lag is reported by `scripts/check-version.sh` as a
     // WARN, with the exact refresh command.
-    // Shape: `zigmodu-<version>-<payload>`. Split after the **second** dash —
+    // Shape: `zmodu-<version>-<payload>`. Split after the **second** dash —
     // the payload itself may contain dashes (Zig's hash alphabet uses them, e.g.
     // `…U40vs6AhTwAVWt-e_i_FWi2M0zEa4AuEC3fVPonQt1-Q`), so `lastIndexOfScalar`
     // would cut it down to its tail and misreport a real hash as a placeholder.
-    const first = std.mem.indexOfScalar(u8, zigmodu_zon_hash, '-') orelse
-        @compileError("zigmodu_zon_hash must look like `zigmodu-<version>-<payload>`");
-    const second = std.mem.indexOfScalarPos(u8, zigmodu_zon_hash, first + 1, '-') orelse
-        @compileError("zigmodu_zon_hash must look like `zigmodu-<version>-<payload>`");
-    const payload = zigmodu_zon_hash[second + 1 ..];
+    const first = std.mem.indexOfScalar(u8, zmodu_zon_hash, '-') orelse
+        @compileError("zmodu_zon_hash must look like `zmodu-<version>-<payload>`");
+    const second = std.mem.indexOfScalarPos(u8, zmodu_zon_hash, first + 1, '-') orelse
+        @compileError("zmodu_zon_hash must look like `zmodu-<version>-<payload>`");
+    const payload = zmodu_zon_hash[second + 1 ..];
     var distinct = false;
     for (payload) |c| {
         if (c != payload[0]) distinct = true;
     }
     if (payload.len < 16 or !distinct) {
-        @compileError("zigmodu_zon_hash is a placeholder — run `zig build --fetch` in a project using " ++
-            "`zigmodu_zon_url` and paste the `expected .hash = ...` value it prints");
+        @compileError("zmodu_zon_hash is a placeholder — run `zig build --fetch` in a project using " ++
+            "`zmodu_zon_url` and paste the `expected .hash = ...` value it prints");
     }
 }
 
@@ -533,13 +533,13 @@ fn parseCommand(cmd: []const u8) ?Command {
 
 fn printUsage() void {
     const usage =
-        \\ZModu - Code generation tool for ZigModu
+        \\ZModu - Code generation tool for zmodu
         \\
         \\Usage:
         \\  zmodu <command> [options]
         \\
         \\Commands:
-        \\  new <name>      Create new ZigModu project
+        \\  new <name>      Create new zmodu project
         \\  module <name>   Generate module boilerplate
         \\  event <name>    Generate event handler
         \\  api <name>      Generate API endpoint
@@ -1358,10 +1358,10 @@ fn cmdNew(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
             \\## Stack
             \\- Framework: zmodu v{s} (Zig 0.17)
             \\- Database: MySQL/PostgreSQL/SQLite via sqlx
-            \\- HTTP: zigmodu.http.Server (async fiber-based)
+            \\- HTTP: zmodu.http.Server (async fiber-based)
             \\
             \\## Conventions
-            \\- Domain imports: const http = zigmodu.http; const data = zigmodu.data;
+            \\- Domain imports: const http = zmodu.http; const data = zmodu.data;
             \\- Module lifecycle: init() at startup → deinit() at shutdown (reverse order)
             \\- Dependencies: declared in module.zig info.dependencies
             \\- Health: registerHealthChecks() per module + HealthEndpoint in main.zig
@@ -1541,7 +1541,7 @@ fn generateBuildZig(allocator: std.mem.Allocator, project_name: []const u8, db_l
     try buf.appendSlice(allocator, "    const target = b.standardTargetOptions(.{});\n");
     try buf.appendSlice(allocator, "    const optimize = b.standardOptimizeOption(.{});\n");
     try buf.appendSlice(allocator, "\n");
-    try buf.appendSlice(allocator, "    const zigmodu_dep = b.dependency(\"zigmodu\", .{\n");
+    try buf.appendSlice(allocator, "    const zmodu_dep = b.dependency(\"zmodu\", .{\n");
     try buf.appendSlice(allocator, "        .target = target,\n");
     try buf.appendSlice(allocator, "        .optimize = optimize,\n");
     try buf.appendSlice(allocator, "        // Link only the drivers you need: sqlite|postgres|mysql|all (comma-list ok)\n");
@@ -1553,7 +1553,7 @@ fn generateBuildZig(allocator: std.mem.Allocator, project_name: []const u8, db_l
     try buf.appendSlice(allocator, "        .target = target,\n");
     try buf.appendSlice(allocator, "        .optimize = optimize,\n");
     try buf.appendSlice(allocator, "    });\n");
-    try buf.appendSlice(allocator, "    exe_mod.addImport(\"zigmodu\", zigmodu_dep.module(\"zigmodu\"));\n");
+    try buf.appendSlice(allocator, "    exe_mod.addImport(\"zmodu\", zmodu_dep.module(\"zmodu\"));\n");
     try buf.appendSlice(allocator, "\n");
     try buf.print(allocator, "    const exe = b.addExecutable(.{{ .name = \"{s}\", .root_module = exe_mod }});\n", .{project_name});
     try buf.appendSlice(allocator, "\n");
@@ -1570,7 +1570,7 @@ fn generateBuildZig(allocator: std.mem.Allocator, project_name: []const u8, db_l
     try buf.appendSlice(allocator, "        .target = target,\n");
     try buf.appendSlice(allocator, "        .optimize = optimize,\n");
     try buf.appendSlice(allocator, "    });\n");
-    try buf.appendSlice(allocator, "    unit_tests_mod.addImport(\"zigmodu\", zigmodu_dep.module(\"zigmodu\"));\n");
+    try buf.appendSlice(allocator, "    unit_tests_mod.addImport(\"zmodu\", zmodu_dep.module(\"zmodu\"));\n");
     try buf.appendSlice(allocator, "\n");
     try buf.appendSlice(allocator, "    const unit_tests = b.addTest(.{ \n");
     try buf.appendSlice(allocator, "        .root_module = unit_tests_mod,\n");
@@ -1584,7 +1584,7 @@ fn generateBuildZig(allocator: std.mem.Allocator, project_name: []const u8, db_l
     return buf.toOwnedSlice(allocator);
 }
 
-/// Map scaffold `--from-db` DSN (or absence) to zigmodu `-Ddb=` / `.db =` value.
+/// Map scaffold `--from-db` DSN (or absence) to zmodu `-Ddb=` / `.db =` value.
 fn scaffoldDbLinkOption(db_dsn: ?[]const u8) []const u8 {
     const dsn = db_dsn orelse return "sqlite";
     if (std.mem.startsWith(u8, dsn, "postgresql://") or std.mem.startsWith(u8, dsn, "postgres://")) {
@@ -1630,7 +1630,7 @@ fn generateBuildZonImpl(allocator: std.mem.Allocator, project_name: []const u8, 
         \\    .fingerprint = 0x{x},
         \\    .minimum_zig_version = "0.17.0",
         \\    .dependencies = .{{
-        \\        .zigmodu = .{{
+        \\        .zmodu = .{{
         \\            .url = "{s}",
         \\            .hash = "{s}",
         \\        }},
@@ -1642,7 +1642,7 @@ fn generateBuildZonImpl(allocator: std.mem.Allocator, project_name: []const u8, 
         \\    }},
         \\}}
         \\
-    , .{ pkg, fp, zigmodu_zon_url, zigmodu_zon_hash });
+    , .{ pkg, fp, zmodu_zon_url, zmodu_zon_hash });
 }
 
 fn parseZigSuggestedFingerprint(diag: []const u8) ?u64 {
@@ -1720,7 +1720,7 @@ fn finalizeBuildZigZonFingerprint(io: std.Io, allocator: std.mem.Allocator, proj
 
 fn generateAgentsMd(allocator: std.mem.Allocator, project_name: []const u8) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
-    try buf.print(allocator, "# AGENTS.md — AI Development Guide\n\n## Project: {s}\n## Framework: zigmodu v{s} (Zig 0.17)\n\n", .{ project_name, ZMODU_VERSION });
+    try buf.print(allocator, "# AGENTS.md — AI Development Guide\n\n## Project: {s}\n## Framework: zmodu v{s} (Zig 0.17)\n\n", .{ project_name, ZMODU_VERSION });
     try buf.appendSlice(allocator,
         \\## Quick Commands
         \\```
@@ -1749,23 +1749,23 @@ fn generateAgentsMd(allocator: std.mem.Allocator, project_name: []const u8) ![]c
         \\pub const info = api.Module{ .name = "x", .dependencies = &.{}, .is_internal = false };
         \\pub fn init() !void { ... }
         \\pub fn deinit() void { ... }
-        \\pub fn registerHealthChecks(endpoint: *zigmodu.HealthEndpoint) !void { ... }
+        \\pub fn registerHealthChecks(endpoint: *zmodu.HealthEndpoint) !void { ... }
         \\```
         \\
         \\## Import Conventions
         \\```zig
         \\// module.zig — api + http domain
-        \\const api = zigmodu.api;
-        \\const http = zigmodu.http;
+        \\const api = zmodu.api;
+        \\const http = zmodu.http;
         \\
         \\// persistence.zig — data domain only
-        \\const data = @import("zigmodu").data;
+        \\const data = @import("zmodu").data;
         \\
         \\// service.zig — data + EventBus
-        \\const data = zigmodu.data;
+        \\const data = zmodu.data;
         \\
         \\// api.zig — http domain only
-        \\const http = @import("zigmodu").http;
+        \\const http = @import("zmodu").http;
         \\```
         \\
         \\## Adding a Module
@@ -1902,19 +1902,19 @@ fn generateAgentsMd(allocator: std.mem.Allocator, project_name: []const u8) ![]c
         \\## Key Framework Types
         \\| Type | Path | Use |
         \\|------|------|-----|
-        \\| Context | zigmodu.http.Context | Request/response |
-        \\| Server | zigmodu.http.Server | HTTP server |
+        \\| Context | zmodu.http.Context | Request/response |
+        \\| Server | zmodu.http.Server | HTTP server |
         \\| Router.scope | http.Router.scope(...).get/post/ws | Runtime route registration (outside catalog) |
-        \\| SqlxBackend | zigmodu.data.SqlxBackend | DB backend |
-        \\| Repository(T) | zigmodu.data.Repository(T) | Typed ORM repo |
-        \\| HealthEndpoint | zigmodu.HealthEndpoint | Health checks |
-        \\| EventBus(T) | zigmodu.EventBus(T) | Typed event bus |
-        \\| Application | zigmodu.Application | App lifecycle |
-        \\| ConnectionRegistry | zigmodu.im.ConnectionRegistry | userId→connection map |
-        \\| WsFramer | zigmodu.im.WsFramer | RFC 6455 frame r/w |
-        \\| BufferPool | zigmodu.im.BufferPool | Shared 4KB buffer pool |
-        \\| Tool | zigmodu.ai.Tool | Agent-callable function |
-        \\| SkillRegistry | zigmodu.ai.SkillRegistry | Tool registry + dispatch |
+        \\| SqlxBackend | zmodu.data.SqlxBackend | DB backend |
+        \\| Repository(T) | zmodu.data.Repository(T) | Typed ORM repo |
+        \\| HealthEndpoint | zmodu.HealthEndpoint | Health checks |
+        \\| EventBus(T) | zmodu.EventBus(T) | Typed event bus |
+        \\| Application | zmodu.Application | App lifecycle |
+        \\| ConnectionRegistry | zmodu.im.ConnectionRegistry | userId→connection map |
+        \\| WsFramer | zmodu.im.WsFramer | RFC 6455 frame r/w |
+        \\| BufferPool | zmodu.im.BufferPool | Shared 4KB buffer pool |
+        \\| Tool | zmodu.ai.Tool | Agent-callable function |
+        \\| SkillRegistry | zmodu.ai.SkillRegistry | Tool registry + dispatch |
         \\
         \\## IM Module (--with-websocket)
         \\
@@ -1937,7 +1937,7 @@ fn generateAgentsMd(allocator: std.mem.Allocator, project_name: []const u8) ![]c
         \\- Memory: MemoryStore.remember/recall for cross-session context
         \\- Cache: messages ordered system→memories→history→query for prefix caching
         \\```zig
-        \\var http = zigmodu.http.HttpClient.init(allocator, io, 10, 30000);
+        \\var http = zmodu.http.HttpClient.init(allocator, io, 10, 30000);
         \\var provider = ai_chat.provider.AiProvider.init(allocator, &http, endpoint, key, model);
         \\ai_chat_svc.setProvider(provider);
         \\ai_chat_svc.setSystemPrompt("You are a helpful assistant.");
@@ -1945,20 +1945,20 @@ fn generateAgentsMd(allocator: std.mem.Allocator, project_name: []const u8) ![]c
         \\
         \\### AI Agent (--with-agent)
         \\
-        \\ReAct loop via first-class `zigmodu.ai.Agent` + SkillRegistry:
+        \\ReAct loop via first-class `zmodu.ai.Agent` + SkillRegistry:
         \\- POST /ai/agent/run?goal=... — execute agent with tool access
         \\- GET /ai/agent/runs — list agent run history
         \\- Skills: register via SkillRegistry; prefer allowlist + tool_timeout_ms
         \\- Optional: AgentAuditLog, AgentMetrics.toPrometheusFormat, Retriever for RAG context
         \\```zig
-        \\var registry = zigmodu.ai.SkillRegistry.init(allocator, io);
+        \\var registry = zmodu.ai.SkillRegistry.init(allocator, io);
         \\try registry.register(.{ .name = "lookup", .description = "...", .parameters = &.{}, .handler = myHandler });
-        \\var agent = zigmodu.ai.Agent{ .provider = &provider, .registry = &registry, .allowlist = &.{"lookup"} };
+        \\var agent = zmodu.ai.Agent{ .provider = &provider, .registry = &registry, .allowlist = &.{"lookup"} };
         \\```
         \\
         \\### SSE Streaming
         \\```zig
-        \\var sse = try zigmodu.http.SseWriter.init(ctx);
+        \\var sse = try zmodu.http.SseWriter.init(ctx);
         \\try sse.sendEvent("message", "hello");  // named event
         \\try sse.sendData("{json}");              // data-only
         \\try sse.heartbeat();                    // keep-alive
@@ -1969,31 +1969,31 @@ fn generateAgentsMd(allocator: std.mem.Allocator, project_name: []const u8) ![]c
         \\
         \\### CSRF Protection
         \\```zig
-        \\var csrf = zigmodu.security.CsrfProtection.init(io);
+        \\var csrf = zmodu.security.CsrfProtection.init(io);
         \\server.addMiddleware(csrf.middleware());  // validates X-CSRF-Token on POST/PUT/DELETE
         \\```
         \\
         \\### Security Headers
         \\```zig
-        \\server.addMiddleware(zigmodu.security.securityHeadersMiddleware(&zigmodu.security.defaultSecurityHeaders));
+        \\server.addMiddleware(zmodu.security.securityHeadersMiddleware(&zmodu.security.defaultSecurityHeaders));
         \\```
         \\
         \\### Auth Rate Limiting
         \\```zig
-        \\var auth_limiter = try zigmodu.security.authRateLimitMiddleware(allocator, 5, 60);
+        \\var auth_limiter = try zmodu.security.authRateLimitMiddleware(allocator, 5, 60);
         \\server.addMiddleware(auth_limiter);  // 5 attempts per 60s window
         \\```
         \\
         \\### Path Traversal Prevention
         \\```zig
-        \\const safe_path = try zigmodu.security.sanitizePath(user_input);
+        \\const safe_path = try zmodu.security.sanitizePath(user_input);
         \\// Rejects: .., null bytes, /, \\ — returns error.InvalidPath
         \\```
         \\
         \\### Multi-Tenant Isolation
         \\- Tables with the tenant column (default `tenant_id`, or `--tenant-column app_id`) auto-generate `listByTenant()` / `getByTenant()`
         \\- Always filter by that column in cross-tenant queries
-        \\- At runtime: `zigmodu.setTenantColumn("app_id")` so TenantInterceptor matches
+        \\- At runtime: `zmodu.setTenantColumn("app_id")` so TenantInterceptor matches
         \\```zig
         \\const results = try svc.listUsers(page, size, tenant_id);
         \\const user = try svc.getUsersByTenant(id, tenant_id);
@@ -2022,7 +2022,7 @@ fn generateAgentsMd(allocator: std.mem.Allocator, project_name: []const u8) ![]c
         \\
         \\### Connection Tuning
         \\```zig
-        \\var server = zigmodu.http.Server.initWithConfig(io, allocator, .{
+        \\var server = zmodu.http.Server.initWithConfig(io, allocator, .{
         \\    .port = 8080,
         \\    .connection_stack_size = 128 * 1024,  // default 128KB (was 8MB)
         \\    .max_requests_per_conn = 100,
@@ -2055,14 +2055,14 @@ fn generateAgentsMd(allocator: std.mem.Allocator, project_name: []const u8) ![]c
 fn generateMainZig(allocator: std.mem.Allocator, project_name: []const u8) ![]const u8 {
     const tpl =
         \\const std = @import("std");
-        \\const zigmodu = @import("zigmodu");
+        \\const zmodu = @import("zmodu");
         \\
         \\pub fn main(_: std.process.Init) !void {
         \\    std.log.info("Application '{{PROJECT_NAME}}' started!", .{});
         \\
         \\    // TODO: Add your modules via `zmodu module <name>`
         \\    // Then wire them in (bind the builder first — a temporary is `*const`):
-        \\    //   var b = zigmodu.builder(allocator, init.io);
+        \\    //   var b = zmodu.builder(allocator, init.io);
         \\    //   defer b.deinit();
         \\    //   var app = try b.build(.{ ... });
         \\}
@@ -2166,7 +2166,7 @@ const module_api_tpl =
     \\//! `{{PASCAL_NAME}}` HTTP surface (ComptimeRouter). `.jwt` is the secure
     \\//! default — switching a route to `.public` should be a deliberate line.
     \\
-    \\const http = @import("zigmodu").http;
+    \\const http = @import("zmodu").http;
     \\
     \\pub fn Api(comptime Service: type) type {
     \\    return struct {
@@ -5584,9 +5584,9 @@ fn cmdHealth(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8)
 
     const content =
         \\const std = @import("std");
-        \\const zigmodu = @import("zigmodu");
+        \\const zmodu = @import("zmodu");
         \\
-        \\const HealthEndpoint = zigmodu.HealthEndpoint;
+        \\const HealthEndpoint = zmodu.HealthEndpoint;
         \\
         \\pub fn initHealth() HealthEndpoint {
         \\    return HealthEndpoint.init(std.heap.page_allocator);
@@ -5601,8 +5601,8 @@ fn cmdHealth(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8)
         \\//   const hc = initHealth();
         \\//   defer hc.deinit();
         \\//   try registerHealthChecks(&hc);
-        \\//   try group.get("/health/live", zigmodu.HealthEndpoint.handleLiveness, null);
-        \\//   try group.get("/health/ready", zigmodu.HealthEndpoint.handleReadiness(&hc), null);
+        \\//   try group.get("/health/live", zmodu.HealthEndpoint.handleLiveness, null);
+        \\//   try group.get("/health/ready", zmodu.HealthEndpoint.handleReadiness(&hc), null);
         \\
         \\// Add custom checks with context:
         \\//   try endpoint.registerCheckWithContext("database", "DB connectivity",
@@ -5671,7 +5671,7 @@ fn cmdConfig(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8)
 
     try buf.appendSlice(allocator,
         \\const std = @import("std");
-        \\const zigmodu = @import("zigmodu");
+        \\const zmodu = @import("zmodu");
         \\
         \\pub const RequiredKeys = [_][]const u8{
         \\
@@ -5694,7 +5694,7 @@ fn cmdConfig(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8)
     try buf.appendSlice(allocator,
         \\};
         \\
-        \\pub fn validateConfig(config: *zigmodu.ExternalizedConfig, allocator: std.mem.Allocator) !void {
+        \\pub fn validateConfig(config: *zmodu.ExternalizedConfig, allocator: std.mem.Allocator) !void {
         \\    const missing = try config.validateRequired(&RequiredKeys, allocator);
         \\    defer allocator.free(missing);
         \\    if (missing.len > 0) {
@@ -5834,13 +5834,13 @@ fn cmdTest(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !
     defer buf.deinit(allocator);
     try buf.print(allocator,
         \\const std = @import("std");
-        \\const zigmodu = @import("zigmodu");
+        \\const zmodu = @import("zmodu");
         \\const module = @import("module.zig");
         \\const service = @import("service.zig");
         \\const model = @import("model.zig");
         \\
         \\test "{s}: service health check" {{
-        \\    try zigmodu.HealthEndpoint.alwaysUp(null);
+        \\    try zmodu.HealthEndpoint.alwaysUp(null);
         \\}}
         \\
         \\test "{s}: module lifecycle init/deinit" {{
@@ -6207,14 +6207,14 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
                 \\// {s} service extension — add custom business logic here.
                 \\// @initialized — AI may modify freely.
                 \\const std = @import("std");
-                \\const zigmodu = @import("zigmodu");
+                \\const zmodu = @import("zmodu");
                 \\const ext_svc = @import("../service.zig");
                 \\
                 \\pub const {s}ServiceExt = struct {{
                 \\    svc: *ext_svc.{s}Service,
-                \\    backend: zigmodu.data.SqlxBackend,
+                \\    backend: zmodu.data.SqlxBackend,
                 \\
-                \\    pub fn init(svc: *ext_svc.{s}Service, backend: zigmodu.data.SqlxBackend) {s}ServiceExt {{
+                \\    pub fn init(svc: *ext_svc.{s}Service, backend: zmodu.data.SqlxBackend) {s}ServiceExt {{
                 \\        return .{{ .svc = svc, .backend = backend }};
                 \\    }}
                 \\
@@ -6246,8 +6246,8 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
                 \\// {s} custom API endpoints — add business routes here.
                 \\// @initialized — AI may modify freely.
                 \\const std = @import("std");
-                \\const zigmodu = @import("zigmodu");
-                \\const http = zigmodu.http;
+                \\const zmodu = @import("zmodu");
+                \\const http = zmodu.http;
                 \\const R = @import("{s}");
                 \\const ext_svc = @import("service.zig");
                 \\
@@ -6327,9 +6327,9 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
 
             const sub_mod = try allocator.print(
                 \\const std = @import("std");
-                \\const zigmodu = @import("zigmodu");
+                \\const zmodu = @import("zmodu");
                 \\
-                \\pub const info = zigmodu.api.Module{{
+                \\pub const info = zmodu.api.Module{{
                 \\    .name = "marketing.{s}",
                 \\    .description = "Marketing {s} sub-module",
                 \\    .dependencies = &.{{"marketing"}},
@@ -6355,7 +6355,7 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
         for (hot_rules) |rule_file| {
             const rule_content = try allocator.print(
                 \\// Hot-reloadable {s} — edit without restarting the server.
-                \\// Watched by: zigmodu.HotReloader
+                \\// Watched by: zmodu.HotReloader
                 \\pub const Rules = struct {{
                 \\    pub fn evaluate() bool {{ return true; }}
                 \\}};
@@ -6370,10 +6370,10 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
         // Generate hot_reload/watcher.zig
         const watcher_content =
             \\const std = @import("std");
-            \\const zigmodu = @import("zigmodu");
+            \\const zmodu = @import("zmodu");
             \\
-            \\pub fn initWatcher(allocator: std.mem.Allocator, io: std.Io) !zigmodu.HotReloader {
-            \\    var reloader = zigmodu.HotReloader.init(allocator, io);
+            \\pub fn initWatcher(allocator: std.mem.Allocator, io: std.Io) !zmodu.HotReloader {
+            \\    var reloader = zmodu.HotReloader.init(allocator, io);
             \\    try reloader.watchPath("hot_reload/targets/");
             \\    reloader.onChange(struct {
             \\        fn cb(path: []const u8) void {
@@ -6404,7 +6404,7 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
         // Plugin manifest
         const manifest_content =
             \\const std = @import("std");
-            \\const zigmodu = @import("zigmodu");
+            \\const zmodu = @import("zmodu");
             \\
             \\pub const PluginEntry = struct {
             \\    name: []const u8,
@@ -6553,7 +6553,7 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
     // shared/response.zig — RuoYi-style API response helpers
     var shared_buf: std.ArrayList(u8) = .empty;
     defer shared_buf.deinit(allocator);
-    try shared_buf.appendSlice(allocator, "//! RuoYi-style API response helpers\nconst std = @import(\"std\");\nconst http = @import(\"zigmodu\").http;\nconst BizCode = @import(\"errors.zig\").BizCode;\n\n");
+    try shared_buf.appendSlice(allocator, "//! RuoYi-style API response helpers\nconst std = @import(\"std\");\nconst http = @import(\"zmodu\").http;\nconst BizCode = @import(\"errors.zig\").BizCode;\n\n");
     try shared_buf.appendSlice(allocator, "pub fn wrapOk(ctx: *http.Context, value: anytype) !void {\n    const inner = try std.json.Stringify.valueAlloc(ctx.allocator, value, .{});\n    defer ctx.allocator.free(inner);\n    const json = try ctx.allocator.print( \"{{\\\"code\\\":0,\\\"msg\\\":\\\"\\\",\\\"data\\\":{s}}}\", .{inner});\n    defer ctx.allocator.free(json);\n    try ctx.json(200, json);\n}\n\n");
     try shared_buf.appendSlice(allocator, "pub fn wrapList(ctx: *http.Context, result: anytype) !void {\n    const inner = try std.json.Stringify.valueAlloc(ctx.allocator, result.items, .{});\n    defer ctx.allocator.free(inner);\n    const json = try ctx.allocator.print( \"{{\\\"code\\\":0,\\\"msg\\\":\\\"\\\",\\\"data\\\":{{\\\"list\\\":{s},\\\"total\\\":{d}}}}}\", .{ inner, result.total });\n    defer ctx.allocator.free(json);\n    try ctx.json(200, json);\n}\n\n");
     // A plain string literal, not a format string: `{{`/`}}` would reach the
@@ -6644,10 +6644,10 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
         \\## Stack
         \\- Framework: zmodu v{s} (Zig 0.17)
         \\- Database: MySQL/PostgreSQL/SQLite via sqlx
-        \\- HTTP: zigmodu.http.Server (async fiber-based)
+        \\- HTTP: zmodu.http.Server (async fiber-based)
         \\
         \\## Conventions
-        \\- Domain imports: const http = zigmodu.http; const data = zigmodu.data;
+        \\- Domain imports: const http = zmodu.http; const data = zmodu.data;
         \\- Module lifecycle: init() → deinit() (reverse dependency order)
         \\- API: RESTful via Router.scope / ComptimeRouter routes, handlers use resolve(ctx)
         \\- ORM: data.Repository(T) returned by persistence Repo accessors
@@ -6786,15 +6786,15 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     try safeWrite(io, allocator, mod_path,
         \\//! AI Chat module — LLM-powered conversations
         \\const std = @import("std");
-        \\const zigmodu = @import("zigmodu");
-        \\pub const info = zigmodu.api.Module{
+        \\const zmodu = @import("zmodu");
+        \\pub const info = zmodu.api.Module{
         \\    .name = "ai/chat", .description = "AI chat module",
         \\    .dependencies = &.{}, .is_internal = false,
         \\};
         \\pub fn init() !void { std.log.info("[ai/chat] ready", .{}); }
         \\pub fn deinit() void {}
-        \\pub fn registerHealthChecks(e: *zigmodu.HealthEndpoint) !void {
-        \\    try e.registerCheck("ai/chat", "AI chat", zigmodu.HealthEndpoint.alwaysUp);
+        \\pub fn registerHealthChecks(e: *zmodu.HealthEndpoint) !void {
+        \\    try e.registerCheck("ai/chat", "AI chat", zmodu.HealthEndpoint.alwaysUp);
         \\}
         \\pub const model = @import("model.zig");
         \\pub const persistence = @import("persistence.zig");
@@ -6826,7 +6826,7 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     defer allocator.free(pers_path);
     try safeWrite(io, allocator, pers_path,
         \\const std = @import("std");
-        \\const data = @import("zigmodu").data;
+        \\const data = @import("zmodu").data;
         \\const model = @import("model.zig");
         \\pub const AiChatPersistence = struct {
         \\    backend: data.SqlxBackend, orm: data.orm.Orm(data.SqlxBackend),
@@ -6848,10 +6848,10 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     defer allocator.free(prov_path);
     try safeWrite(io, allocator, prov_path,
         \\//! @initialized by zmodu — AI may modify freely
-        \\const zigmodu = @import("zigmodu");
-        \\pub const AiProvider = zigmodu.ai.AiProvider;
-        \\pub const ChatMsg = zigmodu.ai.AiProvider.ChatMsg;
-        \\pub const ChatResponse = zigmodu.ai.AiProvider.ChatResponse;
+        \\const zmodu = @import("zmodu");
+        \\pub const AiProvider = zmodu.ai.AiProvider;
+        \\pub const ChatMsg = zmodu.ai.AiProvider.ChatMsg;
+        \\pub const ChatResponse = zmodu.ai.AiProvider.ChatResponse;
     , gen_opts);
 
     // ── sse.zig ──
@@ -6859,8 +6859,8 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     defer allocator.free(sse_path);
     try safeWrite(io, allocator, sse_path,
         \\//! @initialized by zmodu — AI may modify freely
-        \\const zigmodu = @import("zigmodu");
-        \\pub const SseWriter = zigmodu.http.SseWriter;
+        \\const zmodu = @import("zmodu");
+        \\pub const SseWriter = zmodu.http.SseWriter;
     , gen_opts);
 
     // ── service.zig ──
@@ -6868,8 +6868,8 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     defer allocator.free(svc_path);
     try safeWrite(io, allocator, svc_path,
         \\const std = @import("std");
-        \\const zigmodu = @import("zigmodu");
-        \\const data = zigmodu.data;
+        \\const zmodu = @import("zmodu");
+        \\const data = zmodu.data;
         \\const model = @import("model.zig");
         \\const persistence = @import("persistence.zig");
         \\const provider_mod = @import("provider.zig");
@@ -6878,8 +6878,8 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
         \\    allocator: std.mem.Allocator,
         \\    persistence: *persistence.AiChatPersistence,
         \\    provider: ?*provider_mod.AiProvider = null,
-        \\    memory: ?*zigmodu.ai.MemoryStore = null,
-        \\    quota: ?*zigmodu.ai.TokenQuota = null,
+        \\    memory: ?*zmodu.ai.MemoryStore = null,
+        \\    quota: ?*zmodu.ai.TokenQuota = null,
         \\    system_prompt: ?[]const u8 = null,
         \\    max_context: usize = 20,
         \\    context_limit: usize = 128000,
@@ -6887,8 +6887,8 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
         \\        return .{ .allocator = a, .persistence = p };
         \\    }
         \\    pub fn setProvider(self: *AiChatService, p: *provider_mod.AiProvider) void { self.provider = p; }
-        \\    pub fn setMemory(self: *AiChatService, m: *zigmodu.ai.MemoryStore) void { self.memory = m; }
-        \\    pub fn setQuota(self: *AiChatService, q: *zigmodu.ai.TokenQuota) void { self.quota = q; }
+        \\    pub fn setMemory(self: *AiChatService, m: *zmodu.ai.MemoryStore) void { self.memory = m; }
+        \\    pub fn setQuota(self: *AiChatService, q: *zmodu.ai.TokenQuota) void { self.quota = q; }
         \\    pub fn setSystemPrompt(self: *AiChatService, sp: []const u8) void { self.system_prompt = sp; }
         \\    /// Send message with multi-turn context. Uses chatStream when `sse` is set.
         \\    pub fn send(self: *AiChatService, conv_id: i64, content: []const u8, sse: ?*sse_mod.SseWriter) !model.AiMessage {
@@ -7016,7 +7016,7 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     defer allocator.free(api_path);
     try safeWrite(io, allocator, api_path,
         \\const std = @import("std");
-        \\const http = @import("zigmodu").http;
+        \\const http = @import("zmodu").http;
         \\const service = @import("service.zig");
         \\const model = @import("model.zig");
         \\const R = @import("../../../shared/response.zig");
@@ -7098,11 +7098,11 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     if (false) {
         if (!fileExists(io, esvc_path)) try safeWrite(io, allocator, esvc_path,
             \\const std = @import("std");
-            \\const zigmodu = @import("zigmodu");
+            \\const zmodu = @import("zmodu");
             \\const ext_svc = @import("../service.zig");
             \\pub const AiChatServiceExt = struct {
-            \\    svc: *ext_svc.AiChatService; backend: zigmodu.data.SqlxBackend;
-            \\    pub fn init(svc: *ext_svc.AiChatService, backend: zigmodu.data.SqlxBackend) AiChatServiceExt { return .{ .svc = svc, .backend = backend }; }
+            \\    svc: *ext_svc.AiChatService; backend: zmodu.data.SqlxBackend;
+            \\    pub fn init(svc: *ext_svc.AiChatService, backend: zmodu.data.SqlxBackend) AiChatServiceExt { return .{ .svc = svc, .backend = backend }; }
             \\};
         , gen_opts);
     } // if(false) — ext/ removed
@@ -7113,8 +7113,8 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     if (false) {
         if (!fileExists(io, eapi_path)) try safeWrite(io, allocator, eapi_path,
             \\const std = @import("std");
-            \\const zigmodu = @import("zigmodu");
-            \\const http = zigmodu.http;
+            \\const zmodu = @import("zmodu");
+            \\const http = zmodu.http;
             \\const R = @import("../../../../shared/response.zig");
             \\const ext_svc = @import("service.zig");
             \\pub const AiChatApiExt = struct {
@@ -7129,12 +7129,12 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     const test_path = try allocator.print("{s}/tests.zig", .{dir});
     defer allocator.free(test_path);
     if (!fileExists(io, test_path)) try safeWrite(io, allocator, test_path,
-        \\const std = @import("std"); const testing = std.testing; const zigmodu = @import("zigmodu"); const model = @import("model.zig"); const provider = @import("provider.zig");
+        \\const std = @import("std"); const testing = std.testing; const zmodu = @import("zmodu"); const model = @import("model.zig"); const provider = @import("provider.zig");
         \\test "model AiConversation defaults" { const c = model.AiConversation{ .id = null, .title = "test", .created_at = 0, .updated_at = 0 }; try testing.expectEqualStrings("deepseek-v4-flash", c.model); }
         \\test "model AiMessage defaults" { const m = model.AiMessage{ .id = null, .conversation_id = 1, .role = "user", .content = "hi", .created_at = 0 }; try testing.expectEqual(@as(i64, 0), m.tokens); }
         \\test "provider buildMessages cache order" { const a = testing.allocator; const history = &[_]provider.ChatMsg{.{ .role = "user", .content = "old" }, .{ .role = "assistant", .content = "reply" }}; const memories = &[_][]const u8{"fact: likes coffee"}; const msgs = try provider.AiProvider.buildMessages(a, "You are helpful.", memories, history, "hello"); defer a.free(msgs); try testing.expectEqual(@as(usize, 5), msgs.len); try testing.expectEqualStrings("system", msgs[0].role); try testing.expectEqualStrings("You are helpful.", msgs[0].content); try testing.expectEqualStrings("system", msgs[1].role); try testing.expectEqualStrings("user", msgs[4].role); }
-        \\test "provider buildRequestBody" { const a = testing.allocator; var http = zigmodu.http.HttpClient.init(a, testing.io, 1, 5000); defer http.deinit(); var p = provider.AiProvider.init(a, &http, "https://api.test/v1", "Bearer sk-xxx", "deepseek-v4-flash"); const msgs = &[_]provider.ChatMsg{.{ .role = "system", .content = "You are helpful." }, .{ .role = "user", .content = "Hi" }}; const body = try p.buildRequestBody(msgs, .{}); defer a.free(body); try testing.expect(std.mem.indexOf(u8, body, "deepseek-v4-flash") != null); try testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\"") != null); }
-        \\test "provider estimateTokens" { const a = testing.allocator; var http = zigmodu.http.HttpClient.init(a, testing.io, 1, 5000); defer http.deinit(); var p = provider.AiProvider.init(a, &http, "https://api.test/v1", "Bearer sk-xxx", "deepseek-v4-flash"); const msgs = &[_]provider.ChatMsg{.{ .role = "system", .content = "You are helpful." }, .{ .role = "user", .content = "Hi" }}; const tokens = p.countTokens(msgs); try testing.expect(tokens > 5); try testing.expect(tokens < 50); }
+        \\test "provider buildRequestBody" { const a = testing.allocator; var http = zmodu.http.HttpClient.init(a, testing.io, 1, 5000); defer http.deinit(); var p = provider.AiProvider.init(a, &http, "https://api.test/v1", "Bearer sk-xxx", "deepseek-v4-flash"); const msgs = &[_]provider.ChatMsg{.{ .role = "system", .content = "You are helpful." }, .{ .role = "user", .content = "Hi" }}; const body = try p.buildRequestBody(msgs, .{}); defer a.free(body); try testing.expect(std.mem.indexOf(u8, body, "deepseek-v4-flash") != null); try testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\"") != null); }
+        \\test "provider estimateTokens" { const a = testing.allocator; var http = zmodu.http.HttpClient.init(a, testing.io, 1, 5000); defer http.deinit(); var p = provider.AiProvider.init(a, &http, "https://api.test/v1", "Bearer sk-xxx", "deepseek-v4-flash"); const msgs = &[_]provider.ChatMsg{.{ .role = "system", .content = "You are helpful." }, .{ .role = "user", .content = "Hi" }}; const tokens = p.countTokens(msgs); try testing.expect(tokens > 5); try testing.expect(tokens < 50); }
     , gen_opts);
 
     // ── README.md ──
@@ -7142,10 +7142,10 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     defer allocator.free(rm_path);
     if (!fileExists(io, rm_path)) try safeWrite(io, allocator, rm_path,
         \\# AI Chat Module
-        \\Full docs: [zigmodu/docs/ai/AI.md](https://github.com/chy3xyz/zigmodu/blob/main/docs/ai/AI.md)
+        \\Full docs: [zmodu/docs/ai/AI.md](https://github.com/chy3xyz/zmodu/blob/main/docs/ai/AI.md)
         \\## Quick Start
         \\```zig
-        \\var http_client = zigmodu.http.HttpClient.init(allocator, io, 10, 30000);
+        \\var http_client = zmodu.http.HttpClient.init(allocator, io, 10, 30000);
         \\defer http_client.deinit();
         \\var ai_provider = ai_chat.provider.AiProvider.init(
         \\    allocator, &http_client,
@@ -7188,11 +7188,11 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
     const mod_path = try allocator.print("{s}/module.zig", .{dir});
     defer allocator.free(mod_path);
     try safeWrite(io, allocator, mod_path,
-        \\const std = @import("std"); const zigmodu = @import("zigmodu");
-        \\pub const info = zigmodu.api.Module{ .name = "ai/agent", .description = "AI Agent module", .dependencies = &.{}, .is_internal = false };
+        \\const std = @import("std"); const zmodu = @import("zmodu");
+        \\pub const info = zmodu.api.Module{ .name = "ai/agent", .description = "AI Agent module", .dependencies = &.{}, .is_internal = false };
         \\pub fn init() !void { std.log.info("[ai/agent] ready", .{}); }
         \\pub fn deinit() void {}
-        \\pub fn registerHealthChecks(e: *zigmodu.HealthEndpoint) !void { try e.registerCheck("ai/agent", "AI agent", zigmodu.HealthEndpoint.alwaysUp); }
+        \\pub fn registerHealthChecks(e: *zmodu.HealthEndpoint) !void { try e.registerCheck("ai/agent", "AI agent", zmodu.HealthEndpoint.alwaysUp); }
         \\pub const model = @import("model.zig"); pub const persistence = @import("persistence.zig");
         \\pub const service = @import("service.zig"); pub const api = @import("api.zig"); pub const agent = @import("agent.zig");
     , gen_opts);
@@ -7216,7 +7216,7 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
     const pers_path = try allocator.print("{s}/persistence.zig", .{dir});
     defer allocator.free(pers_path);
     try safeWrite(io, allocator, pers_path,
-        \\const std = @import("std"); const data = @import("zigmodu").data; const model = @import("model.zig");
+        \\const std = @import("std"); const data = @import("zmodu").data; const model = @import("model.zig");
         \\pub const AiAgentPersistence = struct { backend: data.SqlxBackend, orm: data.orm.Orm(data.SqlxBackend),
         \\    pub fn init(b: data.SqlxBackend) AiAgentPersistence { return .{ .backend = b, .orm = .{ .backend = b } }; }
         \\    pub fn runRepo(self: *AiAgentPersistence) data.Repository(model.AgentRun) { return .{ .orm = &self.orm }; }
@@ -7228,12 +7228,12 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
     const ag_path = try allocator.print("{s}/agent.zig", .{dir});
     defer allocator.free(ag_path);
     try safeWrite(io, allocator, ag_path,
-        \\//! Thin re-export of first-class zigmodu.ai.Agent (ReAct + tool_calls).
-        \\const zigmodu = @import("zigmodu");
-        \\pub const Agent = zigmodu.ai.Agent;
-        \\pub const AgentResult = zigmodu.ai.AgentResult;
-        \\pub const AgentHooks = zigmodu.ai.AgentHooks;
-        \\pub const ToolApproval = zigmodu.ai.ToolApproval;
+        \\//! Thin re-export of first-class zmodu.ai.Agent (ReAct + tool_calls).
+        \\const zmodu = @import("zmodu");
+        \\pub const Agent = zmodu.ai.Agent;
+        \\pub const AgentResult = zmodu.ai.AgentResult;
+        \\pub const AgentHooks = zmodu.ai.AgentHooks;
+        \\pub const ToolApproval = zmodu.ai.ToolApproval;
     , gen_opts);
 
     // ── service.zig ──
@@ -7241,45 +7241,45 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
     defer allocator.free(svc_path);
     try safeWrite(io, allocator, svc_path,
         \\const std = @import("std");
-        \\const zigmodu = @import("zigmodu");
+        \\const zmodu = @import("zmodu");
         \\const model = @import("model.zig");
         \\const persistence = @import("persistence.zig");
         \\
         \\pub const AiAgentService = struct {
         \\    persistence: *persistence.AiAgentPersistence,
-        \\    registry: *zigmodu.ai.SkillRegistry,
-        \\    provider: ?*zigmodu.ai.AiProvider = null,
+        \\    registry: *zmodu.ai.SkillRegistry,
+        \\    provider: ?*zmodu.ai.AiProvider = null,
         \\    allowlist: ?[]const []const u8 = null,
         \\    tool_timeout_ms: ?u64 = 10_000,
-        \\    audit: ?*zigmodu.ai.AgentAuditLog = null,
-        \\    retriever: ?zigmodu.ai.Retriever = null,
-        \\    quota: ?*zigmodu.ai.TokenQuota = null,
+        \\    audit: ?*zmodu.ai.AgentAuditLog = null,
+        \\    retriever: ?zmodu.ai.Retriever = null,
+        \\    quota: ?*zmodu.ai.TokenQuota = null,
         \\    /// Authority. `Guard.init(.{})` is **fail-closed**: with an empty allow
         \\    /// list the agent runs no tool at all and every call comes back
         \\    /// `ToolDenied` (counted in `guard.stats()`). Replace the policy at
-        \\    /// startup — `svc.guard = zigmodu.ai.Guard.init(.{ .allow = &.{"order.draft"} })`
+        \\    /// startup — `svc.guard = zmodu.ai.Guard.init(.{ .allow = &.{"order.draft"} })`
         \\    /// — and turn on `.allow_execute = true` only for tools that take effect.
         \\    /// The guard is addressable on purpose: it keeps counters and a budget.
-        \\    guard: zigmodu.ai.Guard = zigmodu.ai.Guard.init(.{}),
+        \\    guard: zmodu.ai.Guard = zmodu.ai.Guard.init(.{}),
         \\
-        \\    pub fn init(p: *persistence.AiAgentPersistence, r: *zigmodu.ai.SkillRegistry) AiAgentService {
+        \\    pub fn init(p: *persistence.AiAgentPersistence, r: *zmodu.ai.SkillRegistry) AiAgentService {
         \\        return .{ .persistence = p, .registry = r };
         \\    }
-        \\    pub fn setProvider(self: *AiAgentService, p: *zigmodu.ai.AiProvider) void {
+        \\    pub fn setProvider(self: *AiAgentService, p: *zmodu.ai.AiProvider) void {
         \\        self.provider = p;
         \\    }
-        \\    pub fn setQuota(self: *AiAgentService, q: *zigmodu.ai.TokenQuota) void {
+        \\    pub fn setQuota(self: *AiAgentService, q: *zmodu.ai.TokenQuota) void {
         \\        self.quota = q;
         \\    }
         \\    /// Replace the authority policy. Keep the default (empty) policy until
         \\    /// you know which skills the agent should be allowed to call.
-        \\    pub fn setGuard(self: *AiAgentService, g: zigmodu.ai.Guard) void {
+        \\    pub fn setGuard(self: *AiAgentService, g: zmodu.ai.Guard) void {
         \\        self.guard = g;
         \\    }
-        \\    pub fn run(self: *AiAgentService, allocator: std.mem.Allocator, goal: []const u8, ctx: *zigmodu.ai.SkillContext) !zigmodu.ai.AgentResult {
+        \\    pub fn run(self: *AiAgentService, allocator: std.mem.Allocator, goal: []const u8, ctx: *zmodu.ai.SkillContext) !zmodu.ai.AgentResult {
         \\        const provider = self.provider orelse return error.NoProvider;
         \\        var run_repo = self.persistence.runRepo();
-        \\        var agent = zigmodu.ai.Agent{
+        \\        var agent = zmodu.ai.Agent{
         \\            .provider = provider,
         \\            .registry = self.registry,
         \\            .name = "ai/agent",
@@ -7320,9 +7320,9 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
         \\        };
         \\        return result;
         \\    }
-        \\    pub fn getRuns(self: *AiAgentService, tenant_id: i64, page: usize, size: usize) !zigmodu.data.orm.PageResult(model.AgentRun) {
+        \\    pub fn getRuns(self: *AiAgentService, tenant_id: i64, page: usize, size: usize) !zmodu.data.orm.PageResult(model.AgentRun) {
         \\        var repo = self.persistence.runRepo();
-        \\        return try repo.findPageFiltered(self.persistence.backend.allocator, "WHERE tenant_id = ?", &.{zigmodu.data.sqlx.Value{ .int = tenant_id }}, page, size);
+        \\        return try repo.findPageFiltered(self.persistence.backend.allocator, "WHERE tenant_id = ?", &.{zmodu.data.sqlx.Value{ .int = tenant_id }}, page, size);
         \\    }
         \\    pub fn getRun(self: *AiAgentService, id: i64) !?model.AgentRun {
         \\        var repo = self.persistence.runRepo();
@@ -7336,8 +7336,8 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
     defer allocator.free(api_path);
     try safeWrite(io, allocator, api_path,
         \\const std = @import("std");
-        \\const zigmodu = @import("zigmodu");
-        \\const http = zigmodu.http;
+        \\const zmodu = @import("zmodu");
+        \\const http = zmodu.http;
         \\const service = @import("service.zig");
         \\const R = @import("../../../shared/response.zig");
         \\pub const AiAgentApi = struct {
@@ -7367,7 +7367,7 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
         \\        if (goal.len == 0) { try R.wrapErr(ctx, .validation_failed, "missing goal"); return; }
         \\        // Identity rides on the run: memory recall and the audit trail are
         \\        // tenant+user scoped, and 0 means "any" to both.
-        \\        var skill_ctx = zigmodu.ai.SkillContext{
+        \\        var skill_ctx = zmodu.ai.SkillContext{
         \\            .allocator = ctx.allocator,
         \\            .tenant_id = tenantId(ctx),
         \\            .user_id = ctx.userIdInt(i64),
@@ -7398,9 +7398,9 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
     defer allocator.free(esvc_path);
     if (false) {
         if (!fileExists(io, esvc_path)) try safeWrite(io, allocator, esvc_path,
-            \\const std = @import("std"); const zigmodu = @import("zigmodu"); const ext_svc = @import("../service.zig");
-            \\pub const AiAgentServiceExt = struct { svc: *ext_svc.AiAgentService; backend: zigmodu.data.SqlxBackend;
-            \\    pub fn init(svc: *ext_svc.AiAgentService, backend: zigmodu.data.SqlxBackend) AiAgentServiceExt { return .{ .svc = svc, .backend = backend }; }
+            \\const std = @import("std"); const zmodu = @import("zmodu"); const ext_svc = @import("../service.zig");
+            \\pub const AiAgentServiceExt = struct { svc: *ext_svc.AiAgentService; backend: zmodu.data.SqlxBackend;
+            \\    pub fn init(svc: *ext_svc.AiAgentService, backend: zmodu.data.SqlxBackend) AiAgentServiceExt { return .{ .svc = svc, .backend = backend }; }
             \\};
         , gen_opts);
     } // if(false) — ext/ removed
@@ -7410,7 +7410,7 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
     defer allocator.free(eapi_path);
     if (false) {
         if (!fileExists(io, eapi_path)) try safeWrite(io, allocator, eapi_path,
-            \\const std = @import("std"); const zigmodu = @import("zigmodu"); const http = zigmodu.http; const R = @import("../../../../shared/response.zig"); const ext_svc = @import("service.zig");
+            \\const std = @import("std"); const zmodu = @import("zmodu"); const http = zmodu.http; const R = @import("../../../../shared/response.zig"); const ext_svc = @import("service.zig");
             \\pub const AiAgentApiExt = struct { ext: *ext_svc.AiAgentServiceExt;
             \\    pub fn init(ext: *ext_svc.AiAgentServiceExt) AiAgentApiExt { return .{ .ext = ext }; }
             \\    pub fn registerRoutes(self: *AiAgentApiExt, group: anytype) !void { _ = self; _ = group; }
@@ -7424,23 +7424,23 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
     if (!fileExists(io, test_path)) try safeWrite(io, allocator, test_path,
         \\const std = @import("std");
         \\const testing = std.testing;
-        \\const zigmodu = @import("zigmodu");
+        \\const zmodu = @import("zmodu");
         \\const agent = @import("agent.zig");
         \\
-        \\test "agent module re-exports zigmodu.ai.Agent" {
-        \\    try testing.expect(@TypeOf(agent.Agent) == @TypeOf(zigmodu.ai.Agent));
+        \\test "agent module re-exports zmodu.ai.Agent" {
+        \\    try testing.expect(@TypeOf(agent.Agent) == @TypeOf(zmodu.ai.Agent));
         \\}
         \\
         \\test "SkillRegistry tools json for agent scaffold" {
         \\    const a = testing.allocator;
-        \\    var reg = zigmodu.ai.SkillRegistry.init(a, testing.io);
+        \\    var reg = zmodu.ai.SkillRegistry.init(a, testing.io);
         \\    defer reg.deinit();
         \\    try reg.register(.{
         \\        .name = "lookup",
         \\        .description = "Look up data",
         \\        .parameters = &.{},
         \\        .handler = struct {
-        \\            fn h(_: *zigmodu.ai.SkillContext, _: std.json.Value) anyerror!std.json.Value {
+        \\            fn h(_: *zmodu.ai.SkillContext, _: std.json.Value) anyerror!std.json.Value {
         \\                return .{ .string = "42" };
         \\            }
         \\        }.h,
@@ -7458,7 +7458,7 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
         \\# AI Agent Module
         \\## ReAct execution loop: Think → Act → Observe → repeat
         \\## API: POST /ai/agent/run?goal=..., GET /ai/agent/runs
-        \\## Skills: register via zigmodu.ai.SkillRegistry, agent dispatches automatically
+        \\## Skills: register via zmodu.ai.SkillRegistry, agent dispatches automatically
         \\## Multi-tenant: agent runs scoped to tenant_id
     , gen_opts);
 }
@@ -7475,11 +7475,11 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
     const m = try allocator.print("{s}/module.zig", .{dir});
     defer allocator.free(m);
     try safeWrite(io, allocator, m,
-        \\const std = @import("std"); const zigmodu = @import("zigmodu");
-        \\pub const info = zigmodu.api.Module{ .name = "web4", .description = "Web4: DID identity + x402 monetization", .dependencies = &.{}, .is_internal = false };
+        \\const std = @import("std"); const zmodu = @import("zmodu");
+        \\pub const info = zmodu.api.Module{ .name = "web4", .description = "Web4: DID identity + x402 monetization", .dependencies = &.{}, .is_internal = false };
         \\pub fn init() !void { std.log.info("[web4] ready", .{}); }
         \\pub fn deinit() void {}
-        \\pub fn registerHealthChecks(e: *zigmodu.HealthEndpoint) !void { try e.registerCheck("web4", "Web4 module", zigmodu.HealthEndpoint.alwaysUp); }
+        \\pub fn registerHealthChecks(e: *zmodu.HealthEndpoint) !void { try e.registerCheck("web4", "Web4 module", zmodu.HealthEndpoint.alwaysUp); }
         \\pub const model = @import("model.zig"); pub const persistence = @import("persistence.zig");
         \\pub const service = @import("service.zig"); pub const api = @import("api.zig");
     , gen_opts);
@@ -7505,7 +7505,7 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
     const pp = try allocator.print("{s}/persistence.zig", .{dir});
     defer allocator.free(pp);
     try safeWrite(io, allocator, pp,
-        \\const std = @import("std"); const data = @import("zigmodu").data; const model = @import("model.zig");
+        \\const std = @import("std"); const data = @import("zmodu").data; const model = @import("model.zig");
         \\pub const Web4Persistence = struct { backend: data.SqlxBackend, orm: data.orm.Orm(data.SqlxBackend),
         \\    pub fn init(b: data.SqlxBackend) Web4Persistence { return .{ .backend = b, .orm = .{ .backend = b } }; }
         \\    pub fn identityRepo(self: *Web4Persistence) data.Repository(model.Web4Identity) { return .{ .orm = &self.orm }; }
@@ -7517,11 +7517,11 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
     const sp = try allocator.print("{s}/service.zig", .{dir});
     defer allocator.free(sp);
     try safeWrite(io, allocator, sp,
-        \\const std = @import("std"); const zigmodu = @import("zigmodu"); const model = @import("model.zig"); const persistence = @import("persistence.zig");
+        \\const std = @import("std"); const zmodu = @import("zmodu"); const model = @import("model.zig"); const persistence = @import("persistence.zig");
         \\pub const Web4Service = struct { persistence: *persistence.Web4Persistence, allocator: std.mem.Allocator, io: std.Io,
         \\    pub fn init(p: *persistence.Web4Persistence, a: std.mem.Allocator, i: std.Io) Web4Service { return .{ .persistence = p, .allocator = a, .io = i }; }
         \\    pub fn createIdentity(self: *Web4Service, tenant_id: i64, user_id: i64) !model.Web4Identity {
-        \\        var did_key = try zigmodu.web4.DidKey.generate(self.allocator, self.io);
+        \\        var did_key = try zmodu.web4.DidKey.generate(self.allocator, self.io);
         \\        const doc = try did_key.document(self.allocator); defer self.allocator.free(doc);
         \\        var repo = self.persistence.identityRepo();
         \\        // tenant_id rides in from the verified JWT attr, so the
@@ -7535,7 +7535,7 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
         \\        return try repo.insertUnscoped(.{ .id = null, .tenant_id = tenant_id, .invoice_id = inv_id, .payee_did = payee_did, .amount = amount, .currency = currency, .created_at = 0 });
         \\    }
         \\    pub fn getIdentity(self: *Web4Service, tenant_id: i64, user_id: i64) !?model.Web4Identity { var repo = self.persistence.identityRepo(); return try repo.findByIdForTenant("tenant_id", tenant_id, user_id); }
-        \\    pub fn getInvoices(self: *Web4Service, tenant_id: i64, page: usize, size: usize) !zigmodu.data.orm.PageResult(model.Web4Invoice) { var repo = self.persistence.invoiceRepo(); return try repo.findPageForTenant("tenant_id", tenant_id, page, size); }
+        \\    pub fn getInvoices(self: *Web4Service, tenant_id: i64, page: usize, size: usize) !zmodu.data.orm.PageResult(model.Web4Invoice) { var repo = self.persistence.invoiceRepo(); return try repo.findPageForTenant("tenant_id", tenant_id, page, size); }
         \\};
     , gen_opts);
 
@@ -7544,8 +7544,8 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
     defer allocator.free(ap);
     try safeWrite(io, allocator, ap,
         \\const std = @import("std");
-        \\const zigmodu = @import("zigmodu");
-        \\const http = zigmodu.http;
+        \\const zmodu = @import("zmodu");
+        \\const http = zmodu.http;
         \\const service = @import("service.zig");
         \\const model = @import("model.zig");
         \\const R = @import("../../shared/response.zig");
@@ -7623,9 +7623,9 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
     defer allocator.free(es);
     if (false) {
         if (!fileExists(io, es)) try safeWrite(io, allocator, es,
-            \\const std = @import("std"); const zigmodu = @import("zigmodu"); const ext_svc = @import("../service.zig");
-            \\pub const Web4ServiceExt = struct { svc: *ext_svc.Web4Service; backend: zigmodu.data.SqlxBackend;
-            \\    pub fn init(svc: *ext_svc.Web4Service, backend: zigmodu.data.SqlxBackend) Web4ServiceExt { return .{ .svc = svc, .backend = backend }; }
+            \\const std = @import("std"); const zmodu = @import("zmodu"); const ext_svc = @import("../service.zig");
+            \\pub const Web4ServiceExt = struct { svc: *ext_svc.Web4Service; backend: zmodu.data.SqlxBackend;
+            \\    pub fn init(svc: *ext_svc.Web4Service, backend: zmodu.data.SqlxBackend) Web4ServiceExt { return .{ .svc = svc, .backend = backend }; }
             \\};
         , gen_opts);
     } // if(false) — ext/ removed
@@ -7635,7 +7635,7 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
     defer allocator.free(ea);
     if (false) {
         if (!fileExists(io, ea)) try safeWrite(io, allocator, ea,
-            \\const std = @import("std"); const zigmodu = @import("zigmodu"); const http = zigmodu.http; const R = @import("../../../shared/response.zig"); const ext_svc = @import("service.zig");
+            \\const std = @import("std"); const zmodu = @import("zmodu"); const http = zmodu.http; const R = @import("../../../shared/response.zig"); const ext_svc = @import("service.zig");
             \\pub const Web4ApiExt = struct { ext: *ext_svc.Web4ServiceExt;
             \\    pub fn init(ext: *ext_svc.Web4ServiceExt) Web4ApiExt { return .{ .ext = ext }; }
             \\    pub fn registerRoutes(self: *Web4ApiExt, group: anytype) !void { _ = self; _ = group; }
@@ -7647,13 +7647,13 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
     const wt = try allocator.print("{s}/tests.zig", .{dir});
     defer allocator.free(wt);
     if (!fileExists(io, wt)) try safeWrite(io, allocator, wt,
-        \\const std = @import("std"); const testing = std.testing; const zigmodu = @import("zigmodu"); const model = @import("model.zig");
+        \\const std = @import("std"); const testing = std.testing; const zmodu = @import("zmodu"); const model = @import("model.zig");
         \\test "Web4Identity defaults" { const i = model.Web4Identity{ .id = null, .tenant_id = 1, .user_id = 1, .did = "did:key:z6Mk...", .did_doc = "{}", .public_key = "ed25519", .created_at = 0 }; try testing.expectEqual(@as(i64, 1), i.tenant_id); }
         \\test "Web4Invoice defaults" { const inv = model.Web4Invoice{ .id = null, .tenant_id = 1, .invoice_id = "inv-1", .payee_did = "did:key:z...", .amount = 1000000, .currency = "usdc", .created_at = 0 }; try testing.expectEqualStrings("pending", inv.status); }
-        \\test "DID generate and resolve" { var did = try zigmodu.web4.DidKey.generate(testing.allocator, testing.io); defer testing.allocator.free(did.did); const doc = try did.document(testing.allocator); defer testing.allocator.free(doc); try testing.expect(std.mem.indexOf(u8, doc, "did:key:z") != null); }
-        \\test "DID sign verify roundtrip" { var did = try zigmodu.web4.DidKey.generate(testing.allocator, testing.io); defer testing.allocator.free(did.did); const sig = try did.sign(testing.allocator, "test"); defer testing.allocator.free(sig); try testing.expect(try did.verify("test", sig)); }
-        \\test "x402 invoice fields" { const inv = zigmodu.web4.x402.Invoice{ .id = "inv-1", .payee_did = "did:key:z...", .amount = 500000, .currency = .usdc, .deadline = 0, .description = "test" }; try testing.expectEqual(@as(u64, 500000), inv.amount); }
-        \\test "x402 payment fail-closed" { const proof = zigmodu.web4.x402.PaymentProof{ .tx_hash = "0xabc", .invoice_id = "inv-1" }; try testing.expect(!zigmodu.web4.x402.verifyPayment(proof)); try testing.expect(zigmodu.web4.x402.verifyWith(zigmodu.web4.x402.verifyPaymentAllowAll, proof)); }
+        \\test "DID generate and resolve" { var did = try zmodu.web4.DidKey.generate(testing.allocator, testing.io); defer testing.allocator.free(did.did); const doc = try did.document(testing.allocator); defer testing.allocator.free(doc); try testing.expect(std.mem.indexOf(u8, doc, "did:key:z") != null); }
+        \\test "DID sign verify roundtrip" { var did = try zmodu.web4.DidKey.generate(testing.allocator, testing.io); defer testing.allocator.free(did.did); const sig = try did.sign(testing.allocator, "test"); defer testing.allocator.free(sig); try testing.expect(try did.verify("test", sig)); }
+        \\test "x402 invoice fields" { const inv = zmodu.web4.x402.Invoice{ .id = "inv-1", .payee_did = "did:key:z...", .amount = 500000, .currency = .usdc, .deadline = 0, .description = "test" }; try testing.expectEqual(@as(u64, 500000), inv.amount); }
+        \\test "x402 payment fail-closed" { const proof = zmodu.web4.x402.PaymentProof{ .tx_hash = "0xabc", .invoice_id = "inv-1" }; try testing.expect(!zmodu.web4.x402.verifyPayment(proof)); try testing.expect(zmodu.web4.x402.verifyWith(zmodu.web4.x402.verifyPaymentAllowAll, proof)); }
     , gen_opts);
 
     // ── README.md ──
@@ -7664,7 +7664,7 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
         \\## Identity (DID)
         \\- POST /web4/identity — create did:key identity for the JWT-authenticated user (tenant + user come from the token)
         \\- GET /web4/identity — get own identity
-        \\- DID resolver: `zigmodu.web4.resolve("did:key:z...")`
+        \\- DID resolver: `zmodu.web4.resolve("did:key:z...")`
         \\## Monetization (x402)
         \\- POST /web4/invoice?amount=N&currency=usdc — create invoice for the caller's tenant
         \\- GET /web4/invoices — list the caller's tenant invoices
@@ -7698,9 +7698,9 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
         \\//! @initialized by zmodu — AI may modify
         \\//! IM module — real-time messaging
         \\const std = @import("std");
-        \\const zigmodu = @import("zigmodu");
+        \\const zmodu = @import("zmodu");
         \\
-        \\pub const info = zigmodu.api.Module{
+        \\pub const info = zmodu.api.Module{
         \\    .name = "im",
         \\    .description = "Real-time messaging module",
         \\    .dependencies = &.{},
@@ -7709,8 +7709,8 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
         \\
         \\pub fn init() !void { std.log.info("[im] initializing", .{}); }
         \\pub fn deinit() void { std.log.info("[im] shutting down", .{}); }
-        \\pub fn registerHealthChecks(endpoint: *zigmodu.HealthEndpoint) !void {
-        \\    try endpoint.registerCheck("im", "IM module health", zigmodu.HealthEndpoint.alwaysUp);
+        \\pub fn registerHealthChecks(endpoint: *zmodu.HealthEndpoint) !void {
+        \\    try endpoint.registerCheck("im", "IM module health", zmodu.HealthEndpoint.alwaysUp);
         \\}
         \\
         \\pub const model = @import("model.zig");
@@ -7888,16 +7888,16 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
             \\Override the onMessage() function in gateway.zig:
             \\```zig
             \\// Parse JSON frames, dispatch to service methods
-            \\fn onMessage(session_ptr: ?*anyopaque, msg: []const u8, kind: zigmodu.http.WsFrameKind) void { ... }
+            \\fn onMessage(session_ptr: ?*anyopaque, msg: []const u8, kind: zmodu.http.WsFrameKind) void { ... }
             \\```
             \\
             \\## Key Types
             \\
             \\| Type | Location | Purpose |
             \\|------|----------|---------|
-            \\| `ConnectionRegistry` | `zigmodu.im.ConnectionRegistry` | userId→connection map |
+            \\| `ConnectionRegistry` | `zmodu.im.ConnectionRegistry` | userId→connection map |
             \\| `WsSession` | `gateway.zig` | Per-connection state + framer |
-            \\| `WsFramer` | `zigmodu.im.WsFramer` | RFC 6455 frame read/write |
+            \\| `WsFramer` | `zmodu.im.WsFramer` | RFC 6455 frame read/write |
             \\| `ImRelay` | `relay.zig` | Write DB + push to online |
             \\| `ImGateway` | `gateway.zig` | WS lifecycle + cleanup |
             \\
@@ -7912,7 +7912,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
             \\
             \\```bash
             \\# Run IM-specific tests
-            \\zig test src/modules/im/tests.zig --dep zigmodu -Mzigmodu=<path>/root.zig
+            \\zig test src/modules/im/tests.zig --dep zmodu -Mzmodu=<path>/root.zig
             \\```
             \\
         , gen_opts);
@@ -8004,7 +8004,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
             \\Add to your main.zig before server.start():
             \\
             \\```zig
-            \\var uring = try zigmodu.im.WsUring.init(allocator, io, .{
+            \\var uring = try zmodu.im.WsUring.init(allocator, io, .{
             \\    .max_connections = 16384,
             \\});
             \\try uring.start();
@@ -8102,7 +8102,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
     try safeWrite(io, allocator, pers_path,
         \\//! @initialized by zmodu — AI may modify
         \\const std = @import("std");
-        \\const data = @import("zigmodu").data;
+        \\const data = @import("zmodu").data;
         \\const model = @import("model.zig");
         \\
         \\pub const ImPersistence = struct {
@@ -8131,8 +8131,8 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
     try safeWrite(io, allocator, svc_path,
         \\//! @initialized by zmodu — AI may modify
         \\const std = @import("std");
-        \\const zigmodu = @import("zigmodu");
-        \\const data = zigmodu.data;
+        \\const zmodu = @import("zmodu");
+        \\const data = zmodu.data;
         \\const model = @import("model.zig");
         \\const persistence = @import("persistence.zig");
         \\
@@ -8189,7 +8189,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
     try safeWrite(io, allocator, api_path,
         \\//! @initialized by zmodu — AI may modify
         \\const std = @import("std");
-        \\const http = @import("zigmodu").http;
+        \\const http = @import("zmodu").http;
         \\const service = @import("service.zig");
         \\const model = @import("model.zig");
         \\const gateway = @import("gateway.zig");
@@ -8275,14 +8275,14 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
         \\//! @initialized by zmodu — AI may modify
         \\//! Single-node message relay: writes to DB, then pushes to online users via ConnectionRegistry.
         \\const std = @import("std");
-        \\const zigmodu = @import("zigmodu");
+        \\const zmodu = @import("zmodu");
         \\const model = @import("model.zig");
         \\
         \\pub const ImRelay = struct {
-        \\    registry: *zigmodu.im.ConnectionRegistry,
+        \\    registry: *zmodu.im.ConnectionRegistry,
         \\    allocator: std.mem.Allocator,
         \\
-        \\    pub fn init(registry: *zigmodu.im.ConnectionRegistry, allocator: std.mem.Allocator) ImRelay {
+        \\    pub fn init(registry: *zmodu.im.ConnectionRegistry, allocator: std.mem.Allocator) ImRelay {
         \\        return .{ .registry = registry, .allocator = allocator };
         \\    }
         \\
@@ -8303,10 +8303,10 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
         \\//! @initialized by zmodu — AI may modify
         \\//! WebSocket gateway: WS upgrade + ConnectionRegistry integration.
         \\const std = @import("std");
-        \\const zigmodu = @import("zigmodu");
-        \\const http = zigmodu.http;
-        \\const ConnectionRegistry = zigmodu.im.ConnectionRegistry;
-        \\const WsFramer = zigmodu.im.WsFramer;
+        \\const zmodu = @import("zmodu");
+        \\const http = zmodu.http;
+        \\const ConnectionRegistry = zmodu.im.ConnectionRegistry;
+        \\const WsFramer = zmodu.im.WsFramer;
         \\
         \\/// Per-connection session stored in ConnectionRegistry.
         \\pub const WsSession = struct {
@@ -8325,7 +8325,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
         \\        try self.sendFrame(.binary, msg);
         \\    }
         \\
-        \\    pub fn sendFrame(self: *WsSession, kind: zigmodu.http.WsFrameKind, msg: []const u8) !void {
+        \\    pub fn sendFrame(self: *WsSession, kind: zmodu.http.WsFrameKind, msg: []const u8) !void {
         \\        self.mutex.lock(self.framer.io) catch return error.NotConnected;
         \\        defer self.mutex.unlock(self.framer.io);
         \\        try self.framer.writeData(kind, msg);
@@ -8359,7 +8359,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
         \\
         \\    /// Resolves the connecting user from the bearer token, or null to
         \\    /// refuse. `verifier_ctx` is whatever `setVerifier` handed in
-        \\    /// (the scaffold passes `*zigmodu.security.AppSecurity`).
+        \\    /// (the scaffold passes `*zmodu.security.AppSecurity`).
         \\    ///
         \\    /// **Null unless wired**, and that default is the point: this gateway
         \\    /// cannot guess an identity safely, so the unwired state refuses every
@@ -8419,7 +8419,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
         \\        try session.send(msg);
         \\    }
         \\
-        \\    pub fn onMessage(session_ptr: ?*anyopaque, msg: []const u8, kind: zigmodu.http.WsFrameKind) void {
+        \\    pub fn onMessage(session_ptr: ?*anyopaque, msg: []const u8, kind: zmodu.http.WsFrameKind) void {
         \\        _ = kind; // .text = JSON IM; .binary = opaque (protobuf / OpenIM)
         \\        const session: *WsSession = @ptrCast(@alignCast(session_ptr orelse return));
         \\        if (session.gateway.msg_handler) |h| h(session.gateway.msg_ctx.?, session.user_id, msg);
@@ -8444,14 +8444,14 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
                 \\// IM service extension — add custom business logic here.
                 \\// @initialized — AI may modify freely.
                 \\const std = @import("std");
-                \\const zigmodu = @import("zigmodu");
+                \\const zmodu = @import("zmodu");
                 \\const ext_svc = @import("../service.zig");
                 \\
                 \\pub const ImServiceExt = struct {
                 \\    svc: *ext_svc.ImService,
-                \\    backend: zigmodu.data.SqlxBackend,
+                \\    backend: zmodu.data.SqlxBackend,
                 \\
-                \\    pub fn init(svc: *ext_svc.ImService, backend: zigmodu.data.SqlxBackend) ImServiceExt {
+                \\    pub fn init(svc: *ext_svc.ImService, backend: zmodu.data.SqlxBackend) ImServiceExt {
                 \\        return .{ .svc = svc, .backend = backend };
                 \\    }
                 \\};
@@ -8469,8 +8469,8 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
                 \\// IM API extension — add custom endpoints here.
                 \\// @initialized — AI may modify freely.
                 \\const std = @import("std");
-                \\const zigmodu = @import("zigmodu");
-                \\const http = zigmodu.http;
+                \\const zmodu = @import("zmodu");
+                \\const http = zmodu.http;
                 \\const R = @import("../../../shared/response.zig");
                 \\const ext_svc = @import("service.zig");
                 \\
@@ -8500,13 +8500,13 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
             \\//! Integration tests for IM module.
             \\const std = @import("std");
             \\const testing = std.testing;
-            \\const zigmodu = @import("zigmodu");
+            \\const zmodu = @import("zmodu");
             \\const model = @import("model.zig");
             \\const persistence = @import("persistence.zig");
             \\const service = @import("service.zig");
             \\const gateway = @import("gateway.zig");
             \\const relay = @import("relay.zig");
-            \\const WsFramer = zigmodu.im.WsFramer;
+            \\const WsFramer = zmodu.im.WsFramer;
             \\
             \\test "model Message default values" {
             \\    const msg = model.Message{
@@ -8584,7 +8584,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
             \\}
             \\
             \\test "ConnectionRegistry register unregister" {
-            \\    var reg = zigmodu.im.ConnectionRegistry.init(testing.allocator, testing.io);
+            \\    var reg = zmodu.im.ConnectionRegistry.init(testing.allocator, testing.io);
             \\    defer reg.deinit();
             \\
             \\    var dummy: u8 = 0;
@@ -8599,13 +8599,13 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
             \\}
             \\
             \\test "ConnectionRegistry sendToUser offline" {
-            \\    var reg = zigmodu.im.ConnectionRegistry.init(testing.allocator, testing.io);
+            \\    var reg = zmodu.im.ConnectionRegistry.init(testing.allocator, testing.io);
             \\    defer reg.deinit();
             \\    try testing.expect(!reg.sendToUser(999, "nobody home"));
             \\}
             \\
             \\test "ConnectionRegistry heartbeat and cleanup" {
-            \\    var reg = zigmodu.im.ConnectionRegistry.init(testing.allocator, testing.io);
+            \\    var reg = zmodu.im.ConnectionRegistry.init(testing.allocator, testing.io);
             \\    defer reg.deinit();
             \\
             \\    var dummy: u8 = 0;
@@ -8621,7 +8621,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
             \\}
             \\
             \\test "relay delivers to online user" {
-            \\    var reg = zigmodu.im.ConnectionRegistry.init(testing.allocator, testing.io);
+            \\    var reg = zmodu.im.ConnectionRegistry.init(testing.allocator, testing.io);
             \\    defer reg.deinit();
             \\
             \\    var captured: [512]u8 = undefined;
@@ -8673,7 +8673,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
             \\}
             \\
             \\test "BufferPool stress: acquire/release many buffers" {
-            \\    var pool = zigmodu.im.BufferPool.init(testing.allocator, testing.io, 50);
+            \\    var pool = zmodu.im.BufferPool.init(testing.allocator, testing.io, 50);
             \\    defer pool.deinit();
             \\
             \\    var buffers: [50][]u8 = undefined;
@@ -8685,7 +8685,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
             \\}
             \\
             \\test "ConnectionRegistry parallel: unique user IDs per shard" {
-            \\    var reg = zigmodu.im.ConnectionRegistry.init(testing.allocator, testing.io);
+            \\    var reg = zmodu.im.ConnectionRegistry.init(testing.allocator, testing.io);
             \\    defer reg.deinit();
             \\
             \\    var dummy: u8 = 0;
@@ -8712,7 +8712,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
             \\}
             \\
             \\test "relay deliver content verification" {
-            \\    var reg = zigmodu.im.ConnectionRegistry.init(testing.allocator, testing.io);
+            \\    var reg = zmodu.im.ConnectionRegistry.init(testing.allocator, testing.io);
             \\    defer reg.deinit();
             \\
             \\    var captured: [512]u8 = undefined;
@@ -8767,7 +8767,7 @@ fn generateLifeDir(io: std.Io, allocator: std.mem.Allocator, out_dir: []const u8
     defer allocator.free(dp);
     var dna: std.ArrayList(u8) = .empty;
     defer dna.deinit(allocator);
-    try dna.print(allocator, "# {s}\ngenesis: zmodu scaffold\ntables: {d}\nmodules: {d}\nframework: zigmodu v{s}\nzig: 0.17.0\n", .{ project_name, table_count, module_count, ZMODU_VERSION });
+    try dna.print(allocator, "# {s}\ngenesis: zmodu scaffold\ntables: {d}\nmodules: {d}\nframework: zmodu v{s}\nzig: 0.17.0\n", .{ project_name, table_count, module_count, ZMODU_VERSION });
     try safeWrite(io, allocator, dp, dna.items, gen_opts);
 
     // manifest.json — compact
@@ -8801,23 +8801,23 @@ fn generateClaudeSkills(io: std.Io, allocator: std.mem.Allocator, out_dir: []con
     defer allocator.free(skills_dir);
     try ensureDirGen(io, skills_dir, gen_opts);
 
-    const skill_dirs = [_][]const u8{ "zigmodu-build", "zigmodu-life", "zigmodu-project", "zigmodu-module", "zigmodu-api", "zigmodu-orm", "zigmodu-analyze", "zigmodu-translate", "zigmodu-harness", "zigmodu-plugin" };
+    const skill_dirs = [_][]const u8{ "zmodu-build", "zmodu-life", "zmodu-project", "zmodu-module", "zmodu-api", "zmodu-orm", "zmodu-analyze", "zmodu-translate", "zmodu-harness", "zmodu-plugin" };
     for (skill_dirs) |sd| {
         const d = try allocator.print("{s}/{s}", .{ skills_dir, sd });
         defer allocator.free(d);
         try ensureDirGen(io, d, gen_opts);
     }
 
-    // zigmodu-build (master skill — always start here)
-    const sb = try allocator.print("{s}/zigmodu-build/SKILL.md", .{skills_dir});
+    // zmodu-build (master skill — always start here)
+    const sb = try allocator.print("{s}/zmodu-build/SKILL.md", .{skills_dir});
     defer allocator.free(sb);
     try safeWrite(io, allocator, sb,
         \\---
-        \\name: zigmodu-build
-        \\description: Build complete ZigModu backend — greenfield/SQL/migration. zmodu generates all possible code, AI fills only gaps. Always start here.
+        \\name: zmodu-build
+        \\description: Build complete zmodu backend — greenfield/SQL/migration. zmodu generates all possible code, AI fills only gaps. Always start here.
         \\---
         \\
-        \\# ZigModu Build — First Principle
+        \\# zmodu Build — First Principle
         \\
         \\**zmodu generates everything possible. AI only writes what zmodu cannot.**
         \\
@@ -8868,12 +8868,12 @@ fn generateClaudeSkills(io: std.Io, allocator: std.mem.Allocator, out_dir: []con
         \\
     , gen_opts);
 
-    // zigmodu-life
-    const sl = try allocator.print("{s}/zigmodu-life/SKILL.md", .{skills_dir});
+    // zmodu-life
+    const sl = try allocator.print("{s}/zmodu-life/SKILL.md", .{skills_dir});
     defer allocator.free(sl);
     try safeWrite(io, allocator, sl,
         \\---
-        \\name: zigmodu-life
+        \\name: zmodu-life
         \\description: Project digital life system. Use zmodu life CLI for all .life/ operations. Read .life/ on first contact. Record decisions via JSONL. Evolve milestones via tree/.
         \\---
         \\
@@ -8903,16 +8903,16 @@ fn generateClaudeSkills(io: std.Io, allocator: std.mem.Allocator, out_dir: []con
         \\
     , gen_opts);
 
-    // zigmodu-project
-    const sp = try allocator.print("{s}/zigmodu-project/SKILL.md", .{skills_dir});
+    // zmodu-project
+    const sp = try allocator.print("{s}/zmodu-project/SKILL.md", .{skills_dir});
     defer allocator.free(sp);
     try safeWrite(io, allocator, sp,
         \\---
-        \\name: zigmodu-project
-        \\description: Navigate and understand a ZigModu project. Use when exploring the codebase, understanding module conventions, or learning the project layout.
+        \\name: zmodu-project
+        \\description: Navigate and understand a zmodu project. Use when exploring the codebase, understanding module conventions, or learning the project layout.
         \\---
         \\
-        \\# ZigModu Project Navigation
+        \\# zmodu Project Navigation
         \\
         \\## Module Structure (5 files per module)
         \\```
@@ -8929,14 +8929,14 @@ fn generateClaudeSkills(io: std.Io, allocator: std.mem.Allocator, out_dir: []con
         \\pub const info = api.Module{ .name = "x", .dependencies = &.{}, .is_internal = false };
         \\pub fn init() !void { ... }
         \\pub fn deinit() void { ... }
-        \\pub fn registerHealthChecks(endpoint: *zigmodu.HealthEndpoint) !void { ... }
+        \\pub fn registerHealthChecks(endpoint: *zmodu.HealthEndpoint) !void { ... }
         \\```
         \\
         \\## Import Conventions
-        \\- module.zig → `const api = zigmodu.api;`
-        \\- persistence.zig → `const data = @import("zigmodu").data;`
-        \\- service.zig → `const data = zigmodu.data;`
-        \\- api.zig → `const http = @import("zigmodu").http;`
+        \\- module.zig → `const api = zmodu.api;`
+        \\- persistence.zig → `const data = @import("zmodu").data;`
+        \\- service.zig → `const data = zmodu.data;`
+        \\- api.zig → `const http = @import("zmodu").http;`
         \\
         \\## Building
         \\```bash
@@ -8947,16 +8947,16 @@ fn generateClaudeSkills(io: std.Io, allocator: std.mem.Allocator, out_dir: []con
         \\
     , gen_opts);
 
-    // zigmodu-module
-    const sm = try allocator.print("{s}/zigmodu-module/SKILL.md", .{skills_dir});
+    // zmodu-module
+    const sm = try allocator.print("{s}/zmodu-module/SKILL.md", .{skills_dir});
     defer allocator.free(sm);
     try safeWrite(io, allocator, sm,
         \\---
-        \\name: zigmodu-module
-        \\description: Create a new ZigModu module. Use when adding a domain module, CRUD resource, or business logic unit.
+        \\name: zmodu-module
+        \\description: Create a new zmodu module. Use when adding a domain module, CRUD resource, or business logic unit.
         \\---
         \\
-        \\# Create a ZigModu Module
+        \\# Create a zmodu Module
         \\
         \\## Quick Start
         \\```bash
@@ -8993,13 +8993,13 @@ fn generateClaudeSkills(io: std.Io, allocator: std.mem.Allocator, out_dir: []con
         \\
     , gen_opts);
 
-    // zigmodu-api
-    const sa = try allocator.print("{s}/zigmodu-api/SKILL.md", .{skills_dir});
+    // zmodu-api
+    const sa = try allocator.print("{s}/zmodu-api/SKILL.md", .{skills_dir});
     defer allocator.free(sa);
     try safeWrite(io, allocator, sa,
         \\---
-        \\name: zigmodu-api
-        \\description: Add REST API endpoints to a ZigModu module. Use when adding routes, custom handlers, or middleware.
+        \\name: zmodu-api
+        \\description: Add REST API endpoints to a zmodu module. Use when adding routes, custom handlers, or middleware.
         \\---
         \\
         \\# Add REST API Endpoints
@@ -9036,12 +9036,12 @@ fn generateClaudeSkills(io: std.Io, allocator: std.mem.Allocator, out_dir: []con
         \\
     , gen_opts);
 
-    // zigmodu-orm
-    const so = try allocator.print("{s}/zigmodu-orm/SKILL.md", .{skills_dir});
+    // zmodu-orm
+    const so = try allocator.print("{s}/zmodu-orm/SKILL.md", .{skills_dir});
     defer allocator.free(so);
     try safeWrite(io, allocator, so,
         \\---
-        \\name: zigmodu-orm
+        \\name: zmodu-orm
         \\description: Generate ORM modules from SQL schema. Use when creating persistence layers or scaffolding from CREATE TABLE statements.
         \\---
         \\
@@ -9076,13 +9076,13 @@ fn generateClaudeSkills(io: std.Io, allocator: std.mem.Allocator, out_dir: []con
         \\
     , gen_opts);
 
-    // zigmodu-analyze
-    const san = try allocator.print("{s}/zigmodu-analyze/SKILL.md", .{skills_dir});
+    // zmodu-analyze
+    const san = try allocator.print("{s}/zmodu-analyze/SKILL.md", .{skills_dir});
     defer allocator.free(san);
     try safeWrite(io, allocator, san,
         \\---
-        \\name: zigmodu-analyze
-        \\description: Analyze Java/PHP project to extract schema, routes, module boundaries. Use when migrating legacy backend to ZigModu.
+        \\name: zmodu-analyze
+        \\description: Analyze Java/PHP project to extract schema, routes, module boundaries. Use when migrating legacy backend to zmodu.
         \\---
         \\
         \\# Analyze Legacy Backend
@@ -9109,13 +9109,13 @@ fn generateClaudeSkills(io: std.Io, allocator: std.mem.Allocator, out_dir: []con
         \\
     , gen_opts);
 
-    // zigmodu-translate
-    const stn = try allocator.print("{s}/zigmodu-translate/SKILL.md", .{skills_dir});
+    // zmodu-translate
+    const stn = try allocator.print("{s}/zmodu-translate/SKILL.md", .{skills_dir});
     defer allocator.free(stn);
     try safeWrite(io, allocator, stn,
         \\---
-        \\name: zigmodu-translate
-        \\description: Translate Java/PHP code to ZigModu Zig. Use when converting services, controllers, or domain logic.
+        \\name: zmodu-translate
+        \\description: Translate Java/PHP code to zmodu Zig. Use when converting services, controllers, or domain logic.
         \\---
         \\
         \\# Translate Legacy Code
@@ -9154,13 +9154,13 @@ fn generateClaudeSkills(io: std.Io, allocator: std.mem.Allocator, out_dir: []con
         \\
     , gen_opts);
 
-    // zigmodu-harness
-    const sha = try allocator.print("{s}/zigmodu-harness/SKILL.md", .{skills_dir});
+    // zmodu-harness
+    const sha = try allocator.print("{s}/zmodu-harness/SKILL.md", .{skills_dir});
     defer allocator.free(sha);
     try safeWrite(io, allocator, sha,
         \\---
-        \\name: zigmodu-harness
-        \\description: Run migration verification — diff test old vs new, verify schema, benchmark. Use when validating ZigModu migration.
+        \\name: zmodu-harness
+        \\description: Run migration verification — diff test old vs new, verify schema, benchmark. Use when validating zmodu migration.
         \\---
         \\
         \\# Migration Verification Harness
@@ -9196,12 +9196,12 @@ fn generateClaudeSkills(io: std.Io, allocator: std.mem.Allocator, out_dir: []con
         \\
     , gen_opts);
 
-    // zigmodu-plugin
-    const spl = try allocator.print("{s}/zigmodu-plugin/SKILL.md", .{skills_dir});
+    // zmodu-plugin
+    const spl = try allocator.print("{s}/zmodu-plugin/SKILL.md", .{skills_dir});
     defer allocator.free(spl);
     try safeWrite(io, allocator, spl,
         \\---
-        \\name: zigmodu-plugin
+        \\name: zmodu-plugin
         \\description: Generate stub plugins for missing Zig dependencies. Creates compilable placeholder modules with error.NotImplemented markers.
         \\---
         \\
@@ -9396,7 +9396,7 @@ fn cmdAdd(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
         const ext_svc = try allocator.print(
             \\// {s} service extension — survives zmodu regeneration.
             \\const std = @import("std");
-            \\const zigmodu = @import("zigmodu");
+            \\const zmodu = @import("zmodu");
             \\const svc = @import("../service.zig");
             \\pub const {s}ServiceExt = struct {{
             \\    svc: *svc.{s}Service;
@@ -9411,7 +9411,7 @@ fn cmdAdd(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
         const ext_api = try allocator.print(
             \\// {s} custom API endpoints — survives zmodu regeneration.
             \\const std = @import("std");
-            \\const zigmodu = @import("zigmodu");
+            \\const zmodu = @import("zmodu");
             \\const ext_svc = @import("service.zig");
             \\pub const {s}ApiExt = struct {{
             \\    ext: *ext_svc.{s}ServiceExt;
@@ -9638,7 +9638,7 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
         \\//! ✅ Add custom routes in api.zig `pub const routes`
         \\
         \\const std = @import("std");
-        \\const zigmodu = @import("zigmodu");
+        \\const zmodu = @import("zmodu");
         \\
         \\
     );
@@ -9664,7 +9664,7 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
             \\/// WS bearer verifier: the same AppSecurity the HTTP JWT middleware
             \\/// uses, so a token that opens an API route also opens a socket.
             \\fn wsBearerVerify(sec_ptr: *anyopaque, token: []const u8) ?u64 {
-            \\    const sec: *zigmodu.security.AppSecurity = @ptrCast(@alignCast(sec_ptr));
+            \\    const sec: *zmodu.security.AppSecurity = @ptrCast(@alignCast(sec_ptr));
             \\    const claims = sec.module.verifyToken(token) catch return null;
             \\    return std.fmt.parseInt(u64, claims.sub, 10) catch null;
             \\}
@@ -9686,8 +9686,8 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
         \\    const db_pass = env.get("DB_PASS") orelse "";
         \\    const db_name = env.get("DB_NAME") orelse "heysen";
         \\
-        \\    const db_driver: zigmodu.data.sqlx.Driver = if (std.mem.eql(u8, db_driver_str, "postgres") or std.mem.eql(u8, db_driver_str, "postgresql")) .postgres else if (std.mem.eql(u8, db_driver_str, "sqlite")) .sqlite else .mysql;
-        \\    const db_cfg = zigmodu.data.sqlx.Config{
+        \\    const db_driver: zmodu.data.sqlx.Driver = if (std.mem.eql(u8, db_driver_str, "postgres") or std.mem.eql(u8, db_driver_str, "postgresql")) .postgres else if (std.mem.eql(u8, db_driver_str, "sqlite")) .sqlite else .mysql;
+        \\    const db_cfg = zmodu.data.sqlx.Config{
         \\        .driver = db_driver,
         \\        .host = db_host,
         \\        .port = std.fmt.parseInt(u16, db_port, 10) catch 3306,
@@ -9698,15 +9698,15 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
         \\        .max_idle_conns = 5,
         \\        .sqlite_path = db_name,
         \\    };
-        \\    var db_client = try zigmodu.data.sqlx.Client.open(allocator, init.io, db_cfg);
+        \\    var db_client = try zmodu.data.sqlx.Client.open(allocator, init.io, db_cfg);
         \\    defer db_client.deinit();
         \\    std.log.info("DB connected: {s}@{s}:{s}/{s}", .{ db_user, db_host, db_port, db_name });
         \\
     );
-    try buf.print(allocator, "    zigmodu.setTenantColumn(\"{s}\");\n", .{sopts.tenant_column});
+    try buf.print(allocator, "    zmodu.setTenantColumn(\"{s}\");\n", .{sopts.tenant_column});
     try buf.appendSlice(allocator,
         \\
-        \\    const backend = zigmodu.data.SqlxBackend{ .allocator = allocator, .client = &db_client };
+        \\    const backend = zmodu.data.SqlxBackend{ .allocator = allocator, .client = &db_client };
         \\
         \\
     );
@@ -9740,9 +9740,9 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
             // bus; without this wiring `service.publish(...)` drops events on
             // the floor (the bus pointer stays null).
             if (isZigReserved(var_name)) {
-                try buf.print(allocator, "    var {s}_events = zigmodu.ThreadSafeEventBus({s}_mod.service.{s}Event).init(allocator, init.io);\n", .{ var_name, var_name, pascal });
+                try buf.print(allocator, "    var {s}_events = zmodu.ThreadSafeEventBus({s}_mod.service.{s}Event).init(allocator, init.io);\n", .{ var_name, var_name, pascal });
             } else {
-                try buf.print(allocator, "    var {s}_events = zigmodu.ThreadSafeEventBus({s}.service.{s}Event).init(allocator, init.io);\n", .{ var_name, var_name, pascal });
+                try buf.print(allocator, "    var {s}_events = zmodu.ThreadSafeEventBus({s}.service.{s}Event).init(allocator, init.io);\n", .{ var_name, var_name, pascal });
             }
             try buf.print(allocator, "    defer {s}_events.deinit();\n", .{var_name});
             try buf.print(allocator, "    {s}_svc.withEvents(&{s}_events);\n", .{ var_name, var_name });
@@ -9780,21 +9780,21 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
     if (sopts.with_aichat or sopts.with_agent) {
         try buf.appendSlice(allocator,
             \\    // Shared AI token quota (per-tenant skeleton)
-            \\    var ai_token_quota = zigmodu.ai.TokenQuota.init(allocator, init.io, 1_000_000);
+            \\    var ai_token_quota = zmodu.ai.TokenQuota.init(allocator, init.io, 1_000_000);
             \\    defer ai_token_quota.deinit();
             \\
         );
     }
     if (sopts.with_aichat) {
         try buf.appendSlice(allocator,
-            \\    // ── AI Chat (zigmodu.ai.AiProvider + optional SSE) ──
+            \\    // ── AI Chat (zmodu.ai.AiProvider + optional SSE) ──
             \\    const ai_chat = @import("modules/ai/chat/module.zig");
-            \\    var ai_chat_http = zigmodu.http.HttpClient.init(allocator, init.io, 8, 60_000);
+            \\    var ai_chat_http = zmodu.http.HttpClient.init(allocator, init.io, 8, 60_000);
             \\    defer ai_chat_http.deinit();
             \\    const ai_chat_endpoint = env.get("AI_ENDPOINT") orelse "https://api.deepseek.com/v1/chat/completions";
             \\    const ai_chat_key = env.get("AI_API_KEY") orelse "Bearer sk-change-me";
             \\    const ai_chat_model = env.get("AI_MODEL") orelse "deepseek-v4-flash";
-            \\    var ai_chat_provider = zigmodu.ai.AiProvider.init(allocator, &ai_chat_http, ai_chat_endpoint, ai_chat_key, ai_chat_model);
+            \\    var ai_chat_provider = zmodu.ai.AiProvider.init(allocator, &ai_chat_http, ai_chat_endpoint, ai_chat_key, ai_chat_model);
             \\    defer ai_chat_provider.deinit();
             \\    var ai_chat_p = ai_chat.persistence.AiChatPersistence.init(backend);
             \\    var ai_chat_svc = ai_chat.service.AiChatService.init(allocator, &ai_chat_p);
@@ -9806,16 +9806,16 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
     }
     if (sopts.with_agent) {
         try buf.appendSlice(allocator,
-            \\    // ── AI Agent (zigmodu.ai.Agent + SkillRegistry) ──
+            \\    // ── AI Agent (zmodu.ai.Agent + SkillRegistry) ──
             \\    const ai_agent = @import("modules/ai/agent/module.zig");
-            \\    var skill_registry = zigmodu.ai.SkillRegistry.init(allocator, init.io);
+            \\    var skill_registry = zmodu.ai.SkillRegistry.init(allocator, init.io);
             \\    defer skill_registry.deinit();
-            \\    var agent_http = zigmodu.http.HttpClient.init(allocator, init.io, 8, 60_000);
+            \\    var agent_http = zmodu.http.HttpClient.init(allocator, init.io, 8, 60_000);
             \\    defer agent_http.deinit();
             \\    const agent_endpoint = env.get("AI_ENDPOINT") orelse "https://api.deepseek.com/v1/chat/completions";
             \\    const agent_key = env.get("AI_API_KEY") orelse "Bearer sk-change-me";
             \\    const agent_model = env.get("AI_MODEL") orelse "deepseek-v4-flash";
-            \\    var agent_provider = zigmodu.ai.AiProvider.init(allocator, &agent_http, agent_endpoint, agent_key, agent_model);
+            \\    var agent_provider = zmodu.ai.AiProvider.init(allocator, &agent_http, agent_endpoint, agent_key, agent_model);
             \\    defer agent_provider.deinit();
             \\    var ai_agent_p = ai_agent.persistence.AiAgentPersistence.init(backend);
             \\    var ai_agent_svc = ai_agent.service.AiAgentService.init(&ai_agent_p, &skill_registry);
@@ -9824,7 +9824,7 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
             \\    // Authority: fail-closed. The empty allow list means this agent may call
             \\    // no tool at all — register the skills you want it to use and name them
             \\    // here (`.allow_execute = true` only for tools that change state).
-            \\    ai_agent_svc.setGuard(zigmodu.ai.Guard.init(.{ .allow = &.{} }));
+            \\    ai_agent_svc.setGuard(zmodu.ai.Guard.init(.{ .allow = &.{} }));
             \\    var ai_agent_api = ai_agent.api.AiAgentApi.init(&ai_agent_svc);
             \\
         );
@@ -9845,22 +9845,22 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
         \\
         \\    // -- HTTP Server --
         \\    const http_port: u16 = if (env.get("HTTP_PORT")) |p| std.fmt.parseInt(u16, p, 10) catch 8080 else 8080;
-        \\    var server = zigmodu.http.Server.initWithConfig(init.io, allocator, .{ .port = http_port });
+        \\    var server = zmodu.http.Server.initWithConfig(init.io, allocator, .{ .port = http_port });
         \\    defer server.deinit();
-        \\    server.withGracefulDrain(zigmodu.getInFlightCounter());
+        \\    server.withGracefulDrain(zmodu.getInFlightCounter());
         \\    // CORS (allow all origins in dev)
-        \\    try server.addMiddleware(try zigmodu.http.http_middleware.cors(.{}));
+        \\    try server.addMiddleware(try zmodu.http.http_middleware.cors(.{}));
         \\
         \\    // -- Health Checks --
-        \\    var health_endpoint = zigmodu.HealthEndpoint.init(allocator);
+        \\    var health_endpoint = zmodu.HealthEndpoint.init(allocator);
         \\    defer health_endpoint.deinit();
-        \\    try health_endpoint.registerCheck("liveness", "Process liveness", zigmodu.HealthEndpoint.alwaysUp);
+        \\    try health_endpoint.registerCheck("liveness", "Process liveness", zmodu.HealthEndpoint.alwaysUp);
         \\
     );
 
     // Auth middleware (after server) — catalog-aware JWT when --with-auth
     try buf.appendSlice(allocator,
-        \\    var catalog_slot: zigmodu.http.CatalogSlot = .{};
+        \\    var catalog_slot: zmodu.http.CatalogSlot = .{};
         \\    defer catalog_slot.deinit();
         \\
     );
@@ -9870,25 +9870,25 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
             \\    // Prefer catalog JWT+RBAC; legacy rbacJwtMiddleware also keeps user_data (auth_info only).
             \\    // Replace role_perms with security.CatalogPermDb.loaderFromClient(&db) in production.
             \\    const jwt_secret = env.get("JWT_SECRET") orelse "changeme-in-production";
-            \\    var app_sec = zigmodu.security.AppSecurity.init(allocator, init.io, .{ .jwt_secret = jwt_secret, .token_expiry_seconds = 3600 });
+            \\    var app_sec = zmodu.security.AppSecurity.init(allocator, init.io, .{ .jwt_secret = jwt_secret, .token_expiry_seconds = 3600 });
             \\    defer app_sec.module.deinit();
-            \\    const role_perms = zigmodu.security.Rbac.RolePermissionTable{ .rows = &.{
+            \\    const role_perms = zmodu.security.Rbac.RolePermissionTable{ .rows = &.{
             \\        .{ .role = "admin", .permissions = &.{ "system:admin", "system:write", "system:read" } },
             \\        .{ .role = "user", .permissions = &.{ "system:read" } },
             \\    } };
-            \\    try server.addMiddleware(try zigmodu.http.jwtAuthFromCatalogWithPermissions(
+            \\    try server.addMiddleware(try zmodu.http.jwtAuthFromCatalogWithPermissions(
             \\        &app_sec.module,
             \\        &catalog_slot,
-            \\        try zigmodu.http.catalogLoaderFromTable(&role_perms),
+            \\        try zmodu.http.catalogLoaderFromTable(&role_perms),
             \\        .{},
             \\    ));
-            \\    try server.addMiddleware(try zigmodu.http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
-            \\    try server.addMiddleware(try zigmodu.http.permissionGateWith(&catalog_slot, .{ .mode = .rbac }));
+            \\    try server.addMiddleware(try zmodu.http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
+            \\    try server.addMiddleware(try zmodu.http.permissionGateWith(&catalog_slot, .{ .mode = .rbac }));
             \\
             \\    // Rate limiter
-            \\    var auth_limiter = try zigmodu.RateLimiter.init(allocator, "api", 1000, 100);
+            \\    var auth_limiter = try zmodu.RateLimiter.init(allocator, "api", 1000, 100);
             \\    defer auth_limiter.deinit();
-            \\    try server.addMiddleware(zigmodu.http.tracing_middleware.rateLimit(&auth_limiter));
+            \\    try server.addMiddleware(zmodu.http.tracing_middleware.rateLimit(&auth_limiter));
             \\
             \\
         );
@@ -9905,13 +9905,13 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
         }
     } else {
         try buf.appendSlice(allocator,
-            \\    try server.addMiddleware(try zigmodu.http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
+            \\    try server.addMiddleware(try zmodu.http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
             \\
         );
     }
 
     if (sopts.with_resilience) {
-        try buf.appendSlice(allocator, "    try health_endpoint.registerCheckWithContext(\"database\", \"DB connectivity\", zigmodu.HealthEndpoint.databaseCheck, @ptrCast(&db_client));\n");
+        try buf.appendSlice(allocator, "    try health_endpoint.registerCheckWithContext(\"database\", \"DB connectivity\", zmodu.HealthEndpoint.databaseCheck, @ptrCast(&db_client));\n");
     }
 
     try buf.appendSlice(allocator,
@@ -9926,7 +9926,7 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
     );
 
     // assertNoDupes (SQL modules + optional plugins)
-    try buf.appendSlice(allocator, "    comptime zigmodu.http.assertNoDupes(.{");
+    try buf.appendSlice(allocator, "    comptime zmodu.http.assertNoDupes(.{");
     var need_comma = false;
     for (module_names) |name| {
         const var_name = try replaceChar(allocator, name, '/', '_');
@@ -9963,7 +9963,7 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
     try buf.appendSlice(allocator, " });\n\n");
 
     try buf.appendSlice(allocator,
-        \\    var router = zigmodu.http.Router(AppState).init(init.io, allocator, &server, &app_state);
+        \\    var router = zmodu.http.Router(AppState).init(init.io, allocator, &server, &app_state);
         \\    defer router.deinit();
         \\    var admin = router.scope("/admin-api");
         \\    try admin.mountAll(.{
@@ -9998,7 +9998,7 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
         \\    try server.addRoute(.{
         \\        .method = .GET,
         \\        .path = "openapi.json",
-        \\        .handler = try zigmodu.http.openApiFromCatalog(&catalog_slot, .{
+        \\        .handler = try zmodu.http.openApiFromCatalog(&catalog_slot, .{
         \\            .title = "
     );
     try buf.appendSlice(allocator, project_name);
@@ -10016,14 +10016,14 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
     // no global bus to wire here.)
 
     if (sopts.with_resilience) {
-        try buf.appendSlice(allocator, "\n    // -- Resilience --\n    var breaker = try zigmodu.CircuitBreaker.init(allocator, \"db\", .{ .failure_threshold = 5, .success_threshold = 2, .timeout_seconds = 30, .half_open_max_calls = 3 });\n    defer breaker.deinit();\n    var limiter = try zigmodu.RateLimiter.init(allocator, \"api\", 1000, 100);\n    defer limiter.deinit();\n");
+        try buf.appendSlice(allocator, "\n    // -- Resilience --\n    var breaker = try zmodu.CircuitBreaker.init(allocator, \"db\", .{ .failure_threshold = 5, .success_threshold = 2, .timeout_seconds = 30, .half_open_max_calls = 3 });\n    defer breaker.deinit();\n    var limiter = try zmodu.RateLimiter.init(allocator, \"api\", 1000, 100);\n    defer limiter.deinit();\n");
     }
 
     if (sopts.with_cluster) {
-        try buf.appendSlice(allocator, "\n    // -- Cluster --\n    const node_id = try allocator.print(\"node-{d}\", .{@as(u64, @intCast(std.time.epoch.unix))});\n    var dist_bus = try zigmodu.DistributedEventBus.init(allocator, init.io, node_id);\n    defer dist_bus.deinit();\n    try dist_bus.start(9091);\n");
+        try buf.appendSlice(allocator, "\n    // -- Cluster --\n    const node_id = try allocator.print(\"node-{d}\", .{@as(u64, @intCast(std.time.epoch.unix))});\n    var dist_bus = try zmodu.DistributedEventBus.init(allocator, init.io, node_id);\n    defer dist_bus.deinit();\n    try dist_bus.start(9091);\n");
     }
     if (sopts.with_metrics) {
-        try buf.appendSlice(allocator, "\n    // -- Prometheus /metrics --\n    var metrics = zigmodu.observability.PrometheusMetrics.init(allocator);\n    defer metrics.deinit();\n    try metrics.registerMetricsRoute(&server);\n");
+        try buf.appendSlice(allocator, "\n    // -- Prometheus /metrics --\n    var metrics = zmodu.observability.PrometheusMetrics.init(allocator);\n    defer metrics.deinit();\n    try metrics.registerMetricsRoute(&server);\n");
     }
     if (sopts.with_websocket) {
         try buf.appendSlice(allocator,
@@ -10034,7 +10034,7 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
     }
 
     // Application lifecycle
-    try buf.appendSlice(allocator, "\n    // -- Lifecycle --\n    var app = try zigmodu.Application.init(init.io, allocator, \"");
+    try buf.appendSlice(allocator, "\n    // -- Lifecycle --\n    var app = try zmodu.Application.init(init.io, allocator, \"");
     try buf.appendSlice(allocator, project_name);
     try buf.appendSlice(allocator, "\", .{\n");
 
@@ -10051,7 +10051,7 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
     if (sopts.with_aichat) try buf.appendSlice(allocator, "        ai_chat,\n");
     if (sopts.with_agent) try buf.appendSlice(allocator, "        ai_agent,\n");
     if (sopts.with_web4) try buf.appendSlice(allocator, "        web4,\n");
-    try buf.appendSlice(allocator, "    }, .{});\n    defer app.deinit();\n\n    try app.start();\n    try server.start();\n}\n\nfn healthLive(ctx: *zigmodu.http.Context) !void {\n    try ctx.json(200, \"{\\\"status\\\":\\\"UP\\\"}\");\n}\n\nfn healthReady(ctx: *zigmodu.http.Context) !void {\n    try ctx.json(200, \"{\\\"status\\\":\\\"UP\\\"}\");\n}\n");
+    try buf.appendSlice(allocator, "    }, .{});\n    defer app.deinit();\n\n    try app.start();\n    try server.start();\n}\n\nfn healthLive(ctx: *zmodu.http.Context) !void {\n    try ctx.json(200, \"{\\\"status\\\":\\\"UP\\\"}\");\n}\n\nfn healthReady(ctx: *zmodu.http.Context) !void {\n    try ctx.json(200, \"{\\\"status\\\":\\\"UP\\\"}\");\n}\n");
 
     return buf.toOwnedSlice(allocator);
 }
@@ -10071,7 +10071,7 @@ fn generateScaffoldTestsZig(
         \\//! They check the module contract (lifecycle, route table) and the model
         \\//! shape, which is what a scaffold can honestly assert before you write
         \\//! migrations. Add DB-backed tests once your tables exist:
-        \\//! `zigmodu.data.sqlx.Client.open(alloc, testing.io, cfg)` gives you a
+        \\//! `zmodu.data.sqlx.Client.open(alloc, testing.io, cfg)` gives you a
         \\//! `*Client` (keep it in a variable — `SqlxBackend` stores the pointer).
         \\const std = @import("std");
         \\const testing = std.testing;
@@ -10217,7 +10217,7 @@ test "trimTrailingNewlines" {
     try std.testing.expectEqualStrings("bar ", trimTrailingNewlines("bar \n"));
 }
 
-test "generateModule: aligns with zigmodu.api.Module + lifecycle" {
+test "generateModule: aligns with zmodu.api.Module + lifecycle" {
     const a = std.testing.allocator;
     const code = try generateModule(a, "billing");
     defer a.free(code);
@@ -10694,8 +10694,8 @@ test "generateWeb4Module takes tenant and user from the JWT, not the query" {
     try std.testing.expect(std.mem.indexOf(u8, svc, "findPageForTenant(\"tenant_id\", tenant_id, page, size)") != null);
     try std.testing.expect(std.mem.indexOf(u8, mod, "pub const sql_tenant_column: ?[]const u8 = \"tenant_id\";") != null);
     // …and the generated code compiles (DidKey.generate returns an error union).
-    try std.testing.expect(std.mem.indexOf(u8, svc, "var did_key = try zigmodu.web4.DidKey.generate(self.allocator, self.io);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tests, "var did = try zigmodu.web4.DidKey.generate(testing.allocator, testing.io);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, svc, "var did_key = try zmodu.web4.DidKey.generate(self.allocator, self.io);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tests, "var did = try zmodu.web4.DidKey.generate(testing.allocator, testing.io);") != null);
 }
 
 test "generateScaffoldMainZig wires per-module event buses and the WS verifier" {
@@ -10716,7 +10716,7 @@ test "generateScaffoldMainZig wires per-module event buses and the WS verifier" 
     // --with-events: each service gets its own typed bus, so publish() has a
     // real sink; the old anonymous `struct { id: i64 }` bus matched no module
     // union and was dead code.
-    try std.testing.expect(std.mem.indexOf(u8, code, "var users_events = zigmodu.ThreadSafeEventBus(users.service.UsersEvent).init(allocator, init.io);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "var users_events = zmodu.ThreadSafeEventBus(users.service.UsersEvent).init(allocator, init.io);") != null);
     try std.testing.expect(std.mem.indexOf(u8, code, "users_svc.withEvents(&users_events);") != null);
     try std.testing.expect(std.mem.indexOf(u8, code, "ThreadSafeEventBus(struct { id: i64 })") == null);
     // --with-auth + --with-websocket: the gateway's bearer check uses the same
@@ -11329,7 +11329,7 @@ test "runMysqlQueryWith: exactly one -e, and the query is its argument" {
 // skips when it is absent, so a laptop run verifies nothing and a run with a
 // server is the real end-to-end exercise of `psql` + information_schema parsing.
 //
-//   ZMODU_TEST_PG_URL=postgres://postgres@127.0.0.1:5432/zigmodu_test
+//   ZMODU_TEST_PG_URL=postgres://postgres@127.0.0.1:5432/zmodu_test
 //
 // The introspection passes no password to `psql`, so the server must accept the
 // connection without one — the official image's
@@ -11342,7 +11342,7 @@ test "introspectDatabasePostgres: live schema round-trip (ZMODU_TEST_PG_URL)" {
 
 // Same shape, with a DSN that may carry a password (`mysql` gets `-p<pass>`):
 //
-//   ZMODU_TEST_MYSQL_URL=mysql://root:secret@127.0.0.1:3306/zigmodu_test
+//   ZMODU_TEST_MYSQL_URL=mysql://root:secret@127.0.0.1:3306/zmodu_test
 test "introspectDatabaseMysql: live schema round-trip (ZMODU_TEST_MYSQL_URL)" {
     const dsn = testEnvVar("ZMODU_TEST_MYSQL_URL") orelse return error.SkipZigTest;
     try liveIntrospectionRoundTrip(std.testing.allocator, std.testing.io, dsn);
@@ -11438,7 +11438,7 @@ test "graph --dot renders a Graphviz digraph (CLI scanner + framework renderer)"
     try tmp.dir.writeFile(io, .{
         .sub_path = "src/modules/order/module.zig",
         .data =
-        \\pub const info = zigmodu.api.Module{
+        \\pub const info = zmodu.api.Module{
         \\    .name = "order",
         \\    .description = "Order management",
         \\    .dependencies = &.{"user"},
@@ -11448,7 +11448,7 @@ test "graph --dot renders a Graphviz digraph (CLI scanner + framework renderer)"
     try tmp.dir.writeFile(io, .{
         .sub_path = "src/modules/user/module.zig",
         .data =
-        \\pub const info = zigmodu.api.Module{
+        \\pub const info = zmodu.api.Module{
         \\    .name = "user",
         \\    .description = "User management",
         \\    .dependencies = &.{},

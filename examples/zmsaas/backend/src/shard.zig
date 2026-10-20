@@ -3,7 +3,7 @@
 //! 打到租户所在分片；列表按 JWT 角色做数据权限过滤（admin=全量, user=本人）。
 //! 生产：分片为 PG/MySQL 时直接用 ShardRouter.buildSqlxConfig(pool) 建连接。
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 const ShardOrder = struct {
     id: i64 = 0,
@@ -27,19 +27,19 @@ pub const ShardApi = struct {
     pub const State = @This();
 
     allocator: std.mem.Allocator,
-    router: zigmodu.ShardRouter,
+    router: zmodu.ShardRouter,
     paths: [2][]const u8,
-    clients: [2]zigmodu.data.Client,
-    meta_client: *zigmodu.data.Client,
+    clients: [2]zmodu.data.Client,
+    meta_client: *zmodu.data.Client,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, base_dir: []const u8, meta_client: *zigmodu.data.Client) !@This() {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, base_dir: []const u8, meta_client: *zmodu.data.Client) !@This() {
         std.Io.Dir.cwd().createDirPath(io, base_dir) catch {};
         var paths: [2][]const u8 = undefined;
-        var clients: [2]zigmodu.data.Client = undefined;
+        var clients: [2]zmodu.data.Client = undefined;
         for (0..2) |i| {
             const suffix = if (i == 0) "shard_a.db" else "shard_b.db";
             paths[i] = try std.fs.path.join(allocator, &.{ base_dir, suffix });
-            clients[i] = zigmodu.data.Client.init(allocator, io, .{ .driver = .sqlite, .sqlite_path = paths[i] });
+            clients[i] = zmodu.data.Client.init(allocator, io, .{ .driver = .sqlite, .sqlite_path = paths[i] });
             try clients[i].connect();
             _ = try clients[i].exec(
                 \\CREATE TABLE IF NOT EXISTS shard_orders (
@@ -61,8 +61,8 @@ pub const ShardApi = struct {
                 &.{},
             );
         }
-        var router = zigmodu.ShardRouter.init(allocator, .{ .shard_count = 2 });
-        const pools = try allocator.alloc(zigmodu.ShardPool, 2);
+        var router = zmodu.ShardRouter.init(allocator, .{ .shard_count = 2 });
+        const pools = try allocator.alloc(zmodu.ShardPool, 2);
         pools[0] = .{ .name = "shard_a", .host = "sqlite", .port = 0, .database = paths[0], .username = "", .password = "", .max_conns = 4 };
         pools[1] = .{ .name = "shard_b", .host = "sqlite", .port = 0, .database = paths[1], .username = "", .password = "", .max_conns = 4 };
         try router.setPools(pools);
@@ -72,12 +72,12 @@ pub const ShardApi = struct {
     }
 
     fn shardFor(self: *@This(), org_id: i64) ?u16 {
-        var tctx = zigmodu.TenantContext{};
+        var tctx = zmodu.TenantContext{};
         tctx.set(org_id);
         return self.router.route(&tctx);
     }
 
-    pub const routes = [_]zigmodu.http.RouteSpec(State){
+    pub const routes = [_]zmodu.http.RouteSpec(State){
         .{ .method = .GET, .path = "route", .handler = routeInfo, .meta = .{ .auth = .jwt, .permission = "orders:read" } },
         .{ .method = .GET, .path = "load", .handler = shardLoad, .meta = .{ .auth = .jwt, .permission = "orders:read" } },
         .{ .method = .POST, .path = "rebalance", .handler = rebalance, .meta = .{ .auth = .jwt, .permission = "orders:write" } },
@@ -85,14 +85,14 @@ pub const ShardApi = struct {
         .{ .method = .GET, .path = "orders", .handler = listOrders, .meta = .{ .auth = .jwt, .permission = "orders:read" } },
     };
 
-    fn routeInfo(ctx: *zigmodu.http.Context, self: *State) !void {
+    fn routeInfo(ctx: *zmodu.http.Context, self: *State) !void {
         const org_id = ctx.queryInt(i64, "org_id", 1);
         const idx = self.shardFor(org_id) orelse return error.NotFound;
         const pool = self.router.getPool(idx) orelse return error.NotFound;
         try ctx.jsonStruct(200, .{ .code = 0, .org_id = org_id, .pool_index = idx, .database = pool.database });
     }
 
-    fn createOrder(ctx: *zigmodu.http.Context, self: *State) !void {
+    fn createOrder(ctx: *zmodu.http.Context, self: *State) !void {
         const org_id = ctx.queryInt(i64, "org_id", 1);
         const idx = self.shardFor(org_id) orelse return error.NotFound;
         const client = &self.clients[idx];
@@ -106,7 +106,7 @@ pub const ShardApi = struct {
         try ctx.jsonStruct(200, .{ .code = 0, .shard = idx, .id = result.last_insert_id orelse 0 });
     }
 
-    fn listOrders(ctx: *zigmodu.http.Context, self: *State) !void {
+    fn listOrders(ctx: *zmodu.http.Context, self: *State) !void {
         const org_id = ctx.queryInt(i64, "org_id", 1);
         const idx = self.shardFor(org_id) orelse return error.NotFound;
         const client = &self.clients[idx];
@@ -116,11 +116,11 @@ pub const ShardApi = struct {
         // handler 不再手写 " AND owner_id = ?"。
         const scope = ctx.getAttr("data_scope") orelse "all";
         const user_id = std.fmt.parseInt(i64, ctx.getAttr("user_id") orelse "0", 10) catch 0;
-        var dp = zigmodu.datapermission.DataPermissionContext{ .allocator = ctx.allocator };
+        var dp = zmodu.datapermission.DataPermissionContext{ .allocator = ctx.allocator };
         defer dp.deinit();
         dp.scope = if (std.mem.eql(u8, scope, "self")) .self_ else .all;
         dp.user_id = user_id;
-        var interceptor = zigmodu.datapermission.DataPermissionInterceptor.init(ctx.allocator);
+        var interceptor = zmodu.datapermission.DataPermissionInterceptor.init(ctx.allocator);
         const filter = try interceptor.andWhere(&dp, "region", "owner_id");
 
         var sql = std.ArrayList(u8).empty;
@@ -132,7 +132,7 @@ pub const ShardApi = struct {
         }
         try sql.appendSlice(ctx.allocator, " ORDER BY id DESC");
 
-        var args = std.ArrayList(zigmodu.data.sqlx.Value).empty;
+        var args = std.ArrayList(zmodu.data.sqlx.Value).empty;
         defer args.deinit(ctx.allocator);
         try args.append(ctx.allocator, .{ .int = org_id });
         if (filter) |f| {
@@ -144,11 +144,11 @@ pub const ShardApi = struct {
         try ctx.jsonStruct(200, .{ .code = 0, .shard = idx, .items = result.items });
     }
 
-    fn countOrders(client: *zigmodu.data.Client) !i64 {
+    fn countOrders(client: *zmodu.data.Client) !i64 {
         return (try client.queryRow(struct { total: i64 }, "SELECT COUNT(*) AS total FROM shard_orders", &.{})).total;
     }
 
-    fn shardLoad(ctx: *zigmodu.http.Context, self: *State) !void {
+    fn shardLoad(ctx: *zmodu.http.Context, self: *State) !void {
         const a = try countOrders(&self.clients[0]);
         const b = try countOrders(&self.clients[1]);
         try ctx.jsonStruct(200, .{ .code = 0, .shards = .{ .shard_a = a, .shard_b = b } });
@@ -160,7 +160,7 @@ pub const ShardApi = struct {
     /// 幂等：`key` 参数 + rebalance_events 表防止同一键重复整轮迁移；
     /// 行级用 (org_id, source_id) 唯一索引 + INSERT OR IGNORE，部分失败重试
     /// 不会重复写入（migrated 只统计实际新插入）。
-    fn rebalance(ctx: *zigmodu.http.Context, self: *State) !void {
+    fn rebalance(ctx: *zmodu.http.Context, self: *State) !void {
         const org_id = ctx.queryInt(i64, "org_id", 1);
         const key = ctx.queryStr("key", "");
         if (key.len > 0) {
@@ -201,7 +201,7 @@ pub const ShardApi = struct {
         try ctx.jsonStruct(200, .{ .code = 0, .org_id = org_id, .from = from, .to = to, .migrated = migrated, .balanced = true });
     }
 
-    fn countOrdersFor(client: *zigmodu.data.Client, org_id: i64) !i64 {
+    fn countOrdersFor(client: *zmodu.data.Client, org_id: i64) !i64 {
         return (try client.queryRow(struct { total: i64 }, "SELECT COUNT(*) AS total FROM shard_orders WHERE org_id = ?", &.{.{ .int = org_id }})).total;
     }
 
@@ -219,7 +219,7 @@ pub const ShardApi = struct {
             .{ .int = from },
             .{ .int = to },
             .{ .int = @intCast(migrated) },
-            .{ .int = zigmodu.Time.monotonicNowSeconds() },
+            .{ .int = zmodu.Time.monotonicNowSeconds() },
         });
     }
 };

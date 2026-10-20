@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// Centralized time utility for ZigModu.
+/// Centralized time utility for zmodu.
 ///
 /// The 0.16/0.17 toolchains removed the old `std.time` helpers
 /// (`std.time.Instant` / `std.time.nanoTimestamp()`, and later

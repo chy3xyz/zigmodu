@@ -73,10 +73,10 @@ AI 侧、集群侧）的实测结果：builder 绑定、worker 归 app、不手�
   仍是固定串 `"node-id"`（见下方 ClusterHealth 一条 —— 2026-09-18 已修）
 - ✅ 本文件「集群」段（即「阶段 3：多实例部署」的组装示例）：已写 `ClusterMembership.init(allocator, io, …)`，并注明
   "`start` 的 Config 只有三项（没有 `seed_nodes`，seed 节点走 `connectToSeed`）"；
-  `zigmodu.core.*` / "实现 PasRaft 共识" 的说法已删
+  `zmodu.core.*` / "实现 PasRaft 共识" 的说法已删
 - ✅ `tools/zmodu/src/main.zig:6011`（`--with-agent` 模板）：生成**无 guard 的裸 `Agent{}`**；`:6082-6086`
   的 handler 同步跑 agent 且不设 tenant/user
-  （2026-09-18 修：模板现生成 `guard: zigmodu.ai.Guard = …`（`tools/zmodu/src/main.zig:6127`）并交给
+  （2026-09-18 修：模板现生成 `guard: zmodu.ai.Guard = …`（`tools/zmodu/src/main.zig:6127`）并交给
   `Agent{ .guard = &self.guard }`（`:6150`），handler 用 `tenantId(ctx)` / `ctx.userIdInt(i64)` 填
   `SkillContext{ .tenant_id = …, .user_id = … }`（`:6214` / `:6232-6233`））
 - ✅ `src/ai/workflow.zig:590`：`.agent` 步骤内部现搓裸 `Agent{}`，Workflow 无处传 guard ⇒ 文档推荐的
@@ -191,7 +191,7 @@ shopdemo↔shopdemo-zent、basic↔testing、distributed↔cluster-demo、`depre
    含 runtime-workers / alpha-engine / mcp-server / shopdemo-zent / metaverse-creative / zmsaas / distributed；
    行数表已删，避免第二份会漂移的清单）。
 6. **加元数据门禁** —— ✅ **已完成（2026-09-17）**：`build.zig.zon` 的 `minimum_zig_version` 全部 → `"0.17.0"`
-   （`grep -rn '"0.16.0"' examples/ --include='*.zon'` 为空）；`metaverse-creative` 两处 → ZigModu **v0.24.0**
+   （`grep -rn '"0.16.0"' examples/ --include='*.zon'` 为空）；`metaverse-creative` 两处 → zmodu **v0.24.0**
    （`DEMO_SUMMARY.md:202` 原 v0.23.0、`ARCHITECTURE_DIAGRAM.txt:153` 原 **v0.4.0** —— 上一版把 v0.4.0 记到了
    `DEMO_SUMMARY.md`，实际在 `ARCHITECTURE_DIAGRAM.txt`，两处都已改）。
 
@@ -253,7 +253,7 @@ CI 构建 15 项 + `zmsaas/backend`。
    `agentForStep()` 透传 `.guard = self.guard`（`:606`）；测试 `workflow .agent steps inherit the workflow guard`（`:1297`））
 4. ✅ **scaffold `--with-agent` 生成无 guard 的裸 `Agent{}`**：`tools/zmodu/src/main.zig:6011-6019`；`:6085` 的 handler 也不设
    tenant/user（落库恒 0）。改：生成 `AgentSpec{ .guard = … }` + `SkillContext{ .tenant_id = ctx.tenantId(), … }`。
-   （2026-09-18 修：模板生成 `guard: zigmodu.ai.Guard = zigmodu.ai.Guard.init(.{})`（`tools/zmodu/src/main.zig:6127`）
+   （2026-09-18 修：模板生成 `guard: zmodu.ai.Guard = zmodu.ai.Guard.init(.{})`（`tools/zmodu/src/main.zig:6127`）
    + `setGuard()`（`:6140`），装配 `Agent{ .guard = &self.guard }`（`:6150`）；handler 侧 `fn tenantId(ctx)`（`:6214`）
    与 `ctx.userIdInt(i64)`（`:6233`）填 `SkillContext`。实测 `scaffold --with-agent` 的生成项目 `zig build` exit 0，
    `rg '\.guard|tenantId\(ctx\)' src/modules/ai/agent/` 命中模板产物）
@@ -331,11 +331,11 @@ CI 构建 15 项 + `zmsaas/backend`。
    `.github/workflows/ci.yml` → `ZIG_VERSION`（`:33`）才是真源。`rg -n 'dev\.1567' README.md docs/QUICK-START.md` 为空）
 2. ✅ **"5 分钟教程"本身编不过**：`docs/QUICK-START.md:68` 的 `app` 通篇未定义、`:65` 的 `generateDocs` 少 `io` 参
    （真签名 4 参）；`:16` 说 `zig version` 显示 `0.17.0` 与 README 的 dev 钉版、AGENTS 互相矛盾；`:86` 调
-   `b.dependency("zigmodu")` 而全篇没给 `build.zig.zon` 依赖声明。README 里 `const UserModule`（非 `pub`）+ 传
+   `b.dependency("zmodu")` 而全篇没给 `build.zig.zon` 依赖声明。README 里 `const UserModule`（非 `pub`）+ 传
    `.{user}`（文件结构体无 `info`）同样编不过。
    （2026-09-18 修：`docs/QUICK-START.md:37` 是 `pub const UserModule`（注释点明 `pub` 的原因），`:84` 有
    `var app = try b.build(.{user.UserModule});`，`:77` 的 `generateDocs` 带满 4 个实参，`:25` 的 `zig version`
-   期望值改为 `ci.yml` 的 `ZIG_VERSION`，`:97` 起补了 `build.zig.zon` 依赖声明（`:133` 的 `b.dependency("zigmodu")`
+   期望值改为 `ci.yml` 的 `ZIG_VERSION`，`:97` 起补了 `build.zig.zon` 依赖声明（`:133` 的 `b.dependency("zmodu")`
    因此有出处）；`README.md:236` 的 `UserModule` 也是 `pub`，`main` 走 `scanModules` / `startAll`）
 3. ✅ **`AGENTS.md` 的核心代码模式是错的**：`:266/:286` 的 `ctx.paramInt("id")` 少类型参（真签名 `paramInt(T, key)`）；
    `:270/:272/:273/:287` 的 `ctx.json(200, .{ .ok = true })`——`ctx.json` 第二参是 `[]const u8`，值形态要用
@@ -362,7 +362,7 @@ CI 构建 15 项 + `zmsaas/backend`。
    （`:4` / `:530` / `:549`）；`docs/MODULE_LAYERS.md:62-64` 写清 `Backend` 两套方法（`*data.Client` → `queryRowPartial`，
    `data.SqlxBackend` → `queryRowPartialBorrowed`），`:72-74` + `:94` 说明租户键表用 `findById(self, tenant_id, id)`、
    租户主表退化为 `findById(self, id)`。`rg -n 'v0\.39\.2' docs/ZENT.md` 为空）
-6. ✅ **孤儿文档**（无任何索引收录）：`docs/LOGGING.md`、`docs/MIGRATION_v04_to_v07.md`、`docs/ZIGMODU_NOTES.md`，
+6. ✅ **孤儿文档**（无任何索引收录）：`docs/LOGGING.md`、`docs/MIGRATION_v04_to_v07.md`、`docs/ZMODU_NOTES.md`，
    以及 `docs/dev/**` 全部 14 个文件。
    （2026-09-18 修：`docs/README.md:48-50` 新增「Other documents」表逐条收录前三份，`:51` 收录 `docs/dev/` 目录；
    `ls docs/dev/ | wc -l` = 14）
@@ -377,10 +377,10 @@ CI 构建 15 项 + `zmsaas/backend`。
 **会误导读者（按严重度）—— ✅ 2026-09-18 已逐条修掉**
 1. ✅ 「正确 vs 错误的内存管理」对照（现「内存管理 → 分配器使用」节）—— 标着「✅ 正确的内存管理」，却在 `defer allocator.free(buffer)` 之后 `return buffer`：**照抄即悬垂指针（静默 UAF）**。现改为两个真正确形态：「返回拷贝，所有权交给调用方」与「写入调用方提供的缓冲，不移交所有权」。
 2. ✅ 「并发安全」节的 `ThreadSafeCounter`（现「安全实践 → 并发安全」节）—— 用了 **Zig 0.17 已删除的 `std.Thread.Mutex`**（现为 `std.Io.Mutex`，`lock`/`unlock` 需 `io` 参数），且 `Self` 未定义；而这是"并发安全"的正面示例。现按 `src/core/EventBus.zig` 的 `ThreadSafeEventBus` 真实写法重写。
-3. ✅ 「阶段 4：服务网格」的能力表与「配置示例」—— `zigmodu.resilience.*` / `zigmodu.tracing.*` / `zigmodu.metrics.*` 三个命名空间**都不存在**。真身：`zigmodu.CircuitBreaker` / `zigmodu.RateLimiter`（`src/root.zig` §3），`zigmodu.observability.DistributedTracer` / `zigmodu.observability.PrometheusMetrics`（`src/observability.zig`）。已改。
+3. ✅ 「阶段 4：服务网格」的能力表与「配置示例」—— `zmodu.resilience.*` / `zmodu.tracing.*` / `zmodu.metrics.*` 三个命名空间**都不存在**。真身：`zmodu.CircuitBreaker` / `zmodu.RateLimiter`（`src/root.zig` §3），`zmodu.observability.DistributedTracer` / `zmodu.observability.PrometheusMetrics`（`src/observability.zig`）。已改。
 4. ✅ 同两处的 `CircuitBreaker.init(5, 30000)` 与 `data.redis.Redis.init(allocator)` + `connect(host, port, .{})` —— 真签名分别是 `CircuitBreaker.init(allocator, name, cfg)`（`cfg` 字段是 `timeout_seconds` / `half_open_max_calls`）与 `data.redis.Redis.new(allocator, io, cfg)` + `connect()`。已改。
 5. ✅ 「部署与 CI/CD」节的三处旧 API —— `std.process.getEnvVarOwned`（0.17 已移除，改走 `init.environ_map`）、`root_module.addDefine(...)`（不存在，改 `b.addOptions()` + `addImport("build_options", …)`）、CI 矩阵 `zig-version: ["0.16.0"]`（本仓走 `ci.yml` 的 `ZIG_VERSION`）。已改。
-6. ✅ 测试节与阶段 2 示例里的 `zigmodu.extensions.ModuleTestContext`（真身 `zigmodu.ModuleTestContext`，`src/root.zig`）与 `zigmodu.extensions.AsyncEventBus`（**全仓无此类型** —— 整段已删除，换成 `ThreadSafeEventBus` 示例）。已改。
+6. ✅ 测试节与阶段 2 示例里的 `zmodu.extensions.ModuleTestContext`（真身 `zmodu.ModuleTestContext`，`src/root.zig`）与 `zmodu.extensions.AsyncEventBus`（**全仓无此类型** —— 整段已删除，换成 `ThreadSafeEventBus` 示例）。已改。
 7. ✅ 本节开头的采样断言（"examples 里没有任何代码用 `ai.Agent`／全仓只有 3 处 `zmodu.builder`"）—— 已标 `（2026-09-17 采样）`、更新数字，并注明"以 `grep` 为准"。
 
 **结构与口径（2026-09-18 部分处理）**
@@ -449,7 +449,7 @@ CI 构建 15 项 + `zmsaas/backend`。
 
 **E. "公开 API + 零调用者 = 从未被编译"：`LogRotator` 的教训**
 
-`zigmodu.observability.LogRotator` 是正式导出的公开组件，但**全仓零调用**（`grep -rn LogRotator src/ tools/ examples/` 只有那一行导出）。Zig 惰性分析函数体，所以 `rotate()` 里的
+`zmodu.observability.LogRotator` 是正式导出的公开组件，但**全仓零调用**（`grep -rn LogRotator src/ tools/ examples/` 只有那一行导出）。Zig 惰性分析函数体，所以 `rotate()` 里的
 
 ```zig
 std.Io.Dir.cwd().rename(self.io, old_name, new_name)   // 0.17 之前的签名

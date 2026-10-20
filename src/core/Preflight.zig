@@ -8,11 +8,11 @@
 //! something fatal is wrong:
 //!
 //! ```zig
-//! var report = zigmodu.Preflight.run(allocator, &.{
-//!     zigmodu.Preflight.envCheck(&env_ctx),
-//!     zigmodu.Preflight.secretCheck(&secret_ctx),
-//!     zigmodu.Preflight.dbCheck(&db_client),
-//!     zigmodu.Preflight.clockCheck(),
+//! var report = zmodu.Preflight.run(allocator, &.{
+//!     zmodu.Preflight.envCheck(&env_ctx),
+//!     zmodu.Preflight.secretCheck(&secret_ctx),
+//!     zmodu.Preflight.dbCheck(&db_client),
+//!     zmodu.Preflight.clockCheck(),
 //! });
 //! defer report.deinit(allocator);
 //! report.log();
@@ -203,7 +203,7 @@ pub fn secretCheck(ctx: *SecretCheck) Check {
 /// Database reachability probe.
 ///
 /// Accepted form: **a pointer** to anything with
-/// `queryRows(T, sql, params) -> QueryResult(T)` — in practice `*zigmodu.data.Client`.
+/// `queryRows(T, sql, params) -> QueryResult(T)` — in practice `*zmodu.data.Client`.
 /// Pass `&client`, not `client`: a value would fail deeper inside this function
 /// with a type error that does not mention the caller.
 pub fn dbCheck(client: anytype) Check {

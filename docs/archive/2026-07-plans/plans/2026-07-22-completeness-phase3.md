@@ -1,8 +1,8 @@
-# ZigModu 完整性补齐 Phase 3 实施计划
+# zmodu 完整性补齐 Phase 3 实施计划
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 把 ZigModu 从 95% 完整性推进到 98%，补齐分布式事件组件接线、MySQL 二进制类型解析、示例可运行性、SQL API 生命周期统一、核心运行时指标与日志格式。
+**Goal:** 把 zmodu 从 95% 完整性推进到 98%，补齐分布式事件组件接线、MySQL 二进制类型解析、示例可运行性、SQL API 生命周期统一、核心运行时指标与日志格式。
 
 **Architecture:** 每个任务独立交付、独立测试、独立提交；不引入破坏性公共 API 变更（queryRows 返回类型改为 `QueryResult(T)` 是预期内的统一，需同步更新内部调用方）；所有改动遵循 Zig 0.17 与 `AGENTS.md` 规则。
 

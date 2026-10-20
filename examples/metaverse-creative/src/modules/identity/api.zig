@@ -1,5 +1,5 @@
-const zigmodu = @import("zigmodu");
-const http = zigmodu.http;
+const zmodu = @import("zmodu");
+const http = zmodu.http;
 
 pub fn IdentityApi(comptime Service: type) type {
     return struct {

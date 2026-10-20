@@ -6,8 +6,8 @@
 //!     `Sensitive` api_key that is only serialized masked (toMaskedJson).
 
 const std = @import("std");
-const zigmodu = @import("zigmodu");
-const http = zigmodu.http;
+const zmodu = @import("zmodu");
+const http = zmodu.http;
 const zent = @import("zent");
 const persist = @import("modules/catalog/persistence.zig");
 

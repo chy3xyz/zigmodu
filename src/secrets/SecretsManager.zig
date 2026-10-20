@@ -278,7 +278,7 @@ pub const SecretsManager = struct {
         defer req.deinit();
         try req.setHeader("X-Vault-Token", vc.token);
         try req.setHeader("Accept", "application/json");
-        try req.setHeader("User-Agent", "zigmodu-secrets/0.14");
+        try req.setHeader("User-Agent", "zmodu-secrets/0.14");
 
         var host_buf: [256]u8 = undefined;
         const host = blk: {
@@ -629,7 +629,7 @@ test "SecretsManager Vault live smoke" {
         .token = token.?,
         .mount_path = if (std.c.getenv("VAULT_MOUNT")) |m| std.mem.span(m) else "secret",
     });
-    const path = if (std.c.getenv("VAULT_SECRET_PATH")) |p| std.mem.span(p) else "zigmodu/smoke";
+    const path = if (std.c.getenv("VAULT_SECRET_PATH")) |p| std.mem.span(p) else "zmodu/smoke";
     sm.loadFromVault(path) catch |err| {
         if (err == error.VaultSecretNotFound) return;
         return err;

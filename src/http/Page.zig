@@ -50,7 +50,7 @@ pub const Envelope = enum {
     plain,
     /// RuoYi-style `{ "code": 0, "msg": "ok", "data": { list, total, page, pageSize } }`
     ruoyi,
-    /// ZigModu codegen style `{ "code": 0, "items": [...], "total": N }`
+    /// zmodu codegen style `{ "code": 0, "items": [...], "total": N }`
     items,
 };
 

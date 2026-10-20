@@ -1,12 +1,12 @@
 //! Error handling for sqlx (adapted from zigzero)
-//! Now unified with ZigModu core/Error.zig. This file remains as a backward-compat
+//! Now unified with zmodu core/Error.zig. This file remains as a backward-compat
 //! shim that re-exports the framework error types plus SQL-specific helpers.
 
 const std = @import("std");
 const core_err = @import("../core/Error.zig");
 
 /// Unified framework error type (alias for backward compatibility)
-pub const Error = core_err.ZigModuError;
+pub const Error = core_err.ZmoduError;
 
 /// Result type alias
 pub const Result = Error!void;

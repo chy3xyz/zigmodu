@@ -3,7 +3,7 @@
 //! 示例用 POST /api/v1/outbox/flush 在请求线程内演示投递（单线程安全、
 //! 兼容 :memory:）。
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 /// 投递回调：这里接 DistributedEventBus / Kafka / webhook。
 fn deliver(topic: []const u8, payload: []const u8) anyerror!void {
@@ -12,8 +12,8 @@ fn deliver(topic: []const u8, payload: []const u8) anyerror!void {
 
 /// 一轮投递：SELECT pending → mark processing → publish → mark delivered；
 /// 失败按 retry_count 标记重试或永久失败。
-pub fn deliverPending(allocator: std.mem.Allocator, client: *zigmodu.data.Client) !void {
-    var poller = zigmodu.outbox.OutboxPoller.init(allocator, .{}, deliver);
+pub fn deliverPending(allocator: std.mem.Allocator, client: *zmodu.data.Client) !void {
+    var poller = zmodu.outbox.OutboxPoller.init(allocator, .{}, deliver);
     const select_sql = try poller.buildSelectPending();
     defer allocator.free(select_sql);
     // OutboxEntry.status is an enum — scan a plain row shape and map.
@@ -32,7 +32,7 @@ pub fn deliverPending(allocator: std.mem.Allocator, client: *zigmodu.data.Client
     defer rows.deinit(allocator);
 
     for (rows.items) |entry| {
-        const outbox_entry = zigmodu.outbox.OutboxEntry{
+        const outbox_entry = zmodu.outbox.OutboxEntry{
             .id = entry.id,
             .topic = entry.topic,
             .payload = entry.payload,
@@ -73,18 +73,18 @@ pub const OpsApi = struct {
     pub const nest = .{"outbox"};
     pub const State = @This();
 
-    client: *zigmodu.data.Client,
+    client: *zmodu.data.Client,
 
-    pub fn init(client: *zigmodu.data.Client) @This() {
+    pub fn init(client: *zmodu.data.Client) @This() {
         return .{ .client = client };
     }
 
-    pub const routes = [_]zigmodu.http.RouteSpec(State){
+    pub const routes = [_]zmodu.http.RouteSpec(State){
         .{ .method = .POST, .path = "flush", .handler = flush, .meta = .{ .auth = .jwt, .permission = "orders:write" } },
     };
 
-    fn flush(ctx: *zigmodu.http.Context, self: *State) !void {
-        deliverPending(ctx.allocator, self.client) catch |err| return zigmodu.http.respondErr(ctx, err);
+    fn flush(ctx: *zmodu.http.Context, self: *State) !void {
+        deliverPending(ctx.allocator, self.client) catch |err| return zmodu.http.respondErr(ctx, err);
         try ctx.jsonStruct(200, .{ .code = 0, .status = "flushed" });
     }
 };

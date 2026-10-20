@@ -239,7 +239,7 @@ fn scanEntanglements(
                 const target = rest[1 .. 1 + end];
 
                 // Only relative file imports cross modules; package imports
-                // ("zigmodu", "std") are not a boundary question.
+                // ("zmodu", "std") are not a boundary question.
                 if (target.len == 0 or target[0] == '/') continue;
                 if (std.mem.indexOf(u8, target, "..") == null) continue;
 
@@ -284,7 +284,7 @@ fn scanEntanglements(
 /// module **root** file, which is the common case. Matching the module list is both
 /// simpler and harder to get wrong.
 ///
-/// A package import (`std`, `zigmodu`) crosses no module boundary and returns null:
+/// A package import (`std`, `zmodu`) crosses no module boundary and returns null:
 /// the name is only meaningful once the import has stepped out of its own directory.
 fn moduleOfImport(target: []const u8) ?[]const u8 {
     if (std.mem.indexOf(u8, target, "..") == null) return null;
@@ -879,7 +879,7 @@ test "moduleOfImport finds the module name behind any number of .." {
     try std.testing.expectEqualStrings("billing", moduleOfImport("../../../billing/service.zig").?);
     try std.testing.expectEqualStrings("billing", moduleOfImport("./../billing/x.zig").?);
     try std.testing.expect(moduleOfImport("std") == null);
-    try std.testing.expect(moduleOfImport("zigmodu") == null);
+    try std.testing.expect(moduleOfImport("zmodu") == null);
 }
 
 test "doctor JSON reports the graph and the findings" {

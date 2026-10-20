@@ -1,6 +1,6 @@
 # EventBus 与 DI：Application 内置接入最佳实践
 
-> 适用范围：zigmodu v0.15.34+（`Application` 内置 `EventRegistry` 与 `di.Container`）。
+> 适用范围：zmodu v0.15.34+（`Application` 内置 `EventRegistry` 与 `di.Container`）。
 > 本文回答三件事：模块间怎么通信、共享服务怎么注入、哪些场景**不该**用它们。
 > 配套阅读：[MODULITH.md](./MODULITH.md) §2.3 通信规则 · [MODULE_LAYERS.md](./MODULE_LAYERS.md)（分层纪律）。
 
@@ -123,7 +123,7 @@ build() 注入 withService  ──▶  start() 模块 initWith 注册/读取  �
 `ApplicationBuilder.withService` 一律走借用注册——main 里的 `config`、`db_client` 等由 main 管理
 生命周期，容器只是目录。把栈指针交给 `register`（拥有语义）会得到悬垂指针，这是旧 API 的已修陷阱。
 
-**scoped 容器同理，且改/查两半的穿透规则不同**（`zigmodu.ScopedContainer`）：
+**scoped 容器同理，且改/查两半的穿透规则不同**（`zmodu.ScopedContainer`）：
 
 | 穿透到 `parent` | 只作用于本 scope |
 |----------------|-----------------|

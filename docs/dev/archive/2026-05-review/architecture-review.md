@@ -1,4 +1,4 @@
-# ZigModu Architecture Review
+# zmodu Architecture Review
 
 **Date**: 2026-05-11
 **Version**: v0.8.3
@@ -24,7 +24,7 @@ Every import forms a DAG. The deepest chain is 4 hops (`pool → sqlx/errors →
 `root.zig` is the single entry point. Internal modules (`eventbus/WAL`, `cluster/FailureDetector`, C bindings, etc.) are hidden from consumers. Deprecated APIs are clearly marked in a separate section.
 
 ### 3. Self-Contained HTTP Server
-`api/Server.zig` (1,615 lines) depends only on `std`. Zero framework imports. It can be extracted and used independently of zigmodu.
+`api/Server.zig` (1,615 lines) depends only on `std`. Zero framework imports. It can be extracted and used independently of zmodu.
 
 ### 4. Minimal Core Foundation
 The dependency root is tiny:

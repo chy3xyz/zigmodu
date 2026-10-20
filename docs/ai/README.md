@@ -1,6 +1,6 @@
 # AI 子系统 — 从这里进
 
-`zigmodu.ai` 提供六件**互相独立**的能力。它们不是六个步骤，是六条按需取的线——
+`zmodu.ai` 提供六件**互相独立**的能力。它们不是六个步骤，是六条按需取的线——
 先确认你要的是哪一条，再打开对应文档。
 
 ## 先定位你要哪一条
@@ -11,10 +11,10 @@
 | 在业务系统里接入 AI | [`AI_DEV_GUIDE.md`](./AI_DEV_GUIDE.md) | KeyManager → Provider → Skill → Agent/Workflow → 接入（HTTP / cron / outbox / MCP） |
 | 查 Agent 能调用哪些技能 | [`AI_SKILLS.md`](./AI_SKILLS.md) | 内置技能目录：`db.query` / `kpi` / `approval` / `admin`…，按 P0–P2 分级，附权限闸门 |
 | 编排多步骤流程 | [`AI_ORCHESTRATION.md`](./AI_ORCHESTRATION.md) | 线性 / DAG / 审批门 / WAL 恢复 / 触发 / 审计 |
-| 给 AI 决策加审批、风控、诊断 | [`LLM_POLICIES.md`](./LLM_POLICIES.md) | `zigmodu.ai.llm` 的策略接线、KeyPool 轮换、无模型验证 |
+| 给 AI 决策加审批、风控、诊断 | [`LLM_POLICIES.md`](./LLM_POLICIES.md) | `zmodu.ai.llm` 的策略接线、KeyPool 轮换、无模型验证 |
 | 让外部 LLM 平台调用框架技能 | [`MCP.md`](./MCP.md) | `SkillRegistry` → MCP 桥（Claude / 外部 agent 平台） |
 
-> 写 ZigModu **框架代码**的 coding agent 请读 [`AGENTS.md`](../../AGENTS.md)——
+> 写 zmodu **框架代码**的 coding agent 请读 [`AGENTS.md`](../../AGENTS.md)——
 > 那里的 §"文档地图"是权威路由，本页只是给人类读者的导航。
 > `AI_METHODOLOGY.md`（讲**为什么**这样设计）已移到 [`docs/dev/`](../dev/AI_METHODOLOGY.md)，
 > 不是现行接线指南。

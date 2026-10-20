@@ -60,16 +60,16 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 // The framework's refusal lines are `debug`-level by design (a refused frame is
 // routine, not an error); this binary exists to make them visible.
 pub const std_options: std.Options = .{ .log_level = .debug };
 
-const Time = zigmodu.time;
-const RaftWire = zigmodu.RaftTransport;
-const DistributedEventBus = zigmodu.DistributedEventBus;
-const ClusterBootstrap = zigmodu.ClusterBootstrap;
+const Time = zmodu.time;
+const RaftWire = zmodu.RaftTransport;
+const DistributedEventBus = zmodu.DistributedEventBus;
+const ClusterBootstrap = zmodu.ClusterBootstrap;
 // `BootstrapConfig` is a file-level decl of ClusterBootstrap.zig, not a member
 // of the struct and not re-exported from the root — on either version. Deriving
 // it from `init`'s parameter reaches it through the public surface alone.
@@ -495,7 +495,7 @@ const HarnessTransport = struct {
         return .{ .sign = self.secret, .verify = self.secret };
     }
 
-    fn transport(self: *HarnessTransport) zigmodu.RaftElection.ElectionTransport {
+    fn transport(self: *HarnessTransport) zmodu.RaftElection.ElectionTransport {
         return @ptrCast(&self.vtable);
     }
 

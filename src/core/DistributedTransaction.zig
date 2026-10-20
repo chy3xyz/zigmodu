@@ -345,7 +345,7 @@ pub const TwoPhaseCommit = struct {
     /// decision on record. **Reports only** — no retry, no rollback, no timeout
     /// policy; the caller decides what the participants should be told. Returns
     /// an empty list when no journal is attached. Free with
-    /// `zigmodu.TransactionJournal.freeInDoubt`.
+    /// `zmodu.TransactionJournal.freeInDoubt`.
     pub fn recover(self: *Self, allocator: std.mem.Allocator) ![]TransactionJournal.InDoubt {
         const journal = self.journal orelse return allocator.alloc(TransactionJournal.InDoubt, 0);
         return journal.recover(allocator);
@@ -744,7 +744,7 @@ test "TwoPhaseCommit: in-doubt transaction survives a coordinator crash" {
     // working in the same tree) delete each other's database mid-test, which is
     // what the intermittent failures in this test were.
     var path_buf: [64]u8 = undefined;
-    const db_path = try std.fmt.bufPrint(&path_buf, "/tmp/zigmodu_2pc_in_doubt_{d}.db", .{std.c.getpid()});
+    const db_path = try std.fmt.bufPrint(&path_buf, "/tmp/zmodu_2pc_in_doubt_{d}.db", .{std.c.getpid()});
     std.Io.Dir.cwd().deleteFile(std.testing.io, db_path) catch {};
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, db_path) catch {};
 
@@ -797,7 +797,7 @@ test "TwoPhaseCommit: in-doubt transaction survives a coordinator crash" {
 test "TwoPhaseCommit: a reported in-doubt transaction can be decided after recovery" {
     const allocator = std.testing.allocator;
     const data = @import("../data.zig");
-    const db_path = "/tmp/zigmodu_2pc_resume.db";
+    const db_path = "/tmp/zmodu_2pc_resume.db";
     std.Io.Dir.cwd().deleteFile(std.testing.io, db_path) catch {};
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, db_path) catch {};
 

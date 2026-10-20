@@ -290,7 +290,7 @@ cat >> "$WORKTREE/build.zig.new" <<'ZIGEOF'
         .optimize = optimize,
         .link_libc = true,
     });
-    cluster_node_mod.addImport("zigmodu", zigmodu_mod);
+    cluster_node_mod.addImport("zmodu", zmodu_mod);
     db_link.link(cluster_node_mod, b, features);
     const cluster_node_exe = b.addExecutable(.{
         .name = "cluster-node",

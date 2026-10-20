@@ -85,7 +85,7 @@ test "ConfigLoader load and get values" {
     defer tmp_dir.cleanup();
 
     const file = try tmp_dir.dir.createFile(std.testing.io, "test.json", .{});
-    try file.writeStreamingAll(std.testing.io, "{\"name\":\"zigmodu\",\"port\":8080,\"debug\":true}");
+    try file.writeStreamingAll(std.testing.io, "{\"name\":\"zmodu\",\"port\":8080,\"debug\":true}");
     file.close(std.testing.io);
 
     const base_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, ".", allocator);
@@ -96,7 +96,7 @@ test "ConfigLoader load and get values" {
     const config = try loader.loadJson(path);
     defer config.deinit();
 
-    try std.testing.expectEqualStrings("zigmodu", ConfigLoader.getString(config, "name").?);
+    try std.testing.expectEqualStrings("zmodu", ConfigLoader.getString(config, "name").?);
     try std.testing.expectEqual(@as(i64, 8080), ConfigLoader.getInt(config, "port").?);
     try std.testing.expectEqual(true, ConfigLoader.getBool(config, "debug").?);
     try std.testing.expect(ConfigLoader.getString(config, "missing") == null);

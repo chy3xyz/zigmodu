@@ -36,7 +36,7 @@
 //! Run: `zig build run`.
 
 const std = @import("std");
-const zmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 const runtime = zmodu.runtime;
 const dlog = runtime.delivery_log;

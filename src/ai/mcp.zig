@@ -256,9 +256,9 @@ fn serveLine(
     if (std.mem.eql(u8, method, "initialize")) {
         var info = std.json.ObjectMap{};
         try putString(&info, a, "protocolVersion", "2024-11-05");
-        try putString(&info, a, "name", "zigmodu");
+        try putString(&info, a, "name", "zmodu");
         try putString(&info, a, "version", "0.40.0");
-        try putString(&info, a, "serverInfo", "zigmodu-ai");
+        try putString(&info, a, "serverInfo", "zmodu-ai");
         var capabilities = std.json.ObjectMap{};
         var tool_caps = std.json.ObjectMap{};
         try tool_caps.put(a, try a.dupe(u8, "listChanged"), .{ .bool = false });

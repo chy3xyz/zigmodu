@@ -105,7 +105,7 @@ echo "PASS: one leader (${leaders# }), members=3 on all nodes, full bus mesh, ze
 echo "==> probe: plaintext raft port 9501 must be unreachable from the network"
 bypass=0
 for ip in 172.28.0.11 172.28.0.12 172.28.0.13; do
-  if docker run --rm --network "$NET" --entrypoint sh zigmodu-cluster-sidecar:local \
+  if docker run --rm --network "$NET" --entrypoint sh zmodu-cluster-sidecar:local \
        -c "nc -z -w2 $ip 9501" >/dev/null 2>&1; then
     echo "FAIL: plaintext raft port 9501 on $ip accepted a connection (sidecar bypassed)" >&2
     bypass=1
@@ -133,7 +133,7 @@ echo "==> probe: mTLS ingress 9601 must refuse a peer without a client cert"
 refused=0
 for attempt in 1 2 3; do
   docker run --rm --network "$NET" -v "$HERE/certs:/certs:ro" \
-    --entrypoint sh zigmodu-cluster-sidecar:local \
+    --entrypoint sh zmodu-cluster-sidecar:local \
     -c "sleep 10 | timeout 8 openssl s_client -connect 172.28.0.11:9601 -CAfile /certs/ca.crt" \
     >"$LOGDIR/probe2-$attempt.log" 2>&1 || probe_rc=$?
   probe_rc=${probe_rc:-0}
@@ -166,7 +166,7 @@ echo "PASS: certless client refused (server-closed pre-timeout, enforcement logg
 # ── positive probe: a valid node cert completes the mTLS handshake ─────────
 echo "==> probe: mTLS ingress 9601 accepts a valid node cert"
 docker run --rm --network "$NET" -v "$HERE/certs:/certs:ro" \
-  --entrypoint sh zigmodu-cluster-sidecar:local \
+  --entrypoint sh zmodu-cluster-sidecar:local \
   -c "echo Q | openssl s_client -connect 172.28.0.11:9601 \
         -cert /certs/node2.crt -key /certs/node2.key -CAfile /certs/ca.crt 2>&1 \
       | grep -q 'Verify return code: 0'" \

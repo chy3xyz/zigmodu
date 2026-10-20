@@ -110,7 +110,7 @@ pub const SecurityModule = struct {
         user_id: []const u8,
         roles: []const []const u8,
     ) ![]const u8 {
-        return self.generateTokenWithTenant(user_id, roles, "zigmodu-app");
+        return self.generateTokenWithTenant(user_id, roles, "zmodu-app");
     }
 
     /// Generate a JWT token with tenant_id as the aud claim
@@ -138,7 +138,7 @@ pub const SecurityModule = struct {
         const header = JwtToken.JwtHeader{ .kid = self.signingKid() };
         const payload = JwtToken.JwtPayload{
             .sub = user_id,
-            .iss = "zigmodu",
+            .iss = "zmodu",
             .aud = tenant_id,
             .exp = exp,
             .iat = now,
@@ -700,7 +700,7 @@ test "verifyPassword refuses a digest longer than the derived key (no prefix mat
 test "SecurityModule role checking" {
     const payload = SecurityModule.JwtToken.JwtPayload{
         .sub = "user",
-        .iss = "zigmodu",
+        .iss = "zmodu",
         .aud = "app",
         .exp = 0 + 3600,
         .iat = 0,

@@ -23,6 +23,24 @@
 > **维护者**：新增条目与发布流程见文末 §模板。`scripts/release.sh` 只改本文件的
 > 节标题，不改正文，所以正文里对 `[Unreleased]` 的引用要在发布前一并改掉。
 
+## v0.41 — 项目改名 ZigModu → zmodu（**Breaking? 编译错**）
+
+包名、模块名与仓库名统一为 `zmodu`。改动是机械的，但编译器会把每一处都指出来：
+
+- 依赖键与模块：`build.zig.zon` 里 `.zmodu = .{ … }`；`b.dependency("zmodu", …).module("zmodu")`；
+  源码 `@import("zmodu")`。
+- **一版兼容垫片**：本版本的 `build.zig` 仍声明模块 `zigmodu`（同一 root），所以只改
+  `@import` 也能渐进迁移；v1.0 删除该别名。`ZIGMODU_*` 环境变量仍被读取（`ZMODU_*` 优先）。
+- **包指纹变了**：`.fingerprint = 0xde7987a02b121580`（Zig 在包名变化后强制要求新值）；
+  依赖 hash 前缀从 `zigmodu-` 变为 `zmodu-`，升级后必须重新 `zig fetch` 并更新 `.hash`。
+- **有意保留的线上契约**（改名不动）：Prometheus 指标 `zigmodu_*`、迁移表
+  `_zigmodu_migrations`、Raft 快照前缀 `zigmodu-raft-snapshot:`、模型字段
+  `zigmodu_ignore_tenant`。它们在仪表盘/既有数据库/落盘格式/应用代码里，静默改名会断，
+  统一留到 1.0 做双写与迁移。
+- 仓库：`https://github.com/chy3xyz/zmodu`（旧 URL 由 GitHub 自动重定向）；文档站
+  `--url-prefix zmodu`；`install.sh` 的安装目录改为 `~/.zmodu`，但检测到旧的
+  `~/.zigmodu` 时继续沿用。
+
 ## 弃用别名与删除计划
 
 **回答的是一个具体问题：「这个旧名字我什么时候必须改完？」** 此前每条弃用只写"保留为别名"、
@@ -35,9 +53,9 @@
 | 弃用名 | 现在的名字 | 计划删除 |
 |---|---|---|
 | `ctx.paramPath` | `ctx.nestedParam` | 不早于 1.0 |
-| `zigmodu.startAll` | `Application.start()` | 不早于 1.0 |
-| `zigmodu.stopAll` | `Application.stop()` | 不早于 1.0 |
-| `zigmodu.http.http_server` | `http.Server` | 不早于 1.0 |
+| `zmodu.startAll` | `Application.start()` | 不早于 1.0 |
+| `zmodu.stopAll` | `Application.stop()` | 不早于 1.0 |
+| `zmodu.http.http_server` | `http.Server` | 不早于 1.0 |
 | `ctx.sendSuccess` | `ctx.json`(200, data) —— 不再包 `{code,msg,data}` 信封 | 不早于 1.0 |
 | `ctx.sendFail` | `ctx.json`(status, body) | 不早于 1.0 |
 | `ctx.sendPageResult` | `ctx.json`(200, body)，分页结构自己拼 | 不早于 1.0 |
@@ -70,9 +88,9 @@
 代码里还有两个**整文件级**的 `DEPRECATED` 横幅。它们与 `Simplified` 不是一类，所以两边都不进：上面那张表只写
 "消费者写过的旧名 → 现在的名字"，而这两处的旧名要么命名空间已经没了，要么本来就只能越路径触达。
 
-- **`src/extensions.zig`** —— 旧的 `zigmodu.extensions` 命名空间**已从顶层移除**（记录见下面的「已移除」），
+- **`src/extensions.zig`** —— 旧的 `zmodu.extensions` 命名空间**已从顶层移除**（记录见下面的「已移除」），
   剩下一个只导出类型别名的 shim，仍被 `src/tests.zig` 的编译门禁 import。
-- **`src/validation/Validator.zig`** —— 横幅写的是"用 `zigmodu.Validator`（`validation/ObjectValidator.zig`）替代，
+- **`src/validation/Validator.zig`** —— 横幅写的是"用 `zmodu.Validator`（`validation/ObjectValidator.zig`）替代，
   v1.0 删除"。本批之后它是一层**薄兼容层**：文件里只剩 `pub const <名字> = 新家.<名字>;` 形式的别名，一个 `pub fn`
   都没有；规范实现分两处 —— 规则形状 `src/validation/FieldRules.zig`（零 import 的新家），求值引擎
   `src/validation/FieldValidation.zig`（`validateStruct:225` / `validateStructCollect:239` / `Violation:157` /
@@ -88,8 +106,8 @@
   `src/test/ApiFreeze.zig` 钉的是**解耦**：规范声明在两处新家、新家**不得** `@import` 弃用文件、弃用文件**必须**
   仍指向新家、`http.*` 两个调用方**必须**直连 `FieldValidation.zig`。
 
-门禁对这两处的断言：横幅仍在**文件头 1500 字节**内、横幅点名的替代路径仍可解析（`zigmodu.Validator` /
-`zigmodu.http.http_server` / `zigmodu.data.sqlx` / `zigmodu.data.orm` / `zigmodu.data.redis` / `zigmodu.security.auth`）、
+门禁对这两处的断言：横幅仍在**文件头 1500 字节**内、横幅点名的替代路径仍可解析（`zmodu.Validator` /
+`zmodu.http.http_server` / `zmodu.data.sqlx` / `zmodu.data.orm` / `zmodu.data.redis` / `zmodu.security.auth`）、
 `http.FieldRules`（含 `api/Extract.zig` 的再导出与 `Validator.FieldRules` 别名）**与 `validation/FieldRules.zig`
 的规范声明是同一个类型**、**整条 `validateStruct*` 链的规范声明都在 `validation/FieldValidation.zig`**（16 条
 `pub fn` / `pub const … = struct {` 逐条断言"新家有、弃用文件没有"）、弃用文件里**不得**出现任何 `pub fn `（别名层不许再长
@@ -140,32 +158,32 @@ handler 同处一张 comptime 表，重复路径在 `finish()` 前就会失败�
 ### 已移除（记录，不是承诺）
 
 `Simplified` 整块入口**已经不在了**，所以它不在上面的表里：`不早于 1.0` 是对**还在**的别名做的承诺，
-对一个已经删掉的名字继续承诺删除时点，只会让读者以为 `zigmodu.App` 今天还能用。
+对一个已经删掉的名字继续承诺删除时点，只会让读者以为 `zmodu.App` 今天还能用。
 
-- **移除的名字**：`zigmodu.App` / `zigmodu.ModuleImpl`（旧写法长什么样见 [`API-MIGRATION.md`](../archive/status/API-MIGRATION.md)
+- **移除的名字**：`zmodu.App` / `zmodu.ModuleImpl`（旧写法长什么样见 [`API-MIGRATION.md`](../archive/status/API-MIGRATION.md)
   的 Before 段 —— 那段今天**照抄编译不过**，它的价值只剩"看懂旧代码在写什么"）。
 - **何时移除的**：commit `557190a`（2026-05-12，标题 `…+ Simplified removal`）已把它从 `src/root.zig` 移除，
   此后顶层不再有这些名字。
 - **替代品**：`Application`（`zmodu.builder(...).build(.{...})`）。
 - **今天在哪能找到它**：`src/api/Simplified.zig` 仍在树里（只被 `src/tests.zig` 的编译门禁引用），
-  但**只能越路径**触达：`const Simplified = @import("zigmodu/src/api/Simplified.zig");` —— 越包内路径不受支持，随时会变。
-- **门禁**：`src/test/ApiFreeze.zig` 钉住 `zigmodu.App` / `zigmodu.ModuleImpl` **不得**回到顶层，
+  但**只能越路径**触达：`const Simplified = @import("zmodu/src/api/Simplified.zig");` —— 越包内路径不受支持，随时会变。
+- **门禁**：`src/test/ApiFreeze.zig` 钉住 `zmodu.App` / `zmodu.ModuleImpl` **不得**回到顶层，
   并钉住 `src/api/Simplified.zig` 仍被 `src/tests.zig` 的编译门禁 import。
 
-第二块是 `zigmodu.extensions`：
+第二块是 `zmodu.extensions`：
 
-- **移除的名字**：`zigmodu.extensions` 整个命名空间 —— 旧写法长这样：`zigmodu.extensions.HttpServer`、
-  `zigmodu.extensions.ModuleTestContext`（迁移方向见 `docs/dev/upgrade-roadmap.md:77`）。
+- **移除的名字**：`zmodu.extensions` 整个命名空间 —— 旧写法长这样：`zmodu.extensions.HttpServer`、
+  `zmodu.extensions.ModuleTestContext`（迁移方向见 `docs/dev/upgrade-roadmap.md:77`）。
 - **何时移除的**：**没有可引用的 commit 或 tag**（本批不查 `git`）。可引用的书面证据是 `CHANGELOG.md` 的
-  `[0.15.0]`（2026-08-01）那一段：它把 `zigmodu.ModuleTestContext` 列为 `root.zig` 的导出，并把
-  `examples/testing` 记作"已移出弃用的 `zigmodu.extensions` 命名空间"—— 也就是说那时这个命名空间已经不在推荐面上。
-  今天的事实**由门禁自己钉住**：`@hasDecl(zigmodu, "extensions")` 必须为**假**。
-- **替代品**：域文件 —— `HttpServer` → `zigmodu.http.Server`、`HttpContext` → `zigmodu.http.Context`、
-  `SqlxClient` → `zigmodu.data.sqlx.Client`、`Orm` → `zigmodu.data.orm.Orm`、`RedisClient` → `zigmodu.data.redis.Redis`。
+  `[0.15.0]`（2026-08-01）那一段：它把 `zmodu.ModuleTestContext` 列为 `root.zig` 的导出，并把
+  `examples/testing` 记作"已移出弃用的 `zmodu.extensions` 命名空间"—— 也就是说那时这个命名空间已经不在推荐面上。
+  今天的事实**由门禁自己钉住**：`@hasDecl(zmodu, "extensions")` 必须为**假**。
+- **替代品**：域文件 —— `HttpServer` → `zmodu.http.Server`、`HttpContext` → `zmodu.http.Context`、
+  `SqlxClient` → `zmodu.data.sqlx.Client`、`Orm` → `zmodu.data.orm.Orm`、`RedisClient` → `zmodu.data.redis.Redis`。
 - **今天在哪能找到它**：`src/extensions.zig` 仍在树里（只导出上述几种类型别名），且**只能越路径**触达：
-  `const extensions = @import("zigmodu/src/extensions.zig");` —— 越包内路径不受支持，随时会变。
+  `const extensions = @import("zmodu/src/extensions.zig");` —— 越包内路径不受支持，随时会变。
   文件头横幅自己写着 "This file will be removed in v1.0"。
-- **门禁**：`src/test/ApiFreeze.zig` 钉住 `zigmodu.extensions` **不得**回到顶层、`src/extensions.zig` 仍在树里、
+- **门禁**：`src/test/ApiFreeze.zig` 钉住 `zmodu.extensions` **不得**回到顶层、`src/extensions.zig` 仍在树里、
   仍被 `src/tests.zig` 的编译门禁 import，且 shim 里的名字仍指向域文件里的**同一批类型**（`HttpServer == http.Server` 等）。
 
 新增弃用项要同时做三件事（否则这张表会变成第二个没人维护的清单）：
@@ -180,12 +198,12 @@ handler 同处一张 comptime 表，重复路径在 `finish()` 前就会失败�
 
 其余各行**在本文里没有可回指的版本段**，逐条给出实际找到的记录（有就引、没有就说没有）：
 
-- `zigmodu.startAll` / `zigmodu.stopAll` —— **找得到版本记录，但不在本文**：`CHANGELOG.md` 的 `[0.15.12]`
+- `zmodu.startAll` / `zmodu.stopAll` —— **找得到版本记录，但不在本文**：`CHANGELOG.md` 的 `[0.15.12]`
   段（Changed）写着"Lifecycle 文档统一：主 API 改为 `Application.start/stop`，`startAll/stopAll` 标注为底层
   Lifecycle"。`docs/UPGRADING.md` **没有 `v0.15.12` 段**，所以回指无处可落 —— 不为了让规则 3 好看而新造一个版本段
   （该段本身不是破坏性变更，本文件只收"会咬人"的条目）。
-- `zigmodu.http.http_server` —— **没有弃用条目**可引：`CHANGELOG.md` 里唯一的版本性记录是 `[0.15.8]`（Changed，
-  "API.md 旧别名清理：`zigmodu.http_server.*` 示例统一为 `zigmodu.http.*`"），那是**示例清理**，不是"某版起弃用"；
+- `zmodu.http.http_server` —— **没有弃用条目**可引：`CHANGELOG.md` 里唯一的版本性记录是 `[0.15.8]`（Changed，
+  "API.md 旧别名清理：`zmodu.http_server.*` 示例统一为 `zmodu.http.*`"），那是**示例清理**，不是"某版起弃用"；
   `src/http.zig:13` 的标记自称 "removed from root in v0.14.0"，而 `CHANGELOG.md` 里**没有 `[0.14.0]` 段**
   （现存最早的是 `[0.14.13]`）。本文也没有对应版本段。
 - `ctx.sendSuccess` / `ctx.sendFail` / `ctx.sendPageResult` / `ctx.sendJsonItems` —— **找不到**"某版本引入/弃用"的条目：
@@ -232,7 +250,7 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 | 被移除 | 替代 |
 |---|---|
 | `std.Thread.sleep` / `std.Thread.Mutex` / `std.Thread.WaitGroup` | busy-loop 或 `std.Io.sleep` / **`std.Io.Mutex`**（`lock(io)`/`unlock(io)` 都要 io 参） / `std.Io.Group` |
-| `std.time.timestamp` / `milliTimestamp` / `microTimestamp` / `nanoTimestamp` | 时长用 **`Time.monotonicNowSeconds/Milliseconds`**（`zigmodu` 导出）；入库墙钟用 **`Time.wallClockSeconds/io` / `wallClockMilliseconds/io`**（墙钟可回拨，差值非时长） |
+| `std.time.timestamp` / `milliTimestamp` / `microTimestamp` / `nanoTimestamp` | 时长用 **`Time.monotonicNowSeconds/Milliseconds`**（`zmodu` 导出）；入库墙钟用 **`Time.wallClockSeconds/io` / `wallClockMilliseconds/io`**（墙钟可回拨，差值非时长） |
 | `std.os.getpid` | `@intFromPtr(&seed)` 取熵 |
 | `std.fs.cwd()` / `std.fs.File` | **`std.Io.Dir.cwd(io)` / `std.Io.File`**（全部 API 要 io 参）；`file.writeAll` → `writeStreamingAll(io, data)` |
 | `ArrayList(T).init(alloc)` | `ArrayList(T).empty` + 每个方法传 allocator |
@@ -319,7 +337,7 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
   `http.compressionMiddleware`，以及 `http.http_middleware` 下的 `cors` / `jwtAuth` /
   `csrf` / `csrfWith` / `securityHeaders` / `rateLimitPerClient`。
 - **`error{SlotPoolExhausted}`**（槽位池）：`http.catalogLoaderFromTable`（64 槽）、
-  `zigmodu.security.CatalogPermDb.loaderFromClient`、`zigmodu.security.ApiKeyAuth`（即
+  `zmodu.security.CatalogPermDb.loaderFromClient`、`zmodu.security.ApiKeyAuth`（即
   `apiKeyAuth`）与 `ApiKeyAuthWithLoader`、`http.openApiFromCatalog` 与
   `http.openApiRoutes`（16 槽）。
 
@@ -335,9 +353,9 @@ try server.addMiddleware(http.permissionGateWith(&slot, .{ .mode = .rbac }));
 try server.addMiddleware(try http.permissionGateWith(&slot, .{ .mode = .rbac }));
 
 // 旧
-const loader = zigmodu.security.CatalogPermDb.loaderFromClient(db);
+const loader = zmodu.security.CatalogPermDb.loaderFromClient(db);
 // 新
-const loader = try zigmodu.security.CatalogPermDb.loaderFromClient(db);
+const loader = try zmodu.security.CatalogPermDb.loaderFromClient(db);
 ```
 
 `SlotPoolExhausted` 只在接线次数超过池上限时发生；一次性接线（每 app 一张表 / 一个 slot）
@@ -350,15 +368,15 @@ const loader = try zigmodu.security.CatalogPermDb.loaderFromClient(db);
 参数。行为变化：从静默串行变成真并发（`std.Io.Group` 按 `max_workers` 分块），传入的
 `func` 必须线程安全。
 
-**影响面**：直接调 `zigmodu.fx.Parallel` / `fx.Map` 的代码（框架仓内零调用点）。
+**影响面**：直接调 `zmodu.fx.Parallel` / `fx.Map` 的代码（框架仓内零调用点）。
 
 **一行改法**：
 
 ```zig
 // 旧
-try zigmodu.fx.Parallel(allocator, T, items, 4, func);
+try zmodu.fx.Parallel(allocator, T, items, 4, func);
 // 新
-try zigmodu.fx.Parallel(io, T, items, 4, func);
+try zmodu.fx.Parallel(io, T, items, 4, func);
 ```
 
 ### ③ JWT 段改用 std 严格 base64url（第 130 批，**行为收紧**）
@@ -439,7 +457,7 @@ HTTP/1.1 缓冲响应、chunked/streaming、SSE、HTTP/2 帧、`Server` 的 WS �
 
 ## v0.33.6 → v0.34.0（内容已随 **v0.34.0** 发布，本节标题是旧名）
 
-> **本版无破坏性变更**：新增 `zigmodu.TomlLoader`、`ScopedContainer` 的三个方法、`zigmodu.runtime.affinity`
+> **本版无破坏性变更**：新增 `zmodu.TomlLoader`、`ScopedContainer` 的三个方法、`zmodu.runtime.affinity`
 > （CPU pin 原语），删除一个从没实现过的空壳 `TransactionalEvent`。**第 31 批也是无公开 API 变化的一批**
 > （一个内部存储层 + 两组实测），但它的结论会改变你读 §12 的方式 —— 见本节最后一条。
 > 另有两条**消费者应当知道的口径**：① `PrecisionTimer` 的 10 µs 中位数界是**宿主的**、不是机制的 ——
@@ -447,10 +465,10 @@ HTTP/1.1 缓冲响应、chunked/streaming、SSE、HTTP/2 帧、`Server` 的 WS �
 
 **新增公开 API（additive，无破坏性）**
 
-- **`zigmodu.TomlLoader`** —— 上一版补了 `ConfigManager` 的导出，但 TOML 还是读不了（loader 本身没导出）。
-  现在 `var loader = zigmodu.TomlLoader.init(allocator); try loader.loadFile("app.toml", &config);`，
+- **`zmodu.TomlLoader`** —— 上一版补了 `ConfigManager` 的导出，但 TOML 还是读不了（loader 本身没导出）。
+  现在 `var loader = zmodu.TomlLoader.init(allocator); try loader.loadFile("app.toml", &config);`，
   `[server]` + `port` 落成 `server.port`，类型保留（`getInt`/`getBool`/`getFloat` 可用）。
-  **一行改法**：以前只能自己 `@import` 框架内部文件路径的，改从 `zigmodu` 导入。`root.zig` 的
+  **一行改法**：以前只能自己 `@import` 框架内部文件路径的，改从 `zmodu` 导入。`root.zig` 的
   "文档里出现的符号必须可导入"测试里加了一条 TOML 端到端（文件 → `loadFile` → 读值），漏加导出让测试红。
 - **`ScopedContainer.registerBorrowed` / `remove` / `serviceCount`** —— 补齐与 `Container` 的差集。
   **语义要点：改/查两半的穿透规则不同** ——`get`/`contains` 查本作用域再下沉 `parent`；
@@ -458,7 +476,7 @@ HTTP/1.1 缓冲响应、chunked/streaming、SSE、HTTP/2 帧、`Server` 的 WS �
   作用域注销一个共享服务，会让 parent 容器的其它读者拿到已销毁的实例。`serviceCount` 只数本层
   （同名可在两层都注册，跨层计数会重复）。**一行改法**：以前为了"改本层"而绕开 `ScopedContainer`、
   直接对 `Container` 动手的代码可以收回来。
-- **`zigmodu.runtime.affinity`** —— `supported`（comptime 常量）与 `pinCurrentThread(cpu_index)`：
+- **`zmodu.runtime.affinity`** —— `supported`（comptime 常量）与 `pinCurrentThread(cpu_index)`：
   Linux 走 `sched_setaffinity(0, …)`（pin 的是**调用线程**），**macOS 与 Windows 返回 `error.Unsupported`**，
   平台有 API 但内核拒绝时返回 `error.PinFailed`。**它绝不假报成功** —— 这是刻意的：
   "静默忽略的声明是比没声明更坏的失败模式"。**注意这不等于 `spawn` 上有了 `.affinity` 字段**：
@@ -467,8 +485,8 @@ HTTP/1.1 缓冲响应、chunked/streaming、SSE、HTTP/2 帧、`Server` 的 WS �
 **删除：`src/core/TransactionalEvent.zig`（249 行的空壳）** —— 上一版已判定它不是公开 API（`root.zig`
 从未导出、`docs/API.md` 那节已改为 internal）。这次连文件一起删掉，因为留着它就是留一份"看起来能用"的假实现
 （`stageEvent`/`addEvent` 都是 `_ = event;`）。**影响面**：只有**越路径**导入框架内部文件的代码
-（`@import("zigmodu/src/core/TransactionalEvent.zig")`）会**编译错**；公开面没有任何变化。
-**一行改法**：`zigmodu.outbox.*`（真实 outbox）或 `zigmodu.SagaOrchestrator`。
+（`@import("zmodu/src/core/TransactionalEvent.zig")`）会**编译错**；公开面没有任何变化。
+**一行改法**：`zmodu.outbox.*`（真实 outbox）或 `zmodu.SagaOrchestrator`。
 
 **测量口径（非破坏，但会改变你在别的机器上看到的数字）：`PrecisionTimer` 的 10 µs 界是宿主相关的。**
 它的用例曾在 GitHub 的 macOS runner 上红两条，原因是那台机器的 `nanosleep` **比自旋窗口还粗**：
@@ -502,17 +520,17 @@ HTTP/1.1 缓冲响应、chunked/streaming、SSE、HTTP/2 帧、`Server` 的 WS �
   `DeliveryLog.setCodec(track, MyCodec)` 之后 **该轨仍然可以内存重放**（第 36 批起）：codec 只在 `drainTo`
   里跑，环里始终是**活值**，所以 `Replayer.bind` 不再因为"这条轨声明了 codec"而拒绝 —— 那条
   `error.CodecRequired` 是第 32 批之前的设计残留（那时以为带 codec 的轨环里存的是字节），第 36 批已拆掉，
-  `BindError` 因此少了那个成员。契约本身是 `zigmodu.runtime.Codec(E)`（`name`/`version`/
+  `BindError` 因此少了那个成员。契约本身是 `zmodu.runtime.Codec(E)`（`name`/`version`/
   `encode`/`decode`），框架只规定接口，不规定格式；`drainTo` 的返回值带 `holes` / `first_hole_seq`
   （环溢出与游标落后都会变成**看得见的洞**，而不是一份看起来完整的 log）。
-- **"读盘重放"这一刀已经到了（第 33 批）**：`zigmodu.runtime.ReplayFromLog`。**从盘上**重放**要求** codec
+- **"读盘重放"这一刀已经到了（第 33 批）**：`zmodu.runtime.ReplayFromLog`。**从盘上**重放**要求** codec
   （它读的是字节，不是活值）—— 这与"内存重放不再要求不开 codec"是两件不同的事，第 36 批之后两条路可以同时开着。
   要点：它是 **load-then-replay**（借 `scan` 读到的记录、按全局 `seq` 排一次索引），**不是**跟随一个
   正在写的 log；**洞默认拒绝**（`error.LogHasHoles`，且不消费那条记录），显式 `allowHoles()` 之后才跨过，
   跨过多少在 `crossedHoles()` 里**精确**计数；绑定走 `setCodec(id, C, E)` + `bindDecoded(id, handle)`
   两步（这样"没声明 codec"与"handle 类型不对"才是**能指名到 id 的运行时错误**）；
   它**持有 allocator**（`Codec.decode` 就是 allocator 版），这是与 `Replayer` 零分配的刻意差别。
-  另有两条**新增公开方法**：`zigmodu.runtime.ReplayFromLog` 本身，以及 `DeliveryLog.setCodecRef(track, C, E)`
+  另有两条**新增公开方法**：`zmodu.runtime.ReplayFromLog` 本身，以及 `DeliveryLog.setCodecRef(track, C, E)`
   —— 后者在第 32 批之后是**必需**的：`setCodec` 要 typed `*Track(E, capacity)`，而 `Runtime.spawn` 只留
   erased 的 `Handle.track: ?*TrackRef`，所以在它出现之前，**运行时用 `.record` 声明的轨根本挂不上 codec**，
   `drainTo` 对这类 worker 不可达（第 32 批的"能进盘"只对直接 `addTrack` 的用户成立）。
@@ -647,11 +665,11 @@ gauge 同名）与 **histogram 的生成名**（`createHistogram("x")` 之后再
 返回 —— 那个指针指向已失效的栈帧。只影响直接用这个测试工具的类型（`IntegrationTest.instrumentation` 字段也变成
 `?*InstrumentationContext`）。
 
-**新增公开 API（additive，无破坏性）**：`zigmodu.Params`、`zigmodu.ScopedContainer`、
-`zigmodu.SlidingWindowRateLimiter`、`zigmodu.ConfigManager` 四个符号以前**只存在于 `src/` 里、没有公开导入路径**
+**新增公开 API（additive，无破坏性）**：`zmodu.Params`、`zmodu.ScopedContainer`、
+`zmodu.SlidingWindowRateLimiter`、`zmodu.ConfigManager` 四个符号以前**只存在于 `src/` 里、没有公开导入路径**
 （文档写了它们但消费者 import 不到），现在从 `root.zig` 再导出，文档路径同步改正。
-`zigmodu.TransactionalEvent` **不再**是公开 API（那一节从文档里删掉了）：它是个空壳，真身是 `zigmodu.outbox.*` 与
-`zigmodu.SagaOrchestrator`。另新增 `zigmodu.runtime.PrecisionTimer`（亚毫秒 deadline 队列，调用方提供缓冲、
+`zmodu.TransactionalEvent` **不再**是公开 API（那一节从文档里删掉了）：它是个空壳，真身是 `zmodu.outbox.*` 与
+`zmodu.SagaOrchestrator`。另新增 `zmodu.runtime.PrecisionTimer`（亚毫秒 deadline 队列，调用方提供缓冲、
 类型内零分配；不要用它替代普通定时器 —— 10 ms 以上的 deadline 仍旧用 scheduler 的 wheel，后者几乎不花 CPU）
 与 `RaftTransport.connectTimeout`（POSIX 有界 dial）。
 **顺带一条给所有人的警告**：`IpAddress.ConnectOptions.timeout` 在本工具链上会让进程**直接 abort**
@@ -1124,7 +1142,7 @@ wf.run(allocator, &ctx) catch |err| switch (err) {
 
 ### 2PC 新增 `TransactionJournal`（in-doubt 有解）
 
-**Breaking?** 否，纯新增（`zigmodu.TransactionJournal`）。append-only、只 INSERT、DDL 方言中立；
+**Breaking?** 否，纯新增（`zmodu.TransactionJournal`）。append-only、只 INSERT、DDL 方言中立；
 不配 backend 时退回内存。配了日志即 **fail-closed**（写不进去就报错、不前进）。`recover()` **只报告不决策**，
 返回"prepared 且无终态"的事务供调用方自行重试/回滚。
 
@@ -1261,10 +1279,10 @@ var app = try b.withName("app").build(.{});
 **改法**：
 
 ```zig
-const mp = zigmodu.http.Multipart.Config.forBodyLimit(64 << 20);
-var form = try zigmodu.http.extractMultipart(ctx, mp);      // 415/413/400 → ProblemDetails
+const mp = zmodu.http.Multipart.Config.forBodyLimit(64 << 20);
+var form = try zmodu.http.extractMultipart(ctx, mp);      // 415/413/400 → ProblemDetails
 defer form.deinit();
-try zigmodu.http.UploadGuard.checkForm(&form, .{
+try zmodu.http.UploadGuard.checkForm(&form, .{
     .extensions = &.{ "jpg", "jpeg", "png" },
     .formats = &.{ .jpeg, .png },
     .max_bytes = 5 << 20,
@@ -1357,15 +1375,15 @@ rehash 后失效**（悬垂指针），以及全程无同步。现在指针在 r
 
 ```zig
 // 链内 + 路由前，全部 RFC 7807（media type application/problem+json）
-zigmodu.http.useRfc7807Errors();
+zmodu.http.useRfc7807Errors();
 ```
 
 只想要其中一半：
 
 ```zig
-zigmodu.http.setDefaultReject(zigmodu.http.problemReject);          // 仅链内
-zigmodu.http.setTransportErrorRenderer(zigmodu.http.problemTransportBody); // 仅路由前
-zigmodu.http.setDefaultReject(null);                                 // 复位
+zmodu.http.setDefaultReject(zmodu.http.problemReject);          // 仅链内
+zmodu.http.setTransportErrorRenderer(zmodu.http.problemTransportBody); // 仅路由前
+zmodu.http.setDefaultReject(null);                                 // 复位
 ```
 
 - 单个 gate 想自行决定：`.reject = problemReject` / `.reject = envelopeReject(.thinkphp)`；`ModuleGateConfig` 新增 `reject`，**`.unknown = .deny` 可保留**。
@@ -1385,15 +1403,15 @@ zigmodu.http.setDefaultReject(null);                                 // 复位
 // before：handler 自己拼门户判断，只认其中一个分支 → 另一门户整类 403
 //   （反馈方的真实故障：路由 meta 是 portal:user|portal:shop，
 //      handler 复用了只认 .shop 的 requireAppAuth）
-if (!shopOnlyAuth(ctx)) { try zigmodu.http.respondErr(ctx, error.Forbidden); return; }
+if (!shopOnlyAuth(ctx)) { try zmodu.http.respondErr(ctx, error.Forbidden); return; }
 
 // after：用与路由声明完全相同的表达式问"我是哪一边"
 if (!ctx.permissionMatches("portal:user|portal:shop")) {
-    try zigmodu.http.respondErr(ctx, error.Forbidden);
+    try zmodu.http.respondErr(ctx, error.Forbidden);
     return;
 }
 // 需要与某个 gate 完全同语义（.roles 只看 roles；.rbac 有 AuthInfo 时以它为准）：
-const ok = zigmodu.http.permissionMatchesWith(ctx, "portal:shop", .{ .mode = .rbac });
+const ok = zmodu.http.permissionMatchesWith(ctx, "portal:shop", .{ .mode = .rbac });
 ```
 
 配套新增 `ctx.permissionsCsv()`（与 `rolesCsv()` 同形）。

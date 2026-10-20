@@ -44,7 +44,7 @@ body: |
 
   | 项 | 值 |
   |---|---|
-  | zigmodu 版本 | <!-- git describe --> |
+  | zmodu 版本 | <!-- git describe --> |
   | Zig 版本 | <!-- zig version --> |
   | 平台 | <!-- macOS 15 / Linux 6.x / Windows 11 · x86_64 / aarch64 --> |
   | 模式 | <!-- Debug / ReleaseFast --> |

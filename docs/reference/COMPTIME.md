@@ -1,6 +1,6 @@
 # Compile-time budget（编译期预算）
 
-ZigModu 把大量"结构上不会变"的东西放在编译期：路由表与 `RouteMeta`、模块依赖图
+zmodu 把大量"结构上不会变"的东西放在编译期：路由表与 `RouteMeta`、模块依赖图
 校验、`Repository` 的租户列强制、邮箱容量（`Mailbox(T, capacity)`）。这是框架
 的差异化，但它有一个**未显式管理的资源**：`@setEvalBranchQuota`。
 
@@ -23,7 +23,7 @@ base = 1_000_000, per_unit = 20_000
 自己的代码需要更大预算时：
 
 ```zig
-const EvalQuota = @import("zigmodu").core.EvalQuota; // 或直接 import 路径
+const EvalQuota = @import("zmodu").core.EvalQuota; // 或直接 import 路径
 comptime {
     @setEvalBranchQuota(EvalQuota.forUnits(fields.len));
     // … 展开/分析 …

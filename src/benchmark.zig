@@ -1,8 +1,8 @@
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 fn now() i128 {
-    return zigmodu.time.monotonicNow();
+    return zmodu.time.monotonicNow();
 }
 
 fn elapsedMs(t0: i128) f64 {
@@ -66,13 +66,13 @@ const harness_allocator = std.heap.smp_allocator;
 
 fn benchModuleScan(count: usize) !f64 {
     const MockModule = struct {
-        pub const info = zigmodu.api.Module{ .name = "bench", .description = "Benchmark module", .dependencies = &.{} };
+        pub const info = zmodu.api.Module{ .name = "bench", .description = "Benchmark module", .dependencies = &.{} };
         pub fn init() !void {}
         pub fn deinit() void {}
     };
     const t0 = now();
     for (0..count) |_| {
-        var modules = try zigmodu.scanModules(harness_allocator, .{MockModule});
+        var modules = try zmodu.scanModules(harness_allocator, .{MockModule});
         modules.deinit();
     }
     return elapsedMs(t0);
@@ -80,27 +80,27 @@ fn benchModuleScan(count: usize) !f64 {
 
 fn benchModuleValidation(allocator: std.mem.Allocator, count: usize) !f64 {
     const A = struct {
-        pub const info = zigmodu.api.Module{ .name = "a", .description = "A", .dependencies = &.{} };
+        pub const info = zmodu.api.Module{ .name = "a", .description = "A", .dependencies = &.{} };
         pub fn init() !void {}
         pub fn deinit() void {}
     };
     const B = struct {
-        pub const info = zigmodu.api.Module{ .name = "b", .description = "B", .dependencies = &.{"a"} };
+        pub const info = zmodu.api.Module{ .name = "b", .description = "B", .dependencies = &.{"a"} };
         pub fn init() !void {}
         pub fn deinit() void {}
     };
-    var modules = try zigmodu.scanModules(allocator, .{ A, B });
+    var modules = try zmodu.scanModules(allocator, .{ A, B });
     defer modules.deinit();
     const t0 = now();
     for (0..count) |_| {
-        try zigmodu.validateModules(&modules);
+        try zmodu.validateModules(&modules);
     }
     return elapsedMs(t0);
 }
 
 fn benchEventBus(allocator: std.mem.Allocator, listeners: usize, events: usize) !f64 {
     const E = struct { id: u64 };
-    var bus = zigmodu.TypedEventBus(E).init(allocator);
+    var bus = zmodu.TypedEventBus(E).init(allocator);
     defer bus.deinit();
     for (0..listeners) |_| {
         try bus.subscribe(struct {
@@ -132,9 +132,9 @@ fn benchEventBus(allocator: std.mem.Allocator, listeners: usize, events: usize) 
 /// afterwards, so a harness that silently stops driving the breaker fails the run
 /// instead of reporting a suspiciously fast number.
 fn benchCircuitBreaker(allocator: std.mem.Allocator, calls: usize, counted: ?*usize) !f64 {
-    const cb = try allocator.create(zigmodu.CircuitBreaker);
+    const cb = try allocator.create(zmodu.CircuitBreaker);
     defer allocator.destroy(cb);
-    cb.* = try zigmodu.CircuitBreaker.init(allocator, "bench", .{ .failure_threshold = 100, .success_threshold = 2, .timeout_seconds = 30, .half_open_max_calls = 10 });
+    cb.* = try zmodu.CircuitBreaker.init(allocator, "bench", .{ .failure_threshold = 100, .success_threshold = 2, .timeout_seconds = 30, .half_open_max_calls = 10 });
     defer cb.deinit();
 
     const op = struct {
@@ -168,7 +168,7 @@ fn benchCircuitBreaker(allocator: std.mem.Allocator, calls: usize, counted: ?*us
 }
 
 fn benchRateLimiter(allocator: std.mem.Allocator, calls: usize) !f64 {
-    var rl = try zigmodu.RateLimiter.init(allocator, "bench", 1_000_000, 1_000_000);
+    var rl = try zmodu.RateLimiter.init(allocator, "bench", 1_000_000, 1_000_000);
     defer rl.deinit();
     const t0 = now();
     for (0..calls) |_| {
@@ -178,12 +178,12 @@ fn benchRateLimiter(allocator: std.mem.Allocator, calls: usize) !f64 {
 }
 
 fn benchHealthEndpoint(checks: usize, iterations: usize) !f64 {
-    var ep = zigmodu.HealthEndpoint.init(harness_allocator);
+    var ep = zmodu.HealthEndpoint.init(harness_allocator);
     defer ep.deinit();
     for (0..checks) |i| {
         const name = try harness_allocator.print("check-{}", .{i});
         defer harness_allocator.free(name);
-        try ep.registerCheck(name, "bench", zigmodu.HealthEndpoint.alwaysUp);
+        try ep.registerCheck(name, "bench", zmodu.HealthEndpoint.alwaysUp);
     }
     const t0 = now();
     for (0..iterations) |_| {
@@ -195,13 +195,13 @@ fn benchHealthEndpoint(checks: usize, iterations: usize) !f64 {
 
 fn benchApplicationLifecycle(io: std.Io, count: usize) !f64 {
     const M = struct {
-        pub const info = zigmodu.api.Module{ .name = "m", .description = "M", .dependencies = &.{} };
+        pub const info = zmodu.api.Module{ .name = "m", .description = "M", .dependencies = &.{} };
         pub fn init() !void {}
         pub fn deinit() void {}
     };
     const t0 = now();
     for (0..count) |_| {
-        var app = try zigmodu.Application.init(io, harness_allocator, "bench", .{M}, .{});
+        var app = try zmodu.Application.init(io, harness_allocator, "bench", .{M}, .{});
         try app.start();
         app.stop();
         app.deinit();
@@ -210,7 +210,7 @@ fn benchApplicationLifecycle(io: std.Io, count: usize) !f64 {
 }
 
 fn benchDbQuery(io: std.Io, queries: usize) !f64 {
-    var client = zigmodu.data.sqlx.Client.init(harness_allocator, io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = zmodu.data.sqlx.Client.init(harness_allocator, io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
     _ = try client.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, value REAL)", &.{});
@@ -219,15 +219,15 @@ fn benchDbQuery(io: std.Io, queries: usize) !f64 {
         defer harness_allocator.free(s);
         _ = try client.exec(s, &.{});
     }
-    const backend = zigmodu.data.SqlxBackend{ .allocator = harness_allocator, .client = &client };
-    var orm = zigmodu.data.orm.Orm(zigmodu.data.SqlxBackend){ .backend = backend };
+    const backend = zmodu.data.SqlxBackend{ .allocator = harness_allocator, .client = &client };
+    var orm = zmodu.data.orm.Orm(zmodu.data.SqlxBackend){ .backend = backend };
     const Row = struct {
         pub const sql_table_name: []const u8 = "t";
         id: i64,
         name: []const u8,
         value: f64,
     };
-    var repo = zigmodu.data.Repository(Row){ .orm = &orm };
+    var repo = zmodu.data.Repository(Row){ .orm = &orm };
     _ = try repo.findById(@as(i64, 50));
     const t0 = now();
     for (0..queries) |_| {
@@ -356,11 +356,11 @@ const LatencyInjector = struct {
     /// would otherwise look exactly like a sampler that cannot see a stall.
     fn fromEnv(environ: anytype) !LatencyInjector {
         var injector = LatencyInjector{};
-        if (environ.get("ZIGMODU_BENCH_INJECT_NS")) |raw| {
+        if (environ.get("ZMODU_BENCH_INJECT_NS") orelse environ.get("ZIGMODU_BENCH_INJECT_NS")) |raw| {
             injector.stall_ns = std.fmt.parseInt(i128, raw, 10) catch return error.BenchInvalidInjectNs;
             if (injector.stall_ns < 0) return error.BenchInvalidInjectNs;
         }
-        if (environ.get("ZIGMODU_BENCH_INJECT_EVERY")) |raw| {
+        if (environ.get("ZMODU_BENCH_INJECT_EVERY") orelse environ.get("ZIGMODU_BENCH_INJECT_EVERY")) |raw| {
             injector.every = std.fmt.parseInt(usize, raw, 10) catch return error.BenchInvalidInjectEvery;
         }
         return injector;
@@ -470,7 +470,7 @@ const LatencyRun = struct {
 // nanoseconds-per-operation band and repeatable on a loaded host.
 // ─────────────────────────────────────────────────
 
-const rt = zigmodu.runtime;
+const rt = zmodu.runtime;
 
 /// The host's atomic-path speed, measured on the same run as everything else —
 /// the reference `scripts/check-bench.sh` divides the atomic-path metrics by.
@@ -1284,14 +1284,14 @@ fn benchPoolSweep(comptime work_iters: u32, io: std.Io, workers: usize, pool_thr
 }
 
 fn benchWorkflow(allocator: std.mem.Allocator, io: std.Io, steps_count: usize, iterations: usize) !f64 {
-    var registry = zigmodu.ai.SkillRegistry.init(allocator, io);
+    var registry = zmodu.ai.SkillRegistry.init(allocator, io);
     defer registry.deinit();
     try registry.register(.{
         .name = "nop",
         .description = "",
         .parameters = &.{},
         .handler = struct {
-            fn h(c: *zigmodu.ai.SkillContext, _: std.json.Value) anyerror!std.json.Value {
+            fn h(c: *zmodu.ai.SkillContext, _: std.json.Value) anyerror!std.json.Value {
                 var o = std.json.ObjectMap{};
                 // Bound to a local before the `put`: inside its argument list an
                 // allocation failure leaves this copy unreachable and unfreed.
@@ -1304,7 +1304,7 @@ fn benchWorkflow(allocator: std.mem.Allocator, io: std.Io, steps_count: usize, i
             }
         }.h,
     });
-    const steps = try allocator.alloc(zigmodu.ai.workflow.Step, steps_count);
+    const steps = try allocator.alloc(zmodu.ai.workflow.Step, steps_count);
     defer allocator.free(steps);
     for (0..steps_count) |i| {
         steps[i] = .{
@@ -1313,12 +1313,12 @@ fn benchWorkflow(allocator: std.mem.Allocator, io: std.Io, steps_count: usize, i
         };
     }
     defer for (steps) |s| allocator.free(s.name);
-    var wf = zigmodu.ai.workflow.Workflow.init(&registry, steps);
+    var wf = zmodu.ai.workflow.Workflow.init(&registry, steps);
     // Steps and registry above are setup state and stay on the caller's arena;
     // what a single `run` allocates — step records, plus the skill's own result
     // value, which the handler builds with `ctx.allocator` — goes through the
     // reclaiming allocator, like the rest of the per-turn loops.
-    var ctx = zigmodu.ai.SkillContext{ .allocator = harness_allocator };
+    var ctx = zmodu.ai.SkillContext{ .allocator = harness_allocator };
     const t0 = now();
     for (0..iterations) |_| {
         var r = try wf.run(harness_allocator, &ctx);
@@ -1601,7 +1601,7 @@ fn allocWorkerSpawnJoin(io: std.Io, turns: usize) !AllocReading {
 
 fn allocModuleScan(count: usize) !AllocReading {
     const MockModule = struct {
-        pub const info = zigmodu.api.Module{ .name = "bench", .description = "Benchmark module", .dependencies = &.{} };
+        pub const info = zmodu.api.Module{ .name = "bench", .description = "Benchmark module", .dependencies = &.{} };
         pub fn init() !void {}
         pub fn deinit() void {}
     };
@@ -1610,7 +1610,7 @@ fn allocModuleScan(count: usize) !AllocReading {
     // counts all of it, scan and deinit alike.
     const before = probe.allocations;
     for (0..count) |_| {
-        var modules = try zigmodu.scanModules(probe.allocator(), .{MockModule});
+        var modules = try zmodu.scanModules(probe.allocator(), .{MockModule});
         modules.deinit();
     }
     return .{ .allocations = probe.allocations - before, .ops = count };
@@ -1618,35 +1618,35 @@ fn allocModuleScan(count: usize) !AllocReading {
 
 fn allocModuleValidation(count: usize) !AllocReading {
     const A = struct {
-        pub const info = zigmodu.api.Module{ .name = "a", .description = "A", .dependencies = &.{} };
+        pub const info = zmodu.api.Module{ .name = "a", .description = "A", .dependencies = &.{} };
         pub fn init() !void {}
         pub fn deinit() void {}
     };
     const B = struct {
-        pub const info = zigmodu.api.Module{ .name = "b", .description = "B", .dependencies = &.{"a"} };
+        pub const info = zmodu.api.Module{ .name = "b", .description = "B", .dependencies = &.{"a"} };
         pub fn init() !void {}
         pub fn deinit() void {}
     };
     var probe = AllocCounter.init(harness_allocator, .{});
-    var modules = try zigmodu.scanModules(probe.allocator(), .{ A, B });
+    var modules = try zmodu.scanModules(probe.allocator(), .{ A, B });
     defer modules.deinit();
     const before = probe.allocations;
     for (0..count) |_| {
-        try zigmodu.validateModules(&modules);
+        try zmodu.validateModules(&modules);
     }
     return .{ .allocations = probe.allocations - before, .ops = count };
 }
 
 fn allocApplicationLifecycle(io: std.Io, count: usize) !AllocReading {
     const M = struct {
-        pub const info = zigmodu.api.Module{ .name = "m", .description = "M", .dependencies = &.{} };
+        pub const info = zmodu.api.Module{ .name = "m", .description = "M", .dependencies = &.{} };
         pub fn init() !void {}
         pub fn deinit() void {}
     };
     var probe = AllocCounter.init(harness_allocator, .{});
     const before = probe.allocations;
     for (0..count) |_| {
-        var app = try zigmodu.Application.init(io, probe.allocator(), "bench", .{M}, .{});
+        var app = try zmodu.Application.init(io, probe.allocator(), "bench", .{M}, .{});
         try app.start();
         app.stop();
         app.deinit();
@@ -1657,14 +1657,14 @@ fn allocApplicationLifecycle(io: std.Io, count: usize) !AllocReading {
 fn allocWorkflow(io: std.Io, steps_count: usize, iterations: usize) !AllocReading {
     var probe = AllocCounter.init(harness_allocator, .{});
     const allocator = probe.allocator();
-    var registry = zigmodu.ai.SkillRegistry.init(allocator, io);
+    var registry = zmodu.ai.SkillRegistry.init(allocator, io);
     defer registry.deinit();
     try registry.register(.{
         .name = "nop",
         .description = "",
         .parameters = &.{},
         .handler = struct {
-            fn h(c: *zigmodu.ai.SkillContext, _: std.json.Value) anyerror!std.json.Value {
+            fn h(c: *zmodu.ai.SkillContext, _: std.json.Value) anyerror!std.json.Value {
                 var o = std.json.ObjectMap{};
                 // Bound to a local before the `put`: inside its argument list an
                 // allocation failure leaves this copy unreachable and unfreed.
@@ -1677,7 +1677,7 @@ fn allocWorkflow(io: std.Io, steps_count: usize, iterations: usize) !AllocReadin
             }
         }.h,
     });
-    const steps = try allocator.alloc(zigmodu.ai.workflow.Step, steps_count);
+    const steps = try allocator.alloc(zmodu.ai.workflow.Step, steps_count);
     defer allocator.free(steps);
     for (0..steps_count) |i| {
         steps[i] = .{
@@ -1686,13 +1686,13 @@ fn allocWorkflow(io: std.Io, steps_count: usize, iterations: usize) !AllocReadin
         };
     }
     defer for (steps) |s| allocator.free(s.name);
-    var wf = zigmodu.ai.workflow.Workflow.init(&registry, steps);
+    var wf = zmodu.ai.workflow.Workflow.init(&registry, steps);
     // Unlike `benchWorkflow` (fixture on the caller's arena, per-run records on
     // `harness_allocator`), the mirror runs everything through the counter: the
     // fixture is built before the snapshot, and the per-run records — step
     // records plus the skill's result value — are exactly what the snapshot
     // region must catch.
-    var ctx = zigmodu.ai.SkillContext{ .allocator = allocator };
+    var ctx = zmodu.ai.SkillContext{ .allocator = allocator };
     const before = probe.allocations;
     for (0..iterations) |_| {
         var r = try wf.run(allocator, &ctx);
@@ -1704,7 +1704,7 @@ fn allocWorkflow(io: std.Io, steps_count: usize, iterations: usize) !AllocReadin
 fn allocEventBus(listeners: usize, events: usize) !AllocReading {
     const E = struct { id: u64 };
     var probe = AllocCounter.init(harness_allocator, .{});
-    var bus = zigmodu.TypedEventBus(E).init(probe.allocator());
+    var bus = zmodu.TypedEventBus(E).init(probe.allocator());
     defer bus.deinit();
     for (0..listeners) |_| {
         try bus.subscribe(struct {
@@ -1730,7 +1730,7 @@ fn allocCircuitBreaker(calls: usize) !AllocReading {
 
 fn allocRateLimiter(calls: usize) !AllocReading {
     var probe = AllocCounter.init(harness_allocator, .{});
-    var rl = try zigmodu.RateLimiter.init(probe.allocator(), "bench", 1_000_000, 1_000_000);
+    var rl = try zmodu.RateLimiter.init(probe.allocator(), "bench", 1_000_000, 1_000_000);
     defer rl.deinit();
     const before = probe.allocations;
     for (0..calls) |_| {
@@ -1742,12 +1742,12 @@ fn allocRateLimiter(calls: usize) !AllocReading {
 fn allocHealthEndpoint(checks: usize, iterations: usize) !AllocReading {
     var probe = AllocCounter.init(harness_allocator, .{});
     const allocator = probe.allocator();
-    var ep = zigmodu.HealthEndpoint.init(allocator);
+    var ep = zmodu.HealthEndpoint.init(allocator);
     defer ep.deinit();
     for (0..checks) |i| {
         const name = try allocator.print("check-{}", .{i});
         defer allocator.free(name);
-        try ep.registerCheck(name, "bench", zigmodu.HealthEndpoint.alwaysUp);
+        try ep.registerCheck(name, "bench", zmodu.HealthEndpoint.alwaysUp);
     }
     const before = probe.allocations;
     for (0..iterations) |_| {
@@ -1760,7 +1760,7 @@ fn allocHealthEndpoint(checks: usize, iterations: usize) !AllocReading {
 fn allocDbQuery(io: std.Io, queries: usize) !AllocReading {
     var probe = AllocCounter.init(harness_allocator, .{});
     const allocator = probe.allocator();
-    var client = zigmodu.data.sqlx.Client.init(allocator, io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = zmodu.data.sqlx.Client.init(allocator, io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
     _ = try client.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, value REAL)", &.{});
@@ -1769,15 +1769,15 @@ fn allocDbQuery(io: std.Io, queries: usize) !AllocReading {
         defer allocator.free(s);
         _ = try client.exec(s, &.{});
     }
-    const backend = zigmodu.data.SqlxBackend{ .allocator = allocator, .client = &client };
-    var orm = zigmodu.data.orm.Orm(zigmodu.data.SqlxBackend){ .backend = backend };
+    const backend = zmodu.data.SqlxBackend{ .allocator = allocator, .client = &client };
+    var orm = zmodu.data.orm.Orm(zmodu.data.SqlxBackend){ .backend = backend };
     const Row = struct {
         pub const sql_table_name: []const u8 = "t";
         id: i64,
         name: []const u8,
         value: f64,
     };
-    var repo = zigmodu.data.Repository(Row){ .orm = &orm };
+    var repo = zmodu.data.Repository(Row){ .orm = &orm };
     if (try repo.findById(@as(i64, 50))) |r| allocator.free(r.name);
     const before = probe.allocations;
     for (0..queries) |_| {
@@ -1953,7 +1953,7 @@ pub fn main(init: std.process.Init) !void {
 
     var results = std.ArrayList(BenchResult).empty;
 
-    std.debug.print("=== ZigModu Framework Benchmarks ===\n", .{});
+    std.debug.print("=== zmodu Framework Benchmarks ===\n", .{});
     std.debug.print("Each metric is the median of 3 samples; every `[med3]` line lists all three, sorted.\n\n", .{});
 
     std.debug.print("-- Module System --\n", .{});

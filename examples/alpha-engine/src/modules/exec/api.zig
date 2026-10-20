@@ -5,7 +5,7 @@
 //! below are the whole contract exec publishes. Were this module to grow an API,
 //! `pub const routes` (ComptimeRouter) would live in this file.
 
-const runtime = @import("zigmodu").runtime;
+const runtime = @import("zmodu").runtime;
 
 /// Approved orders arrive in a 256-slot mailbox. Bounded: a queue that is behind
 /// sheds and counts, it never grows.

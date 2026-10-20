@@ -4,8 +4,8 @@
 //! the quote that leaves this module is a `contracts.Quote` and nothing here
 //! knows what a risk worker looks like.
 
-const runtime = @import("zigmodu").runtime;
-const zmodu = @import("zigmodu");
+const runtime = @import("zmodu").runtime;
+const zmodu = @import("zmodu");
 const api = @import("api.zig");
 const service = @import("service.zig");
 

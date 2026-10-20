@@ -1,4 +1,4 @@
-# ZigModu v0.40.0
+# zmodu v0.40.0
 
 **Compile-time modular application framework + worker-oriented execution runtime, for Zig 0.17.**
 
@@ -20,8 +20,8 @@ services only after the boundary is proven — with the dependency rules enforce
 
 [![Zig](https://img.shields.io/badge/Zig-0.17+-orange?style=flat-square)](https://ziglang.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/github/v/release/chy3xyz/zigmodu?style=flat-square)]()
-[![CI](https://github.com/chy3xyz/zigmodu/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/chy3xyz/zigmodu/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/github/v/release/chy3xyz/zmodu?style=flat-square)]()
+[![CI](https://github.com/chy3xyz/zmodu/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/chy3xyz/zmodu/actions/workflows/ci.yml)
 
 ## 📚 Documentation
 
@@ -34,7 +34,7 @@ services only after the boundary is proven — with the dependency rules enforce
 | [Best Practices](docs/guide/BEST_PRACTICES.md) | Both planes: architecture evolution, JWT checklist, resilience, and where the runtime earns its keep |
 | [Declarative Routes](docs/reference/ROUTE_TABLE.md) | ComptimeRouter + catalog JWT/RBAC |
 | [Events & DI](docs/guide/EVENTS_DI.md) | `initWith(ctx)` + `app.eventBus` + container freeze |
-| [ZigModu × zent](docs/reference/ZENT.md) | **Recommended pairing for commerce/social**: zent ORM integration best practices |
+| [zmodu × zent](docs/reference/ZENT.md) | **Recommended pairing for commerce/social**: zent ORM integration best practices |
 | [SQLx drivers](docs/guide/SQLX_DRIVERS.md) | Selective driver linking (`-Ddb=`, `.db=`) |
 | [Distributed](docs/reference/DISTRIBUTED.md) | Multi-instance, cluster stack, fail-closed startup |
 | [Agent Runtime](docs/reference/AGENT_RUNTIME.md) | **Agents can't act by default**: `Guard` (two fail-closed axes — an `execute` second switch + empty-by-default allow list) |
@@ -54,7 +54,7 @@ services only after the boundary is proven — with the dependency rules enforce
 - **Module System** — Declarative module definition with compile-time dependency validation
 - **Lifecycle Management** — Automatic init/deinit orchestration in dependency order; modules opt into framework facilities via `initWith(ctx)`
 - **Dependency Injection** — Type-safe container built into `Application`: register at startup (`withService` / `registerBorrowed`), frozen after `start()`, lock-free reads thereafter
-- **Event System** — Application-wide `EventRegistry` hands out thread-safe per-type buses (`app.eventBus(T)`); plus TypedEventBus and the transactional outbox pattern (`zigmodu.outbox.*`)
+- **Event System** — Application-wide `EventRegistry` hands out thread-safe per-type buses (`app.eventBus(T)`); plus TypedEventBus and the transactional outbox pattern (`zmodu.outbox.*`)
 - **Application Builder** — Fluent API with shutdown hooks and graceful termination
 
 ### HTTP & API
@@ -258,7 +258,7 @@ The gates are the reason to trust any of the above, and all of them run locally:
 | Full suite (`-Ddb=all`) | 2000+ tests over 8 artifacts | `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test` |
 | Allocation **contract** | exact zero allocations on the mailbox / ring / HotBus / `send` / timer hot paths | `src/runtime/alloc_contract_test.zig` |
 | Production gate | no bare `catch {}` in hot modules, CSPRNG source, fuzz declarations match the tree | `zig build check` |
-| API import gate | examples go through the canonical `zigmodu.http` | `zig build check-api` |
+| API import gate | examples go through the canonical `zmodu.http` | `zig build check-api` |
 | Dead-code ratchet | baseline 32 in `src`+`tools` (30 + 2), 0 in `examples` | `bash scripts/check-deadcode.sh` |
 | Benchmark ratchet | 32 metrics against a CI baseline + 32 allocation budgets | `bash scripts/check-bench.sh` |
 | Soak (HTTP + tenants) | cross-tenant leaks, FrozenMap concurrency, fd/slot growth | `zig build soak` |
@@ -277,7 +277,7 @@ Readings follow one convention so a number means exactly one thing:
 For large projects, import only the domains you need:
 
 ```zig
-const zmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 // Builder wiring. This is a fragment, not a whole `main`: `allocator` / `io`
 // come from `std.process.Init` (see "Bootstrap Application") and `UserModule`
@@ -310,9 +310,9 @@ placeholder `.fingerprint` and prints the exact value to paste in:
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         // Local checkout (what examples/basic uses — no `.hash` needed):
-        .zigmodu = .{ .path = "../zigmodu" },
+        .zmodu = .{ .path = "../zmodu" },
         // …or a tagged release; `zig fetch --save <url>` fills in `.hash`:
-        // .zigmodu = .{ .url = "git+https://github.com/chy3xyz/zigmodu?ref=v0.25.0" },
+        // .zmodu = .{ .url = "git+https://github.com/chy3xyz/zmodu?ref=v0.25.0" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }
@@ -322,7 +322,7 @@ Then link only the database drivers you need (the dependency's default is `all`,
 which pulls in all three):
 
 ```zig
-const zigmodu_dep = b.dependency("zigmodu", .{
+const zigmodu_dep = b.dependency("zmodu", .{
     .target = target,
     .optimize = optimize,
     .db = db_opt, // or postgres | mysql | "sqlite,postgres" | all
@@ -351,10 +351,10 @@ and `/health/*`. It must run **before** routes are registered. Fragment —
 [`examples/tenant-mgmt/`](examples/tenant-mgmt/)):
 
 ```zig
-var server = zigmodu.http.Server.init(io, allocator, 8080);
-var profile = zigmodu.http.ProductionProfileState.init(allocator);
+var server = zmodu.http.Server.init(io, allocator, 8080);
+var profile = zmodu.http.ProductionProfileState.init(allocator);
 defer profile.deinit(allocator);
-try zigmodu.http.productionProfile(&server, .{
+try zmodu.http.productionProfile(&server, .{
     .max_connections = 4096,
     .over_limit_response = .close,  // or .unavailable to answer 503 first
     .header_timeout_ms = 10_000,    // request line + headers (slowloris guard)
@@ -386,11 +386,11 @@ zigup 0.17.0
 ```zig
 // src/modules/user.zig
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 // `pub` matters: `main.zig` refers to it as `user.UserModule`.
 pub const UserModule = struct {
-    pub const info = zigmodu.api.Module{
+    pub const info = zmodu.api.Module{
         .name = "user",
         .description = "User management module",
         .dependencies = &.{},
@@ -411,19 +411,19 @@ pub const UserModule = struct {
 ```zig
 // src/main.zig
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 const user = @import("modules/user.zig");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
-    var modules = try zigmodu.scanModules(allocator, .{user.UserModule});
+    var modules = try zmodu.scanModules(allocator, .{user.UserModule});
     defer modules.deinit();
 
-    try zigmodu.validateModules(&modules);
-    try zigmodu.startAll(&modules);
-    defer zigmodu.stopAll(&modules);
+    try zmodu.validateModules(&modules);
+    try zmodu.startAll(&modules);
+    defer zmodu.stopAll(&modules);
 
     std.log.info("Application started!", .{});
 }
@@ -464,9 +464,9 @@ Self-contained — it needs only `build.zig` + `build.zig.zon` and this file:
 
 ```zig
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
-const http = zigmodu.http;
+const http = zmodu.http;
 
 const Server = http.Server;
 const Context = http.Context;
@@ -492,7 +492,7 @@ pub fn main(init: std.process.Init) !void {
 ### Docker Compose Quick Start
 
 ```bash
-# Start full stack (zigmodu + PostgreSQL + Redis)
+# Start full stack (zmodu + PostgreSQL + Redis)
 docker compose up -d
 
 # With Vault and Jaeger
@@ -502,7 +502,7 @@ docker compose --profile secrets --profile tracing up -d
 ## 📁 Project Structure
 
 ```text
-zigmodu/
+zmodu/
 ├── src/
 │   ├── root.zig                     # Public API (PRIMARY / ADVANCED / DEPRECATED)
 │   ├── Application.zig              # Application builder: lifecycle, DI, runtime wiring
@@ -540,7 +540,7 @@ zigmodu/
 
 ## 🎯 Progressive Evolution
 
-ZigModu grows along **two independent axes**. You can move on one without the other, and neither one
+zmodu grows along **two independent axes**. You can move on one without the other, and neither one
 requires splitting anything into services:
 
 | Axis | Stage | What you add | Where it lands |
@@ -570,7 +570,7 @@ ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test   # full suite (-Ddb=all b
 bash scripts/test-fast.sh --filter RaftElection --db none --force-run   # one family of tests
 zig fmt --check src tools examples                      # formatting
 zig build check                     # hot-path gate: no bare catch {}, CSPRNG, fuzz declarations
-zig build check-api                 # examples must route through zigmodu.http
+zig build check-api                 # examples must route through zmodu.http
 bash scripts/check-deadcode.sh      # dead-code ratchet
 bash scripts/check-bench.sh         # benchmark + allocation ratchets
 bash scripts/check-production.sh    # layered production checks
@@ -620,7 +620,7 @@ Each directory is a runnable project with its own README; the index is
 Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md). Before a PR, run what CI runs:
 
 ```bash
-git clone https://github.com/chy3xyz/zigmodu.git
+git clone https://github.com/chy3xyz/zmodu.git
 git checkout -b feature/my-feature
 ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test    # full suite
 zig build check check-api && zig fmt --check src tools examples

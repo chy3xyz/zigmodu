@@ -47,7 +47,7 @@ done
 
 # ── docs/: self-declared version footers ─────────────────────────────────────
 # A document footer that states which version it describes ("最后更新 …
-# ZigModu v0.26.0") is a claim about the present, so a stale one is a defect:
+# zmodu v0.26.0") is a claim about the present, so a stale one is a defect:
 # BEST_PRACTICES.md sat at v0.26.0 for nine releases, reading as current
 # guidance while describing a framework four major versions behind.
 #
@@ -55,13 +55,13 @@ done
 # usually correct history and checking those would make the gate useless:
 #
 #   - Only docs/, never README/AGENTS (already covered above).
-#   - Only a "ZigModu vX.Y.Z" self-description, not every 0.x.y on the page.
+#   - Only a "zmodu vX.Y.Z" self-description, not every 0.x.y on the page.
 #     RUNTIME.md §2 and UPGRADING.md are full of accurate historical versions.
 #   - Only in a trailing footer — the last 10 lines. A version quoted in the
 #     body is describing something, not claiming currency.
 #   - docs/archive/ and docs/dev/ are excluded. A stale version there is the
 #     point of the file: it is a snapshot of the tree at that release.
-footer_re='ZigModu \*?\*?v[0-9]+\.[0-9]+\.[0-9]+'
+footer_re='zmodu \*?\*?v[0-9]+\.[0-9]+\.[0-9]+'
 while IFS= read -r doc; do
   [[ -n "$doc" ]] || continue
   while IFS= read -r hit; do
@@ -91,7 +91,7 @@ tools_grep() {
 }
 
 # 1. Framework-shaped pins must be the current release.
-pin_re='(zmodu v|zigmodu v|tags/v|zigmodu-)[0-9]+\.[0-9]+\.[0-9]+'
+pin_re='(zmodu v|zmodu v|tags/v|zmodu-)[0-9]+\.[0-9]+\.[0-9]+'
 while IFS= read -r hit; do
   [[ -n "$hit" ]] || continue
   for pv in $(printf '%s\n' "$hit" | grep -oE "$pin_re" | sed -E 's/^.*[v-]([0-9]+\.[0-9]+\.[0-9]+)$/\1/'); do
@@ -100,7 +100,7 @@ while IFS= read -r hit; do
       fail=1
     fi
   done
-done <<<"$(tools_grep "$pin_re" | grep -v 'zigmodu_zon_hash')"
+done <<<"$(tools_grep "$pin_re" | grep -v 'zmodu_zon_hash')"
 
 # 2. Any other 0.x.y literal must be deliberate (see allowed_version) — and must
 #    be a real version reference. A fixture inside a `test { … }` block is not;
@@ -130,9 +130,9 @@ allowed_version() {
 while IFS= read -r hit; do
   [[ -n "$hit" ]] || continue
   # The scaffold's dependency hash is version-tagged by construction
-  # ('zigmodu-<version>-<payload>'); its lag behind a fresh bump is reported as a
+  # ('zmodu-<version>-<payload>'); its lag behind a fresh bump is reported as a
   # WARN in section 4, not a "hard-coded version" to derive from ZMODU_VERSION.
-  [[ "$hit" == *zigmodu_zon_hash* ]] && continue
+  [[ "$hit" == *zmodu_zon_hash* ]] && continue
   in_test_block "$hit" && continue
   for lv in $(printf '%s\n' "$hit" | grep -oE 'v?0\.[0-9]+\.[0-9]+' | sed 's/^v//'); do
     if ! allowed_version "$lv"; then
@@ -153,21 +153,21 @@ fi
 # 4. The scaffold dependency hash is release-specific, so it can only be
 #    verified by shape: it must be addressed to $VERSION (check 1) and must not
 #    be a repeated-character placeholder.
-hash_payload="$(sed -n 's/^const zigmodu_zon_hash = "zigmodu-[0-9.]*-\(.*\)";$/\1/p' "$TOOLS/zmodu/src/main.zig" | head -1)"
+hash_payload="$(sed -n 's/^const zmodu_zon_hash = "zmodu-[0-9.]*-\(.*\)";$/\1/p' "$TOOLS/zmodu/src/main.zig" | head -1)"
 if [[ -z "$hash_payload" ]]; then
-  echo "check-version: $TOOLS/zmodu/src/main.zig: no parseable zigmodu_zon_hash" >&2
+  echo "check-version: $TOOLS/zmodu/src/main.zig: no parseable zmodu_zon_hash" >&2
   fail=1
 else
   payload_body="${hash_payload%%=*}"
   if [[ -z "$(printf '%s' "$payload_body" | tr -d "${payload_body%"${payload_body#?}"}")" ]]; then
-    echo "check-version: $TOOLS/zmodu/src/main.zig: zigmodu_zon_hash is a placeholder" >&2
+    echo "check-version: $TOOLS/zmodu/src/main.zig: zmodu_zon_hash is a placeholder" >&2
     fail=1
   fi
   # The hash can only be regenerated once the tag exists, so a lagging version is
   # a WARN, not a failure (see the comment above the comptime check in main.zig).
-  hash_ver="$(sed -n 's/^const zigmodu_zon_hash = "zigmodu-\([0-9][0-9.]*\)-.*";$/\1/p' "$TOOLS/zmodu/src/main.zig" | head -1)"
+  hash_ver="$(sed -n 's/^const zmodu_zon_hash = "zmodu-\([0-9][0-9.]*\)-.*";$/\1/p' "$TOOLS/zmodu/src/main.zig" | head -1)"
   if [[ -n "$hash_ver" && "$hash_ver" != "$VERSION" ]]; then
-    echo "check-version: WARN: scaffold pins zigmodu-$hash_ver; after tag v$VERSION is pushed, regenerate it:" >&2
+    echo "check-version: WARN: scaffold pins zmodu-$hash_ver; after tag v$VERSION is pushed, regenerate it:" >&2
     echo "check-version: WARN:   cd tools/zmodu && zig build --fetch   (paste the 'expected .hash' value)" >&2
   fi
 fi

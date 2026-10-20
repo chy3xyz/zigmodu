@@ -1,5 +1,5 @@
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 // ============================================
 // Distributed Example - Multi-Node Demo
@@ -9,7 +9,7 @@ const zigmodu = @import("zigmodu");
 // - Docker multi-container deployment
 // - Cluster configuration via environment variables
 //
-// This demo shows the structure of a distributed ZigModu application.
+// This demo shows the structure of a distributed zmodu application.
 //
 // Docker Compose runs 3 containers, each running this example.
 // See docker-compose.yml for the configuration.
@@ -27,7 +27,7 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
 
-    std.log.info("=== ZigModu Distributed Example ===", .{});
+    std.log.info("=== zmodu Distributed Example ===", .{});
     std.log.info("This demonstrates a distributed node configuration", .{});
 
     // Configuration would come from environment variables in production
@@ -40,7 +40,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Initialize DistributedEventBus
     std.log.info("Initializing DistributedEventBus...", .{});
-    var event_bus = try zigmodu.DistributedEventBus.init(allocator, io, node_id);
+    var event_bus = try zmodu.DistributedEventBus.init(allocator, io, node_id);
     defer event_bus.deinit();
 
     // Subscribe to order events
@@ -49,7 +49,7 @@ pub fn main(init: std.process.Init) !void {
             const Self = @This();
             var node_id_ptr: []const u8 = undefined;
 
-            pub fn handler(event: zigmodu.DistributedEventBus.NetworkEvent) void {
+            pub fn handler(event: zmodu.DistributedEventBus.NetworkEvent) void {
                 std.log.info("[{s}] Received event on topic '{s}': {s}", .{
                     Self.node_id_ptr, event.topic, event.payload,
                 });
@@ -71,7 +71,7 @@ pub fn main(init: std.process.Init) !void {
         .order_id = 12345,
         .event_type = "created",
         .amount = 99.99,
-        .timestamp = zigmodu.time.monotonicNowSeconds(),
+        .timestamp = zmodu.time.monotonicNowSeconds(),
     };
 
     std.log.info("Created test event:", .{});

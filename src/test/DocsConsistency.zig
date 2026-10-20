@@ -96,15 +96,15 @@ test "every symbol documented in docs/ exists in src/" {
 }
 
 // A documented root alias must be *importable*, not merely present in `src/`:
-// `zigmodu.<Name>` is what a consumer writes, and it resolves only through
+// `zmodu.<Name>` is what a consumer writes, and it resolves only through
 // `root.zig`. Importing the root file from here sees exactly what
-// `@import("zigmodu")` sees — `pub` declarations only — so dropping one of
+// `@import("zmodu")` sees — `pub` declarations only — so dropping one of
 // these aliases fails this test at compile time, not at the user's call site.
 test "documented root aliases are importable" {
-    const zigmodu = @import("../root.zig");
+    const zmodu = @import("../root.zig");
     const allocator = std.testing.allocator;
 
-    const Params = zigmodu.Params;
+    const Params = zmodu.Params;
     var params = Params.init(allocator);
     defer params.deinit();
     try params.put("ids", "1");
@@ -112,7 +112,7 @@ test "documented root aliases are importable" {
     try std.testing.expectEqualStrings("2", params.get("ids").?);
     try std.testing.expectEqual(@as(usize, 2), params.totalValues());
 
-    const ScopedContainer = zigmodu.ScopedContainer;
+    const ScopedContainer = zmodu.ScopedContainer;
     var scoped = ScopedContainer.init(allocator, "request", null);
     defer scoped.deinit();
     const Service = struct { n: u32 = 7 };
@@ -121,14 +121,14 @@ test "documented root aliases are importable" {
     try scoped.register(Service, "svc", service);
     try std.testing.expectEqual(@as(u32, 7), scoped.get(Service, "svc").?.n);
 
-    const SlidingWindowRateLimiter = zigmodu.SlidingWindowRateLimiter;
+    const SlidingWindowRateLimiter = zmodu.SlidingWindowRateLimiter;
     var window = try SlidingWindowRateLimiter.init(allocator, "api", 60, 1);
     defer window.deinit();
     try std.testing.expect(window.tryAcquire());
     try std.testing.expect(!window.tryAcquire());
     try std.testing.expectEqual(@as(usize, 1), window.currentCount());
 
-    const ConfigManager = zigmodu.ConfigManager;
+    const ConfigManager = zmodu.ConfigManager;
     var config = ConfigManager.init(allocator);
     defer config.deinit();
     try config.set("app.name", .{ .string = "demo" });
@@ -137,8 +137,8 @@ test "documented root aliases are importable" {
 
     // The store loads JSON itself; TOML reaches it through the loader alias.
     // Exercised end to end: file → `TomlLoader.loadFile` → typed reads.
-    const TomlLoader = zigmodu.TomlLoader;
-    const toml_path = "zigmodu_root_alias_test.toml";
+    const TomlLoader = zmodu.TomlLoader;
+    const toml_path = "zmodu_root_alias_test.toml";
     {
         const file = try std.Io.Dir.cwd().createFile(std.testing.io, toml_path, .{});
         defer file.close(std.testing.io);

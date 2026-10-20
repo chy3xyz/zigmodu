@@ -1,8 +1,8 @@
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 const MockOrder = struct {
-    pub const info = zigmodu.api.Module{
+    pub const info = zmodu.api.Module{
         .name = "order",
         .description = "Order management",
         .dependencies = &.{"inventory"},
@@ -10,7 +10,7 @@ const MockOrder = struct {
 };
 
 const MockPayment = struct {
-    pub const info = zigmodu.api.Module{
+    pub const info = zmodu.api.Module{
         .name = "payment",
         .description = "Payment processing",
         .dependencies = &.{"order"},
@@ -18,7 +18,7 @@ const MockPayment = struct {
 };
 
 const MockInventory = struct {
-    pub const info = zigmodu.api.Module{
+    pub const info = zmodu.api.Module{
         .name = "inventory",
         .description = "Inventory tracking",
         .dependencies = &.{},
@@ -29,17 +29,17 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
 
-    std.log.info("=== Generating ZigModu Documentation ===", .{});
+    std.log.info("=== Generating zmodu Documentation ===", .{});
 
-    var modules = try zigmodu.scanModules(allocator, .{ MockOrder, MockPayment, MockInventory });
+    var modules = try zmodu.scanModules(allocator, .{ MockOrder, MockPayment, MockInventory });
     defer modules.deinit();
 
-    try zigmodu.validateModules(&modules);
+    try zmodu.validateModules(&modules);
 
-    try zigmodu.generateDocs(&modules, "docs/modules.puml", allocator, io);
+    try zmodu.generateDocs(&modules, "docs/modules.puml", allocator, io);
     std.log.info("PlantUML docs generated: docs/modules.puml", .{});
 
-    const json = try zigmodu.Documentation.generateJsonDocs(&modules, allocator);
+    const json = try zmodu.Documentation.generateJsonDocs(&modules, allocator);
     defer allocator.free(json);
 
     var json_file = try std.Io.Dir.cwd().createFile(io, "docs/modules.json", .{});
@@ -47,7 +47,7 @@ pub fn main(init: std.process.Init) !void {
     try json_file.writeStreamingAll(io, json);
     std.log.info("JSON docs generated: docs/modules.json", .{});
 
-    const md = try zigmodu.Documentation.generateMarkdownDocs(&modules, allocator);
+    const md = try zmodu.Documentation.generateMarkdownDocs(&modules, allocator);
     defer allocator.free(md);
 
     var md_file = try std.Io.Dir.cwd().createFile(io, "docs/modules.md", .{});

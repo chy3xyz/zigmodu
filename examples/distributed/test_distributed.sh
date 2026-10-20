@@ -1,5 +1,5 @@
 #!/bin/bash
-# ZigModu Distributed Example - Test Script
+# zmodu Distributed Example - Test Script
 # Tests the distributed event bus with Docker containers
 
 set -e
@@ -7,7 +7,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-echo "=== ZigModu Distributed Example Test ==="
+echo "=== zmodu Distributed Example Test ==="
 echo ""
 
 # Check if Docker is available

@@ -1,4 +1,4 @@
-# ZigModu Distributed Example - Docker Compose
+# zmodu Distributed Example - Docker Compose
 # Multi-node cluster for testing DistributedEventBus and ClusterMembership
 
 services:
@@ -7,14 +7,14 @@ services:
     build:
       context: ../..
       dockerfile: examples/distributed/Dockerfile
-    container_name: zigmodu-node1
+    container_name: zmodu-node1
     environment:
       - NODE_ID=node1
       - PORT=9000
     ports:
       - "9000:9000"
     networks:
-      - zigmodu-cluster
+      - zmodu-cluster
     command: ["node1", "9000"]
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "9000"]
@@ -27,14 +27,14 @@ services:
     build:
       context: ../..
       dockerfile: examples/distributed/Dockerfile
-    container_name: zigmodu-node2
+    container_name: zmodu-node2
     environment:
       - NODE_ID=node2
       - PORT=9001
     ports:
       - "9001:9001"
     networks:
-      - zigmodu-cluster
+      - zmodu-cluster
     depends_on:
       node1:
         condition: service_healthy
@@ -45,14 +45,14 @@ services:
     build:
       context: ../..
       dockerfile: examples/distributed/Dockerfile
-    container_name: zigmodu-node3
+    container_name: zmodu-node3
     environment:
       - NODE_ID=node3
       - PORT=9002
     ports:
       - "9002:9002"
     networks:
-      - zigmodu-cluster
+      - zmodu-cluster
     depends_on:
       node1:
         condition: service_healthy
@@ -61,7 +61,7 @@ services:
     command: ["node3", "9002", "node1:9000", "node2:9001"]
 
 networks:
-  zigmodu-cluster:
+  zmodu-cluster:
     driver: bridge
     ipam:
       driver: default

@@ -1,5 +1,5 @@
 //! Observability domain: metrics, tracing, logging.
-//! Import directly: `const obs = @import("zigmodu").observability;`
+//! Import directly: `const obs = @import("zmodu").observability;`
 
 /// Metrics vtable — implement it to plug your own metrics system.
 pub const MetricsBackend = @import("metrics/MetricsBackend.zig").MetricsBackend;

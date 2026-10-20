@@ -6,7 +6,7 @@
 //! satisfied by the book module's published inbox type.
 
 const std = @import("std");
-const zmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 const api = @import("api.zig");
 const service = @import("service.zig");
 

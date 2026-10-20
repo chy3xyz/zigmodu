@@ -39,7 +39,7 @@ pub fn build(b: *std.Build) void {
 
     // Life governance core (../../src/life.zig) — the issue state machine and
     // validators, one implementation shared between the framework and the CLI
-    // (`zmodu life issue/...` runs the same `zigmodu.life` core the Phase-2
+    // (`zmodu life issue/...` runs the same `zmodu.life` core the Phase-2
     // module adapter will). Pure std, no framework types.
     const life_core_mod = b.createModule(.{
         .root_source_file = b.path("../../src/life.zig"),

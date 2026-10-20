@@ -586,7 +586,7 @@ test "doc snippets: source scans find the `try app.runtime()` chain and clear th
 test "doc snippets: the init detector flags an allocator-first call and clears the io-first one" {
     // The broken shape: the pre-0.16 signature, allocator first.
     try std.testing.expect(initStartsWithAllocator(
-        "var app = try zigmodu.Application.init(allocator, .{ .name = \"shop\" });",
+        "var app = try zmodu.Application.init(allocator, .{ .name = \"shop\" });",
     ));
     try std.testing.expect(initStartsWithAllocator(
         "var app = try Application.init(alloc, \"app\", .{M});",
@@ -597,15 +597,15 @@ test "doc snippets: the init detector flags an allocator-first call and clears t
 
     // The working forms: `io` first, however it is spelled.
     try std.testing.expect(!initStartsWithAllocator(
-        "var app = try zigmodu.Application.init(io, allocator, \"shop\", .{M}, .{});",
+        "var app = try zmodu.Application.init(io, allocator, \"shop\", .{M}, .{});",
     ));
     try std.testing.expect(!initStartsWithAllocator(
         "var app = try Application.init(std.testing.io, allocator, \"app\", .{M}, .{});",
     ));
     // `ApplicationBuilder.init` really does take the allocator first — not this rule.
-    try std.testing.expect(!initStartsWithAllocator("var b = zigmodu.ApplicationBuilder.init(allocator, io);"));
+    try std.testing.expect(!initStartsWithAllocator("var b = zmodu.ApplicationBuilder.init(allocator, io);"));
     // A fragment that breaks the line after `(` is not judged (docs' multi-line form).
-    try std.testing.expect(!initStartsWithAllocator("var app = try zigmodu.Application.init("));
+    try std.testing.expect(!initStartsWithAllocator("var app = try zmodu.Application.init("));
 }
 
 test "doc snippets: source doc comments carry no stale snippets" {

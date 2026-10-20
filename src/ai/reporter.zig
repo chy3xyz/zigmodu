@@ -1,5 +1,5 @@
 //! Business reporting: run configured SQL queries and render a Markdown
-//! report. Pair with `zigmodu.ai.trigger` for scheduled delivery (cron → run →
+//! report. Pair with `zmodu.ai.trigger` for scheduled delivery (cron → run →
 //! outbox writeback) or call `generate` directly from an API route.
 
 const std = @import("std");

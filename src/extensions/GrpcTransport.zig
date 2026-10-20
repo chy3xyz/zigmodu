@@ -1,4 +1,4 @@
-//! gRPC transport for ZigModu.
+//! gRPC transport for zmodu.
 //!
 //! Unary (production):
 //! - Length-prefixed message framing (`GrpcFrame`)
@@ -1046,7 +1046,7 @@ pub const GrpcClient = struct {
         try req.setBody(framed);
         try req.setHeader("Content-Type", "application/grpc");
         try req.setHeader("TE", "trailers");
-        try req.setHeader("User-Agent", "zigmodu-grpc/0.14");
+        try req.setHeader("User-Agent", "zmodu-grpc/0.14");
         var cl_buf: [32]u8 = undefined;
         const cl = try std.fmt.bufPrint(&cl_buf, "{d}", .{framed.len});
         try req.setHeader("Content-Length", cl);

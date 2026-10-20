@@ -611,7 +611,7 @@ prev 在边界**外**→ 活条目比对，冲突照常截断（截不到快照�
 ### RobustMQ messaging
 
 ```zig
-var producer = zigmodu.KafkaProducer.initWithIo(allocator, io, .{
+var producer = zmodu.KafkaProducer.initWithIo(allocator, io, .{
     .bootstrap_servers = "127.0.0.1:9092", // RobustMQ Kafka listener
     .client_id = "my-app",
 });
@@ -621,7 +621,7 @@ try producer.send(.{
     .key = null,
     .value = payload,
     .headers = &.{},
-    .timestamp = zigmodu.time.monotonicNowSeconds(),
+    .timestamp = zmodu.time.monotonicNowSeconds(),
 });
 ```
 
@@ -647,11 +647,11 @@ try debus_a.publish("order.created", order_data);
 补的就是这块：**append-only** 的协调者日志，决定**先落盘、再执行**。
 
 ```zig
-var journal = zigmodu.TransactionJournal.initWithBackend(allocator, backend); // data.SqlxBackend
+var journal = zmodu.TransactionJournal.initWithBackend(allocator, backend); // data.SqlxBackend
 defer journal.deinit();
 try journal.migrate();                        // CREATE TABLE IF NOT EXISTS zigmodu_tx_journal
 
-var tpc = zigmodu.TwoPhaseCommit.init(allocator);
+var tpc = zmodu.TwoPhaseCommit.init(allocator);
 defer tpc.deinit();
 tpc.setJournal(&journal);                     // 不设置 = 纯内存协调者（旧行为，零破坏）
 
@@ -666,7 +666,7 @@ if (try tpc.preparePhase("tx-1")) {           // 全 YES：prepared 先落盘，
 
 // 崩溃之后的新进程：只报告，不决策
 const in_doubt = try tpc.recover(allocator);
-defer zigmodu.TransactionJournal.freeInDoubt(allocator, in_doubt);
+defer zmodu.TransactionJournal.freeInDoubt(allocator, in_doubt);
 for (in_doubt) |tx| { /* tx.tx_id / tx.participants / tx.updated_at */ }
 ```
 
@@ -702,7 +702,7 @@ for (in_doubt) |tx| { /* tx.tx_id / tx.participants / tx.updated_at */ }
 的取舍（数据每几秒才变一次，而请求是微秒级的）。
 
 ```zig
-var view = zigmodu.ClusterView(64, 4).init(allocator);
+var view = zmodu.ClusterView(64, 4).init(allocator);
 defer view.deinit();
 
 // 维护循环（单写者）：整份发布，读者要么看到旧的、要么看到新的，绝不看到半份

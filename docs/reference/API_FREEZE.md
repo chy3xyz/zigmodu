@@ -1,6 +1,6 @@
 # API 冻结面 / preview 面（1.0 前）
 
-> **一句话**：冻结面上的入口在 1.0 之前**只增不改**；`zigmodu.runtime.*` 的 preview 面**允许 breaking**。
+> **一句话**：冻结面上的入口在 1.0 之前**只增不改**；`zmodu.runtime.*` 的 preview 面**允许 breaking**。
 > 门禁在 `src/test/ApiFreeze.zig`（跑在整树套件里 —— 它被 `src/tests.zig` 的聚合根 import，漏接就不会跑）。
 > 本文件**只写能从证据里读出来的东西**：每条口径都标出处，每个可检查的断言都对应门禁里的一个检查。
 
@@ -24,23 +24,23 @@
 
 | 类别 | 门禁锚点（逐条断言） | 冻结依据 |
 |---|---|---|
-| `zigmodu` 顶层 · 生命周期与模块契约 | `Application`, `ApplicationBuilder`, `builder`, `api`, `ModuleContext`, `ZigModuError`, `Result`, `Time`, `scanModules`, `ModuleInfo` | 引用（`RUNTIME.md:58`） |
+| `zmodu` 顶层 · 生命周期与模块契约 | `Application`, `ApplicationBuilder`, `builder`, `api`, `ModuleContext`, `ZmoduError`, `Result`, `Time`, `scanModules`, `ModuleInfo` | 引用（`RUNTIME.md:58`） |
 | `域别名`（opt-in 域） | `http`, `data`, `security`, `observability`, `runtime`, `ai`, `im`, `web4`, `outbox`, `cron`, `migration`, `datapermission` | 决定（别名本身是导入缝，改名=全员编译错） |
 | `http` · 路由与请求 | `http.Server`, `http.Context`, `http.RouteSpec`, `http.RouteMeta`, `http.Router`, `http.CatalogSlot` | 引用（HTTP 在 `RUNTIME.md:58` 的"只增不改"名单里） |
 | `http` · extractor 与错误渲染 | `http.extractPath`, `http.extractQuery`, `http.extractJson`, `http.extractJsonValidated`, `http.extractMultipart`, `http.respondErr`, `http.setErrorMap`, `http.problemReject`, `http.useRfc7807Errors`, `http.productionProfile`, `http.sse`, `http.Testkit` | 引用（同上） |
 | `http` / `security` · 鉴权（Path A） | `http.jwtAuthFromCatalogWithPermissions`, `http.catalogLoaderFromTable`, `http.AuthBackend`, `http.jwtBackend`, `http.envelopeReject`, `http.permissionGateWith`, `http.tenantResolver`, `security.AppSecurity`, `security.PasswordEncoder`, `security.CatalogPermDb`, `security.JwksKeyRing` | 决定（`AGENTS.md` 把 Path A 定为默认接法；门禁只保证名字还在，签名准确性人工看） |
 | `data` · 数据层 | `data.Client`, `data.Repository`, `data.SqlxBackend`, `data.CrudService`, `data.CacheManager`, `data.MigrationRunner`, `data.sqlx`, `data.redis`, `data.orm`, `data.pool` | 决定 |
 | `observability` · 可观测性 | `observability.PrometheusMetrics`, `observability.DistributedTracer`, `observability.StructuredLogger`, `observability.ModuleLogger`, `observability.OtlpExporter`, `observability.LogScope` | 决定 |
-| `zigmodu` 顶层 · 韧性 / 调度 / 分布式 | `CircuitBreaker`, `RateLimiter`, `Bulkhead`, `retry`, `cron`, `DistributedLock`, `Preflight`, `SagaOrchestrator`, `ClusterView`, `MembershipView` | 决定 |
-| `zigmodu` 顶层 · DI / 事件 / 配置 / 工具 | `Container`, `ScopedContainer`, `EventBus`, `ThreadSafeEventBus`, `FrozenMap`, `Params`, `ConfigManager`, `TomlLoader`, `Validator`, `panicHook` | 引用（前四个在 `RUNTIME.md:58` 的名单里，其余按同一类别一并冻结） |
-| `zigmodu` 顶层 · 测试辅助与扩展 | `IntegrationTest`, `Benchmark`, `ContractTestRunner`, `ModuleTestContext`, `WebSocketServer`, `PluginManager` | 决定 |
+| `zmodu` 顶层 · 韧性 / 调度 / 分布式 | `CircuitBreaker`, `RateLimiter`, `Bulkhead`, `retry`, `cron`, `DistributedLock`, `Preflight`, `SagaOrchestrator`, `ClusterView`, `MembershipView` | 决定 |
+| `zmodu` 顶层 · DI / 事件 / 配置 / 工具 | `Container`, `ScopedContainer`, `EventBus`, `ThreadSafeEventBus`, `FrozenMap`, `Params`, `ConfigManager`, `TomlLoader`, `Validator`, `panicHook` | 引用（前四个在 `RUNTIME.md:58` 的名单里，其余按同一类别一并冻结） |
+| `zmodu` 顶层 · 测试辅助与扩展 | `IntegrationTest`, `Benchmark`, `ContractTestRunner`, `ModuleTestContext`, `WebSocketServer`, `PluginManager` | 决定 |
 
 ## 0.x 允许破坏的 preview 面
 
 依据是 `docs/RUNTIME.md:47-49`（§2 第 10 条）。这里只列 §11–§14 文档点到名的符号；
 "仍未做 / 明确不做"的口径在 `docs/RUNTIME.md:696-706`（§12）、`:1649`（§13.5）、`:1913`（§14.7）等处，是散文 —— **人工看**。
 
-**可检查的推论**（门禁 `src/test/ApiFreeze.zig` 的第二个 test）：这些符号只经 `zigmodu.runtime.*` 暴露，
+**可检查的推论**（门禁 `src/test/ApiFreeze.zig` 的第二个 test）：这些符号只经 `zmodu.runtime.*` 暴露，
 **不得**出现在冻结的顶层 —— 一旦 `pub const Supervision = …` 之类被加到 `root.zig`，第 10 条允许的破坏就打到了冻结面。
 
 | preview 出处 | 门禁锚点（逐条断言） |
@@ -64,13 +64,13 @@
 表只承诺**还活着**的别名。已经删掉的名字进不了表 —— 给它写"不早于 1.0 删除"等于告诉读者它今天还能用；
 它们记在表下方的「已移除」小节里，门禁对它们的断言方向**相反**：**不得**重新出现在顶层。
 
-- `zigmodu.App` / `zigmodu.ModuleImpl`：随 `Simplified` 整块在 commit `557190a`（2026-05-12）从 `src/root.zig` 移除，
+- `zmodu.App` / `zmodu.ModuleImpl`：随 `Simplified` 整块在 commit `557190a`（2026-05-12）从 `src/root.zig` 移除，
   替代品 `Application`。门禁断言 `@hasDecl(zmodu, …)` 为**假**（回到顶层即红），
   并断言 `src/api/Simplified.zig` 仍在树里、仍被 `src/tests.zig` 的编译门禁 import —— **只到文件级**，
   不是"整块 API 仍受支持"的承诺。记录里的名字 / 证据 / 文件路径三者都由门禁对照文档检查（措辞改了也要一起改）。
-- `zigmodu.extensions`：整个命名空间（旧写法 `zigmodu.extensions.HttpServer` 等）已从顶层移除，
+- `zmodu.extensions`：整个命名空间（旧写法 `zmodu.extensions.HttpServer` 等）已从顶层移除，
   **没有可引用的 commit** —— 记录里给的是本仓最老的书面证据 `CHANGELOG.md` 的 `[0.15.0]` 段，门禁要求文档
-  原样保留这个引用。替代品是域文件（`zigmodu.http.*` / `zigmodu.data.*`），今天 `src/extensions.zig` 仍在树里、
+  原样保留这个引用。替代品是域文件（`zmodu.http.*` / `zmodu.data.*`），今天 `src/extensions.zig` 仍在树里、
   仍被 `src/tests.zig` 的编译门禁 import，且 shim 里的名字仍指向域文件的**同一批类型**（门禁逐条 `==`）。
 
 ### 整模块级弃用横幅（第三类：既不进表，也不进「已移除」）
@@ -88,7 +88,7 @@
   `Validator.FieldRules` 别名**三处是同一个类型**；规范实现**不得**再出现在弃用文件里；新家**不得** `@import`
   弃用文件，弃用文件**必须**仍指向新家。三条合起来证明"删掉 `Validator.zig` 不会再打断 `http.FieldRules`"。
   （`@import` 匹配用的是带引号的拼写，所以散文里提到文件名不算依赖 —— 反向的假绿堵住了。）
-  替代品 `zigmodu.Validator` 仍解析到 `validation/ObjectValidator.zig` 的**另一个**类型（`!=` 是断言的一部分：
+  替代品 `zmodu.Validator` 仍解析到 `validation/ObjectValidator.zig` 的**另一个**类型（`!=` 是断言的一部分：
   那是真迁移，不是自指）。
 - **`validateStruct*` 链的依赖方向**（第二批收口，见 `FIELD_VALIDATION_HOME`）：求值引擎的规范声明（16 条
   `pub fn` / `pub const … = struct {`）在 `src/validation/FieldValidation.zig`，逐条断言"新家有、弃用文件没有"；
@@ -102,9 +102,9 @@
 ## 覆盖不到的部分（只能人工看）
 
 1. **已移除的块只钉"回不到顶层"，不钉"用不了"。** `Simplified` 整块（`App` / `ModuleImpl` / `Module`）已从顶层移除
-   （`docs/UPGRADING.md:82-157`）。门禁钉的是 `zigmodu.App` / `zigmodu.ModuleImpl` **不**在顶层、且 `src/api/Simplified.zig`
+   （`docs/UPGRADING.md:82-157`）。门禁钉的是 `zmodu.App` / `zmodu.ModuleImpl` **不**在顶层、且 `src/api/Simplified.zig`
    仍在树上并被 `src/tests.zig` 的编译门禁 import —— 这不是"整块 API 仍受支持"的承诺：门禁**不断言**里面的签名，
-   也不断言越路径 `@import("zigmodu/src/api/Simplified.zig")` 在下一个版本还能用（越包内路径不受支持）。
+   也不断言越路径 `@import("zmodu/src/api/Simplified.zig")` 在下一个版本还能用（越包内路径不受支持）。
    门禁确实跑 `App.init` → `register(ModuleImpl(T).interface(…))` → `start` / `stop` 的 before 流程，但那是**走越路径 import**
    跑的 —— `docs/API-MIGRATION.md` 的 Before 片段（写的是 `zmodu.App`）照抄**编译不过**，文档里已写明它只剩教学价值。
 2. **签名准确性**（"这个函数还接受同样的参数吗"）不在门禁范围，与 `src/test/DocsConsistency.zig` 的既有口径一致 —— 人工看。
@@ -132,7 +132,7 @@
      要么记录只存在于 `CHANGELOG.md`（`startAll`/`stopAll` → `[0.15.12]`；`http_server` → 只有 `[0.15.8]` 的示例清理，
      而 `src/http.zig:13` 自称的 `v0.14.0` 在 `CHANGELOG.md` 里**没有对应段落**），要么根本找不到弃用条目
      （四个 `ctx.send*`）。本文件不镜像那份逐条说明。
-8. **`zigmodu.stopAll` 的标记检查不独立。** 门禁的标记看的是声明前 1500 字节（`marker_window`），
+8. **`zmodu.stopAll` 的标记检查不独立。** 门禁的标记看的是声明前 1500 字节（`marker_window`），
    `src/root.zig:63-66` 两条标记只隔一行，所以只删 `stopAll` 那条注释**不会**让它红（`startAll` 的注释里也有
    `Application.stop()`）。要让两条各自独立，得把窗口收窄成"紧邻的 doc comment"—— 那是门禁自己的比较口径，暂不动，人工看。
    同样的窗口口径也适用于 `Server.zig` 里连续四个 `send*`（四个标记相邻），以及两条 `root.zig` 之外的

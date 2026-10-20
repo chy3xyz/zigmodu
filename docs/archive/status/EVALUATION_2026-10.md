@@ -1,4 +1,4 @@
-# ZigModu 品质与竞争力评估 · 2026-10
+# zmodu 品质与竞争力评估 · 2026-10
 
 > **取代 [`EVALUATION_REPORT.md`](./EVALUATION_REPORT.md)**（那份标v5，评估日期 2026-08-27，
 > 测试数 990/1009，12 维给 ~98/100）。那份快照早于 2026-09 起的加固批次，且把当时的版本号
@@ -145,8 +145,8 @@
 
 | PR | 内容 | 结果 |
 |---|---|---|
-| [#3](https://github.com/chy3xyz/zigmodu/pull/3) | sqlx `ConnPool.acquire` 的 deadline 假账（`waited_ms += 50` 切片计数） | 合并（含一次修订） |
-| [#4](https://github.com/chy3xyz/zigmodu/pull/4) | `integration-full` 覆盖 `pull_request` + `examples/README.md` 索引漂移 | 合并 |
+| [#3](https://github.com/chy3xyz/zmodu/pull/3) | sqlx `ConnPool.acquire` 的 deadline 假账（`waited_ms += 50` 切片计数） | 合并（含一次修订） |
+| [#4](https://github.com/chy3xyz/zmodu/pull/4) | `integration-full` 覆盖 `pull_request` + `examples/README.md` 索引漂移 | 合并 |
 
 三条断言的读数，逐条对应档 2 的三个条件：
 
@@ -181,9 +181,9 @@
 
 框架不是自娱自乐——**已公开的两个下游项目**证明它在真实项目里跑得动：
 
-| 项目 | 性质 | zigmodu 用法 | 证据强度 |
+| 项目 | 性质 | zmodu 用法 | 证据强度 |
 |---|---|---|---|
-| [**zenaipa**](https://github.com/chy3xyz/zenaipa) | 全栈管理平台（Zig + SolidJS，单二进制） | HTTP / security / AI / resilience / Application 生命周期；依赖用 **git tag + content hash 双锁**（`zigmodu-0.39.9-U40vs30XlQC-...`） | 中——**依赖锁定姿势正确**，说明使用者懂供应链 |
+| [**zenaipa**](https://github.com/chy3xyz/zenaipa) | 全栈管理平台（Zig + SolidJS，单二进制） | HTTP / security / AI / resilience / Application 生命周期；依赖用 **git tag + content hash 双锁**（`zmodu-0.39.9-U40vs30XlQC-...`） | 中——**依赖锁定姿势正确**，说明使用者懂供应链 |
 | [**zasdoor**](https://github.com/chy3xyz/zasdoor) | **IAM/身份系统**：OAuth2/OIDC、MFA、SIWE、组织/项目/应用/角色 | 直接吃框架的 security 面：JWT / 多租户 / OIDC EdDSA+JWKS / 会话吊销 / 口令策略与锁定 | **高——79 个后端测试**（含 IAM/OAuth/MFA/web3 路由、JWT 多租户、联邦 IdP、密码策略） |
 
 两条值得记下的细节：
@@ -191,7 +191,7 @@
 1. **zasdoor 是高安全要求的场景**（身份与访问管理）。它选择用本框架承载，
    且**自己写了 79 个后端测试**——**框架的边界被真实业务逻辑反复压过**，
    这比任何自证 benchmark 都有说服力。
-2. **两个项目的提交身份是 `shimonenator`**，与 zigmodu 仓库里的
+2. **两个项目的提交身份是 `shimonenator`**，与 zmodu 仓库里的
    `Antigravity Agent` / `chy3xyz` 不同。虽是同一所有者名下，但**至少不是自审自签一个身份**。
 
 **必须同时说清的三件事**（否则这个加分会被误读）：
@@ -201,14 +201,14 @@
 - **B-14 判定不变**：同一所有者 + 同一身份链，验证的是"作者能交付"，
   而 B-14 要求的是"**有人能推翻我们的结论**"。dogfooding 压出 bug 的能力很强，
   但**它不能替代独立审计**——因为作者自己选择实现方案，也自己判断实现对不对。
-- **版本落差是真实风险**：zasdoor 声明 `zigmodu v0.15.44`、zenaipa 徽章写 `v0.20.1`
+- **版本落差是真实风险**：zasdoor 声明 `zmodu v0.15.44`、zenaipa 徽章写 `v0.20.1`
   （实际依赖已是 0.39.9）。**下游跑的是 0.x 的老版本**，这也侧面印证了
   §3.4 的判断——**碎片化版本让用户不敢升级**。
 
 ### 3.4 发布节奏是陀螺
 
 99 个版本**全部在 0.x**，近月 1–2 次/天。语义化版本在 0.x 下被当成了 CI 计数器。
-后果是真实的：生产团队看到 `zigmodu` 出现在依赖树里会犹豫——因为它显然还不打算稳定。
+后果是真实的：生产团队看到 `zmodu` 出现在依赖树里会犹豫——因为它显然还不打算稳定。
 （反直觉的是，**破坏性只有 6/99**，说明这不是"重构频繁"，而是"发得勤"。）
 
 ### 3.5 A 组剩余（5 条，多为有界定界）

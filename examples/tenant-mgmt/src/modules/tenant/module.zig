@@ -1,6 +1,6 @@
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
-pub const info = zigmodu.api.Module{
+pub const info = zmodu.api.Module{
     .name = "tenant",
     .description = "Multi-tenant management — tenant CRUD, tier management",
     .dependencies = &.{},

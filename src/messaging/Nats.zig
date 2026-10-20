@@ -21,7 +21,7 @@ pub const NatsConfig = struct {
     token: ?[]const u8 = null,
     username: ?[]const u8 = null,
     password: ?[]const u8 = null,
-    name: []const u8 = "zigmodu-nats",
+    name: []const u8 = "zmodu-nats",
     ping_interval_ms: u64 = 30_000,
     /// How long `ping` / `flush` waits for the server's `PONG` while it keeps
     /// dispatching whatever else arrives.
@@ -724,14 +724,14 @@ test "NATS publish and subscribe" {
     _ = try client.connect();
 
     // Subscribe to test subject
-    const sid = try client.subscribe("zigmodu.test.pubsub", struct {
+    const sid = try client.subscribe("zmodu.test.pubsub", struct {
         fn handler(msg: NatsClient.Message) void {
             _ = msg;
         }
     }.handler);
     defer client.unsubscribe(sid) catch {};
 
-    try client.publish("zigmodu.test.pubsub", "hello-nats");
+    try client.publish("zmodu.test.pubsub", "hello-nats");
     try client.flush();
 
     // Poll to receive the message
@@ -750,7 +750,7 @@ test "NATS request-reply" {
     _ = try client.connect();
 
     // Subscribe to respond to requests
-    const sid = try client.subscribe("zigmodu.test.request", struct {
+    const sid = try client.subscribe("zmodu.test.request", struct {
         fn handler(msg: NatsClient.Message) void {
             _ = msg;
         }
@@ -758,7 +758,7 @@ test "NATS request-reply" {
     defer client.unsubscribe(sid) catch {};
 
     // Send a request — will timeout (no responder), but validates protocol
-    _ = client.request("zigmodu.test.request", "ping", 1000) catch |err| {
+    _ = client.request("zmodu.test.request", "ping", 1000) catch |err| {
         try std.testing.expectEqual(error.Timeout, err);
         return;
     };
@@ -826,12 +826,12 @@ test "NatsClient poll reassembles a MSG frame split across reads" {
     client.stream = testStream(fds[0]);
 
     TestSink.reset();
-    _ = try client.subscribe("zigmodu.test.split", TestSink.callback);
+    _ = try client.subscribe("zmodu.test.split", TestSink.callback);
 
     // The first read ends inside the header line. The per-read parser used to
     // drop everything after the last complete line, stranding the partial
     // frame; now the tail stays in `pending` for the next read.
-    const frame = "MSG zigmodu.test.split 1 10\r\nhello-nats\r\n";
+    const frame = "MSG zmodu.test.split 1 10\r\nhello-nats\r\n";
     try sockread.writeFull(testStream(fds[1]), frame[0..9]);
     try std.testing.expectEqual(@as(usize, 0), try client.poll());
     try std.testing.expectEqual(@as(usize, 0), TestSink.count);
@@ -839,7 +839,7 @@ test "NatsClient poll reassembles a MSG frame split across reads" {
     try sockread.writeFull(testStream(fds[1]), frame[9..]);
     try std.testing.expectEqual(@as(usize, 1), try client.poll());
     try std.testing.expectEqual(@as(usize, 1), TestSink.count);
-    try std.testing.expectEqualStrings("zigmodu.test.split", TestSink.subject());
+    try std.testing.expectEqualStrings("zmodu.test.split", TestSink.subject());
     try std.testing.expectEqualStrings("hello-nats", TestSink.payload());
     // Nothing left half-consumed.
     try std.testing.expectEqual(@as(usize, 0), client.pending.items.len);
@@ -856,7 +856,7 @@ test "NatsClient poll reassembles a MSG larger than one read buffer" {
     client.stream = testStream(fds[0]);
 
     TestSink.reset();
-    _ = try client.subscribe("zigmodu.test.big", TestSink.callback);
+    _ = try client.subscribe("zmodu.test.big", TestSink.callback);
 
     // A 20 KiB payload cannot fit the 8 KiB per-read buffer: it necessarily
     // arrives over several reads. Written in 4 KiB pieces with a poll after
@@ -864,7 +864,7 @@ test "NatsClient poll reassembles a MSG larger than one read buffer" {
     // buffer.
     var payload: [20 * 1024]u8 = undefined;
     for (&payload, 0..) |*b, i| b.* = @truncate(i);
-    const header = try allocator.print("MSG zigmodu.test.big 1 {d}\r\n", .{payload.len});
+    const header = try allocator.print("MSG zmodu.test.big 1 {d}\r\n", .{payload.len});
     defer allocator.free(header);
 
     try sockread.writeFull(testStream(fds[1]), header);
@@ -902,7 +902,7 @@ test "NatsClient request reports a peer shutdown as ConnectionClosed, not Timeou
     // misreport the closed connection as error.Timeout — the generous 60 s
     // timeout makes that old behavior hang this test, the new one returns at
     // once.
-    if (client.request("zigmodu.test.closed", "x", 60_000)) |resp| {
+    if (client.request("zmodu.test.closed", "x", 60_000)) |resp| {
         allocator.free(resp);
         return error.TestUnexpectedResult;
     } else |err| {
@@ -926,7 +926,7 @@ test "NatsClient subscribeGroup frees the partial copies when an allocation fail
         var client = NatsClient.init(failing.allocator(), std.testing.io, .{});
         client.stream = testStream(fds[0]);
 
-        if (client.subscribeGroup("zigmodu.test.oom", "workers", TestSink.callback)) |sid| {
+        if (client.subscribeGroup("zmodu.test.oom", "workers", TestSink.callback)) |sid| {
             _ = sid;
         } else |err| {
             try std.testing.expectEqual(@as(anyerror, error.OutOfMemory), err);

@@ -1,6 +1,6 @@
 //! Compatibility shim: the module contract lives in `core/Module.zig`.
 //!
-//! `zigmodu.api.Module` and the other names below keep working; new code can
+//! `zmodu.api.Module` and the other names below keep working; new code can
 //! import `core.Module` directly. The move removed the last core -> api edge
 //! (core's registry had to import the API layer to name the contract).
 

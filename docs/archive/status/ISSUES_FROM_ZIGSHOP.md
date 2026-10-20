@@ -61,7 +61,7 @@
 
 ```zig
 // 启动期一行：之后框架生成的错误体全部是 RFC 7807
-zigmodu.http.useRfc7807Errors();
+zmodu.http.useRfc7807Errors();
 ```
 
 - 链内：`http.setDefaultReject(renderer)` 装进程级渲染器，`ctx.sendError`/`sendErrorResponse` 一律走它 —— 于是**所有内部调用点**一次到位（`Server.zig` 8 处 + `Middleware.zig` 4 处，含 `handleRequest` catch 里的 500，中间件永远抓不到那个；gate 经 `cfg.reject` 默认转发的站点同样覆盖，因为 `defaultReject` 就是走 `ctx.sendError`）。

@@ -1,5 +1,5 @@
 //! Security domain: auth, RBAC, API keys, secrets, password, JWT.
-//! Import directly: `const security = @import("zigmodu").security;`
+//! Import directly: `const security = @import("zmodu").security;`
 
 /// Auth + authorization + encryption bundle; `AppSecurity` wires it to an app.
 pub const SecurityModule = @import("security/SecurityModule.zig").SecurityModule;

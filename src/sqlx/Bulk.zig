@@ -6,7 +6,7 @@
 //! and Repository code reuse the same generator.
 //!
 //! ```zig
-//! const bulk = zigmodu.data.bulk;
+//! const bulk = zmodu.data.bulk;
 //! const rows = [_][]const sqlx.Value{
 //!     &.{ .{ .int = 1 }, .{ .string = "a" } },
 //!     &.{ .{ .int = 2 }, .{ .string = "b" } },

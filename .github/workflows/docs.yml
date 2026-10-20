@@ -60,8 +60,8 @@ jobs:
         # working notes and superseded status reports.
         run: |
           ./zdoc docs docs \
-            --title ZigModu \
-            --url-prefix zigmodu \
+            --title zmodu \
+            --url-prefix zmodu \
             --exclude 'dev/**' \
             --exclude 'archive/**' \
             --output site-dist

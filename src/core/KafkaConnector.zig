@@ -45,7 +45,7 @@ pub const KafkaMessage = struct {
 pub const KafkaProducerConfig = struct {
     /// RobustMQ / Kafka bootstrap: `host:port` (default RobustMQ Kafka listener).
     bootstrap_servers: []const u8 = "127.0.0.1:9092",
-    client_id: []const u8 = "zigmodu-robustmq",
+    client_id: []const u8 = "zmodu-robustmq",
     acks: Acks = .leader,
     compression: Compression = .none,
     batch_size: usize = 16384,
@@ -95,8 +95,8 @@ pub fn parsePartitionAssignorKind(s: []const u8) ?PartitionAssignorKind {
 
 pub const KafkaConsumerConfig = struct {
     bootstrap_servers: []const u8 = "127.0.0.1:9092",
-    group_id: []const u8 = "zigmodu-group",
-    client_id: []const u8 = "zigmodu-robustmq",
+    group_id: []const u8 = "zmodu-group",
+    client_id: []const u8 = "zmodu-robustmq",
     auto_offset_reset: []const u8 = "latest",
     enable_auto_commit: bool = true,
     max_poll_records: usize = 500,
@@ -2733,7 +2733,7 @@ test "KafkaWireFormat produce request" {
         null,
         "hello",
         1,
-        "zigmodu",
+        "zmodu",
         1,
     );
     defer allocator.free(payload);
@@ -2800,18 +2800,18 @@ test "RobustMQ live produce" {
     const allocator = std.testing.allocator;
     var producer = KafkaProducer.initWithIo(allocator, std.testing.io, .{
         .bootstrap_servers = url.?,
-        .client_id = "zigmodu-test",
+        .client_id = "zmodu-test",
     });
     defer producer.deinit();
 
     try producer.send(.{
-        .topic = "zigmodu.robustmq.smoke",
+        .topic = "zmodu.robustmq.smoke",
         .key = "k1",
         .value = "hello-robustmq",
         .headers = &.{},
         .timestamp = Time.monotonicNowSeconds(),
     });
-    try std.testing.expectEqual(@as(u64, 1), producer.getTopicStats("zigmodu.robustmq.smoke").?.produced);
+    try std.testing.expectEqual(@as(u64, 1), producer.getTopicStats("zmodu.robustmq.smoke").?.produced);
 }
 
 test "KafkaWireFormat consumer group requests" {
@@ -3246,11 +3246,11 @@ test "RobustMQ live joinGroup" {
     const allocator = std.testing.allocator;
     var consumer = KafkaConsumer.initWithIo(allocator, std.testing.io, .{
         .bootstrap_servers = url.?,
-        .group_id = "zigmodu-live-cg",
-        .client_id = "zigmodu-cg-test",
+        .group_id = "zmodu-live-cg",
+        .client_id = "zmodu-cg-test",
     });
     defer consumer.deinit();
-    try consumer.subscribe("zigmodu.robustmq.smoke", struct {
+    try consumer.subscribe("zmodu.robustmq.smoke", struct {
         fn h(_: KafkaMessage) void {}
     }.h);
     consumer.joinGroup() catch |err| {

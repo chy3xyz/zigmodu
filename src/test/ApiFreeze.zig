@@ -25,13 +25,13 @@
 //!    `DEPRECATED` marker inside its doc comment, and that comment must name the
 //!    replacement.
 //! 3. **Removal** — the opposite direction for names that already left. The
-//!    「已移除」 record in `docs/reference/UPGRADING.md` carries `zigmodu.App` /
-//!    `zigmodu.ModuleImpl` and `zigmodu.extensions`, so re-exporting one from
+//!    「已移除」 record in `docs/reference/UPGRADING.md` carries `zmodu.App` /
+//!    `zmodu.ModuleImpl` and `zmodu.extensions`, so re-exporting one from
 //!    `root.zig` is red. That is the failure the old table row invited: "removed
 //!    no earlier than 1.0" reads as "still available", and a `@hasDecl` is
 //!    enough to stop it.
 //! 4. **File-level banners** — two files mark the *whole module* deprecated
-//!    without a consumer-writable `zigmodu.<name>` having left, so they are
+//!    without a consumer-writable `zmodu.<name>` having left, so they are
 //!    neither rows nor removals. The gate pins the banner and the dependency
 //!    direction of both chains that used to run through `Validator.zig`:
 //!    `http.FieldRules` must resolve to `validation/FieldRules.zig`, and the
@@ -86,21 +86,21 @@ const ALIASES = [_]Alias{
         .decl_must_contain = &.{ "DEPRECATED", "nestedParam" },
     },
     .{
-        .doc_deprecated = "zigmodu.startAll",
+        .doc_deprecated = "zmodu.startAll",
         .doc_target = "Application.start()",
         .decl_file = "src/root.zig",
         .decl_symbol = "pub const startAll = ",
         .decl_must_contain = &.{ "DEPRECATED", "Application.start()" },
     },
     .{
-        .doc_deprecated = "zigmodu.stopAll",
+        .doc_deprecated = "zmodu.stopAll",
         .doc_target = "Application.stop()",
         .decl_file = "src/root.zig",
         .decl_symbol = "pub const stopAll = ",
         .decl_must_contain = &.{ "DEPRECATED", "Application.stop()" },
     },
     .{
-        .doc_deprecated = "zigmodu.http.http_server",
+        .doc_deprecated = "zmodu.http.http_server",
         .doc_target = "http.Server",
         .decl_file = "src/http.zig",
         .decl_symbol = "pub const http_server = ",
@@ -163,7 +163,7 @@ const removed_heading = "### 已移除";
 /// Recording it only pays off if the gate notices it coming back, so
 /// `root_name` is asserted **absent** from `root.zig` instead of present.
 const Removed = struct {
-    /// The spelling a consumer used to write: `zigmodu.<root_name>`.
+    /// The spelling a consumer used to write: `zmodu.<root_name>`.
     root_name: []const u8,
     /// The removal evidence, as the doc cites it: a commit when one is recorded,
     /// otherwise the oldest written record the repo still has. Evidence, not a
@@ -195,7 +195,7 @@ const REMOVED = [_]Removed{
         .root_name = "extensions",
         // No commit and no tag records this one; `CHANGELOG.md`'s `[0.15.0]`
         // section is the oldest written record — it already describes
-        // `zigmodu.extensions` as a namespace apps were moving off.
+        // `zmodu.extensions` as a namespace apps were moving off.
         .evidence = "0.15.0",
         .file = "src/extensions.zig",
         .compiled_import = "\"extensions.zig\"",
@@ -210,7 +210,7 @@ const REMOVED = [_]Removed{
 /// table material and are not: the table pairs "the old name a consumer wrote"
 /// with "the name to write now", and neither file has such a pair any more.
 ///
-/// * `src/extensions.zig` — its `zigmodu.extensions` namespace is gone (see
+/// * `src/extensions.zig` — its `zmodu.extensions` namespace is gone (see
 ///   `REMOVED`); what is left is a type-alias shim, path-reachable only.
 /// * `src/validation/Validator.zig` — its banner says "will be removed in v1.0",
 ///   and as of the `FieldValidation` move that plan has no consumer-visible
@@ -242,7 +242,7 @@ const BANNERS = [_]Banner{
         // domain files' types.
         .file = "src/extensions.zig",
         // The replacement the banner names for its first line of exports.
-        .must_contain = &.{ "DEPRECATED", "zigmodu.http.http_server" },
+        .must_contain = &.{ "DEPRECATED", "zmodu.http.http_server" },
     },
 };
 
@@ -425,7 +425,7 @@ fn replacementResolves(comptime target: []const u8) bool {
     if (comptime std.mem.startsWith(u8, name, "http.")) return @hasDecl(http, name["http.".len..]);
     if (comptime std.mem.startsWith(u8, name, "RateLimiter.")) return @hasDecl(zmodu.RateLimiter, name["RateLimiter.".len..]);
     if (comptime std.mem.startsWith(u8, name, "Application.")) return @hasDecl(zmodu.Application, name["Application.".len..]);
-    if (comptime std.mem.startsWith(u8, name, "zigmodu.")) return @hasDecl(zmodu, name["zigmodu.".len..]);
+    if (comptime std.mem.startsWith(u8, name, "zmodu.")) return @hasDecl(zmodu, name["zmodu.".len..]);
     return @hasDecl(zmodu, name);
 }
 
@@ -446,11 +446,11 @@ test "removed: http.RouteGroup and Server.group are gone (runtime registration m
 test "removed: the names off the root stay off, and their files are still compiled" {
     const allocator = std.testing.allocator;
 
-    // `@hasDecl(zmodu, …)` is what a consumer's `zigmodu.App` resolves against,
+    // `@hasDecl(zmodu, …)` is what a consumer's `zmodu.App` resolves against,
     // so `true` here is exactly the regression the 「已移除」 record guards.
     inline for (REMOVED) |removed| {
         if (comptime @hasDecl(zmodu, removed.root_name)) {
-            std.debug.print("[api-freeze] `zigmodu.{s}` is exported again — docs/reference/UPGRADING.md records it as removed ({s}); use the domain files / `Application` instead\n", .{ removed.root_name, removed.evidence });
+            std.debug.print("[api-freeze] `zmodu.{s}` is exported again — docs/reference/UPGRADING.md records it as removed ({s}); use the domain files / `Application` instead\n", .{ removed.root_name, removed.evidence });
             return error.RemovedNameReexported;
         }
     }
@@ -507,11 +507,11 @@ test "removed: the names off the root stay off, and their files are still compil
 }
 
 test "removed: the extensions shim is a rename, not a fork" {
-    // The record has two halves: the `zigmodu.extensions` namespace is gone (the
+    // The record has two halves: the `zmodu.extensions` namespace is gone (the
     // loop in the test above), and the file that carried it is still in the tree
     // with the same *types* the domain files export. Pinning the second half is
     // what makes "migrate off the namespace" a rename rather than a fork: an old
-    // `zigmodu.extensions.HttpServer` value is a `http.Server` value.
+    // `zmodu.extensions.HttpServer` value is a `http.Server` value.
     const Ext = @import("../extensions.zig");
 
     inline for (.{ "HttpServer", "HttpContext", "SqlxClient", "Orm", "RedisClient", "RetryPolicy", "ConnectionPool", "CronScheduler" }) |name| {
@@ -542,8 +542,8 @@ test "removed: docs/reference/UPGRADING.md records the same removals this gate p
     var problems: usize = 0;
     for (REMOVED) |removed| {
         // The exact spelling the gate pins, so a mention of the replacement
-        // (`zigmodu.Application`) cannot satisfy a check for `zigmodu.App`.
-        const name = try allocator.print("`zigmodu.{s}`", .{removed.root_name});
+        // (`zmodu.Application`) cannot satisfy a check for `zmodu.App`.
+        const name = try allocator.print("`zmodu.{s}`", .{removed.root_name});
         defer allocator.free(name);
 
         if (std.mem.indexOf(u8, section, name) == null) {
@@ -551,11 +551,11 @@ test "removed: docs/reference/UPGRADING.md records the same removals this gate p
             problems += 1;
         }
         if (std.mem.indexOf(u8, section, removed.evidence) == null) {
-            std.debug.print("[api-freeze] docs/reference/UPGRADING.md '{s}' does not cite {s} for `zigmodu.{s}` — the record needs evidence (a commit, or the oldest written record there is), not just a name\n", .{ removed_heading, removed.evidence, removed.root_name });
+            std.debug.print("[api-freeze] docs/reference/UPGRADING.md '{s}' does not cite {s} for `zmodu.{s}` — the record needs evidence (a commit, or the oldest written record there is), not just a name\n", .{ removed_heading, removed.evidence, removed.root_name });
             problems += 1;
         }
         if (std.mem.indexOf(u8, section, removed.file) == null) {
-            std.debug.print("[api-freeze] docs/reference/UPGRADING.md '{s}' does not say where `zigmodu.{s}` can still be found ({s})\n", .{ removed_heading, removed.root_name, removed.file });
+            std.debug.print("[api-freeze] docs/reference/UPGRADING.md '{s}' does not say where `zmodu.{s}` can still be found ({s})\n", .{ removed_heading, removed.root_name, removed.file });
             problems += 1;
         }
     }
@@ -670,7 +670,7 @@ test "banners: the whole-file DEPRECATED notices are still at the top, and http.
     }
 
     // …and the replacement the banner names is a *different* type, so "use
-    // `zigmodu.Validator` instead" is a real migration and not a self-reference.
+    // `zmodu.Validator` instead" is a real migration and not a self-reference.
     try std.testing.expect(@hasDecl(zmodu, "Validator"));
     try std.testing.expect(zmodu.Validator == ObjectValidator.Validator);
     try std.testing.expect(zmodu.Validator != DeprecatedValidator.Validator);
@@ -1033,10 +1033,10 @@ const FreezeCategory = struct {
 
 const FREEZE_CATEGORIES = [_]FreezeCategory{
     .{
-        .name = "zigmodu 顶层 · 生命周期与模块契约",
+        .name = "zmodu 顶层 · 生命周期与模块契约",
         .anchors = &.{
             "Application",   "ApplicationBuilder", "builder", "api",
-            "ModuleContext", "ZigModuError",       "Result",  "Time",
+            "ModuleContext", "ZmoduError",         "Result",  "Time",
             "scanModules",   "ModuleInfo",
         },
     },
@@ -1113,7 +1113,7 @@ const FREEZE_CATEGORIES = [_]FreezeCategory{
 
 /// The preview surface docs/reference/RUNTIME.md documents in §12–§14 (plus §11/§13's
 /// recorder): `runtime.*` may break during 0.x (RUNTIME.md §2 item 10), so these
-/// names stay under `zigmodu.runtime` and off the frozen top level — otherwise a
+/// names stay under `zmodu.runtime` and off the frozen top level — otherwise a
 /// change the runtime is allowed to make lands on the surface that is not.
 const PREVIEW = [_][]const u8{
     "runtime.Runtime",

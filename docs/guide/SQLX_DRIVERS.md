@@ -1,6 +1,6 @@
 # SQLx 选择性驱动链接（`-Ddb=` / `.db=`）
 
-ZigModu 默认链接 **sqlite + postgres + mysql**（`-Ddb=all`），保证旧项目与框架自测兼容。小系统 / 单驱动部署应收窄链接，减少系统库依赖与部署面。`-Ddb=none` 全不链驱动（sqlx 走 stub，`DriverNotEnabled` 守卫运行时生效）——用于无 DB 的二进制（如 Windows 交叉编译 agent）或纯测试桩。
+zmodu 默认链接 **sqlite + postgres + mysql**（`-Ddb=all`），保证旧项目与框架自测兼容。小系统 / 单驱动部署应收窄链接，减少系统库依赖与部署面。`-Ddb=none` 全不链驱动（sqlx 走 stub，`DriverNotEnabled` 守卫运行时生效）——用于无 DB 的二进制（如 Windows 交叉编译 agent）或纯测试桩。
 
 **实现**：`examples/_shared/db_link.zig` · `build_options.enable_*` · `src/sqlx/*_c_stub.zig` · `sqlx.DriverFeatures`  
 **相关**：[`data.sqlx`](../../src/data.zig) · [PRODUCTION_ROADMAP.md](../archive/status/PRODUCTION_ROADMAP.md)（sqlx 维护边界）· [ZENT.md](../reference/ZENT.md)（正交 ORM，仍可能链 libsqlite3）  
@@ -11,24 +11,24 @@ ZigModu 默认链接 **sqlite + postgres + mysql**（`-Ddb=all`），保证旧�
 ## 1. 消费者（package dependency）
 
 ```zig
-const zigmodu_dep = b.dependency("zigmodu", .{
+const zmodu_dep = b.dependency("zmodu", .{
     .target = target,
     .optimize = optimize,
     .db = "sqlite", // 见下表
 });
-exe_mod.addImport("zigmodu", zigmodu_dep.module("zigmodu"));
+exe_mod.addImport("zmodu", zmodu_dep.module("zmodu"));
 ```
 
-不必在应用 `build.zig` 里手写 `linkSystemLibrary("sqlite3")`：zigmodu 根 `build.zig` 会按 `.db=` 链接。
+不必在应用 `build.zig` 里手写 `linkSystemLibrary("sqlite3")`：zmodu 根 `build.zig` 会按 `.db=` 链接。
 
-同一次 `b.dependency("zigmodu", .{ .db = … })` 也决定了 zigmodu 自己的 `build_options`
-（`enable_sqlite` / `enable_postgres` / `enable_mysql`）。这三项是 **zigmodu 模块内部**
+同一次 `b.dependency("zmodu", .{ .db = … })` 也决定了 zmodu 自己的 `build_options`
+（`enable_sqlite` / `enable_postgres` / `enable_mysql`）。这三项是 **zmodu 模块内部**
 的编译期开关：应用侧 `exe_mod.addImport("build_options", 自己的 options 模块)` 只作用于
 应用自己的编译单元，**不会**改变依赖被链接的方式。两者同名不代表同一模块——应用自己的
-`build_options` 与 zigmodu 的 `build_options` 在依赖形态下是两个独立模块。想改链路，
-唯一的旋钮是 `.db=`，不要试图把自定义 options 模块 `addImport` 到 `zigmodu_dep.module("zigmodu")` 上。
+`build_options` 与 zmodu 的 `build_options` 在依赖形态下是两个独立模块。想改链路，
+唯一的旋钮是 `.db=`，不要试图把自定义 options 模块 `addImport` 到 `zmodu_dep.module("zmodu")` 上。
 
-**纯框架嵌入（数据层不在 `data.sqlx`）用 `.db = "none"`。** 应用只用 zigmodu 的
+**纯框架嵌入（数据层不在 `data.sqlx`）用 `.db = "none"`。** 应用只用 zmodu 的
 HTTP / Application / Runtime，数据库走 zent 或别的栈时，`.db = "none"` 是最小形态：
 三个驱动的 `translate-c` 全跳过、不链任何客户端库（部署机不需要 MariaDB/libpq 头文件），
 `data.sqlx` 编成 stub——误用 `data.Client.open` 得到的是 `error.DriverNotEnabled`，
@@ -70,7 +70,7 @@ cd examples/tenant-mgmt && zig build -Ddb=sqlite -Doptimize=ReleaseSafe
 | C 绑定 | 未启用 → `src/sqlx/{sqlite3,libpq,libmysql}_c_stub.zig` |
 | `build_options` | `enable_sqlite` / `enable_postgres` / `enable_mysql` |
 | 运行时 | `Client.connect` / `newConn` → `error.DriverNotEnabled` |
-| HTTP | `ZigModuError.DriverNotEnabled` → **400 Bad Request** |
+| HTTP | `ZmoduError.DriverNotEnabled` → **400 Bad Request** |
 | 探测 | `sqlx.DriverFeatures.sqlite` 等；`isEnabled(driver)` |
 
 ```zig
@@ -153,7 +153,7 @@ examples/<name>/db_link.zig  →  symlink → ../_shared/db_link.zig
 改链接逻辑只改 `_shared/db_link.zig`；各 example 的 symlink 自动跟上。
 
 > **git 依赖消费者**：`build.zig.zon` 的 `.paths` 已包含 `examples/_shared`，
-> 因此通过 `git+https://…zigmodu` 拉取的包内自带 `examples/_shared/db_link.zig`
+> 因此通过 `git+https://…zmodu` 拉取的包内自带 `examples/_shared/db_link.zig`
 > 与 `zent_helpers.zig`，无需再从源码 clone 复制（换版本也无需重打 workaround）。
 > 若消费者直接引用，路径为 `<zigmodu_pkg>/examples/_shared/db_link.zig`。
 
@@ -165,7 +165,7 @@ examples/<name>/db_link.zig  →  symlink → ../_shared/db_link.zig
 
 zent 使用自己的 SQLite / 驱动栈，与 `data.sqlx` **正交**（见 [ZENT.md](../reference/ZENT.md)）。
 
-路径依赖示例仍可能 `addImport("zigmodu", …)` 并设置 `build_options`：即便业务只走 zent，zigmodu 模块图仍可能拉入 sqlx 符号——这些示例用 `Features.sqlite_only`，避免再链 pq/mysql。
+路径依赖示例仍可能 `addImport("zmodu", …)` 并设置 `build_options`：即便业务只走 zent，zmodu 模块图仍可能拉入 sqlx 符号——这些示例用 `Features.sqlite_only`，避免再链 pq/mysql。
 
 ---
 
@@ -179,7 +179,7 @@ zent 使用自己的 SQLite / 驱动栈，与 `data.sqlx` **正交**（见 [ZENT
 
 ## 10. 检查清单
 
-- [ ] 应用 `b.dependency("zigmodu", .{ .db = "…" })` 与真实 DSN 一致  
+- [ ] 应用 `b.dependency("zmodu", .{ .db = "…" })` 与真实 DSN 一致  
 - [ ] 数据层不在 `data.sqlx`（zent / 其他栈）→ `.db = "none"`；只用框架的 HTTP/Application 层时不要顺手链三库  
 - [ ] 生产镜像只安装对应客户端库（sqlite 系统库 / libpq / mysqlclient）  
 - [ ] CI 应用构建使用收窄 `-Ddb=`；框架 PR 测试保持 `all`  

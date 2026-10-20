@@ -1,4 +1,4 @@
-# ZigModu v0.31.0 安全审计
+# zmodu v0.31.0 安全审计
 
 > 只读静态审计（无端到端 PoC）。**引用由仓库维护者逐条复核过**：
 > 高危①的三处证据（`Server.zig:2657` 在 `router.match:2724` 之前、`RouteGroup.ws` 只写 `ws_handlers`、
@@ -7,7 +7,7 @@
 > 文中的"没读"清单同样重要 —— 集群帧解码与 `WsFramer` 是**未审计**的高风险段。
 
 
-# ZigModu v0.31.0 安全审计（只读）
+# zmodu v0.31.0 安全审计（只读）
 
 **结论（3 行）**
 1. **最高危：WebSocket 路由完全绕过全局中间件链** —— `ws_routes` 声明的 `.auth = .jwt` 只是 catalog 里的元数据，升级请求在 `router.match`/`executeWithMiddleware` 之前就被处理掉了；仓库自带的 auth 审计还会主动跳过 `is_ws`。脚手架的 IM 模块因此用 `?userId=` 当身份。
@@ -230,7 +230,7 @@ for (cfg.headers) |name| { if (ctx.header(name)) |v| { if (v.len > 0) { resolved
 
 1. **CL/TE 走私的端到端可复现性**（发现②）。为什么无法确认：需要真实网络 + 一个具体代理（nginx/Envoy 的原始解析行为、是否拒绝 TE+CL、是否重写 `Content-Length`）。我做了只读代码阅读（parser 只读 `content-length`、无 TE、`: "` 才认头、请求行第三段不校验），但**没有启动服务、没有发过任何请求**，因此「chunk-size 行被解析成合法请求行」这一步是用 `Method.fromString` + 请求行切分推导的，不是实测。
 2. **`Where` 之外的 `TenantInterceptor` / `sqlx.Bulk` 路径是否也有谓词拼接问题**。为什么无法确认：`src/sqlx/sqlx.zig` 有 348 KB，我只做了 keyword 级检索（`ForTenant`/`sql_tenant_column`/`Unscoped` 在它里面**零命中**，租户逻辑集中在 `src/persistence/Orm.zig`），没有逐段读完 Bulk/Upsert 的 SQL 生成。
-3. **Postgres/MySQL 方言下的行为**。为什么无法确认：本机没有 PG/MySQL 服务端；`writeBackInsertedId` 的 `SELECT lastval()`（`Orm.zig:1078-1091`）、`IN (...)` 空列表、锁语义都需要真实服务端。仓库的 PG 锁用例本身是 `ZIGMODU_TEST_PG=1` 门控的。
+3. **Postgres/MySQL 方言下的行为**。为什么无法确认：本机没有 PG/MySQL 服务端；`writeBackInsertedId` 的 `SELECT lastval()`（`Orm.zig:1078-1091`）、`IN (...)` 空列表、锁语义都需要真实服务端。仓库的 PG 锁用例本身是 `ZMODU_TEST_PG=1` 门控的。
 4. **WS 在 io_uring 分发路径下是否同样绕过中间件**。为什么无法确认：`Server.zig:2682-2690` 的 adopt 分支与 fiber 分支在同一个「已握手」块内，我读到的结论是同样绕过，但没有网络环境验证 `WsFramer`/uring 实际行为。
 5. **`ctx.path` 是否始终是未 percent-decode 的原始串**。我读到 `path = raw_path[0..query_start]`（`Server.zig:1441-1453`）未解码，这是 StaticFiles 安全的前提；但没有跑用例确认没有别处（如 `path_rewriter`、H2 路径）改写 `ctx.path`。
 6. **`ai.Guard` 在 `AgentSpec` 未设 guard 时的实际默认**。只读了 `guard.zig` 的 `Decision/check` 与 `skill.zig:509` 的 action 表，没有追 `Agent.run` 里 guard 缺省的分支。

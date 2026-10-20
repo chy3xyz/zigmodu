@@ -1,15 +1,15 @@
-# ZigModu on Kubernetes: probes, restart policy, resource caps, metrics scrape.
+# zmodu on Kubernetes: probes, restart policy, resource caps, metrics scrape.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: zigmodu-api
+  name: zmodu-api
 spec:
   replicas: 3
   selector:
-    matchLabels: { app: zigmodu-api }
+    matchLabels: { app: zmodu-api }
   template:
     metadata:
-      labels: { app: zigmodu-api }
+      labels: { app: zmodu-api }
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/path: "/metrics"
@@ -18,7 +18,7 @@ spec:
       # TLS is terminated at the Ingress/LB; the pod speaks plain HTTP.
       containers:
         - name: api
-          image: registry.example.com/zigmodu-api:0.15.36
+          image: registry.example.com/zmodu-api:0.15.36
           ports: [{ containerPort: 8080 }]
           env:
             - { name: HTTP_PORT, value: "8080" }
@@ -26,7 +26,7 @@ spec:
             - { name: HTTP_HEADER_TIMEOUT_MS, value: "10000" }
             - { name: WS_WRITE_TIMEOUT_MS, value: "10000" }
             - name: JWT_SECRET
-              valueFrom: { secretKeyRef: { name: zigmodu-secrets, key: jwt-secret } }
+              valueFrom: { secretKeyRef: { name: zmodu-secrets, key: jwt-secret } }
           # Liveness: process-level only. Never check dependencies here, or a
           # downstream outage turns into a cluster-wide restart storm.
           livenessProbe:
@@ -52,18 +52,18 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: zigmodu-api
+  name: zmodu-api
 spec:
-  selector: { app: zigmodu-api }
+  selector: { app: zmodu-api }
   ports: [{ port: 80, targetPort: 8080 }]
 ---
 # Scale on saturation, not on CPU alone if you have a request-rate metric.
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: zigmodu-api
+  name: zmodu-api
 spec:
-  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: zigmodu-api }
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: zmodu-api }
   minReplicas: 3
   maxReplicas: 20
   metrics:

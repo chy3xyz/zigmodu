@@ -1,4 +1,4 @@
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 const model = @import("model.zig");
 
 pub fn CartService(comptime Persistence: type) type {
@@ -12,7 +12,7 @@ pub fn CartService(comptime Persistence: type) type {
 
         pub fn getOrCreate(self: *Self, tenant_id: i64, user_id: i64) !model.Cart {
             if (try self.persistence.findCart(tenant_id, user_id)) |c| return c;
-            const now: i64 = @intCast(zigmodu.time.monotonicNowSeconds());
+            const now: i64 = @intCast(zmodu.time.monotonicNowSeconds());
             const id = try self.persistence.insertCart(.{
                 .id = 0,
                 .tenant_id = tenant_id,
@@ -22,7 +22,7 @@ pub fn CartService(comptime Persistence: type) type {
             return .{ .id = id, .tenant_id = tenant_id, .user_id = user_id, .updated_at = now };
         }
 
-        pub fn listItems(self: *Self, tenant_id: i64, user_id: i64) !zigmodu.data.sqlx.QueryResult(model.CartItem) {
+        pub fn listItems(self: *Self, tenant_id: i64, user_id: i64) !zmodu.data.sqlx.QueryResult(model.CartItem) {
             const cart = try self.getOrCreate(tenant_id, user_id);
             return try self.persistence.listItems(tenant_id, cart.id);
         }

@@ -5,8 +5,8 @@
 //! handlers.
 
 const std = @import("std");
-const zigmodu = @import("zigmodu");
-const http = zigmodu.http;
+const zmodu = @import("zmodu");
+const http = zmodu.http;
 const zent = @import("zent");
 
 /// Public-demo middleware: reads scope params from the query string and

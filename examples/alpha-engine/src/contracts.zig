@@ -10,8 +10,8 @@
 //! One type per hop, so each worker's input is a shape it can own outright:
 
 const std = @import("std");
-const runtime = @import("zigmodu").runtime;
-const ai = @import("zigmodu").ai;
+const runtime = @import("zmodu").runtime;
+const ai = @import("zmodu").ai;
 
 pub const Side = enum { buy, sell };
 

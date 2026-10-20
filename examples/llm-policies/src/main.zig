@@ -12,9 +12,9 @@
 //! Test: zig build test   (fake json_fn, no network)
 
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
-const ai = zigmodu.ai;
+const ai = zmodu.ai;
 
 // ── Fake model (no network): scripted JSON replies per policy ─────────────
 const FakeKind = enum { approve, escalate, diagnose, pass };
@@ -57,7 +57,7 @@ fn run(init: std.process.Init) !void {
     const api_key = init.environ_map.get("LLM_API_KEY") orelse "";
     const model = init.environ_map.get("LLM_MODEL") orelse "gpt-4o-mini";
 
-    var http = zigmodu.http.HttpClient.init(allocator, io, 4, 30000);
+    var http = zmodu.http.HttpClient.init(allocator, io, 4, 30000);
     defer http.deinit();
     var provider = ai.AiProvider.init(allocator, &http, endpoint, api_key, model);
     var policy_ctx = if (api_key.len == 0) blk: {

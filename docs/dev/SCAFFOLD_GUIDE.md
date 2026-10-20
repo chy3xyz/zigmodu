@@ -1,17 +1,17 @@
-# ZigModu AI Developer Guide
+# zmodu AI Developer Guide
 
-让 AI 更流畅、更方便地使用 ZigModu 框架开发。
+让 AI 更流畅、更方便地使用 zmodu 框架开发。
 
 ## 1. 项目配置文件
 
-在使用 ZigModu 的项目中，创建以下文件让 AI 自动识别：
+在使用 zmodu 的项目中，创建以下文件让 AI 自动识别：
 
-### `.sisyphus/skills/zigmodu.md` (技能)
+### `.sisyphus/skills/zmodu.md` (技能)
 
 ```markdown
-# ZigModu 开发技能
+# zmodu 开发技能
 
-使用 ZigModu 框架开发的最佳实践和模式。
+使用 zmodu 框架开发的最佳实践和模式。
 
 ## 必须遵循的约束
 
@@ -25,9 +25,9 @@
 ### 创建新模块
 
 ```zig
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
-pub const info = zigmodu.api.Module{
+pub const info = zmodu.api.Module{
     .name = "mymodule",
     .description = "我的模块",
     .dependencies = &.{"dependency1"},
@@ -46,30 +46,30 @@ pub fn deinit() void {
 
 ```zig
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 const mymodule = @import("mymodule.zig");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     
-    var modules = try zigmodu.scanModules(allocator, .{ mymodule });
+    var modules = try zmodu.scanModules(allocator, .{ mymodule });
     defer modules.deinit();
     
-    try zigmodu.validateModules(&modules);
-    try zigmodu.startAll(&modules);
-    defer zigmodu.stopAll(&modules);
+    try zmodu.validateModules(&modules);
+    try zmodu.startAll(&modules);
+    defer zmodu.stopAll(&modules);
 }
 ```
 ```
 
-### `.sisyphus/plans/zigmodu-development.md` (计划模板)
+### `.sisyphus/plans/zmodu-development.md` (计划模板)
 
 ```markdown
-# ZigModu 项目开发计划
+# zmodu 项目开发计划
 
 ## 概述
-使用 ZigModu 框架开发项目的标准流程。
+使用 zmodu 框架开发项目的标准流程。
 
 ## 阶段 1: 项目初始化
 - [ ] 使用 `zmodu new <项目名>` 创建项目
@@ -121,7 +121,7 @@ zmodu orm --sql schema.sql --out src/modules
 
 1. 在项目根目录创建 `.sisyphus/` 文件夹
 2. 将上述技能和计划模板放入相应子文件夹
-3. AI 会自动识别并遵循 ZigModu 的最佳实践
+3. AI 会自动识别并遵循 zmodu 的最佳实践
 4. 使用 `zmodu` 命令生成代码骨架，AI 填充业务逻辑
 
 ---
@@ -130,6 +130,6 @@ zmodu orm --sql schema.sql --out src/modules
 
 在向 AI 提问时，可以加上：
 
-> "使用 ZigModu 框架的最佳实践。参考 AGENTS.md 和 .sisyphus/skills/zigmodu.md。"
+> "使用 zmodu 框架的最佳实践。参考 AGENTS.md 和 .sisyphus/skills/zmodu.md。"
 
 这会让 AI 自动遵循框架约定。

@@ -1,5 +1,5 @@
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 const model = @import("model.zig");
 
 pub fn TenantPersistence(comptime Backend: type) type {
@@ -49,7 +49,7 @@ pub fn TenantPersistence(comptime Backend: type) type {
             return tenant;
         }
 
-        pub fn findAll(self: *Self) !zigmodu.data.sqlx.QueryResult(model.Tenant) {
+        pub fn findAll(self: *Self) !zmodu.data.sqlx.QueryResult(model.Tenant) {
             return try self.db.queryRowsPartial(
                 model.Tenant,
                 "SELECT id, name, domain, status, tier, created_at, updated_at FROM tenants WHERE status = 1 ORDER BY id",

@@ -11,13 +11,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Add zigmodu dependency
-    const zigmodu_dep = b.dependency("zigmodu", .{
+    // Add zmodu dependency
+    const zmodu_dep = b.dependency("zmodu", .{
         .target = target,
         .optimize = optimize,
         .db = "sqlite",
     });
-    exe_mod.addImport("zigmodu", zigmodu_dep.module("zigmodu"));
+    exe_mod.addImport("zmodu", zmodu_dep.module("zmodu"));
 
     const exe = b.addExecutable(.{
         .name = "basic-example",
@@ -39,7 +39,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    tests_mod.addImport("zigmodu", zigmodu_dep.module("zigmodu"));
+    tests_mod.addImport("zmodu", zmodu_dep.module("zmodu"));
 
     const test_step = b.step("test", "Run the example tests");
     const tests = b.addTest(.{ .root_module = tests_mod });

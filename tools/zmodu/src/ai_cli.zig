@@ -2,7 +2,7 @@
 //!
 //!   zmodu ai export-skills [--out skills.json]
 //!     Write the built-in framework AI skill catalog (same JSON shape as
-//!     zigmodu.ai.skill_export.toSkillsJson).
+//!     zmodu.ai.skill_export.toSkillsJson).
 //!
 //!   zmodu ai openapi --in skills.json [--out openapi.json]
 //!     Convert a skills catalog (built-in or app-exported) into an OpenAPI

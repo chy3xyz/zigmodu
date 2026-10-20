@@ -37,7 +37,7 @@ pub fn SubscriptionService(comptime Persistence: type) type {
         }
 
         /// 列出所有可用套餐（调用方 `defer result.deinit(allocator)`）
-        pub fn listPlans(self: *Self) !@import("zigmodu").data.sqlx.QueryResult(model.Plan) {
+        pub fn listPlans(self: *Self) !@import("zmodu").data.sqlx.QueryResult(model.Plan) {
             return try self.persistence.findAllPlans();
         }
     };

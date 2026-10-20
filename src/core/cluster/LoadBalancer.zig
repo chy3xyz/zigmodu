@@ -1,4 +1,4 @@
-//! Client-side load balancing for ZigModu distributed services.
+//! Client-side load balancing for zmodu distributed services.
 //!
 //! Supports:
 //! - Round-robin (atomic counter)

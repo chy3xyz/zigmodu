@@ -9,9 +9,9 @@
 //! Run with: `zig build test`
 
 const std = @import("std");
-const zigmodu = @import("zigmodu");
-const http = zigmodu.http;
-const security = zigmodu.security;
+const zmodu = @import("zmodu");
+const http = zmodu.http;
+const security = zmodu.security;
 
 const tenant_module = @import("modules/tenant/module.zig");
 const user_module = @import("modules/user/module.zig");
@@ -27,14 +27,14 @@ const schema = @import("db/schema.zig");
 test "module graph: three modules scan, validate and run their lifecycle" {
     const allocator = std.testing.allocator;
 
-    var modules = try zigmodu.scanModules(allocator, .{ tenant_module, user_module, subscription_module });
+    var modules = try zmodu.scanModules(allocator, .{ tenant_module, user_module, subscription_module });
     defer modules.deinit();
 
     try std.testing.expectEqual(@as(usize, 3), modules.modules.count());
-    try zigmodu.validateModules(&modules);
+    try zmodu.validateModules(&modules);
 
-    try zigmodu.startAll(&modules);
-    defer zigmodu.stopAll(&modules);
+    try zmodu.startAll(&modules);
+    defer zmodu.stopAll(&modules);
 }
 
 test "route catalog: /api/v1 resources map to their module and RBAC meta" {
@@ -111,7 +111,7 @@ const Stack = struct {
 
     allocator: std.mem.Allocator,
     io: std.Io,
-    db: zigmodu.data.Client,
+    db: zmodu.data.Client,
     sec: security.AppSecurity,
     slot: http.CatalogSlot,
     app_state: AppState,
@@ -441,6 +441,6 @@ test "trace id: the tenant handler's log scope carries the request's trace id" {
     // itself — `src/log/ModuleLogger.zig` pins "the suffix really lands in the
     // line", and the line itself is printed by the call above.
     const log = tenant_mod.api.tracedLog(&ctx);
-    var suffix_buf: [zigmodu.observability.LogScope.suffix_capacity]u8 = undefined;
+    var suffix_buf: [zmodu.observability.LogScope.suffix_capacity]u8 = undefined;
     try std.testing.expectEqualStrings(" trace_id=demo-trace-4bf92f35", log.fieldSuffix(&suffix_buf));
 }

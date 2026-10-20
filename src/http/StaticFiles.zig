@@ -3,7 +3,7 @@
 //! revalidation, and Range support (206/416) for video and resumable downloads.
 //!
 //! ```zig
-//! try zigmodu.http.staticFiles(io, &server, allocator, "/assets", "public", .{
+//! try zmodu.http.staticFiles(io, &server, allocator, "/assets", "public", .{
 //!     .cache_control = "public, max-age=3600",
 //! });
 //! // GET /assets/css/app.css → <cwd>/public/css/app.css
@@ -357,7 +357,7 @@ test "static files: serve, HEAD, 304, Range and traversal refusal" {
     const Testkit = @import("Testkit.zig");
     const io = std.testing.io;
 
-    const dir_name = "zigmodu_static_test";
+    const dir_name = "zmodu_static_test";
     std.Io.Dir.cwd().createDirPath(io, dir_name) catch {};
     defer std.Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     {
@@ -427,7 +427,7 @@ test "static files: bodies above chunk_bytes stream chunked over a real socket" 
     if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
     const io = std.testing.io;
 
-    const dir_name = "zigmodu_static_stream_test";
+    const dir_name = "zmodu_static_stream_test";
     std.Io.Dir.cwd().createDirPath(io, dir_name) catch {};
     defer std.Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 

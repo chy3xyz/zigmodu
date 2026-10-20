@@ -271,7 +271,7 @@ test "YamlParser basic key-value" {
     var parser = YamlParser.init(allocator);
 
     const yaml =
-        \\name: "zigmodu"
+        \\name: "zmodu"
         \\version: "0.2.0"
         \\port: 8080
     ;
@@ -279,7 +279,7 @@ test "YamlParser basic key-value" {
     var map = try parser.parse(yaml);
     defer parser.deinitMap(&map);
 
-    try std.testing.expectEqualStrings("zigmodu", map.get("name").?);
+    try std.testing.expectEqualStrings("zmodu", map.get("name").?);
     try std.testing.expectEqualStrings("0.2.0", map.get("version").?);
     try std.testing.expectEqualStrings("8080", map.get("port").?);
 }
@@ -327,7 +327,7 @@ test "TomlParser basic key-value" {
     var parser = TomlParser.init(allocator);
 
     const toml =
-        \\name = "zigmodu"
+        \\name = "zmodu"
         \\version = "0.2.0"
         \\port = 8080
     ;
@@ -335,7 +335,7 @@ test "TomlParser basic key-value" {
     var map = try parser.parse(toml);
     defer parser.deinitMap(&map);
 
-    try std.testing.expectEqualStrings("zigmodu", map.get("name").?);
+    try std.testing.expectEqualStrings("zmodu", map.get("name").?);
     try std.testing.expectEqualStrings("0.2.0", map.get("version").?);
     try std.testing.expectEqualStrings("8080", map.get("port").?);
 }
@@ -363,7 +363,7 @@ test "TomlParser sections and arrays" {
 test "YamlParser.parseFile reads a YAML file end to end" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const path = "zigmodu_yaml_parsefile_test.yaml";
+    const path = "zmodu_yaml_parsefile_test.yaml";
 
     {
         const file = try std.Io.Dir.cwd().createFile(io, path, .{});

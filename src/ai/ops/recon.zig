@@ -2,7 +2,7 @@
 //! both return `key, value...` columns, then compare the two snapshots.
 //! Differences are reported as missing-in-target, extra-in-source and value
 //! mismatches — via callback, a transactional-outbox writeback, or a Markdown
-//! report. Pair with `zigmodu.ai.trigger` for scheduled reconciliation.
+//! report. Pair with `zmodu.ai.trigger` for scheduled reconciliation.
 
 const std = @import("std");
 const SqlxBackend = @import("../../data.zig").SqlxBackend;

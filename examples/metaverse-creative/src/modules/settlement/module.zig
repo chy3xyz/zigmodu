@@ -1,6 +1,6 @@
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
-pub const info = zigmodu.api.Module{
+pub const info = zmodu.api.Module{
     .name = "settlement",
     .description = "P0 payment intent + ledger + ownership + outbox",
     .dependencies = &.{ "identity", "creative" },

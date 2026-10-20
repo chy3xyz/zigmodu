@@ -1,6 +1,6 @@
 const std = @import("std");
-const zigmodu = @import("zigmodu");
-const http = zigmodu.http;
+const zmodu = @import("zmodu");
+const http = zmodu.http;
 
 /// Extract X-Tenant-ID (lowercase header key) into request attributes.
 pub fn tenantMiddleware() http.Middleware {
@@ -16,9 +16,9 @@ pub fn tenantMiddleware() http.Middleware {
 
 /// Optional JWT: skip when Authorization absent (smoke / local).
 /// When present, verify via catalog-safe path (attrs only; no `user_data` overwrite).
-pub fn jwtAuthMiddleware(sec: *zigmodu.security.SecurityModule, _: *http.CatalogSlot) http.Middleware {
+pub fn jwtAuthMiddleware(sec: *zmodu.security.SecurityModule, _: *http.CatalogSlot) http.Middleware {
     const Store = struct {
-        var stored: *zigmodu.security.SecurityModule = undefined;
+        var stored: *zmodu.security.SecurityModule = undefined;
     };
     Store.stored = sec;
     return .{

@@ -1,4 +1,4 @@
-# ZigModu 使用中发现的问题（v0.14.17 / Zig 0.17.0-dev.1422）
+# zmodu 使用中发现的问题（v0.14.17 / Zig 0.17.0-dev.1422）
 
 > 来源：真实项目（devs_monitor）接入时发现并记录；前两条已在框架侧修复，第三条为已知约束。
 
@@ -30,7 +30,7 @@ SELECT ... FROM users WHERE username = ?1 LIMIT 1
 
 ## 3. HttpClient 纯 HTTP 路径在普通 main 里永久挂起 —— 已修复
 
-**原现象**：`zigmodu.http.HttpClient` 的 HTTP（非 TLS）路径在无 server 事件循环的普通 `main` 里调用会**永久挂起**（不报错、不超时）。
+**原现象**：`zmodu.http.HttpClient` 的 HTTP（非 TLS）路径在无 server 事件循环的普通 `main` 里调用会**永久挂起**（不报错、不超时）。
 
 **原根因（2026-07-31 复现确认）**：并非事件循环依赖，而是 `executeRequest` 用缓冲 Writer 写完请求头后**从未 flush**——请求字节一直憋在用户态缓冲区，服务端永远收不到请求，双方死锁。byte 级复现：带 flush 的同一段代码立刻返回 200，不带则永久卡在首次 read。
 
@@ -45,6 +45,6 @@ SELECT ... FROM users WHERE username = ?1 LIMIT 1
 - **fiber 模式 WebSocket 读**：`connFiber` 运行在 io worker 线程，`WsFramer.readFrame` 走 `io.operate(net_read)` → 读挂起 → `on_message` / ping/close 无响应、`on_close` 不触发；写路径（握手/welcome）正常。**已修复**：WS 两处读循环改为 `posix.poll + posix.read`（`http/WsFramer.zig`、`extensions/WebSocket.zig`），并新增端到端回归测试。
 - **全量审计（2026-08-01）**：同一风险（「写请求 → 阻塞等响应」的 io 读，多线程共享 io 下可能挂死）已统一收敛到新工具 `core/sockread.zig`（`readSome`/`readFull` = `posix.poll + posix.read`），覆盖：Redis 响应（16 处）、NATS（4 处）、Kafka `readExact`、`DistributedEventBus` 连接循环、`ClusterConnection.recv`（顺带修复 4 字节头可能半包的问题）、HttpClient `readResponse`/流式 body。**仍走 io 读但实测正常**（数据在 accept 时已就绪、非长阻塞）：HTTP 请求行读取（`Server.zig` `StreamReader`）、WebMonitor/WebSocket 升级请求读取、Http2Server 帧读取（复杂缓冲，留待验证）。
 - 同一线程内独占使用 io 时读写均正常（HttpClient 主线程对 python 服务 OK）；跨线程用裸 `posix.read` 也正常。
-- 结论：这是 zigmodu 0.14.17 所用 `std.Io`（Threaded）在多线程共享下的环境/实现限制，非迁移引入；**socket 读建议绕开 io、用裸 posix poll+read**（服务端 WS、HttpClient 超时均已采用该模式）。
+- 结论：这是 zmodu 0.14.17 所用 `std.Io`（Threaded）在多线程共享下的环境/实现限制，非迁移引入；**socket 读建议绕开 io、用裸 posix poll+read**（服务端 WS、HttpClient 超时均已采用该模式）。
 
-**规避（devs_monitor agent 已采用）**：独立客户端用 `std.http.Client.fetch(...)`（zigmodu HTTPS 路径同款 API，阻塞式可用）——修复后 `zigmodu.http.HttpClient` 的纯 HTTP 路径也可在普通 main 中直接使用。
+**规避（devs_monitor agent 已采用）**：独立客户端用 `std.http.Client.fetch(...)`（zmodu HTTPS 路径同款 API，阻塞式可用）——修复后 `zmodu.http.HttpClient` 的纯 HTTP 路径也可在普通 main 中直接使用。

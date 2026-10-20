@@ -1,6 +1,6 @@
 const std = @import("std");
-const zigmodu = @import("zigmodu");
-const http = zigmodu.http;
+const zmodu = @import("zmodu");
+const http = zmodu.http;
 const middleware = @import("../../middleware/root.zig");
 
 /// User HTTP API — ComptimeRouter (`docs/ROUTE_TABLE.md`).
@@ -100,7 +100,7 @@ pub fn UserApi(comptime Service: type) type {
             // `queryRowPartial` scans from the **client** allocator, so the row
             // must be freed with that one — `ctx.allocator` is the per-request
             // arena, where `free` is a no-op and the row would leak for good.
-            defer zigmodu.data.sqlx.freeScanned(self.service.persistence.db.allocator, @TypeOf(user), user);
+            defer zmodu.data.sqlx.freeScanned(self.service.persistence.db.allocator, @TypeOf(user), user);
             const resp = try ctx.allocator.print(
                 \\{{"id":{d},"tenant_id":{d},"username":"{s}","email":"{s}","role":"{s}","status":{d}}}
             , .{ user.id, user.tenant_id, user.username, user.email, user.role, user.status });

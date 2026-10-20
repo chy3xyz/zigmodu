@@ -1,6 +1,6 @@
 const std = @import("std");
-const zigmodu = @import("zigmodu");
-const http = zigmodu.http;
+const zmodu = @import("zmodu");
+const http = zmodu.http;
 const middleware = @import("../../middleware/root.zig");
 
 /// Subscription + plans HTTP API — ComptimeRouter (`docs/ROUTE_TABLE.md`).

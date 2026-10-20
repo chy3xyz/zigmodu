@@ -1,4 +1,4 @@
-//! zent Schema-as-code — domain model for the ZigModu + zent demo.
+//! zent Schema-as-code — domain model for the zmodu + zent demo.
 const zent = @import("zent");
 const field = zent.core.field;
 const edge = zent.core.edge;

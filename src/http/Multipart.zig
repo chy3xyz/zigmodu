@@ -24,8 +24,8 @@
 //! pair from one number, and see `BEST_PRACTICES.md`「上传与 multipart」.
 //!
 //! ```zig
-//! var server = zigmodu.http.Server.initWithConfig(io, alloc, .{ .max_body_size = 64 << 20 });
-//! const cfg = zigmodu.http.Multipart.Config.forBodyLimit(64 << 20);
+//! var server = zmodu.http.Server.initWithConfig(io, alloc, .{ .max_body_size = 64 << 20 });
+//! const cfg = zmodu.http.Multipart.Config.forBodyLimit(64 << 20);
 //! ```
 //!
 //! Streaming large uploads straight to disk is deliberately out of scope: the

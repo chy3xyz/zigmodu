@@ -1,5 +1,5 @@
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 const db_mod = @import("db.zig");
 const cli = @import("cli.zig");
@@ -14,7 +14,7 @@ const creative = @import("modules/creative/root.zig");
 const world = @import("modules/world/root.zig");
 const settlement = @import("modules/settlement/root.zig");
 
-/// Metaverse Creative — ZigModu + zent best-practice demo (P0 settlement).
+/// Metaverse Creative — zmodu + zent best-practice demo (P0 settlement).
 ///
 ///   ZENT_DRIVER=sqlite zig build run -- cli demo
 ///   ZENT_DRIVER=postgres zig build run -- cli demo
@@ -40,11 +40,11 @@ pub fn main(init: std.process.Init) !void {
     wo_svc.withIdentity(&id_svc);
     var st_svc = settlement.service.SettlementService.init(&st_store, &cr_store);
 
-    var modules = try zigmodu.scanModules(allocator, .{ identity_mod, creative_mod, world_mod, settlement_mod });
+    var modules = try zmodu.scanModules(allocator, .{ identity_mod, creative_mod, world_mod, settlement_mod });
     defer modules.deinit();
-    try zigmodu.validateModules(&modules);
-    try zigmodu.startAll(&modules);
-    defer zigmodu.stopAll(&modules);
+    try zmodu.validateModules(&modules);
+    try zmodu.startAll(&modules);
+    defer zmodu.stopAll(&modules);
 
     const app = cli.App{
         .identity = &id_svc,
@@ -97,7 +97,7 @@ fn serveHttp(
         break :blk 18200;
     };
 
-    var server = zigmodu.http.Server.init(io, allocator, port);
+    var server = zmodu.http.Server.init(io, allocator, port);
     defer server.deinit();
 
     var id_api = identity.api.IdentityApi(@TypeOf(id_svc.*)).init(id_svc);
@@ -108,7 +108,7 @@ fn serveHttp(
     // Runtime scope (see docs/reference/ROUTE_TABLE.md): trie + scope middleware,
     // outside the comptime catalog like every runtime route.
     var app_state: void = {};
-    var router = zigmodu.http.Router(void).init(io, allocator, &server, &app_state);
+    var router = zmodu.http.Router(void).init(io, allocator, &server, &app_state);
     defer router.deinit();
     var v1 = router.scope("/api/v1");
     try id_api.registerRoutes(&v1);
@@ -120,7 +120,7 @@ fn serveHttp(
         .method = .GET,
         .path = "health/live",
         .handler = struct {
-            fn handle(ctx: *zigmodu.http.Context) !void {
+            fn handle(ctx: *zmodu.http.Context) !void {
                 try ctx.json(200, "{\"status\":\"UP\",\"app\":\"metaverse-creative\"}");
             }
         }.handle,

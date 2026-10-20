@@ -1,12 +1,12 @@
 # production-deploy — TLS 终结、边车与进程守护参考
 
-这不是一个可运行的 Zig 应用，而是一份**部署拓扑参考**：ZigModu 的 stdlib 没有
+这不是一个可运行的 Zig 应用，而是一份**部署拓扑参考**：zmodu 的 stdlib 没有
 TLS server（`docs/PRODUCTION_ROADMAP.md`、`Server.tls_front` 注释），生产 TLS
 一律在**边车 / 网关**终结，后端说 h2c 或明文 HTTP。
 
 ```
         ┌────────────┐   TLS (443)   ┌──────────────────────┐  h2c/HTTP  ┌──────────────┐
-client ─┤  网关/边车  ├──────────────►│  zigmodu 服务实例 N  │◄───────────┤  supervisor  │
+client ─┤  网关/边车  ├──────────────►│  zmodu 服务实例 N  │◄───────────┤  supervisor  │
         │ nginx/envoy│               │  单进程 · 无状态      │  Restart   │ systemd / k8s│
         └────────────┘               └──────────────────────┘            └──────────────┘
 ```
@@ -22,7 +22,7 @@ client ─┤  网关/边车  ├──────────────►�
 | 后端设 `max_connections` + `header_timeout_ms` | 边车只是转发；连接洪泛/slowloris 会穿透到后端 |
 | 健康检查用 `/health/live`（liveness）+ `/health/ready`（readiness） | 存活与就绪语义不同：依赖挂了应摘流量而不是重启 |
 | 每实例 `max_connections ≈ 预期并发 × 2` | 超过后直接拒连（或 503），比 OOM 优雅 |
-| 启动跑 `zigmodu.Preflight`（env / JWT secret / DB / 迁移 / 时钟） | 带病运行的进程比拒绝启动的进程贵得多 |
+| 启动跑 `zmodu.Preflight`（env / JWT secret / DB / 迁移 / 时钟） | 带病运行的进程比拒绝启动的进程贵得多 |
 | JWT secret 用 `JwksKeyRing` 承载，轮换只切主密钥 | 直接改 secret 重启 = 全员强制重登 |
 | 多副本的 cron / 迁移配 `DistributedLock` | 每副本各跑一遍 = 重复副作用与并发 DDL |
 
@@ -36,7 +36,7 @@ client ─┤  网关/边车  ├──────────────►�
 | `envoy.yaml` | Envoy 版本（ALPN h2、`/health` 探针、上游健康检查） |
 | `docker-compose.yml` | 本地跑通「nginx + 两个后端副本」的最小拓扑 |
 | `k8s.yaml` | Deployment/Service/探针/Prometheus 注解 + HPA 片段 |
-| `zigmodu.service` | systemd 单元（`Restart=always`、`LimitNOFILE`、环境变量） |
+| `zmodu.service` | systemd 单元（`Restart=always`、`LimitNOFILE`、环境变量） |
 
 ## 后端启动参数（对应各文件）
 

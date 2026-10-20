@@ -1,5 +1,5 @@
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 const zent = @import("zent");
 const zent_helpers = @import("zent_helpers");
 const zent_crud = @import("zent_crud.zig");
@@ -41,7 +41,7 @@ fn wakeBlockedAccept(port: u16) void {
 }
 
 // ═══════════════════════════════════════════════════
-// ZigModu Application + zent (ent-style) data layer
+// zmodu Application + zent (ent-style) data layer
 // See docs/ZENT.md · ComptimeRouter: docs/ROUTE_TABLE.md
 //
 // Run (requires sibling checkout of chy3xyz/zent):
@@ -52,7 +52,7 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
 
-    std.log.info("zent-modulith: ZigModu + zent demo starting (ComptimeRouter)", .{});
+    std.log.info("zent-modulith: zmodu + zent demo starting (ComptimeRouter)", .{});
 
     // --- zent: open SQLite + migrate schema-as-code ---
     const sqlite_path = init.environ_map.get("ZENT_SQLITE") orelse ":memory:";
@@ -257,9 +257,9 @@ pub fn main(init: std.process.Init) !void {
         .io = io,
         .client = if (cron_client) |*c| c else null,
     };
-    var cron = zigmodu.cron.Scheduler.init(allocator, io);
+    var cron = zmodu.cron.Scheduler.init(allocator, io);
     defer cron.deinit();
-    try cron.addJob("outbox-dispatch", try zigmodu.cron.Expression.parse("* * * * *"), struct {
+    try cron.addJob("outbox-dispatch", try zmodu.cron.Expression.parse("* * * * *"), struct {
         fn run(ctx: ?*anyopaque) void {
             const c: *CronCtx = @ptrCast(@alignCast(ctx.?));
             if (c.client) |cl| {
@@ -270,12 +270,12 @@ pub fn main(init: std.process.Init) !void {
     }.run, &cron_ctx);
     try cron.start();
 
-    // --- ZigModu modules ---
-    var modules = try zigmodu.scanModules(allocator, .{catalog_module});
+    // --- zmodu modules ---
+    var modules = try zmodu.scanModules(allocator, .{catalog_module});
     defer modules.deinit();
-    try zigmodu.validateModules(&modules);
-    try zigmodu.startAll(&modules);
-    defer zigmodu.stopAll(&modules);
+    try zmodu.validateModules(&modules);
+    try zmodu.startAll(&modules);
+    defer zmodu.stopAll(&modules);
 
     const port: u16 = blk: {
         if (init.environ_map.get("HTTP_PORT")) |p| {
@@ -284,28 +284,28 @@ pub fn main(init: std.process.Init) !void {
         break :blk 18100;
     };
 
-    var server = zigmodu.http.Server.init(io, allocator, port);
+    var server = zmodu.http.Server.init(io, allocator, port);
     defer server.deinit();
 
-    var profile_state = zigmodu.http.HttpProfileState.init(allocator);
+    var profile_state = zmodu.http.HttpProfileState.init(allocator);
     defer profile_state.deinit(allocator);
-    try zigmodu.http.applyHttpDefaults(&server, .{
+    try zmodu.http.applyHttpDefaults(&server, .{
         .security_basics = true,
         .access_log = false, // quieter for local demo
         .metrics = false,
     }, &profile_state);
 
-    var catalog_slot: zigmodu.http.CatalogSlot = .{};
+    var catalog_slot: zmodu.http.CatalogSlot = .{};
     defer catalog_slot.deinit();
 
     // JWT stack: verifies Bearer tokens on non-public routes and writes the
     // `tenant_id` attr from the token `aud` claim — the only tenant source the
     // products CRUD trusts.
     const jwt_secret = init.environ_map.get("JWT_SECRET") orelse "dev-secret-change-me";
-    var app_sec = zigmodu.security.AppSecurity.init(allocator, io, .{ .jwt_secret = jwt_secret });
-    try server.addMiddleware(try zigmodu.http.jwtAuthFromCatalog(&app_sec.module, &catalog_slot, .{}));
+    var app_sec = zmodu.security.AppSecurity.init(allocator, io, .{ .jwt_secret = jwt_secret });
+    try server.addMiddleware(try zmodu.http.jwtAuthFromCatalog(&app_sec.module, &catalog_slot, .{}));
 
-    try server.addMiddleware(try zigmodu.http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
+    try server.addMiddleware(try zmodu.http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
 
     // Dev token mint — a backdoor by construction, so it only exists when
     // ZENT_DEV_TOKEN=1. See dev_auth.zig.
@@ -313,11 +313,11 @@ pub fn main(init: std.process.Init) !void {
     const DevAuthApiT = dev_auth.DevAuthApi(@TypeOf(app_sec.module));
     var dev_auth_api = DevAuthApiT.init(&app_sec.module);
 
-    comptime zigmodu.http.assertNoDupes(.{ CatalogApiT, ProductApiT, OutboxApiT, DocApiT, InventoryApiT, FeedApiT, SummaryApiT, BatchApiT, UpsertApiT, FeedModernApiT, FeedJoinApiT, OrderApiT, AccountApiT, DevAuthApiT });
+    comptime zmodu.http.assertNoDupes(.{ CatalogApiT, ProductApiT, OutboxApiT, DocApiT, InventoryApiT, FeedApiT, SummaryApiT, BatchApiT, UpsertApiT, FeedModernApiT, FeedJoinApiT, OrderApiT, AccountApiT, DevAuthApiT });
 
     const AppState = struct {};
     var app_state: AppState = .{};
-    var router = zigmodu.http.Router(AppState).init(io, allocator, &server, &app_state);
+    var router = zmodu.http.Router(AppState).init(io, allocator, &server, &app_state);
     defer router.deinit();
     router.default_auth = .public;
 
@@ -345,7 +345,7 @@ pub fn main(init: std.process.Init) !void {
     try server.addRoute(.{
         .method = .GET,
         .path = "openapi.json",
-        .handler = try zigmodu.http.openApiFromCatalog(&catalog_slot, .{
+        .handler = try zmodu.http.openApiFromCatalog(&catalog_slot, .{
             .title = "zent-modulith",
             .version = "0.1.0",
             .description = "ComptimeRouter + zent catalog",
@@ -356,7 +356,7 @@ pub fn main(init: std.process.Init) !void {
         .method = .GET,
         .path = "health/live",
         .handler = struct {
-            fn handle(ctx: *zigmodu.http.Context) !void {
+            fn handle(ctx: *zmodu.http.Context) !void {
                 try ctx.json(200, "{\"status\":\"UP\",\"data\":\"zent\"}");
             }
         }.handle,

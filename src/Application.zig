@@ -42,7 +42,7 @@ pub fn getInFlightCounter() *std.atomic.Value(u64) {
 ///
 /// Preferred — build through the builder (bind it first: a temporary is `*const`):
 /// ```zig
-/// var b = zigmodu.builder(allocator, io);
+/// var b = zmodu.builder(allocator, io);
 /// defer b.deinit();
 /// var app = try b.withName("shop").build(.{ order_module, payment_module });
 /// defer app.deinit();
@@ -53,7 +53,7 @@ pub fn getInFlightCounter() *std.atomic.Value(u64) {
 ///
 /// Or construct directly — the argument order is `(io, allocator, name, modules, Config)`:
 /// ```zig
-/// var app = try zigmodu.Application.init(io, allocator, "shop", .{ order_module, payment_module }, .{});
+/// var app = try zmodu.Application.init(io, allocator, "shop", .{ order_module, payment_module }, .{});
 /// defer app.deinit();
 ///
 /// try app.start();
@@ -408,7 +408,7 @@ pub const Application = struct {
 ///
 /// Example:
 /// ```zig
-/// var builder = zigmodu.ApplicationBuilder.init(allocator, io);
+/// var builder = zmodu.ApplicationBuilder.init(allocator, io);
 /// defer builder.deinit();
 ///
 /// var app = try builder

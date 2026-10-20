@@ -8,17 +8,17 @@
 //! template (tenant + permissions).
 
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
-const ai = zigmodu.ai;
+const ai = zmodu.ai;
 
 pub fn main(init: std.process.Init) !void {
-    var client = zigmodu.data.sqlx.Client.init(init.gpa, init.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = zmodu.data.sqlx.Client.init(init.gpa, init.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
     _ = try client.exec("CREATE TABLE orders (id INTEGER PRIMARY KEY, tenant_id INTEGER, amount INTEGER, status TEXT)", &.{});
     _ = try client.exec("INSERT INTO orders (tenant_id, amount, status) VALUES (1, 100, 'paid'), (1, 5000, 'paid'), (2, 9000, 'paid')", &.{});
-    var backend = zigmodu.data.SqlxBackend{ .allocator = init.gpa, .client = &client };
+    var backend = zmodu.data.SqlxBackend{ .allocator = init.gpa, .client = &client };
 
     const metrics = [_]ai.kpi.KpiMetric{
         .{ .name = "paid_revenue", .description = "paid revenue", .sql = "SELECT SUM(amount) AS value FROM orders WHERE tenant_id = 1 AND status = 'paid'" },

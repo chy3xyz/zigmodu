@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# zmsaas dual-process dev: zigmodu backend + SolidStart frontend.
+# zmsaas dual-process dev: zmodu backend + SolidStart frontend.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

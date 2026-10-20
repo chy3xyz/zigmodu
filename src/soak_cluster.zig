@@ -147,20 +147,20 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 const build_options = @import("build_options");
 const history = @import("test/run_history.zig");
 
 const io = std.testing.io;
-const Time = zigmodu.time;
-const RaftWire = zigmodu.RaftTransport;
-const DistributedEventBus = zigmodu.DistributedEventBus;
-const ClusterBootstrap = zigmodu.ClusterBootstrap;
-// Through the zigmodu module, not a path import: a path import would compile
-// netdial.zig into this module while the zigmodu module already owns it
-// ("file exists in modules 'root' and 'zigmodu'"). Same discipline as the
+const Time = zmodu.time;
+const RaftWire = zmodu.RaftTransport;
+const DistributedEventBus = zmodu.DistributedEventBus;
+const ClusterBootstrap = zmodu.ClusterBootstrap;
+// Through the zmodu module, not a path import: a path import would compile
+// netdial.zig into this module while the zmodu module already owns it
+// ("file exists in modules 'root' and 'zmodu'"). Same discipline as the
 // RaftElection note below — one instance, reached through the public surface.
-const netdial = zigmodu.netdial;
+const netdial = zmodu.netdial;
 
 // ── sizing (build options) ──────────────────────────────────────────────────
 
@@ -250,7 +250,7 @@ const bus_keys = [node_count][32]u8{
 //
 // A relative `@import` of RaftElection.zig would compile a *second* instance
 // of the file inside this module, and the vtable's function-pointer types —
-// which come from the instance inside the `zigmodu` module — would not match.
+// which come from the instance inside the `zmodu` module — would not match.
 // The public wire codecs are exported from that same instance, so the payload
 // types are extracted from their signatures instead of being named directly.
 
@@ -555,7 +555,7 @@ fn SoakTransport(comptime slot: usize) type {
         /// The interface `RaftElection` stores a pointer to. Valid for the
         /// lifetime of the instance (file-scope storage — the harness never
         /// restarts a node).
-        fn transport(self: *Self) zigmodu.RaftElection.ElectionTransport {
+        fn transport(self: *Self) zmodu.RaftElection.ElectionTransport {
             return @ptrCast(&self.vtable);
         }
 
@@ -952,7 +952,7 @@ fn subscriberFor(comptime i: usize) *const fn (DistributedEventBus.NetworkEvent)
 
 const Fixture = struct {
     cluster: *ClusterBootstrap,
-    raft: *zigmodu.RaftElection,
+    raft: *zmodu.RaftElection,
     bus: *DistributedEventBus,
     driver: std.Thread = undefined,
 };
@@ -1507,7 +1507,7 @@ test "soak: 3-node cluster — raft + event bus, leader/fd/RSS invariants" {
     // for the measurements. Safer in every way this test cares about, and it
     // stops the harness from measuring std's debug-info arena instead of itself.
     const allocator = soakAllocator();
-    if (!zigmodu.NetworkProbe.available()) return error.SkipZigTest;
+    if (!zmodu.NetworkProbe.available()) return error.SkipZigTest;
     const started_ns = std.Io.Timestamp.now(io, .awake).nanoseconds;
 
     initThresholds();

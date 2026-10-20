@@ -3,7 +3,7 @@
 ## Quick Start
 
 ```zig
-const log = @import("zigmodu").observability.StructuredLogger;
+const log = @import("zmodu").observability.StructuredLogger;
 
 var logger = try log.init(allocator, .{
     .level = .info,
@@ -32,7 +32,7 @@ var logger = try StructuredLogger.init(allocator, .{
     .level = .info,
     .format = .json,
     .output = .file,
-    .file_path = "/var/log/zigmodu/app.log",
+    .file_path = "/var/log/zmodu/app.log",
     .rotation = .{
         .max_size_mb = 100,
         .max_files = 5,

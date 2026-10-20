@@ -5,13 +5,13 @@
 #   curl -sk  https://localhost:8443/metrics | head
 #
 # The backends run examples/basic via ../../Dockerfile (context = repo root,
-# because the example depends on zigmodu through a relative path). Point
+# because the example depends on zmodu through a relative path). Point
 # APP at another example or your own project as needed.
 
 services:
   app1:
     build:
-      # Context must be the repo root: the example apps depend on zigmodu via
+      # Context must be the repo root: the example apps depend on zmodu via
       # `.path = "../.."`.
       context: ../..
       dockerfile: examples/production-deploy/Dockerfile
@@ -64,7 +64,7 @@ services:
     ports:
       - "8443:443"
     volumes:
-      - ./nginx.conf:/etc/nginx/conf.d/zigmodu.conf:ro
+      - ./nginx.conf:/etc/nginx/conf.d/zmodu.conf:ro
       - ./certs:/etc/nginx/certs:ro
     restart: always
 

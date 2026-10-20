@@ -1,5 +1,5 @@
 //! zent-backed generic CRUD API - the schema-as-code counterpart of
-//! `zigmodu.http.CrudApi` (sqlx). One declaration generates the standard
+//! `zmodu.http.CrudApi` (sqlx). One declaration generates the standard
 //! five ComptimeRouter routes (list / create / get / update / delete) over a
 //! `zent.crud.CrudService`, with tenant scoping and PageParams clamping.
 //!
@@ -20,8 +20,8 @@
 //! CRUD surface.
 
 const std = @import("std");
-const zigmodu = @import("zigmodu");
-const http = zigmodu.http;
+const zmodu = @import("zmodu");
+const http = zmodu.http;
 const zent = @import("zent");
 
 pub const TenantSource = enum {

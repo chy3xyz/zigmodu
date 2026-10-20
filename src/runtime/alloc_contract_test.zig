@@ -13,7 +13,7 @@
 
 const std = @import("std");
 
-/// The runtime namespace as a user sees it (`zigmodu.runtime`), so the primitives
+/// The runtime namespace as a user sees it (`zmodu.runtime`), so the primitives
 /// measured here are reached the same way an application reaches them.
 const rt = @import("../runtime.zig");
 

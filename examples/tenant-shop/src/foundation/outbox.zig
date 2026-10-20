@@ -5,8 +5,8 @@
 //! Does not reuse framework `event_outbox` schema.
 
 const std = @import("std");
-const zigmodu = @import("zigmodu");
-const data = zigmodu.data;
+const zmodu = @import("zmodu");
+const data = zmodu.data;
 const mq = @import("mq.zig");
 
 pub const Row = struct {
@@ -72,7 +72,7 @@ pub const Poller = struct {
     /// Drain up to `batch_size` pending rows.
     pub fn pollOnce(self: *Self) !PollResult {
         var result: PollResult = .{};
-        const now: i64 = @intCast(zigmodu.time.monotonicNowSeconds());
+        const now: i64 = @intCast(zmodu.time.monotonicNowSeconds());
 
         const sql = try self.allocator.print(
             \\SELECT id, tenant_id, topic, payload, status, retry_count, max_retries, last_error, created_at, updated_at
@@ -161,7 +161,7 @@ pub const Poller = struct {
 
     /// Move DLQ row back to pending with retry_count reset.
     pub fn requeue(self: *Self, id: i64) !bool {
-        const now: i64 = @intCast(zigmodu.time.monotonicNowSeconds());
+        const now: i64 = @intCast(zmodu.time.monotonicNowSeconds());
         const res = try self.db.exec(
             "UPDATE outbox SET status = 'pending', retry_count = 0, last_error = NULL, updated_at = ? WHERE id = ? AND status = 'dlq'",
             &.{ .{ .int = now }, .{ .int = id } },

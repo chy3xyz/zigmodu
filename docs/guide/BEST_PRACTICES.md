@@ -1,6 +1,6 @@
-# ZigModu 最佳实践指南 (Best Practices Guide)
+# zmodu 最佳实践指南 (Best Practices Guide)
 
-> **两条平面**：ZigModu 是"**编译期模块化应用框架 + worker 导向执行运行时**"。本文按这两条平面组织 ——
+> **两条平面**：zmodu 是"**编译期模块化应用框架 + worker 导向执行运行时**"。本文按这两条平面组织 ——
 > **应用平面**（模块 / DI / HTTP / 数据 / 事件 / 安全 / 运维，默认就在用）与**执行平面**
 > （worker / mailbox / 调度 / 定时器 / 监督 / 回放，`app.runtime()` opt-in）。
 > 执行平面的**规格**在 [RUNTIME.md](../reference/RUNTIME.md)；**该不该用、怎么用、哪里会踩**在本文
@@ -9,11 +9,11 @@
 > **Modulith 从第一天怎么写高并发应用**：见专文 [MODULITH.md](./MODULITH.md)（边界、fiber、池化、规模阶梯、反模式）。
 > 
 > **model / persistence / service / Tx 分层**：见专文 [MODULE_LAYERS.md](./MODULE_LAYERS.md)（参考实现 `examples/tenant-shop`）。  
-> **ZigModu × zent（schema / Client / privacy / 模块级选型）**：见专文 [ZENT.md](../reference/ZENT.md)（参考实现 `examples/zent-modulith`）。  
+> **zmodu × zent（schema / Client / privacy / 模块级选型）**：见专文 [ZENT.md](../reference/ZENT.md)（参考实现 `examples/zent-modulith`）。  
 > **SQLx 选择性驱动链接（`-Ddb=` / `.db=`）**：见专文 [SQLX_DRIVERS.md](./SQLX_DRIVERS.md)。  
 > **HTTP 路由 + catalog JWT / RBAC**：见专文 [ROUTE_TABLE.md](../reference/ROUTE_TABLE.md) §7；可执行清单见下文「JWT / 多端身份」。  
 > **AI / Agent 写代码**：先读仓库根目录 [AGENTS.md](../../AGENTS.md)（文档地图 + DO/DON'T）；方法论见 [AI_METHODOLOGY.md](../dev/AI_METHODOLOGY.md)。  
-> **代码片段基线**：**ZigModu v0.35.0 · Zig 0.17.0**（CI 钉 `0.17.0` **正式版**，见 `.github/workflows/ci.yml` 的 `ZIG_VERSION`）。跨版本升级看 [UPGRADING.md](../reference/UPGRADING.md)；"哪些是证明过的、哪些不是"看 [v1.0 差距评估](../dev/v1.0-readiness-v0.35.md)。  
+> **代码片段基线**：**zmodu v0.35.0 · Zig 0.17.0**（CI 钉 `0.17.0` **正式版**，见 `.github/workflows/ci.yml` 的 `ZIG_VERSION`）。跨版本升级看 [UPGRADING.md](../reference/UPGRADING.md)；"哪些是证明过的、哪些不是"看 [v1.0 差距评估](../dev/v1.0-readiness-v0.35.md)。  
 > **片段口径**：本文的代码围栏分两类 —— **可照抄的完整示例**，和**示意用的片段/伪码**（含 `...`、`// ...`、
 > 或引用了上下文里没给的标识符）。伪码**不保证可直接编译**，只表达结构与契约；可编译的完整示例看
 > `examples/**`。逐段标注见各围栏前的说明。
@@ -62,7 +62,7 @@
 
 ## 🚀 渐进式架构演进路线图
 
-ZigModu 核心设计理念：**从单体部署到分布式集群，随着用户规模增长平滑演进**。
+zmodu 核心设计理念：**从单体部署到分布式集群，随着用户规模增长平滑演进**。
 
 ### 📐 两条轴，先认清自己在哪条上
 
@@ -114,7 +114,7 @@ ZigModu 核心设计理念：**从单体部署到分布式集群，随着用户�
 ┌─────────────────────────────────┐
 │         单机部署                 │
 │  ┌─────────────────────────┐    │
-│  │   ZigModu Application   │    │
+│  │   zmodu Application   │    │
 │  │  ┌─────┐ ┌─────┐ ┌────┐ │    │
 │  │  │User │ │Order│ │Pay │ │    │
 │  │  └─────┘ └─────┘ └────┘ │    │
@@ -144,7 +144,7 @@ Week 4: 上线准备
 **推荐配置**：
 ```zig
 // 单机最小配置
-var app = try zigmodu.Application.init(io, allocator, "shop", .{
+var app = try zmodu.Application.init(io, allocator, "shop", .{
     UserModule,
     OrderModule,
     ProductModule,
@@ -181,7 +181,7 @@ try app.start();
 ┌─────────────────────────────────┐
 │       垂直扩展（单机增强）        │
 │  ┌─────────────────────────┐    │
-│  │   ZigModu Application   │    │
+│  │   zmodu Application   │    │
 │  │  ┌─────┐ ┌─────┐ ┌────┐ │    │
 │  │  │User │ │Order│ │Pay │ │    │
 │  │  └─────┘ └─────┘ └────┘ │    │
@@ -205,8 +205,8 @@ const CacheModule = struct {
 };
 
 // 异步事件处理：业务事件走线程安全的 ThreadSafeEventBus（L1 层）
-// —— 没有 `zigmodu.extensions.AsyncEventBus` 这个类型。
-var bus = try zigmodu.ThreadSafeEventBus(OrderCreated).init(allocator, io);
+// —— 没有 `zmodu.extensions.AsyncEventBus` 这个类型。
+var bus = try zmodu.ThreadSafeEventBus(OrderCreated).init(allocator, io);
 defer bus.deinit();
 try bus.subscribe(onOrderCreated);   // 回调在 publish 的线程上同步跑，保持短小
 bus.publish(.{ .order_id = 42 });
@@ -261,16 +261,16 @@ bus.publish(.{ .order_id = 42 });
 
 | 能力 | 作用 | 引入方式 |
 |------|------|----------|
-| DistributedEventBus | 跨实例事件通信 | `zigmodu.DistributedEventBus` |
-| ClusterMembership | 节点发现与健康检查 | `zigmodu.ClusterMembership` |
-| 集群读侧 | 请求路径选节点（引用计数快照 + rendezvous） | `zigmodu.MembershipView` / `ClusterBootstrap.getView()` |
+| DistributedEventBus | 跨实例事件通信 | `zmodu.DistributedEventBus` |
+| ClusterMembership | 节点发现与健康检查 | `zmodu.ClusterMembership` |
+| 集群读侧 | 请求路径选节点（引用计数快照 + rendezvous） | `zmodu.MembershipView` / `ClusterBootstrap.getView()` |
 | Session 共享 | 分布式会话 | Redis Session Store |
 | 负载均衡 | 请求分发 | Nginx/Envoy |
 
 **配置示例**：
 ```zig
 // 多实例部署配置（组装 + 读侧首选 ClusterBootstrap；单节点 raft_cluster_size = 1）
-var boot = try zigmodu.ClusterBootstrap.init(allocator, io, .{
+var boot = try zmodu.ClusterBootstrap.init(allocator, io, .{
     .node_id = "node-1",
     .port = 9001,
     .peers = &.{ "node-2@127.0.0.1:9002" },   // 每项 `"<id>@<host>:<port>"`；多节点必须写 `@id`
@@ -280,7 +280,7 @@ defer boot.deinit();
 try boot.start();             // 循环里再调 boot.tick()（外部驱动：gossip/health + 刷新读侧）
 
 // 裸用 membership 也可以，但 `start` 的 Config 只有三项（没有 `seed_nodes`，seed 节点走 `connectToSeed`）：
-//   var member = try zigmodu.ClusterMembership.init(allocator, io, "node-1", address, &bus);
+//   var member = try zmodu.ClusterMembership.init(allocator, io, "node-1", address, &bus);
 //   try member.start(.{ .gossip_interval_ms = 1000, .health_check_interval_ms = 3000, .node_timeout_ms = 10000 });
 
 // 跨实例事件走它内部的 DistributedEventBus：
@@ -307,18 +307,18 @@ try bus.publish("order.created", event_data);
 
 > **框架不给服务网格。** 拆分之后跨进程的治理是**运维层的事**：mTLS、服务发现、
 > 流量分配都由你自己的基础设施（Envoy / Linkerd / 云厂商）承担。
-> ZigModu 提供的是**每个进程内部**的治理原语——断路器、限流、隔离舱、卸压、
+> zmodu 提供的是**每个进程内部**的治理原语——断路器、限流、隔离舱、卸压、
 > 追踪、指标——它们是网格 sidecar 之后**每个服务自己**要接线的东西。
 > 图里没有网格，因为 `src/` 里没有网格。
 
-**每个服务进程内**（全部是 `zigmodu.*` 的真实导入，详见下方能力表）：
+**每个服务进程内**（全部是 `zmodu.*` 的真实导入，详见下方能力表）：
 
 ```
 ┌──────────────────────────────────────────────────────────┐
 │  单个服务进程（可独立部署）                                │
 │                                                          │
 │   ┌────────────┐                                          │
-│   │  HTTP 入口 │  REST · gRPC（zigmodu.http / GrpcService）│
+│   │  HTTP 入口 │  REST · gRPC（zmodu.http / GrpcService）│
 │   └─────┬──────┘                                          │
 │         │                                                 │
 │   ┌─────▼──────────────────────────────────────┐         │
@@ -356,18 +356,18 @@ try bus.publish("order.created", event_data);
 
 | 能力 | 框架支持（真实导入路径） | 配置 |
 |------|--------------------------|------|
-| 断路器 | `zigmodu.CircuitBreaker` | 5 次失败，30 秒半开 |
-| 限流 | `zigmodu.RateLimiter` | 令牌桶 1000/s |
-| 隔离舱 | `zigmodu.Bulkhead` | 每组并发上限，一个失败不拖垮全部 |
-| 自适应卸压 | `zigmodu.load_shedder` | 超载时拒绝，而不是无限排队（见下 §自适应卸压） |
-| 分布式限流 | `zigmodu.data.redis_rate_limit.RateLimiter` | Redis INCR+EXPIRE 固定窗口（跨实例，fail-closed）|
-| 分布式追踪 | `zigmodu.observability.DistributedTracer` | 采样 + `OtlpExporter` 导出 |
-| 指标收集 | `zigmodu.observability.PrometheusMetrics` | /metrics 端点 |
-| gRPC | `zigmodu.GrpcServiceRegistry` / `zigmodu.GrpcClient` | HTTP/2（unary + stream） |
-| 消息队列 | `zigmodu.NatsClient` / `zigmodu.MessageQueue` | 没有 MQTT 实现，别照抄旧名 |
+| 断路器 | `zmodu.CircuitBreaker` | 5 次失败，30 秒半开 |
+| 限流 | `zmodu.RateLimiter` | 令牌桶 1000/s |
+| 隔离舱 | `zmodu.Bulkhead` | 每组并发上限，一个失败不拖垮全部 |
+| 自适应卸压 | `zmodu.load_shedder` | 超载时拒绝，而不是无限排队（见下 §自适应卸压） |
+| 分布式限流 | `zmodu.data.redis_rate_limit.RateLimiter` | Redis INCR+EXPIRE 固定窗口（跨实例，fail-closed）|
+| 分布式追踪 | `zmodu.observability.DistributedTracer` | 采样 + `OtlpExporter` 导出 |
+| 指标收集 | `zmodu.observability.PrometheusMetrics` | /metrics 端点 |
+| gRPC | `zmodu.GrpcServiceRegistry` / `zmodu.GrpcClient` | HTTP/2（unary + stream） |
+| 消息队列 | `zmodu.NatsClient` / `zmodu.MessageQueue` | 没有 MQTT 实现，别照抄旧名 |
 
-> 韧性/观测**没有** `zigmodu.resilience.*` / `zigmodu.tracing.*` / `zigmodu.metrics.*` 这三层命名空间：
-> 韧性原语直接挂在 `zigmodu.*`（`src/root.zig` §3 RESILIENCE），追踪与指标在 `zigmodu.observability.*`
+> 韧性/观测**没有** `zmodu.resilience.*` / `zmodu.tracing.*` / `zmodu.metrics.*` 这三层命名空间：
+> 韧性原语直接挂在 `zmodu.*`（`src/root.zig` §3 RESILIENCE），追踪与指标在 `zmodu.observability.*`
 > （`src/observability.zig`）。见到旧写法请一并改。
 
 **配置示例**：
@@ -381,7 +381,7 @@ try bus.publish("order.created", event_data);
 那个管的是**连接数**，这个管的是**在途请求**。`allow()` 要**你自己在请求路径上调用**。
 
 ```zig
-const shedder = zigmodu.load_shedder;
+const shedder = zmodu.load_shedder;
 
 var s = try shedder.newAdaptiveShedder(allocator, io, .{});
 defer s.deinit();
@@ -417,8 +417,8 @@ fn handle(req: *Request) !Response {
 不需要卸压时用 `NopShedder`：`allow()` 永远通过，返回一个空 `Promise`。
 
 ```zig
-const CircuitBreaker = zigmodu.CircuitBreaker;
-const RateLimiter = zigmodu.RateLimiter;
+const CircuitBreaker = zmodu.CircuitBreaker;
+const RateLimiter = zmodu.RateLimiter;
 
 var cb = try CircuitBreaker.init(allocator, "order-service", .{
     .failure_threshold = 5,   // 连续 5 次失败 → OPEN
@@ -447,19 +447,19 @@ const allowed = dist_limiter.allow("login:user-1", 5, 60) catch |err| {
 if (!allowed) return error.RateLimited;
 
 // 分布式追踪：init(allocator, tracer_name, service_name)
-var tracer = try zigmodu.observability.DistributedTracer.init(allocator, "order-tracer", "order-service");
+var tracer = try zmodu.observability.DistributedTracer.init(allocator, "order-tracer", "order-service");
 var span = try tracer.startTrace("createOrder");
 defer tracer.endSpan(span);
 ```
 
 跨实例 WebSocket fanout（任意实例 publish → 全集群所有实例本地 broadcast）走
-`zigmodu.DistributedEventBus`（`init(allocator, io, node_id)` + `publish` / `subscribeWithContext`，
+`zmodu.DistributedEventBus`（`init(allocator, io, node_id)` + `publish` / `subscribeWithContext`，
 见 `src/core/DistributedEventBus.zig`）。下面这段**省略了 `bus` 的创建与 `ws_server` 的定义**：
 
 ```zig
-// （伪码：假设已有 var bus = try zigmodu.DistributedEventBus.init(allocator, io, node_id);）
+// （伪码：假设已有 var bus = try zmodu.DistributedEventBus.init(allocator, io, node_id);）
 try bus.subscribeWithContext("ws.fanout", &ws_server, struct {
-    fn onEvent(ctx: ?*anyopaque, ev: zigmodu.DistributedEventBus.NetworkEvent) void {
+    fn onEvent(ctx: ?*anyopaque, ev: zmodu.DistributedEventBus.NetworkEvent) void {
         const s: *WebSocketServer = @ptrCast(@alignCast(ctx.?));
         s.broadcast(ev.payload);
     }
@@ -515,15 +515,15 @@ try bus.publish("ws.fanout", "{\"type\":\"notice\"}");
 
 | 能力 | 作用 | 框架支持 |
 |------|------|----------|
-| 选主 / 日志复制 | 跨区域协调 | `zigmodu.RaftElection` + `zigmodu.RaftTransport`（自带传输；见 `docs/DISTRIBUTED.md`） |
+| 选主 / 日志复制 | 跨区域协调 | `zmodu.RaftElection` + `zmodu.RaftTransport`（自带传输；见 `docs/DISTRIBUTED.md`） |
 | 多租户 | 租户隔离 | Namespace + 资源配额 |
-| 热更新 | 运行时模块替换 | `zigmodu.HotReloader` |
-| 插件系统 | 动态扩展 | `zigmodu.PluginManager` |
+| 热更新 | 运行时模块替换 | `zmodu.HotReloader` |
+| 插件系统 | 动态扩展 | `zmodu.PluginManager` |
 
 **配置示例**：
 ```zig
 // 单节点：显式 raft_cluster_size = 1（默认 3 会因内置传输是桩而拒绝启动）
-var boot = try zigmodu.ClusterBootstrap.init(allocator, io, .{
+var boot = try zmodu.ClusterBootstrap.init(allocator, io, .{
     .node_id = "node-asia-1",
     .port = 9001,
     .peers = &.{},
@@ -642,10 +642,10 @@ Month 4: 可观测性
 ```
 
 **技术要点**：
-- 多协议：gRPC 用 `zigmodu.GrpcServiceRegistry` / `zigmodu.GrpcClient`；消息总线用 `zigmodu.NatsClient` / `zigmodu.MessageQueue`（**没有** MQTT 实现）
+- 多协议：gRPC 用 `zmodu.GrpcServiceRegistry` / `zmodu.GrpcClient`；消息总线用 `zmodu.NatsClient` / `zmodu.MessageQueue`（**没有** MQTT 实现）
 - 断路器配置：`CircuitBreaker.init(allocator, name, Config)`（完整字段见上文阶段 A4「配置示例」）
   ```zig
-  var cb = try zigmodu.CircuitBreaker.init(allocator, "order-service", .{
+  var cb = try zmodu.CircuitBreaker.init(allocator, "order-service", .{
       .failure_threshold = 5,   // 5 次失败 → OPEN
       .success_threshold = 2,
       .timeout_seconds = 30,    // 30 秒后转 HALF_OPEN
@@ -726,7 +726,7 @@ Month 4: 可观测性
 
 ## 🗄 数据访问选型（zent / sqlx）
 
-ZigModu 不绑定 ORM：**同一个应用里按模块选型**，但两者正交——**不要混驱动、不要跨两者共享事务**。
+zmodu 不绑定 ORM：**同一个应用里按模块选型**，但两者正交——**不要混驱动、不要跨两者共享事务**。
 
 | 场景 | 选 | 理由 |
 |------|-----|------|
@@ -849,7 +849,7 @@ pub fn deinit() void {
 
 ```zig
 // api.zig —— 整份文件一行注册
-pub const OrdersApi = zigmodu.http.CrudApi(model.Orders, service.OrdersService, .{});
+pub const OrdersApi = zmodu.http.CrudApi(model.Orders, service.OrdersService, .{});
 ```
 
 - 自动生成 5 条路由，JWT + `<module>:read`/`<module>:write` 权限 meta；
@@ -871,7 +871,7 @@ pub const OrdersApi = zigmodu.http.CrudApi(model.Orders, service.OrdersService, 
   一次释放），单行用 `queryRowsSlice`（按列名映射、索引每查询建一次）；
 - 多写一致性：`svc.transact(T, f)` 事务封装（生成物自带），避免手写
   begin/commit/rollback 遗漏。
-- 可观测一行开：`server.addMiddleware(zigmodu.http.tracingMiddleware())`
+- 可观测一行开：`server.addMiddleware(zmodu.http.tracingMiddleware())`
   注入 `x-trace-id` + 请求耗时日志（`rateLimitMiddleware` 同款）；autoCrud
   路由与自定义路由一并生效，业务代码无需埋点。
 - 多语言错误：`http.setErrorLocalizations(&.{.{ .err = error.ValidationFailed,
@@ -911,7 +911,7 @@ autoCrud 之上加业务逻辑，按复杂度选档，全部向后兼容：
        pub const nest = .{"orders"};
        pub const State = @This();
        service: *service.OrdersService,
-       pub const routes = [_]zigmodu.http.RouteSpec(State){
+       pub const routes = [_]zmodu.http.RouteSpec(State){
            .{ .method = .POST, .path = "{id}/cancel", .handler = cancel,
              .meta = .{ .auth = .jwt, .permission = "orders:write" } },
        };
@@ -924,7 +924,7 @@ autoCrud 之上加业务逻辑，按复杂度选档，全部向后兼容：
 4. **解耦副作用** — 订阅 `CrudEvent{created,updated,deleted}`（含自定义方法内
    复用 `crud.create/update/delete` 的路径）：
    ```zig
-   var bus = zigmodu.TypedEventBus(zigmodu.data.CrudEvent(model.Orders)).init(allocator);
+   var bus = zmodu.TypedEventBus(zmodu.data.CrudEvent(model.Orders)).init(allocator);
    defer bus.deinit();
    try bus.subscribe(module.events.onOrderEvent);
    svc.crud.setEventBus(&bus);   // 通知/审计/外发/积分，与主流程解耦
@@ -939,7 +939,7 @@ model/persistence/service/api/module/root 五个文件，自定义逻辑可放�
 
 > **适用**：`app.runtime()` 已经或将要出现在你的应用里。**没用它的应用不必读这一节** ——
 > 不调 `runtime()` 就不多起线程，行为与上文完全一致。规格与 API 看 [RUNTIME.md](../reference/RUNTIME.md)；
-> 领域背景见 [alpha-engine](https://github.com/chy3xyz/zigmodu/tree/master/examples/alpha-engine)。
+> 领域背景见 [alpha-engine](https://github.com/chy3xyz/zmodu/tree/master/examples/alpha-engine)。
 
 ### 0. 先判断该不该上执行平面
 
@@ -1106,7 +1106,7 @@ pub fn processRequest(req: Request) AppError!Response {
 
 ```zig
 // 启动期一次：链内 + 路由前全部 RFC 7807（application/problem+json）
-zigmodu.http.useRfc7807Errors();
+zmodu.http.useRfc7807Errors();
 ```
 
 | 需求 | 调用 |
@@ -1152,9 +1152,9 @@ Zig 的 panic 不可捕获——请求路径上任何一次 panic 都会终止**
 [`ROUTE_TABLE.md`](../reference/ROUTE_TABLE.md) §7.4）：
 
 ```zig
-var profile = zigmodu.http.ProductionProfileState.init(allocator);
+var profile = zmodu.http.ProductionProfileState.init(allocator);
 defer profile.deinit(allocator);
-try zigmodu.http.productionProfile(&server, .{
+try zmodu.http.productionProfile(&server, .{
     .max_connections = 4096,      // 连接洪泛背压
     .header_timeout_ms = 10_000,  // slowloris（请求行+header 阶段）
 }, &profile);                     // ⚠️ 必须在 addRoute / mountAll 之前
@@ -1216,7 +1216,7 @@ handler/service/persistence 里用错误返回，不用 `catch unreachable` /
 root（含 `main` 的文件）加一行：
 
 ```zig
-const zmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 pub const panic = zmodu.panicHook;
 ```
 
@@ -1354,7 +1354,7 @@ pub const Order = struct {
 打挂进程**，所以是独立的两个开关：
 
 ```zig
-var server = zigmodu.http.Server.initWithConfig(io, allocator, .{
+var server = zmodu.http.Server.initWithConfig(io, allocator, .{
     .port = 8080,
     .max_connections = 4096,          // 0 = 不限（默认）；超限立即处理
     .over_limit_response = .close,    // .close（最省）或 .unavailable（先回 503）
@@ -1376,7 +1376,7 @@ var server = zigmodu.http.Server.initWithConfig(io, allocator, .{
 **HTTP 响应出站**（"慢客户端"的写方向；上面几行是请求方向的期限）：
 
 ```zig
-var server = zigmodu.http.Server.initWithConfig(io, allocator, .{
+var server = zmodu.http.Server.initWithConfig(io, allocator, .{
     .port = 8080,
     .response_write_timeout_ms = 30_000,   // 0 = 旧行为（可无限阻塞）
 });
@@ -1403,7 +1403,7 @@ var server = zigmodu.http.Server.initWithConfig(io, allocator, .{
 **WebSocket 出站**（同属"慢客户端"问题，但发生在写方向）：
 
 ```zig
-var server = zigmodu.http.Server.initWithConfig(io, allocator, .{
+var server = zmodu.http.Server.initWithConfig(io, allocator, .{
     .port = 8080,
     .ws_write_timeout_ms = 10_000,   // 0 = 继承 response_write_timeout_ms（默认）
 });
@@ -1491,15 +1491,15 @@ socket 的 N 并发 × M 租户压测，断言跨租户读取为 **0**、冻结�
 上线后排查却极贵：
 
 ```zig
-var env_ctx = zigmodu.Preflight.EnvCheck.fromMap(init.environ_map, &.{ "JWT_SECRET", "DATABASE_URL" });
-var secret_ctx = zigmodu.Preflight.SecretCheck{ .secret = jwt_secret };  // 拒绝占位/过短
-var clock_ctx = zigmodu.Preflight.ClockCheck{ .io = io };
-var report = zigmodu.Preflight.run(allocator, &.{
-    zigmodu.Preflight.envCheck(&env_ctx),
-    zigmodu.Preflight.secretCheck(&secret_ctx),
-    zigmodu.Preflight.dbCheck(&db_client),      // SELECT 1
-    zigmodu.Preflight.migrationCheck(&mig_ctx), // 有待应用迁移就拒绝启动
-    zigmodu.Preflight.clockCheck(&clock_ctx),
+var env_ctx = zmodu.Preflight.EnvCheck.fromMap(init.environ_map, &.{ "JWT_SECRET", "DATABASE_URL" });
+var secret_ctx = zmodu.Preflight.SecretCheck{ .secret = jwt_secret };  // 拒绝占位/过短
+var clock_ctx = zmodu.Preflight.ClockCheck{ .io = io };
+var report = zmodu.Preflight.run(allocator, &.{
+    zmodu.Preflight.envCheck(&env_ctx),
+    zmodu.Preflight.secretCheck(&secret_ctx),
+    zmodu.Preflight.dbCheck(&db_client),      // SELECT 1
+    zmodu.Preflight.migrationCheck(&mig_ctx), // 有待应用迁移就拒绝启动
+    zmodu.Preflight.clockCheck(&clock_ctx),
 });
 defer report.deinit();
 report.log();
@@ -1533,7 +1533,7 @@ if (!report.ok()) return error.PreflightFailed;   // 不启动，胜过带病运
 
    ```zig
    /// Accepted form: **a pointer** to anything with
-   /// `queryRows(T, sql, params)` — in practice `*zigmodu.data.Client`.
+   /// `queryRows(T, sql, params)` — in practice `*zmodu.data.Client`.
    /// Pass `&client`, not `client`.
    pub fn dbCheck(client: anytype) Check { ... }
    ```
@@ -1616,7 +1616,7 @@ pub const LogPage = struct { list: []Log, total: i64 };
 接上 `JwksKeyRing` 后，token 头部带 `kid`，验签按 `kid` 取密钥：
 
 ```zig
-var ring = zigmodu.security.JwksKeyRing.init(allocator);
+var ring = zmodu.security.JwksKeyRing.init(allocator);
 defer ring.deinit();
 try ring.addKey("v1", old_secret, true);      // 上线时的主密钥
 app_sec.module.setKeyring(&ring);
@@ -1661,7 +1661,7 @@ FROM _zigmodu_migrations ORDER BY version;
 
 ```zig
 // 一张表即可，三个驱动通用（表名会做标识符校验）
-var lock = try zigmodu.DistributedLock.SqlLock(@TypeOf(db)).init(
+var lock = try zmodu.DistributedLock.SqlLock(@TypeOf(db)).init(
     allocator, io, &db, "zigmodu_lock", .sqlite,   // .sqlite | .postgres | .mysql
 );
 defer lock.deinit();
@@ -1749,11 +1749,11 @@ pub fn badPractice() ![]u8 {
 ### 测试编写规范
 ```zig
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 // 被测模块
 const UserModule = struct {
-    pub const info = zigmodu.api.Module{
+    pub const info = zmodu.api.Module{
         .name = "user",
         .description = "User module",
         .dependencies = &.{},
@@ -1763,13 +1763,13 @@ const UserModule = struct {
 };
 
 // ✅ 良好实践（一）：模块级测试用 ModuleTestContext
-//    真身是 `zigmodu.ModuleTestContext`（src/root.zig）——
-//    **没有** `zigmodu.extensions.ModuleTestContext` 这一层。
+//    真身是 `zmodu.ModuleTestContext`（src/root.zig）——
+//    **没有** `zmodu.extensions.ModuleTestContext` 这一层。
 test "用户模块 - 装 mock 并查表" {
-    var ctx = try zigmodu.ModuleTestContext.init(std.testing.allocator, "user");
+    var ctx = try zmodu.ModuleTestContext.init(std.testing.allocator, "user");
     defer ctx.deinit();
 
-    try ctx.registerMockModule(zigmodu.createMockModule("user", "User module", &.{}));
+    try ctx.registerMockModule(zmodu.createMockModule("user", "User module", &.{}));
 
     const module = ctx.modules.get("user");
     try std.testing.expect(module != null);
@@ -1782,7 +1782,7 @@ fn createOrder(quantity: usize) !void {
 }
 
 test "订单模块 - 异常路径" {
-    var app = try zigmodu.Application.init(
+    var app = try zmodu.Application.init(
         std.testing.io,                 // 第一个参数是 io，不是 allocator
         std.testing.allocator,
         "order-failure",
@@ -1987,30 +1987,30 @@ pub fn processBatch(allocator: Allocator, items: []Item) !void {
 单机 `beginTx` 管不了"协调者进程崩在 prepare 与 commit 之间"：参与者锁着资源，
 协调者自己什么都记不住 —— 重启后没人知道这笔事务该提交还是回滚。这就是 **in-doubt**。
 
-`zigmodu.TransactionJournal`（`src/core/TransactionJournal.zig`）是**追加写**的协调者日志：
+`zmodu.TransactionJournal`（`src/core/TransactionJournal.zig`）是**追加写**的协调者日志：
 每次状态迁移插一条记录，崩溃最多丢最后一条，不会损坏已写的。接进 `TwoPhaseCommit` 后，
 `prepared` 记录在任何参与者收到 commit 指令**之前**落盘。带 journal 的协调者一旦
 写不进日志就拒绝推进（fail-closed）。
 
 ```zig
-const zigmodu = @import("zigmodu");
-const data = zigmodu.data;
+const zmodu = @import("zmodu");
+const data = zmodu.data;
 
 // 启动期一次：建表 + 挂到协调者上
-var journal = zigmodu.TransactionJournal.initWithBackend(
+var journal = zmodu.TransactionJournal.initWithBackend(
     allocator,
     data.SqlxBackend{ .allocator = allocator, .client = &db },
 );
 defer journal.deinit();
 try journal.migrate();               // CREATE TABLE IF NOT EXISTS（三驱动通用，表名可配）
 
-var tpc = zigmodu.TwoPhaseCommit.init(allocator);
+var tpc = zmodu.TwoPhaseCommit.init(allocator);
 defer tpc.deinit();
 tpc.setJournal(&journal);            // ← 不接这一步，协调者就是纯内存的
 
 // 进程重启后（或在 supervisor 的启动序列里）：把悬挂事务捞出来交人工/补偿
 const in_doubt = try tpc.recover(allocator);
-defer zigmodu.TransactionJournal.freeInDoubt(allocator, in_doubt);
+defer zmodu.TransactionJournal.freeInDoubt(allocator, in_doubt);
 for (in_doubt) |tx| {
     // tx.tx_id / tx.participants / tx.updated_at —— 只报告
     std.log.warn("in-doubt tx {s} prepared at {d}, participants={any}", .{ tx.tx_id, tx.updated_at, tx.participants });
@@ -2035,10 +2035,10 @@ for (in_doubt) |tx| {
 saga 就永远停在 `running` —— 补偿不跑、实例不释放、没人知道它死了。
 
 ```zig
-// `SagaStep` 是 `core/SagaOrchestrator.zig` 的顶层声明（`zigmodu` 目前只再导出
-// `SagaOrchestrator` / `SagaLog` / `SagaStatus`）。所以别写 `zigmodu.SagaStep`——
+// `SagaStep` 是 `core/SagaOrchestrator.zig` 的顶层声明（`zmodu` 目前只再导出
+// `SagaOrchestrator` / `SagaLog` / `SagaStatus`）。所以别写 `zmodu.SagaStep`——
 // 直接把字面量交给 `registerSaga`，元素类型由此推断：
-var orch = zigmodu.SagaOrchestrator.init(allocator);
+var orch = zmodu.SagaOrchestrator.init(allocator);
 defer orch.deinit();
 
 try orch.registerSaga("order", &.{
@@ -2075,17 +2075,17 @@ try orch.registerSaga("order", &.{
 
 ```zig
 // 1) 能收多大：先抬服务端上限，再让 multipart 的限额在它之内
-var server = zigmodu.http.Server.initWithConfig(io, allocator, .{
+var server = zmodu.http.Server.initWithConfig(io, allocator, .{
     .max_body_size = 64 << 20,
 });
-const mp = zigmodu.http.Multipart.Config.forBodyLimit(64 << 20);
+const mp = zmodu.http.Multipart.Config.forBodyLimit(64 << 20);
 
 // 2) 收进来是什么：解析失败按 ProblemDetails 出 415/413/400
-var form = try zigmodu.http.extractMultipart(ctx, mp);
+var form = try zmodu.http.extractMultipart(ctx, mp);
 defer form.deinit();
 
 // 3) 安全吗：按字节判定格式，并要求与扩展名一致
-try zigmodu.http.UploadGuard.checkForm(&form, .{
+try zmodu.http.UploadGuard.checkForm(&form, .{
     .extensions = &.{ "jpg", "jpeg", "png", "webp" },
     .formats = &.{ .jpeg, .png, .webp },
     .max_bytes = 5 << 20,
@@ -2147,8 +2147,8 @@ if (!std.mem.eql(u8, part.content_type, "image/jpeg")) return error.Rejected;
 - 被拒时 form 由内部释放，调用方不用管。
 
 ```zig
-var form = try zigmodu.http.extractMultipartGuarded(ctx, .{
-    .multipart = zigmodu.http.Multipart.Config.forBodyLimit(64 << 20),
+var form = try zmodu.http.extractMultipartGuarded(ctx, .{
+    .multipart = zmodu.http.Multipart.Config.forBodyLimit(64 << 20),
     .policy = .{
         .extensions = &.{ "jpg", "jpeg", "png", "webp" },
         .formats = &.{ .jpeg, .png, .webp },
@@ -2175,7 +2175,7 @@ const avatar = form.file("avatar").?;   // 到这里才可信
 #### 默认栈（路径 A · 新应用必选）
 
 ```zig
-var app_sec = zigmodu.security.AppSecurity.init(allocator, io, .{
+var app_sec = zmodu.security.AppSecurity.init(allocator, io, .{
     .jwt_secret = jwt_secret,
     .token_expiry_seconds = 3600,
 });
@@ -2187,7 +2187,7 @@ try server.addMiddleware(try http.jwtAuthFromCatalogWithPermissions(
     &app_sec.module,
     &catalog_slot,
     // 简单应用：try http.catalogLoaderFromTable(&table)
-    // 或：try zigmodu.security.CatalogPermDb.loaderFromClient(&db)
+    // 或：try zmodu.security.CatalogPermDb.loaderFromClient(&db)
     // 多主体：自定义 CatalogPermissionLoader（见下）
     try http.catalogLoaderFromTable(&role_perm_table),
     .{ .skip_prefixes = &.{ "api/health", "health", "dashboard", "openapi.json" } },
@@ -2430,7 +2430,7 @@ pub fn main(init: std.process.Init) !void {
 
 > 生产接线还有一条更省事的路径：`Server.fromEnv(io, allocator, init.environ_map)`
 > （`src/api/Server.zig`）读 `HTTP_PORT` / `HTTP_MAX_BODY` / `HTTP_MAX_CONNECTIONS` /
-> `HTTP_HEADER_TIMEOUT_MS`；启动期必填项检查交给 `zigmodu.Preflight.run(...)`。
+> `HTTP_HEADER_TIMEOUT_MS`；启动期必填项检查交给 `zmodu.Preflight.run(...)`。
 
 ### CI/CD 流水线
 ```yaml
@@ -2486,7 +2486,7 @@ jobs:
 
 **进程与启动**
 - [ ] 应用 root 接上 `pub const panic = zmodu.panicHook;`（panic 时输出正在处理的请求）
-- [ ] 启动跑 `zigmodu.Preflight.run(...)`：必填 env、JWT secret 非占位、DB 连通、无待应用迁移、时钟正常（`!report.ok()` 直接拒绝启动）
+- [ ] 启动跑 `zmodu.Preflight.run(...)`：必填 env、JWT secret 非占位、DB 连通、无待应用迁移、时钟正常（`!report.ok()` 直接拒绝启动）
 - [ ] supervisor 就位：systemd `Restart=always` 或 k8s `restartPolicy: Always`（panic 不可捕获，重启是最后一道可用性防线）
 
 **HTTP 层**
@@ -2647,11 +2647,11 @@ macOS 腿 `100 checks x10K` 42.9ms vs 基线 19.9ms，同 commit 原样重跑 28
   与两份基线文件；分位数只出现在它 `grep -v '^info: '` 之后的日志里。理由：这些数**跨宿主档的离散度还不知道**
   —— 这个仓库已经为“拿一台机器的单点基线去卡新数字”付过三次账（`RingBuffer SPSC x1M` 一个指标就随宿主
   内存序实现差 2.15×，见 `scripts/check-bench.sh` 头部）。先攒几轮观测，等手里有离散度再决定要不要立判据。
-- **自证采样是真的**：`ZIGMODU_BENCH_INJECT_NS=<ns>`（配合 `ZIGMODU_BENCH_INJECT_EVERY`，默认每 40 个
+- **自证采样是真的**：`ZMODU_BENCH_INJECT_NS=<ns>`（配合 `ZMODU_BENCH_INJECT_EVERY`，默认每 40 个
   batch 一次，即 1000 个样本里的 25 个 = 2.5%）让这些 batch 各多付一段**忙等**，宽度用同一只钟量出来并加进
   该 batch 的样本。2.5% 的样本恰好落在排序后分布的最顶部（在 p95 的 5% 边界之上），所以 p50 必须不动、
   p99/p99.9 必须按注入量抬起来。`every` 取 21–99 保持这个性质（被挪动的质量占 1%–5%）。本机实测
-  （M1 Pro，负载均值 8–9，`ZIGMODU_BENCH_INJECT_NS=2000000`，同一台机器上的相邻两次运行，左=关、右=开，
+  （M1 Pro，负载均值 8–9，`ZMODU_BENCH_INJECT_NS=2000000`，同一台机器上的相邻两次运行，左=关、右=开，
   逐项对应）：
 
   ```
@@ -2814,7 +2814,7 @@ macOS 腿 `100 checks x10K` 42.9ms vs 基线 19.9ms，同 commit 原样重跑 28
 | 性能 | 32 条指标对 CI 基线（阈值 2.0×），双峰指标降级为"候选回归 + 诊断" | `bash scripts/check-bench.sh` |
 | 死代码 | ratchet：`src`+`tools` 基线 32（30 + 2）、`examples` 基线 0 | `bash scripts/check-deadcode.sh` |
 | 热路径纪律 | 禁裸 `catch {}`、CSPRNG 来源、fuzz 声明与树一致 | `zig build check` |
-| API 纪律 | examples 必须走 `zigmodu.http` 规范入口 | `zig build check-api` |
+| API 纪律 | examples 必须走 `zmodu.http` 规范入口 | `zig build check-api` |
 | 长跑 | 三套 harness：HTTP+租户 / 3 节点集群 / runtime 交织 | `zig build soak` · `soak-cluster` · `runtime-stress` |
 | 覆盖率 | **没有强制阈值**（`zig build test` 不产出覆盖率门禁）。想加就得先有工具与基线；在那之前不写进清单当承诺 | —— |
 
@@ -2862,8 +2862,8 @@ Build Examples 腿），"哪些证明过、哪些没有"逐条记在 [dev/v1.0-r
 
 --
 
-**本文描述的版本**：ZigModu v0.40.0（Zig 0.17.0）—— 以 `build.zig.zon` 为准  
-**维护者**：ZigModu 团队
+**本文描述的版本**：zmodu v0.40.0（Zig 0.17.0）—— 以 `build.zig.zon` 为准  
+**维护者**：zmodu 团队
 
 > 历史上的"最后更新：2026-09-18 · v0.26.0"已删除。带版本号的页脚每次发版都要手工跟一次，
 > 九个版本之后就没人跟了，于是它以"当前状态"的语气描述着四个大版本之前的框架。

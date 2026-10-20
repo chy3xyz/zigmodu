@@ -6,7 +6,7 @@
 //! point of writing the policy as a literal instead of spreading it across
 //! handlers.
 
-const ai = @import("zigmodu").ai;
+const ai = @import("zmodu").ai;
 
 /// The one action the agent may *name*. Listing it is what lets the agent
 /// propose; the class is what stops it there — `Guard.Permissions` puts the

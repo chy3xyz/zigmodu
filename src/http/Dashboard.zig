@@ -240,7 +240,7 @@ const DASHBOARD_HTML =
     \\<head>
     \\<meta charset="UTF-8">
     \\<meta name="viewport" content="width=device-width,initial-scale=1.0">
-    \\<title>ZigModu Dashboard</title>
+    \\<title>zmodu Dashboard</title>
     \\<script src="https://cdn.tailwindcss.com"></script>
     \\<script>tailwind.config={darkMode:'class'}</script>
     \\<script>
@@ -278,7 +278,7 @@ const DASHBOARD_HTML =
     \\<nav class="border-b border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 sticky top-0 z-50">
     \\<div class="max-w-7xl mx-auto px-6 flex items-center justify-between h-16">
     \\  <div class="flex items-center gap-3">
-    \\    <span class="text-2xl font-black tracking-tight">⚡ ZigModu</span>
+    \\    <span class="text-2xl font-black tracking-tight">⚡ zmodu</span>
 ++ "    <span class=\"badge-up text-xs\">v" ++ framework_version ++ "</span>\n" ++
     \\  </div>
     \\  <div class="flex items-center gap-4">
@@ -378,7 +378,7 @@ const DASHBOARD_HTML =
     \\<!-- Footer -->
     \\<footer class="max-w-7xl mx-auto px-6 py-8 mt-12 border-t border-zinc-200 dark:border-zinc-800">
     \\<div class="flex justify-between text-xs text-zinc-400">
-++ "  <span>ZigModu v" ++ framework_version ++ " · Zig " ++ zig_version ++ "</span>\n" ++
+++ "  <span>zmodu v" ++ framework_version ++ " · Zig " ++ zig_version ++ "</span>\n" ++
     \\  <span>Dashboard · Alpine.js + TailwindCSS</span>
     \\</div>
     \\</footer>
@@ -402,7 +402,7 @@ test "Dashboard HTML is valid" {
     try std.testing.expect(std.mem.containsAtLeast(u8, DASHBOARD_HTML, 1, "<!DOCTYPE html>"));
     try std.testing.expect(std.mem.containsAtLeast(u8, DASHBOARD_HTML, 1, "alpinejs"));
     try std.testing.expect(std.mem.containsAtLeast(u8, DASHBOARD_HTML, 1, "tailwindcss"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, DASHBOARD_HTML, 1, "ZigModu Dashboard"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, DASHBOARD_HTML, 1, "zmodu Dashboard"));
     try std.testing.expect(std.mem.containsAtLeast(u8, DASHBOARD_HTML, 1, "/api/dashboard/modules"));
     try std.testing.expect(std.mem.containsAtLeast(u8, DASHBOARD_HTML, 1, "/api/dashboard/stats"));
     try std.testing.expect(std.mem.containsAtLeast(u8, DASHBOARD_HTML, 1, "/api/dashboard/system"));

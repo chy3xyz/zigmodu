@@ -169,7 +169,7 @@ pub const WebMonitor = struct {
             \\<!DOCTYPE html>
             \\u003chtml>
             \\u003chead>
-            \\    <title>ZigModu Monitor</title>
+            \\    <title>zmodu Monitor</title>
             \\    <style>
             \\        body { font-family: sans-serif; margin: 40px; }
             \\        h1 { color: #333; }
@@ -178,8 +178,8 @@ pub const WebMonitor = struct {
             \\    </style>
             \\u003c/head>
             \\u003cbody>
-            \\    <h1>ZigModu Module Monitor</h1>
-            \\    <p>Real-time monitoring interface for ZigModu framework</p>
+            \\    <h1>zmodu Module Monitor</h1>
+            \\    <p>Real-time monitoring interface for zmodu framework</p>
             \\    
             \\    <h2>API Endpoints</h2>
             \\    <div class="endpoint">
@@ -309,6 +309,6 @@ test "a monitor response reaches the socket instead of dying in the writer's buf
     }
     const wire = buf[0..got];
     try std.testing.expect(std.mem.indexOf(u8, wire, "HTTP/1.1 200 OK") != null);
-    try std.testing.expect(std.mem.indexOf(u8, wire, "ZigModu Module Monitor") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "zmodu Module Monitor") != null);
     try std.testing.expect(std.mem.indexOf(u8, wire, "HTTP/1.1 404 Not Found") != null);
 }

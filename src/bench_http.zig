@@ -20,7 +20,7 @@
 //! one by default).
 
 const std = @import("std");
-const http = @import("zigmodu").http;
+const http = @import("zmodu").http;
 const Http2 = http.Http2;
 
 const Proto = enum { h1, h2c };

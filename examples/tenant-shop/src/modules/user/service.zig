@@ -1,4 +1,4 @@
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 const model = @import("model.zig");
 const enums = @import("../../business/enums.zig");
 
@@ -11,12 +11,12 @@ pub fn UserService(comptime Persistence: type) type {
             return .{ .persistence = p };
         }
 
-        pub fn listByTenant(self: *Self, tenant_id: i64) !zigmodu.data.sqlx.QueryResult(model.User) {
+        pub fn listByTenant(self: *Self, tenant_id: i64) !zmodu.data.sqlx.QueryResult(model.User) {
             return try self.persistence.findByTenant(tenant_id);
         }
 
         pub fn create(self: *Self, tenant_id: i64, username: []const u8, email: []const u8, role_str: []const u8) !model.User {
-            const now: i64 = @intCast(zigmodu.time.monotonicNowSeconds());
+            const now: i64 = @intCast(zmodu.time.monotonicNowSeconds());
             const role = enums.UserRole.fromString(role_str);
             const user = model.User{
                 .id = 0,

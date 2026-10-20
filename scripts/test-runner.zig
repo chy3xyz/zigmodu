@@ -111,7 +111,7 @@ fn isUnnamedTest(fqn: []const u8) bool {
 
 pub fn main(init: std.process.Init.Minimal) void {
     @disableInstrumentation();
-    if (builtin.fuzz) @panic("the zigmodu test runner does not support fuzz mode; drop -Dtest-filter so the default runner is used");
+    if (builtin.fuzz) @panic("the zmodu test runner does not support fuzz mode; drop -Dtest-filter so the default runner is used");
 
     var fba: std.heap.FixedBufferAllocator = .init(&fba_buffer);
     const args = init.args.toSlice(fba.allocator()) catch
@@ -438,7 +438,7 @@ pub fn fuzz(
     options: std.testing.FuzzInputOptions,
 ) anyerror!void {
     @disableInstrumentation();
-    if (builtin.fuzz) @panic("the zigmodu test runner does not support fuzz mode; drop -Dtest-filter so the default runner is used");
+    if (builtin.fuzz) @panic("the zmodu test runner does not support fuzz mode; drop -Dtest-filter so the default runner is used");
     for (options.corpus) |input| {
         var smith: std.testing.Smith = .{ .in = input };
         try testOne(context, &smith);

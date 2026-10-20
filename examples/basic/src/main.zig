@@ -1,5 +1,5 @@
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 // The documented panic-hook wire-up. It lives in this example on purpose: only
 // a consumer root's `pub const panic` makes the compiler lower panic sites
@@ -7,7 +7,7 @@ const zigmodu = @import("zigmodu");
 // stays at signature level (that is how `writeStderr` shipped a call to
 // `std.posix.write`, removed in 0.17, behind a green tree). Build Examples is
 // the gate that keeps `PanicHook.zig` honestly compiled.
-pub const panic = zigmodu.panicHook;
+pub const panic = zmodu.panicHook;
 
 // ============================================
 // Example 1: Basic E-commerce - Core Features
@@ -20,11 +20,11 @@ const PaymentModule = @import("modules/payment.zig");
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
-    std.log.info("=== ZigModu Basic Example ===", .{});
+    std.log.info("=== zmodu Basic Example ===", .{});
     std.log.info("Demonstrates: Module definition, dependency management, lifecycle\n", .{});
 
     // Method 1: Using the new Application API (Recommended)
-    var app = try zigmodu.Application.init(
+    var app = try zmodu.Application.init(
         init.io,
         allocator,
         "shop",

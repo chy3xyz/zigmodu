@@ -1,4 +1,4 @@
-# ZigModu Performance Review
+# zmodu Performance Review
 
 **Date**: 2026-05-11
 **Version**: v0.8.3

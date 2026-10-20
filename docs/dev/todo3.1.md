@@ -10,12 +10,12 @@
 
 我的判断是：如果按照我上面那套升级直接重构现有 `Application / Module / EventBus / DI`，确实可能产生较大的 breaking changes；但如果采用**“内核兼容 + Runtime 增量”的演进方式**，可以做到 **v0.16～v0.21 基本保持现有业务代码兼容**，最后到 1.0 再做一次有计划的 API 收敛。
 
-目前 ZigModu 已经有 Module、DI、Event、Lifecycle、HTTP/gRPC、Resilience、Distributed 等成熟基础，因此没必要推倒重来。
+目前 zmodu 已经有 Module、DI、Event、Lifecycle、HTTP/gRPC、Resilience、Distributed 等成熟基础，因此没必要推倒重来。
 
 ## 我建议采用“双层架构”
 
 ```text
-                 ZigModu
+                 zmodu
                     │
         ┌───────────┴───────────┐
         │                       │
@@ -275,7 +275,7 @@ app.module(...)
 我建议不要现在就宣布：
 
 ```text
-ZigModu 0.16 = breaking rewrite
+zmodu 0.16 = breaking rewrite
 ```
 
 而是：
@@ -409,7 +409,7 @@ Dispatcher
 
 ---
 
-# 对 `zigmodu` 来说，最危险的是“为了性能重写整个框架”
+# 对 `zmodu` 来说，最危险的是“为了性能重写整个框架”
 
 我反而**不建议这么做**。
 
@@ -439,7 +439,7 @@ CLI
 真正应该做的是：
 
 ```text
-                 ZigModu 现有资产
+                 zmodu 现有资产
                        │
                  ┌─────┴─────┐
                  ↓           ↓
@@ -456,7 +456,7 @@ CLI
 
 所以我会把这次升级定义成：
 
-# **ZigModu Evolution，而不是 ZigModu Rewrite**
+# **zmodu Evolution，而不是 zmodu Rewrite**
 
 ---
 
@@ -465,7 +465,7 @@ CLI
 可以直接写进项目 `ARCHITECTURE.md`：
 
 ```text
-ZigModu Compatibility Principles
+zmodu Compatibility Principles
 
 1. Existing Module API remains stable.
 2. Existing Application API remains stable.
@@ -479,11 +479,11 @@ ZigModu Compatibility Principles
 10. Breaking changes are reserved for 1.0.
 ```
 
-这套策略特别适合你现在的 `zigmodu`。
+这套策略特别适合你现在的 `zmodu`。
 
 **一句话：不要动“已经跑起来的骨架”，把新的 Runtime 作为第二条高速通道接进去。**
 
-这样 `zigmodu` 可以同时服务：
+这样 `zmodu` 可以同时服务：
 
 ```text
 普通 SaaS

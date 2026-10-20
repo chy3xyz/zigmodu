@@ -1,7 +1,7 @@
 //! SLA / 时效管理: track deadlines on business items (tickets, approvals,
 //! refunds) and fire escalating reminders — a warning before the deadline and
 //! a breach event after it passes. `check()` is meant to run on a cron cadence
-//! (`zigmodu.ai.trigger.registerCron`); violations go to a callback (e.g. push
+//! (`zmodu.ai.trigger.registerCron`); violations go to a callback (e.g. push
 //! into `ai.notify`) and the outbox (`ai.sla`) for audit/automation.
 
 const std = @import("std");

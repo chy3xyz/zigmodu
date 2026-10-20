@@ -13,7 +13,7 @@
 ```zig
 // node.zig
 const std = @import("std");
-const zmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 // The HTTP handler below is a plain fn (Zig has no closures), so the node lives at file scope.
 var cluster: *zmodu.ClusterBootstrap = undefined;

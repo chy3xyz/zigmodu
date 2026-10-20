@@ -1,4 +1,4 @@
-name: ZigModu CI/CD
+name: zmodu CI/CD
 
 on:
   push:
@@ -767,7 +767,7 @@ jobs:
           # PGSSLMODE=disable: the sqlx PG driver defaults to `require`, and the
           # service container below has no TLS. Production keeps the secure
           # default; this only relaxes the throwaway test database.
-          ZIGMODU_TEST_PG: "1"
+          ZMODU_TEST_PG: "1"
           # Enables the `zmodu introspectDatabasePostgres` live round-trip in
           # tools/zmodu/src/main.zig. The DSN deliberately carries no password:
           # that test shells out to `psql`, which takes the password from
@@ -1501,19 +1501,19 @@ jobs:
           cp -r zig-out/bin release/
           # no zig-out/lib: `zig build` only installs bin/
           cp README.md CHANGELOG.md LICENSE release/ 2>/dev/null || true
-          tar -czf zigmodu-${{ github.ref_name }}-linux-x86_64.tar.gz -C release .
+          tar -czf zmodu-${{ github.ref_name }}-linux-x86_64.tar.gz -C release .
           # Companion checksum in `sha256sum -c` format, generated next to the
           # tarball it describes (same step, same build) so the two can never
           # drift apart — a consumer can tell a truncated or tampered download
           # from a good one.
-          sha256sum zigmodu-${{ github.ref_name }}-linux-x86_64.tar.gz > zigmodu-${{ github.ref_name }}-linux-x86_64.tar.gz.sha256
+          sha256sum zmodu-${{ github.ref_name }}-linux-x86_64.tar.gz > zmodu-${{ github.ref_name }}-linux-x86_64.tar.gz.sha256
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            zigmodu-${{ github.ref_name }}-linux-x86_64.tar.gz
-            zigmodu-${{ github.ref_name }}-linux-x86_64.tar.gz.sha256
+            zmodu-${{ github.ref_name }}-linux-x86_64.tar.gz
+            zmodu-${{ github.ref_name }}-linux-x86_64.tar.gz.sha256
 
   # ── AI real-provider smoke (optional; runs only when LLM_API_KEY is set) ──
   ai-real-provider:

@@ -1,6 +1,6 @@
 const std = @import("std");
-const zigmodu = @import("zigmodu");
-const http = zigmodu.http;
+const zmodu = @import("zmodu");
+const http = zmodu.http;
 
 /// 租户解析中间件 — 建立请求级租户上下文（attr `tenant_id`）。
 ///
@@ -65,14 +65,14 @@ pub fn requireTenantId(ctx: *http.Context) !i64 {
 
 /// JWT + SQLite role→permission (`CatalogPermDb`) into `permissions` attr.
 pub fn jwtAuthMiddleware(
-    sec: *zigmodu.security.SecurityModule,
+    sec: *zmodu.security.SecurityModule,
     slot: *http.CatalogSlot,
-    db: *zigmodu.data.Client,
+    db: *zmodu.data.Client,
 ) !http.Middleware {
     return http.jwtAuthFromCatalogWithPermissions(
         sec,
         slot,
-        try zigmodu.security.CatalogPermDb.loaderFromClient(db),
+        try zmodu.security.CatalogPermDb.loaderFromClient(db),
         .{},
     );
 }

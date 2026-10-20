@@ -1,4 +1,4 @@
-# ZigModu 产品级评估报告
+# zmodu 产品级评估报告
 
 > **历史快照（2026-04-23 / v0.7.0），勿照做。** 评分、行数、测试数全部过期；
 > 其中的 TODO 项早已被后续版本实现或取代。现行的差距判断看
@@ -74,7 +74,7 @@ TH|## ✅ Phase 2 - API 清理与统一 - 已完成！
 VH|| # | 任务 | 状态 |
 HH||---|------|------|
 JR|| 2.1 | **选定并统一 API 路线** | ✅ Application 作为主API，Simplified 标记为 DEPRECATED |
-WK|| 2.2 | **统一错误类型** | ✅ ZigModuError 作为统一错误集，ValidationError 为 struct（非错误集） |
+WK|| 2.2 | **统一错误类型** | ✅ ZmoduError 作为统一错误集，ValidationError 为 struct（非错误集） |
 YN|| 2.3 | **API 层面的 std.Io 传递** | ✅ Application 持有并传递 io，SecurityModule 支持 optional io |
 YW|| 2.4 | **导出清理** | ✅ root.zig 重构为 PRIMARY/ADVANCED/DEPRECATED 三层结构 |
 

@@ -1,5 +1,5 @@
 //! Data domain: SQLx, Redis, ORM, Cache, Pool, Migrations.
-//! Import directly: `const data = @import("zigmodu").data;`
+//! Import directly: `const data = @import("zmodu").data;`
 
 /// Driver-agnostic SQL client (sqlite/postgres/mysql): open, tx, rows.
 pub const sqlx = @import("sqlx/sqlx.zig");

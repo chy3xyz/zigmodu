@@ -35,7 +35,7 @@ pub const ModuleLogger = struct {
 };
 
 /// The log scope, reachable as `ModuleLogger.LogScope` — the path
-/// `zigmodu.observability.LogScope` re-exports for consumers.
+/// `zmodu.observability.LogScope` re-exports for consumers.
 const ScopeImpl = struct {
     pub const default_level = std.log.Level.info;
 
@@ -55,10 +55,10 @@ const ScopeImpl = struct {
     /// A suffix that does not fit is cut at the last whole field.
     pub const suffix_capacity = 256;
 
-    /// Emits one line through the framework's `zigmodu` log scope. `level` is
+    /// Emits one line through the framework's `zmodu` log scope. `level` is
     /// comptime so `std.log`'s compile-time filtering still applies.
     fn emitAt(comptime level: std.log.Level, comptime fmt: []const u8, args: anytype) void {
-        const scoped_log = std.log.scoped(.zigmodu);
+        const scoped_log = std.log.scoped(.zmodu);
         switch (level) {
             .debug => scoped_log.debug(fmt, args),
             .info => scoped_log.info(fmt, args),
@@ -82,7 +82,7 @@ const ScopeImpl = struct {
             /// findable from a trace and vice versa:
             ///
             /// ```zig
-            /// const log = zigmodu.observability.LogScope.scope("payments")
+            /// const log = zmodu.observability.LogScope.scope("payments")
             ///     .withField("trace_id", ctx.traceId() orelse "");
             /// log.info("charged {d}", .{amount});
             /// ```
@@ -172,19 +172,19 @@ const ScopeImpl = struct {
             }
 
             pub fn debug(comptime fmt: []const u8, args: anytype) void {
-                std.log.scoped(.zigmodu).debug(module_prefix ++ fmt, args);
+                std.log.scoped(.zmodu).debug(module_prefix ++ fmt, args);
             }
 
             pub fn info(comptime fmt: []const u8, args: anytype) void {
-                std.log.scoped(.zigmodu).info(module_prefix ++ fmt, args);
+                std.log.scoped(.zmodu).info(module_prefix ++ fmt, args);
             }
 
             pub fn warn(comptime fmt: []const u8, args: anytype) void {
-                std.log.scoped(.zigmodu).warn(module_prefix ++ fmt, args);
+                std.log.scoped(.zmodu).warn(module_prefix ++ fmt, args);
             }
 
             pub fn err(comptime fmt: []const u8, args: anytype) void {
-                std.log.scoped(.zigmodu).err(module_prefix ++ fmt, args);
+                std.log.scoped(.zmodu).err(module_prefix ++ fmt, args);
             }
         };
     }

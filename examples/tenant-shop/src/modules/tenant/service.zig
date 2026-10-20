@@ -1,5 +1,5 @@
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 const model = @import("model.zig");
 const persistence = @import("persistence.zig");
 const enums = @import("../../business/enums.zig");
@@ -20,7 +20,7 @@ pub fn TenantService(comptime Persistence: type) type {
 
         pub fn create(self: *Self, name: []const u8, domain: []const u8, tier_str: []const u8) !model.Tenant {
             if (name.len < 2) return error.InvalidInput;
-            const now: i64 = @intCast(zigmodu.time.monotonicNowSeconds());
+            const now: i64 = @intCast(zmodu.time.monotonicNowSeconds());
             const tier = enums.TenantTier.fromString(tier_str);
             const tenant = model.Tenant{
                 .id = 0,
@@ -41,7 +41,7 @@ pub fn TenantService(comptime Persistence: type) type {
             return try self.persistence.findById(id);
         }
 
-        pub fn listActive(self: *Self) !zigmodu.data.sqlx.QueryResult(model.Tenant) {
+        pub fn listActive(self: *Self) !zmodu.data.sqlx.QueryResult(model.Tenant) {
             return try self.persistence.findAll();
         }
     };

@@ -1,6 +1,6 @@
 const std = @import("std");
-const zigmodu = @import("zigmodu");
-const data = zigmodu.data;
+const zmodu = @import("zmodu");
+const data = zmodu.data;
 const model = @import("model.zig");
 const enums = @import("../../business/enums.zig");
 const order_persist = @import("persistence.zig");
@@ -48,7 +48,7 @@ pub const OrderService = struct {
         if (items.len == 0) return error.InvalidInput;
 
         var total: i64 = 0;
-        const now: i64 = @intCast(zigmodu.time.monotonicNowSeconds());
+        const now: i64 = @intCast(zmodu.time.monotonicNowSeconds());
 
         var priced = try self.allocator.alloc(struct { product_id: i64, qty: i64, price_cents: i64 }, items.len);
         defer self.allocator.free(priced);

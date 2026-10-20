@@ -1,6 +1,6 @@
 const std = @import("std");
-const zigmodu = @import("zigmodu");
-const http = zigmodu.http;
+const zmodu = @import("zmodu");
+const http = zmodu.http;
 
 /// Storefront BFF — thin orchestration over order + payment services.
 pub fn ShopBffApi(comptime OrderService: type, comptime PaymentService: type) type {

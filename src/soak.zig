@@ -18,8 +18,8 @@
 
 const std = @import("std");
 const RouteRegistrar = @import("api/RouteRegistrar.zig").RouteRegistrar;
-const zigmodu = @import("zigmodu");
-const http = zigmodu.http;
+const zmodu = @import("zmodu");
+const http = zmodu.http;
 const build_options = @import("build_options");
 const history = @import("test/run_history.zig");
 
@@ -28,7 +28,7 @@ const iterations: usize = build_options.soak_iterations;
 
 const tenants = [_][]const u8{ "1", "2", "3", "4", "5", "6", "7", "8" };
 
-var registry: zigmodu.FrozenStringMap(i64) = undefined;
+var registry: zmodu.FrozenStringMap(i64) = undefined;
 
 fn tenantMiddleware(ctx: *http.Context, next: http.HandlerFn, _: ?*anyopaque) anyerror!void {
     // Stands in for the JWT middleware: the identity is established once, and
@@ -132,10 +132,10 @@ fn clientWorker(ctx: *ClientCtx) void {
 
 test "soak: N clients x M tenants — zero cross-tenant reads" {
     const allocator = std.testing.allocator;
-    if (!zigmodu.NetworkProbe.available()) return error.SkipZigTest;
+    if (!zmodu.NetworkProbe.available()) return error.SkipZigTest;
     const started_ns = std.Io.Timestamp.now(std.testing.io, .awake).nanoseconds;
 
-    registry = zigmodu.FrozenStringMap(i64).init(allocator);
+    registry = zmodu.FrozenStringMap(i64).init(allocator);
     defer registry.deinit();
     for (tenants, 0..) |t, i| {
         try registry.put(t, @intCast(1000 + i));
@@ -235,7 +235,7 @@ fn writeHistory(duration_ms: i64) void {
 }
 
 const MapCtx = struct {
-    map: *zigmodu.FrozenStringMap(i64),
+    map: *zmodu.FrozenStringMap(i64),
     tenant: []const u8,
     expect: i64,
     failure: *Failure,
@@ -258,7 +258,7 @@ fn mapWorker(ctx: *MapCtx) void {
 
 test "soak: frozen registry — concurrent readers + rejected writers" {
     const allocator = std.testing.allocator;
-    var map = zigmodu.FrozenStringMap(i64).init(allocator);
+    var map = zmodu.FrozenStringMap(i64).init(allocator);
     defer map.deinit();
     for (tenants, 0..) |t, i| try map.put(t, @intCast(i));
     map.freeze();

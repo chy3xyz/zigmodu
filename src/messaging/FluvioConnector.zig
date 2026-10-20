@@ -361,7 +361,7 @@ test "FluvioConnector produce and consume" {
 
     if (!connector.isAvailable()) return error.SkipZigTest;
 
-    const test_topic = "zigmodu-test";
+    const test_topic = "zmodu-test";
 
     // Create topic (ignore if already exists)
     connector.createTopic(test_topic, 1) catch {};

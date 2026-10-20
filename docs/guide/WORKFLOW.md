@@ -17,7 +17,7 @@ WAL 持久化）与 `ai/workflow.zig`（AI 流程，同样有 WAL + resume）。
 | `compensating` 中途 | 拒绝 | 补偿做了一半，该由人决定，不是框架猜 |
 
 ```zig
-var orch = zigmodu.SagaOrchestrator.init(allocator);
+var orch = zmodu.SagaOrchestrator.init(allocator);
 defer orch.deinit();
 orch.setWal(&wal);                      // 真持久：分段文件 + fsync
 try orch.registerSaga("order", steps);  // 启动时重新注册（闭包在定义里）

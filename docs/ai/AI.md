@@ -1,12 +1,12 @@
 # AI Chat Module — 使用指南
 
 > 本文档描述 **LLM 对话 / Agent 产品能力**（`zmodu scaffold --with-aichat` / `--with-agent`）。  
-> 写 ZigModu 框架代码的 coding agent 请读：[AGENTS.md](../../AGENTS.md)。  
+> 写 zmodu 框架代码的 coding agent 请读：[AGENTS.md](../../AGENTS.md)。  
 > `zmodu mcp` 是 **codegen** MCP 服务端，与运行时 `SkillRegistry` 正交。
 > 在业务系统里完整接入 AI（KeyManager / Agent / Workflow / 自定义技能 / MCP）
 > 请读：[AI_DEV_GUIDE.md](./AI_DEV_GUIDE.md)。
 
-## 核心 API（zigmodu.ai）
+## 核心 API（zmodu.ai）
 
 | 类型 | 作用 |
 |------|------|
@@ -19,7 +19,7 @@
 | `TokenQuota` | 租户 token 配额骨架（`tryConsume` / `record` / Prometheus） |
 
 ```zig
-var registry = zigmodu.ai.SkillRegistry.init(allocator, io);
+var registry = zmodu.ai.SkillRegistry.init(allocator, io);
 defer registry.deinit();
 try registry.register(.{
     .name = "ping",
@@ -30,8 +30,8 @@ try registry.register(.{
 });
 
 // 用 AgentSpec 装配：裸 `Agent{}` 漏掉 `.guard` 就是无界（任何注册工具都能跑）。
-var guard = zigmodu.ai.Guard.init(.{ .allow = &.{"ping"}, .allow_execute = false });
-var spec = zigmodu.ai.AgentSpec{
+var guard = zmodu.ai.Guard.init(.{ .allow = &.{"ping"}, .allow_execute = false });
+var spec = zmodu.ai.AgentSpec{
     .name = "ping-agent",      // 身份：进日志与指标标签
     .provider = &provider,
     .skills = &registry,
@@ -41,7 +41,7 @@ var spec = zigmodu.ai.AgentSpec{
     .tool_timeout_ms = 5_000,  // 协作式超时（handler 应 checkDeadline）
 };
 var agent = spec.build();
-var skill_ctx = zigmodu.ai.SkillContext{ .allocator = allocator };
+var skill_ctx = zmodu.ai.SkillContext{ .allocator = allocator };
 var result = try agent.run(allocator, "ping the system", &skill_ctx, 5);
 defer result.deinit(allocator);
 ```
@@ -82,8 +82,8 @@ zmodu scaffold --sql schema.sql --name myapp --with-aichat
 
 ```
 src/modules/ai/chat/
-├── provider.zig    # AiProvider（re-export zigmodu.ai.AiProvider）
-├── sse.zig         # SseWriter（re-export zigmodu.http.SseWriter）
+├── provider.zig    # AiProvider（re-export zmodu.ai.AiProvider）
+├── sse.zig         # SseWriter（re-export zmodu.http.SseWriter）
 ├── service.zig     # 多轮对话 + 记忆 + token 预算
 ├── api.zig         # REST 端点
 ├── model.zig       # AiConversation, AiMessage
@@ -97,7 +97,7 @@ src/modules/ai/chat/
 
 ```zig
 // 创建 HTTP 客户端（连接池复用；HTTPS 走 std TLS，不进明文池）
-var http_client = zigmodu.http.HttpClient.init(allocator, io, 10, 30000);
+var http_client = zmodu.http.HttpClient.init(allocator, io, 10, 30000);
 defer http_client.deinit();
 
 // 初始化 AiProvider
@@ -117,7 +117,7 @@ try ai_provider.enableRateLimit(io, 60);
 ai_chat_svc.setProvider(&ai_provider);
 ai_chat_svc.setSystemPrompt("你是一个有用的助手");
 // 可选：租户配额
-// var quota = zigmodu.ai.TokenQuota.init(allocator, io, 1_000_000);
+// var quota = zmodu.ai.TokenQuota.init(allocator, io, 1_000_000);
 // ai_chat_svc.setQuota(&quota);
 ```
 
@@ -128,25 +128,25 @@ ai_chat_svc.setSystemPrompt("你是一个有用的助手");
 
 ```zig
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
 
     const ai_chat = @import("modules/ai/chat/module.zig");
-    var db_client = zigmodu.data.Client.init(allocator, io, .{
+    var db_client = zmodu.data.Client.init(allocator, io, .{
         .driver = .sqlite,
         .sqlite_path = "app.db",
     });
     defer db_client.deinit();
     try db_client.connect();
-    var backend = zigmodu.data.SqlxBackend{ .allocator = allocator, .client = &db_client };
+    var backend = zmodu.data.SqlxBackend{ .allocator = allocator, .client = &db_client };
     var ai_chat_p = ai_chat.persistence.AiChatPersistence.init(backend);
     var ai_chat_svc = ai_chat.service.AiChatService.init(allocator, &ai_chat_p);
 
     // Provider
-    var http_client = zigmodu.http.HttpClient.init(allocator, io, 10, 30000);
+    var http_client = zmodu.http.HttpClient.init(allocator, io, 10, 30000);
     defer http_client.deinit();
     var ai_provider = ai_chat.provider.AiProvider.init(
         allocator, &http_client,
@@ -159,17 +159,17 @@ pub fn main(init: std.process.Init) !void {
     ai_chat_svc.setSystemPrompt("你是一个有用的助手");
 
     // Memory（可选）
-    var memory = zigmodu.ai.MemoryStore.init(allocator, io);
+    var memory = zmodu.ai.MemoryStore.init(allocator, io);
     defer memory.deinit();
     ai_chat_svc.setMemory(&memory);
 
     // 服务器：scope.mountAll 挂模块（鉴权接线见 docs/reference/ROUTE_TABLE.md §7）
-    var server = zigmodu.http.Server.init(io, allocator, 8080);
+    var server = zmodu.http.Server.init(io, allocator, 8080);
     defer server.deinit();
     var ai_chat_api = ai_chat.api.AiChatApi.init(&ai_chat_svc);
     const AppState = struct {};
     var app_state: AppState = .{};
-    var router = zigmodu.http.Router(AppState).init(io, allocator, &server, &app_state);
+    var router = zmodu.http.Router(AppState).init(io, allocator, &server, &app_state);
     defer router.deinit();
     try router.scope("").mountAll(.{
         .{ .Mod = @TypeOf(ai_chat_api), .state = &ai_chat_api },
@@ -216,7 +216,7 @@ ai_chat_svc.max_context = 20;       // 最多加载 20 条历史消息
 ## 跨会话记忆
 
 ```zig
-var memory = zigmodu.ai.MemoryStore.init(allocator, io);
+var memory = zmodu.ai.MemoryStore.init(allocator, io);
 defer memory.deinit();
 
 // 键格式：namespace:category:detail
@@ -257,8 +257,8 @@ memory.max_entries = 50000;
 ## Agent 观测
 
 ```zig
-var guard = zigmodu.ai.Guard.init(.{ .allow = &.{"ping"}, .allow_execute = false });
-var spec = zigmodu.ai.AgentSpec{
+var guard = zmodu.ai.Guard.init(.{ .allow = &.{"ping"}, .allow_execute = false });
+var spec = zmodu.ai.AgentSpec{
     .name = "ping-agent",
     .provider = &provider,
     .skills = &registry,
@@ -278,20 +278,20 @@ const prom = try agent.metrics.toPrometheusFormat(allocator, "ops");
 defer allocator.free(prom);
 
 // 审计
-var audit = try zigmodu.ai.AgentAuditLog.init(allocator, io, 256);
+var audit = try zmodu.ai.AgentAuditLog.init(allocator, io, 256);
 defer audit.deinit();
 agent.audit = &audit;
 
 // 人机 / 策略门：拒绝危险工具
 agent.hooks.on_tool_request = struct {
-    fn f(_: ?*anyopaque, name: []const u8, _: []const u8) zigmodu.ai.ToolApproval {
+    fn f(_: ?*anyopaque, name: []const u8, _: []const u8) zmodu.ai.ToolApproval {
         if (std.mem.eql(u8, name, "delete_all")) return .deny;
         return .allow;
     }
 }.f;
 
 // RAG（可选）
-var kr = zigmodu.ai.KeywordRetriever.init(allocator);
+var kr = zmodu.ai.KeywordRetriever.init(allocator);
 defer kr.deinit();
 try kr.add("pol", "Refunds within 14 days", "policy");
 const chunks = try kr.asRetriever().retrieve(allocator, "refund", 3);
@@ -307,7 +307,7 @@ defer kr.asRetriever().free(allocator, chunks);
 const msg = try ai_chat_svc.send(conv_id, "你好", null);
 
 // 流式 SSE — 逐字输出（对应生成的 POST /ai/chat/stream 路由）
-var sse = try zigmodu.http.SseWriter.init(ctx);
+var sse = try zmodu.http.SseWriter.init(ctx);
 const msg = try ai_chat_svc.send(conv_id, "讲个故事", &sse);
 try sse.done();
 ```
@@ -321,7 +321,7 @@ tool / done）。参考实现见 `examples/ai-ops`（`POST /api/ai/chat/stream`�
 含 in-process mock LLM 的端到端测试）：
 
 ```zig
-var sse = try zigmodu.http.sse(ctx);
+var sse = try zmodu.http.sse(ctx);
 var bridge = ai.stream_sse.DeltaSse(@TypeOf(sse)).init(allocator, &sse);
 agent.hooks.ctx = &bridge;
 agent.hooks.on_delta = @TypeOf(bridge).onDelta;
@@ -347,7 +347,7 @@ try sse.done();
 ## SSE API 参考
 
 ```zig
-var sse = try zigmodu.http.SseWriter.init(ctx);
+var sse = try zmodu.http.SseWriter.init(ctx);
 
 // 命名事件
 try sse.sendEvent("message", "hello");
@@ -386,17 +386,17 @@ const ratio = ai_provider.cacheHitRatio(); // 0.0 - 1.0
 ## Token 估算
 
 ```zig
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
-const tokens = zigmodu.ai.estimateTokens("Hello, 你好");
+const tokens = zmodu.ai.estimateTokens("Hello, 你好");
 // 英文 ~4 chars/token, 中日韩 ~1 char/token
 // 精度 ±20%
 
-const msgs = &[_]zigmodu.ai.AiProvider.ChatMsg{
+const msgs = &[_]zmodu.ai.AiProvider.ChatMsg{
     .{ .role = "system", .content = "You are helpful." },
     .{ .role = "user", .content = "Hi" },
 };
-const total = zigmodu.ai.estimateMessages(msgs);
+const total = zmodu.ai.estimateMessages(msgs);
 ```
 
 ## 配置选项
@@ -430,11 +430,11 @@ ai_provider.temperature = 0.7;         // 温度
 ## 与 Scheduler 集成（AI → cron 薄桥）
 
 框架提供**受控的排程桥**：Agent 只能把**预先注册的命名任务**挂到 cron 表达式上，
-LLM 永远不提供代码（保持「受控执行」姿态）。桥接方向：`zigmodu.ai.registerScheduleSkills`。
+LLM 永远不提供代码（保持「受控执行」姿态）。桥接方向：`zmodu.ai.registerScheduleSkills`。
 
 ```zig
-const Scheduler = zigmodu.cron.Scheduler;
-const ai = zigmodu.ai;
+const Scheduler = zmodu.cron.Scheduler;
+const ai = zmodu.ai;
 
 // 1) 预注册可排程任务（纯 Zig 函数）
 const tasks = [_]ai.ScheduledTask{
@@ -465,6 +465,6 @@ try ai.registerScheduleSkills(&registry);
 
 - `Scheduler` 是线程化的：`start()` 起后台线程，每秒 tick 一次，按分钟粒度触发 cron 任务；`addJob` 与 `tick` 互斥保护，可随时加任务。
 - `schedule_job` 只接受**已注册任务名 + cron 表达式**；未知任务返回 `error.TaskNotFound`。
-- 另一个方向（cron → AI）：`Scheduler` 的 task 里直接同步调用 `AiProvider.chat/chatStream` 即可（如定时摘要）；注意 HTTP 出站在线程内的 io 使用约束（见 [ZIGMODU_NOTES.md](../archive/status/ZIGMODU_NOTES.md) 第 3 条）。
+- 另一个方向（cron → AI）：`Scheduler` 的 task 里直接同步调用 `AiProvider.chat/chatStream` 即可（如定时摘要）；注意 HTTP 出站在线程内的 io 使用约束（见 [ZMODU_NOTES.md](../archive/status/ZMODU_NOTES.md) 第 3 条）。
 - `ScheduledTask.TaskScheduler`（旧占位实现）**已移除**；调度统一走
-  `Scheduler`（线程化）与 `zigmodu.ai.registerScheduleSkills` 技能桥。
+  `Scheduler`（线程化）与 `zmodu.ai.registerScheduleSkills` 技能桥。

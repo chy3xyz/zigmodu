@@ -1,15 +1,15 @@
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 // ============================================
-// Example 4: Testing with ZigModu
+// Example 4: Testing with zmodu
 // ============================================
 // Demonstrates: ModuleTestContext, mock modules, Application lifecycle and
 // dependency validation. Run with: zig build test
 
 // Module under test
 const CalculatorModule = struct {
-    pub const info = zigmodu.api.Module{
+    pub const info = zmodu.api.Module{
         .name = "calculator",
         .description = "Simple calculator for testing demo",
         .dependencies = &.{},
@@ -49,7 +49,7 @@ const CalculatorModule = struct {
 
 // Service layer depending on the module above
 const CalculatorService = struct {
-    pub const info = zigmodu.api.Module{
+    pub const info = zmodu.api.Module{
         .name = "calculator_service",
         .description = "Service layer using calculator",
         .dependencies = &.{"calculator"},
@@ -62,7 +62,7 @@ const CalculatorService = struct {
 test "module lifecycle: start runs init, stop runs deinit" {
     try std.testing.expect(!CalculatorModule.isInitialized());
 
-    var app = try zigmodu.Application.init(
+    var app = try zmodu.Application.init(
         std.testing.io,
         std.testing.allocator,
         "lifecycle",
@@ -79,10 +79,10 @@ test "module lifecycle: start runs init, stop runs deinit" {
 }
 
 test "mock module can be registered and looked up" {
-    var ctx = try zigmodu.ModuleTestContext.init(std.testing.allocator, "mock_calculator");
+    var ctx = try zmodu.ModuleTestContext.init(std.testing.allocator, "mock_calculator");
     defer ctx.deinit();
 
-    try ctx.registerMockModule(zigmodu.createMockModule(
+    try ctx.registerMockModule(zmodu.createMockModule(
         "mock_calculator",
         "Mock calculator for testing",
         &.{},
@@ -94,7 +94,7 @@ test "mock module can be registered and looked up" {
 }
 
 test "calculator basic operations" {
-    var app = try zigmodu.Application.init(
+    var app = try zmodu.Application.init(
         std.testing.io,
         std.testing.allocator,
         "test",
@@ -112,7 +112,7 @@ test "calculator basic operations" {
 }
 
 test "calculator division by zero" {
-    var app = try zigmodu.Application.init(
+    var app = try zmodu.Application.init(
         std.testing.io,
         std.testing.allocator,
         "test",
@@ -129,7 +129,7 @@ test "calculator division by zero" {
 
 test "module dependency validation" {
     // Succeeds because calculator_service declares calculator as a dependency
-    var app = try zigmodu.Application.init(
+    var app = try zmodu.Application.init(
         std.testing.io,
         std.testing.allocator,
         "test",
@@ -139,5 +139,5 @@ test "module dependency validation" {
     defer app.deinit();
 
     try app.start();
-    try std.testing.expectEqual(zigmodu.Application.State.started, app.getState());
+    try std.testing.expectEqual(zmodu.Application.State.started, app.getState());
 }

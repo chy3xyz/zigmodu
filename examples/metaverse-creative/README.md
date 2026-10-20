@@ -1,4 +1,4 @@
-# Metaverse Creative — ZigModu × zent
+# Metaverse Creative — zmodu × zent
 
 **结构升级**：创意资产 = 三域（problem / solution / world），见 [`METHOD.md`](METHOD.md)。  
 **业务不变**：身份仍以 **DID** 为键（注册 / 声誉 / 验证 / 归属 / 访客），不拆成数字 ID 业务主键。  

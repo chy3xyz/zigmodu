@@ -1,8 +1,8 @@
 //! zmsaas — versioned schema (MigrationRunner) + RBAC grants.
 //! DDL 走框架 MigrationRunner（history 表 + checksum），不再手写 apply 循环。
 const std = @import("std");
-const zigmodu = @import("zigmodu");
-const data = zigmodu.data;
+const zmodu = @import("zmodu");
+const data = zmodu.data;
 
 pub fn apply(client: *data.Client, allocator: std.mem.Allocator, io: std.Io) !void {
     var runner = data.MigrationRunner.init(allocator);
@@ -10,11 +10,11 @@ pub fn apply(client: *data.Client, allocator: std.mem.Allocator, io: std.Io) !vo
     // Rolling deploys start several replicas at once: without this guard two of
     // them can apply the same DDL concurrently. TTL covers the slowest
     // migration; a crashed holder's lock is reaped after it elapses.
-    var migration_lock = try zigmodu.DistributedLock.SqlLock(@TypeOf(client.*)).init(
+    var migration_lock = try zmodu.DistributedLock.SqlLock(@TypeOf(client.*)).init(
         allocator,
         io,
         client,
-        "zigmodu_migration_lock",
+        "zmodu_migration_lock",
         .sqlite,
     );
     defer migration_lock.deinit();
@@ -56,10 +56,10 @@ pub fn pendingCount(ctx: ?*anyopaque) anyerror!usize {
 
 /// RBAC: role → permission grants for the orders module.
 pub fn grants(client: *data.Client) !void {
-    try zigmodu.security.CatalogPermDb.ensureSchema(client);
-    try zigmodu.security.CatalogPermDb.grant(client, "admin", "orders:read");
-    try zigmodu.security.CatalogPermDb.grant(client, "admin", "orders:write");
-    try zigmodu.security.CatalogPermDb.grant(client, "owner", "orders:read");
-    try zigmodu.security.CatalogPermDb.grant(client, "owner", "orders:write");
-    try zigmodu.security.CatalogPermDb.grant(client, "user", "orders:read");
+    try zmodu.security.CatalogPermDb.ensureSchema(client);
+    try zmodu.security.CatalogPermDb.grant(client, "admin", "orders:read");
+    try zmodu.security.CatalogPermDb.grant(client, "admin", "orders:write");
+    try zmodu.security.CatalogPermDb.grant(client, "owner", "orders:read");
+    try zmodu.security.CatalogPermDb.grant(client, "owner", "orders:write");
+    try zmodu.security.CatalogPermDb.grant(client, "user", "orders:read");
 }

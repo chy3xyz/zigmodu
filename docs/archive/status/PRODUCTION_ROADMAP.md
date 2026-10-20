@@ -1,4 +1,4 @@
-# ZigModu 生产级路线图（修订版）
+# zmodu 生产级路线图（修订版）
 
 **版本口径**: v0.40.0 · Zig 0.17.0  
 **最后更新**: 2026-08-27  
@@ -186,7 +186,7 @@ gRPC 的价值与**通信距离**成正比，modulith 的核心通信都在**进
   + `/health/*`），顺序约束见 `ROUTE_TABLE.md` §7.4。
 - ✅ WS 出站背压 `ws_write_timeout_ms`（`SO_SNDTIMEO`）+ `WsFramer.isWritable()`。
 - ✅ 并发浸泡测试 `zig build soak`；沙箱隔离 `-Dnet-tests=false`。
-- ✅ 观测闭环：`docs/OBSERVABILITY.md` + `docs/grafana/zigmodu-overview.json`。
+- ✅ 观测闭环：`docs/OBSERVABILITY.md` + `docs/grafana/zmodu-overview.json`。
 - ✅ 部署参考拓扑 `examples/production-deploy/`（nginx/Envoy/k8s/systemd）。
 - ✅ 韧性三件套：`FrozenMap` / `panicHook` / audit b19–b24（b23 = 分配器归属，b24 = 非 CSPRNG 熵源）。
 - ✅ 启动预检 `Preflight`（env / 占位 secret / DB / 待应用迁移 / 时钟）；
@@ -195,7 +195,7 @@ gRPC 的价值与**通信距离**成正比，modulith 的核心通信都在**进
   指标按 `ctx.route_template` 受限基数打标签。
 - ✅ 故障注入测试（熔断/限流走完整 HTTP 链路）与契约门禁模板
   （`src/test/FaultInjection.zig` · `src/test/ContractGate.zig`）。
-- ✅ `DistributedLock` 的 `.postgres` 方言在真实 PG 上验证（`ZIGMODU_TEST_PG=1`，
+- ✅ `DistributedLock` 的 `.postgres` 方言在真实 PG 上验证（`ZMODU_TEST_PG=1`，
   CI `test-postgres` 已接入）；`.mysql` 仍待真实库验证。
 - ✅ 旗舰示例 `tenant-mgmt` 改为 `productionProfile`；CI 增加夜间 soak job。
 
@@ -263,7 +263,7 @@ Agent / Workflow / Skill / MCP / LLM 策略等**业务产品能力**，不是后
 **抽取前置条件**（未满足，故不排期）：
 1. 明确 `zmodu.ai` 对核心域的依赖清单，并把它降为"仅公开 API"（不碰内部类型）。
 2. 给 `ai` 定义自己的 `build.zig.zon` 与版本线，示例改为独立依赖。
-3. 确认没有消费者从 `zigmodu.ai` 反向依赖框架内部（当前示例均只用公开面）。
+3. 确认没有消费者从 `zmodu.ai` 反向依赖框架内部（当前示例均只用公开面）。
 
 **当下结论**：保持同仓但**守住边界**；不要往核心域加 `ai` 引用。
 
@@ -271,12 +271,12 @@ Agent / Workflow / Skill / MCP / LLM 策略等**业务产品能力**，不是后
 
 **2026-08 对照核实**：Spring Modulith 无真正分布式（无 RPC/服务发现），其演进出口是
 **进程内事件 → 事务性 outbox 外部化**（`event_publication` 表 + 异步转发 Kafka/RabbitMQ/JMS，
-严格 outbox 到 2.1 才引入且靠第三方 Namastack/JobRunr）。zigmodu 已原生对齐且更强：
+严格 outbox 到 2.1 才引入且靠第三方 Namastack/JobRunr）。zmodu 已原生对齐且更强：
 `OutboxPublisher`（业务事务内写 `event_outbox` + 同事务提交 → 轮询投递 → retry/DLQ/多租户/三方言）+ `DistributedEventBus`（WAL + 一致哈希，Spring 没有）。
 
 **因此拆分出口的下一步是补 outbox 治理差距（中成本，拆分前做）**：
 - **显式重发 API**：按失败时间/次数策略 `resubmit()`（Spring 有
-  `FailedEventPublications.resubmit()` + Staleness Monitor；zigmodu 目前只有
+  `FailedEventPublications.resubmit()` + Staleness Monitor；zmodu 目前只有
   retry + DLQ + `stale_threshold_seconds` 自动机制，缺手动治理入口）
 - 事件契约显式边界：`@Externalized` 式 payload/routing 映射（当前 outbox 事件直接投递，
   无"内部事件 → 对外稳定契约"的映射层）

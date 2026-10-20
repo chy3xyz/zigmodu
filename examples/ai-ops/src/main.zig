@@ -24,11 +24,11 @@
 //!       + the streaming endpoint against an in-process mock LLM)
 
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
-const ai = zigmodu.ai;
-const sqlx = zigmodu.data.sqlx;
-const http = zigmodu.http;
+const ai = zmodu.ai;
+const sqlx = zmodu.data.sqlx;
+const http = zmodu.http;
 
 /// LLM upstream for the streaming endpoint (env-configured in `main`,
 /// pointed at an in-process mock in tests).
@@ -60,7 +60,7 @@ fn streamChatHandler(ctx: *http.Context) !void {
     };
     defer parsed.deinit();
 
-    var client = zigmodu.http.HttpClient.init(allocator, ctx.io.?, 1, 30000);
+    var client = zmodu.http.HttpClient.init(allocator, ctx.io.?, 1, 30000);
     defer client.deinit();
     var provider = ai.AiProvider.init(allocator, &client, config.base_url, config.api_key, config.model);
     var registry = ai.SkillRegistry.init(allocator, ctx.io.?);
@@ -154,8 +154,8 @@ fn runDemo(allocator: std.mem.Allocator, io: std.Io, verbose: bool, serve: bool,
         &.{},
     );
 
-    var backend = zigmodu.data.SqlxBackend{ .allocator = allocator, .client = &client };
-    var outbox = zigmodu.outbox.OutboxPublisher.init(allocator, .{ .max_retries = 3 });
+    var backend = zmodu.data.SqlxBackend{ .allocator = allocator, .client = &client };
+    var outbox = zmodu.outbox.OutboxPublisher.init(allocator, .{ .max_retries = 3 });
     // A run has an identity: the escalated approval carries this tenant, and
     // the HTTP API resolves only inside it (an unscoped escalation is invisible
     // to every scoped request by design).
@@ -255,13 +255,13 @@ fn runDemo(allocator: std.mem.Allocator, io: std.Io, verbose: bool, serve: bool,
         var consumed: usize = 0;
     };
     const Consumer = struct {
-        fn call(_: *anyopaque, _: std.mem.Allocator, entry: zigmodu.outbox.OutboxEntry) anyerror!void {
+        fn call(_: *anyopaque, _: std.mem.Allocator, entry: zmodu.outbox.OutboxEntry) anyerror!void {
             ConsumerState.consumed += 1;
             _ = entry;
         }
     };
     var dummy: u8 = 0;
-    var consumer = zigmodu.outbox.OutboxConsumer.init(allocator, &backend, .{}, &dummy, Consumer.call);
+    var consumer = zmodu.outbox.OutboxConsumer.init(allocator, &backend, .{}, &dummy, Consumer.call);
     const poll = try consumer.pollOnce();
 
     if (verbose) {

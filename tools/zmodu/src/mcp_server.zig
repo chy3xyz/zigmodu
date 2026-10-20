@@ -105,7 +105,7 @@ fn buildInitialize(allocator: std.mem.Allocator, id: ?i64) !std.json.Value {
 fn buildToolsList(allocator: std.mem.Allocator, id: ?i64) !std.json.Value {
     var tools = std.json.Array.init(allocator);
 
-    try tools.append(try makeToolSchema(allocator, "zmodu_scaffold", "Generate a full ZigModu project from SQL DDL", &.{
+    try tools.append(try makeToolSchema(allocator, "zmodu_scaffold", "Generate a full zmodu project from SQL DDL", &.{
         .{ .name = "sql_path", .type = "string", .desc = "Path to SQL file" },
         .{ .name = "output_dir", .type = "string", .desc = "Output directory" },
         .{ .name = "diff_old_sql", .type = "string", .desc = "Path to old SQL file for diff (incremental)", .opt = true },

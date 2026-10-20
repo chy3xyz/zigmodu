@@ -41,7 +41,7 @@ test "idempotency middleware replays stored response" {
 
     var ctx = try server_mod.Context.init(allocator, .POST, "orders");
     defer ctx.deinit();
-    // Request headers are lowercase in Context (ZigModu rule).
+    // Request headers are lowercase in Context (zmodu rule).
     const hk = try allocator.dupe(u8, "idempotency-key");
     const hv = try allocator.dupe(u8, "k-1");
     try ctx.headers.put(hk, hv);

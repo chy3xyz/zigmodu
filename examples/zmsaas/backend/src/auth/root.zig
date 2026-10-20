@@ -1,9 +1,9 @@
 //! zmsaas auth — public login route issuing a tenant JWT.
 const std = @import("std");
-const http = @import("zigmodu").http;
-const zigmodu = @import("zigmodu");
+const http = @import("zmodu").http;
+const zmodu = @import("zmodu");
 
-pub var g_sec: ?*zigmodu.security.AppSecurity = null;
+pub var g_sec: ?*zmodu.security.AppSecurity = null;
 
 pub const AuthApi = struct {
     pub const module_name = "auth";

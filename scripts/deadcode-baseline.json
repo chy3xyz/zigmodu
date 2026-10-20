@@ -144,7 +144,7 @@
       "file": "src/main.zig",
       "line": 2,
       "kind": "constant",
-      "name": "zigmodu",
+      "name": "zmodu",
       "parent": null
     },
     {

@@ -428,10 +428,10 @@ test "OtlpExporter live HTTP export" {
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var exporter = try OtlpExporter.init(allocator, "zigmodu-test", ep);
+    var exporter = try OtlpExporter.init(allocator, "zmodu-test", ep);
     defer exporter.deinit();
 
-    var tracer = try DistributedTracer.init(allocator, "live", "zigmodu-test");
+    var tracer = try DistributedTracer.init(allocator, "live", "zmodu-test");
     defer tracer.deinit();
     const span = try tracer.startTrace("otlp.live");
     defer {

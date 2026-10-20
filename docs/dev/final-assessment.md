@@ -1,4 +1,4 @@
-# ZigModu Final Assessment
+# zmodu Final Assessment
 
 **Date**: 2026-05-11
 **Version**: v0.8.3
@@ -105,7 +105,7 @@
 ### Strengths
 
 - **Testing**: 345 tests, 0 failures, E2E integration tests for Server + Application
-- **Error handling**: unified `ZigModuError` (45+ variants) with `ErrorContext`, `ErrorHandler`, `Result(T)`
+- **Error handling**: unified `ZmoduError` (45+ variants) with `ErrorContext`, `ErrorHandler`, `Result(T)`
 - **Documentation**: Module contract in `api/Module.zig`, architecture review, performance review, API migration guide
 - **CI/CD**: GitHub Actions matrix build (Linux + macOS), Docker release, npm publish for zmodu
 - **Deprecation**: clear DEPRECATED markers on `Simplified.zig`, `Validator.zig`, `extensions.zig`

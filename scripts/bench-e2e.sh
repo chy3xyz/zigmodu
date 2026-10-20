@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # bench-e2e.sh [--requests N] [--json-out PATH] [--debug]
 #
-# End-to-end HTTP benchmark against a real ZigModu server: builds
+# End-to-end HTTP benchmark against a real zmodu server: builds
 # `examples/http-stress-test` (h2c enabled, `/ping` + `/json`) in **ReleaseFast**
 # — Debug is not a performance build: on the h2 path per-frame `std.log.debug`
 # alone costs an order of magnitude (275 req/s vs 13.5k measured) — starts it on

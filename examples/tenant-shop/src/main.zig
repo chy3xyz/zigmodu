@@ -1,5 +1,5 @@
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 // ═══════════════════════════════════════════════════
 // Multi-Tenant Shop (Modulith scaffold)
@@ -52,7 +52,7 @@ pub fn main(init: std.process.Init) !void {
 
     const sqlite_path = init.environ_map.get("TENANT_SHOP_SQLITE") orelse ":memory:";
     const is_memory = std.mem.eql(u8, sqlite_path, ":memory:");
-    var db_client = zigmodu.data.Client.init(allocator, io, .{
+    var db_client = zmodu.data.Client.init(allocator, io, .{
         .driver = .sqlite,
         .sqlite_path = sqlite_path,
         // :memory: must be single-conn; file DB can pool for outbox fiber.
@@ -64,7 +64,7 @@ pub fn main(init: std.process.Init) !void {
     try schema.apply(&db_client);
     std.log.info("[main] SQLite ready at {s}", .{sqlite_path});
 
-    var modules = try zigmodu.scanModules(allocator, .{
+    var modules = try zmodu.scanModules(allocator, .{
         tenant_module,
         user_module,
         product_module,
@@ -77,9 +77,9 @@ pub fn main(init: std.process.Init) !void {
     });
     defer modules.deinit();
 
-    try zigmodu.validateModules(&modules);
-    try zigmodu.startAll(&modules);
-    defer zigmodu.stopAll(&modules);
+    try zmodu.validateModules(&modules);
+    try zmodu.startAll(&modules);
+    defer zmodu.stopAll(&modules);
     std.log.info("[main] 9 modules validated and started", .{});
 
     const bootstrap = init.environ_map.get("ROBUSTMQ_URL") orelse init.environ_map.get("KAFKA_BOOTSTRAP");
@@ -132,12 +132,12 @@ pub fn main(init: std.process.Init) !void {
         break :blk 18090;
     };
 
-    var server = zigmodu.http.Server.init(io, allocator, port);
+    var server = zmodu.http.Server.init(io, allocator, port);
     defer server.deinit();
 
     const jwt_secret = init.environ_map.get("JWT_SECRET") orelse "dev-secret";
-    var app_sec = zigmodu.security.AppSecurity.init(allocator, io, .{ .jwt_secret = jwt_secret });
-    var catalog_slot: zigmodu.http.CatalogSlot = .{};
+    var app_sec = zmodu.security.AppSecurity.init(allocator, io, .{ .jwt_secret = jwt_secret });
+    var catalog_slot: zmodu.http.CatalogSlot = .{};
     defer catalog_slot.deinit();
 
     try server.addMiddleware(middleware.tenantMiddleware());
@@ -158,12 +158,12 @@ pub fn main(init: std.process.Init) !void {
     const ShopBffApiT = @TypeOf(shop_bff_api);
     const OutboxApiT = @TypeOf(outbox_http);
     const AdminBffApiT = @TypeOf(admin_bff_api);
-    comptime zigmodu.http.assertNoDupes(.{
+    comptime zmodu.http.assertNoDupes(.{
         TenantApiT, UserApiT,    ProductApiT, InventoryApiT, CartApiT,
         OrderApiT,  PaymentApiT, ShopBffApiT, OutboxApiT,    AdminBffApiT,
     });
 
-    var router = zigmodu.http.Router(AppState).init(io, allocator, &server, &app_state);
+    var router = zmodu.http.Router(AppState).init(io, allocator, &server, &app_state);
     defer router.deinit();
     router.default_auth = .public;
 
@@ -186,7 +186,7 @@ pub fn main(init: std.process.Init) !void {
     try server.addRoute(.{
         .method = .GET,
         .path = "openapi.json",
-        .handler = try zigmodu.http.openApiFromCatalog(&catalog_slot, .{
+        .handler = try zmodu.http.openApiFromCatalog(&catalog_slot, .{
             .title = "tenant-shop",
             .version = "0.1.0",
             .description = "ComptimeRouter catalog (live)",
@@ -197,7 +197,7 @@ pub fn main(init: std.process.Init) !void {
         .method = .GET,
         .path = "health/live",
         .handler = struct {
-            fn handle(ctx: *zigmodu.http.Context) !void {
+            fn handle(ctx: *zmodu.http.Context) !void {
                 try ctx.json(200, "{\"status\":\"UP\"}");
             }
         }.handle,

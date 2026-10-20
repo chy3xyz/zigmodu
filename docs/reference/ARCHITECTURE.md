@@ -2,7 +2,7 @@
 
 ## Overview
 
-ZigModu is designed around the concept of **modular architecture** (modulith), where an application is composed of loosely coupled, highly cohesive modules. This guide explains the architectural decisions and how to effectively use ZigModu in your projects.
+zmodu is designed around the concept of **modular architecture** (modulith), where an application is composed of loosely coupled, highly cohesive modules. This guide explains the architectural decisions and how to effectively use zmodu in your projects.
 
 **Day-one modulith + high-concurrency practices** (boundaries, fiber model, pooling, scale ladder): see **[MODULITH.md](../guide/MODULITH.md)** (中文专文).
 
@@ -10,7 +10,7 @@ ZigModu is designed around the concept of **modular architecture** (modulith), w
 
 ### What is a Module?
 
-A module in ZigModu is:
+A module in zmodu is:
 - A logical unit of functionality
 - A collection of related features
 - An independently deployable unit (in theory)
@@ -107,7 +107,7 @@ A module in ZigModu is:
 │  - Module API                       │
 │  - Event handlers                   │
 ├─────────────────────────────────────┤
-│  Framework Layer (zigmodu)          │
+│  Framework Layer (zmodu)          │
 │  - Module management                │
 │  - Event bus                        │
 │  - DI container                     │
@@ -520,7 +520,7 @@ CLI（报告+可选失败）跨模块直接 import 的纠缠     → doctor 的 
 
 ## Multi-Tenancy (Optional)
 
-**多租户不是框架强制能力。** ZigModu 核心（`Application`、HTTP Server、SQLx、EventBus）可在完全不启用租户逻辑的情况下运行，例如 [`examples/basic/`](../../examples/basic/) 就没有任何租户中间件或 `tenant_id` 过滤。
+**多租户不是框架强制能力。** zmodu 核心（`Application`、HTTP Server、SQLx、EventBus）可在完全不启用租户逻辑的情况下运行，例如 [`examples/basic/`](../../examples/basic/) 就没有任何租户中间件或 `tenant_id` 过滤。
 
 多租户相关代码位于 **可选基础设施层**，按需接入：
 
@@ -574,7 +574,7 @@ CLI（报告+可选失败）跨模块直接 import 的纠缠     → doctor 的 
   HTTP → catalog JWT（aud→tenant_id attr）→ [moduleGate] → permissionGate(.rbac)
        → [可选 TenantMiddleware / DataPermission] → handler
        → Service（显式传 tenant 值）→ SQL（WHERE tenant_id|app_id = ?）
-  启动时可选：zigmodu.setTenantColumn("app_id")  // 与 schema 列名对齐
+  启动时可选：zmodu.setTenantColumn("app_id")  // 与 schema 列名对齐
 ```
 
 要点：
@@ -582,7 +582,7 @@ CLI（报告+可选失败）跨模块直接 import 的纠缠     → doctor 的 
 1. **不挂租户中间件 = 单租户**，与 Spring 里不用 `@TenantLine` 一样。
 2. **`TenantContext.isActive()`** 为 false 时，拦截器不注入条件。
 3. **租户列名**：默认 `tenant_id`；ZigShop 等用 `app_id` 时调用 `setTenantColumn("app_id")`，且模型字段名与列名一致。`zmodu --tenant-column app_id` 生成对应 `WHERE` 与 `setTenantColumn`。
-4. **JWT 默认** `generateToken(user, roles)` 的 `aud` 为 `"zigmodu-app"`，不是租户 ID；租户 claim 用 `generateTokenWithTenant`；catalog 中间件写入 attr `tenant_id`。
+4. **JWT 默认** `generateToken(user, roles)` 的 `aud` 为 `"zmodu-app"`，不是租户 ID；租户 claim 用 `generateTokenWithTenant`；catalog 中间件写入 attr `tenant_id`。
 5. **`examples/tenant-mgmt`** 是最佳实践演示；鉴权栈见 [`ROUTE_TABLE.md`](./ROUTE_TABLE.md) §7、[`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)。
 6. Legacy `security.auth.jwtAuth` / `rbacJwtMiddleware` 仅写 `auth_info`；新应用优先 catalog 路径。
 
@@ -590,10 +590,10 @@ CLI（报告+可选失败）跨模块直接 import 的纠缠     → doctor 的 
 
 ## Conclusion
 
-ZigModu's architecture promotes:
+zmodu's architecture promotes:
 - **Modularity**: Clear boundaries and responsibilities
 - **Testability**: Easy to test in isolation
 - **Maintainability**: Changes are localized
 - **Scalability**: Grow your application incrementally
 
-By following these architectural principles, you can build robust, maintainable applications with ZigModu.
+By following these architectural principles, you can build robust, maintainable applications with zmodu.

@@ -5,8 +5,8 @@
 //! type, so it reads exec's published inbox type without importing a single one
 //! of exec's files.
 
-const runtime = @import("zigmodu").runtime;
-const zmodu = @import("zigmodu");
+const runtime = @import("zmodu").runtime;
+const zmodu = @import("zmodu");
 const c = @import("../../contracts.zig");
 const api = @import("api.zig");
 const service = @import("service.zig");

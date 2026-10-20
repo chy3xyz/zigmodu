@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# ZigModu Installation Script
+# zmodu Installation Script
 # Supports: macOS, Linux, Windows (WSL)
 
 set -e
@@ -13,8 +13,12 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Configuration
-ZIGMODU_REPO="https://github.com/knot3bot/zigmodu.git"
-INSTALL_DIR="${HOME}/.zigmodu"
+ZMODU_REPO="${ZMODU_REPO:-https://github.com/chy3xyz/zmodu.git}"
+INSTALL_DIR="${ZMODU_INSTALL_DIR:-${HOME}/.zmodu}"
+# Keep an existing pre-rename install working instead of cloning a second copy.
+if [[ ! -d "$INSTALL_DIR" && -d "${HOME}/.zigmodu" ]]; then
+    INSTALL_DIR="${HOME}/.zigmodu"
+fi
 BIN_DIR="${HOME}/.local/bin"
 ZIG_MIN_VERSION="0.16.0"
 
@@ -121,40 +125,29 @@ check_sqlite() {
 # Clone or update repository
 setup_repository() {
     if [ -d "$INSTALL_DIR" ]; then
-        print_info "ZigModu directory exists, updating..."
+        print_info "zmodu directory exists, updating..."
         cd "$INSTALL_DIR"
         git pull origin master
     else
-        print_info "Cloning ZigModu repository..."
-        git clone "$ZIGMODU_REPO" "$INSTALL_DIR"
+        print_info "Cloning zmodu repository..."
+        git clone "$ZMODU_REPO" "$INSTALL_DIR"
         cd "$INSTALL_DIR"
     fi
 }
 
-# Build ZigModu
-build_zigmodu() {
-    print_info "Building ZigModu..."
+# Build zmodu
+build_zmodu() {
+    print_info "Building zmodu..."
     cd "$INSTALL_DIR"
     
     if zig build; then
-        print_success "ZigModu built successfully!"
+        print_success "zmodu built successfully!"
     else
         print_error "Build failed!"
         exit 1
     fi
 }
 
-# Install zmodu CLI tool
-install_cli() {
-    print_info "Installing zmodu CLI tool...";
-
-    # Create bin directory if it doesn't exist
-    mkdir -p "$BIN_DIR"
-
-    # Build zmodu specifically
-    cd "$INSTALL_DIR"
-    if ! zig build zmodu; then
-        print_error "Failed to build zmodu!";
 install_cli() {
     print_info "Installing zmodu CLI tool..."
     
@@ -207,7 +200,7 @@ setup_path() {
         
         if [ -f "$shell_rc" ]; then
             echo "" >> "$shell_rc"
-            echo "# ZigModu CLI" >> "$shell_rc"
+            echo "# zmodu CLI" >> "$shell_rc"
             echo "export PATH=\"\$PATH:$BIN_DIR\"" >> "$shell_rc"
             print_success "PATH updated in $shell_rc"
             print_warning "Please run: source $shell_rc"
@@ -228,7 +221,7 @@ verify_installation() {
     
     if command_exists zmodu; then
         print_success "Installation verified!"
-        print_info "ZigModu CLI is available: zmodu"
+        print_info "zmodu CLI is available: zmodu"
     else
         print_warning "zmodu command not found in PATH"
         print_info "You may need to restart your shell or run: source ~/.bashrc"
@@ -240,7 +233,7 @@ print_next_steps() {
     echo ""
     echo -e "${GREEN}╔════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${GREEN}║                                                            ║${NC}"
-    echo -e "${GREEN}║  🎉  ZigModu Installation Complete!                       ║${NC}"
+    echo -e "${GREEN}║  🎉  zmodu Installation Complete!                       ║${NC}"
     echo -e "${GREEN}║                                                            ║${NC}"
     echo -e "${GREEN}╚════════════════════════════════════════════════════════════╝${NC}"
     echo ""
@@ -258,16 +251,16 @@ print_next_steps() {
     echo -e "     ${YELLOW}zig build run${NC}"
     echo ""
     echo -e "${BLUE}Documentation:${NC}"
-    echo "  - GitHub: https://github.com/knot3bot/zigmodu"
+    echo "  - GitHub: https://github.com/knot3bot/zmodu"
     echo "  - Installation: $INSTALL_DIR/"
     echo ""
-    echo -e "${GREEN}Happy coding with ZigModu! 🚀${NC}"
+    echo -e "${GREEN}Happy coding with zmodu! 🚀${NC}"
     echo ""
 }
 
 # Uninstall function
 uninstall() {
-    print_info "Uninstalling ZigModu..."
+    print_info "Uninstalling zmodu..."
     
     # Remove installation directory
     if [ -d "$INSTALL_DIR" ]; then
@@ -281,7 +274,7 @@ uninstall() {
         print_success "Removed $BIN_DIR/zmodu"
     fi
     
-    print_success "ZigModu uninstalled successfully!"
+    print_success "zmodu uninstalled successfully!"
     print_info "You may want to remove the PATH entry from your shell config"
 }
 
@@ -290,7 +283,7 @@ main() {
     echo ""
     echo -e "${BLUE}╔════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${BLUE}║                                                            ║${NC}"
-    echo -e "${BLUE}║             ZigModu Installation Script                   ║${NC}"
+    echo -e "${BLUE}║             zmodu Installation Script                   ║${NC}"
     echo -e "${BLUE}║                                                            ║${NC}"
     echo -e "${BLUE}╚════════════════════════════════════════════════════════════╝${NC}"
     echo ""
@@ -307,7 +300,7 @@ main() {
         echo ""
         echo "Options:"
         echo "  -h, --help        Show this help message"
-        echo "  -u, --uninstall   Uninstall ZigModu"
+        echo "  -u, --uninstall   Uninstall zmodu"
         echo ""
         exit 0
     fi
@@ -317,7 +310,7 @@ main() {
     check_zig
     check_sqlite
     setup_repository
-    build_zigmodu
+    build_zmodu
     install_cli
     setup_path
     verify_installation

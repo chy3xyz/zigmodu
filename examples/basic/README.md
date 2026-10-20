@@ -1,6 +1,6 @@
 # Basic Example
 
-This example demonstrates the basic usage of ZigModu with three modules: User, Order, and Payment.
+This example demonstrates the basic usage of zmodu with three modules: User, Order, and Payment.
 
 ## Project Structure
 
@@ -27,7 +27,7 @@ zig build run
 ## Running the Tests
 
 `src/tests.zig` carries the testing demo:
-`ModuleTestContext`, `zigmodu.createMockModule`, application lifecycle, and
+`ModuleTestContext`, `zmodu.createMockModule`, application lifecycle, and
 dependency validation.
 
 ```bash

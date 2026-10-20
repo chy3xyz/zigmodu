@@ -11,7 +11,7 @@
 //! Wire-up is one line in the application's root file (the one with `main`):
 //!
 //! ```zig
-//! const zmodu = @import("zigmodu");
+//! const zmodu = @import("zmodu");
 //! pub const panic = zmodu.panicHook;
 //! ```
 //!

@@ -401,7 +401,7 @@ test "RunAuditStore persists token usage and upgrades a legacy table" {
     var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
-    // Shape written by an older zigmodu: no model / token columns.
+    // Shape written by an older zmodu: no model / token columns.
     _ = try client.exec(
         "CREATE TABLE ai_run_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, tenant_id INTEGER, steps INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)",
         &.{},

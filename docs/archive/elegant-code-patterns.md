@@ -1,4 +1,4 @@
-# Writing Elegant ZigModu Code — Patterns & Conventions
+# Writing Elegant zmodu Code — Patterns & Conventions
 
 > Companion to `best-practices-heysen-lessons.md`. Concrete code patterns, not just bug reports.
 > **Modulith day-one + concurrency playbook**: [MODULITH.md](../guide/MODULITH.md).

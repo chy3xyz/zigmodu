@@ -1,11 +1,11 @@
 const std = @import("std");
 
 // ============================================================
-// ZigModu — Production-Grade Zig Framework
+// zmodu — Production-Grade Zig Framework
 // ============================================================
 //
 // Quick start:
-//   const zmodu = @import("zigmodu");
+//   const zmodu = @import("zmodu");
 //   var b = zmodu.builder(allocator, io);          // bind first: a temporary is `*const`
 //   defer b.deinit();
 //   var app = try b.build(.{MyModule});
@@ -30,7 +30,7 @@ pub const getInFlightCounter = @import("Application.zig").getInFlightCounter;
 pub const api = @import("api/Module.zig");
 
 /// The framework error set — return these instead of ad-hoc error sets.
-pub const ZigModuError = @import("core/Error.zig").ZigModuError;
+pub const ZmoduError = @import("core/Error.zig").ZmoduError;
 /// Time helpers (`std.time.*` moved in Zig 0.17; use these instead).
 pub const Time = @import("core/Time.zig");
 
@@ -39,9 +39,9 @@ pub const life = @import("life.zig");
 pub const ErrorContext = @import("core/Error.zig").ErrorContext;
 /// Callback invoked with an `ErrorContext` to log or report a failure.
 pub const ErrorHandler = @import("core/Error.zig").ErrorHandler;
-/// `Result(T)`: a success value or a `ZigModuError`, for fallible APIs.
+/// `Result(T)`: a success value or a `ZmoduError`, for fallible APIs.
 pub const Result = @import("core/Error.zig").Result;
-/// Maps `ZigModuError` values onto HTTP status codes.
+/// Maps `ZmoduError` values onto HTTP status codes.
 pub const HttpCode = @import("core/Error.zig").HttpCode;
 /// Health check surface: register checks, render app and module health.
 pub const HealthEndpoint = @import("core/HealthEndpoint.zig").HealthEndpoint;
@@ -164,7 +164,7 @@ pub const load_shedder = @import("resilience/LoadShedder.zig");
 // ============================================================
 // 4. MESSAGING
 // ============================================================
-/// Thin barrel — `zigmodu.outbox.*` or direct root aliases below.
+/// Thin barrel — `zmodu.outbox.*` or direct root aliases below.
 pub const outbox = @import("messaging/outbox.zig");
 /// Writes commands/events into the outbox table inside your transaction.
 pub const OutboxPublisher = outbox.OutboxPublisher;

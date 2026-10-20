@@ -1,6 +1,6 @@
 const std = @import("std");
-const zigmodu = @import("zigmodu");
-const data = zigmodu.data;
+const zmodu = @import("zmodu");
+const data = zmodu.data;
 const model = @import("model.zig");
 const enums = @import("../../business/enums.zig");
 const payment_persist = @import("persistence.zig");
@@ -61,7 +61,7 @@ pub const PaymentService = struct {
         defer items_qr.deinit(self.allocator);
         const items = items_qr.items;
 
-        const now: i64 = @intCast(zigmodu.time.monotonicNowSeconds());
+        const now: i64 = @intCast(zmodu.time.monotonicNowSeconds());
         const pay_status = if (cmd.success)
             enums.PaymentStatus.succeeded.toString()
         else

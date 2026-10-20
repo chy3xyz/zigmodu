@@ -1,6 +1,6 @@
 const std = @import("std");
-const zigmodu = @import("zigmodu");
-const http = zigmodu.http;
+const zmodu = @import("zmodu");
+const http = zmodu.http;
 const outbox = @import("../foundation/outbox.zig");
 
 /// Ops endpoints for outbox drain / DLQ / requeue.

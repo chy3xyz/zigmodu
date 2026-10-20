@@ -19,8 +19,8 @@
 //!     target's full read contract, saving the second round trip.
 
 const std = @import("std");
-const zigmodu = @import("zigmodu");
-const http = zigmodu.http;
+const zmodu = @import("zmodu");
+const http = zmodu.http;
 const zent = @import("zent");
 
 /// Serialize a zent entity array as a JSON array via zent's toMaskedJson —

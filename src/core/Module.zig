@@ -4,7 +4,7 @@
 //! (ModuleRegistry/ModuleRuntime/Lifecycle/ModuleScanner) had to import the API
 //! layer to name the very type modules are declared with — the last
 //! `core -> api` edge. `api/Module.zig` is now a re-export shim, so
-//! `zigmodu.api.Module` keeps working.
+//! `zmodu.api.Module` keeps working.
 
 const std = @import("std");
 const ModuleContext = @import("ModuleContext.zig").ModuleContext;
@@ -109,9 +109,9 @@ test "ApplicationModules register and get" {
 // Module contract (moved from api/Module.zig)
 // ================================================================
 //
-// A ZigModu module is ANY struct that satisfies this contract:
+// A zmodu module is ANY struct that satisfies this contract:
 //
-//   pub const info: zigmodu.core.Module = .{
+//   pub const info: zmodu.core.Module = .{
 //       .name        = "my-module",          // required
 //       .description = "What it does",        // required
 //       .dependencies = &.{"other-module"},   // optional

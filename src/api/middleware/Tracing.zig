@@ -1,9 +1,9 @@
 //! Production-grade HTTP middlewares — tracing, rate limiting.
-//! Plugs into `zigmodu.http.Server.addMiddleware(...)`.
+//! Plugs into `zmodu.http.Server.addMiddleware(...)`.
 //!
 //! Usage:
-//!   server.addMiddleware(zigmodu.http.tracingMiddleware());
-//!   server.addMiddleware(zigmodu.http_middleware.rateLimit(&limiter));
+//!   server.addMiddleware(zmodu.http.tracingMiddleware());
+//!   server.addMiddleware(zmodu.http_middleware.rateLimit(&limiter));
 
 const std = @import("std");
 const api = @import("../../api/Server.zig");

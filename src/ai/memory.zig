@@ -975,7 +975,7 @@ test "loadJson refuses a dump whose scope is unusable and applies nothing" {
     // The restore path the docs hand applications (`loadFromFile`) is the same
     // judgment, so the refusal reaches the operator there too rather than a
     // half-restored store.
-    const path = "zigmodu-test-memory-corrupt-scope.json";
+    const path = "zmodu-test-memory-corrupt-scope.json";
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
     {
         const file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{});
@@ -1323,7 +1323,7 @@ test "recall leaves the store untouched when an allocation fails" {
 
 test "MemoryStore saveToFile loadFromFile" {
     const a = std.testing.allocator;
-    const path = "zigmodu-test-memory-store.json";
+    const path = "zmodu-test-memory-store.json";
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
     var store = MemoryStore.init(a, std.testing.io);

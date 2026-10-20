@@ -170,7 +170,7 @@ pub const MemoryCooldownStore = struct {
 
 pub const RedisCooldownStore = struct {
     const Self = @This();
-    const key_prefix = "zigmodu:llm:key:";
+    const key_prefix = "zmodu:llm:key:";
 
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -395,10 +395,10 @@ test "memory store two-key cooldown sequence" {
 test "redis cooldown store builds and formats keys" {
     var buf: [128]u8 = undefined;
     const k = RedisCooldownStore.redisKey(&buf, "deepseek:3");
-    try std.testing.expectEqualStrings("zigmodu:llm:key:deepseek:3", k);
+    try std.testing.expectEqualStrings("zmodu:llm:key:deepseek:3", k);
     var fbuf: [128]u8 = undefined;
     const f = RedisCooldownStore.failKey(&fbuf, "deepseek:3");
-    try std.testing.expectEqualStrings("zigmodu:llm:key:deepseek:3:fail", f);
+    try std.testing.expectEqualStrings("zmodu:llm:key:deepseek:3:fail", f);
 }
 
 // `isCooling` answering a canceled lock wait with `false` is the reading that

@@ -29,7 +29,7 @@ pub const VerifyReport = struct {
 pub const usage =
     \\Usage: zmodu verify [dir] [--json]
     \\
-    \\Verify an existing ZigModu project: module layout, import resolution, compile.
+    \\Verify an existing zmodu project: module layout, import resolution, compile.
     \\
     \\Arguments:
     \\  dir          project root (default: .)
@@ -295,7 +295,7 @@ fn checkFileImports(
         // Skip std, builtin, and third-party package imports
         if (!is_embed and (std.mem.eql(u8, import_path, "std") or
             std.mem.eql(u8, import_path, "builtin") or
-            std.mem.startsWith(u8, import_path, "zigmodu")))
+            std.mem.startsWith(u8, import_path, "zmodu")))
         {
             pos = val_end + 1;
             continue;
@@ -470,7 +470,7 @@ test "checkModuleIntegrity accepts table-less (BFF) module without persistence.z
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "src/modules/shop_bff");
-    try writeModuleFile(&tmp, "src/modules/shop_bff/module.zig", "pub const info = zigmodu.api.Module{ .name = \"shop_bff\" };\n");
+    try writeModuleFile(&tmp, "src/modules/shop_bff/module.zig", "pub const info = zmodu.api.Module{ .name = \"shop_bff\" };\n");
     try writeModuleFile(&tmp, "src/modules/shop_bff/api.zig", "// placeholder");
     try writeModuleFile(&tmp, "src/modules/shop_bff/root.zig", "// placeholder");
 

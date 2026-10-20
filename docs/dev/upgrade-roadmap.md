@@ -1,4 +1,4 @@
-# ZigModu Upgrade Roadmap — v0.9 → v1.0
+# zmodu Upgrade Roadmap — v0.9 → v1.0
 
 **Current**: v0.9.2, 86/100, 129 files, ~417 tests, 0 failures
 
@@ -74,7 +74,7 @@ Extract `sqlx/types.zig` (Value, Row, Rows, etc.) and `sqlx/conn.zig` from the
 
 ### 4.2 Remove extensions.zig shim
 Mark `extensions.zig` as fully deprecated; remove all duplicate exports. Users
-migrate from `zigmodu.extensions.HttpServer` to `zigmodu.http.http_server`.
+migrate from `zmodu.extensions.HttpServer` to `zmodu.http.http_server`.
 
 ### 4.3 Deprecate GoZero Validator
 Remove `validation/Validator.zig` in favor of `validation/ObjectValidator.zig`.
@@ -92,14 +92,14 @@ mock DB, test fixtures, and health check verification.
 Add `zmodu init` with project questionnaire (name, features, DB backend).
 
 ### 5.3 VS Code extension
-Publish `zigmodu` snippets and module templates for VS Code Zig extension.
+Publish `zmodu` snippets and module templates for VS Code Zig extension.
 
 ---
 
 ## Phase 6: Production Polish (est. 3 days)
 
 ### 6.1 Structured logging enforcement
-Add `@import("zigmodu").log` check in CI; require `StructuredLogger` over
+Add `@import("zmodu").log` check in CI; require `StructuredLogger` over
 `std.log.info` for production modules.
 
 ### 6.2 Load testing framework

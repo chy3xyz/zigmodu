@@ -70,13 +70,13 @@
   alpha-engine P2/P3 → 集群门面与 2PC → 真选主剩余项 —— **三条现已全部落地**。
 
 
-**现在的 ZigModu 已经不是“功能不够”的问题，而是产品定位还可以再往上提一层。**
+**现在的 zmodu 已经不是“功能不够”的问题，而是产品定位还可以再往上提一层。**
 
 目前它已经覆盖了 Modulith、DI、Event、HTTP、WebSocket、gRPC、ORM、Redis、Kafka、Resilience、Observability、Security、AI、CLI 等相当完整的能力；仓库目前是 `v0.15.47`（原文快照 —— **实际已是 v0.26.0**，见文首复核），并且明确定位为 Zig 0.17 的 Modulith Framework。([GitHub][1])
 
 但如果目标是让它在未来 2～3 年形成**真正有竞争力的 Zig 基础框架**，我不会继续单纯增加 CRUD / Web API 功能，而会把它升级成：
 
-# ZigModu = Modular Runtime for High-Performance Systems
+# zmodu = Modular Runtime for High-Performance Systems
 
 也就是：
 
@@ -101,7 +101,7 @@
 | ⭐⭐⭐⭐  | Developer Experience / CLI |    高 |
 | ⭐⭐⭐   | Data / Workflow Runtime    |   中高 |
 
-其中前四个，才是 ZigModu 真正的护城河。
+其中前四个，才是 zmodu 真正的护城河。
 
 ---
 
@@ -109,7 +109,7 @@
 
 这是我最建议你现在做的。
 
-现在 ZigModu 已经有一些性能设计，比如 ArenaAllocator、Object Pool、`ensureTotalCapacity`、branch hints 等。([GitHub][1])
+现在 zmodu 已经有一些性能设计，比如 ArenaAllocator、Object Pool、`ensureTotalCapacity`、branch hints 等。([GitHub][1])
 
 但这些还是：
 
@@ -124,7 +124,7 @@
 ## 建议增加
 
 ```text
-zigmodu/runtime/
+zmodu/runtime/
 ├── runtime.zig
 ├── scheduler.zig
 ├── worker.zig
@@ -172,9 +172,9 @@ MPSC
 
 # 三、第二优先级：Actor / Worker Model
 
-这是我认为 ZigModu 很值得做的东西。
+这是我认为 zmodu 很值得做的东西。
 
-不要把 ZigModu 做成：
+不要把 zmodu 做成：
 
 ```text
 Module
@@ -251,7 +251,7 @@ Metrics
 
 # 四、第三个核心：Compile-time Architecture
 
-这个其实是 ZigModu 最应该强化的护城河。
+这个其实是 zmodu 最应该强化的护城河。
 
 现在已经有：
 
@@ -350,7 +350,7 @@ Alpha
 });
 ```
 
-于是 ZigModu 不只是：
+于是 zmodu 不只是：
 
 > 帮你运行程序
 
@@ -364,7 +364,7 @@ Alpha
 
 # 六、第四个核心：Event Runtime 重新设计
 
-目前 ZigModu 已经有：
+目前 zmodu 已经有：
 
 ```text
 EventRegistry
@@ -452,7 +452,7 @@ QUIC
 于是形成：
 
 ```text
-                ZigModu Event Runtime
+                zmodu Event Runtime
 
                      Event
                        │
@@ -470,7 +470,7 @@ QUIC
 
 # 七、第五个：Distributed Runtime
 
-现在 ZigModu 已经有：
+现在 zmodu 已经有：
 
 * DistributedEventBus
 * ClusterMembership
@@ -484,9 +484,9 @@ QUIC
 
 应该做：
 
-# `ZigModu Cluster`
+# `zmodu Cluster`
 
-让多个 ZigModu 实例天然形成：
+让多个 zmodu 实例天然形成：
 
 ```text
                  Cluster
@@ -532,7 +532,7 @@ Kafka
 
 # 八、第六个：AI-native Runtime
 
-这个方向你已经开始做了，而且现在 ZigModu 已经存在 AI Provider、SkillRegistry、MemoryStore、SSE、ReAct Loop。([GitHub][1])
+这个方向你已经开始做了，而且现在 zmodu 已经存在 AI Provider、SkillRegistry、MemoryStore、SSE、ReAct Loop。([GitHub][1])
 
 但是现在这些更像：
 
@@ -623,7 +623,7 @@ Execution
 
 这个我认为未来会非常重要。
 
-现在 ZigModu 有 Saga，但还可以进一步抽象。
+现在 zmodu 有 Saga，但还可以进一步抽象。
 
 例如：
 
@@ -656,7 +656,7 @@ Schedule
 Event trigger
 ```
 
-这样 ZigModu 可以覆盖：
+这样 zmodu 可以覆盖：
 
 ```text
 金融
@@ -789,7 +789,7 @@ Architecture Health
 
 这是关键。
 
-现在 ZigModu 已经有很多功能。
+现在 zmodu 已经有很多功能。
 
 **不要继续走“大而全 Java Spring 替代品”的路线。**
 
@@ -814,10 +814,10 @@ Architecture Health
 
 # 十三、真正应该形成的产品结构
 
-我会重新定义 ZigModu：
+我会重新定义 zmodu：
 
 ```text
-                         ZigModu
+                         zmodu
                             │
              ┌──────────────┼──────────────┐
              │              │              │
@@ -843,7 +843,7 @@ Architecture Health
 然后再向上：
 
 ```text
-                ZigModu Platform
+                zmodu Platform
                        │
         ┌──────────────┼──────────────┐
         ↓              ↓              ↓
@@ -855,9 +855,9 @@ Architecture Health
 
 ---
 
-# 十四、我最看好的差异化：ZigModu + Modulith + Actor
+# 十四、我最看好的差异化：zmodu + Modulith + Actor
 
-如果让我给 ZigModu 找一个非常明确的技术标签，我不会叫：
+如果让我给 zmodu 找一个非常明确的技术标签，我不会叫：
 
 > Zig Spring Modulith
 
@@ -953,12 +953,12 @@ Agent Observability
 
 这是我觉得最有意思的地方。
 
-不要为了证明 ZigModu 能做什么而做 demo。
+不要为了证明 zmodu 能做什么而做 demo。
 
 直接做：
 
 ```text
-ZigModu
+zmodu
    │
    └── examples/
           └── alpha-engine/
@@ -992,7 +992,7 @@ Live Trading
 这样一个项目就同时证明：
 
 ```text
-ZigModu
+zmodu
 ├── 高性能
 ├── Event-driven
 ├── Actor
@@ -1007,7 +1007,7 @@ ZigModu
 
 ---
 
-## 我会给 ZigModu 定一个非常明确的演进公式
+## 我会给 zmodu 定一个非常明确的演进公式
 
 你现在：
 
@@ -1045,7 +1045,7 @@ Agent
 
 而且这个方向与 Zig 本身的发展非常契合——Zig 0.17 周边正在强化 build server、增量编译等开发体验和底层能力；同时像 TigerBeetle 这类 Zig 生产项目也证明了“低延迟、可预测性能、数据密集型系统”是 Zig 很有辨识度的应用方向。([ziglang.org][2])
 
-**如果是我来推进 `chy3xyz/zigmodu`，下一步不会再做功能堆积，而会直接做 `ZigModu Runtime 1.0`：`Worker + Mailbox + RingBuffer + TimerWheel + Sequencer + Actor + Hot EventBus`。** 这是最可能把它从“一个功能比较完整的 Zig Modulith 框架”变成“一个有自己技术范式的 Zig 基础设施”的升级点。 [ZigModu GitHub](https://github.com/chy3xyz/zigmodu?utm_source=chatgpt.com)
+**如果是我来推进 `chy3xyz/zmodu`，下一步不会再做功能堆积，而会直接做 `zmodu Runtime 1.0`：`Worker + Mailbox + RingBuffer + TimerWheel + Sequencer + Actor + Hot EventBus`。** 这是最可能把它从“一个功能比较完整的 Zig Modulith 框架”变成“一个有自己技术范式的 Zig 基础设施”的升级点。 [zmodu GitHub](https://github.com/chy3xyz/zmodu?utm_source=chatgpt.com)
 
-[1]: https://github.com/chy3xyz/zigmodu "GitHub - chy3xyz/zigmodu: A Modulith framework · GitHub"
+[1]: https://github.com/chy3xyz/zmodu "GitHub - chy3xyz/zmodu: A Modulith framework · GitHub"
 [2]: https://ziglang.org/devlog/2026/?utm_source=chatgpt.com "Devlog ⚡ Zig Programming Language"

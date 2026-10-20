@@ -1,4 +1,4 @@
-//! ⚠️ DEPRECATED — use `zigmodu.Validator` (validation/ObjectValidator.zig) instead.
+//! ⚠️ DEPRECATED — use `zmodu.Validator` (validation/ObjectValidator.zig) instead.
 //! This GoZero-style validator will be removed in v1.0.
 //!
 //! As of the "move the chain to a non-deprecated home" batch, this file is a

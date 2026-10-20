@@ -1,6 +1,6 @@
-# zent-modulith — ZigModu + zent
+# zent-modulith — zmodu + zent
 
-Demonstrates **ZigModu** (Application / HTTP / **ComptimeRouter**) with **[zent](https://github.com/chy3xyz/zent)** v0.96.0 as the schema-as-code data layer (demos span v0.21–v0.96 capabilities).
+Demonstrates **zmodu** (Application / HTTP / **ComptimeRouter**) with **[zent](https://github.com/chy3xyz/zent)** v0.96.0 as the schema-as-code data layer (demos span v0.21–v0.96 capabilities).
 
 See framework guides: [`docs/reference/ZENT.md`](../../docs/reference/ZENT.md) · [`docs/reference/ROUTE_TABLE.md`](../../docs/reference/ROUTE_TABLE.md).
 
@@ -16,7 +16,7 @@ See framework guides: [`docs/reference/ZENT.md`](../../docs/reference/ZENT.md) �
 ```bash
 # optional dev layout (only for developing zent itself)
 zig_ws/
-  zigmodu/
+  zmodu/
   zent/          # git clone https://github.com/chy3xyz/zent.git
 ```
 
@@ -260,7 +260,7 @@ curl -s -X POST 'http://127.0.0.1:18100/api/v1/feed/1/restore'
 
 ```
 src/
-  main.zig                 # ZigModu ComptimeRouter + zent migrate/client
+  main.zig                 # zmodu ComptimeRouter + zent migrate/client
   outbox_demo.zig          # outbox 事务入队 + dispatch（HTTP + cron）
   data_scope_demo.zig      # scope 中间件 + DocApi（行级权限）
   features_demo.zig        # 原子库存扣减 + 两级预加载（feed）
@@ -271,7 +271,7 @@ src/
   service.zig            # validation / Cmd
   zent_crud.zig          # 泛型 CrudApi 适配器（包 zent CrudService）
   api.zig                # 自定义端点（counts/search/bulk/SSE）
-  module.zig             # ZigModu module contract
+  module.zig             # zmodu module contract
 ```
 
-**Do not** mix `zent.Driver` into `zigmodu.data.sqlx.Client` — keep stacks separate.
+**Do not** mix `zent.Driver` into `zmodu.data.sqlx.Client` — keep stacks separate.

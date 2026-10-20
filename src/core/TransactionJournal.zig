@@ -101,7 +101,7 @@ pub const TransactionJournal = struct {
     allocator: std.mem.Allocator,
     /// `null` = memory-only: same API, nothing survives the process.
     backend: ?SqlxBackend = null,
-    table_name: []const u8 = "zigmodu_tx_journal",
+    table_name: []const u8 = "zmodu_tx_journal",
     /// Memory fallback: one *latest* record per transaction (memory mode has no
     /// crash to replay), keyed by the same allocation as `value.tx_id`.
     memory: std.StringHashMap(Record),
@@ -345,7 +345,7 @@ test "TransactionJournal SQL: round-trips records and drops decided ones" {
 
 test "TransactionJournal SQL: a prepared transaction survives losing the coordinator" {
     const allocator = std.testing.allocator;
-    const db_path = "/tmp/zigmodu_tx_journal_crash.db";
+    const db_path = "/tmp/zmodu_tx_journal_crash.db";
     std.Io.Dir.cwd().deleteFile(std.testing.io, db_path) catch {};
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, db_path) catch {};
 

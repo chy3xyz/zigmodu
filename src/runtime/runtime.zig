@@ -315,7 +315,7 @@ pub fn poolable(comptime W: type) bool {
 /// type with no allocation, which is what lets it ride in a mailbox slot.
 ///
 /// Re-exported (it lives in `tracing/DistributedTracer.zig`) so a producer tags a
-/// message as `zigmodu.runtime.TraceId` without reaching into the tracing module,
+/// message as `zmodu.runtime.TraceId` without reaching into the tracing module,
 /// and so the framework keeps exactly one such shape rather than a parallel
 /// runtime-local one.
 pub const TraceId = @import("../tracing/DistributedTracer.zig").DistributedTracer.TraceId;

@@ -1,6 +1,6 @@
 # Modulith 高并发最佳实践
 
-**适用**：ZigModu **v0.35+** · Zig 0.17  
+**适用**：zmodu **v0.35+** · Zig 0.17  
 **定位**：项目第一天如何按 modulith 边界开发，并平滑支撑高并发——**一个进程、多个清晰模块**，先可拆分地写，再按流量加池化 / 缓存 / 消息，而不是一上来微服务。
 
 > **本文只讲应用平面**（模块边界、fiber、池化、缓存、消息）。当"一请求一 fiber"不再是正确的形状
@@ -22,7 +22,7 @@
 | [elegant-code-patterns.md](../archive/elegant-code-patterns.md) | 五文件布局与代码样例 |
 | [DISTRIBUTED.md](../reference/DISTRIBUTED.md) | 多实例 / RobustMQ / 集群注意点 |
 | [MODULITH_TENANT_SHOP.md](./MODULITH_TENANT_SHOP.md) | **蓝图**：多租户店依赖图 + 目录清单 |
-| [ZENT.md](../reference/ZENT.md) | **zent**：schema-as-code ORM 与 ZigModu 正交集成 |
+| [ZENT.md](../reference/ZENT.md) | **zent**：schema-as-code ORM 与 zmodu 正交集成 |
 | [SQLX_DRIVERS.md](./SQLX_DRIVERS.md) | **sqlx**：`-Ddb=` / `.db=` 选择性驱动链接 |
 | [best-practices-heysen-lessons.md](../archive/best-practices-heysen-lessons.md) | 生产踩坑（sqlx / ORM） |
 
@@ -30,7 +30,7 @@
 
 ## 1. 核心原则
 
-ZigModu modulith = **单二进制部署 + 模块级边界**（Spring Modulith 思路）：
+zmodu modulith = **单二进制部署 + 模块级边界**（Spring Modulith 思路）：
 
 1. **边界第一天就定**，比中间件选型更重要。
 2. **同进程直接调 service** 做强一致；**跨域副作用用 EventBus / Outbox**。
@@ -138,7 +138,7 @@ pub fn deinit() void {}
 ## 4. 启动骨架
 
 ```zig
-const zmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};

@@ -1,6 +1,6 @@
 # LLM 策略真实接线（LLM-Powered Policies）
 
-> `zigmodu.ai.llm` 提供开箱即用的 LLM-backed 策略：审批、风控、异常归因、
+> `zmodu.ai.llm` 提供开箱即用的 LLM-backed 策略：审批、风控、异常归因、
 > workflow 质量门。本文是**真实接线**指南——从 `AiProvider` 初始化到把
 > 策略挂进 `ApprovalFlow` / `RiskReview` / `DiagnosisFlow` / `Workflow.reflection`，
 > 含完整代码与验证方法。配套可编译示例：[`examples/llm-policies`](../../examples/llm-policies)。
@@ -10,14 +10,14 @@
 所有 LLM 策略共用同一个 `AiProvider`（OpenAI 兼容 chat completions）：
 
 ```zig
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 // HTTP 客户端（HTTPS 走 std.http.Client；超时毫秒）
-var http = zigmodu.http.HttpClient.init(allocator, io, 4, 30000);
+var http = zmodu.http.HttpClient.init(allocator, io, 4, 30000);
 defer http.deinit();
 
 // endpoint 是完整的 chat/completions URL；api_key 是 Authorization 头的完整值
-var provider = zigmodu.ai.AiProvider.init(
+var provider = zmodu.ai.AiProvider.init(
     allocator,
     &http,
     "https://api.openai.com/v1/chat/completions", // 或 DeepSeek / vLLM / Ollama 兼容端点
@@ -31,7 +31,7 @@ var provider = zigmodu.ai.AiProvider.init(
 ## 2. LlmPolicyCtx：策略共享配置
 
 ```zig
-var policy_ctx = zigmodu.ai.llm.LlmPolicyCtx{
+var policy_ctx = zmodu.ai.llm.LlmPolicyCtx{
     .provider = &provider,          // 真实模型
     // .json_fn = ...               // 测试时注入 fake（不填则用 provider）
     .system_hint = "公司审批政策：单笔>10万必须 CFO 签字。", // 附加 system 指导
@@ -43,7 +43,7 @@ var policy_ctx = zigmodu.ai.llm.LlmPolicyCtx{
 每个策略回调都从 `SkillContext.userdata` 取 `LlmPolicyCtx`：
 
 ```zig
-var ctx = zigmodu.ai.SkillContext{
+var ctx = zmodu.ai.SkillContext{
     .allocator = allocator,
     .tenant_id = 1,          // 多租户示例会把它用于隔离
     .userdata = &policy_ctx, // ← 关键
@@ -55,7 +55,7 @@ var ctx = zigmodu.ai.SkillContext{
 ### 审批（ApprovalFlow）
 
 ```zig
-var approval = zigmodu.ai.approval.ApprovalFlow.init(allocator, &backend, zigmodu.ai.llm.llmApprove);
+var approval = zmodu.ai.approval.ApprovalFlow.init(allocator, &backend, zmodu.ai.llm.llmApprove);
 approval.outbox = &outbox;                       // 审计写回（可选）
 approval.on_escalated = ...;                     // 转人工入队（可选，见 AI_ORCHESTRATION.md）
 var result = try approval.submit(allocator, &ctx, "order-42", 150000, &steps);
@@ -67,16 +67,16 @@ var result = try approval.submit(allocator, &ctx, "order-42", 150000, &steps);
 ### 风控（RiskReview）
 
 ```zig
-var risk = zigmodu.ai.risk.RiskReview.init(allocator, &backend);
+var risk = zmodu.ai.risk.RiskReview.init(allocator, &backend);
 risk.rules = &rules;             // SQL 规则累加风险分
-risk.decide = zigmodu.ai.llm.llmRiskDecide;  // LLM 决策
+risk.decide = zmodu.ai.llm.llmRiskDecide;  // LLM 决策
 var out = try risk.review(allocator, &ctx, "order-42");
 ```
 
 ### 异常归因（DiagnosisFlow）
 
 ```zig
-var diag = zigmodu.ai.diagnose.DiagnosisFlow.init(allocator, &backend, zigmodu.ai.llm.llmDiagnose);
+var diag = zmodu.ai.diagnose.DiagnosisFlow.init(allocator, &backend, zmodu.ai.llm.llmDiagnose);
 diag.evidence_queries = &queries; // 证据 SQL → prompt
 diag.outbox = &outbox;
 var res = try diag.run(allocator, &ctx, .{ .source = "alert", .subject = "orders", .severity = .critical, .description = "..." });
@@ -85,7 +85,7 @@ var res = try diag.run(allocator, &ctx, .{ .source = "alert", .subject = "orders
 ### Workflow 质量门（Workflow.reflection）
 
 ```zig
-wf.reflection = zigmodu.ai.llm.llmVerify;  // 模型判断最终输出是否达标
+wf.reflection = zmodu.ai.llm.llmVerify;  // 模型判断最终输出是否达标
 wf.goal = "产出一份含退款金额的 Markdown 报告";
 wf.max_reviews = 2;                        // 不达标重跑上限
 ```
@@ -102,8 +102,8 @@ const FakeJson = struct {
         return .{ .object = obj };
     }
 };
-var policy_ctx = zigmodu.ai.llm.LlmPolicyCtx{ .json_fn = FakeJson.f };
-var ctx = zigmodu.ai.SkillContext{ .allocator = allocator, .userdata = &policy_ctx };
+var policy_ctx = zmodu.ai.llm.LlmPolicyCtx{ .json_fn = FakeJson.f };
+var ctx = zmodu.ai.SkillContext{ .allocator = allocator, .userdata = &policy_ctx };
 // 之后正常调 approval.submit / risk.review / diag.run —— 断言结果即可。
 ```
 
@@ -112,9 +112,9 @@ var ctx = zigmodu.ai.SkillContext{ .allocator = allocator, .userdata = &policy_c
 `LlmPolicyCtx.retriever` 把 top-k 检索块注入策略 prompt（政策、历史、playbook）：
 
 ```zig
-var policy_ctx = zigmodu.ai.llm.LlmPolicyCtx{
+var policy_ctx = zmodu.ai.llm.LlmPolicyCtx{
     .provider = &provider,
-    .retriever = my_retriever,               // 实现 zigmodu.ai.retriever.Retriever 接口
+    .retriever = my_retriever,               // 实现 zmodu.ai.retriever.Retriever 接口
     .retrieval_query = "approval policy for large orders",
     .top_k = 3,
 };
@@ -140,7 +140,7 @@ zig build run
 
 ## 8. AiKeyManager：provider + key 轮换（高并发）
 
-`zigmodu.ai.AiKeyManager` 是 `AiProvider` 的上游供给层，分四层文件：
+`zmodu.ai.AiKeyManager` 是 `AiProvider` 的上游供给层，分四层文件：
 
 | 文件 | 职责 |
 |------|------|
@@ -153,7 +153,7 @@ zig build run
 簿记用 `std.Io.Mutex` 保护（微秒级），HTTP 调用不持锁，可高并发。
 
 ```zig
-var mgr = zigmodu.ai.AiKeyManager.init(allocator, io);
+var mgr = zmodu.ai.AiKeyManager.init(allocator, io);
 defer mgr.deinit();
 try mgr.applyConfig(&.{
     .{
@@ -190,7 +190,7 @@ status/failures/调用与错误计数快照；`enableKey` / `enableProvider` 支
 实例 B–N 不知情继续打 429，且 401 禁用阈值会被放大 N 倍）：
 
 ```zig
-var redis_store = try zigmodu.ai.RedisCooldownStore.init(allocator, io, &redis_client);
+var redis_store = try zmodu.ai.RedisCooldownStore.init(allocator, io, &redis_client);
 defer redis_store.deinit();
 var store = redis_store.asStore();
 mgr.setSharedStore(&store); // 之后注册的 provider 池都走 Redis 冷却
@@ -199,7 +199,7 @@ mgr.setSharedStore(&store); // 之后注册的 provider 池都走 Redis 冷却
 实现：`SET key 1 EX ttl`（冷却/禁用按 TTL 过期，无需时钟对齐）、
 `INCR + EXPIRE`（失败计数）、`DEL`（恢复）；Redis 不可用时 **fail-open**
 回退本地镜像并 warn（对齐 `RedisRateLimiter` 先例），key 轮换不会因基础设施
-故障而阻塞。key 形如 `zigmodu:llm:key:<provider>:<idx>`。
+故障而阻塞。key 形如 `zmodu:llm:key:<provider>:<idx>`。
 
 | 策略 | 模型返回 | 失败回退 |
 |------|----------|----------|

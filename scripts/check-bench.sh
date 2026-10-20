@@ -687,7 +687,7 @@ if [ "$MODE" = explain ] || [ "$MODE" = ratios ]; then
   exit $?
 fi
 
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/zigmodu-bench.XXXXXX")"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/zmodu-bench.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
 # Machine identification for the verdict. Every source is best-effort: a missing

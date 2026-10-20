@@ -24,10 +24,10 @@
 DB 权限表示例：
 
 ```zig
-try zigmodu.security.CatalogPermDb.ensureSchema(&db_client);
-try zigmodu.security.CatalogPermDb.grant(&db_client, "admin", "tenant:suspend");
+try zmodu.security.CatalogPermDb.ensureSchema(&db_client);
+try zmodu.security.CatalogPermDb.grant(&db_client, "admin", "tenant:suspend");
 try server.addMiddleware(try http.jwtAuthFromCatalogWithPermissions(
-    &sec, &slot, try zigmodu.security.CatalogPermDb.loaderFromClient(&db_client), .{},
+    &sec, &slot, try zmodu.security.CatalogPermDb.loaderFromClient(&db_client), .{},
 ));
 try server.addMiddleware(try http.permissionGateWith(&slot, .{ .mode = .rbac }));
 ```
@@ -351,7 +351,7 @@ WS：`pub const ws_routes = [_]http.WsSpec(State){ .{ .path = "ws", .on_connect 
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  ZigModu（通用）                                              │
+│  zmodu（通用）                                              │
 │  JWT: sub + aud(租户) + roles(门户粗身份)                      │
 │  Middleware: verify → CatalogPermissionLoader → permissions │
 │  Gate: RouteMeta.permission + permissionGateWith(.rbac)     │
@@ -505,11 +505,11 @@ const rl = res.limiter("payment").?;   // RateLimiter（单节点；全局限流
 `/metrics` + `/health/*`，可选 dashboard）。
 
 ```zig
-var server = zigmodu.http.Server.init(io, allocator, 8080);
-var profile = zigmodu.http.ProductionProfileState.init(allocator);
+var server = zmodu.http.Server.init(io, allocator, 8080);
+var profile = zmodu.http.ProductionProfileState.init(allocator);
 defer profile.deinit(allocator);
 
-try zigmodu.http.productionProfile(&server, .{
+try zmodu.http.productionProfile(&server, .{
     .max_connections = 4096,        // 0 = 不限；超限 .close 或 .unavailable(503)
     .header_timeout_ms = 10_000,    // 请求行+header deadline（slowloris）
 }, &profile);                       // ← 必须在下面任何一条之前
@@ -545,7 +545,7 @@ TLS 边车与守护拓扑：[`../examples/production-deploy/`](../../examples/pr
 
 配套的两件事（都在同一批加固里，别只做 profile）：
 
-- **启动预检**：`zigmodu.Preflight.run(...)` 检查必填 env、占位 JWT secret、
+- **启动预检**：`zmodu.Preflight.run(...)` 检查必填 env、占位 JWT secret、
   DB 连通、待应用迁移、时钟偏移；`!report.ok()` 就拒绝启动。
   见 [`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「上线前预检」。
   其中 `migrationCheck` 需应用侧提供 `pending` 回调（返回待应用迁移数，可对接
@@ -575,7 +575,7 @@ Extractors → `src/api/Extract.zig` · Testkit → `http.Testkit.dispatch`
 **返回值**，渲染交给适配器。成功路径只有业务：
 
 ```zig
-const http = zigmodu.http;
+const http = zmodu.http;
 
 fn getUser(ctx: *http.Context, self: *State) !UserDto {
     const id = try ctx.paramInt(i64, "id");

@@ -1,6 +1,6 @@
 //! Business alerting: run SQL rules periodically; any rule returning rows is a
 //! violation that raises an alert (callback + optional transactional-outbox
-//! writeback). Pair with `zigmodu.ai.trigger` for scheduled checks.
+//! writeback). Pair with `zmodu.ai.trigger` for scheduled checks.
 
 const std = @import("std");
 const SqlxBackend = @import("../../data.zig").SqlxBackend;

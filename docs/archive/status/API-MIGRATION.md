@@ -1,8 +1,8 @@
 # API Migration Guide: Simplified API → Application API
 
-ZigModu v0.8+ recommends `Application` as the primary API. The legacy `Simplified.zig`
+zmodu v0.8+ recommends `Application` as the primary API. The legacy `Simplified.zig`
 (`App`, `Module`, `ModuleImpl`) was **removed from the root exports** in commit `557190a`
-(2026-05-12): `zigmodu.App` / `zigmodu.ModuleImpl` no longer compile. The file is still in the
+(2026-05-12): `zmodu.App` / `zmodu.ModuleImpl` no longer compile. The file is still in the
 tree, reachable only by internal path — see [`UPGRADING.md`](../../reference/UPGRADING.md) 「已移除」.
 
 ## Quick Comparison
@@ -22,15 +22,15 @@ tree, reachable only by internal path — see [`UPGRADING.md`](../../reference/U
 
 ### Before: Simplified API
 
-> ⚠️ **这段是历史，不是能照抄的代码。** `zigmodu.App` / `zigmodu.ModuleImpl` 已在 commit `557190a`（2026-05-12）
+> ⚠️ **这段是历史，不是能照抄的代码。** `zmodu.App` / `zmodu.ModuleImpl` 已在 commit `557190a`（2026-05-12）
 > 从根导出里**移除**，所以下面那两行 `const` 今天**编译不过**（后面用到的 `App` 也随之未定义）。
 > `src/api/Simplified.zig` 仍在树里，但只能**越路径**触达：
-> `const Simplified = @import("zigmodu/src/api/Simplified.zig");` —— 那不是受支持的消费面，
+> `const Simplified = @import("zmodu/src/api/Simplified.zig");` —— 那不是受支持的消费面，
 > 见 [`UPGRADING.md`](../../reference/UPGRADING.md) 的「已移除」。保留这段只是为了看懂旧代码在写什么。
 
 ```zig
 // 旧代码长这样（前两行今天编译不过：顶层不再导出这两个名字）
-const zmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 const Simplified = zmodu.App;
 const ModuleImpl = zmodu.ModuleImpl;
 
@@ -60,7 +60,7 @@ pub fn main() !void {
 ### After: Application API
 
 ```zig
-const zmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 const UserModule = struct {
     pub const info = zmodu.api.Module{
@@ -103,7 +103,7 @@ pub fn main() !void {
 Canonical imports — use these in all new code:
 
 ```zig
-const zmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 const http = zmodu.http;
 const data = zmodu.data;
 const sec = zmodu.security;
@@ -112,27 +112,27 @@ const obs = zmodu.observability;
 
 | Deprecated (remove v0.14.0) | Canonical replacement |
 |-----------------------------|------------------------|
-| `zigmodu.http_server.Server` | `zigmodu.http.Server` |
-| `zigmodu.http_server.Context` | `zigmodu.http.Context` |
-| `zigmodu.sqlx.Client` | `zigmodu.data.Client` |
-| `zigmodu.orm` | `zigmodu.data.orm` |
-| `zigmodu.SqlxBackend` | `zigmodu.data.SqlxBackend` |
-| `zigmodu.PasswordEncoder` | `zigmodu.security.PasswordEncoder` |
-| `zigmodu.SecurityModule` | `zigmodu.security.SecurityModule` |
-| `zigmodu.Cache` | `@import("cache/Lru.zig").Cache` (generic) |
+| `zmodu.http_server.Server` | `zmodu.http.Server` |
+| `zmodu.http_server.Context` | `zmodu.http.Context` |
+| `zmodu.sqlx.Client` | `zmodu.data.Client` |
+| `zmodu.orm` | `zmodu.data.orm` |
+| `zmodu.SqlxBackend` | `zmodu.data.SqlxBackend` |
+| `zmodu.PasswordEncoder` | `zmodu.security.PasswordEncoder` |
+| `zmodu.SecurityModule` | `zmodu.security.SecurityModule` |
+| `zmodu.Cache` | `@import("cache/Lru.zig").Cache` (generic) |
 
-The flat aliases (`zigmodu.http_server`, `zigmodu.sqlx`, `zigmodu.orm`,
-`zigmodu.SqlxBackend`, `zigmodu.PasswordEncoder`, `zigmodu.SecurityModule`,
-`zigmodu.Cache`) and the `zigmodu.deprecated` namespace were **removed in
+The flat aliases (`zmodu.http_server`, `zmodu.sqlx`, `zmodu.orm`,
+`zmodu.SqlxBackend`, `zmodu.PasswordEncoder`, `zmodu.SecurityModule`,
+`zmodu.Cache`) and the `zmodu.deprecated` namespace were **removed in
 v0.15.1** (the planned removal version was v0.14.0). Use the canonical domain
-imports: `zigmodu.http`, `zigmodu.data`, `zigmodu.security`, `zigmodu.cache`.
+imports: `zmodu.http`, `zmodu.data`, `zmodu.security`, `zmodu.cache`.
 
 ## JWT & Security (v0.13.15+)
 
 Production apps should use **wall-clock** JWT expiry (not monotonic time).
 
 ```zig
-const zmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 const sec = zmodu.security;
 
 // Recommended: builder helper (uses initWithIo internally)
@@ -162,7 +162,7 @@ CI / local probes: `JWT_SECRET=dev-secret zig build gen-jwt-token && ./zig-out/b
 
 ## Multi-Tenancy (Optional)
 
-ZigModu **does not require** multi-tenancy. Core apps (`examples/basic`) run without `TenantContext` or `tenant_id` columns.
+zmodu **does not require** multi-tenancy. Core apps (`examples/basic`) run without `TenantContext` or `tenant_id` columns.
 
 | Need | Use |
 |------|-----|

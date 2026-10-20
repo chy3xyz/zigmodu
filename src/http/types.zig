@@ -5,7 +5,7 @@
 //! *server implementation* to name `Context`/`Middleware`, while the server
 //! imported the helpers — a directory-level cycle between one layer split in
 //! two. The types now live here; `api/Server.zig` re-exports them, so
-//! `zigmodu.http.Context` and `zigmodu.api.Server.Context` are the same type.
+//! `zmodu.http.Context` and `zmodu.api.Server.Context` are the same type.
 //!
 //! `Context.permissionMatches` evaluates RBAC *expressions* with the pure
 //! evaluator in `security/Rbac.zig` (that file imports only `std`, so this is a
@@ -167,7 +167,7 @@ pub const Identity = struct {
 /// Response envelope dialect for the `ok` / `fail` / `unauth` / `paginated`
 /// Context helpers and auth-rejection rendering (see `http.envelopeReject`).
 pub const EnvelopeDialect = enum {
-    /// ZigModu CommonResult: ok `{code:0,msg:"ok",data}`; fail `{code:1,…}`;
+    /// zmodu CommonResult: ok `{code:0,msg:"ok",data}`; fail `{code:1,…}`;
     /// unauth HTTP 401 `{code:401,…}`; paged `{code:0,…,data:{list,total}}`.
     default,
     /// ThinkPHP: ok `{code:1,msg:"success",data}`; fail `{code:0,…}`;

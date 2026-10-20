@@ -10,7 +10,7 @@
 //!
 //! Handler wire-up:
 //!
-//!     var sse = try zigmodu.http.sse(ctx);
+//!     var sse = try zmodu.http.sse(ctx);
 //!     var bridge = ai.stream_sse.DeltaSse(@TypeOf(sse)).init(allocator, &sse);
 //!     agent.hooks.ctx = &bridge;
 //!     agent.hooks.on_delta = @TypeOf(bridge).onDelta;

@@ -8,7 +8,7 @@
 
 ## 1. Context & Constraints
 
-`zigmodu` is positioned as a Modulith framework (see `docs/MODULITH.md`, `docs/MODULE_LAYERS.md`).
+`zmodu` is positioned as a Modulith framework (see `docs/MODULITH.md`, `docs/MODULE_LAYERS.md`).
 The latest release `v0.14.5` hardened the SQLx layer (pool lifecycle, streaming cursor, batch protocols), but single-cluster QPS is still bounded by:
 
 1. **Synchronous cross-module calls** — modules call each other through repositories/services directly, creating long, blocking chains under load.

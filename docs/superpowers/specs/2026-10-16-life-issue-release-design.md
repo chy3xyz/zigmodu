@@ -2,7 +2,7 @@
 
 > 日期：2026-10-16 · 状态：已获原则批准（命名 `life` / 方案 C 双适配器 / 公布出口：静态 feed + Dashboard feed）
 > 定位：**v1.x 候选**（1.0-alpha 功能冻结期不动代码，本 spec 先行；冻结解除后按 Phase 落地）
-> 参考：heysen_saas 生产实践（feedback + release_note 模块）+ zigmodu 现有接口面（`zmodu life` CLI、双通道 MCP、audit/CI JSON、Dashboard）
+> 参考：heysen_saas 生产实践（feedback + release_note 模块）+ zmodu 现有接口面（`zmodu life` CLI、双通道 MCP、audit/CI JSON、Dashboard）
 
 ## 1. 背景与目标
 

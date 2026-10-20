@@ -18,7 +18,7 @@ const Io = std.Io;
 const Dir = Io.Dir;
 
 pub const embedded_catalog = @embedFile("marketplace/catalog.json");
-pub const default_index_url = "https://raw.githubusercontent.com/chy3xyz/zigmodu/master/tools/zmodu/src/marketplace/catalog.json";
+pub const default_index_url = "https://raw.githubusercontent.com/chy3xyz/zmodu/master/tools/zmodu/src/marketplace/catalog.json";
 const cache_path = ".zmodu/market-index.json";
 
 pub const Entry = struct {

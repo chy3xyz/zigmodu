@@ -12,7 +12,7 @@
 //!
 //! The middleware lives in `http_middleware.securityHeaders` (canonical);
 //! this file keeps the default header data for backwards compatibility
-//! (`zigmodu.security.defaultSecurityHeaders`).
+//! (`zmodu.security.defaultSecurityHeaders`).
 
 const middleware = @import("../api/Middleware.zig");
 

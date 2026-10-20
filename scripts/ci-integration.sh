@@ -80,7 +80,7 @@ expect_code "${BASE}/api/v1/plans" 200 "plans with a token" -H "${AUTH}"
 echo "integration: tenant isolation probes"
 # What `requireTenantId` actually promises, measured against a real server.
 # The token this script mints carries the framework's default `aud`
-# (`"zigmodu-app"`, `SecurityModule.generateToken` always writes one), so "a
+# (`"zmodu-app"`, `SecurityModule.generateToken` always writes one), so "a
 # token with no `aud` at all" is not a shape this generator can produce — the
 # absent-tenant branch (401) is real, but nothing here can reach it. The three
 # shapes below are the ones that exist:

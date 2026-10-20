@@ -4,9 +4,9 @@
 //! Run with: cd examples/http-stress-test && zig build run
 
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
-const http = zigmodu.http;
+const http = zmodu.http;
 
 const Server = http.Server;
 const Context = http.Context;

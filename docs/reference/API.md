@@ -1,6 +1,6 @@
-# ZigModu API Reference
+# zmodu API Reference
 
-Complete API reference for the ZigModu modular framework.
+Complete API reference for the zmodu modular framework.
 
 > 1.0 冻结的入口类别、0.x 允许破坏的 preview 面（`runtime.*`），以及每一条对应的门禁：
 > [`API_FREEZE.md`](./API_FREEZE.md)。弃用别名与删除时点见 [`UPGRADING.md`](./UPGRADING.md) 顶部那张表。
@@ -30,7 +30,7 @@ Complete API reference for the ZigModu modular framework.
 
 ### Module Definition
 
-#### `zigmodu.api.Module`
+#### `zmodu.api.Module`
 
 Declarative module definition with metadata.
 
@@ -46,7 +46,7 @@ pub const Module = struct {
 **Example:**
 ```zig
 const OrderModule = struct {
-    pub const info = zigmodu.api.Module{
+    pub const info = zmodu.api.Module{
         .name = "order",
         .description = "Order management module",
         .dependencies = &.{"inventory", "payment"},
@@ -59,7 +59,7 @@ const OrderModule = struct {
 
 ### Module Scanning
 
-#### `zigmodu.scanModules`
+#### `zmodu.scanModules`
 
 Scan modules at compile time and extract metadata.
 
@@ -72,7 +72,7 @@ pub fn scanModules(
 
 **Example:**
 ```zig
-var modules = try zigmodu.scanModules(allocator, .{
+var modules = try zmodu.scanModules(allocator, .{
     UserModule,
     OrderModule,
     PaymentModule,
@@ -82,7 +82,7 @@ defer modules.deinit();
 
 ### Module Validation
 
-#### `zigmodu.validateModules`
+#### `zmodu.validateModules`
 
 Validate that all module dependencies are satisfied.
 
@@ -101,7 +101,7 @@ pub fn start(self: *Self) !void
 pub fn stop(self: *Self) void
 ```
 
-#### `zigmodu.startAll` / `zigmodu.stopAll`（底层 Lifecycle）
+#### `zmodu.startAll` / `zmodu.stopAll`（底层 Lifecycle）
 
 `Application.start/stop` 的内部实现；直接使用需自行管理模块生命周期。
 
@@ -115,7 +115,7 @@ pub fn stopAll(modules: *ApplicationModules) void
 
 ### Documentation Generation
 
-#### `zigmodu.generateDocs`
+#### `zmodu.generateDocs`
 
 Generate PlantUML documentation.
 
@@ -133,7 +133,7 @@ pub fn generateDocs(
 
 ### Application Builder
 
-#### `zigmodu.Application`
+#### `zmodu.Application`
 
 High-level application abstraction.
 
@@ -160,7 +160,7 @@ pub const Config = struct {
 
 **Example:**
 ```zig
-var app = try zigmodu.Application.init(
+var app = try zmodu.Application.init(
     io,
     allocator,
     "myapp",
@@ -174,7 +174,7 @@ defer app.deinit();
 try app.start();
 ```
 
-#### `zigmodu.builder`
+#### `zmodu.builder`
 
 Fluent builder pattern for application creation.
 
@@ -184,7 +184,7 @@ pub fn builder(allocator: std.mem.Allocator) ApplicationBuilder
 
 **Example:**
 ```zig
-var builder = zigmodu.builder(allocator, io);   // io 来自 std.process.Init / 应用的 Io
+var builder = zmodu.builder(allocator, io);   // io 来自 std.process.Init / 应用的 Io
 defer builder.deinit();
 
 var app = try builder
@@ -200,7 +200,7 @@ var app = try builder
 
 ### Container
 
-#### `zigmodu.Container`
+#### `zmodu.Container`
 
 Service container for dependency injection.
 
@@ -224,7 +224,7 @@ and `get`/`contains` are lock-free reads.
 
 **Example:**
 ```zig
-var container = zigmodu.Container.init(allocator);
+var container = zmodu.Container.init(allocator);
 defer container.deinit();
 
 try container.register(Database, "main_db", &db_instance);
@@ -233,10 +233,10 @@ const db = container.get(Database, "main_db");
 
 ### Scoped Container
 
-#### `zigmodu.ScopedContainer`
+#### `zmodu.ScopedContainer`
 
-Scoped dependency container with parent resolution. Hoisted like `zigmodu.Container`
-(there is no `zigmodu.di` namespace); own registrations win, misses fall through to
+Scoped dependency container with parent resolution. Hoisted like `zmodu.Container`
+(there is no `zmodu.di` namespace); own registrations win, misses fall through to
 `parent`.
 
 ```zig
@@ -271,10 +271,10 @@ specialization cannot hoist away.
 
 ### ConfigManager
 
-#### `zigmodu.ConfigManager`
+#### `zmodu.ConfigManager`
 
 Centralized configuration management. Hoisted from `src/config/ConfigManager.zig`
-(there is no `zigmodu.config` namespace); `ModuleConfig` gives one module a key
+(there is no `zmodu.config` namespace); `ModuleConfig` gives one module a key
 prefix over the same store.
 
 ```zig
@@ -288,11 +288,11 @@ pub fn set(self: *Self, key: []const u8, value: ConfigValue) !void
 pub fn has(self: *Self, key: []const u8) bool
 ```
 
-The store loads JSON itself; TOML arrives through `zigmodu.TomlLoader` below.
+The store loads JSON itself; TOML arrives through `zmodu.TomlLoader` below.
 
 ### TomlLoader
 
-#### `zigmodu.TomlLoader`
+#### `zmodu.TomlLoader`
 
 Fills an existing `ConfigManager` from a `.toml` file — sections become
 dotted keys (`[server]` + `port` → `server.port`) and values keep their TOML
@@ -305,21 +305,21 @@ pub fn loadFile(self: *Self, path: []const u8, config: *ConfigManager) !void
 ```
 
 ```zig
-var config = zigmodu.ConfigManager.init(allocator);
+var config = zmodu.ConfigManager.init(allocator);
 defer config.deinit();
 
-var loader = zigmodu.TomlLoader.init(allocator);
+var loader = zmodu.TomlLoader.init(allocator);
 try loader.loadFile("app.toml", &config);
 
 const port = config.getInt("server.port") orelse 8080;
 ```
 
-For a flat string→string map instead (no typed reads), `zigmodu.TomlParser` in
+For a flat string→string map instead (no typed reads), `zmodu.TomlParser` in
 the parser section below does the same job without a store.
 
 ### ExternalizedConfig
 
-#### `zigmodu.ExternalizedConfig`
+#### `zmodu.ExternalizedConfig`
 
 External configuration with priority-based loading.
 
@@ -334,10 +334,10 @@ pub fn refresh(self: *Self) !void
 
 ### YAML/TOML Parser
 
-#### `zigmodu.YamlParser` / `zigmodu.TomlParser`
+#### `zmodu.YamlParser` / `zmodu.TomlParser`
 
 Both flatten a file into a `StringHashMap([]const u8)` — values stay strings, so
-numbers and booleans need parsing by hand. Reach for `zigmodu.TomlLoader` above
+numbers and booleans need parsing by hand. Reach for `zmodu.TomlLoader` above
 instead when you want typed reads out of the same key space.
 
 ```zig
@@ -356,12 +356,12 @@ hand the map back to `deinitMap` rather than freeing it field by field.
 
 ### EventBus
 
-#### `zigmodu.EventBus(T)`
+#### `zmodu.EventBus(T)`
 
 **无类型事件总线**：`T` 是**事件类型键**（枚举等可哈希类型），payload 以
 `*anyopaque` 传递、由回调自己转回来；一个实例可挂任意多个事件类型。
 **非线程安全**；并发场景用 `ThreadSafeEventBus`（根导出
-`zigmodu.ThreadSafeEventBus`），或模块里 `ModuleContext.eventBus(...)`
+`zmodu.ThreadSafeEventBus`），或模块里 `ModuleContext.eventBus(...)`
 拿到的应用级总线。
 
 ```zig
@@ -383,7 +383,7 @@ pub fn totalSubscriberCount(self: *Self) usize
 const Topic = enum { order_created };
 const OrderEvent = struct { order_id: u64, status: []const u8 };
 
-const Bus = zigmodu.EventBus(Topic);
+const Bus = zmodu.EventBus(Topic);
 
 var bus = Bus.init(allocator);
 defer bus.deinit();
@@ -401,7 +401,7 @@ fn onOrderCreated(topic: Topic, payload: *anyopaque) void {
 
 ### TypedEventBus
 
-#### `zigmodu.TypedEventBus(T)`
+#### `zmodu.TypedEventBus(T)`
 
 单事件类型的简化总线：payload **按值**传递（`fn (T) void`），不用 `*anyopaque`
 转换。同样**非线程安全**。
@@ -424,7 +424,7 @@ pub fn droppedAsyncCount(self: *Self) u64           // 异步投递因分配/派
 **Example:**
 ```zig
 const OrderEvent = struct { order_id: u64, status: []const u8 };
-const Bus = zigmodu.TypedEventBus(OrderEvent);
+const Bus = zmodu.TypedEventBus(OrderEvent);
 
 var bus = Bus.init(allocator);
 defer bus.deinit();
@@ -435,7 +435,7 @@ bus.publish(.{ .order_id = 123, .status = "completed" });
 
 ### DistributedEventBus
 
-#### `zigmodu.DistributedEventBus`
+#### `zmodu.DistributedEventBus`
 
 Cross-node event communication.
 
@@ -461,9 +461,9 @@ pub fn getNodeCount(self: *Self) usize
 (`_ = event;`), `commit` only flipped a local state field, and `EventOutbox.store`
 allocated a zero-length payload. It had no `root.zig` export and no caller anywhere in
 `src/`, `examples/` or `tools/`, so there was nothing to keep for. The working
-implementations are the outbox (`zigmodu.outbox.OutboxPublisher` / `OutboxPoller`, see
-§ `zigmodu.outbox.OutboxConsumer` below) and, for compensating long-running flows,
-`zigmodu.SagaOrchestrator`.
+implementations are the outbox (`zmodu.outbox.OutboxPublisher` / `OutboxPoller`, see
+§ `zmodu.outbox.OutboxConsumer` below) and, for compensating long-running flows,
+`zmodu.SagaOrchestrator`.
 
 ---
 
@@ -471,7 +471,7 @@ implementations are the outbox (`zigmodu.outbox.OutboxPublisher` / `OutboxPoller
 
 ### CircuitBreaker
 
-#### `zigmodu.CircuitBreaker`
+#### `zmodu.CircuitBreaker`
 
 Prevent cascade failures with circuit breaker pattern.
 
@@ -515,7 +515,7 @@ pub fn resetAll(self: *Self) void
 
 ### RateLimiter
 
-#### `zigmodu.RateLimiter`
+#### `zmodu.RateLimiter`
 
 Token bucket rate limiting. **线程安全**（内部短自旋守卫），可跨线程共享。
 
@@ -555,10 +555,10 @@ the registry.
 
 ### SlidingWindowRateLimiter
 
-#### `zigmodu.SlidingWindowRateLimiter`
+#### `zmodu.SlidingWindowRateLimiter`
 
-窗口内计数限流；**线程安全**。Hoisted like `zigmodu.RateLimiter` (there is no
-`zigmodu.resilience` namespace).
+窗口内计数限流；**线程安全**。Hoisted like `zmodu.RateLimiter` (there is no
+`zmodu.resilience` namespace).
 
 ```zig
 pub fn init(allocator: std.mem.Allocator, name: []const u8, window_size_seconds: u64, max_requests: u32) !Self
@@ -569,7 +569,7 @@ pub fn currentCount(self: *Self) usize
 
 ### Retry Policy
 
-#### `zigmodu.http.HttpClient.RetryPolicy`
+#### `zmodu.http.HttpClient.RetryPolicy`
 
 Exponential backoff retry strategy.
 
@@ -584,7 +584,7 @@ pub fn calculateDelay(self: RetryPolicy, attempt: u32) u64
 
 ### Distributed Tracing
 
-#### `zigmodu.observability.DistributedTracer`
+#### `zmodu.observability.DistributedTracer`
 
 OpenTelemetry-compatible distributed tracing.
 
@@ -609,7 +609,7 @@ pub fn end(self: *Span) void
 
 ### Prometheus Metrics
 
-#### `zigmodu.observability.PrometheusMetrics`
+#### `zmodu.observability.PrometheusMetrics`
 
 Prometheus-compatible metrics collection.
 
@@ -654,7 +654,7 @@ pub fn observe(self: *Histogram, value: f64) void
 
 ### Auto Instrumentation
 
-#### `zigmodu.observability.AutoInstrumentation`
+#### `zmodu.observability.AutoInstrumentation`
 
 Automatic instrumentation for modules.
 
@@ -668,7 +668,7 @@ pub fn recordApiRequestStart(self: *Self, api_name: []const u8, module_name: []c
 
 ### Structured Logging
 
-#### `zigmodu.observability.StructuredLogger`
+#### `zmodu.observability.StructuredLogger`
 
 JSON-formatted structured logging.
 
@@ -686,7 +686,7 @@ pub fn err(self: *Self, message: []const u8, fields: anytype) !void
 
 ## HTTP Server & Profiles
 
-### `zigmodu.http.Server`
+### `zmodu.http.Server`
 
 ```zig
 pub fn init(io: std.Io, allocator: std.mem.Allocator, port: u16) Server
@@ -711,7 +711,7 @@ request (details: `docs/ROUTE_TABLE.md` §4.6).
 | Field | Default | Meaning |
 |-------|---------|---------|
 | `port` | `8080` | listen port |
-| `name` | `"zigmodu-api"` | server name |
+| `name` | `"zmodu-api"` | server name |
 | `max_body_size` | `8 MiB` | body limit (413 over) |
 | `request_timeout_ms` | `30000` | **handler stage** budget |
 | `max_requests_per_conn` | `100` | keep-alive reuse cap |
@@ -728,7 +728,7 @@ Environment equivalents (`fromEnv`): `HTTP_PORT`, `HTTP_MAX_BODY`,
 `HTTP_MAX_CONNECTIONS`, `HTTP_HEADER_TIMEOUT_MS`, `HTTP_BODY_TIMEOUT_MS`,
 `HTTP_RESPONSE_WRITE_TIMEOUT_MS`, `WS_WRITE_TIMEOUT_MS`.
 
-### `zigmodu.http.productionProfile`
+### `zmodu.http.productionProfile`
 
 One call: backpressure + security/observability middleware + `/metrics` +
 liveness/readiness probes (+ optional dashboard).
@@ -778,7 +778,7 @@ Thresholds, PromQL and the Grafana dashboard: [`OBSERVABILITY.md`](./OBSERVABILI
 | `applyHttpDefaults(server, ProfileConfig, *HttpProfileState)` | CORS / request-id / recover / access log / in-memory metrics middleware only |
 | `ResilienceProfileState.init(allocator, deps)` / `applyResilienceDefaults` | per-dependency `CircuitBreaker` + `RateLimiter` holders — nothing is enforced until handlers use `breaker(name)` / `limiter(name)` |
 
-### `zigmodu.observability.PrometheusMetrics`（HTTP profile 接线）
+### `zmodu.observability.PrometheusMetrics`（HTTP profile 接线）
 
 与上文是**同一个类型**，这里只列 HTTP profile 侧用到的入口。
 
@@ -799,7 +799,7 @@ pub fn registerMetricsRoutePath(self: *Self, server: anytype, path: []const u8) 
 
 ## Hardening primitives
 
-### `zigmodu.FrozenMap` / `zigmodu.FrozenStringMap`
+### `zmodu.FrozenMap` / `zmodu.FrozenStringMap`
 
 Build-time-populated, run-time read-only maps for app-level shared registries.
 Fill during startup, `freeze()` before serving; afterwards reads are lock-free
@@ -814,7 +814,7 @@ pub fn FrozenStringMap(comptime V: type) type
 //          get(K) ?V, contains(K), count(), iterator()
 ```
 
-### `zigmodu.panicHook`
+### `zmodu.panicHook`
 
 Request-aware panic handler. The server records `METHOD /path` into a threadlocal
 slot before dispatch; on panic the hook prints it to stderr (no allocation)
@@ -822,7 +822,7 @@ before delegating to `std.debug.defaultPanic`.
 
 ```zig
 // in the application root file (the one with `main`):
-const zmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 pub const panic = zmodu.panicHook;
 ```
 
@@ -831,10 +831,10 @@ comes from a supervisor (`Restart=always`, k8s `restartPolicy: Always`); see
 [`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「韧性」and
 [`PRODUCTION_ROADMAP.md`](../archive/status/PRODUCTION_ROADMAP.md) for the prefork boundary.
 
-### `zigmodu.Params` (multi-value query/form)
+### `zmodu.Params` (multi-value query/form)
 
-Hoisted to the root (there is no `zigmodu.http.Params` alias; `PageParams` stays
-under `zigmodu.http`).
+Hoisted to the root (there is no `zmodu.http.Params` alias; `PageParams` stays
+under `zmodu.http`).
 
 `ctx.query` and `ctx.form` are `Params`, not `StringHashMap`: HTML's two native
 "several values for one name" shapes are kept.
@@ -859,7 +859,7 @@ query/form. `route_template` is the metric label to use; it is normalised to a
 leading `/` at registration, so `group.get("health")` and a ComptimeRouter mount
 both report the same shape as `group.get("/health")`.
 
-### `zigmodu.http.Multipart`
+### `zmodu.http.Multipart`
 
 ```zig
 pub const Config = struct {
@@ -932,7 +932,7 @@ endpoint cannot ship with the policy defined but never applied; it renders the
 refusal (415 by default) and still returns the guard error for handlers that
 branch on it.
 
-### `zigmodu.http.staticFiles` (static file serving)
+### `zmodu.http.staticFiles` (static file serving)
 
 ```zig
 pub fn staticFiles(io, server: *Server, allocator, prefix: []const u8, root_dir: []const u8, config: Config) !void
@@ -963,7 +963,7 @@ Labels must be low-cardinality by construction: `productionProfile` labels the
 golden signals with `Context.route_template` (the matched pattern), never the raw
 path. See [`OBSERVABILITY.md`](./OBSERVABILITY.md).
 
-### `zigmodu.outbox.OutboxConsumer`
+### `zmodu.outbox.OutboxConsumer`
 
 ```zig
 pub fn setMetrics(self: *Self, metrics: *PrometheusMetrics) !void   // selected/delivered/failed + pending gauge
@@ -974,7 +974,7 @@ pub fn stopPolling(self: *Self) void
 pub fn pollOnce(self: *Self) !PollStats
 ```
 
-### `zigmodu.Preflight`
+### `zmodu.Preflight`
 
 Startup checks that turn "it broke at 3am" into "it refused to start".
 
@@ -995,14 +995,14 @@ pub fn clockCheck(*ClockCheck) Check                 // wall-clock sanity
 Checks never panic and are isolated: one failure does not hide the others.
 See [`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「上线前预检」.
 
-### `zigmodu.security.JwksKeyRing` (key rotation)
+### `zmodu.security.JwksKeyRing` (key rotation)
 
 `SecurityModule.setKeyring(&ring)` makes new tokens carry `kid`; verification
 uses the key the token names and rejects unknown kids (`error.UnknownKeyId`).
 Rotate by adding a new primary key and keeping the old one in the ring until
 its tokens expire.
 
-### `zigmodu.DistributedLock`
+### `zmodu.DistributedLock`
 
 Cross-instance mutual exclusion for background work (cron jobs, migrations).
 
@@ -1017,18 +1017,18 @@ pub fn SqlLock(comptime Client: type) type // init(allocator, io, client, table,
 ```
 
 Consumers: `cron.Scheduler.setLock(lock, ttl_ms)` (key `cron:<job>`) and
-`data.MigrationRunner.setLock(lock, ttl_ms)` (key `zigmodu:migration`, returns
+`data.MigrationRunner.setLock(lock, ttl_ms)` (key `zmodu:migration`, returns
 `error.MigrationLocked` when another instance holds it).
 
 Coverage: SQLite in-memory, plus a real PostgreSQL 17 test gated on
-`ZIGMODU_TEST_PG=1` (CI's `test-postgres` job sets it, along with `PGHOST` /
+`ZMODU_TEST_PG=1` (CI's `test-postgres` job sets it, along with `PGHOST` /
 `PGPORT` / `PGUSER` / `PGPASSWORD` / `PGDATABASE`). The MySQL variant
 (`INSERT IGNORE`) is implemented but still awaits a real-server test. Claiming is one atomic
 statement (`ON CONFLICT DO NOTHING` / `INSERT IGNORE`), so contention is
 `rows_affected == 0`, not an error; a crashed holder is reaped after `ttl_ms`.
 See [`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「多副本后台任务」.
 
-### `zigmodu.NetworkProbe`
+### `zmodu.NetworkProbe`
 
 ```zig
 pub fn available() bool   // loopback TCP usable?
@@ -1038,7 +1038,7 @@ Used by socket-dependent tests to `return error.SkipZigTest` in sandboxes.
 `zig build test -Dnet-tests=false` forces it to `false` so the whole suite skips
 network cases.
 
-### `zigmodu.im.WsFramer` (outbound control)
+### `zmodu.im.WsFramer` (outbound control)
 
 ```zig
 pub fn setSendTimeout(self: *WsFramer, timeout_ms: u32) void  // 0 = unbounded
@@ -1051,7 +1051,7 @@ pub fn isWritable(self: *WsFramer) bool                       // O(1) send-buffe
 
 ### Transport Protocols
 
-ZigModu ships HTTP/1.1 and h2c in `http.Server` (`enable_http2`), and gRPC over
+zmodu ships HTTP/1.1 and h2c in `http.Server` (`enable_http2`), and gRPC over
 HTTP/2 via `extensions/GrpcTransport.zig` + `GrpcServiceRegistry`. There is no
 `TransportProtocol` enum and no built-in MQTT transport — bring your own client
 for those (an MQTT client is not part of the framework).
@@ -1077,28 +1077,28 @@ regression test (it no longer sends a per-stream `WINDOW_UPDATE`).
 
 ```zig
 // Local (modulith)
-var registry = zigmodu.GrpcServiceRegistry.init(allocator);
+var registry = zmodu.GrpcServiceRegistry.init(allocator);
 defer registry.deinit();
 try registry.registerService("echo.Echo");
 try registry.registerMethod("echo.Echo", "Say", .unary, handler);
 
-var client = zigmodu.GrpcClient.init(allocator);
+var client = zmodu.GrpcClient.init(allocator);
 defer client.deinit();
 client.bindLocal(&registry);
 var resp = try client.call("echo.Echo", "Say", proto_bytes);
 defer resp.deinit();
 
 // HTTP/1.1 application/grpc
-var net = zigmodu.GrpcClient.initWithIo(allocator, io);
+var net = zmodu.GrpcClient.initWithIo(allocator, io);
 defer net.deinit();
 try net.registerEndpoint("echo.Echo", "127.0.0.1", 50051);
 var remote = try net.call("echo.Echo", "Say", proto_bytes);
 defer remote.deinit();
 
 // Framing helpers
-const framed = try zigmodu.GrpcFrame.encode(allocator, proto_bytes);
+const framed = try zmodu.GrpcFrame.encode(allocator, proto_bytes);
 defer allocator.free(framed);
-const payload = try zigmodu.GrpcFrame.decode(framed);
+const payload = try zmodu.GrpcFrame.decode(framed);
 ```
 
 HTTP unary server side: `registry.handleHttpUnary(path, body)` → set `grpc-status` / `grpc-message` headers + framed body.
@@ -1106,7 +1106,7 @@ HTTP unary server side: `registry.handleHttpUnary(path, body)` → set `grpc-sta
 ### SecretsManager (Vault KV v2)
 
 ```zig
-var sm = zigmodu.security.SecretsManager.initWithIo(allocator, io);
+var sm = zmodu.security.SecretsManager.initWithIo(allocator, io);
 defer sm.deinit();
 try sm.configureVaultEx(.{
     .address = "http://127.0.0.1:8200",
@@ -1128,7 +1128,7 @@ Not provided. Use an external MQTT client library; the framework's HTTP stack
 
 ### HTTP Client
 
-#### `zigmodu.http.HttpClient`
+#### `zmodu.http.HttpClient`
 
 HTTP client with connection pooling.
 
@@ -1150,7 +1150,7 @@ pub fn delete(self: *Self, url: []const u8) !HttpResponse
 
 
 
-ZigModu provides an async fiber-based HTTP server built on `std.Io`. It supports routing, middleware chains, keep-alive connections, and structured request handling aligned with go-zero's rest package.
+zmodu provides an async fiber-based HTTP server built on `std.Io`. It supports routing, middleware chains, keep-alive connections, and structured request handling aligned with go-zero's rest package.
 
 
 
@@ -1162,7 +1162,7 @@ ZigModu provides an async fiber-based HTTP server built on `std.Io`. It supports
 
 
 
-`zigmodu.http.Server` — Main async HTTP server.
+`zmodu.http.Server` — Main async HTTP server.
 
 
 
@@ -1285,13 +1285,13 @@ Linux CI 腿将第一次执行真 ring（runner 内核的 io_uring 可用性是�
 
 const std = @import("std");
 
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 
 
-const Server = zigmodu.http.Server;
+const Server = zmodu.http.Server;
 
-const Context = zigmodu.http.Context;
+const Context = zmodu.http.Context;
 
 
 
@@ -1558,11 +1558,11 @@ try server.addMiddleware(.{ .func = authMiddleware });
 
 const std = @import("std");
 
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
-const Server = zigmodu.http.Server;
+const Server = zmodu.http.Server;
 
-const Context = zigmodu.http.Context;
+const Context = zmodu.http.Context;
 
 
 
@@ -1645,7 +1645,7 @@ pub fn main(init: std.process.Init) !void {
 
 ## Error response rendering
 
-### `zigmodu.http.useRfc7807Errors`
+### `zmodu.http.useRfc7807Errors`
 
 框架自产的错误体有三条出口（链内 `ctx.sendError`、路由前裸 socket、handler 自写）。
 这两条钩子把前两条统一成 RFC 7807 ProblemDetails（media type `application/problem+json`）：
@@ -1678,7 +1678,7 @@ pub const ModuleGateConfig = struct { reject: AuthRejectFn = defaultReject, ... 
 
 ### JWT Authentication
 
-#### `zigmodu.security.SecurityModule`
+#### `zmodu.security.SecurityModule`
 
 JWT token generation and verification.
 
@@ -1696,7 +1696,7 @@ pub const PasswordError = error{MalformedStoredHash} || std.mem.Allocator.Error;
 > 不可解码、或解码时分配失败，都会被答成 `false`，调用方只能回 401 —— 把一个"我们这边出错"记成
 > "口令错"。现在 `error.MalformedStoredHash`（记录不可用）与 `error.OutOfMemory` 各自冒泡，
 > 调用方按需回 5xx；口令**不匹配**仍然只是 `false`。
-> `zigmodu.security.PasswordEncoder.matches` 同形。
+> `zmodu.security.PasswordEncoder.matches` 同形。
 
 ### Permission matching
 
@@ -1717,11 +1717,11 @@ pub fn permissionMatchesAuthInfo(auth: *const Rbac.AuthInfo, permission: []const
 
 `expr` 支持 `a|b` 备选语法。`permissionMatches` 命中任一身份来源（AuthInfo / `permissions` / `roles`）；
 `permissionMatchesWith` 则**锁定某个 gate 的语义**（`.roles` 只读 roles；`.rbac` 有 AuthInfo 时以它为准）。
-两者共用 `zigmodu.security.Rbac.exprMatchesCsv` / `exprMatchesAuthInfo`，与 gate 同一份实现。
+两者共用 `zmodu.security.Rbac.exprMatchesCsv` / `exprMatchesAuthInfo`，与 gate 同一份实现。
 
 ### Security Scanner
 
-#### `zigmodu.security.SecurityScanner`
+#### `zmodu.security.SecurityScanner`
 
 Static security analysis for source code.
 
@@ -1740,7 +1740,7 @@ pub fn isSecure(self: *Self, result: *const ScanResult) bool
 
 ### Module Testing
 
-#### `zigmodu.ModuleTestContext`
+#### `zmodu.ModuleTestContext`
 
 Testing context for module testing.
 
@@ -1754,7 +1754,7 @@ pub fn stop(self: *Self) void
 
 ### Integration Testing
 
-#### `zigmodu.IntegrationTest`
+#### `zmodu.IntegrationTest`
 
 Full integration test framework.
 
@@ -1769,7 +1769,7 @@ pub fn waitFor(self: *Self, condition: fn () bool, timeout_ms: u64) !void
 
 ### Benchmark
 
-#### `zigmodu.Benchmark`
+#### `zmodu.Benchmark`
 
 Performance benchmarking utilities.
 
@@ -1783,7 +1783,7 @@ pub fn generateReport(self: *Self) ![]const u8
 
 ## Additional Components
 
-### `zigmodu.WebSocketServer` / `zigmodu.WebSocketMonitor` (`src/extensions/WebSocket.zig`)
+### `zmodu.WebSocketServer` / `zmodu.WebSocketMonitor` (`src/extensions/WebSocket.zig`)
 
 RFC 6455 server for pushing live updates to browsers; `WebSocketMonitor` wraps it
 and adds a 5 s metrics `updateLoop` on top.
@@ -1839,7 +1839,7 @@ pub const CacheManager = struct {
 
 ### Scheduler
 
-#### `zigmodu.cron.Scheduler` (`src/scheduler/Cron.zig`)
+#### `zmodu.cron.Scheduler` (`src/scheduler/Cron.zig`)
 
 Cron expression jobs (`* * * * *`), driven by a background thread. For
 multi-replica deployments guard it with `DistributedLock` (see
@@ -1881,7 +1881,7 @@ pub fn Repository(comptime T: type) type {
 （`sqlx.Client` / `Transaction` / `SqlxBackend` 均可作为 exec 目标）：
 
 ```zig
-pub const bulk = zigmodu.data.bulk;
+pub const bulk = zmodu.data.bulk;
 _ = try bulk.insertMany(alloc, &client, "order_product", &.{ "order_id", "sku" }, &rows, .sqlite, .{
     .conflict_columns = &.{"id"},
 }); // upsert 后缀：SQLite/PG → ON CONFLICT ("id") DO UPDATE SET …；MySQL → ON DUPLICATE KEY UPDATE

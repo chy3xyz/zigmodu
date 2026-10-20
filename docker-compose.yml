@@ -1,30 +1,30 @@
 # ─────────────────────────────────────────────────
-# ZigModu Development / Production Compose Stack
+# zmodu Development / Production Compose Stack
 # ─────────────────────────────────────────────────
 
 version: "3.9"
 
 services:
   # ── Framework application ──────────────────────
-  zigmodu:
+  zmodu:
     build:
       context: .
       dockerfile: Dockerfile
-    image: zigmodu:latest
-    container_name: zigmodu-app
+    image: zmodu:latest
+    container_name: zmodu-app
     ports:
       - "${HTTP_PORT:-8080}:8080"
       - "${CLUSTER_PORT:-9091}:9091"
     environment:
       - DB_HOST=${DB_HOST:-postgres}
       - DB_PORT=${DB_PORT:-5432}
-      - DB_NAME=${DB_NAME:-zigmodu}
-      - DB_USER=${DB_USER:-zigmodu}
-      - DB_PASS=${DB_PASS:-zigmodu}
+      - DB_NAME=${DB_NAME:-zmodu}
+      - DB_USER=${DB_USER:-zmodu}
+      - DB_PASS=${DB_PASS:-zmodu}
       - HTTP_PORT=8080
     volumes:
-      - ./config:/etc/zigmodu:ro
-      - zigmodu_logs:/var/log/zigmodu
+      - ./config:/etc/zmodu:ro
+      - zigmodu_logs:/var/log/zmodu
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/health/live"]
@@ -36,34 +36,34 @@ services:
       postgres:
         condition: service_healthy
     networks:
-      - zigmodu-net
+      - zmodu-net
 
   # ── PostgreSQL (primary datastore) ─────────────
   postgres:
     image: postgres:17-alpine
-    container_name: zigmodu-pg
+    container_name: zmodu-pg
     environment:
-      POSTGRES_DB: ${DB_NAME:-zigmodu}
-      POSTGRES_USER: ${DB_USER:-zigmodu}
-      POSTGRES_PASSWORD: ${DB_PASS:-zigmodu}
+      POSTGRES_DB: ${DB_NAME:-zmodu}
+      POSTGRES_USER: ${DB_USER:-zmodu}
+      POSTGRES_PASSWORD: ${DB_PASS:-zmodu}
     ports:
       - "${PG_PORT:-5432}:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
       - ./init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-zigmodu} -d ${DB_NAME:-zigmodu}"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-zmodu} -d ${DB_NAME:-zmodu}"]
       interval: 10s
       timeout: 5s
       retries: 5
     restart: unless-stopped
     networks:
-      - zigmodu-net
+      - zmodu-net
 
   # ── Redis (cache / pub-sub) ────────────────────
   redis:
     image: redis:7-alpine
-    container_name: zigmodu-redis
+    container_name: zmodu-redis
     ports:
       - "${REDIS_PORT:-6379}:6379"
     volumes:
@@ -75,12 +75,12 @@ services:
       retries: 5
     restart: unless-stopped
     networks:
-      - zigmodu-net
+      - zmodu-net
 
   # ── Vault (secrets — dev only) ─────────────────
   vault:
     image: hashicorp/vault:1.18
-    container_name: zigmodu-vault
+    container_name: zmodu-vault
     cap_add:
       - IPC_LOCK
     environment:
@@ -97,14 +97,14 @@ services:
       retries: 5
     restart: unless-stopped
     networks:
-      - zigmodu-net
+      - zmodu-net
     profiles:
       - secrets
 
   # ── Jaeger (tracing — dev only) ────────────────
   jaeger:
     image: jaegertracing/all-in-one:1.65
-    container_name: zigmodu-jaeger
+    container_name: zmodu-jaeger
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
     ports:
@@ -114,7 +114,7 @@ services:
       - "${OTLP_HTTP_PORT:-4318}:4318"       # OTLP HTTP
     restart: unless-stopped
     networks:
-      - zigmodu-net
+      - zmodu-net
     profiles:
       - tracing
 
@@ -129,6 +129,6 @@ volumes:
     name: zigmodu_vault_data
 
 networks:
-  zigmodu-net:
-    name: zigmodu-net
+  zmodu-net:
+    name: zmodu-net
     driver: bridge

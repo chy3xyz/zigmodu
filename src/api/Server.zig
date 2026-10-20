@@ -1,4 +1,4 @@
-//! HTTP API server for ZigModu
+//! HTTP API server for zmodu
 //!
 //! Provides HTTP server with routing, middleware, and handlers.
 //! Aligned with go-zero's rest package.
@@ -1276,7 +1276,7 @@ pub const Server = struct {
 
     pub const Config = struct {
         port: u16 = 8080,
-        name: []const u8 = "zigmodu-api",
+        name: []const u8 = "zmodu-api",
         max_body_size: usize = 8 * 1024 * 1024,
         request_timeout_ms: u32 = 30000,
         max_requests_per_conn: usize = 100,
@@ -3912,12 +3912,12 @@ test "WebSocket route path normalization handles leading slash variations" {
 test "header lookup is case-insensitive" {
     var headers = std.StringHashMap([]const u8).init(std.testing.allocator);
     defer headers.deinit();
-    try headers.put("user-agent", "zigmodu-test");
+    try headers.put("user-agent", "zmodu-test");
     try headers.put("x-tenant-id", "42");
 
-    try std.testing.expectEqualStrings("zigmodu-test", headerLookup(headers, "User-Agent").?);
+    try std.testing.expectEqualStrings("zmodu-test", headerLookup(headers, "User-Agent").?);
     try std.testing.expectEqualStrings("42", headerLookup(headers, "X-Tenant-ID").?);
-    try std.testing.expectEqualStrings("zigmodu-test", headerLookup(headers, "user-agent").?);
+    try std.testing.expectEqualStrings("zmodu-test", headerLookup(headers, "user-agent").?);
     try std.testing.expect(headerLookup(headers, "content-type") == null);
 }
 

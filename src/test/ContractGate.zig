@@ -8,7 +8,7 @@
 //!
 //! ```zig
 //! // In an app: same shape, but contracts describe your published endpoints.
-//! var runner = zigmodu.ContractTestRunner.init(allocator);
+//! var runner = zmodu.ContractTestRunner.init(allocator);
 //! defer runner.deinit();
 //! try runner.registerContract(.{ .name = "orders.list", ... });
 //! const result = try runner.verifyContract("orders.list", resp.status_code, resp.body, &.{});

@@ -1,6 +1,6 @@
-# ZigModu × zmodu CLI 工具集成与代码生成指南
+# zmodu × zmodu CLI 工具集成与代码生成指南
 
-`zmodu` 是专为 `ZigModu` 框架定制的高性能 CLI 代码生成器（独立工程位于 `w4_proj/zig_ws/zmodu`）。它支持直接解析 SQL DDL/Schema 或点对点反向工程数据库，一键产出符合 [`docs/MODULE_LAYERS.md`](./MODULE_LAYERS.md) 六层架构契约的工程代码骨架。
+`zmodu` 是专为 `zmodu` 框架定制的高性能 CLI 代码生成器（独立工程位于 `w4_proj/zig_ws/zmodu`）。它支持直接解析 SQL DDL/Schema 或点对点反向工程数据库，一键产出符合 [`docs/MODULE_LAYERS.md`](./MODULE_LAYERS.md) 六层架构契约的工程代码骨架。
 
 ---
 
@@ -22,7 +22,7 @@
 
 ### 1. 使用内置统一构建 Step
 
-在 `zigmodu` 根目录下先构建安装 `zmodu` CLI，再直接调用二进制：
+在 `zmodu` 根目录下先构建安装 `zmodu` CLI，再直接调用二进制：
 
 ```bash
 zig build zmodu   # 构建 + 安装到 zig-out/bin/zmodu
@@ -34,7 +34,7 @@ zig-out/bin/zmodu scaffold --sql ./schema.sql --name myapp --tenant-column app_i
 > 造成的断档已补，且改参数不再触发 build 脚本重编）。需要反复调用的脚本仍
 > 建议 `zig-out/bin/zmodu` 形态——每次调用不过构建图检查。
 
-`--tenant-column`（默认 `tenant_id`）控制生成的 `WHERE` 与 scaffold `main` 里的 `zigmodu.setTenantColumn(...)`。模型字段须与列名一致（如 `app_id: i64`）。
+`--tenant-column`（默认 `tenant_id`）控制生成的 `WHERE` 与 scaffold `main` 里的 `zmodu.setTenantColumn(...)`。模型字段须与列名一致（如 `app_id: i64`）。
 
 或安装到系统可执行路径：
 
@@ -71,16 +71,16 @@ zmodu add --name order_item --sql ./schema.sql
 ### 3b. 零样板 CRUD（`zmodu saas` 生成 + `http.CrudApi`）
 
 `zmodu saas` 生成的业务模块，API 层已收敛成一行声明——list/get/create/
-update/delete 五个 handler 由框架 `zigmodu.http.CrudApi(Entity, Service, opts)`
+update/delete 五个 handler 由框架 `zmodu.http.CrudApi(Entity, Service, opts)`
 自动生成：
 
 ```zig
 // api.zig（生成物）—— 整份文件即一行注册
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 const model = @import("model.zig");
 const service = @import("service.zig");
 
-pub const OrdersApi = zigmodu.http.CrudApi(model.Orders, service.OrdersService, .{});
+pub const OrdersApi = zmodu.http.CrudApi(model.Orders, service.OrdersService, .{});
 ```
 
 生成的路由与元数据（`nest`/`module_name` 取自 Service）：
@@ -102,7 +102,7 @@ Service 只需 duck-typed `list/get/create/update/delete` + `module_name`/`nest`
 
 - 生成器输出带 `validate` 钩子的薄 service（保留业务扩展点，如写 outbox、加事件）；
 - 想要「透传归零 + CRUD 即事件源」的项目可直接组合
-  `zigmodu.data.CrudService(Entity, Persistence)`：写操作自动 publish
+  `zmodu.data.CrudService(Entity, Persistence)`：写操作自动 publish
   `CrudEvent{created,updated,deleted}`，无需手写事件发布代码。
 - 生成 service 另带 `transact(T, f)` 透传：多表业务方法直接
   `try self.transact(...)`，不用手写 begin/commit/rollback。
@@ -112,7 +112,7 @@ Service 只需 duck-typed `list/get/create/update/delete` + `module_name`/`nest`
 pub const OrdersService = struct {
     pub const module_name = "orders";
     pub const nest = .{"orders"};
-    pub const impl = zigmodu.data.CrudService(model.Orders, persistence.OrdersPersistence);
+    pub const impl = zmodu.data.CrudService(model.Orders, persistence.OrdersPersistence);
     crud: impl,
 
     pub fn init(p: *persistence.OrdersPersistence) @This() {
@@ -144,7 +144,7 @@ pub const OrdersService = struct {
   非白名单忽略，防 ORDER BY 注入）；
 - 分页 `total` 是真实 COUNT（生成 list 内建 COUNT + LIMIT/OFFSET，不再是页长）。
 
-可观测：`server.addMiddleware(zigmodu.http.tracingMiddleware())` 一行启用
+可观测：`server.addMiddleware(zmodu.http.tracingMiddleware())` 一行启用
 `x-trace-id` 注入与请求耗时日志（示例见 `examples/zmsaas/backend/src/main.zig`）。
 
 运维标配（见 `examples/zmsaas`）：版本化迁移走
@@ -173,7 +173,7 @@ CrudService（可调 `self.crud.*` 复用基础行为 + 事件），自定义端
 ### 4. AI 技能注册表（`zmodu ai`）
 
 ```bash
-# 导出内置 AI 技能目录（JSON，与 zigmodu.ai.skill_export.toSkillsJson 同构）
+# 导出内置 AI 技能目录（JSON，与 zmodu.ai.skill_export.toSkillsJson 同构）
 zmodu ai export-skills --out skills.json
 
 # 把技能目录（内置或应用导出的）转换为 OpenAPI 3.0 文档
@@ -182,7 +182,7 @@ zmodu ai openapi --in skills.json --out openapi.json
 
 每个技能对应一个 `POST /skills/{name}` 操作，参数从注册表推导
 （`properties` + `required`）。应用侧可直接用
-`zigmodu.ai.skill_export.toSkillsJson / toOpenApi` 在运行时导出并挂成
+`zmodu.ai.skill_export.toSkillsJson / toOpenApi` 在运行时导出并挂成
 `GET /api/ai/skills` 与 `GET /api/ai/skills/openapi` 之类的端点。
 
 ---
@@ -216,10 +216,10 @@ lint 风格的可达性分析）：报告未使用的顶层 `fn`/`const`/`var`�
 - **architecture**：模块自依赖、循环依赖、缺失描述、命名规范
   （小写字母/数字/`-`/`_`）、依赖数量上限（默认 5）、未知依赖（拼写错误）、
   base 模块依赖业务模块（`--base-modules core,http` 时启用）——与框架内
-  `zigmodu.ArchitectureTester` 的默认规则对齐（静态源码扫描版）；
+  `zmodu.ArchitectureTester` 的默认规则对齐（静态源码扫描版）；
 - **business**：handler/model 含 SQL、非参数化 SQL（字符串字面量拼接）、
   `@ptrCast(ctx.user_data)`、legacy `sendSuccess`/`sendFail`、banned 导入
-  （`zigmodu.http_server` / `orm.Orm` / `PasswordEncoder`）、已移除的 Zig
+  （`zmodu.http_server` / `orm.Orm` / `PasswordEncoder`）、已移除的 Zig
   0.17 API（`std.Thread.Mutex` 等）、跨模块直接文件导入、handler 手工解析
   Authorization/Bearer、空 `catch {}` 吞错、未使用 catch 捕获
   （`catch |err| { _ = err; }` → 应写 `catch {`）、service 层纯透传 CRUD
@@ -378,11 +378,11 @@ CLI `--max-deps` 优先于配置文件，配置文件优先于内置默认值。
 
 ## 最佳实践规范
 
-在整合使用 `zmodu` 生成代码时，必须遵守 ZigModu 生产规范：
+在整合使用 `zmodu` 生成代码时，必须遵守 zmodu 生产规范：
 1. **模块依赖拓扑**：生成的 `module.zig` 中的 `dependencies` 需精准列出下游模块名，启动时框架通过 `ModuleValidator` 自动检测并防范循环依赖。
 2. **规范领域导入**：生成的业务代码统一使用 canonical 导入：
    ```zig
-   const zmodu = @import("zigmodu");
+   const zmodu = @import("zmodu");
    const http = zmodu.http;
    const data = zmodu.data;
    const sec = zmodu.security;
@@ -404,7 +404,7 @@ CLI `--max-deps` 优先于配置文件，配置文件优先于内置默认值。
 
 ```bash
 zig-out/bin/zmodu scaffold --from-db postgresql://user@localhost/db --name myapp
-# → build.zig 中 b.dependency("zigmodu", .{ .db = "postgres", ... })
+# → build.zig 中 b.dependency("zmodu", .{ .db = "postgres", ... })
 ```
 
 运行时 DSN 与链接驱动必须一致；未链接的驱动会在 `Client.connect` 返回 `error.DriverNotEnabled`。

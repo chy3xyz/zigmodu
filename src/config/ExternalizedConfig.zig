@@ -1,5 +1,4 @@
 const std = @import("std");
-const ZigModuError = @import("../core/Error.zig").ZigModuError;
 
 /// Externalized configuration manager.
 /// Multiple sources are supported: environment variables, config files, or any custom loader.
@@ -414,23 +413,30 @@ pub const ExternalizedConfig = struct {
     }
 };
 
-/// Environment variable config source; reads the ZIGMODU_ prefixed variables.
+/// Environment variable config source; reads the `ZMODU_` prefixed variables.
+///
+/// `ZIGMODU_` is still honoured for one release (the project was renamed from
+/// zmodu to zmodu): a property present under both prefixes takes the `ZMODU_`
+/// value. Deployments can migrate at their own pace without renaming env vars
+/// first.
 pub fn envVarLoader(allocator: std.mem.Allocator) !std.StringHashMap([]const u8) {
     var props = std.StringHashMap([]const u8).init(allocator);
 
-    // Read env vars with specific prefix
-    const prefix = "ZIGMODU_";
+    const prefixes = [_][]const u8{ "ZMODU_", "ZIGMODU_" };
 
     var env_map = std.process.getEnvMap(allocator) catch return props;
     defer env_map.deinit();
 
-    var iter = env_map.iterator();
-    while (iter.next()) |entry| {
-        const key = entry.key_ptr.*;
-        if (std.mem.startsWith(u8, key, prefix)) {
-            const prop_key = try allocator.dupe(u8, key[prefix.len..]);
+    for (prefixes) |prefix| {
+        var iter = env_map.iterator();
+        while (iter.next()) |entry| {
+            const key = entry.key_ptr.*;
+            if (!std.mem.startsWith(u8, key, prefix)) continue;
+            const prop_key = key[prefix.len..];
+            if (props.contains(prop_key)) continue; // new prefix wins
+            const k = try allocator.dupe(u8, prop_key);
             const value = try allocator.dupe(u8, entry.value_ptr.*);
-            try props.put(prop_key, value);
+            try props.put(k, value);
         }
     }
 
@@ -551,10 +557,10 @@ test "ExternalizedConfig file watcher lifecycle" {
     defer config.deinit();
 
     // Create a temp file
-    var tmp = try std.Io.Dir.cwd().createFile(std.testing.io, "zigmodu_test_config.tmp", .{});
+    var tmp = try std.Io.Dir.cwd().createFile(std.testing.io, "zmodu_test_config.tmp", .{});
     defer {
         tmp.close(std.testing.io);
-        std.Io.Dir.cwd().deleteFile(std.testing.io, "zigmodu_test_config.tmp") catch {};
+        std.Io.Dir.cwd().deleteFile(std.testing.io, "zmodu_test_config.tmp") catch {};
     }
     try tmp.writeStreamingAll(std.testing.io, "{}");
 
@@ -564,7 +570,7 @@ test "ExternalizedConfig file watcher lifecycle" {
         }
     }.load;
 
-    try config.watchFile("zigmodu_test_config.tmp", dummyLoader);
+    try config.watchFile("zmodu_test_config.tmp", dummyLoader);
     try std.testing.expectEqual(@as(usize, 1), config.getWatcherCount());
 
     try config.watch(.{ .interval_ms = 100 });

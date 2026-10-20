@@ -43,7 +43,7 @@ done
 
 WORK="$(mktemp -d)"
 APP_PID=""
-NGINX_NAME="zigmodu-smuggle-$$"
+NGINX_NAME="zmodu-smuggle-$$"
 
 skip() {
     echo "SKIP: $*"

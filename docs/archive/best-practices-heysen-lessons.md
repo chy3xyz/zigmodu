@@ -1,6 +1,6 @@
-# ZigModu Best Practices — Lessons from Heysen SaaS
+# zmodu Best Practices — Lessons from Heysen SaaS
 
-> Derived from building a 68-module insurance brokerage platform (Zig 0.17.0 + zigmodu).  
+> Derived from building a 68-module insurance brokerage platform (Zig 0.17.0 + zmodu).  
 > 选择性驱动链接（减小部署依赖面）：[SQLX_DRIVERS.md](../guide/SQLX_DRIVERS.md)。
 
 ## 1. SQLx — PostgreSQL Driver
@@ -87,7 +87,7 @@ pub fn findPage(self: @This(), page: usize, size: usize) !PageResult(T) {
 
 **Problem**: Generated models had wrong column names (`menu_type` vs `type` in DB, `ip` vs `user_ip`). Model and DB schema drifted.
 
-**Proposed**: Add a `zigmodu validate-schema` command that compares model `json_names` against actual DB columns at startup. Or generate models from `\d` output.
+**Proposed**: Add a `zmodu validate-schema` command that compares model `json_names` against actual DB columns at startup. Or generate models from `\d` output.
 
 ---
 
@@ -97,7 +97,7 @@ pub fn findPage(self: @This(), page: usize, size: usize) !PageResult(T) {
 
 **Problem**: Admin frontend (Vben, Java convention) uses kebab-case (`/crm/business-status/page`). Zig backend uses snake_case (`/crm/business_status/page`). Every module needed manual aliases.
 
-**Proposed**: Add a `normalizePath` middleware in zigmodu's Server that converts `-` → `_` in URL paths before route matching. One line of code saves dozens of alias routes.
+**Proposed**: Add a `normalizePath` middleware in zmodu's Server that converts `-` → `_` in URL paths before route matching. One line of code saves dozens of alias routes.
 
 ```zig
 pub fn setPathNormalizer(self: *Server, normalize: PathNormalizerFn) void {
@@ -199,7 +199,7 @@ pub fn registerRoutes(_: *Api, _: *RouteGroup) !void {
 
 **Problem**: Column name mismatches discovered at runtime (500 errors), not compile time.
 
-**Proposed**: Add `zigmodu check` command that:
+**Proposed**: Add `zmodu check` command that:
 1. Connects to database
 2. Reads `\d` output for each model's `sql_table_name`
 3. Compares model fields against actual columns
@@ -273,6 +273,6 @@ pub fn acquire(self: *ConnPool) !Conn {
 | P1 | Arena-backed JSON parsing in generated handlers | Prevent production crashes |
 | P1 | Connection pool `ping()` before `acquire()` | Prevent stale connection crashes |
 | P2 | Generate `simple-list` alias alongside `list-all-simple` | Eliminate manual alias additions |
-| P2 | `zigmodu check` — validate models against DB schema | Catch drift at build time |
+| P2 | `zmodu check` — validate models against DB schema | Catch drift at build time |
 | P3 | Request tracing with `x-request-id` | Debugging speed |
 | P3 | Deprecate `.query()` for DML, add `.select()` | API clarity |

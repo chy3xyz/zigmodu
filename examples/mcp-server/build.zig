@@ -9,12 +9,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const zigmodu_dep = b.dependency("zigmodu", .{
+    const zmodu_dep = b.dependency("zmodu", .{
         .target = target,
         .optimize = optimize,
         .db = "sqlite",
     });
-    exe_mod.addImport("zigmodu", zigmodu_dep.module("zigmodu"));
+    exe_mod.addImport("zmodu", zmodu_dep.module("zmodu"));
 
     const exe = b.addExecutable(.{ .name = "mcp-server", .root_module = exe_mod });
     b.installArtifact(exe);

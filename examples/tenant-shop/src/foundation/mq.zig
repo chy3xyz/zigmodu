@@ -5,13 +5,13 @@
 //!   otherwise → offline producer (stats + log only, no network)
 
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 pub const Publisher = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
-    producer: zigmodu.KafkaProducer,
+    producer: zmodu.KafkaProducer,
     online: bool,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, bootstrap: ?[]const u8) Self {
@@ -19,7 +19,7 @@ pub const Publisher = struct {
             std.log.info("[mq] RobustMQ online bootstrap={s}", .{bs});
             return .{
                 .allocator = allocator,
-                .producer = zigmodu.KafkaProducer.initWithIo(allocator, io, .{
+                .producer = zmodu.KafkaProducer.initWithIo(allocator, io, .{
                     .bootstrap_servers = bs,
                     .client_id = "tenant-shop",
                 }),
@@ -29,7 +29,7 @@ pub const Publisher = struct {
         std.log.info("[mq] offline mode (set ROBUSTMQ_URL or KAFKA_BOOTSTRAP to enable)", .{});
         return .{
             .allocator = allocator,
-            .producer = zigmodu.KafkaProducer.init(allocator, .{
+            .producer = zmodu.KafkaProducer.init(allocator, .{
                 .client_id = "tenant-shop",
             }),
             .online = false,
@@ -42,7 +42,7 @@ pub const Publisher = struct {
 
     /// Publish one outbox payload. Key is typically tenant_id string.
     pub fn publish(self: *Self, topic: []const u8, key: ?[]const u8, payload: []const u8) !void {
-        const ts: i64 = @intCast(zigmodu.time.monotonicNowSeconds());
+        const ts: i64 = @intCast(zmodu.time.monotonicNowSeconds());
         std.log.info("[mq] publish topic={s} key={s} bytes={d} online={}", .{
             topic,
             key orelse "-",

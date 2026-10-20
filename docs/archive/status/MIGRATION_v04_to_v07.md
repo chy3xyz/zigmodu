@@ -1,6 +1,6 @@
-# Migration Guide: ZigModu v0.4 to v0.7
+# Migration Guide: zmodu v0.4 to v0.7
 
-**ZigModu v0.7.0** introduces several breaking changes and improvements over v0.4. This guide helps you migrate your existing code.
+**zmodu v0.7.0** introduces several breaking changes and improvements over v0.4. This guide helps you migrate your existing code.
 
 ---
 
@@ -20,10 +20,10 @@ const MyModule = struct {
 
 #### New API (v0.7)
 ```zig
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 const MyModule = struct {
-    pub const info = zigmodu.api.Module{
+    pub const info = zmodu.api.Module{
         .name = "my-module",
         .description = "My module description",
         .dependencies = &.{"other"},
@@ -33,7 +33,7 @@ const MyModule = struct {
 ```
 
 **Changes:**
-- `ModuleInfo` renamed to `zigmodu.api.Module`
+- `ModuleInfo` renamed to `zmodu.api.Module`
 - Added `.description` field (required)
 - Added `.is_internal` field (default: `false`)
 
@@ -50,7 +50,7 @@ const now = 0; // Incorrect - was placeholder
 
 #### After (v0.7)
 ```zig
-const Time = @import("zigmodu").core.Time;
+const Time = @import("zmodu").core.Time;
 const now = Time.monotonicNowSeconds();
 ```
 
@@ -91,7 +91,7 @@ defer app.deinit();
 
 ### 4. Error Types
 
-Error types have been unified under `ZigModuError`.
+Error types have been unified under `ZmoduError`.
 
 #### Before (v0.4)
 ```zig
@@ -101,8 +101,8 @@ return error.LifecycleError;
 
 #### After (v0.7)
 ```zig
-return ZigModuError.ModuleInitializationFailed;
-return ZigModuError.InvalidDependency;
+return ZmoduError.ModuleInitializationFailed;
+return ZmoduError.InvalidDependency;
 ```
 
 ---
@@ -170,11 +170,11 @@ try bus.publish(.{ .topic = "order", .payload = data });
 
 ## Recommended Update Sequence
 
-1. **Update Module Definitions** - Change `ModuleInfo` to `zigmodu.api.Module`
+1. **Update Module Definitions** - Change `ModuleInfo` to `zmodu.api.Module`
 2. **Add descriptions** - Add `.description` field to all modules
 3. **Fix Time Usage** - Replace hardcoded `0` with `Time.monotonicNowSeconds()`
 4. **Update Application Init** - Add `std.Io` parameter and options
-5. **Migrate Error Handling** - Use `ZigModuError` instead of custom errors
+5. **Migrate Error Handling** - Use `ZmoduError` instead of custom errors
 6. **Update EventBus** - Rename to `TypedEventBus`
 
 ---
@@ -192,4 +192,4 @@ try bus.publish(.{ .topic = "order", .payload = data });
 
 - [API Documentation](../../reference/API.md)
 - [Quick Start Guide](../../guide/QUICK-START.md)
-- [GitHub Issues](https://github.com/knot3bot/zigmodu/issues)
+- [GitHub Issues](https://github.com/knot3bot/zmodu/issues)

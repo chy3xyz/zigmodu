@@ -2,7 +2,7 @@
 layout: home
 
 hero:
-  name: ZigModu
+  name: zmodu
   text: A modular framework for Zig
   tagline: Build services as modules — compose, route, observe, evolve.
   actions:
@@ -40,6 +40,6 @@ features:
 The **[documentation index](./dev/archive/README.md)** is the full map — it lists every document
 by role, so an agent or a newcomer can pick a path without guessing.
 
-Start with **[AGENTS.md](https://github.com/chy3xyz/zigmodu/blob/master/AGENTS.md)**
+Start with **[AGENTS.md](https://github.com/chy3xyz/zmodu/blob/master/AGENTS.md)**
 if you are driving this repository with an LLM: it is the canonical doc map,
 including the DO / DON'T list and the auth Path A rules.

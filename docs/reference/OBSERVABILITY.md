@@ -6,13 +6,13 @@
 ## 1. 一行接入
 
 ```zig
-var server = zigmodu.http.Server.init(io, allocator, 8080);
+var server = zmodu.http.Server.init(io, allocator, 8080);
 defer server.deinit();
 
-var profile = zigmodu.http.ProductionProfileState.init(allocator);
+var profile = zmodu.http.ProductionProfileState.init(allocator);
 defer profile.deinit(allocator);
 
-try zigmodu.http.productionProfile(&server, .{
+try zmodu.http.productionProfile(&server, .{
     .max_connections = 4096,
     .header_timeout_ms = 10_000,
 }, &profile);
@@ -145,7 +145,7 @@ HTTP 指标正常 ≠ 系统正常。outbox 停止投递、连接池打满这类
 
 ```zig
 // 1) outbox：积压 / 投递 / 死信（OutboxConsumer 自带后台轮询）
-var consumer = zigmodu.outbox.OutboxConsumer.init(allocator, &backend, .{}, ctx, handler);
+var consumer = zmodu.outbox.OutboxConsumer.init(allocator, &backend, .{}, ctx, handler);
 try consumer.setMetrics(profile.prometheus.?);   // selected/delivered/failed + pending
 try consumer.startPolling(io, 1000);             // 每秒一批，取代手工 cron
 defer consumer.stopPolling();
@@ -196,13 +196,13 @@ metrics.setScrapeHook(struct {
 接线（应用侧显式接全部 feed）：
 
 ```zig
-var source = zigmodu.http.Dashboard.DataSource{
+var source = zmodu.http.Dashboard.DataSource{
     .server = &server,                       // routes / middleware 计数
     .http_metrics = &collector,              // 可选：stats.http 块
     .modules = &.{ .{ .name = "order", .desc = "Order module", .deps = 2 } }, // 从模块图填充
 };
 var scope = router.scope("");
-try zigmodu.http.Dashboard.registerRoutesWith(&scope, &source);
+try zmodu.http.Dashboard.registerRoutesWith(&scope, &source);
 ```
 
 `productionProfile` 已自动把 `server` 和 `HttpProfileState.metrics_collector`
@@ -238,7 +238,7 @@ sum(rate(http_request_duration_milliseconds_sum[5m]))
 
 | 告警 | 表达式（示例阈值） | 处置 |
 |------|--------------------|------|
-| 服务不可用 | `up{job="zigmodu"} == 0` for 1m | 看 supervisor 重启原因；接 `zmodu.panicHook` 的 stderr |
+| 服务不可用 | `up{job="zmodu"} == 0` for 1m | 看 supervisor 重启原因；接 `zmodu.panicHook` 的 stderr |
 | 5xx 燃烧 | 5xx 率 > 1% for 5m（或 > 5% for 1m 立即） | 查 trace/日志；必要时回滚 |
 | 高延迟 | P95 > 500ms for 10m | 查 DB/下游；确认不是连接池耗尽 |
 | 4xx 突增 | 4xx 率 > 基线 3 倍 for 10m | 常见于鉴权批量失效、客户端版本问题 |
@@ -251,7 +251,7 @@ sum(rate(http_request_duration_milliseconds_sum[5m]))
 
 ```yaml
 scrape_configs:
-  - job_name: zigmodu
+  - job_name: zmodu
     metrics_path: /metrics
     scrape_interval: 15s
     static_configs:
@@ -269,7 +269,7 @@ annotations:
 
 ## 6. Grafana
 
-导入 [`grafana/zigmodu-overview.json`](../grafana/zigmodu-overview.json)
+导入 [`grafana/zmodu-overview.json`](../grafana/zmodu-overview.json)
 （Grafana → Dashboards → Import → 上传 JSON，数据源选 Prometheus）。
 面板：QPS、5xx 错误率、4xx 比率、P50/P95/P99 延迟、状态码分类堆叠、总请求数。
 

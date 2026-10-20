@@ -1,4 +1,4 @@
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 const model = @import("model.zig");
 
 pub fn UserPersistence(comptime Backend: type) type {
@@ -10,7 +10,7 @@ pub fn UserPersistence(comptime Backend: type) type {
             return .{ .db = db };
         }
 
-        pub fn findByTenant(self: *Self, tenant_id: i64) !zigmodu.data.sqlx.QueryResult(model.User) {
+        pub fn findByTenant(self: *Self, tenant_id: i64) !zmodu.data.sqlx.QueryResult(model.User) {
             return try self.db.queryRowsPartial(
                 model.User,
                 "SELECT id, tenant_id, username, email, password_hash, role, status, created_at, updated_at FROM users WHERE tenant_id = ?1 ORDER BY id",

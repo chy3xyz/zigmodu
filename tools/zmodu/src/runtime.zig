@@ -370,7 +370,7 @@ fn clockLess(_: void, a: Clock, b: Clock) bool {
 }
 
 const Report = struct {
-    /// Any `app.runtime()` / `ctx.runtime()` / `zigmodu.runtime` reference.
+    /// Any `app.runtime()` / `ctx.runtime()` / `zmodu.runtime` reference.
     uses_runtime: bool = false,
     files_scanned: usize = 0,
     workers: std.ArrayList(Worker) = .empty,
@@ -733,11 +733,11 @@ fn analyzeSource(
 
 /// A project "uses the runtime" when it reaches for the app's runtime or
 /// imports the namespace: `app.runtime()`, `ctx.runtime()`, `zmodu.runtime`,
-/// `@import("zigmodu").runtime`.
+/// `@import("zmodu").runtime`.
 fn usesRuntime(content: []const u8) bool {
     if (indexOfCode(content, ".runtime()", 0) != null) return true;
     if (indexOfCode(content, "zmodu.runtime", 0) != null) return true;
-    if (indexOfCode(content, "\"zigmodu\").runtime", 0) != null) return true;
+    if (indexOfCode(content, "\"zmodu\").runtime", 0) != null) return true;
     return false;
 }
 
@@ -1107,9 +1107,9 @@ fn renderText(project_dir: []const u8, report: Report, w: anytype) !void {
     // `runtime()` reference still gets its call sites listed rather than hidden
     // behind this line.
     if (report.uses_runtime) {
-        try w.writeAll("uses runtime: yes  (app.runtime()/ctx.runtime() or zigmodu.runtime)\n");
+        try w.writeAll("uses runtime: yes  (app.runtime()/ctx.runtime() or zmodu.runtime)\n");
     } else {
-        try w.writeAll("uses runtime: no  (no app.runtime()/ctx.runtime(), no zigmodu.runtime reference)\n");
+        try w.writeAll("uses runtime: no  (no app.runtime()/ctx.runtime(), no zmodu.runtime reference)\n");
     }
 
     try w.print("\nworkers ({d} spawn site(s)):\n", .{report.workers.items.len});
@@ -1507,7 +1507,7 @@ test "runtime follows a named capacity to the const in the imported file" {
             .path = "src/modules/exec/module.zig",
             .content =
             \\const api = @import("api.zig");
-            \\const runtime = @import("zigmodu").runtime;
+            \\const runtime = @import("zmodu").runtime;
             \\pub fn initWith(ctx: *zmodu.ModuleContext) !void {
             \\    const rt = try ctx.runtime();
             \\    inbox = try rt.spawn(Worker, .{
@@ -1710,7 +1710,7 @@ test "runtime --json parses back into the documented shape" {
 test "runtime reports the pool both ways round: who is pooled, and what was declared" {
     const allocator = std.testing.allocator;
     const src =
-        \\const rt = try zigmodu.Runtime.initWithOptions(allocator, io, .{
+        \\const rt = try zmodu.Runtime.initWithOptions(allocator, io, .{
         \\    .scheduler = .{ .max_pooled_workers = 8 },
         \\});
         \\pub fn initWith(ctx: *zmodu.ModuleContext) !void {
@@ -1818,7 +1818,7 @@ test "runtime scans a project tree and reports the wiring with file:line" {
     try tmp.dir.writeFile(io, .{
         .sub_path = "src/modules/pipeline/inner/module.zig",
         .data =
-        \\const runtime = @import("zigmodu").runtime;
+        \\const runtime = @import("zmodu").runtime;
         \\pub fn initWith(ctx: *zmodu.ModuleContext) !void {
         \\    const rt = try ctx.runtime();
         \\    inbox = try rt.spawn(Worker, .{}, 128);

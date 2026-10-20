@@ -44,11 +44,11 @@ pub const AutoInstrumentation = struct {
 
     pub fn init(allocator: std.mem.Allocator, metrics: *PrometheusMetrics, tracer: *DistributedTracer) !Self {
         // Create module lifecycle metrics
-        const module_init_duration = try metrics.createHistogram("zigmodu_module_init_duration_seconds", "Module initialization duration", &.{ 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0 });
+        const module_init_duration = try metrics.createHistogram("zmodu_module_init_duration_seconds", "Module initialization duration", &.{ 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0 });
 
-        const module_init_total = try metrics.createCounter("zigmodu_module_init_total", "Module initialization count (success + failure)");
+        const module_init_total = try metrics.createCounter("zmodu_module_init_total", "Module initialization count (success + failure)");
 
-        const module_active_gauge = try metrics.createGauge("zigmodu_module_active", "Current active module count");
+        const module_active_gauge = try metrics.createGauge("zmodu_module_active", "Current active module count");
 
         // Create event processing metrics
         const event_published_total = try metrics.createCounter("zigmodu_event_published_total", "Total published events");

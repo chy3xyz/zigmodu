@@ -1,8 +1,8 @@
-# ZigModu Runtime —— 第二条高速通道
+# zmodu Runtime —— 第二条高速通道
 
 > 定位：**Modulith（架构单元）+ Runtime（执行单元）**。
 > 目标句式：*a compile-time modular, worker-oriented, event-driven runtime for Zig*。
-> 版本口径：运行时代码自 **v0.16.0** 起（`zigmodu.runtime`）。参考 `docs/dev/todo3.md`（方向）与
+> 版本口径：运行时代码自 **v0.16.0** 起（`zmodu.runtime`）。参考 `docs/dev/todo3.md`（方向）与
 > `docs/dev/todo3.1.md`（兼容策略）。
 
 ## 1. 为什么是"第二条通道"而不是重写
@@ -11,7 +11,7 @@
 运行时要做的是补上另一件正交的事：**一个线程拥有的状态、一个邮箱拥有交接、一个时间轮拥有延迟**。
 
 ```
-                     ZigModu
+                     zmodu
                         │
         ┌───────────────┴───────────────┐
         │                               │
@@ -32,7 +32,7 @@
 ## 2. 兼容原则（写进契约，逐条可验证）
 
 ```
-ZigModu Compatibility Principles
+zmodu Compatibility Principles
 
  1. Existing Module API remains stable.
  2. Existing Application API remains stable.
@@ -223,7 +223,7 @@ error set 里只剩接线错误，没有"可以习惯性无视"的那一支。
 `stop()` 时请求停止并 join。模块通过 `ModuleContext.runtime()` 拿到**同一个** runtime：
 
 ```zig
-const zmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 const rt = zmodu.runtime;
 
 /// 拥有一个 worker 的模块：从 `initWith` 里 spawn，生命周期交给 app。
@@ -431,7 +431,7 @@ const s = rt.stats();
 **接进 `/metrics`**：`RuntimeStats` 有现成的桥，起服务时接一次即可，抓取时采样（无后台线程）：
 
 ```zig
-var bridge = try zigmodu.runtime.Runtime.MetricsBridge(PrometheusMetrics).init(&rt, metrics);
+var bridge = try zmodu.runtime.Runtime.MetricsBridge(PrometheusMetrics).init(&rt, metrics);
 metrics.setScrapeHook(@TypeOf(bridge).sample, &bridge);
 ```
 
@@ -537,9 +537,9 @@ const http_trace = ctx.traceId() orelse "";
 try worker.sendTraced(cmd, traceFromHeader(http_trace));
 
 /// `x-trace-id`（两段 16 进制，或上游任意字符串）→ runtime 的 `TraceId`。
-fn traceFromHeader(id: []const u8) zigmodu.runtime.TraceId {
+fn traceFromHeader(id: []const u8) zmodu.runtime.TraceId {
     var parts = std.mem.splitScalar(u8, id, '-');
-    const high = std.fmt.parseInt(u64, parts.next() orelse "", 16) catch return zigmodu.runtime.TraceId.generate();
+    const high = std.fmt.parseInt(u64, parts.next() orelse "", 16) catch return zmodu.runtime.TraceId.generate();
     const low = std.fmt.parseInt(u64, parts.next() orelse "", 16) catch 0;
     return .{ .high = high, .low = low };
 }
@@ -567,7 +567,7 @@ fn traceFromHeader(id: []const u8) zigmodu.runtime.TraceId {
 与投递轨的分工、以及"复现 / 测试 / 留证选哪件"的总选型表见 **§13.1**。
 
 ```zig
-const runtime = @import("zigmodu").runtime;
+const runtime = @import("zmodu").runtime;
 
 var rec = runtime.Recorder(Trade, 4096).init(clock); // clock 与 Runtime.init 用同一个
 try bus.attachRecorder(&rec);                        // 必须在 bus.freeze() 之前
@@ -1322,7 +1322,7 @@ deschedule 得比整个预算还久；②的"耗尽即断言"随后改为"耗尽
 
 ### 12.15 `PrecisionTimer` 的界是**宿主的**，不是机制的（v0.33.6；CI 红过一次）
 
-`zigmodu.runtime.PrecisionTimer` 的 `lateness_p50_bound_ns = 10 µs` 此前被直接当作断言，
+`zmodu.runtime.PrecisionTimer` 的 `lateness_p50_bound_ns = 10 µs` 此前被直接当作断言，
 在 GitHub 的 macOS runner 上红了两条用例。实测原因不是循环写错，而是**那台宿主机的
 `nanosleep` 粒度比自旋窗口还粗**：
 

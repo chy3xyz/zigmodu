@@ -1,4 +1,4 @@
-# ZigModu 代码完整性评估报告
+# zmodu 代码完整性评估报告
 
 > **这是 2026-05-08 / v0.8.0 的历史快照，不是当前状态。** 它按当时的树逐模块打勾，从那以后
 > 代码只增不减地演进过（`docs/dev/final-assessment.md` 也把"本文件待同步"记为 Low）。
@@ -6,7 +6,7 @@
 >
 > | 本文件里的说法 | 现状 |
 > |---|---|
-> | `TransactionalEvent` / `TransactionalEvent.zig` ✅ 完成 | **文件已删除**（v0.33.6）。它当时就是个空壳（`stageEvent`/`addEvent` 都是 `_ = event;`），真身是 `zigmodu.outbox.*` 与 `zigmodu.SagaOrchestrator`。 |
+> | `TransactionalEvent` / `TransactionalEvent.zig` ✅ 完成 | **文件已删除**（v0.33.6）。它当时就是个空壳（`stageEvent`/`addEvent` 都是 `_ = event;`），真身是 `zmodu.outbox.*` 与 `zmodu.SagaOrchestrator`。 |
 > | 行数 ~32,000 / 模块 75+ / Zig 0.16.0 / v0.8.0 | 现为 ~115,000 行 / Zig 0.17.0 / v0.33.x；当前版本与测试数以 `build.zig.zon`、`AGENTS.md` 与 `CHANGELOG.md` 为准。 |
 >
 > 分数与百分比请当作**当时**的读数读，不要用来判断今天该不该采用。
@@ -216,7 +216,7 @@ Other:               61 tests ✅
 
 ---
 
-**结论**: ZigModu v0.8.0 框架已达到生产级标准，功能完整度 98%，测试覆盖 95%，文档完善度 95%。框架已准备好用于生产环境！
+**结论**: zmodu v0.8.0 框架已达到生产级标准，功能完整度 98%，测试覆盖 95%，文档完善度 95%。框架已准备好用于生产环境！
 
 ---
 

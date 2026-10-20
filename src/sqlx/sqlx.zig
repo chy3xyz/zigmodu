@@ -2834,7 +2834,7 @@ pub const PostgresConn = struct {
         // server refused is `error.DatabaseError`. `PostgresStmt.prepare`'s
         // inferred set also carries `error.NoSpaceLeft` from its own 32-byte
         // name buffer — unreachable for `"stmt_{x}"` of a pointer, and not a
-        // member of `ZigModuError`, so it lands on the database arm.
+        // member of `ZmoduError`, so it lands on the database arm.
         const stmt = try allocator.create(PostgresStmt);
         errdefer allocator.destroy(stmt);
         stmt.* = PostgresStmt.prepare(self.conn, allocator, sql_str) catch |err| switch (err) {
@@ -3203,7 +3203,7 @@ fn mysqlReadRowsAfterQuery(mysql: ?*libmysql_c.MYSQL, arena: std.heap.ArenaAlloc
     return rows;
 }
 
-/// Map MySQL/MariaDB errno to ZigModu errors.
+/// Map MySQL/MariaDB errno to zmodu errors.
 fn mysqlErrnoToError(err_no: c_uint) errors.Error {
     return switch (err_no) {
         // Constraint violations
@@ -9230,7 +9230,7 @@ test "sqlite streaming cursor falls back to buffered" {
 //
 // Gating follows both conventions already in this tree: `DB=postgres` (the CI
 // `test-postgres` job, same as this file's other live-PG tests) or
-// `ZIGMODU_TEST_PG=1` (the opt-in the other real-database tests use — and the
+// `ZMODU_TEST_PG=1`（旧名 `ZIGMODU_TEST_PG` 仍读取） (the opt-in the other real-database tests use — and the
 // only one that survives `scripts/test-fast.sh`, which owns `DB`).
 //
 // The queries are shaped so the server streams rows and *then* fails:
@@ -9247,7 +9247,7 @@ test "sqlite streaming cursor falls back to buffered" {
 // i.e. the documented `while (cursor.next()) |row|` loop reported a truncated
 // result set as a complete one.
 test "streaming PG cursor reports a mid-stream server error instead of ending the result" {
-    const opt_in = if (std.c.getenv("ZIGMODU_TEST_PG")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else false;
+    const opt_in = if (std.c.getenv("ZMODU_TEST_PG") orelse std.c.getenv("ZIGMODU_TEST_PG")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else false;
     if (!opt_in) try skipUnlessDb("postgres");
     if (!DriverFeatures.postgres) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -9310,7 +9310,7 @@ test "streaming PG cursor reports a mid-stream server error instead of ending th
 // re-pools the connection or retires it, and the very next statement on the
 // same client has to work.
 test "pooled client stays usable after a streaming cursor fails mid-result" {
-    const opt_in = if (std.c.getenv("ZIGMODU_TEST_PG")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else false;
+    const opt_in = if (std.c.getenv("ZMODU_TEST_PG") orelse std.c.getenv("ZIGMODU_TEST_PG")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else false;
     if (!opt_in) try skipUnlessDb("postgres");
     if (!DriverFeatures.postgres) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -10489,10 +10489,10 @@ test "queryScalar reads the first column" {
 // load — only a live server for the two drivers whose paths exist solely
 // against one.
 
-/// Skip unless the live-PG tests may run: `ZIGMODU_TEST_PG=1` (the opt-in that
+/// Skip unless the live-PG tests may run: `ZMODU_TEST_PG=1`（旧名 `ZIGMODU_TEST_PG` 仍读取） (the opt-in that
 /// survives `scripts/test-fast.sh`, which owns `DB`) or `DB=postgres`.
 fn skipUnlessLivePg() !void {
-    const opt_in = if (std.c.getenv("ZIGMODU_TEST_PG")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else false;
+    const opt_in = if (std.c.getenv("ZMODU_TEST_PG") orelse std.c.getenv("ZIGMODU_TEST_PG")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else false;
     if (!opt_in) try skipUnlessDb("postgres");
     if (!DriverFeatures.postgres) return error.SkipZigTest;
 }

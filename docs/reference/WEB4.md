@@ -1,15 +1,15 @@
 # Web4：DID 身份 + x402 支付
 
-> zigmodu 的 Web4 原语：`zigmodu.web4`（DID `did:key` 身份 + HTTP 402/x402
-> 支付协议）与 HTTP 中间件（`zigmodu.web4.middleware`）。配套示例：
+> zmodu 的 Web4 原语：`zmodu.web4`（DID `did:key` 身份 + HTTP 402/x402
+> 支付协议）与 HTTP 中间件（`zmodu.web4.middleware`）。配套示例：
 > [`examples/web4`](../../examples/web4)。
 
-## 1. DID 身份（`zigmodu.web4.DidKey`）
+## 1. DID 身份（`zmodu.web4.DidKey`）
 
 Ed25519 `did:key` 自证明身份（无需区块链）：
 
 ```zig
-const web4 = zigmodu.web4;
+const web4 = zmodu.web4;
 
 var key = try web4.DidKey.generate(allocator, io);
 defer allocator.free(key.did);
@@ -24,7 +24,7 @@ defer allocator.free(resolved.did);
 
 `VerifiableCredential`：`issueCredential` / `verifyCredential` 签发与验证可验证凭证。
 
-## 2. x402 支付（`zigmodu.web4.x402`）
+## 2. x402 支付（`zmodu.web4.x402`）
 
 HTTP 402 变现协议：服务端返回 402 + invoice，客户端支付后带 proof 重试。
 
@@ -33,7 +33,7 @@ HTTP 402 变现协议：服务端返回 402 + invoice，客户端支付后带 pr
 - `PaymentVerifier` 可插拔验证器；**默认 fail-closed**（`verifyPaymentReject` 永拒；
   dev 才显式注入 `verifyPaymentAllowAll`；生产注入链上/白名单验证器）。
 
-## 3. HTTP 中间件（`zigmodu.web4.middleware`）
+## 3. HTTP 中间件（`zmodu.web4.middleware`）
 
 ```zig
 // x402 支付门：保护 /api/paid —— 无 proof → 402 + invoice；无效 → 403；通过 → 放行
@@ -53,7 +53,7 @@ try server.addMiddleware(web4.middleware.didAuthMiddleware(&did_cfg));
 
 ### 生产加固
 
-**invoice 持久化 + 幂等核销（防重放）**：`zigmodu.web4.x402_store.X402Store`
+**invoice 持久化 + 幂等核销（防重放）**：`zmodu.web4.x402_store.X402Store`
 （SQL 表）创建 invoice 落库；proof 到达时 `redeem(invoice_id, tx_hash, payer_did)`
 **每个 invoice 恰好核销一次**——重复 proof 返回 `already_used`（410），
 未知/过期分别返回 `not_found` / `expired`。
@@ -74,7 +74,7 @@ var x402_cfg = web4.middleware.X402Config{
 };
 ```
 
-**DID 一次性 challenge（防重放）**：`zigmodu.web4.challenge.ChallengeStore`
+**DID 一次性 challenge（防重放）**：`zmodu.web4.challenge.ChallengeStore`
 签发短时随机 challenge，`verifyAndConsume` 每个 challenge 只接受一次。
 中间件**先解 DID、验签，通过后才消费**该 challenge —— 反过来的顺序会让任何能
 观测到 challenge 的人用一份无效签名替受害者把它烧掉（此后受害者的合法请求被判重放）：

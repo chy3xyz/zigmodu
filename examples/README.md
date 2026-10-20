@@ -1,6 +1,6 @@
-# ZigModu Examples
+# zmodu Examples
 
-This directory contains comprehensive examples demonstrating various features of ZigModu.
+This directory contains comprehensive examples demonstrating various features of zmodu.
 
 **DB linking**: most runnable examples use sqlite-only (`.db = "sqlite"` or `-Ddb=sqlite`). Path-dep apps share [`_shared/db_link.zig`](_shared/db_link.zig) via per-example symlinks. Full guide: [`docs/guide/SQLX_DRIVERS.md`](../docs/guide/SQLX_DRIVERS.md).
 
@@ -9,7 +9,7 @@ This directory contains comprehensive examples demonstrating various features of
 **Flagship runnable demo** — multi-tenant SaaS, `http.productionProfile` (connection
 backpressure + security/observability middleware + `/metrics` golden signals +
 `/health/live` + `/health/ready`), middleware chain (tenant → JWT → data permission),
-dashboard, and `zigmodu.http` canonical imports. Used by CI integration probes (`scripts/ci-integration.sh`).
+dashboard, and `zmodu.http` canonical imports. Used by CI integration probes (`scripts/ci-integration.sh`).
 
 ```bash
 cd examples/tenant-mgmt && HTTP_PORT=18080 zig build run
@@ -28,9 +28,9 @@ cd examples/tenant-shop && HTTP_PORT=18090 zig build run
 curl http://127.0.0.1:18090/health/live
 ```
 
-## ZigModu × zent (`examples/zent-modulith`)
+## zmodu × zent (`examples/zent-modulith`)
 
-**Orthogonal ORM demo** — ZigModu `http.Server` + [zent](https://github.com/chy3xyz/zent) schema-as-code Client/migrate. zent is pinned by git tag in `build.zig.zon` (`v0.96.0`); a sibling `../zent` checkout is only for developing zent itself. Practices: [`docs/reference/ZENT.md`](../docs/reference/ZENT.md).
+**Orthogonal ORM demo** — zmodu `http.Server` + [zent](https://github.com/chy3xyz/zent) schema-as-code Client/migrate. zent is pinned by git tag in `build.zig.zon` (`v0.96.0`); a sibling `../zent` checkout is only for developing zent itself. Practices: [`docs/reference/ZENT.md`](../docs/reference/ZENT.md).
 
 ```bash
 cd examples/zent-modulith && HTTP_PORT=18100 zig build run
@@ -70,7 +70,7 @@ Covered in [docs/ai/AI_ORCHESTRATION.md](../docs/ai/AI_ORCHESTRATION.md).
 
 ## LLM-Powered Policies (`examples/llm-policies`)
 
-**Real wiring for `zigmodu.ai.llm`** — connects `AiProvider` to the built-in
+**Real wiring for `zmodu.ai.llm`** — connects `AiProvider` to the built-in
 LLM policies (`llmApprove` / `llmRiskDecide` / `llmDiagnose` / `llmVerify`),
 exactly as documented in [docs/ai/LLM_POLICIES.md](../docs/ai/LLM_POLICIES.md):
 
@@ -86,7 +86,7 @@ still exercises every policy; with credentials it calls the real model.
 ## Web4 (DID + x402) (`examples/web4`)
 
 **DID identity + HTTP 402 payment gating** — two protected routes on one
-server using `zigmodu.web4.middleware`:
+server using `zmodu.web4.middleware`:
 
 - `GET /api/paywall` — x402 gate: no proof → `402` + invoice; valid proof → `200`
   (dev verifier accepts; production injects an on-chain/allow-list verifier);
@@ -107,7 +107,7 @@ Covered in [docs/WEB4.md](../docs/reference/WEB4.md).
 supervisor (`Restart=always` / k8s `restartPolicy`) is the availability backstop
 because a Zig panic aborts the process. Also covers probe semantics
 (liveness = process, readiness = dependencies), `docker-compose.yml`,
-`k8s.yaml` (probes + HPA + Prometheus annotations), `zigmodu.service`, and a
+`k8s.yaml` (probes + HPA + Prometheus annotations), `zmodu.service`, and a
 multi-stage Dockerfile.
 
 Backend flags wired throughout: `HTTP_MAX_CONNECTIONS`, `HTTP_HEADER_TIMEOUT_MS`,
@@ -146,8 +146,8 @@ step is stated per row — that is the command CI runs for it.
 | [`tenant-mgmt`](tenant-mgmt/) | Flagship: multi-tenant SaaS on `http.productionProfile` (CI integration demo) | `zig build run` · `zig build test` |
 | [`tenant-shop`](tenant-shop/) | Modulith blueprint: tenant/user/product/inventory + `shop_bff` / `admin_bff` | `zig build run` |
 | [`web4`](web4/) | did:key identity + x402 payment gating | `zig build run` · `zig build test` |
-| [`zent-modulith`](zent-modulith/) | ZigModu HTTP + zent schema-as-code ORM (zent pinned by git tag) | `zig build run` |
-| [`zmsaas`](zmsaas/) | Backend (ZigModu) + SolidStart frontend | `cd examples/zmsaas/backend && zig build` · `zig build test` |
+| [`zent-modulith`](zent-modulith/) | zmodu HTTP + zent schema-as-code ORM (zent pinned by git tag) | `zig build run` |
+| [`zmsaas`](zmsaas/) | Backend (zmodu) + SolidStart frontend | `cd examples/zmsaas/backend && zig build` · `zig build test` |
 
 The three walkthroughs below go one level deeper on a few of those rows.
 
@@ -155,7 +155,7 @@ The three walkthroughs below go one level deeper on a few of those rows.
 **Demonstrates**: Core module system features
 
 This row also carries the testing example: `src/tests.zig` covers
-`ModuleTestContext`, `zigmodu.createMockModule`, application lifecycle and
+`ModuleTestContext`, `zmodu.createMockModule`, application lifecycle and
 dependency validation, and runs via `zig build test`.
 
 - Module definition with dependencies
@@ -167,14 +167,14 @@ dependency validation, and runs via `zig build test`.
 **Key Concepts**:
 ```zig
 const MyModule = struct {
-    pub const info = zigmodu.api.Module{
+    pub const info = zmodu.api.Module{
         .name = "my-module",
         .dependencies = &.{"other-module"},
     };
 };
 
 // Bind the builder first: its methods take `*Self`, a temporary is `*const`.
-var b = zigmodu.builder(allocator, io);
+var b = zmodu.builder(allocator, io);
 defer b.deinit();
 var app = try b.withName("app").build(.{MyModule});
 defer app.deinit();
@@ -221,7 +221,7 @@ bus.publish(.{ .order_id = 123, .total = 99.99 });
 
 **Key Concepts**:
 ```zig
-const http = zigmodu.http;
+const http = zmodu.http;
 
 const Server = http.Server;
 const Context = http.Context;
@@ -254,8 +254,8 @@ try server.start();
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/zigmodu.git
-cd zigmodu
+git clone https://github.com/yourusername/zmodu.git
+cd zmodu
 
 # Run basic example
 cd examples/basic
@@ -298,7 +298,7 @@ zig build test
 ### Pattern 1: Simple Module
 ```zig
 const SimpleModule = struct {
-    pub const info = zigmodu.api.Module{
+    pub const info = zmodu.api.Module{
         .name = "simple",
         .description = "A simple module",
         .dependencies = &.{},
@@ -317,7 +317,7 @@ const SimpleModule = struct {
 ### Pattern 2: Module with Dependencies
 ```zig
 const DependentModule = struct {
-    pub const info = zigmodu.api.Module{
+    pub const info = zmodu.api.Module{
         .name = "dependent",
         .description = "Depends on other modules",
         .dependencies = &.{"simple"},
@@ -333,7 +333,7 @@ const DependentModule = struct {
 ### Pattern 3: Event-Driven Module
 ```zig
 const EventModule = struct {
-    pub const info = zigmodu.api.Module{
+    pub const info = zmodu.api.Module{
         .name = "eventful",
         .dependencies = &.{},
     };
@@ -366,9 +366,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Add zigmodu dependency
-    const zigmodu_dep = b.dependency("zigmodu", .{});
-    exe.root_module.addImport("zigmodu", zigmodu_dep.module("zigmodu"));
+    // Add zmodu dependency
+    const zmodu_dep = b.dependency("zmodu", .{});
+    exe.root_module.addImport("zmodu", zmodu_dep.module("zmodu"));
 
     b.installArtifact(exe);
 }
@@ -380,7 +380,7 @@ pub fn build(b: *std.Build) void {
 
 ### Updating Examples
 
-When updating ZigModu API:
+When updating zmodu API:
 1. Update all examples
 2. Run each example the way it ships: `zig build test` for the ones with a `test` step (`ai-ops`, `basic`, `llm-policies`, `shopdemo`, `tenant-mgmt`, `web4`, `zmsaas/backend` — the list `ci.yml`'s `Run the example test steps` loops over); the rest are `zig build` / `zig build run`
 3. Update documentation
@@ -408,7 +408,7 @@ A: Check dependency declarations and remove cycles
 ```
 error: expected type 'xxx', found 'yyy'
 ```
-A: Update to latest ZigModu version
+A: Update to latest zmodu version
 
 ---
 
@@ -426,7 +426,7 @@ Want to add an example?
 
 ```zig
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 // ============================================
 // Example: [Name]
@@ -434,7 +434,7 @@ const zigmodu = @import("zigmodu");
 // Demonstrates: [What it shows]
 
 const Module1 = struct {
-    pub const info = zigmodu.api.Module{
+    pub const info = zmodu.api.Module{
         .name = "module1",
         .dependencies = &.{},
     };
@@ -444,7 +444,7 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
 
-    var b = zigmodu.builder(allocator, io);
+    var b = zmodu.builder(allocator, io);
     defer b.deinit();
     var app = try b.withName("example").build(.{Module1});
     defer app.deinit();

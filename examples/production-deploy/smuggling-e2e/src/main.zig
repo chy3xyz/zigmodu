@@ -1,4 +1,4 @@
-//! Request-boundary probe: the smallest ZigModu server that makes a
+//! Request-boundary probe: the smallest zmodu server that makes a
 //! front-end/back-end framing disagreement **observable** instead of argued.
 //!
 //! Two routes, deliberately asymmetric:
@@ -18,8 +18,8 @@
 //! This is a probe, not an app: no modules, no DB, no auth.
 
 const std = @import("std");
-const zigmodu = @import("zigmodu");
-const http = zigmodu.http;
+const zmodu = @import("zmodu");
+const http = zmodu.http;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;

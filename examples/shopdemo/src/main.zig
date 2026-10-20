@@ -1,5 +1,5 @@
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 const order_module = @import("modules/order/module.zig");
 const order_mod = @import("modules/order/root.zig");
@@ -12,11 +12,11 @@ pub fn main(init: std.process.Init) !void {
 
     std.log.info("╔══════════════════════════════════════════╗", .{});
     std.log.info("║  ShopDemo — Single Order Module           ║", .{});
-    std.log.info("║  ZigModu Minimal Runnable Example         ║", .{});
+    std.log.info("║  zmodu Minimal Runnable Example         ║", .{});
     std.log.info("╚══════════════════════════════════════════╝", .{});
 
     const sqlite_path = init.environ_map.get("SHOPDEMO_SQLITE") orelse ":memory:";
-    var db_client = zigmodu.data.Client.init(allocator, io, .{
+    var db_client = zmodu.data.Client.init(allocator, io, .{
         .driver = .sqlite,
         .sqlite_path = sqlite_path,
     });
@@ -25,7 +25,7 @@ pub fn main(init: std.process.Init) !void {
     try schema.apply(&db_client);
     std.log.info("[main] SQLite ready at {s}", .{sqlite_path});
 
-    var builder = zigmodu.builder(allocator, io);
+    var builder = zmodu.builder(allocator, io);
     _ = builder.withName("shopdemo");
     _ = builder.withValidation(true);
     var app = try builder.build(.{order_module});
@@ -50,7 +50,7 @@ pub fn main(init: std.process.Init) !void {
     const Backend = db_backend.Backend;
     _ = Backend;
 
-    const backend = zigmodu.data.SqlxBackend{
+    const backend = zmodu.data.SqlxBackend{
         .allocator = allocator,
         .client = &db_client,
     };
@@ -66,15 +66,15 @@ pub fn main(init: std.process.Init) !void {
         break :blk 8080;
     };
 
-    var server = zigmodu.http.Server.init(io, allocator, port);
+    var server = zmodu.http.Server.init(io, allocator, port);
     defer server.deinit();
-    server.withGracefulDrain(zigmodu.getInFlightCounter());
+    server.withGracefulDrain(zmodu.getInFlightCounter());
 
     // Runtime scope: routes land in the trie and in the scope middleware
     // chain. They are outside the comptime catalog (no auth metadata), which
     // is the same contract `server.group` had.
     var app_state: void = {};
-    var router = zigmodu.http.Router(void).init(io, allocator, &server, &app_state);
+    var router = zmodu.http.Router(void).init(io, allocator, &server, &app_state);
     defer router.deinit();
     var v1 = router.scope("/api/v1");
     try order_api.registerRoutes(&v1);
@@ -83,7 +83,7 @@ pub fn main(init: std.process.Init) !void {
         .method = .GET,
         .path = "health/live",
         .handler = struct {
-            fn handle(ctx: *zigmodu.http.Context) !void {
+            fn handle(ctx: *zmodu.http.Context) !void {
                 try ctx.json(200, "{\"status\":\"UP\"}");
             }
         }.handle,

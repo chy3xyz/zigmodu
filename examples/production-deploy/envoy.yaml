@@ -1,4 +1,4 @@
-# Envoy — TLS/ALPN termination in front of a ZigModu h2c backend.
+# Envoy — TLS/ALPN termination in front of a zmodu h2c backend.
 # Note: proxy_http_version 2 / h2c upgrade requires Envoy's http2_protocol_options
 # on the upstream cluster when the backend enables HTTP/2 (Server.enable_http2).
 
@@ -19,14 +19,14 @@ static_resources:
                 route_config:
                   name: local_route
                   virtual_hosts:
-                    - name: zigmodu
+                    - name: zmodu
                       domains: ["*"]
                       routes:
                         - match: { prefix: "/metrics" }
-                          route: { cluster: zigmodu_internal, timeout: 5s }
+                          route: { cluster: zmodu_internal, timeout: 5s }
                         - match: { prefix: "/" }
                           route:
-                            cluster: zigmodu
+                            cluster: zmodu
                             timeout: 30s
                             retry_policy:
                               retry_on: "5xx,reset,connect-failure"
@@ -61,21 +61,21 @@ static_resources:
                       domains: ["*"]
                       routes:
                         - match: { path: "/health/live" }
-                          route: { cluster: zigmodu, timeout: 2s }
+                          route: { cluster: zmodu, timeout: 2s }
                         - match: { path: "/health/ready" }
-                          route: { cluster: zigmodu, timeout: 2s }
+                          route: { cluster: zmodu, timeout: 2s }
                 http_filters:
                   - name: envoy.filters.http.router
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
 
   clusters:
-    - name: zigmodu
+    - name: zmodu
       connect_timeout: 3s
       type: STRICT_DNS
       lb_policy: ROUND_ROBIN
       load_assignment:
-        cluster_name: zigmodu
+        cluster_name: zmodu
         endpoints:
           - lb_endpoints:
               - endpoint: { address: { socket_address: { address: app1, port_value: 8080 } } }
@@ -88,12 +88,12 @@ static_resources:
           http_health_check: { path: /health/ready }
 
     # Same endpoints, but never retried (metrics scrapes must not fan out).
-    - name: zigmodu_internal
+    - name: zmodu_internal
       connect_timeout: 3s
       type: STRICT_DNS
       lb_policy: ROUND_ROBIN
       load_assignment:
-        cluster_name: zigmodu_internal
+        cluster_name: zmodu_internal
         endpoints:
           - lb_endpoints:
               - endpoint: { address: { socket_address: { address: app1, port_value: 8080 } } }

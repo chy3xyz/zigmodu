@@ -1,4 +1,4 @@
-# ZigModu Framework Backlog
+# zmodu Framework Backlog
 
 Status tracker for framework ergonomics improvements (Zig 0.17).  
 Monolith boundaries unchanged — see `docs/PRODUCTION_ROADMAP.md`.
@@ -15,7 +15,7 @@ typed identity). Sibling ORM backlog: `zig_ws/zent/docs/ISSUES_FROM_ZAPI.md`.
 | 4 | Router oneshot / Testkit | **Landed** | `Testkit.dispatch` / `dispatchOpts` |
 | 5 | Security / Obs / Resilience profiles | **Landed** | `productionProfile`（生产一键：背压+中间件+`/metrics`+`/health/*`）；散件 `applyHttpDefaults` + `applyResilienceDefaults` |
 | 6 | Testkit JWT / SQLite / tenant / SSE | **Landed** | `signBearerToken`, `openMemorySqlite`, `tenantMiddleware`, `SseRecorder` |
-| 7 | Outbox / Idempotency | **Landed** | `zigmodu.outbox.*`, `idempotencyMiddleware` (+ sample tests) |
+| 7 | Outbox / Idempotency | **Landed** | `zmodu.outbox.*`, `idempotencyMiddleware` (+ sample tests) |
 | 8 | Config / health / shutdown | **Landed** | `requireEnv`, `ShutdownChecklist` |
 | 9 | OpenAPI ↔ extractors / SSE | **Landed** | `openApiParamsFromStruct` + `RouteMeta.openapi_params` merged in catalog |
 | + | **SSE first-class** | **Landed** | `http.sse` sets `streaming` (no double write); `SseSpec`/`sse_routes`; `lastEventId`; multiline `data:`; `SseRecorder` + live stream test |

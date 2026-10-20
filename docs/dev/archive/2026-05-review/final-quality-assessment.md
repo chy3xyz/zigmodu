@@ -1,4 +1,4 @@
-# ZigModu Final Quality Assessment
+# zmodu Final Quality Assessment
 
 **Date**: 2026-05-12
 **Version**: v0.9.2
@@ -112,7 +112,7 @@
 - Single public entry point through domain files
 - `builder()` pattern: one-line Application construction
 - `ClusterBootstrap`: single start()/stop() for distributed stack
-- Consistent error type: `ZigModuError` (45+ variants)
+- Consistent error type: `ZmoduError` (45+ variants)
 - Deprecation clearly marked: `Simplified.zig`, `Validator.zig`, `extensions.zig`
 
 ### Gaps
@@ -125,7 +125,7 @@
 ## 7. Elegance: 80/100 (B)
 
 ### Strengths
-- Domain file pattern: `zigmodu.http`, `zigmodu.data` — clean and discoverable
+- Domain file pattern: `zmodu.http`, `zmodu.data` — clean and discoverable
 - `MetricsBackend` VTable: demonstrates interface design
 - `packed struct` WAL header: replaces 5 `writeInt` calls with single `@bitCast`
 - `@intFromPtr` entropy: clean cross-platform CSPRNG seeding
@@ -142,7 +142,7 @@
 
 ### Strengths
 - Consistent naming: PascalCase types, camelCase functions, snake_case modules
-- Error handling: unified `ZigModuError` with `ErrorContext`/`ErrorHandler`
+- Error handling: unified `ZmoduError` with `ErrorContext`/`ErrorHandler`
 - Memory management: arena allocators for request scope, defer consistently used
 - Thread safety documented: `ThreadSafeEventBus`, `CircuitBreaker` NOTICE
 - Zig 0.16 compatibility: all removed APIs migrated

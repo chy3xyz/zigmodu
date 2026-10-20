@@ -2,7 +2,7 @@
 //! Usage: JWT_SECRET=dev-secret ./zig-out/bin/gen-jwt-token
 //! Optional: JWT_SUB=ci-user JWT_ROLES=admin,user JWT_AUD=1
 const std = @import("std");
-const zmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 const SecurityModule = zmodu.security.SecurityModule;
 
 pub fn main(init: std.process.Init) !void {

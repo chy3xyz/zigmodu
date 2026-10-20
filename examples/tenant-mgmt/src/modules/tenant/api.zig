@@ -1,11 +1,11 @@
 const std = @import("std");
-const zigmodu = @import("zigmodu");
-const http = zigmodu.http;
+const zmodu = @import("zmodu");
+const http = zmodu.http;
 
 /// 本模块的日志作用域。handler 用 `TenantLog.withField("trace_id", …)` 把请求的
 /// trace id 绑到每一行上 —— 于是"慢 span → 日志"和"错误日志 → trace"都只需一个
 /// 字符串。写法就是 `docs/` 里的配方，没有隐式全局态。
-const TenantLog = zigmodu.observability.LogScope.scope("tenant");
+const TenantLog = zmodu.observability.LogScope.scope("tenant");
 
 /// `TenantLog` 绑定 trace_id 后的类型（`LogScope.withField` 返回的是值）。
 pub const TracedTenantLog = @TypeOf(TenantLog.withField("trace_id", ""));

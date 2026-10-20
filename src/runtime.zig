@@ -1,7 +1,7 @@
 //! Runtime domain: workers, mailboxes, timers, ring buffers, pools, clocks.
 //!
 //! ```zig
-//! const runtime = @import("zigmodu").runtime;   // the namespace: RingBuffer, Clock, HotBus, Runtime…
+//! const runtime = @import("zmodu").runtime;   // the namespace: RingBuffer, Clock, HotBus, Runtime…
 //! const rt = try app.runtime();                 // first call creates and starts it
 //! const worker = try rt.spawn(MyWorker, .{}, 256); // 256 = mailbox capacity (comptime)
 //! // The long tail can share one pool thread instead (§12):

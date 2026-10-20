@@ -1,5 +1,5 @@
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 const model = @import("model.zig");
 const persistence = @import("persistence.zig");
 const enums = @import("../../business/enums.zig");
@@ -30,7 +30,7 @@ pub fn TenantService(comptime Persistence: type) type {
             if (domain.len < 3 or !std.mem.containsAtLeast(u8, domain, 1, ".")) return error.InvalidDomain;
 
             const tier = enums.TenantTier.fromString(tier_str);
-            const now: i64 = @intCast(zigmodu.time.monotonicNowSeconds());
+            const now: i64 = @intCast(zmodu.time.monotonicNowSeconds());
 
             const tenant = model.Tenant{
                 .id = 0,
@@ -66,7 +66,7 @@ pub fn TenantService(comptime Persistence: type) type {
             const owned_tier = try self.allocator.dupe(u8, tier.toString());
             self.allocator.free(tenant.tier);
             tenant.tier = owned_tier;
-            tenant.updated_at = @intCast(zigmodu.time.monotonicNowSeconds());
+            tenant.updated_at = @intCast(zmodu.time.monotonicNowSeconds());
             try self.persistence.update(tenant);
         }
 
@@ -75,12 +75,12 @@ pub fn TenantService(comptime Persistence: type) type {
             var tenant = (try self.getById(id)) orelse return error.TenantNotFound;
             defer self.freeTenant(tenant);
             tenant.status = @backingInt(enums.TenantStatus.suspended);
-            tenant.updated_at = @intCast(zigmodu.time.monotonicNowSeconds());
+            tenant.updated_at = @intCast(zmodu.time.monotonicNowSeconds());
             try self.persistence.update(tenant);
         }
 
         /// 获取所有活跃租户（调用方 `defer result.deinit(allocator)`）
-        pub fn listActive(self: *Self) !zigmodu.data.sqlx.QueryResult(model.Tenant) {
+        pub fn listActive(self: *Self) !zmodu.data.sqlx.QueryResult(model.Tenant) {
             return try self.persistence.findAll();
         }
 

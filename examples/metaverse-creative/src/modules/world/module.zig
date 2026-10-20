@@ -1,6 +1,6 @@
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
-pub const info = zigmodu.api.Module{
+pub const info = zmodu.api.Module{
     .name = "world",
     .description = "Virtual world hosting featured creatives",
     .dependencies = &.{ "identity", "creative" },

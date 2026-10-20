@@ -1,5 +1,5 @@
-const zigmodu = @import("zigmodu");
-pub const info = zigmodu.api.Module{
+const zmodu = @import("zmodu");
+pub const info = zmodu.api.Module{
     .name = "subscription",
     .description = "Plan & subscription management",
     .dependencies = &.{},

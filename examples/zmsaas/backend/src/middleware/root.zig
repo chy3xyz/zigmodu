@@ -1,6 +1,6 @@
 const std = @import("std");
-const zigmodu = @import("zigmodu");
-const http = zigmodu.http;
+const zmodu = @import("zmodu");
+const http = zmodu.http;
 
 /// 租户拦截中间件 — 从请求中提取 X-Tenant-ID 并设置 TenantContext
 pub fn tenantMiddleware() http.Middleware {
@@ -18,14 +18,14 @@ pub fn tenantMiddleware() http.Middleware {
 
 /// JWT + SQLite role→permission (`CatalogPermDb`) into `permissions` attr.
 pub fn jwtAuthMiddleware(
-    sec: *zigmodu.security.SecurityModule,
+    sec: *zmodu.security.SecurityModule,
     slot: *http.CatalogSlot,
-    db: *zigmodu.data.Client,
+    db: *zmodu.data.Client,
 ) !http.Middleware {
     return http.jwtAuthFromCatalogWithPermissions(
         sec,
         slot,
-        try zigmodu.security.CatalogPermDb.loaderFromClient(db),
+        try zmodu.security.CatalogPermDb.loaderFromClient(db),
         .{},
     );
 }

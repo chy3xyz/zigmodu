@@ -39,7 +39,7 @@
 //!   needs an `Io`, and no entry point in this file has one — `init`, `push`,
 //!   `requeue`, `purgeExpired`, `size`, `get`, `remove`, `stats` and `deinit`
 //!   are all io-free in their public signatures, which `DistributedEventBus`
-//!   and `zigmodu.DLQ` consumers already call. Threading an `Io` through them
+//!   and `zmodu.DLQ` consumers already call. Threading an `Io` through them
 //!   is an API break of its own, so it is left to a separate change.
 //!
 //! Critical sections are list mutations plus the matching allocator calls — no

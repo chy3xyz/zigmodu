@@ -1,4 +1,4 @@
-//! Shared DB driver link helpers for zigmodu / examples `build.zig`.
+//! Shared DB driver link helpers for zmodu / examples `build.zig`.
 //! Build-scripts only — not part of the runtime library.
 
 const std = @import("std");

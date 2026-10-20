@@ -1,6 +1,6 @@
 # alpha-engine (P3)
 
-A **replay-driven trading pipeline** on the ZigModu runtime, assembled from
+A **replay-driven trading pipeline** on the zmodu runtime, assembled from
 modules, with an AI agent that **may propose and may not trade**. One
 deterministic input series in, one snapshot out — the shape of a real trading
 stack, small enough to read in one sitting.

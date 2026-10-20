@@ -4,7 +4,7 @@
     .fingerprint = 0xd3cd747607c68c74,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        .zigmodu = .{ .path = "../.." },
+        .zmodu = .{ .path = "../.." },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

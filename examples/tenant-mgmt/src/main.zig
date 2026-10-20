@@ -1,9 +1,9 @@
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 // ═══════════════════════════════════════════════════
 // Multi-Tenant Management System
-// ZigModu Best Practice Demo
+// zmodu Best Practice Demo
 //
 // Architecture:
 //   HTTP → Middleware (JWT/Tenant/DataPermission) → API (Tenant/User/Subscription) → Service → Persistence → DB
@@ -47,11 +47,11 @@ pub fn main(init: std.process.Init) !void {
 
     std.log.info("╔══════════════════════════════════════════╗", .{});
     std.log.info("║  Multi-Tenant Management System          ║", .{});
-    std.log.info("║  ZigModu — Best Practice Demo (ComptimeRouter: 3 modules)   ║", .{});
+    std.log.info("║  zmodu — Best Practice Demo (ComptimeRouter: 3 modules)   ║", .{});
     std.log.info("╚══════════════════════════════════════════╝", .{});
 
     const sqlite_path = init.environ_map.get("TENANT_MGMT_SQLITE") orelse ":memory:";
-    var db_client = zigmodu.data.Client.init(allocator, io, .{
+    var db_client = zmodu.data.Client.init(allocator, io, .{
         .driver = .sqlite,
         .sqlite_path = sqlite_path,
     });
@@ -60,38 +60,38 @@ pub fn main(init: std.process.Init) !void {
 
     // ── 启动预检：宁可拒绝启动，也不要带着缺失的依赖 / 坏时钟上线 ──
     // 预检失败只记录 finding（不 panic），最后统一决定是否继续。
-    var env_ctx = zigmodu.Preflight.EnvCheck.fromMap(
+    var env_ctx = zmodu.Preflight.EnvCheck.fromMap(
         init.environ_map,
         &.{"JWT_SECRET"},
     );
-    var secret_ctx = zigmodu.Preflight.SecretCheck{ .secret = init.environ_map.get("JWT_SECRET") orelse "" };
-    var clock_ctx = zigmodu.Preflight.ClockCheck{ .io = io };
-    var secret_probe = zigmodu.Preflight.secretCheck(&secret_ctx);
+    var secret_ctx = zmodu.Preflight.SecretCheck{ .secret = init.environ_map.get("JWT_SECRET") orelse "" };
+    var clock_ctx = zmodu.Preflight.ClockCheck{ .io = io };
+    var secret_probe = zmodu.Preflight.secretCheck(&secret_ctx);
     // 演示与 CI 以 dev-secret 启动（README 同款指令）：占位 secret 记 warn
     // （会进启动日志）；生产部署保持默认 .fatal，占位值即拒绝启动。
     secret_probe.severity = .warn;
-    var preflight = zigmodu.Preflight.run(allocator, &.{
-        zigmodu.Preflight.envCheck(&env_ctx),
+    var preflight = zmodu.Preflight.run(allocator, &.{
+        zmodu.Preflight.envCheck(&env_ctx),
         secret_probe,
-        zigmodu.Preflight.clockCheck(&clock_ctx),
+        zmodu.Preflight.clockCheck(&clock_ctx),
     });
     defer preflight.deinit();
     preflight.log();
     if (!preflight.ok()) return error.PreflightFailed;
 
     try schema.apply(&db_client);
-    try zigmodu.security.CatalogPermDb.ensureSchema(&db_client);
-    try zigmodu.security.CatalogPermDb.grant(&db_client, "admin", zigmodu.security.Rbac.Permissions.tenant_read);
-    try zigmodu.security.CatalogPermDb.grant(&db_client, "admin", zigmodu.security.Rbac.Permissions.tenant_write);
-    try zigmodu.security.CatalogPermDb.grant(&db_client, "admin", zigmodu.security.Rbac.Permissions.tenant_suspend);
-    try zigmodu.security.CatalogPermDb.grant(&db_client, "owner", zigmodu.security.Rbac.Permissions.tenant_read);
-    try zigmodu.security.CatalogPermDb.grant(&db_client, "owner", zigmodu.security.Rbac.Permissions.tenant_write);
-    try zigmodu.security.CatalogPermDb.grant(&db_client, "owner", zigmodu.security.Rbac.Permissions.tenant_suspend);
-    try zigmodu.security.CatalogPermDb.grant(&db_client, "user", zigmodu.security.Rbac.Permissions.tenant_read);
+    try zmodu.security.CatalogPermDb.ensureSchema(&db_client);
+    try zmodu.security.CatalogPermDb.grant(&db_client, "admin", zmodu.security.Rbac.Permissions.tenant_read);
+    try zmodu.security.CatalogPermDb.grant(&db_client, "admin", zmodu.security.Rbac.Permissions.tenant_write);
+    try zmodu.security.CatalogPermDb.grant(&db_client, "admin", zmodu.security.Rbac.Permissions.tenant_suspend);
+    try zmodu.security.CatalogPermDb.grant(&db_client, "owner", zmodu.security.Rbac.Permissions.tenant_read);
+    try zmodu.security.CatalogPermDb.grant(&db_client, "owner", zmodu.security.Rbac.Permissions.tenant_write);
+    try zmodu.security.CatalogPermDb.grant(&db_client, "owner", zmodu.security.Rbac.Permissions.tenant_suspend);
+    try zmodu.security.CatalogPermDb.grant(&db_client, "user", zmodu.security.Rbac.Permissions.tenant_read);
     std.log.info("[main] SQLite ready at {s}", .{sqlite_path});
 
     // ── 1. Scan modules ────────────────────────────
-    var modules = try zigmodu.scanModules(allocator, .{
+    var modules = try zmodu.scanModules(allocator, .{
         tenant_module,
         user_module,
         subscription_module,
@@ -99,12 +99,12 @@ pub fn main(init: std.process.Init) !void {
     defer modules.deinit();
 
     // ── 2. Validate dependencies ────────────────────
-    try zigmodu.validateModules(&modules);
+    try zmodu.validateModules(&modules);
     std.log.info("[main] Module validation passed", .{});
 
     // ── 3. Start lifecycle ─────────────────────────
-    try zigmodu.startAll(&modules);
-    defer zigmodu.stopAll(&modules);
+    try zmodu.startAll(&modules);
+    defer zmodu.stopAll(&modules);
     std.log.info("[main] All modules started", .{});
 
     // ── 4. Assemble dependency chain ────────────────
@@ -133,15 +133,15 @@ pub fn main(init: std.process.Init) !void {
         break :blk 18080;
     };
 
-    var server = zigmodu.http.Server.init(io, allocator, port);
+    var server = zmodu.http.Server.init(io, allocator, port);
     defer server.deinit();
 
     // ── 5b. 生产一行接入（必须在任何 addRoute / mountAll 之前）──
     //    连接背压 + 安全/观测中间件 + GET /metrics（按路由模板的黄金信号）
     //    + GET /health/live + /health/ready。见 docs/ROUTE_TABLE.md §7.4。
-    var profile = zigmodu.http.ProductionProfileState.init(allocator);
+    var profile = zmodu.http.ProductionProfileState.init(allocator);
     defer profile.deinit(allocator);
-    try zigmodu.http.productionProfile(&server, .{
+    try zmodu.http.productionProfile(&server, .{
         .max_connections = 4096,
         .over_limit_response = .close,
         .header_timeout_ms = 10_000,
@@ -156,13 +156,13 @@ pub fn main(init: std.process.Init) !void {
 
     // ── 6. Global Middleware (catalog slot filled after mount) ──
     const jwt_secret = init.environ_map.get("JWT_SECRET") orelse "dev-secret";
-    var app_sec = zigmodu.security.AppSecurity.init(allocator, io, .{ .jwt_secret = jwt_secret });
-    var catalog_slot: zigmodu.http.CatalogSlot = .{};
+    var app_sec = zmodu.security.AppSecurity.init(allocator, io, .{ .jwt_secret = jwt_secret });
+    var catalog_slot: zmodu.http.CatalogSlot = .{};
     defer catalog_slot.deinit();
     // Order: trace id → JWT(from catalog) → tenant resolution → ModuleGate → RBAC → data permission
     // The framework's own middleware: it now stamps the request (not just the
     // response header), so the handler's log scope picks the id up for free.
-    try server.addMiddleware(zigmodu.http.tracingMiddleware());
+    try server.addMiddleware(zmodu.http.tracingMiddleware());
     try server.addMiddleware(try middleware.jwtAuthMiddleware(&app_sec.module, &catalog_slot, &db_client));
     try server.addMiddleware(middleware.tenantMiddleware());
     try server.addMiddleware(try middleware.moduleGateMiddleware(&catalog_slot));
@@ -175,9 +175,9 @@ pub fn main(init: std.process.Init) !void {
     const TenantApiT = @TypeOf(tenant_api);
     const UserApiT = @TypeOf(user_api);
     const SubApiT = @TypeOf(sub_api);
-    comptime zigmodu.http.assertNoDupes(.{ TenantApiT, UserApiT, SubApiT });
+    comptime zmodu.http.assertNoDupes(.{ TenantApiT, UserApiT, SubApiT });
 
-    var router = zigmodu.http.Router(AppState).init(io, allocator, &server, &app_state);
+    var router = zmodu.http.Router(AppState).init(io, allocator, &server, &app_state);
     defer router.deinit();
 
     var api_v1 = router.scope("/api/v1");
@@ -199,7 +199,7 @@ pub fn main(init: std.process.Init) !void {
     try server.addRoute(.{
         .method = .GET,
         .path = "openapi.json",
-        .handler = try zigmodu.http.openApiFromCatalog(&catalog_slot, .{
+        .handler = try zmodu.http.openApiFromCatalog(&catalog_slot, .{
             .title = "tenant-mgmt",
             .version = "0.1.0",
             .description = "ComptimeRouter catalog (live)",
@@ -210,12 +210,12 @@ pub fn main(init: std.process.Init) !void {
     // 由 productionProfile 挂出：GET /health/live（进程）+ GET /health/ready（依赖）。
 
     // ── 9. Dashboard ────────────────────────────────
-    zigmodu.http.Dashboard.system_info.module_count = 3;
-    zigmodu.http.Dashboard.system_info.test_passed = 413;
-    zigmodu.http.Dashboard.system_info.started_at = zigmodu.time.monotonicNowSeconds();
+    zmodu.http.Dashboard.system_info.module_count = 3;
+    zmodu.http.Dashboard.system_info.test_passed = 413;
+    zmodu.http.Dashboard.system_info.started_at = zmodu.time.monotonicNowSeconds();
     // Dashboard routes
     try server.addRoute(.{ .method = .GET, .path = "dashboard", .handler = struct {
-        fn handle(ctx: *zigmodu.http.Context) !void {
+        fn handle(ctx: *zmodu.http.Context) !void {
             try ctx.text(200, "Dashboard");
         }
     }.handle });

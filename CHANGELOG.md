@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased]
+
+### 项目改名：ZigModu → zmodu（**破坏性：是**）
+
+- **包名与模块名**：`build.zig.zon` 的 `.name = .zmodu`，模块 `addModule("zmodu")`；
+  消费方写 `@import("zmodu")`、`b.dependency("zmodu").module("zmodu")`。
+- **一版兼容垫片**：`addModule("zigmodu")` 仍存在（同一 root/imports），旧
+  `module("zigmodu")` 可继续解析到 v1.0；`ZIGMODU_*` 环境变量仍被读取（`ZMODU_*` 优先）。
+- **包指纹随包名变化**：`0xde7987a02b121580`（Zig 在 `.name` 改变后强制要求新指纹）。
+  依赖 hash 前缀由 `zigmodu-` 变为 `zmodu-`，消费方需要重新 `zig fetch`。
+- **有意不改的线上契约**：Prometheus 指标名 `zigmodu_*`、迁移表 `_zigmodu_migrations`、
+  Raft 快照前缀 `zigmodu-raft-snapshot:`、模型字段 `zigmodu_ignore_tenant`。它们是
+  仪表盘/既有库/落盘格式/应用代码的一部分，改名会静默破坏；留到 1.0 做双写/迁移。
+- 仓库与文档站：`chy3xyz/zmodu`（GitHub 对旧 URL 自动重定向），
+  `docs.yml --url-prefix zmodu`；`install.sh` 仓库地址、安装目录（保留旧 `~/.zigmodu`
+  探测）与 CLI 名同步。
+- 顺带修复：`install.sh` 里一段重复的 `install_cli()` 片段导致整份脚本
+  `bash -n` 失败——安装脚本此前跑不起来。
+
 ## [0.40.0] - 2026-10-20
 
 ### 路由：`RouteGroup` 移除，运行时注册收敛到 `Scoped`（**破坏性：是**）
@@ -543,7 +562,7 @@ announcement. `scripts/release.sh` now separates the two cadences:
 Phase 1 of the life spec (`docs/superpowers/specs/2026-10-16-life-issue-release-design.md`):
 the AI-agent-era issue & release governance system.
 
-1. **Shared core** (`src/life/`, exported as `zigmodu.life`): data model +
+1. **Shared core** (`src/life/`, exported as `zmodu.life`): data model +
    14-transition state machine with required-field validation (heysen-proven
    semantics — validate the transition, then the fields, mutate nothing on
    rejection; terminal states `closed/duplicate/rejected` have no out-edges),
@@ -826,7 +845,7 @@ documentation mode — one pinned static binary instead of a Node toolchain.
 
 1. **`.github/workflows/docs.yml` rewritten**: install zdoc v0.16.1
    (x86_64-linux-musl, SHA256-verified against the upstream `SHA256SUMS`),
-   build with `zdoc docs docs --title ZigModu --url-prefix zigmodu`, publish
+   build with `zdoc docs docs --title zmodu --url-prefix zmodu`, publish
    `site-dist`. No Node, no `npm ci`, no site config file; sidebar, per-page
    TOC, search index and mermaid come from zdoc's built-in theme. Build time
    drops from a npm-ci + VitePress run to ~1 s.
@@ -855,7 +874,7 @@ documentation mode — one pinned static binary instead of a Node toolchain.
 
 Verified locally with the exact CI command shape: all pages generated,
 search index + sitemap + mermaid present, same-directory links resolve with
-the prefix (`/zigmodu/guide/MODULITH/`).
+the prefix (`/zmodu/guide/MODULITH/`).
 
 ### 第 173 批：文档站排除开发噪音树 + zdoc v0.16.2（**破坏性：否；CI-only**）
 
@@ -915,7 +934,7 @@ noise.
 此前已完整；缺的是把 delta 推到浏览器的服务端组件。三处补齐：
 
 1. **New framework module `src/ai/stream_sse.zig`** (exported as
-   `zigmodu.ai.stream_sse`): `DeltaSse(W)` adapts `AgentHooks.on_delta` to any
+   `zmodu.ai.stream_sse`): `DeltaSse(W)` adapts `AgentHooks.on_delta` to any
    SSE sink (`SseWriter` on a live socket, `SseRecorder` in tests). Each
    `StreamDelta` becomes one `data:` JSON event whose union tag is the event
    type (`content` / `reasoning` / `tool` / `done`); the terminal delta also
@@ -1136,7 +1155,7 @@ test-fast 复跑 EXIT=0（偶发失败后修复 + 最终全绿）。
 **已核实的两个下游**（`build.zig.zon` 实证依赖，非README 自述）：
 
 1. **[zenaipa](https://github.com/chy3xyz/zenaipa)** — 全栈管理平台（Zig + SolidJS 单二进制）。
-   依赖用 **git tag + content hash 双锁**（`zigmodu-0.39.9-U40vs30XlQC-...`），
+   依赖用 **git tag + content hash 双锁**（`zmodu-0.39.9-U40vs30XlQC-...`），
    供应链姿势正确，说明使用者懂依赖锁定。
 2. **[zasdoor](https://github.com/chy3xyz/zasdoor)** — **IAM/身份系统**：OAuth2/OIDC、MFA、SIWE、
    组织/项目/应用/角色。**79 个后端测试**，覆盖 IAM/OAuth/MFA/web3 路由、JWT 多租户、
@@ -1151,7 +1170,7 @@ test-fast 复跑 EXIT=0（偶发失败后修复 + 最终全绿）。
 - **B-14 判定维持未关**：同一所有者 + 同一身份链，dogfooding 压得出 bug，但
   **替代不了独立审计**——作者自己决定实现方案、也自己判断实现对否。
   B-14 要的是"**有人能推翻我们的结论**"。
-- **版本落差是真实风险**：zasdoor 声明 `zigmodu v0.15.44`、zenaipa 徽章写 `v0.20.1`
+- **版本落差是真实风险**：zasdoor 声明 `zmodu v0.15.44`、zenaipa 徽章写 `v0.20.1`
   （实际依赖已0.39.9）——**下游跑的是 0.x 老版本**，侧面印证"碎片化版本让用户不敢升级"。
 - 另：`zalpha`仓库经 GitHub 仓库页 / raw / API 三路核实均为 404，本次**不计入**。
 
@@ -1340,8 +1359,8 @@ interop 也会过（它的旧节点全程都在），而 wave 2 永远选不出�
 
 | PR | 范围 | 核心断言（已核实属实） |
 |---|---|---|
-| [#3`fix(sqlx): ConnPool acquire 的 deadline 改用单调时钟`](https://github.com/chy3xyz/zigmodu/pull/3) | `src/sqlx/sqlx.zig` +43 −3 | `sqlx.zig:4677` 的 `waited_ms += 50` 每轮固定记 50ms，切片提前返回（spurious wakeup / 只唤醒队首）会让预算被高估而**提前放弃** |
-| [#4 `ci: integration-full 覆盖 pull_request，并修复 examples 索引漂移`](https://github.com/chy3xyz/zigmodu/pull/4) | `ci.yml` · `examples/README.md` +18 −1 | `integration-full` 仅在 push-to-master 触发（走私 e2e 合并后才验）；`examples/README.md` 索引漏了 `quant-replay`（目录存在、CI 真跑） |
+| [#3`fix(sqlx): ConnPool acquire 的 deadline 改用单调时钟`](https://github.com/chy3xyz/zmodu/pull/3) | `src/sqlx/sqlx.zig` +43 −3 | `sqlx.zig:4677` 的 `waited_ms += 50` 每轮固定记 50ms，切片提前返回（spurious wakeup / 只唤醒队首）会让预算被高估而**提前放弃** |
+| [#4 `ci: integration-full 覆盖 pull_request，并修复 examples 索引漂移`](https://github.com/chy3xyz/zmodu/pull/4) | `ci.yml` · `examples/README.md` +18 −1 | `integration-full` 仅在 push-to-master 触发（走私 e2e 合并后才验）；`examples/README.md` 索引漏了 `quant-replay`（目录存在、CI 真跑） |
 
 **#3 最有价值的一点**：它指出`sqlx.ConnPool` 的假账与 `src/pool/Pool.zig:150-154`
 **是同一处缺陷模式**——那里已有一段几乎同文的修复记录（*"assumed 10 ms per
@@ -1414,8 +1433,8 @@ Redis/NATS/Kafka 三平台腿）。
 
 | PR | 内容 | 结果 |
 |---|---|---|
-| [#3 `fix(sqlx): ConnPool acquire 的 deadline 改用单调时钟`](https://github.com/chy3xyz/zigmodu/pull/3) | `waited_ms += 50` 的切片计数假账 → 真实 deadline | 合并（2 commits，含一次修订） |
-| [#4 `ci: integration-full 覆盖 pull_request`](https://github.com/chy3xyz/zigmodu/pull/4) | 该 job 原本只在 push-to-master 跑 + `examples/README.md` 索引漂移 | 合并（1 commit） |
+| [#3 `fix(sqlx): ConnPool acquire 的 deadline 改用单调时钟`](https://github.com/chy3xyz/zmodu/pull/3) | `waited_ms += 50` 的切片计数假账 → 真实 deadline | 合并（2 commits，含一次修订） |
+| [#4 `ci: integration-full 覆盖 pull_request`](https://github.com/chy3xyz/zmodu/pull/4) | 该 job 原本只在 push-to-master 跑 + `examples/README.md` 索引漂移 | 合并（1 commit） |
 
 **#3 的修订值得单独记**：它新增的测试**抓不住它声称要抓的缺陷**——
 变异验证（放回 bug 后重跑）显示 2320/2383 全绿。评审指出根因是数学必然：
@@ -1460,14 +1479,14 @@ PR #3 修订版 head 上复跑 `2319/2382` 全绿（少2 = 删掉的测试及其
 忽略规则防它们被误提交。
 
 **3. `.sisyphus/` 归档而非删除** —— 它含3 个跟踪文件，其中两份是**活文档**
-（`skills/zigmodu.md` 162 行开发技能 · `AI_DEVELOPER_GUIDE.md` 135 行），
+（`skills/zmodu.md` 162 行开发技能 · `AI_DEVELOPER_GUIDE.md` 135 行），
 与 `AGENTS.md` 同类，不是工具残留。已归入 `docs/dev/`：
 
 | 原路径 | 新路径 |
 |---|---|
-| `.sisyphus/skills/zigmodu.md` | `docs/dev/SCAFFOLD_SKILL.zigmodu.md` |
+| `.sisyphus/skills/zmodu.md` | `docs/dev/SCAFFOLD_SKILL.zmodu.md` |
 | `.sisyphus/AI_DEVELOPER_GUIDE.md` | `docs/dev/SCAFFOLD_GUIDE.md` |
-| `.sisyphus/plans/zigmodu-development.md` | `docs/dev/SCAFFOLD_PLAN_TEMPLATE.md` |
+| `.sisyphus/plans/zmodu-development.md` | `docs/dev/SCAFFOLD_PLAN_TEMPLATE.md` |
 
 **4. `zsaas/` 移到 `tools/zsaas/`（不删）** —— 它此前**挂在仓库根目录**，
 看起来像个示例，其实是**脚手架工具**（3 个 `.mjs` + 1 个模型 JSON + README），
@@ -1495,9 +1514,9 @@ PR #3 修订版 head 上复跑 `2319/2382` 全绿（少2 = 删掉的测试及其
 全部有名可指。
 
 **顺带记录一个既有缺陷（不是本次引入，未修）**：
-`tools/zsaas/scripts/check-gen.mjs` 自检报 `MISSING src/libs/zmoduApi.ts`。
+`tools/zsaas/scripts/check-gen.mjs` 自检报 `MISSING src/libs/ZmoduApi.ts`。
 已用 `git worktree` 在移动前的版本对照跑过—— **移动前同样报此错**，
-即 `gen-business.mjs` 建了 `src/libs` 目录却没写 `zmoduApi.ts`，与本次移动无关。
+即 `gen-business.mjs` 建了 `src/libs` 目录却没写 `ZmoduApi.ts`，与本次移动无关。
 
 ### 第 164 批：examples 构建产物清理（4.5G → 443M）+ docs 结构整理（**破坏性：否；一处代码注释级改动**）
 
@@ -1577,7 +1596,7 @@ PR #3 修订版 head 上复跑 `2319/2382` 全绿（少2 = 删掉的测试及其
 
 顺带按实测更新 `GOVERNANCE.md` 的提交构成（该文件自称"当前的真相，不加修饰"，
 故其 1 008 已过时）：**1 022 提交** · `Antigravity Agent` 770 / `neox33` 220 /
-`ZigModu Developer` 29 / **`knot3bot` 4（外部）** / 所有者 `chy3xyz` 1。
+`zmodu Developer` 29 / **`knot3bot` 4（外部）** / 所有者 `chy3xyz` 1。
 
 `v1.0-roadmap-1.0.md:6` 的「1008 提交」**刻意不改**——它标注了「日期口径：2026-10-10」，
 属带日期的历史读数，按项目惯例（`dev/READING_NUMBERS.md`）保留。
@@ -1605,7 +1624,7 @@ file — 15 of them are `file:///Users/...` absolute paths inside
 one in `dev/todo.md`. Left alone: they are outside the scope of this change, and
 fixing the `file:///` ones is a separate job.
 
-**2. `zigmodu.github.io` — a standalone Astro 7 site (new repo)**
+**2. `zmodu.github.io` — a standalone Astro 7 site (new repo)**
 
 Built in its own repository rather than under `examples/`, so it does not grow the
 framework's checkout, its 14-job CI matrix, or its `.paths` — the last of which
@@ -1627,7 +1646,7 @@ De-duplication, with each exclusion reasoned rather than assumed:
 
 `docs/dev/`, `docs/archive/`, `docs/grafana/` and `docs/superpowers/` are not
 walked. Documents that are current-but-historical (`ISSUES_FROM_*`,
-`ZIGMODU_NOTES.md`) are **kept under "Snapshots" with a banner** rather than
+`ZMODU_NOTES.md`) are **kept under "Snapshots" with a banner** rather than
 dropped — they are still evidence of real use, and hiding them would lose that
 while presenting them as current would mislead.
 
@@ -1847,7 +1866,7 @@ EXIT=0。
      `id`（新库首插 `foreign key mismatch`）与 prepared-cache 命中后失败永久占槽。
      本仓库示例不用 EntQL 谓词 / `Has{Edge}With`，零适配。
    - **0.85（所有权 BREAKING）**：`ShardSet` 改**借用** `ShardRouter`；grep 实证
-     本仓库示例不用 `ShardSet`（`ShardRouter` 命中均为 zigmodu 自有
+     本仓库示例不用 `ShardSet`（`ShardRouter` 命中均为 zmodu 自有
      `src/tenant/ShardRouter.zig`），零适配。同版修 MySQL `bool`/`float` 假 drift。
    - **0.86（additive）**：`field.String.VarChar(n)`（写路径各方言统一拒绝超长）
      与 `client.<entity>.AllOwned(allocator)`；MySQL prepared `exec` 的 `SELECT`
@@ -3058,7 +3077,7 @@ publish 96.6%，deadline 比 writers 跑完早 ~5 分钟触发，假红。
    的出站 dial、`redis`、`Nats`、`FluvioNative`、`HttpClient` 连接池，以及 soak/cluster-node
    两个 harness。（任务清单实测漏了 redis×2 / Nats / FluvioNative / HttpClient /
    soak_cluster 第三处 sendInstallSnapshot —— 同一 grep 复查补齐，一并未换。）
-3. **修法**：新建 `src/core/netdial.zig`（经 `root.zig` 导出为 `zigmodu.netdial`）——
+3. **修法**：新建 `src/core/netdial.zig`（经 `root.zig` 导出为 `zmodu.netdial`）——
    `connectBlocking(io, addr)` 用 raw `posix.system.socket/connect` 自管重试循环，
    errno 分类提成纯函数 `classifyConnectErrno`：`ISCONN → connected`（POSIX 正解）、
    `INTR → retry`、具名 errno 全部映射到与 std **同名**错误（`ConnectionRefused` /
@@ -3073,8 +3092,8 @@ publish 96.6%，deadline 比 writers 跑完早 ~5 分钟触发，假红。
    **本地复制**一份 ~35 行 `dialBlocking`（不许 import netdial：该文件同源码跨
    master/v0.32.0 两棵树编译，v0.32.0 没有 netdial.zig；走的 `std.posix.system` /
    `std.Io.Threaded.addressToPosix` 都是 std，同一钉死工具链下两棵树一致）。
-   `soak_cluster.zig` 走 `zigmodu.netdial` 模块导出而非 path import —— path import 会把
-   netdial.zig 重复编进 harness 模块（`file exists in modules 'root' and 'zigmodu'`），
+   `soak_cluster.zig` 走 `zmodu.netdial` 模块导出而非 path import —— path import 会把
+   netdial.zig 重复编进 harness 模块（`file exists in modules 'root' and 'zmodu'`），
    与 RaftElection vtable 的"第二实例"纪律同源。
 4. **测试与变异证据**：netdial 6 条新单测全绿 —— classify 逐条断言
    （SUCCESS/ISCONN→connected、INTR→retry、12 个具名 errno→同名错误、std panic 集
@@ -3594,7 +3613,7 @@ ARM64 腿的首次结果由本批 push 后的 CI 给出。
 2. **修复：`writeStderr` 改用 `std.debug.lockStderr`**——`std.debug.print` 自己基于的原语：绕过
    `Io` 接口、用最基础的 syscall 直写 stderr、不切栈不挂起，正是 panic 路径唯一允许的形状（hook 也
    没有 `io` 可给 `std.Io.File`）。
-3. **永久门禁：`examples/basic` 接上 `pub const panic = zigmodu.panicHook;`**——只有消费者 root 的
+3. **永久门禁：`examples/basic` 接上 `pub const panic = zmodu.panicHook;`**——只有消费者 root 的
    声明能让编译器真正分析 hook 链的函数体，Build Examples CI job 自此每推必编译它。拆守卫验证：
    把旧调用装回 → example 构建红（`PanicHook.zig:77:28: no member named 'write'`）；装回修复 →
    绿。**教训一并刻在 `hook` 的 doc 上**：树内 `_ = hook;` 只到签名级分析，证明不了函数体可编译
@@ -4832,7 +4851,7 @@ if (5 + len > rem.len) return error.IncompleteGrpcFrame;   // ← u32 加法
 |---|---|
 | A（写代码能关的，9 条） | **0 已关 · 4 部分 · 5 未关** |
 | B（要证据的，6 条）—— v0.32 说这才是门槛 | **4 已关**（soak 覆盖 cluster、fuzz、bench 证据、CL/TE 端到端）**· 2 未关**（混合版本对跑、独立验证） |
-| C（治理/可持续性） | 2 条仍在（879 提交：AI 629 / neox33 220 / ZigModu Developer 29 / **所有者 1**；stars 3 · forks 0） |
+| C（治理/可持续性） | 2 条仍在（879 提交：AI 629 / neox33 220 / zmodu Developer 29 / **所有者 1**；stars 3 · forks 0） |
 
 判断：**功能+安全 ≈ 1.0 的 88%；"能称为 1.0" ≈ 70%**。差的三件不是功能 —— **Raft 侧身份绑定
 （A-1）、混合版本对跑（B-11）、独立验证（B-14）**；"如果只能做一件"从 v0.32 的"soak + 混合版本
@@ -5069,7 +5088,7 @@ io writer + 无界：`broadcast` 的注释自己写着"这是会 park 的那一�
   投递与上界一起成立；同时新增 `setWriteTimeout`（默认 30 s）。这里是**每个连接一个
   detached 线程**，没有任何 `stop()` 会 join 它们，所以上界只能挂在这里。
 * 新测试（socketpair，直接调三个 handler）：断言三条响应**都在**线缆上
-  （`HTTP/1.1 200 OK` / `ZigModu Module Monitor` / `HTTP/1.1 404 Not Found`）。
+  （`HTTP/1.1 200 OK` / `zmodu Module Monitor` / `HTTP/1.1 404 Not Found`）。
   > **红证据**（换回修复前那 6 行）：`a monitor response reaches the socket instead of dying in the writer's buffer...FAIL (TestUnexpectedResult)`
   > —— 线上一个字节都没有。
 
@@ -5557,10 +5576,10 @@ try std.testing.expect(precise.p50_ns <= coarse.p50_ns + lateness_p50_bound_ns);
 > **这一批查出来最值得记的一条**：`src/validation/Validator.zig` **今天仍然是活的** —— `http.FieldRules`
 > **就是**它的 `FieldRules`（`src/http.zig:291` → `src/api/Extract.zig:16`），`http.validateRequest` 中间件也
 > import 它。所以那条横幅写的"v1.0 删除"**不能直接执行**：删之前必须先把 `http.FieldRules` 这个公开拼写迁走。
-> 门禁把这条耦合钉住了（`http.FieldRules` 仍指向该文件，且 `zigmodu.Validator` 解析到的是**另一个**类型 ——
+> 门禁把这条耦合钉住了（`http.FieldRules` 仍指向该文件，且 `zmodu.Validator` 解析到的是**另一个**类型 ——
 > 那是真迁移，不是自指）。
-> `zigmodu.extensions` 记进"已移除"，并**如实标注没有可引用的 commit**（无 git 可用）：改引本仓最老的书面证据
-> `CHANGELOG.md` 的 `[0.15.0]` 段，再由门禁实测 `@hasDecl(zigmodu, "extensions") == false`。
+> `zmodu.extensions` 记进"已移除"，并**如实标注没有可引用的 commit**（无 git 可用）：改引本仓最老的书面证据
+> `CHANGELOG.md` 的 `[0.15.0]` 段，再由门禁实测 `@hasDecl(zmodu, "extensions") == false`。
 > **仍缺**：规则 3（在各自版本条目里回指本节）没补。
 
 **② `WebSocketMonitor.stop()` 不再等满一个 sleep 周期。** 上一批改成 `concurrent` 时留的代价是
@@ -5690,7 +5709,7 @@ error: step run test: corrupted coverage file .zig-cache/v/59e4bde28e630904: pcs
   （声明前 1500 字节内必须同时出现 `DEPRECATED` 与替代名，防止"表在、标记没了"）。
 * **表 ↔ 门禁双向同步**：表里每一行都要有对应门禁项，门禁里也不能留着表里已删掉的行 —— 谁只动一边都红。
 * **冻结面 vs runtime-preview**：94 个冻结锚点逐条 `@hasDecl`（数据驱动自文档，不是手抄调用清单）；
-  17 个 preview 符号必须仍在 `zigmodu.runtime.*` 且**不得**出现在顶层（把允许破坏的东西搬上冻结面即红）。
+  17 个 preview 符号必须仍在 `zmodu.runtime.*` 且**不得**出现在顶层（把允许破坏的东西搬上冻结面即红）。
   口径是从 `docs/RUNTIME.md` 读出来的（§2 第 1–4/9 条、第 10 条与 v0.28.0 的先例），**文档里逐行区分"引用"与"本清单自己的决定"**。
 * **覆盖不到的写进文档**：签名准确性、`runtime.*` 的 breaking 有没有真的进 §9 与 UPGRADING、
   以及一条**不独立**的检查（`stopAll` 的标记窗口与 `startAll` 只隔一行，删掉它自己的注释不会红）。
@@ -5706,7 +5725,7 @@ error: step run test: corrupted coverage file .zig-cache/v/59e4bde28e630904: pcs
   `http_server`），违反表自己的规则 2（"新增弃用项要同时在表里加一行"）→ 补三行 + 门禁三项（各自可执行）。
 
 > **红证据（5 类断言各自"改坏 → 红 → 还原"）**：把已移除的名字加回顶层 →
-> `\`zigmodu.Application\` is exported again — docs/UPGRADING.md records it as removed in 557190a` / `FAIL (RemovedNameReexported)`；
+> `\`zmodu.Application\` is exported again — docs/UPGRADING.md records it as removed in 557190a` / `FAIL (RemovedNameReexported)`；
 > 删掉 `src/tests.zig` 的 `api/Simplified.zig` 编译门 → `FAIL (RemovedBlockUncompiled)`；
 > 改掉别名声明定位串 → `FAIL (DeclarationMissing)`；改掉标记窗口里的替代名 → `FAIL (DeprecationMarkerMissing)`；
 > 表里换名或门禁留孤行 → `FAIL (DeprecationTableDrift)`（一次跑出两条）。六个文件的 sha256 还原校验全部通过。
@@ -5987,7 +6006,7 @@ alpha 拒 seq 4/6 → `drainTo` 写出 6 条 + 2 个洞（`first_hole_seq = 4`�
 "零分配 + 值语义"一个字没动：环里仍然放值，把值变成字节发生在**显式 drain**（调用方的维护循环驱动）。
 代价写在明面上：环有界，**两次 drain 之间的溢出会变成盘上的洞**。
 
-**D2 —— 契约是接口，不是格式。** `zigmodu.runtime.Codec(E)`（`name` / `version` / `encode` /
+**D2 —— 契约是接口，不是格式。** `zmodu.runtime.Codec(E)`（`name` / `version` / `encode` /
 `decode`）；框架只要求这个形状并通过擦除 thunk 把它挂到 `TrackRef.encode`/`decode` 上，
 **标识落到为这件事预留的 `TrackRef.payload_codec`**。`addTrack(spec, E, capacity)` 与 `Track.record`
 的签名一字未动（§13.2 拒绝"定义一套通用序列化协议"那条大路，这一点不变）。
@@ -6114,8 +6133,8 @@ allocator 字段，32 字节栈上帧头 + 三次 positional 写；测试用 `Fa
 并清掉 `src/tests.zig` 的编译门、`docs/API.md` 那节改写成 "**removed**" + 指回真身、`README.zh.md` 去掉它。
 **顺带**：`scripts/deadcode-baseline.json` 里那条指向**已删文件**的陈旧条目一并清掉（手工，不动别人的漂移）。
 
-**`zigmodu.TomlLoader` 补导出（上一批"顺带发现、未做"的那条）。** 上一批让 `ConfigManager` 可命名了，但
-store 只读得了 JSON —— TOML 那条路仍锁在内部。现在 `zigmodu.TomlLoader.init(allocator)` +
+**`zmodu.TomlLoader` 补导出（上一批"顺带发现、未做"的那条）。** 上一批让 `ConfigManager` 可命名了，但
+store 只读得了 JSON —— TOML 那条路仍锁在内部。现在 `zmodu.TomlLoader.init(allocator)` +
 `loadFile(path, &config)`。**没有做成 `ConfigManager.loadToml` 方法**的理由写在导出注释里：那样会让
 store → loader 反向依赖，两个文件为两行转发互相 import。`src/test/DocsConsistency.zig` 的
 "文档里出现的符号必须可导入"用例加了一条**端到端**（写临时 `.toml` → `loadFile` → `getInt`/`getBool`），
@@ -6157,13 +6176,13 @@ store → loader 反向依赖，两个文件为两行转发互相 import。`src/
 - 补上（`src/root.zig`）：`Params`（它本来就是公开字段 `Context.query`/`Context.form` 的类型，消费者连名字都写不出来）、
   `ScopedContainer`（邻居 `Container` 早就导出了）、`SlidingWindowRateLimiter`（与已导出的 `RateLimiter` 同族的真实现）、
   `ConfigManager`（真实实现，且其唯一树内消费者 `TomlLoader` 以 `*ConfigManager` 为参数 —— store 必须可命名）。
-  文档里对应的 4 处路径同步改掉（`zigmodu.di.*`/`zigmodu.config.*`/`zigmodu.resilience.*`/`zigmodu.http.Params`）。
+  文档里对应的 4 处路径同步改掉（`zmodu.di.*`/`zmodu.config.*`/`zmodu.resilience.*`/`zmodu.http.Params`）。
 - **判定为内部、不导出**：`TransactionalEvent` —— 它是个**空壳**（`stageEvent`/`addEvent` 都是 `_ = event;`、
   `commit` 只改状态并留着 `// In real implementation:`、事件载荷 `alloc(u8, 0)`），而真身早已导出为
-  `zigmodu.outbox.*` 与 `zigmodu.SagaOrchestrator`。文档那一节整段删除，换成"**internal, not importable**"并指向真身；
+  `zmodu.outbox.*` 与 `zmodu.SagaOrchestrator`。文档那一节整段删除，换成"**internal, not importable**"并指向真身；
   `README.md` 里也去掉了它。
 - **新增导入证明测试**（`src/test/DocsConsistency.zig`）：跨文件 `@import("../root.zig")`，与消费者
-  `@import("zigmodu")` 的可见性完全一致 —— 漏加或没写 `pub` 就编译失败，而不是等到用户调用处才炸；四个符号都真跑了调用链。
+  `@import("zmodu")` 的可见性完全一致 —— 漏加或没写 `pub` 就编译失败，而不是等到用户调用处才炸；四个符号都真跑了调用链。
   同时保留了"文档里出现的符号必须在 `src/` 存在"那条硬门。
 > **顺带发现、未做（已列）**：`TomlLoader` 也没导出 ⇒ 公开面能用 `ConfigManager` 读 JSON/手工 `set`，但**读不了 TOML**；
 > `ScopedContainer` 相比 `Container` 缺 `remove`/`serviceCount`；`TransactionalEvent` 这个空壳该删（连带 `tests.zig`
@@ -6275,18 +6294,18 @@ CI 被抓住。**刻意改了**那个"一个名字注册四种 kind"的既有用
 > summary 加渲染（按惯例会输出 `x_sum`/`x_count`），那些名字**没有**预留（没为此加推测性断言）；
 > 容器字段本身仍是 `pub`，直接 `m.counters.put(...)` 能绕过规则（未加固、未测试）。
 
-**文档：`zigmodu.<ns>.<Symbol>` 有一半是编出来的路径。** 逐个核对 `root.zig` 的 **158 个导出**与各域 barrel 后：
+**文档：`zmodu.<ns>.<Symbol>` 有一半是编出来的路径。** 逐个核对 `root.zig` 的 **158 个导出**与各域 barrel 后：
 真实存在的命名空间只有 `ai · api · cluster_health · cron · csv · data · datapermission · fx · http · im ·
 load_shedder · migration · observability · outbox · retry · runtime · security · time · util · web4` 加上扁平的
 大写符号；而 **`core` / `di` / `test` / `config` / `metrics` / `tracing` / `log` / `resilience` / `extensions`
-全都是编出来的**（没有 `src/core.zig`、没有 `pub const core`）。修了 21 行（`zigmodu.core.EventBus` →
-`zigmodu.EventBus`、`zigmodu.metrics.PrometheusMetrics` → `zigmodu.observability.PrometheusMetrics`、
-`zigmodu.di.Container` → `zigmodu.Container` …）。两处非显然的：
-**`zigmodu.security.JwtModule` 里的 `JwtModule` 在 `src/` 里根本不存在**（那段 API 正是 `SecurityModule`），
+全都是编出来的**（没有 `src/core.zig`、没有 `pub const core`）。修了 21 行（`zmodu.core.EventBus` →
+`zmodu.EventBus`、`zmodu.metrics.PrometheusMetrics` → `zmodu.observability.PrometheusMetrics`、
+`zmodu.di.Container` → `zmodu.Container` …）。两处非显然的：
+**`zmodu.security.JwtModule` 里的 `JwtModule` 在 `src/` 里根本不存在**（那段 API 正是 `SecurityModule`），
 以及 `RetryPolicy` 其实是**嵌套**在 `HttpClient` 里的。
 > **留下 5 处需要源码决定**（不加是刻意的）：`ScopedContainer`、`ConfigManager`、`TransactionalEvent`、
 > `SlidingWindowRateLimiter`、`Params` 都是**真实存在但没有公开导入路径**的符号（从没接进 `root.zig`）。
-> 加一个 `zigmodu.core` 别名**也修不好**它们 —— 这不是"文档写错了前缀"，而是"这些符号压根没被导出"。
+> 加一个 `zmodu.core` 别名**也修不好**它们 —— 这不是"文档写错了前缀"，而是"这些符号压根没被导出"。
 > 要么补上 root 再导出（源码改动），要么接受内部文件路径/删掉那几节。
 
 ## [0.33.5] - 2026-09-25
@@ -6374,7 +6393,7 @@ harness 改为堆分配并持指针、两个类型都标 **Not copyable**）。*
 "注册必须发生在第一次抓取之前"；**`docs/API.md` 里 `EventBus(T)` 那一节其实写的是 `TypedEventBus` 的方法**
 （真实的无类型 `EventBus(T)` 是 `subscribe(event_type, callback)`/`publish(event_type, payload)`/
 `subscriberCount(event_type)`）—— 这一节改成描述无类型总线，紧接着的 `TypedEventBus(T)` 那节拿到类型化方法表与
-例子。另记录：`docs/API.md` 里的 `zigmodu.core.<Symbol>` 路径风格**全仓都不对**（`root.zig` 是扁平导出、
+例子。另记录：`docs/API.md` 里的 `zmodu.core.<Symbol>` 路径风格**全仓都不对**（`root.zig` 是扁平导出、
 没有 `src/core.zig` 也没有 `pub const core`），本批只在新增文字里避开它，没有半改两处。
 
 > **顺带发现、未修（已列）**：`WebSocketServer.sendFrame` 把所有写失败报成 `error.NotConnected` 且不置
@@ -6937,7 +6956,7 @@ src/ai/cooldown_store.zig:265:37: error: member function expected 2 argument(s),
 src/ai/cooldown_store.zig:295:42: error: incompatible types: 'u32' and 'void'               (del 的 u32 丢进 void catch)
 （修掉前两条后再现）src/ai/cooldown_store.zig:282:59: error: division with 'i64' and 'comptime_int'
 ```
-而 `docs/LLM_POLICIES.md:193` **明着教用户** `zigmodu.ai.RedisCooldownStore.init(...)` —— 照着抄就编译不过。
+而 `docs/LLM_POLICIES.md:193` **明着教用户** `zmodu.ai.RedisCooldownStore.init(...)` —— 照着抄就编译不过。
 做最小机械修复（`put` 改两参并在失败时释放 dupe 的 key、`del` 的结果用 `if … else |err|`、
 `/ 1000` → `@divTrunc`），并且新加的 Redis 测试通过 `asStore()` **真正实例化那张 vtable** ——
 这正是 AGENTS.md 要求的那种"真正调用"测试，也是这类"只导出、没调用者"缺陷唯一的防线。
@@ -7687,13 +7706,13 @@ MySQL 侧的 `mysql_errno` 分支与 `columns_arena` 生命周期**没有任何�
 > 前缀导出的值被脚本内的赋值盖掉，测试二进制看到的是 `DB=all`，`skipUnlessDb("mysql")` 全部静默 skip
 > （实测同一 filter：包装脚本 8 passed / 7 skipped，直连 build 13 passed / 2 skipped）。
 > **正确形式**：`DB=mysql zig build test -Ddb=all -Dtest-filter=… -Dtest-force-run=true`。
-> PG 不受影响（`ZIGMODU_TEST_PG=1` 是环境变量，没有同名脚本变量）。上一批那句"与 MySQL 9.3.0 分组跑过"
+> PG 不受影响（`ZMODU_TEST_PG=1` 是环境变量，没有同名脚本变量）。上一批那句"与 MySQL 9.3.0 分组跑过"
 > 因此是错的，已在原处标注。
 
 ### 第 8 批：CI 那条红是测试的等待谓词反了；`Cursor.next` 不再把错误折叠成 EOF；H2 补齐表单/改写器/查询串；`authRateLimitMiddleware` 首次可编译（**破坏性：是**，1 处编译错）
 
 全量 `-Ddb=all` **1740/1766（26 skipped，0 failed）**；PG 侧另有真机 17.10 跑过
-（`ZIGMODU_TEST_PG=1` 是**唯一**能穿过 `scripts/test-fast.sh` 的环境门控）。
+（`ZMODU_TEST_PG=1` 是**唯一**能穿过 `scripts/test-fast.sh` 的环境门控）。
 
 > **更正一处口径（本批写错过，第 9 批发现）**：`DB=mysql bash scripts/test-fast.sh …` **不会**启用
 > MySQL 门控用例 —— `test-fast.sh` 自己持有 `DB` 变量（默认 `sqlite`，被 `--db all` 覆盖），前缀导出
@@ -7841,7 +7860,7 @@ client（单次原子发布：`load(.acquire)` 快路径、`cmpxchgStrong` 慢�
 `src/web4/x402_store.zig` 的迁移探测改调这个 helper。
 
 > **未验证**：没有可达的 PG/MySQL 服务器，所以**服务端行为没有实测**——用例只断言生成的语句与绑定参数的
-> 顺序/个数。真机覆盖（`ZIGMODU_TEST_PG=1` / `DB=mysql` 门控的 `probeCatalogColumn`）在本地是 skipped。
+> 顺序/个数。真机覆盖（`ZMODU_TEST_PG=1` / `DB=mysql` 门控的 `probeCatalogColumn`）在本地是 skipped。
 
 **删除 `ConnPool.reconnect` 与其两个只服务它的字段**（`max_reconnect_attempts` / `reconnect_delay_ms`）。
 它开连接时**不更新 `active` 计数**（其他所有开路都更新），且**无任何调用点**（`zmodu deadcode` 也把它标为
@@ -7873,7 +7892,7 @@ dead 并已在基线里）——缺陷真实但不可达，所以删掉而不是
 仍然 403。未绑定的遗留行（老库 `payer_did IS NULL`）按原语义放行。`migrate()` 增加幂等 `ALTER`（sqlite 走
 `PRAGMA table_info`，PG/MySQL 走 `information_schema`），老库可以直接升级。红证据：去掉比对 →
 `expected .payer_mismatch, found .redeemed` / `expected 403, found 200`。**在真 PG 17.10 与 MySQL 9.3.0 上验过**
-（门控形式：PG 用 `ZIGMODU_TEST_PG=1`；MySQL **不能**用 `DB=mysql bash scripts/test-fast.sh` —— 那句的
+（门控形式：PG 用 `ZMODU_TEST_PG=1`；MySQL **不能**用 `DB=mysql bash scripts/test-fast.sh` —— 那句的
 `DB` 会被脚本自己的赋值盖掉、门控用例全部静默 skip，得用 `DB=mysql zig build test -Ddb=all
 -Dtest-filter=… -Dtest-force-run=true`；见第 9 批的口径更正）。
 
@@ -7968,7 +7987,7 @@ body 没编码"的响应。红证据：把 `compressResponse` 挖空 → 12 条�
 但**无任何调用点**（死代码）。
 
 **测试隔离修复（顺带，解释了我们看到的"偶发失败"）**：两个用例用**固定的 `/tmp` 路径**
-（`/tmp/zigmodu_2pc_in_doubt.db`、`/tmp/zigzero_sqlx_stmt_test.db`），并发跑同一套件（第二个测试二进制、
+（`/tmp/zmodu_2pc_in_doubt.db`、`/tmp/zigzero_sqlx_stmt_test.db`），并发跑同一套件（第二个测试二进制、
 或同一工作树里的另一个代理）会互相 `deleteFile` 拆台——这正解释了并行时偶发的
 `TwoPhaseCommit: in-doubt` / `sqlite prepared statement` 失败。两处改为**按 pid 唯一**并保留了前后清理。
 
@@ -8216,7 +8235,7 @@ CI 那次构建的 codegen 下触发，所以"先红"这一步只有 CI 的栈�
 `if rg -q …` 加的前置守卫修掉了"缺工具就静默通过"，却把**没有预装 rg 的 macOS runner** 判红 ——
 两种都不对。现在门禁**优先 rg、回退 `grep -Rn --include='*.zig'`，只有两者都不存在才失败**：
 门禁要的是"真的搜过"，用哪个工具是实现细节。**红/绿都验过**：造一个含字面
-`zigmodu.http_server` 的 fixture，有 rg 与无 rg 两条路径都 exit 1 并打出报文；清理后 exit 0。
+`zmodu.http_server` 的 fixture，有 rg 与无 rg 两条路径都 exit 1 并打出报文；清理后 exit 0。
 
 
 ### zent 升到 v0.76.2：两个示例改 pin，并采用 0.76.0 的按驱动裁剪（**破坏性：否**）
@@ -10919,7 +10938,7 @@ worker 报错只说得出"谁出错了"，说不出"哪一次请求造成的"。
 **改动（集中在 `src/runtime/runtime.zig`）**
 
 - 邮箱元素从裸 `Message` 换成文件内私有信封 `struct { trace: ?TraceId = null, message: Message }`。
-  `TraceId` 从 `tracing/DistributedTracer.zig` **原样** re-export（`zigmodu.runtime.TraceId`，16 字节
+  `TraceId` 从 `tracing/DistributedTracer.zig` **原样** re-export（`zmodu.runtime.TraceId`，16 字节
   值类型），不另造平行结构。**零分配**：trace 跟着邮箱槽位走，不给 `Mailbox` / `RingBuffer` /
   `HotBus` / `send` 加 allocator 形参 —— 热路径上只是一个字段的拷贝。
 - `Handle.send` / `sendBlocking` **签名不变**（内部发 `trace = null`）；新增
@@ -10956,7 +10975,7 @@ worker 报错只说得出"谁出错了"，说不出"哪一次请求造成的"。
   `check-tenant-scope.sh`、`zig build check-api`、`zig build check`（后者内部跑
   `check-production.sh`）。"本地绿、CI 红"的发布事故因此不会复发。
 - scaffold 的 `zigmodu_zon_hash` 刷新到 **v0.27.0**
-  （`zigmodu-0.27.0-U40vs9t8UgBlmRaJ7WNawmUCr_LZFk9H1XrKU44bvHk1`）。该 hash 必须在 tag
+  （`zmodu-0.27.0-U40vs9t8UgBlmRaJ7WNawmUCr_LZFk9H1XrKU44bvHk1`）。该 hash 必须在 tag
   存在之后才能算出，所以每次发布后都要补这一手；滞后期间 `check-version.sh` 只报 WARN
   （设计如此）。验证不看 hash 像不像，而是**真编译**一个钉住该 URL+hash 的生成工程，
   `zig build` exit 0 才算数。
@@ -11163,15 +11182,15 @@ legacy `RouteGroup` 扩展模板的 `resolve2` 也一并改成了 `ctx.state(T)`
   改成两个真正确的形态（所有权随返回值移交 / `dupe` 出拷贝），原写法降级为显式反例。
 - 并发范例用了 **Zig 0.17 已删除的 `std.Thread.Mutex`** 且 `Self` 未定义 → 改成 `std.Io.Mutex = .init`
   + 显式 `io` 字段 + `lock(io) catch return` / `unlock(io)`。
-- `zigmodu.resilience.*` / `tracing.*` / `metrics.*` 三个**命名空间不存在** → 改为
-  `zigmodu.CircuitBreaker` / `zigmodu.observability.DistributedTracer` 等真实路径。
+- `zmodu.resilience.*` / `tracing.*` / `metrics.*` 三个**命名空间不存在** → 改为
+  `zmodu.CircuitBreaker` / `zmodu.observability.DistributedTracer` 等真实路径。
 - `CircuitBreaker.init(5, 30000)`、`.timeout_ms`（字段不存在）、`data.redis.Redis.init(allocator)`
   + `connect(host, port, .{})` 均为旧签名 → 按 `src/resilience/CircuitBreaker.zig`、
   `src/redis/redis.zig` 的真实签名重写。
 - 部署节：`root_module.addDefine`（不存在）、`std.process.getEnvVarOwned`（已移除）、
   GitHub Action 的 `0.16.0` 版本矩阵 → 改成 `b.addOptions()` + `init.environ_map` + `ci.yml` 的 `ZIG_VERSION`。
-- `zigmodu.extensions.ModuleTestContext` → `zigmodu.ModuleTestContext`；
-  `zigmodu.extensions.AsyncEventBus`（**全仓无此类型**）整段删除，换成 `ThreadSafeEventBus` 真实示例。
+- `zmodu.extensions.ModuleTestContext` → `zmodu.ModuleTestContext`；
+  `zmodu.extensions.AsyncEventBus`（**全仓无此类型**）整段删除，换成 `ThreadSafeEventBus` 真实示例。
 - "examples 里没有任何代码用 `ai.Agent`" 等采样断言已失效 → 加时间标注并更新。
 
 **文档：入册与口径**
@@ -11254,7 +11273,7 @@ arena（复刻 `connFiber` 层次），真的 `dispatch` `list` 与 `get?id=1`�
 
 **修复：`LogRotator` —— 公开导出但从未被编译**
 
-`zigmodu.observability.LogRotator` 是正式导出的组件，但**全仓零调用**；Zig 惰性分析函数体，
+`zmodu.observability.LogRotator` 是正式导出的组件，但**全仓零调用**；Zig 惰性分析函数体，
 所以 `rotate()` 里 0.17 之前的 `std.Io.Dir.cwd().rename(self.io, old, new)`（正确签名是 5 参
 自由函数 `Dir.rename(old_dir, old_sub, new_dir, new_sub, io)`）一直没报错 —— **任何用户一调用
 `write` 就编译失败**。`zig build test` 抓不到，因为"编译所有源文件"的测试只做文件级 import，
@@ -11529,7 +11548,7 @@ arena（复刻 `connFiber` 层次），真的 `dispatch` `list` 与 `get?id=1`�
 
 ### 2PC 持久化协调日志（in-doubt 有解）
 
-- 新增 `src/core/TransactionJournal.zig`（`zigmodu.TransactionJournal`）：append-only、**只 INSERT 不 UPDATE**、
+- 新增 `src/core/TransactionJournal.zig`（`zmodu.TransactionJournal`）：append-only、**只 INSERT 不 UPDATE**、
   DDL 方言中立、走 `data.SqlxBackend` 领域缝；不配 backend 时退回内存。
 - 写点：`begun`（带参与者名单）→ **`prepared` 先落盘再返回**（崩溃窗口）→ `committed`；`abortPhase` 先写 `aborted` 再回滚。
   配了日志即 **fail-closed**（写不进去就报错、不前进）。
@@ -11630,7 +11649,7 @@ arena（复刻 `connFiber` 层次），真的 `dispatch` `list` 与 `get?id=1`�
 - **doctor 补三项检查 + `graph --dot`**：doctor 新增「未解析服务 / 消费者计数 / 事件拓扑」三项 **advisory** 检查
   （查不到就输出 `n/a (静态分析不可得)`，不编数字；阈值 `--max-consumers N`）；`zmodu graph --dot` 把
   `ModuleGraph.renderDot` 接进 CLI（DOT 与 Mermaid 共用 `--out`）。顺带修：**doctor 的测试此前从未被编译**
-  （`main.zig` 未在测试上下文引用它）→ 已并入 CLI 覆盖率门禁；`moduleOfImport` 把 `std`/`zigmodu` 误判成模块名 →
+  （`main.zig` 未在测试上下文引用它）→ 已并入 CLI 覆盖率门禁；`moduleOfImport` 把 `std`/`zmodu` 误判成模块名 →
   改为只认相对 import。
 
 ## [0.22.0] - 2026-09-17
@@ -11803,7 +11822,7 @@ v0.21 的 Agent Runtime 要求 AI 层能被别的包依赖 —— 而"能被依�
 > ClusterMembership 并存，后者一行未动。
 
 ### Added
-- **`zigmodu.ClusterView(N, G)`（`src/cluster/ClusterView.zig`）** —— 集群状态在**请求路径**上的安全读法：
+- **`zmodu.ClusterView(N, G)`（`src/cluster/ClusterView.zig`）** —— 集群状态在**请求路径**上的安全读法：
   - **引用计数的成员快照**：写者（维护循环，单写者）`publish()` 整份替换；读者 `acquire()` → 用 →
     `release()`，全程无锁、无分配、无 GC。写者在复用槽位前等该槽读者清零，等不到返回
     `error.ReadersBusy` 而不是覆盖活数据（发布是秒级活动、读是微秒级活动，等是便宜的方向）。
@@ -11919,7 +11938,7 @@ v0.21 的 Agent Runtime 要求 AI 层能被别的包依赖 —— 而"能被依�
 > 不调用 `app.runtime()` 的应用，线程数、生命周期、行为与 v0.15.x 完全一致。
 
 ### Added
-- **ZigModu Runtime（`zigmodu.runtime` + `app.runtime()`）** —— `Application`（架构单元：Module/DI/
+- **zmodu Runtime（`zmodu.runtime` + `app.runtime()`）** —— `Application`（架构单元：Module/DI/
   Lifecycle/EventBus/HTTP）旁边新增一条**可选**执行通道（执行单元：Worker/Mailbox/RingBuffer/
   TimerWheel），共享同一个 io / config / 可观测性。定位与契约见 `docs/RUNTIME.md`。
   - `RingBuffer(T, N)`：单生产者/单消费者**无锁**环（各自只读对方指针，无 CAS），N 必须 2 的幂。
@@ -12109,7 +12128,7 @@ v0.21 的 Agent Runtime 要求 AI 层能被别的包依赖 —— 而"能被依�
   `Context.permissionMatches(expr)`、`http.permissionMatchesContext(ctx, expr)`、
   `http.permissionMatchesWith(ctx, expr, config)`（与某个 gate 完全同语义）。
   与 gate 的 OR 语义（`portal:user|portal:shop`）共用同一实现 —— 匹配原语下沉到
-  `ZigModu.security.Rbac.exprMatchesCsv` / `exprMatchesAuthInfo`，
+  `zmodu.security.Rbac.exprMatchesCsv` / `exprMatchesAuthInfo`，
   `permissionGateWith` 改为委托，杜绝 handler 与 gate 两套语义漂移。
 - 测试：`src/test/ErrorShape.zig`（链内/路由前/未捕获 500 的形状矩阵，含"装 `defaultReject`
   为默认渲染器不得自递归"）、`src/test/PermissionMatch.zig`（OR 表达式、AuthInfo 权威性、
@@ -12208,7 +12227,7 @@ v0.21 的 Agent Runtime 要求 AI 层能被别的包依赖 —— 而"能被依�
   首次运行抓出 **4 个纯虚构 API**：`TransportProtocol`、`MqttTransport`、
   `TaskScheduler`、`PasRaftAdapter`——它们从未存在于本仓库，却被当作可用能力写在
   API 参考里。已修正文档（Transport 段改为真实情况：HTTP/1.1 + h2c + gRPC，
-  MQTT 明确"未提供"；Scheduler 改为真实的 `zigmodu.cron.Scheduler` 签名；
+  MQTT 明确"未提供"；Scheduler 改为真实的 `zmodu.cron.Scheduler` 签名；
   Raft 指向 `core/cluster/RaftElection.zig` 并标注 experimental），另修掉把
   `Context.body` 字段写成方法的条目。
   范围只含 API.md：BEST_PRACTICES 有意展示**应用侧**示例代码（`OrdersApi` 等），
@@ -12303,7 +12322,7 @@ v0.21 的 Agent Runtime 要求 AI 层能被别的包依赖 —— 而"能被依�
   query 与 form 都按"出现次数"计数，超限返回 `error.TooManyParams`，**不静默截断**。
 
 ### Added
-- `zigmodu.http.Params` 导出（`put`/`putOwned`/`get`/`getFirst`/`getAll`/`getArray`/
+- `zmodu.http.Params` 导出（`put`/`putOwned`/`get`/`getFirst`/`getAll`/`getArray`/
   `getPath`/`getSegments`/`count`/`totalValues`），6 个新测试覆盖重复键、括号数组
   （索引排序 + `[]` 追加 + 无括号回退）、点路径、参数上限与所有权转移。
 
@@ -12331,10 +12350,10 @@ v0.21 的 Agent Runtime 要求 AI 层能被别的包依赖 —— 而"能被依�
   文本字段桥接、Context 端到端）。
 
 ### Added
-- **静态文件服务**（`zigmodu.http.staticFiles` / `StaticFiles.staticMiddleware`，zapi 反馈 P1-6）：
+- **静态文件服务**（`zmodu.http.staticFiles` / `StaticFiles.staticMiddleware`，zapi 反馈 P1-6）：
 
   ```zig
-  try zigmodu.http.staticFiles(io, &server, allocator, "/assets", "public", .{
+  try zmodu.http.staticFiles(io, &server, allocator, "/assets", "public", .{
       .cache_control = "public, max-age=3600",
   });
   ```
@@ -12434,7 +12453,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   经真实路由 dispatch 后逐条校验，漂移即构建失败；负例验证漂移会被报告而不是
   静默通过。`ContractVerificationResult` 新增 `deinit`（此前所有权无处释放）。
 - **真实 PostgreSQL 的锁验证**：`DistributedLock` 的 `.postgres` 方言在 PG 17 上
-  实测通过（双 owner 互斥、释放移交、过期回收）；经 `ZIGMODU_TEST_PG=1` 门控，
+  实测通过（双 owner 互斥、释放移交、过期回收）；经 `ZMODU_TEST_PG=1` 门控，
   CI 的 `test-postgres` job 已带上该变量与 PG 环境变量。
 - **迁移失败恢复指引**：`docs/BEST_PRACTICES.md` 新增运维小节，写清 `success=false`
   重试语义、部分生效要求幂等、`ALTER TABLE` 失败被跳过的代价，及现场查询 SQL。
@@ -12447,7 +12466,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/health/live` + `/health/ready`，删掉自带 health 路由避免重复）。
 - **路由标签归一化**：ComptimeRouter 的模式不带前导 `/`，而 server 级路由带 ——
   指标标签统一补 `/`，避免同一接口裂成两条序列。
-- **`zigmodu.Preflight`**（`src/core/Preflight.zig`）：启动预检，把"凌晨三点炸"变成
+- **`zmodu.Preflight`**（`src/core/Preflight.zig`）：启动预检，把"凌晨三点炸"变成
   "拒绝启动"。内置 `envCheck`（缺必填变量）/ `secretCheck`（占位或过短的 JWT
   secret）/ `dbCheck`（SELECT 1）/ `migrationCheck`（有待应用迁移）/
   `clockCheck`（时钟偏移）；`Severity.warn` 只告警，检查之间互不影响，不 panic。
@@ -12470,7 +12489,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     线程即可刷新连接池/积压等 gauge。
   - `Client.poolMetrics()`：暴露已有的 `ConnPool.PoolMetrics`
     （active / idle / waiters / 各项计数）。
-- **`zigmodu.DistributedLock`**（`src/core/DistributedLock.zig`）：后台任务的跨实例互斥。
+- **`zmodu.DistributedLock`**（`src/core/DistributedLock.zig`）：后台任务的跨实例互斥。
   接口 `Lock.tryAcquire(name, ttl_ms)` / `release(name)` + `NoopLock`（默认，保持
   单进程行为）+ `SqlLock(Client)`（表锁，`.sqlite` / `.postgres` 用
   `ON CONFLICT DO NOTHING`、`.mysql` 用 `INSERT IGNORE`，靠 `rows_affected`
@@ -12490,7 +12509,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **黄金信号指标**：`productionProfile` 默认维护 `http_requests_total`、
   `http_responses_{2xx,3xx,4xx,5xx}_total` 与
   `http_request_duration_milliseconds` 直方图（1ms–5s 固定桶）。
-- **`docs/OBSERVABILITY.md`** + **`docs/grafana/zigmodu-overview.json`**
+- **`docs/OBSERVABILITY.md`** + **`docs/grafana/zmodu-overview.json`**
   （7 面板）：PromQL 速查、告警阈值起点、Prometheus/K8s 抓取配置、上线自检。
 - **生产部署参考** `examples/production-deploy/`：nginx / Envoy TLS 终结 +
   h2c 反代、docker-compose、K8s（探针/HPA/Prometheus 注解）、systemd
@@ -12681,7 +12700,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **zent 升级 v0.32.0 → v0.32.1**（纯新增 + CI 修复，零 breaking）：v0.32.1
   新增 interceptor 多租户查询改写示例与 eager/upsert 基准，并修复四个既有
-  CI 失败；已 pin zigmodu v0.15.32 并移除其 libc 补丁。`examples/zent-modulith`
+  CI 失败；已 pin zmodu v0.15.32 并移除其 libc 补丁。`examples/zent-modulith`
   zon 锁定 `git+https#v0.32.1`（hash `zent-0.32.1-oiur-3jiDwAri-…`），
   文档版本口径同步 v0.32.1。
 
@@ -12873,7 +12892,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.15.24] - 2026-08-13
 
 ### Added
-- **migration barrel 导出（F2）**: `zigmodu.migration` 全量导出
+- **migration barrel 导出（F2）**: `zmodu.migration` 全量导出
   MigrationRunner/Entry/Applied/Status/Loader——业务侧可弃用自研 migrate.sh。
 
 ### Fixed
@@ -13101,7 +13120,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Repository 租户感知查询**: 新增 `findPageForTenant` / `findByIdsForTenant`
   / `findPageFilteredForTenant` / `countForTenant`（comptime 列名；模型缺租户
   字段时编译期报错，fail-closed）；原有方法签名不变。
-- **API.md 旧别名清理**: `zigmodu.http_server.*` 示例统一为 `zigmodu.http.*`。
+- **API.md 旧别名清理**: `zmodu.http_server.*` 示例统一为 `zmodu.http.*`。
 
 ## [0.15.7] - 2026-08-04
 
@@ -13136,16 +13155,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   取舍（ADR-015 式）：Phase 1 只做可发现性，远程 registry/自动安装/签名包
   延后（质量门优先）。2 个单测并入 CLI 套件；docs/ZMODU_CLI_INTEGRATION 补
   章节。
-- **zsaas — SaaS 业务框架（zigmodu 后端 + saas-solidjs 前端）**: 新增 `zsaas/`
+- **zsaas — SaaS 业务框架（zmodu 后端 + saas-solidjs 前端）**: 新增 `zsaas/`
   目录。同一份业务模型 JSON 生成两端：后端 `zmodu saas <model.json>` 产出
-  org 隔离的 zigmodu 模块（model/persistence/service/api/module/root 六文件、
+  org 隔离的 zmodu 模块（model/persistence/service/api/module/root 六文件、
   参数化 SQL 强制 `org_id` 租户过滤、ComptimeRouter `.auth=.jwt` + permission
-  门控、ctx.json、saas-schema.sql 迁移产物），生成模块已在真实 zigmodu 工程
+  门控、ctx.json、saas-schema.sql 迁移产物），生成模块已在真实 zmodu 工程
   编译通过；前端 `scripts/gen-business.mjs` 生成 SolidStart 管理页（列表/新建/
-  编辑/删除 + i18n + 导航）+ `zmoduFetch` REST client（`/api/v1/<entity>`，
+  编辑/删除 + i18n + 导航）+ `ZmoduFetch` REST client（`/api/v1/<entity>`，
   Bearer 鉴权），tsc 全绿；`scripts/check-gen.mjs` 自检。
   **一键新建前后端**：`scripts/create-project.mjs <model.json> --name <app>` 同时
-  创建 zigmodu 后端工程（自动把 zigmodu 依赖指向本地仓库，规避 `zmodu new`
+  创建 zmodu 后端工程（自动把 zmodu 依赖指向本地仓库，规避 `zmodu new`
   的旧 tag 占位 hash）与 saas-solidjs 前端工程（模板复制 + 业务页面），端到端
   验证：后端 `zig build` 编译通过 + `zmodu verify` 全过、前端页面生成、零泄漏。
   顺带修复 `zmodu new` 的既有 bug：生成 main.zig 引用未定义 `project_name`、
@@ -13190,12 +13209,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **`zmodu audit` 业务最佳实践检查器**: 新 CLI 命令，两组规则——architecture
   （模块自依赖/循环依赖/缺失描述/命名规范/依赖上限/未知依赖/base 模块依赖，
-  与 `zigmodu.ArchitectureTester` 默认规则对齐）与 business（handler/model 含
+  与 `zmodu.ArchitectureTester` 默认规则对齐）与 business（handler/model 含
   SQL、非参数化 SQL、`@ptrCast(ctx.user_data)`、legacy sendSuccess/sendFail、
   banned 导入、已移除 Zig 0.17 API、跨模块直接文件导入）。支持 `-j` JSON、
   `--group`/`--max-deps`/`--base-modules`、`.zmodu/audit-baseline.json` 基线
   （与 deadcode 同语义，`--update` 收缩）；CLI 单测 4 个并入 `zig build test`。
-  同时把 `zigmodu.ArchitectureTester` 导出到 root（修复与
+  同时把 `zmodu.ArchitectureTester` 导出到 root（修复与
   docs/AI_METHODOLOGY.md 的断点），docs/ZMODU_CLI_INTEGRATION.md 补章节。
 - **zmodu 工具链增强（P0/P1 落地）**: (1) `zmodu ci` 一站式门禁——`zig build`
   → `fmt --check` → `verify` → `audit` → `deadcode`，单命令面向 CI；(2)
@@ -13219,9 +13238,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `std.testing.allocator` 回归测试，修复前实测 crash），以及 `Agent.run` 工具结果在
   `Stringify.valueAlloc` 失败时未释放的 OOM 路径泄漏。
 - **Agent composition tests + AI benchmark + optional real-provider CI**: (1) `Agent.run` integration tests for the composed paths — context auto-compaction (`ContextManager` summarize invoked mid-run), budget exhaustion (early stop + `budget_exhausted`), and cooperative cancel (requested from `on_step`, stops next iteration); (2) `zig build benchmark` gains an AI section (workflow 20-step × 100 ≈ 5 ms); (3) CI adds an optional `ai-real-provider` job that runs `examples/llm-policies` against a real LLM when `LLM_API_KEY` is configured (GitHub secret). AGENTS/AI_METHODOLOGY docs synced.
-- **SkillRegistry → MCP bridge**: `zigmodu.ai.mcp` exposes registered AI skills as Model Context Protocol tools — `toMcpTools` (MCP `tools/list` payload with inputSchema derived from tool parameters), `handleToolCall` (dispatch to the registry, text content result) and `serveStdio` (JSON-RPC 2.0 MCP server over stdin/stdout). Applications serve a session `SkillContext` (tenant/user/permissions), so `required_permission` gates and admin.* allowlists still apply. docs/MCP.md documents wiring + security.
+- **SkillRegistry → MCP bridge**: `zmodu.ai.mcp` exposes registered AI skills as Model Context Protocol tools — `toMcpTools` (MCP `tools/list` payload with inputSchema derived from tool parameters), `handleToolCall` (dispatch to the registry, text content result) and `serveStdio` (JSON-RPC 2.0 MCP server over stdin/stdout). Applications serve a session `SkillContext` (tenant/user/permissions), so `required_permission` gates and admin.* allowlists still apply. docs/MCP.md documents wiring + security.
 - **MCP 真实链路示例 + 客户端冒烟 + 泄漏修复**: new `examples/mcp-server` exposes `kpi.query` (in-memory SQLite) + `ping` over real MCP stdio; `scripts/mcp-client-test.py` drives a real session (initialize / tools/list / tools/call) asserting protocol 2024-11-05 and KPI sum — verified locally with zero leaks. Fixes a `handleToolCall` leak (response tree was never freed after stringify). Added to CI example builds.
-- **Admin/ops AI skills (P2 落地)**: `zigmodu.ai.admin` — `admin.cache.invalidate` / `admin.cache.clear` (whitelisted caches, wildcard keys rejected, `all=true` opt-in for clears), `admin.config.get` / `admin.config.set` (ConfigStore with mutable-keys whitelist), `admin.audit.export` (RunAuditStore query with kind/tenant/limit filters) and `admin.user.manage` / `admin.tenant.provision` (app-callback delegation). Each requires its own permission code and **must be explicitly allowlisted** — off by default, per the controlled-execution posture.
+- **Admin/ops AI skills (P2 落地)**: `zmodu.ai.admin` — `admin.cache.invalidate` / `admin.cache.clear` (whitelisted caches, wildcard keys rejected, `all=true` opt-in for clears), `admin.config.get` / `admin.config.set` (ConfigStore with mutable-keys whitelist), `admin.audit.export` (RunAuditStore query with kind/tenant/limit filters) and `admin.user.manage` / `admin.tenant.provision` (app-callback delegation). Each requires its own permission code and **must be explicitly allowlisted** — off by default, per the controlled-execution posture.
 - **Dead-code baseline gate**: `scripts/check-deadcode.sh` fails CI when the repo gains new dead declarations (identity `file:kind:name:parent`, so line moves don't false-positive); removals are allowed and `--update` shrinks the baseline (`scripts/deadcode-baseline.json`, 37 items). Wired into CI after the deadcode smoke.
 - **Agent end-to-end test**: `Agent.run` driven against a loopback mock OpenAI endpoint — tool_calls → skill dispatch → final answer, asserting `answer`, `metrics.tool_calls`, tool hook invocation.
 - **Workflow DAG approval-gate test**: a `.approval` step in a DAG stops the run with `pending_human` after dependencies complete; downstream steps never run.
@@ -13233,11 +13252,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Remaining zero-test coverage**: added tests for `src/util.zig` (`randomHex`/`randomUuid` length + hex charset, `pluralize` english rules incl. vowel-y, `hexEncode` + `HashKit` MD5/SHA-256 known vectors) and `sqlx.errors.sqlStateToError` (SQLState → kind mapping, unknown → Other) — which surfaced two missing mappings (`57014` Timeout, `53300` TooManyConnections) now added. The remaining zero-test files are barrels (http/observability/security/data/root/docs/outbox/im/extensions/ai/web4), C bindings (sqlite3_c/libpq_c/libmysql_c + stubs), platform-specific io_uring stubs and the usage `main.zig`/benchmark entry — none require unit tests.
 - **Fluvio native transport + thin-component tests**: `messaging.FluvioNative.NativeTransport` replaces the `fluvio` CLI subprocess with a pluggable TCP transport (line protocol over a socket; loopback server for tests/dev — end-to-end createTopic/produce/consume/list verified). `FluvioConnector` gains a `transport` field so apps inject the native transport or a faithful Fluvio SC/SPU protocol implementation. Added tests for the remaining zero-test thin components: `core.Event` (tagged-union payloads), `log.ModuleLogger` (+ `LogScope`), `metrics.MetricsBackend` (vtable routing).
 - **Zero-test component hardening**: added tests for `sqlx.CircuitBreaker` (open/half-open/closed state machine incl. timeout re-open and half-open failure), `core.EventPublisher` (TypedEventBus publish + event validation + metadata) and `core.ApplicationModuleListener` (subscribe + receive). Fixing them surfaced three more lazily-compiled broken implementations: `EventPublisherMixin` validated against the wrong bus type (`EventBus` vs `TypedEventBus`), `ModuleListener.subscribe` called a 2-arg `EventBus.subscribe` with one argument and wrapped the handler with the wrong signature — both now compile and pass tests. `FluvioConnector` CLI-fallback stub semantics confirmed covered by existing tests.
-- **Productization pass (per component audit)**: (1) **Security consolidation** — `http_middleware.securityHeaders()` (default HSTS/X-Frame-Options/CSP/etc.) is the canonical security-header middleware; deleted the broken `security/SecurityHeaders.zig` middleware (wrong return type + wrong `next` call, never compiled) and the duplicate broken `security/Csrf.zig` (`CsrfProtection` — invalid API calls, never compiled); `Middleware.csrf()` is now the single CSRF implementation. Added tests for csrf allow/reject and security-header injection. (2) **EventStore productionized** — JSON event serialization, replay invoking the application handler, snapshot-based replay (state + events after snapshot), thread safety via `std.Io.Mutex`, owned metadata; tests cover append/serialize/replay and snapshot replay. (3) **Removed deprecated `ScheduledTask.zig`** (placeholder `start()`/`calculateNextCronRun`; AI bridge uses `Cron.zig`) — `zigmodu.TaskScheduler` export dropped. (4) **gRPC audit** — server/client/bidi/bidi-pump streaming are fully implemented and tested (corrects an earlier "streaming UNIMPLEMENTED" note). (5) PluginManager comment dedupe + HealthEndpoint test.
+- **Productization pass (per component audit)**: (1) **Security consolidation** — `http_middleware.securityHeaders()` (default HSTS/X-Frame-Options/CSP/etc.) is the canonical security-header middleware; deleted the broken `security/SecurityHeaders.zig` middleware (wrong return type + wrong `next` call, never compiled) and the duplicate broken `security/Csrf.zig` (`CsrfProtection` — invalid API calls, never compiled); `Middleware.csrf()` is now the single CSRF implementation. Added tests for csrf allow/reject and security-header injection. (2) **EventStore productionized** — JSON event serialization, replay invoking the application handler, snapshot-based replay (state + events after snapshot), thread safety via `std.Io.Mutex`, owned metadata; tests cover append/serialize/replay and snapshot replay. (3) **Removed deprecated `ScheduledTask.zig`** (placeholder `start()`/`calculateNextCronRun`; AI bridge uses `Cron.zig`) — `zmodu.TaskScheduler` export dropped. (4) **gRPC audit** — server/client/bidi/bidi-pump streaming are fully implemented and tested (corrects an earlier "streaming UNIMPLEMENTED" note). (5) PluginManager comment dedupe + HealthEndpoint test.
 - **Web4 production hardening**: `web4.x402_store.X402Store` — persisted invoices (SQL) with exactly-once redemption (`redeem(invoice_id, tx_hash)` → redeemed / not_found / already_used / expired), wired into `x402Middleware` via `X402Config.store` (invoices created on 402, proofs redeemed once, replay → 410). `web4.challenge.ChallengeStore` — one-time DID challenges (issue + verifyAndConsume, TTL, anti-replay), wired into `didAuthMiddleware` via `DidAuthConfig.challenge_store`. `DidAuthConfig.jwt_issuer` issues a JWT (`x-did-token` header) after DID auth so clients continue on the framework's JWT/RBAC chain. Fixed pre-existing did.zig leaks (credential issue/verify buffers). `examples/web4` upgraded to the production path (402→200→410 replay rejection; DID challenge + JWT issuance); docs/WEB4.md documents the hardening.
-- **Web4 middleware + example**: `zigmodu.web4.middleware` — `x402Middleware` (no proof → 402 + invoice, invalid → 403, valid → pass; fail-closed default verifier, optional per-route `path_prefix` + `on_invoice` pricing hook) and `didAuthMiddleware` (did:key signature verification → writes `did` / `user_id` attrs; per-route `path_prefix`). New `examples/web4` demonstrates both flows end-to-end (402→200 with proof, 401→200 with a generated did:key signature), `docs/WEB4.md` documents protocol + wiring + security defaults. Added to CI example builds.
+- **Web4 middleware + example**: `zmodu.web4.middleware` — `x402Middleware` (no proof → 402 + invoice, invalid → 403, valid → pass; fail-closed default verifier, optional per-route `path_prefix` + `on_invoice` pricing hook) and `didAuthMiddleware` (did:key signature verification → writes `did` / `user_id` attrs; per-route `path_prefix`). New `examples/web4` demonstrates both flows end-to-end (402→200 with proof, 401→200 with a generated did:key signature), `docs/WEB4.md` documents protocol + wiring + security defaults. Added to CI example builds.
 - **LLM policy real-chain fixes**: `llmJson` now deep-copies the parsed response out of the parser arena before returning (callers `freeValue` it safely — previously the arena-resident tree caused invalid frees; only fake `json_fn` tests exercised that path until now). Added an end-to-end test that drives `llmApprove` through a real loopback mock OpenAI endpoint (provider.chat → llmJson → decision), plus fixed a dangling-pointer in `examples/llm-policies` (provider/http moved to function scope). Verified live against DeepSeek: llmApprove/llmRiskDecide/llmDiagnose/llmVerify all return real model decisions.
-- **Write-operation AI skills (P1 落地)**: `zigmodu.ai.actions` — `entity.create/update` (whitelisted writable columns via `EntitySpec.writable`, tenant column forced from `SkillContext.tenant_id` and rejected from the model, PK forbidden, permission `entity:write`), `command.execute` (app-registered commands via the transactional outbox, idempotency key = `SkillContext.run_id`, permission `command:execute`) and `report.generate` (app-registered aggregations → CSV/JSON, row-capped). Closes the "AI 只读 → AI 可执行" gap; `EntitySpec` gains a `writable` field (backward compatible).
+- **Write-operation AI skills (P1 落地)**: `zmodu.ai.actions` — `entity.create/update` (whitelisted writable columns via `EntitySpec.writable`, tenant column forced from `SkillContext.tenant_id` and rejected from the model, PK forbidden, permission `entity:write`), `command.execute` (app-registered commands via the transactional outbox, idempotency key = `SkillContext.run_id`, permission `command:execute`) and `report.generate` (app-registered aggregations → CSV/JSON, row-capped). Closes the "AI 只读 → AI 可执行" gap; `EntitySpec` gains a `writable` field (backward compatible).
 - **Dead-code analyzer fixes (`zmodu deadcode`)**: fixed two false-positive roots in the zdeadcode reference resolver — (1) a `test "name"` whose name equals a function name shadowed the function in `name_map`, so references resolved to the (already-live) test and the function was reported dead; (2) container members (enum variants/fields/methods) shadowed same-named top-level declarations (e.g. `const deadcode = @import(...)` + `enum { deadcode }`). Members no longer overwrite top-level names; both cases have regression tests. Also fixed an arena leak in the CLI adapter and wired the analyzer's own unit tests (analyze + scanner) into `zig build test` (was previously only compiled, not run). Repo scan dropped from 45 to 39 findings (0.4%), with the remaining items genuine unused imports/functions plus layout field `WALEntryHeader._pad` (kept).
 - **Dead-code checker (`zmodu deadcode`)**: integrated the zdeadcode analyzer (rustc `dead_code`-style reachability: unused top-level fns/consts/vars, container fields, enum variants, methods, never-imported modules; `.gitignore`-aware scanning; human + JSON output; exit code 0/1/2 for CI). Its unit tests ship with the zmodu CLI test suite (framework suite now 825/843). CI adds a deadcode smoke asserting detection + valid JSON.
 
@@ -13259,47 +13278,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **AI hardening pass**: (1) `Agent.audit_store` — standalone agent runs now persist to `RunAuditStore` (kind=agent, status/steps/duration), closing the durable-audit gap next to workflow runs; (2) `Tool.required_permission` + `SkillContext.permissions` — dispatch refuses with `error.PermissionDenied` when the tool's required permission is not granted; `approval.request` now requires `approval:decide`; (3) `skill_export.toOpenApi` gains optional bearer security (`OpenApiOpts.security_scheme` → components.securitySchemes + per-operation security); (4) barrel integrity test asserts the public `ai.*` API surface and caught a missing `ai.schedule` export (fixed); (5) docs synced — `docs/AI_SKILLS.md` now lists implemented business skills (kpi.query / approval.request / notification.send) vs planned ones, `docs/AI.md` reflects the removed `TaskScheduler`; (6) CI adds a `zmodu ai export-skills + openapi` smoke test asserting valid JSON.
-- **AI skill registry → OpenAPI + CLI**: `zigmodu.ai.skill_export` renders a `SkillRegistry` as a JSON catalog (`toSkillsJson`) or an OpenAPI 3.0 document (`toOpenApi`, one `POST /skills/{name}` per skill with schema derived from parameters). `zmodu ai export-skills --out` writes the built-in catalog and `zmodu ai openapi --in/--out` converts any catalog (built-in or app-exported) to OpenAPI. tenant-ai serves both at `GET /api/ai/skills` / `GET /api/ai/skills/openapi` (verified live).
+- **AI skill registry → OpenAPI + CLI**: `zmodu.ai.skill_export` renders a `SkillRegistry` as a JSON catalog (`toSkillsJson`) or an OpenAPI 3.0 document (`toOpenApi`, one `POST /skills/{name}` per skill with schema derived from parameters). `zmodu ai export-skills --out` writes the built-in catalog and `zmodu ai openapi --in/--out` converts any catalog (built-in or app-exported) to OpenAPI. tenant-ai serves both at `GET /api/ai/skills` / `GET /api/ai/skills/openapi` (verified live).
 - **LLM policy wiring guide + example**: new `docs/LLM_POLICIES.md` walks through wiring a real `AiProvider` into `llmApprove` / `llmRiskDecide` / `llmDiagnose` / `llmVerify` (LlmPolicyCtx, RAG, json_fn testing, behavior contract), with a companion runnable `examples/llm-policies` (real-model mode via env vars, fake-json fallback so tests stay network-free). Fixed `llmDiagnose` summary parsing (missing `.string`) surfaced by the example, with a regression test. Added to CI example builds.
-- **Durable AI run audit**: `zigmodu.ai.run_audit.RunAuditStore` persists one row per workflow/agent/approval run (run_id, kind, status, tenant, steps, duration); attached via `Workflow.audit`, run/resume record automatically. `list(kind, tenant, limit)` filters history; tenant-ai serves it at `GET /api/ai/runs` (tenant-isolated, verified live). `zigmodu.Time` exported from the barrel.
-- **AI observability aggregation**: `zigmodu.ai.observability.AiMetrics` merges `WorkflowMetrics` + `AgentMetrics` + `TokenQuota` into one Prometheus document (attach pointers + labels) for a single `/metrics` endpoint; tenant-ai serves it at `GET /api/ai/metrics` (verified live alongside workflow runs).
+- **Durable AI run audit**: `zmodu.ai.run_audit.RunAuditStore` persists one row per workflow/agent/approval run (run_id, kind, status, tenant, steps, duration); attached via `Workflow.audit`, run/resume record automatically. `list(kind, tenant, limit)` filters history; tenant-ai serves it at `GET /api/ai/runs` (tenant-isolated, verified live). `zmodu.Time` exported from the barrel.
+- **AI observability aggregation**: `zmodu.ai.observability.AiMetrics` merges `WorkflowMetrics` + `AgentMetrics` + `TokenQuota` into one Prometheus document (attach pointers + labels) for a single `/metrics` endpoint; tenant-ai serves it at `GET /api/ai/metrics` (verified live alongside workflow runs).
 - **tenant-ai example extended**: workflow endpoints now carry `WorkflowMetrics` and a `GET /api/ai/workflow/graph` Mermaid export of the step pipeline (incl. the approval gate); `ai.WorkflowMetrics` re-exported from the barrel. Verified live.
 - **Approval skill bridge**: `registerApprovalRequestSkills` exposes `approval.request` (subject + amount; chain + policy app-registered) so an Agent inside a workflow `.agent` step can submit approvals directly; the escalated run lands in the queue and `resumeRun` continues after the human decides.
 - **Workflow graph export**: `Workflow.toMermaid` renders the step graph as a Mermaid `flowchart` — implicit order edges for linear runs, dependency edges for DAG runs, nodes annotated with their kind (llm/skill/agent/approval). Tests cover both layouts.
-- **LLM-backed workflow verification**: `zigmodu.ai.llm.llmVerify` implements `VerifyFn` for `Workflow.reflection` — the model judges whether the final output meets the goal (`{"pass":...}`); failures and malformed responses conservatively return `false` (re-run / escalate). Tests cover pass, fail and provider-error paths.
+- **LLM-backed workflow verification**: `zmodu.ai.llm.llmVerify` implements `VerifyFn` for `Workflow.reflection` — the model judges whether the final output meets the goal (`{"pass":...}`); failures and malformed responses conservatively return `false` (re-run / escalate). Tests cover pass, fail and provider-error paths.
 - **Workflow approval gate resume lifecycle**: end-to-end test proving run → `.pending_human` (gate persisted to WAL) → human approves → `resumeRun` continues from the persisted gate and finishes the remaining steps — the human decision is not re-submitted on resume.
 - **Workflow approval gate (human-in-the-loop)**: new `.approval` step kind (`{ subject, amount }`) driven by `Workflow.approval_flow` — approved continues, rejected fails the step, escalated stops the run with a new `.pending_human` status so the app can hand the queue to a human and `resumeRun` afterwards (the gate re-runs under the same policy). Test covers both approved → completed and escalated → pending_human.
-- **Workflow observability**: `zigmodu.ai.WorkflowMetrics` attaches to `Workflow.metrics` and accumulates `runs` / `completed_steps` / `failed_steps` / `escalations` / `reviews` (reflection re-runs) on every run/resume — including DAG waves; `toPrometheusFormat` exports `zigmodu_ai_workflow_*` counters alongside `AgentMetrics` and `TokenQuota`.
+- **Workflow observability**: `zmodu.ai.WorkflowMetrics` attaches to `Workflow.metrics` and accumulates `runs` / `completed_steps` / `failed_steps` / `escalations` / `reviews` (reflection re-runs) on every run/resume — including DAG waves; `toPrometheusFormat` exports `zigmodu_ai_workflow_*` counters alongside `AgentMetrics` and `TokenQuota`.
 - **Multi-tenant AI example**: `examples/tenant-ai` — two tenants share one app with tenant-scoped AI operations: per-tenant KPI (`kpi.query`), business reports, alert rules, an approval chain with a `PersistentApprovalQueue` that carries `tenant_id` (tenants cannot see or resolve each other's pending items), and a workflow running the registered skills. `ApprovalApi` + `PersistentApprovalQueue` gained optional tenant scoping (`listPending`/`resolve`/`count` take `?i64`); `ai.freeValue` is now exported from the barrel. Added to CI example builds.
 - **AI orchestration P2 (RAG context for LLM policies)**: `LlmPolicyCtx` accepts an optional `retriever` + `retrieval_query`; `buildContext` injects top-k retrieved chunks (policies / history / playbooks) into the `llmDiagnose` / `llmApprove` / `llmRiskDecide` prompts so decisions are grounded in business context. Test: keyword retriever chunk appears in the approval prompt and drives the outcome.
-- **AI orchestration P2 (persistent approval queue)**: `zigmodu.ai.approval_store.PersistentApprovalQueue` — SQL-backed human approval queue with the same interface as the in-memory one (`push` / `listPending` / `resolve` / `count`, `migrate()` DDL) and a `queuedEscalationPersistent` hook. `ApprovalApi` is now generic over the queue type, so both in-memory and persistent queues mount into the ComptimeRouter unchanged.
-- **AI orchestration P2 (outbox→workflow bridge)**: `zigmodu.ai.bridge.OutboxWorkflowBridge` routes outbox entries (exact or prefix topic) into `ai.trigger.fire(input)` — cron / in-process fire / outbox events are now three unified trigger sources; run outcomes flow back through the trigger's outbox writeback.
-- **AI orchestration P2 (human approval queue + HTTP API)**: `zigmodu.ai.approval_api` — `ApprovalQueue` (thread-safe in-memory queue), `queuedEscalation` hook for `ApprovalFlow.on_escalated`, and an `ApprovalApi` ComptimeRouter module exposing `GET /approvals/pending`, `POST /approvals/{id}/approve`, `POST /approvals/{id}/reject` (`approval:decide` permission).
-- **AI orchestration P2 (LLM default policies)**: `zigmodu.ai.llm` provides `llmDiagnose` / `llmApprove` / `llmRiskDecide` — LLM-backed callbacks for DiagnosisFlow / ApprovalFlow / RiskReview via `LlmPolicyCtx` (`provider` + injectable `json_fn` + `system_hint`); model failures or malformed JSON fall back to escalate (never silently approve). `ApprovalFlow` gains an `on_escalated` hook (+ `escalated_userdata`).
+- **AI orchestration P2 (persistent approval queue)**: `zmodu.ai.approval_store.PersistentApprovalQueue` — SQL-backed human approval queue with the same interface as the in-memory one (`push` / `listPending` / `resolve` / `count`, `migrate()` DDL) and a `queuedEscalationPersistent` hook. `ApprovalApi` is now generic over the queue type, so both in-memory and persistent queues mount into the ComptimeRouter unchanged.
+- **AI orchestration P2 (outbox→workflow bridge)**: `zmodu.ai.bridge.OutboxWorkflowBridge` routes outbox entries (exact or prefix topic) into `ai.trigger.fire(input)` — cron / in-process fire / outbox events are now three unified trigger sources; run outcomes flow back through the trigger's outbox writeback.
+- **AI orchestration P2 (human approval queue + HTTP API)**: `zmodu.ai.approval_api` — `ApprovalQueue` (thread-safe in-memory queue), `queuedEscalation` hook for `ApprovalFlow.on_escalated`, and an `ApprovalApi` ComptimeRouter module exposing `GET /approvals/pending`, `POST /approvals/{id}/approve`, `POST /approvals/{id}/reject` (`approval:decide` permission).
+- **AI orchestration P2 (LLM default policies)**: `zmodu.ai.llm` provides `llmDiagnose` / `llmApprove` / `llmRiskDecide` — LLM-backed callbacks for DiagnosisFlow / ApprovalFlow / RiskReview via `LlmPolicyCtx` (`provider` + injectable `json_fn` + `system_hint`); model failures or malformed JSON fall back to escalate (never silently approve). `ApprovalFlow` gains an `on_escalated` hook (+ `escalated_userdata`).
 - **End-to-end AI ops example**: `examples/ai-ops` chains the built-in business tools into one runnable pipeline — `BusinessAlert` detect → `DiagnosisFlow` diagnose → `ApprovalFlow` approve (auto-approve small / escalate large) → `NotificationHub` notify → `OutboxConsumer` audit; `zig build run` prints the trace and `zig build test` asserts every stage. Added to CI example builds and the examples README.
-- **Built-in business tool (P1, anomaly diagnosis)**: `zigmodu.ai.diagnose.DiagnosisFlow` takes a detected anomaly (from alerts/recon/sla/app code), gathers evidence via configured SQL queries and hands symptom + evidence to a `diagnose` callback (LLM or rule engine) producing likely causes + recommended actions; the result is written to the outbox (`ai.diagnose`) for audit/automation.
-- **Built-in business tool (P1, SLA tracker)**: `zigmodu.ai.sla.SlaTracker` tracks monotonic deadlines on business items (tickets/approvals/refunds); `check()` (cron-driven) fires a `warn` when an item enters the deadline window and a `breach` once past it — events go to an `on_sla` callback (e.g. route into `ai.notify`) and the outbox (`ai.sla`) for audit/automation.
-- **Built-in business tool (P1, KPI metric queries)**: `zigmodu.ai.kpi` registers app-owned named metrics (name → SQL → value column); the `kpi.query` skill lets an Agent answer business questions like "本周营收多少" by name only, and a programmatic `Kpi.query` returns the metric value for dashboards/automation.
-- **Outbox read side (consumer)**: `zigmodu.outbox.OutboxConsumer` polls pending entries (optional topic filter), dispatches to a registered handler (`userdata` + `call`; topic/payload handed over as call-scoped copies) and advances the lifecycle pending → processing → delivered, with `retry_count++` + `error_message` on failure and failed/DLQ after retries are exhausted. Closes the loop for the AI business-tool outbox writebacks (`ai.approval` / `ai.recon` / `ai.notify` / `ai.risk` / `ai.alert`).
-- **Built-in business tool (P1, notification hub)**: `zigmodu.ai.notify.NotificationHub` delivers a message to named channels — webhook (via `HttpClient`, HTTP 2xx counts as delivered), custom sink (email/IM/in-app callback with `userdata`+`call`) or durable outbox fallback (`ai.notify`) when no channel matches; delivery failures propagate, nothing is silently dropped. `registerNotifySkills` exposes the `notification.send` skill bridge (LLM supplies channel/title/body; channel targets stay app-registered with an optional allowlist).
-- **Built-in business tool (P1, approval chain)**: `zigmodu.ai.approval.ApprovalFlow` runs a request through a configured multi-level chain — each step is decided by a `policy` callback (LLM/RBAC/rule engine) as approved / escalated / rejected, stopping on first rejection or human escalation; every step + a final event is written to the transactional outbox (`ai.approval`). `registerApprovalSkills` exposes the `approval.submit` skill bridge (LLM supplies subject/amount/request only; chain + policy stay app-registered; safe default policy escalates to a human).
-- **Built-in business tools (P1, risk + recon)**: `zigmodu.ai.risk.RiskReview` scores a subject via configurable SQL rules → level (low/medium/high) → decision (approve/escalate/reject, `DecideFn` hook for LLM/policy) → outbox writeback (`ai.risk`); `zigmodu.ai.recon.ReconCheck` compares source/target SQL snapshots by key (missing / extra / mismatch), fires per-diff `on_diff`, writes a CLEAN/DRIFT summary to the outbox (`ai.recon`) and renders a Markdown diff report (`renderReport`).
-- **Built-in business tool (P1, refund with compensation)**: `zigmodu.ai.refund.RefundFlow` validates → approves → executes a refund as a transactional outbox command → notifies; notify failure auto-emits the compensation command (`refund.reverse`), plus app-initiated `compensate()`.
-- **Built-in business tool (P1, ticket triage)**: `zigmodu.ai.ticket.TicketFlow` loads customer/order context, classifies, drafts a reply, runs an approval/send gate (`on_send`) and writes the outcome to the outbox.
-- **Built-in business tools (P0)**: `zigmodu.ai.reporter.BusinessReporter` renders configured SQL queries as a Markdown report (cron + outbox = scheduled delivery); `zigmodu.ai.alerts.BusinessAlert` runs SQL rules and alerts (callback + outbox writeback) on any violation row.
+- **Built-in business tool (P1, anomaly diagnosis)**: `zmodu.ai.diagnose.DiagnosisFlow` takes a detected anomaly (from alerts/recon/sla/app code), gathers evidence via configured SQL queries and hands symptom + evidence to a `diagnose` callback (LLM or rule engine) producing likely causes + recommended actions; the result is written to the outbox (`ai.diagnose`) for audit/automation.
+- **Built-in business tool (P1, SLA tracker)**: `zmodu.ai.sla.SlaTracker` tracks monotonic deadlines on business items (tickets/approvals/refunds); `check()` (cron-driven) fires a `warn` when an item enters the deadline window and a `breach` once past it — events go to an `on_sla` callback (e.g. route into `ai.notify`) and the outbox (`ai.sla`) for audit/automation.
+- **Built-in business tool (P1, KPI metric queries)**: `zmodu.ai.kpi` registers app-owned named metrics (name → SQL → value column); the `kpi.query` skill lets an Agent answer business questions like "本周营收多少" by name only, and a programmatic `Kpi.query` returns the metric value for dashboards/automation.
+- **Outbox read side (consumer)**: `zmodu.outbox.OutboxConsumer` polls pending entries (optional topic filter), dispatches to a registered handler (`userdata` + `call`; topic/payload handed over as call-scoped copies) and advances the lifecycle pending → processing → delivered, with `retry_count++` + `error_message` on failure and failed/DLQ after retries are exhausted. Closes the loop for the AI business-tool outbox writebacks (`ai.approval` / `ai.recon` / `ai.notify` / `ai.risk` / `ai.alert`).
+- **Built-in business tool (P1, notification hub)**: `zmodu.ai.notify.NotificationHub` delivers a message to named channels — webhook (via `HttpClient`, HTTP 2xx counts as delivered), custom sink (email/IM/in-app callback with `userdata`+`call`) or durable outbox fallback (`ai.notify`) when no channel matches; delivery failures propagate, nothing is silently dropped. `registerNotifySkills` exposes the `notification.send` skill bridge (LLM supplies channel/title/body; channel targets stay app-registered with an optional allowlist).
+- **Built-in business tool (P1, approval chain)**: `zmodu.ai.approval.ApprovalFlow` runs a request through a configured multi-level chain — each step is decided by a `policy` callback (LLM/RBAC/rule engine) as approved / escalated / rejected, stopping on first rejection or human escalation; every step + a final event is written to the transactional outbox (`ai.approval`). `registerApprovalSkills` exposes the `approval.submit` skill bridge (LLM supplies subject/amount/request only; chain + policy stay app-registered; safe default policy escalates to a human).
+- **Built-in business tools (P1, risk + recon)**: `zmodu.ai.risk.RiskReview` scores a subject via configurable SQL rules → level (low/medium/high) → decision (approve/escalate/reject, `DecideFn` hook for LLM/policy) → outbox writeback (`ai.risk`); `zmodu.ai.recon.ReconCheck` compares source/target SQL snapshots by key (missing / extra / mismatch), fires per-diff `on_diff`, writes a CLEAN/DRIFT summary to the outbox (`ai.recon`) and renders a Markdown diff report (`renderReport`).
+- **Built-in business tool (P1, refund with compensation)**: `zmodu.ai.refund.RefundFlow` validates → approves → executes a refund as a transactional outbox command → notifies; notify failure auto-emits the compensation command (`refund.reverse`), plus app-initiated `compensate()`.
+- **Built-in business tool (P1, ticket triage)**: `zmodu.ai.ticket.TicketFlow` loads customer/order context, classifies, drafts a reply, runs an approval/send gate (`on_send`) and writes the outcome to the outbox.
+- **Built-in business tools (P0)**: `zmodu.ai.reporter.BusinessReporter` renders configured SQL queries as a Markdown report (cron + outbox = scheduled delivery); `zmodu.ai.alerts.BusinessAlert` runs SQL rules and alerts (callback + outbox writeback) on any violation row.
 - **Workflow linear ↔ DAG hybrid**: steps can declare `depends_on`; when any step has dependencies the runner switches to dependency-aware parallel waves (`max_parallel` via `std.Io.Group`) with cycle detection (`error.CyclicDependency`). Budget, WAL persistence, retry and escalation apply in DAG mode too; reflection stays on the linear final step.
-- **AI orchestration P2 (runtime control)**: `zigmodu.ai.AgentHandle` cooperative cancel / pause / step progress (checked at step boundaries; `canceled` flag + metric); `Agent.tracer` + `parent_span` create a run-level span via `DistributedTracer`.
-- **AI orchestration P2 (context management)**: `zigmodu.ai.context` auto-compacts long conversations by token threshold — older messages are summarized (via `SummarizeFn`) or dropped, prepended as a system message, keeping a recent window; wired into `Agent` (`Agent.context`, checked each loop iteration).
-- **AI orchestration P1 (hierarchical)**: `zigmodu.ai.hierarchy` planner → concurrent executor (`std.Io.Group`, `max_parallel` waves) → aggregation; partial failures surface as `.partial_failed`. Planner/executor are callbacks wireable to `Agent`/`Workflow`.
-- **AI orchestration P1 (AgentTrigger)**: `zigmodu.ai.trigger` unifies cron / event / webhook sources into `fire(input)` + `registerCron`; optional transactional-outbox writeback of `{run_id, ok, message}` when an `OutboxPublisher` + SQL backend are configured.
+- **AI orchestration P2 (runtime control)**: `zmodu.ai.AgentHandle` cooperative cancel / pause / step progress (checked at step boundaries; `canceled` flag + metric); `Agent.tracer` + `parent_span` create a run-level span via `DistributedTracer`.
+- **AI orchestration P2 (context management)**: `zmodu.ai.context` auto-compacts long conversations by token threshold — older messages are summarized (via `SummarizeFn`) or dropped, prepended as a system message, keeping a recent window; wired into `Agent` (`Agent.context`, checked each loop iteration).
+- **AI orchestration P1 (hierarchical)**: `zmodu.ai.hierarchy` planner → concurrent executor (`std.Io.Group`, `max_parallel` waves) → aggregation; partial failures surface as `.partial_failed`. Planner/executor are callbacks wireable to `Agent`/`Workflow`.
+- **AI orchestration P1 (AgentTrigger)**: `zmodu.ai.trigger` unifies cron / event / webhook sources into `fire(input)` + `registerCron`; optional transactional-outbox writeback of `{run_id, ok, message}` when an `OutboxPublisher` + SQL backend are configured.
 - **AI orchestration P1 (WAL persistence + resume)**: `Workflow.wal` + `run_id` persist each step record to the WAL; `resumeRun(run_id)` replays completed steps and continues from the first unpersisted one (crash recovery / idempotent replay).
 - **AI orchestration P1 (reflection + escalation)**: `Workflow` gains a reflection quality gate (`VerifyFn` + `max_reviews` — re-runs the final step until verified) and a human-escalation hook (`on_escalate` on step failure after retries / budget exhaustion / persistent verification failure).
-- **AI orchestration (P0)**: `zigmodu.ai.workflow` linear multi-step runner (`.llm` / `.skill` / `.agent` steps, per-step records, retry, stop-on-failure, shared budget) and `zigmodu.ai.Budget` (hard token reservation per step; `.stop`/`.warn` modes; wired into `Agent` — `budget_exhausted` flag + metric). Plan + roadmap in `docs/AI_ORCHESTRATION.md`.
+- **AI orchestration (P0)**: `zmodu.ai.workflow` linear multi-step runner (`.llm` / `.skill` / `.agent` steps, per-step records, retry, stop-on-failure, shared budget) and `zmodu.ai.Budget` (hard token reservation per step; `.stop`/`.warn` modes; wired into `Agent` — `budget_exhausted` flag + metric). Plan + roadmap in `docs/AI_ORCHESTRATION.md`.
 - **sockread performance pass**: `readSome`/`readFull` drop the redundant `poll` (std.Io sockets are blocking, so a bare `read` already waits — syscall count halves); new `sockread.Reader` buffered reader collapses many small reads into one larger syscall, adopted by `WsFramer` frame parsing and the Kafka transport; new `sockread.writevAll` sends header+body in a single `writev` (adopted by `WsFramer.writeFrame`, `ClusterConnection.send`, Kafka `writeFrame`). HttpClient keeps its timeout `waitForReadable`.
-- **Built-in business AI skills (P0)**: `zigmodu.ai.business` registers `db.query` (read-only parameterized SELECT, row-capped, rejects literals/comments), `entity.lookup` / `entity.list` (app-registered entity whitelist, tenant-scoped when configured) via `SkillContext.backend_ptr`. Scheduler bridge completed with `list_jobs` / `cancel_job` (`ScheduleCtx` via `SkillContext.userdata`). New `ai.freeValue` defines result ownership (handlers dupe keys/strings; callers deep-free). Plan + roadmap in `docs/AI_SKILLS.md`.
+- **Built-in business AI skills (P0)**: `zmodu.ai.business` registers `db.query` (read-only parameterized SELECT, row-capped, rejects literals/comments), `entity.lookup` / `entity.list` (app-registered entity whitelist, tenant-scoped when configured) via `SkillContext.backend_ptr`. Scheduler bridge completed with `list_jobs` / `cancel_job` (`ScheduleCtx` via `SkillContext.userdata`). New `ai.freeValue` defines result ownership (handlers dupe keys/strings; callers deep-free). Plan + roadmap in `docs/AI_SKILLS.md`.
 - **Raw socket reads for all long-blocking io read paths**: new `core/sockread` helper (`readSome`/`readFull`/`writeFull`, `posix.poll` + `posix.read`/`write`) now backs the reads that wait for peer data — Redis responses (16 call sites), NATS reads (4), Kafka `readExact`, `DistributedEventBus` connection loop, `ClusterConnection.recv` (fixes partial-header reads) and `send` (loops on partial writes so frames are never split), and `HttpClient` `readResponse`/streaming body reads. Same class of fix as the fiber-mode WebSocket read: with the Threaded Io shared across threads, io-based socket reads can block forever even with data in the kernel buffer.
 - **Fiber-mode WebSocket read fixed**: `WsFramer.readFrame` / `WebSocketClient` reads now use raw `posix.poll + posix.read` instead of `io.operate(net_read)`. With the Threaded Io shared across the accept thread, worker fibers and clients, io-based socket reads block forever even when data is in the kernel buffer (reproduced: `poll` readable + `MSG_PEEK` shows bytes, `readv` hangs) — so WS client→server frames, ping/close handling and `on_close` never fired. Writes were unaffected. Added an end-to-end regression test (handshake → masked frame → `on_message` → client close → `on_close`).
-- **AI ⇄ cron 薄桥**: `Cron.Scheduler` fixed — the background loop now ticks periodically (`std.Io.sleep`), `addJob` is thread-safe (mutex + name copy) with public `tick()` for deterministic scheduling; `every` is a blocking one-shot helper. New `zigmodu.ai.registerScheduleSkills` exposes `list_schedulable_tasks` / `schedule_job` tools so an Agent can attach pre-registered named tasks to cron expressions (LLM never supplies code). `ScheduledTask.TaskScheduler` marked deprecated (never looped; placeholder next-run math) for removal in v1.0.
+- **AI ⇄ cron 薄桥**: `Cron.Scheduler` fixed — the background loop now ticks periodically (`std.Io.sleep`), `addJob` is thread-safe (mutex + name copy) with public `tick()` for deterministic scheduling; `every` is a blocking one-shot helper. New `zmodu.ai.registerScheduleSkills` exposes `list_schedulable_tasks` / `schedule_job` tools so an Agent can attach pre-registered named tasks to cron expressions (LLM never supplies code). `ScheduledTask.TaskScheduler` marked deprecated (never looped; placeholder next-run math) for removal in v1.0.
 - **`HttpClient` pure-HTTP path fixed**: the buffered request writer was never flushed, so the request never reached the peer and `request()` deadlocked in a plain `main` (misdiagnosed earlier as an event-loop dependency). `executeRequest` now flushes after writing headers/body. `timeout_ms` (previously stored but unused) is now honored via `posix.poll` in `readResponse` (`error.Timeout` on a stalled peer). Added loopback end-to-end tests: live request round-trip and stalled-peer timeout.
 - **`ctx.header()` is now case-insensitive** (RFC 9110): mixed-case lookups like `"User-Agent"` or `"X-Tenant-ID"` resolve to the lowercased parse-time keys. Fixes latent null-header bugs in `AccessLog`, `middleware/Validation`, and the tenant-mgmt example.
 - **Postgres `?N` placeholder bug fixed**: `convertPlaceholders` now consumes sqlite-style `?N` digits so `?1` maps to `$1` (previously `$11`, SQLSTATE 42P18), numbers placeholders sequentially, and skips `?` inside quoted strings/identifiers and `--`/`/* */` comments. Added unit tests covering `?`, `?N`, mixed forms, `?12`, literals and comments.
@@ -13309,17 +13328,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`HttpClient.ConnectionPool` tests now use a real loopback listener** instead of always skipping on `ConnectionRefused` to port 9999.
 - **Network-dependent tests skip gracefully** in sandboxed/restricted environments via `src/test/NetworkProbe.zig` (raw-syscall probe) instead of crashing the whole test binary with `errnoBug` on `EPERM`.
 - **CI hardening**: `ZIG_VERSION` pinned to `0.17.0-dev.1422+e863bf3be`; `zig fmt --check` now covers `src tools examples`; new `examples` job builds all nine examples (incl. `zent-modulith` with a sibling `zent` checkout); `test-live-services` adds a real Kafka broker (`apache/kafka:3.7.2` KRaft) via `KAFKA_BOOTSTRAP`.
-- **Module test helpers are public API**: `zigmodu.ModuleTestContext` and `zigmodu.createMockModule` exported from `root.zig` (consistent with `IntegrationTest`/`Benchmark`/`ContractTest`); `examples/testing` updated off the deprecated `zigmodu.extensions` namespace.
+- **Module test helpers are public API**: `zmodu.ModuleTestContext` and `zmodu.createMockModule` exported from `root.zig` (consistent with `IntegrationTest`/`Benchmark`/`ContractTest`); `examples/testing` updated off the deprecated `zmodu.extensions` namespace.
 - **Repo hygiene**: tracked `wal_test`/`wal_test2` artifacts removed; `.gitignore` covers `wal_test*` and `.codegraph/`.
 
 ### Added
 - **WebSocket binary frames**: `on_message` receives text (0x1) **and** binary (0x2) with `WsFrameKind`; fiber + io_uring paths; `WsFramer.writeBinary` / `writeData`. Unblocks OpenIM-style protobuf over WS. **Breaking**: `WsMessageFn` gains `kind` parameter.
-- **Selective SQL driver linking**: `-Ddb=all|sqlite|postgres|mysql` (comma-list) via `examples/_shared/db_link.zig`; `build_options.enable_*`; disabled drivers use C stubs (no link) and `Client.connect` returns `error.DriverNotEnabled` (also in `ZigModuError`, HTTP 400). Package consumers: `b.dependency("zigmodu", .{ .db = "sqlite" })`. Scaffold/`--from-db` maps DSN → `.db=`. Framework `zig build test` keeps default `all`; CI integration builds use `-Ddb=sqlite`. Guide: [`docs/SQLX_DRIVERS.md`](docs/SQLX_DRIVERS.md).
+- **Selective SQL driver linking**: `-Ddb=all|sqlite|postgres|mysql` (comma-list) via `examples/_shared/db_link.zig`; `build_options.enable_*`; disabled drivers use C stubs (no link) and `Client.connect` returns `error.DriverNotEnabled` (also in `ZmoduError`, HTTP 400). Package consumers: `b.dependency("zmodu", .{ .db = "sqlite" })`. Scaffold/`--from-db` maps DSN → `.db=`. Framework `zig build test` keeps default `all`; CI integration builds use `-Ddb=sqlite`. Guide: [`docs/SQLX_DRIVERS.md`](docs/SQLX_DRIVERS.md).
 
 ### Added
 - **zent support — shared helper for examples**: `examples/_shared/zent_helpers.zig` provides `StoreEnv(Driver, Infos).open / inMemory / openWith` (RAII wrapper that replaces the open-driver + migrate + make-client dance) and `TestEnv(schemas).init / reset / deinit` (per-test in-memory SQLite with fresh migrations). Both `examples/zent-modulith/` and `examples/shopdemo-zent/` now use it; `examples/_shared/build.zig` runs the helper's own tests.
-- **zent docs extended**: `docs/ZENT.md` adds `§6.1 Testing` (TestEnv pattern), `§6.2 Production: ConnPool` (production driver wrapping), `§6.3 Observability` (zent `sql_logger` → ZigModu logger adapter), and `§6.4 Transactions` (beginTx + savepoint). Shared helper callout at the top.
-- **`examples/shopdemo-zent` runnable**: parallel of `examples/shopdemo/` using `zent` (ent-style schema-as-code ORM) instead of `zigmodu.data.sqlx`. Single `order` module with `Order` + `OrderItem` zent Schemas, `OrderStore` persistence, `OrderService` validation, and `OrderApi` exposing `POST/GET /api/v1/orders` plus `POST /api/v1/orders/{order_no}/items`. Demonstrates `docs/ZENT.md`'s orthogonal data-stack rule: each module picks one driver and does not mix or share transactions.
+- **zent docs extended**: `docs/ZENT.md` adds `§6.1 Testing` (TestEnv pattern), `§6.2 Production: ConnPool` (production driver wrapping), `§6.3 Observability` (zent `sql_logger` → zmodu logger adapter), and `§6.4 Transactions` (beginTx + savepoint). Shared helper callout at the top.
+- **`examples/shopdemo-zent` runnable**: parallel of `examples/shopdemo/` using `zent` (ent-style schema-as-code ORM) instead of `zmodu.data.sqlx`. Single `order` module with `Order` + `OrderItem` zent Schemas, `OrderStore` persistence, `OrderService` validation, and `OrderApi` exposing `POST/GET /api/v1/orders` plus `POST /api/v1/orders/{order_no}/items`. Demonstrates `docs/ZENT.md`'s orthogonal data-stack rule: each module picks one driver and does not mix or share transactions.
 - **Completeness Phase 3 — distributed event bus wiring**: `DistributedEventBus` now actually routes through `Partitioner.route(topic)`, captures send failures in `DLQ` after `max_send_failures` threshold, drains DLQ via a retry fiber, and exposes `connectToNode` / `nodeId` / `clusterSize` for membership integration. `WAL.readFrom` is implemented so `replayFromWal` and `restoreFromWal` actually recover uncommitted entries. `ClusterMembership` keeps the partitioner ring in sync on join / leave / failure.
 - **SQLx MySQL binary protocol hardening**: `mysqlFetchStringColumn` re-reads oversized values via `mysql_stmt_fetch_column` instead of silently truncating; `mysqlParseDecimal` / `mysqlParseDateTime` / `mysqlParseJson` validate input strictly (negative TIME allowed, fractional seconds `.[0-9]{1,6}`, JSON via `std.json.parseFromSlice`).
 - **`examples/shopdemo` runnable**: `build.zig` / `build.zig.zon` / `src/main.zig` / `src/db/*` added; the single `order` module from `generated-sample/` is migrated with API compatibility fixes; `zig build run` starts the app and `GET /api/v1/orders` returns 200.
@@ -13340,14 +13359,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SSE Server lifecycle**: `http.sse` / `markSseResponse` sets `ctx.streaming` so Server does not double-`writeResponse` after the handler; `lastEventId(ctx)`; multiline `data:` splitting; `sendRetry` write-buffer alias fix.
 
 ### Added
-- **zigmodu.ai Agent P0/P1**: `AiProvider.chatWith` + `tool_calls` parse; `SkillRegistry.toOpenAiFunctionsAlloc` / `dispatchAllowed` / `validateArgs`; first-class `ai.Agent` ReAct loop + `AgentHooks`/`AgentMetrics`; `chatStream` buffered shim; `MemoryStore` composite tenant/user keys + `dumpJson`/`loadJson`.
-- **zigmodu.ai skill timeout skeleton**: `Tool.timeout_ms`, `SkillContext.deadline_ms` / `expired` / `checkDeadline`, `dispatchWith` → `error.ToolTimeout` (cooperative; not preemptive).
+- **zmodu.ai Agent P0/P1**: `AiProvider.chatWith` + `tool_calls` parse; `SkillRegistry.toOpenAiFunctionsAlloc` / `dispatchAllowed` / `validateArgs`; first-class `ai.Agent` ReAct loop + `AgentHooks`/`AgentMetrics`; `chatStream` buffered shim; `MemoryStore` composite tenant/user keys + `dumpJson`/`loadJson`.
+- **zmodu.ai skill timeout skeleton**: `Tool.timeout_ms`, `SkillContext.deadline_ms` / `expired` / `checkDeadline`, `dispatchWith` → `error.ToolTimeout` (cooperative; not preemptive).
 - **HttpClient.requestStream + AiProvider SSE chatStream**: chunked/content-length/EOF body streaming; OpenAI `data:` delta parse with buffered fallback.
 - **MemoryStore file persistence + Agent tool timeout**: `saveToFile`/`loadFromFile`; `Agent.tool_timeout_ms` via `dispatchWith`.
 - **HttpClient request wire**: auto `Host` + `Content-Length`; path+query; `https://` → `TlsNotSupported` (plain HTTP only, same posture as Vault/OTLP).
 - **AI observability / RAG hooks**: `AgentAuditLog`; `Retriever` + `KeywordRetriever`; `Metrics.toPrometheusFormat` for provider and agent.
 - **HttpClient HTTPS**: `https://` via `std.http.Client` (system CA, TLS 1.3); HTTPS `requestStream` incremental body read loop; finer transport errors (`TlsHandshakeFailed` / `DnsFailed` / `Timeout`).
-- **Agent HITL + RAG wire-up**: `hooks.on_tool_request` / `ToolApproval`; optional `retriever` merges context into system prompt; scaffold `--with-agent` uses core `zigmodu.ai.Agent` + `AiProvider`.
+- **Agent HITL + RAG wire-up**: `hooks.on_tool_request` / `ToolApproval`; optional `retriever` merges context into system prompt; scaffold `--with-agent` uses core `zmodu.ai.Agent` + `AiProvider`.
 - **AI stream tool_calls + quota**: `chatStream` accumulates streamed `delta.tool_calls`; `TokenQuota` per-tenant skeleton; scaffold `--with-aichat` uses `*AiProvider` + `chatStream` + shared quota; Agent scaffold persists `ai_agent_run`.
 - **AiProvider HTTP status mapping**: `AuthError` / `RateLimited` / `UpstreamError` / transport errors.
 ## [0.14.17] - 2026-07-31
@@ -13457,7 +13476,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`core/Time.zig`** — Centralized monotonic time utility using `clock_gettime(CLOCK_MONOTONIC)`. Replaces all hardcoded `const now = 0` throughout the codebase (16 occurrences across 10 files).
-- **`root.zig`** — Exports `time` module as `zigmodu.time`.
+- **`root.zig`** — Exports `time` module as `zmodu.time`.
 - **3 new tests** for Time.zig (monotonicity, positive values).
 
 ### Fixed

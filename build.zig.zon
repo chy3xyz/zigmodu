@@ -1,7 +1,7 @@
 .{
-    .name = .zigmodu,
+    .name = .zmodu,
     .version = "0.40.0",
-    .fingerprint = 0x7aa42d07b32f8d53,
+    .fingerprint = 0xde7987a02b121580,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{},
     // What a downstream `zig build` actually needs. Three of these were missing

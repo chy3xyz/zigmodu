@@ -53,7 +53,7 @@ node tools/zsaas/scripts/gen-business.mjs orders.model.json <saas-solidjs-dir>
 cd <saas-solidjs-dir> && npm run dev   # /dashboard/orders
 ```
 
-前端经 `src/libs/zmoduApi.ts` 的 `zmoduFetch` 调 zigmodu：请求带
+前端经 `src/libs/ZmoduApi.ts` 的 `ZmoduFetch` 调 zigmodu：请求带
 `Authorization: Bearer <token>`（dev 用 `ZMODU_API_TOKEN` 环境变量；生产由
 SolidStart 会话换发 zigmodu JWT），后端从 JWT 取 `tenant_id` 做行级隔离。
 
@@ -82,7 +82,7 @@ REST 契约：`GET /api/v1/<entity>?page&size` → `{code,items,total}`；
 
 ## 验证
 
-- `node tools/zsaas/scripts/check-gen.mjs` — 前端生成器自检（产物结构 + zmoduFetch 接线）；
+- `node tools/zsaas/scripts/check-gen.mjs` — 前端生成器自检（产物结构 + ZmoduFetch 接线）；
 - 生成的前端在真实 saas-solidjs 工程 `tsc --noEmit` 通过；
 - 生成的后端模块在真实 zigmodu 工程 `zig build test` 编译通过。
 

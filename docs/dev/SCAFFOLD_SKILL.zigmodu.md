@@ -1,6 +1,6 @@
-# ZigModu Framework Development
+# zmodu Framework Development
 
-使用 ZigModu 框架开发的最佳实践和模式。
+使用 zmodu 框架开发的最佳实践和模式。
 
 ---
 
@@ -18,8 +18,8 @@
     .fingerprint = 0x7aa42d07b32f8d53,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        .zigmodu = .{
-            .url = "https://github.com/chy3xyz/zigmodu/archive/refs/tags/v0.6.5.tar.gz",
+        .zmodu = .{
+            .url = "https://github.com/chy3xyz/zmodu/archive/refs/tags/v0.6.5.tar.gz",
             .hash = "1220xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
         },
     },
@@ -49,9 +49,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // 添加 zigmodu 依赖
-    const zigmodu_dep = b.dependency("zigmodu", .{});
-    exe.root_module.addImport("zigmodu", zigmodu_dep.module("zigmodu"));
+    // 添加 zmodu 依赖
+    const zmodu_dep = b.dependency("zmodu", .{});
+    exe.root_module.addImport("zmodu", zmodu_dep.module("zmodu"));
 
     b.installArtifact(exe);
 }
@@ -59,9 +59,9 @@ pub fn build(b: *std.Build) void {
 
 ### 4. 模块定义
 ```zig
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
-pub const info = zigmodu.api.Module{
+pub const info = zmodu.api.Module{
     .name = "mymodule",                    // 唯一模块名
     .description = "我的模块",
     .dependencies = &.{"dependency1"},    // 依赖作为字符串字面量数组
@@ -80,7 +80,7 @@ pub fn deinit() void {
 ### 5. 应用入口点
 ```zig
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 const mymodule = @import("mymodule.zig");
 
@@ -88,13 +88,13 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     
     // 必须的顺序：
-    var modules = try zigmodu.scanModules(allocator, .{ mymodule });
+    var modules = try zmodu.scanModules(allocator, .{ mymodule });
     defer modules.deinit();
     
-    try zigmodu.validateModules(&modules);
-    try zigmodu.generateDocs(&modules, "modules.puml", allocator);
-    try zigmodu.startAll(&modules);
-    defer zigmodu.stopAll(&modules);
+    try zmodu.validateModules(&modules);
+    try zmodu.generateDocs(&modules, "modules.puml", allocator);
+    try zmodu.startAll(&modules);
+    defer zmodu.stopAll(&modules);
 }
 ```
 
@@ -127,14 +127,14 @@ const OrderCreated = struct {
     total: f64,
 };
 
-var bus = zigmodu.EventBus(OrderCreated).init(allocator);
+var bus = zmodu.EventBus(OrderCreated).init(allocator);
 try bus.subscribe(handleOrderCreated);
 bus.publish(.{ .order_id = 123, .total = 99.99 });
 ```
 
 ### DI Container 使用
 ```zig
-var container = zigmodu.Container.init(allocator);
+var container = zmodu.Container.init(allocator);
 try container.register(Database, "db", &db);
 const db = container.get(Database, "db");
 ```

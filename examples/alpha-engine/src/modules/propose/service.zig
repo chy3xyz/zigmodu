@@ -25,7 +25,7 @@
 //! edge lives.
 
 const std = @import("std");
-const zmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 const ai = zmodu.ai;
 const data = zmodu.data;
 const c = @import("../../contracts.zig");

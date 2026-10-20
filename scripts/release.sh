@@ -42,7 +42,7 @@ create_github_release() {
     if bash scripts/release-notes.sh "$ver" > "$notes" && [ -s "$notes" ]; then
         if gh release create "v$ver" --verify-tag --notes-file "$notes"; then
             echo "release: GitHub Release v$ver created — the ci.yml release job now"
-            echo "  builds and attaches zigmodu-v$ver-linux-x86_64.tar.gz (+ .sha256)."
+            echo "  builds and attaches zmodu-v$ver-linux-x86_64.tar.gz (+ .sha256)."
         else
             echo "WARN: gh release create failed; create the release by hand:" >&2
             echo "  bash scripts/release-notes.sh $ver > /tmp/notes-v$ver.md" >&2
@@ -135,13 +135,13 @@ if [ "$SKIP_BUMP" != "1" ]; then
 perl -0pi -e "s/\.version = \"$OLD\"/.version = \"$VERSION\"/" build.zig.zon
 perl -0pi -e "s/\.version = \"$OLD\"/.version = \"$VERSION\"/" tools/zmodu/build.zig.zon
 perl -0pi -e "s/\"version\", \"$OLD\"/\"version\", \"$VERSION\"/" src/ai/mcp.zig
-perl -0pi -e "s/# ZigModu v$OLD/# ZigModu v$VERSION/" README.md README.zh.md
-perl -0pi -e "s/ZigModu \*\*v$OLD\*\*/ZigModu **v$VERSION**/" CLAUDE.md docs/dev/AI_METHODOLOGY.md
+perl -0pi -e "s/# zmodu v$OLD/# zmodu v$VERSION/" README.md README.zh.md
+perl -0pi -e "s/zmodu \*\*v$OLD\*\*/zmodu **v$VERSION**/" CLAUDE.md docs/dev/AI_METHODOLOGY.md
 perl -0pi -e "s/\*\*v$OLD\*\*/**v$VERSION**/g" AGENTS.md
 perl -0pi -e "s/\*\*框架版本\*\*: v$OLD/**框架版本**: v$VERSION/" docs/archive/status/EVALUATION_REPORT.md
-perl -0pi -e "s/ZigModu \*\*v$OLD\*\*/ZigModu **v$VERSION**/" docs/archive/status/EVALUATION_REPORT.md
+perl -0pi -e "s/zmodu \*\*v$OLD\*\*/zmodu **v$VERSION**/" docs/archive/status/EVALUATION_REPORT.md
 perl -0pi -e "s/\*\*版本口径\*\*: v$OLD/**版本口径**: v$VERSION/" docs/archive/status/PRODUCTION_ROADMAP.md
-perl -0pi -e "s/\*\*本文描述的版本\*\*：ZigModu v$OLD/**本文描述的版本**：ZigModu v$VERSION/" docs/guide/BEST_PRACTICES.md
+perl -0pi -e "s/\*\*本文描述的版本\*\*：zmodu v$OLD/**本文描述的版本**：zmodu v$VERSION/" docs/guide/BEST_PRACTICES.md
 fi
 
 # 2. CHANGELOG: promote Unreleased to the new version.
@@ -271,7 +271,7 @@ if [ "$PUSH" = "1" ]; then
 
     # 6. GitHub Release (skipped with --tag-only): publishing the release fires
     #    ci.yml's `release: published` trigger, so the docker + release jobs
-    #    build zigmodu-v$VERSION-linux-x86_64.tar.gz and its .sha256 companion
+    #    build zmodu-v$VERSION-linux-x86_64.tar.gz and its .sha256 companion
     #    and attach both. Tags are the frequent, pinnable artifact; the Release
     #    is the weekly announcement — cut it later for any existing tag with:
     #      bash scripts/release.sh --publish-release <x.y.z>

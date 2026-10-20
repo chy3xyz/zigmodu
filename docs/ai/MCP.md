@@ -1,13 +1,13 @@
 # SkillRegistry → MCP 桥
 
-把 zigmodu 的 AI 技能注册表暴露为 **Model Context Protocol** 工具——Claude /
+把 zmodu 的 AI 技能注册表暴露为 **Model Context Protocol** 工具——Claude /
 Codex 等 LLM 平台可直接通过 MCP 调用框架技能（`db.query`、`kpi.query`、
 `approval.request`、`entity.create`、`admin.*` 等）。
 
 ## 快速接入
 
 ```zig
-const ai = zigmodu.ai;
+const ai = zmodu.ai;
 
 // 1. 注册技能（业务/审批/KPI/管理…）
 var registry = ai.SkillRegistry.init(allocator, io);

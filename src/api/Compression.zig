@@ -1,6 +1,6 @@
 //! Opt-in **response compression** middleware (`Accept-Encoding: gzip` / `deflate`).
 //!
-//!   try server.addMiddleware(try zigmodu.http.compressionMiddleware(.{}));
+//!   try server.addMiddleware(try zmodu.http.compressionMiddleware(.{}));
 //!
 //! The middleware wraps the rest of the chain and re-encodes whatever the
 //! handler left in `ctx.response_body`. A response is encoded only when all of

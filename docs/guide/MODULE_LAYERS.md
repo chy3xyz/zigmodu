@@ -1,6 +1,6 @@
-# ZigModu 领域分层最佳实践（model / persistence / service）
+# zmodu 领域分层最佳实践（model / persistence / service）
 
-**适用**：ZigModu v0.14+ · Zig 0.17  
+**适用**：zmodu v0.14+ · Zig 0.17  
 **参考实现**：[`examples/tenant-shop/`](../../examples/tenant-shop/)（sqlx）；zent 栈见 [`examples/zent-modulith/`](../../examples/zent-modulith/) + [ZENT.md](../reference/ZENT.md)
 
 相关文档：
@@ -141,7 +141,7 @@ pub fn ProductService(comptime Persistence: type) type {
     return struct {
         persistence: Persistence,
         pub fn create(self: *@This(), tenant_id: i64, name: []const u8, price_cents: i64) !model.Product {
-            const now: i64 = @intCast(zigmodu.time.monotonicNowSeconds());
+            const now: i64 = @intCast(zmodu.time.monotonicNowSeconds());
             // 组装 model → persistence.insert → 填 id
         }
     };

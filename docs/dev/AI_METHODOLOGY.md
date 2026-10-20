@@ -1,8 +1,8 @@
-# ZigModu AI 编程方法论
+# zmodu AI 编程方法论
 
 > 基于 Spring Modulith 架构哲学 + Zig 编译期能力 + AI 协作实践
 >
-> 版本：1.1 | ZigModu **v0.40.0** | Zig **0.17.0**
+> 版本：1.1 | zmodu **v0.40.0** | Zig **0.17.0**
 >
 > **操作手册（写代码先读）**：仓库根目录 [`AGENTS.md`](../../AGENTS.md) — 文档地图、近期栈 DO/DON'T、ComptimeRouter / Path A 鉴权。  
 > 本文讲**为什么**；与 AGENTS / `ROUTE_TABLE` / `MODULE_LAYERS` 冲突时，以那三份为准。
@@ -28,7 +28,7 @@
 
 Spring Modulith 的核心洞察：**模块边界必须显式声明，而非靠约定或文档维持**。
 
-在 ZigModu 中，这个原则被编码为编译器可强制执行的规则：
+在 zmodu 中，这个原则被编码为编译器可强制执行的规则：
 
 ```zig
 // 这不是注释或文档——这是编译期可验证的契约
@@ -68,13 +68,13 @@ inline for (modules) |mod| {
 
 AI 生成代码的质量瓶颈不是"生成速度"，而是**验证速度**。
 
-ZigModu 的设计目标之一：**让 AI 生成的每一行代码都能被编译器立即检查**。
+zmodu 的设计目标之一：**让 AI 生成的每一行代码都能被编译器立即检查**。
 
 ```
 传统 AI 编程循环：
   AI 生成 → 人工审查 → 运行测试 → 发现 bug → AI 修复 → 循环
 
-ZigModu AI 编程循环：
+zmodu AI 编程循环：
   AI 生成 → comptime 验证 → 编译错误精确指示 → AI 修复 → 循环
              ↑                                    ↑
         0 人工介入                          0 人工介入
@@ -88,7 +88,7 @@ ZigModu AI 编程循环：
 
 AI 的上下文窗口和推理能力有一个"甜蜜点"：**约 100-300 行的单一职责代码**。
 
-ZigModu 的模块结构天然匹配这个粒度（五文件 · 见 `MODULE_LAYERS.md`）：
+zmodu 的模块结构天然匹配这个粒度（五文件 · 见 `MODULE_LAYERS.md`）：
 
 ```
 src/modules/order/
@@ -104,7 +104,7 @@ src/modules/order/
 
 ### 2.2 模块的"三明治结构"
 
-ZigModu 模块遵循一个 AI 友好的三层结构：
+zmodu 模块遵循一个 AI 友好的三层结构：
 
 ```
 ┌──────────────────────────────────────┐
@@ -132,10 +132,10 @@ ZigModu 模块遵循一个 AI 友好的三层结构：
 // ═══════════════════════════════════════════════════════════
 
 const std = @import("std");
-const zigmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 // ── 声明层 ─────────────────────────────────────────────────
-pub const info = zigmodu.api.Module{
+pub const info = zmodu.api.Module{
     .name = "[模块名]",
     .description = "[描述]",
     .dependencies = &.{ [依赖列表] },
@@ -172,7 +172,7 @@ test "模块名 - 基本初始化" {
 ```
 
 **AI prompt 建议**：
-> "基于 ZigModu 框架，创建一个 [模块名] 模块。依赖：[列表]。生成完整的 module.zig 文件，包含 info 声明、init/deinit 骨架、配置结构体、以及单元测试支架。"
+> "基于 zmodu 框架，创建一个 [模块名] 模块。依赖：[列表]。生成完整的 module.zig 文件，包含 info 声明、init/deinit 骨架、配置结构体、以及单元测试支架。"
 
 ---
 
@@ -180,7 +180,7 @@ test "模块名 - 基本初始化" {
 
 ### 3.1 依赖声明 → 自动校验
 
-这是 ZigModu 对 AI 编程最关键的贡献：**依赖关系的声明与验证形成闭环**。
+这是 zmodu 对 AI 编程最关键的贡献：**依赖关系的声明与验证形成闭环**。
 
 ```zig
 // 1. AI 生成模块时声明依赖（声明层）
@@ -204,11 +204,11 @@ pub const info = api.Module{
 
 ### 3.2 `scanModules` 的 AI 价值
 
-`scanModules` 是 ZigModu 的"编译期反射"机制：
+`scanModules` 是 zmodu 的"编译期反射"机制：
 
 ```zig
 // 应用入口：声明模块列表
-var modules = try zigmodu.scanModules(allocator, .{
+var modules = try zmodu.scanModules(allocator, .{
     UserModule,
     OrderModule,
     PaymentModule,   // ← 添加新模块只需加一行
@@ -230,7 +230,7 @@ var modules = try zigmodu.scanModules(allocator, .{
 
 ```zig
 // 编译期验证（在 startAll 之前）
-try zigmodu.validateModules(&modules);
+try zmodu.validateModules(&modules);
 // 检查项：
 // ✅ 所有声明的依赖模块都已注册
 // ✅ 无模块依赖自身
@@ -254,12 +254,12 @@ AI 修复：添加 cache 依赖或移除依赖声明 → zig build → ✅ 通�
 
 **AI 输入**：
 ```
-"为 ZigModu 项目创建以下模块骨架：
+"为 zmodu 项目创建以下模块骨架：
 1. user 模块：用户管理，依赖 auth
 2. order 模块：订单管理，依赖 user, inventory
 3. payment 模块：支付处理，依赖 order
 
-每个模块遵循 ZigModu 标准模板：info 声明 + init/deinit 骨架 + 测试支架"
+每个模块遵循 zmodu 标准模板：info 声明 + init/deinit 骨架 + 测试支架"
 ```
 
 **AI 输出**：3 个 `module.zig` 文件，每个约 40 行
@@ -326,12 +326,12 @@ pub fn init() !void {
 **目标**：确保持续符合模块化架构原则
 
 ```zig
-// ArchitectureTester：自动验证模块边界（zigmodu.ArchitectureTester，已导出）
+// ArchitectureTester：自动验证模块边界（zmodu.ArchitectureTester，已导出）
 test "architecture - no illegal dependencies" {
-    var modules = zigmodu.ApplicationModules.init(allocator);
+    var modules = zmodu.ApplicationModules.init(allocator);
     defer modules.deinit();
     // 注册模块：modules.register(...)（name + deps）
-    var tester = zigmodu.ArchitectureTester.init(allocator, &modules);
+    var tester = zmodu.ArchitectureTester.init(allocator, &modules);
     defer tester.deinit();
 
     try std.testing.expect(try tester.verify()); // runDefaultRules: 自依赖/循环/描述/命名/依赖上限
@@ -448,9 +448,9 @@ pub const info = api.Module{
 };
 ```
 
-**ZigModu 的防护**：
+**zmodu 的防护**：
 ```zig
-try zigmodu.validateModules(&modules);
+try zmodu.validateModules(&modules);
 // → error: Circular dependency detected: order → inventory → order
 ```
 
@@ -558,7 +558,7 @@ zmodu api users --module user  # → src/modules/user/api.zig
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│               ZigModu AI 开发工作流                       │
+│               zmodu AI 开发工作流                       │
 ├─────────────────────────────────────────────────────────┤
 │                                                         │
 │  1. zmodu module <name>                                 │
@@ -650,17 +650,17 @@ AI 生成的代码应匹配当前阶段，不过度工程化。
 
 ### 模板 1：创建新模块
 ```
-基于 ZigModu 框架，创建模块 [模块名]。
+基于 zmodu 框架，创建模块 [模块名]。
 职责：[一句话描述]
 依赖：[列出依赖模块，用逗号分隔]
 
 生成 module.zig 文件，包含：
-1. zigmodu.api.Module info 声明
+1. zmodu.api.Module info 声明
 2. init() 和 deinit() 函数骨架
 3. 模块级 Config 结构体
 4. 一个单元测试支架
 
-遵循 ZigModu 的三明治结构（声明层 → 实现层 → 测试层）。
+遵循 zmodu 的三明治结构（声明层 → 实现层 → 测试层）。
 ```
 
 ### 模板 2：添加业务函数
@@ -672,7 +672,7 @@ AI 生成的代码应匹配当前阶段，不过度工程化。
 
 要求：
 - 使用 std.mem.Allocator 作为第一个参数
-- 每个错误路径返回具体的 ZigModuError 变体
+- 每个错误路径返回具体的 ZmoduError 变体
 - 使用 defer 确保资源释放
 - 添加对应的单元测试
 ```
@@ -680,7 +680,7 @@ AI 生成的代码应匹配当前阶段，不过度工程化。
 ### 模板 3：添加事件集成
 ```
 在模块 [模块A] 中发布事件 [事件名]，在模块 [模块B] 中订阅。
-使用 zigmodu.TypedEventBus 编译期类型安全。
+使用 zmodu.TypedEventBus 编译期类型安全。
 事件结构体包含字段：[列出字段名和类型]
 
 要求：

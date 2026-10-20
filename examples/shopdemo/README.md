@@ -1,7 +1,7 @@
-# ShopDemo — Minimal Runnable ZigModu Example
+# ShopDemo — Minimal Runnable zmodu Example
 
 > **Scope**: This directory is now a **minimal runnable app** that uses only the single `order` module extracted from `generated-sample/`.  
-> The full 152-table e-commerce schema remains in `schema.sql`; generating all 30+ modules requires the [zmodu CLI](https://github.com/chy3xyz/zigmodu).
+> The full 152-table e-commerce schema remains in `schema.sql`; generating all 30+ modules requires the [zmodu CLI](https://github.com/chy3xyz/zmodu).
 
 ## Quick Start
 

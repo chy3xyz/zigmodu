@@ -1,4 +1,4 @@
-# AI 开发指南（ZigModu.ai 业务接入）
+# AI 开发指南（zmodu.ai 业务接入）
 
 > 面向「在业务系统里接入 AI」的开发者：从 key / provider 供给到
 > `Agent` / `Workflow` / 自定义技能 / 接入方式（HTTP、cron、outbox、MCP）
@@ -38,7 +38,7 @@
 429/401 冷却禁用和 provider fallback（详见 `LLM_POLICIES.md` §8）：
 
 ```zig
-var mgr = zigmodu.ai.AiKeyManager.init(allocator, io);
+var mgr = zmodu.ai.AiKeyManager.init(allocator, io);
 defer mgr.deinit();
 try mgr.applyConfig(&.{
     .{
@@ -56,7 +56,7 @@ try mgr.applyConfig(&.{
     },
 });
 
-var http = zigmodu.http.HttpClient.init(allocator, io, 4, 30000);
+var http = zmodu.http.HttpClient.init(allocator, io, 4, 30000);
 defer http.deinit();
 var provider = try mgr.providerFor(allocator, &http, "deepseek-v4-flash");
 ```
@@ -67,7 +67,7 @@ var provider = try mgr.providerFor(allocator, &http, "deepseek-v4-flash");
 ### 3.2 能力：注册自定义 Skill
 
 ```zig
-fn orderSummaryHandler(ctx: *zigmodu.ai.SkillContext, args: std.json.Value) anyerror!std.json.Value {
+fn orderSummaryHandler(ctx: *zmodu.ai.SkillContext, args: std.json.Value) anyerror!std.json.Value {
     try ctx.checkDeadline();                       // 协作式超时
     const order_id = args.object.get("order_id").?.integer;
     var obj = std.json.ObjectMap{};
@@ -77,7 +77,7 @@ fn orderSummaryHandler(ctx: *zigmodu.ai.SkillContext, args: std.json.Value) anye
     return .{ .object = obj };
 }
 
-var registry = zigmodu.ai.SkillRegistry.init(allocator, io);
+var registry = zmodu.ai.SkillRegistry.init(allocator, io);
 defer registry.deinit();
 try registry.register(.{
     .name = "order.summary",
@@ -97,15 +97,15 @@ try registry.register(.{
 闸门 / 工具类别 / 权限默认 deny 的完整说明见 [`AGENT_RUNTIME.md`](../reference/AGENT_RUNTIME.md)。
 
 ```zig
-var budget = zigmodu.ai.Budget.init(2000);          // 硬 token 预算（预留制）
-var audit_log = try zigmodu.ai.AgentAuditLog.init(allocator, io, 256);
-var memory = zigmodu.ai.MemoryStore.init(allocator, io);   // 可选：按 tenant + user 注入
-var guard = zigmodu.ai.Guard.init(.{
+var budget = zmodu.ai.Budget.init(2000);          // 硬 token 预算（预留制）
+var audit_log = try zmodu.ai.AgentAuditLog.init(allocator, io, 256);
+var memory = zmodu.ai.MemoryStore.init(allocator, io);   // 可选：按 tenant + user 注入
+var guard = zmodu.ai.Guard.init(.{
     .allow = &.{"order.summary"},                   // 列名 ≠ 可执行；空 = 什么都不放行
     .allow_execute = false,                         // 执行类是第二道开关
 });
 
-var spec = zigmodu.ai.AgentSpec{
+var spec = zmodu.ai.AgentSpec{
     .name = "order-assistant",                      // 身份：进日志与 Prometheus 标签
     .provider = &provider,
     .skills = &registry,
@@ -121,7 +121,7 @@ var spec = zigmodu.ai.AgentSpec{
 var agent = spec.build();
 // agent.tracer = &tracer;                          // 可选：run 级 trace span（Spec 未收，build 后赋值）
 
-var skill_ctx = zigmodu.ai.SkillContext{
+var skill_ctx = zmodu.ai.SkillContext{
     .allocator = allocator,
     .tenant_id = 1,
     .user_id = 42,
@@ -136,13 +136,13 @@ if (result.canceled) { /* 用户/编排方中止 */ }
 ### 3.4 编排：Workflow
 
 ```zig
-var wf = zigmodu.ai.workflow.Workflow.init(&registry, &.{
+var wf = zmodu.ai.workflow.Workflow.init(&registry, &.{
     .{ .name = "check", .kind = .{ .skill = .{ .name = "order.summary", .args = .{ .object = .{} } } } },
     .{ .name = "risk",  .kind = .{ .skill = .{ .name = "risk.review", .args = .{ .object = .{} } } }, .depends_on = &.{"check"} },
     .{ .name = "report", .kind = .{ .llm = .{ .prompt = "把风险结论汇总为一段话" } }, .depends_on = &.{"risk"} },
 });
 wf.wal = &wal;                          // 崩溃恢复 / 幂等重放
-wf.reflection = zigmodu.ai.llm.llmVerify;
+wf.reflection = zmodu.ai.llm.llmVerify;
 wf.goal = "输出订单风险结论";
 wf.max_reviews = 2;
 var wf_result = try wf.run(allocator, &skill_ctx);
@@ -198,7 +198,7 @@ fn runAgent(ctx: *http.Context, self: *State) !void {
 **cron**：
 
 ```zig
-var trigger = zigmodu.ai.trigger.Trigger.init(allocator, io, run_fn, skill_ctx);
+var trigger = zmodu.ai.trigger.Trigger.init(allocator, io, run_fn, skill_ctx);
 try trigger.registerCron(&scheduler, "nightly-report", "0 3 * * *", "nightly report");
 _ = trigger.fire(allocator, "webhook-event");   // 事件源即时触发
 ```
@@ -267,7 +267,7 @@ server，`tools/list` 自动从注册表推导参数 schema，并列出注册表
 
 ### 核心与扩展的边界
 
-`zigmodu.ai` 里有两类模块，改动时别混：
+`zmodu.ai` 里有两类模块，改动时别混：
 
 - **核心**（`Agent` / `skill` / `provider` / `workflow` / `guard` / `budget` / `memory` /
   `retriever` / `quota` / `context` / 供给层）：不知道任何业务名词，只依赖
@@ -295,10 +295,10 @@ server，`tools/list` 自动从注册表推导参数 schema，并列出注册表
 
 ## 8. 观测与调试
 
-- `zigmodu.ai.observability.AiMetrics`：合并 `WorkflowMetrics` + `AgentMetrics`
+- `zmodu.ai.observability.AiMetrics`：合并 `WorkflowMetrics` + `AgentMetrics`
   + `TokenQuota` 为一份 Prometheus 文档（挂指针 + 名字，一个 `/metrics` 端点
   即可覆盖整个 AI 栈）。
-- `zigmodu.ai.run_audit.RunAuditStore`：workflow / agent / approval 运行历史
+- `zmodu.ai.run_audit.RunAuditStore`：workflow / agent / approval 运行历史
   （`GET /api/ai/runs`，租户隔离）。每行现在带 **`prompt_tokens` /
   `completion_tokens`**（`Agent` 自动累计；`recordRunWithUsage` 供自定义入口），
   是一份**持久化**的用量账本——内存里的 `TokenQuota` 重启即失真，账单/租户

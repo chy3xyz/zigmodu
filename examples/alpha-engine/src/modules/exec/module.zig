@@ -5,8 +5,8 @@
 //! module its runtime through `ctx.runtime()`, so `app.stop()` joins them and no
 //! caller has to remember to.
 
-const runtime = @import("zigmodu").runtime;
-const zmodu = @import("zigmodu");
+const runtime = @import("zmodu").runtime;
+const zmodu = @import("zmodu");
 const c = @import("../../contracts.zig");
 const api = @import("api.zig");
 const service = @import("service.zig");

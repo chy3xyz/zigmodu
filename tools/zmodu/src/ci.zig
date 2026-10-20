@@ -1,4 +1,4 @@
-//! `zmodu ci` — one-shot quality gate for ZigModu projects.
+//! `zmodu ci` — one-shot quality gate for zmodu projects.
 //!
 //! Runs, in order: `zig build` (compile), `zig fmt --check`, `verify`
 //! (structure/imports), `audit` (best-practice rules), `deadcode` and `doctor`

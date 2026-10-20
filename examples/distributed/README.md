@@ -72,7 +72,7 @@ zig build run     # or: zig build && ./zig-out/bin/distributed-example
 Expected output:
 
 ```
-info: === ZigModu Distributed Example ===
+info: === zmodu Distributed Example ===
 info: Node configuration:
 info:   Node ID: node1
 info:   Port: 9000

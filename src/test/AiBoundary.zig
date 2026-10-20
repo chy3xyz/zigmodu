@@ -99,7 +99,7 @@ test "AI boundary: imports stay inside the allowlist (root export is the only wa
             const raw = rest[1 .. 1 + end];
             rest = rest[1 + end ..];
 
-            if (raw.len == 0 or !std.mem.startsWith(u8, raw, ".")) continue; // package import ("std", "zigmodu")
+            if (raw.len == 0 or !std.mem.startsWith(u8, raw, ".")) continue; // package import ("std", "zmodu")
             const target = stripUpward(raw);
             switch (classify(target)) {
                 .forbidden => {

@@ -1,13 +1,13 @@
-# ZigModu × zent 最佳实践
+# zmodu × zent 最佳实践
 
 **zent**: [chy3xyz/zent](https://github.com/chy3xyz/zent) — Zig 版 [ent](https://entgo.io/)（schema-as-code ORM）  
-**版本口径**: zent **v0.97.0**（0.97 起：包图重构为 **DAG**——`src/base/`（Value/Dialect/log/budget）、`src/migrate.zig` + `src/migrate/`、`src/services/` 三个新落位；导出路径 `zent.sql_dialect`/`zent.sql_schema`/`zent.runtime.log` **全不变**，`zent.base`/`zent.services`/`zent.migrate` 只是新的叫法，行为不变（同一套 642 单元 + 257 集成 + PG-wire 基线通过），消费方零动作；`@setEvalBranchQuota` 的 31 处手写数字收敛到 `base/budget.zig` 的 `flat`/`graph(tables)`，图规模配额不再各点各算；0.96 起：迁移的每条计划语句包在 savepoint 里跑（PG/SQLite；MySQL DDL 隐式提交不动）——被服务端拒绝的语句**只回滚该语句**、warn 点名 SQL、返回新 `error.MigrationStatementRejected`（已分类错误原样保留，如 `ForeignKeyViolation`），事务保持可用；同时把此前三个未发批次一并发布：`sql_dialect.translatePlaceholdersAlloc(dialect, allocator, sql)` 公开（裸 `?` 语句在 PG 上需先翻译——引号/注释/dollar-quoted 原样跳过；fluent builder 本就逐参数翻译，消费方的 **raw** `driver.exec`/`driver.query` 才需要它；本仓库两示例无 raw SQL，无动作）+ 迁移 helper 的 comptime 配额按图规模 `evalQuotaFor(infos)`（154 表图此前撞 50_000/1000 上限编译失败；无 API 动作）+ **跨图边不再猜外键**：边目标不在 `infos` 里时列照建、约束不再发（此前 `toSnakeCase(target)` 猜表名，PG 直接拒绝整条 `CREATE TABLE`），全图迁移 DDL 逐字节不变——本仓库两示例都一次迁移全图，无动作；0.95 起 PG-wire 部分目录服务器**降级读取**（`getPostgresIndexes`/`getPostgresForeignKeys`/`checkPostgresExtensions` 先发制人探 `pg_am`/`pg_proc`/`pg_extension`——HeliosDB Nano 类"说 v3 协议但目录不全"的服务器不再整盘拒绝迁移，缺目录的比较降级 warn+跳过，新增 `error.IndexCatalogUnavailable`/`ForeignKeyCatalogUnavailable`）+ 修迁移事务**双重释放**（三个自管理迁移入口 `errdefer tx.deinit()` 与显式 `tx.deinit()` 并存，commit 后错误路径二次释放真实句柄 = UAF/segfault），均 additive/修复、无消费方动作；0.93 起公共墙钟 `zent.walltime`（libc `CLOCK_REALTIME`，存库时间戳用它；时长仍用 `sql_logger.nowUs()` 单调钟）+ `Row.textDup/blobDup(allocator, i)` 与**借用行生命周期契约**（下一次 `next()`/`deinit()` 之前有效，三驱动各自的保证写在 `Row` doc 上）+ `zent.sql_dialect_expr`（`nowSecs`/`insertIgnore`/`numericTextAsNumber`，DDL 与 DML 同一拼写不再漂移）+ prepared-cache 11 项计数（`cacheStats()`）；0.94 起 `entity.ownedCopy`/`client.<entity>.ownedCopy(allocator, &row)` 公开导出（`getOwned` 的同款复制，释放走 `deinitRowWith`/`deinitEntity`）+ `migrateSchemaInTx(allocator, tx, infos, opts)`（**调用方持有事务**——循环迁移多组 schema 不再一组一事务、半路失败留下半提交）+ 迁移前 PG 扩展预检（声明了 `vector`/`citext`/`hstore`/`ltree`/`geometry` 而 `pg_extension` 缺失 → `error.MissingPostgresExtension`，warn 给出确切 `CREATE EXTENSION` 语句且**零执行**；不需要扩展的 schema 完全不探）+ 方言无法兑现的列类型（SQLite/MySQL 的 `field.Vector`→TEXT）现在按（表,列）warn 点名实际落型与后果——错误集增员照旧只影响穷尽 `switch`；0.92 起 pgvector：`field.Vector(name, dims)`（PG 落 `vector(dims)`；MySQL/SQLite 落 TEXT 只存取、**不能**计算距离）+ 距离谓词 `sql.VectorL2Distance/VectorCosineDistance/VectorInnerProduct/VectorL1Distance` 与 `sql.OrderByVectorDistance`（PG-only 构造，他方言由服务端拒绝）+ `field.Other(name, "vector(1536)")`/`.SqlType("citext")` 声明库未建模的 PG 类型（`checkSchema` 经 `udt_name` 比对免误报 drift）+ index `.Using("hnsw", "vector_cosine_ops")`/`.Method`/`.OpClass`；同版修 **PG `field.Bytes` 双向**（写改二进制参数——非 UTF-8/NUL/反斜杠不再坏；读解 hex 与 legacy escape 两种文本表示）——注意错误集增员（`CreateTablesError` 等），有穷尽 `switch` 才需复核；0.91 起 `MigrateOptions.add_missing_foreign_keys`（opt-in：已存在表的缺声明 FK 可由迁移补齐——MySQL `ADD CONSTRAINT`、PG `NOT VALID`+`VALIDATE CONSTRAINT` 同事务（违反行使整计划回滚）、SQLite 声明 no-op）；0.90 起 builder `initCapacity` 可失败孪生（公开 `Builder.init` 吞 OOM 的老行为**不变**）+ SQLite `.strict_numeric_text` opt-in + MariaDB 文本默认值识别；**0.88 起 `QueryBuilder.joinEdge`（受控 JOIN v1）**：只收 FK 在本表的 `edge.From`（m2o/o2o，o2m/m2m 编译期拒——join 会让 LIMIT 下的页倍增），目标的全读契约（软删→隐私→拦截器）挂 join 别名，目标列以 `<alias>__<col>` 内联投影进实体的 eager edge 字段，一条语句省一次往返；`GroupBy`+join 报 `JoinWithGroupBy`；PG `ForUpdate` 自动 `OF <源表>`；**分工**：display lookup/单值内联用 `joinEdge`，to-many/嵌套路径仍 `WithEdge`/`WithEdgeOptions`；0.87 起隐式 M2M junction 尊重两端声明 `table_name`/`.pk`（修复，默认名 DDL 字节不变）、0.88 修 `Through` junction 尊重声明 `table_name`（此前 m2m 首写 `no such table`）；0.86 起 `field.String.VarChar(n)`（MySQL 落 `VARCHAR(n)`，PG/SQLite 保持 TEXT；**所有方言**写路径拒绝超长 `ValidationFailed`）+ `client.<entity>.AllOwned(allocator)` 一行式放页；**0.85 `ShardSet` 改借用 `ShardRouter`**（所有权契约破坏：调用方持有并 `deinit` router，按值拷贝的 router 在 `init` 后不得再变异——本仓库示例不用 `ShardSet`，无动作）；0.84 起 EntQL 按**字段名优先**寻址（`StorageKey` 感知，物理列名仍可用，都不是 → `UnknownField`）、`Has{Edge}With` 校验谓词列存在（`UnknownField`）、边外键 DDL 尊重目标 `.pk`/`StorageKey`（此前新库首插 `foreign key mismatch`）；**0.81 起 `insertMany`/`upsertMany` 必传 `tenant_id`**（与 0.54 的 `create` 双参同一契约，忽略实体自带租户值）；0.81 起 `cursorPage` 拒绝可空整数游标列（`NullableCursorColumn`，旧的 `has_more=true + next_cursor=null` 会死循环翻页）；0.78 起七个单值聚合（`Sum`/`Avg`/`Max`/`Min`/`SumOrZero`/`AggregateOne`/`AggregateText`）拒绝带 `GROUP BY` 的查询（`GroupByNotSupported`，分组聚合用 `AggregateBy`/`GroupCount`）；0.78 起 `SaveOne`/`ExecOne`/`ForceExecOne` 在驱动无计数时报 `RowsAffectedUnknown` 而非 `NotFound`（三内置驱动不可达）；0.82 起工具链钉 **0.17.0 正式版**（`minimum_zig_version`，旧 dev 快照不再满足）；0.83 comptime quota 显式化（300 实体图压测）+ `id.uuidv4/uuidv7` 换 threadlocal ChaCha+OS 熵（修并发 UB）+ `allocPrint` 弃用迁移；**0.76 起可按驱动裁剪构建**：`b.dependency("zent", .{ .pg = false, .mysql = false })`，翻译期跳过对应 `translate-c`；**0.75 起** junction 表名与某个实体表名撞车时 `checkSchema` 报 **`junction_name_collision`** 并归为 read-breaking，`migrateSchema` 计划建表时 `warn` —— 只有一方能存在，改名是调用方的决定；0.76.1 修三处 OOM 路径泄漏（`Builder.initCapacity`/`takeQuery`/`Selector.init`）；0.73 起 `CrudService.get` → **`getOwned`**、配套 `deinitRowWith(allocator, &e)`；0.73 起 `Sum`/`Avg` 空集报 `EmptyAggregate`；0.70 起 **SQLite 强制外键**（`PRAGMA foreign_keys = ON`）；0.70 起 PG 的 `23502/23503` 不再误报 `UniqueViolation`；0.69 起 `SaveError` 增 `InconsistentRowFields`/`MissingPrimaryKey`；0.72 起 `Restore` 受策略过滤与拦截器约束；0.74 起 EntQL 拒绝未知字段；0.54 起 `CrudService.create(entity, tenant_id)` 双参；0.57 起 MySQL 的 `String`/`Enum` 落 `VARCHAR(255)`；0.40 起一行式实体释放 `deinitRows`/`deinitRow`/`deinitEdgeRows`；0.38 起 `queryTargets*` fail-closed；0.39 起 `zent.scope` 让裸 SQL 也走同一套读契约，见 §14/§15）· 本仓库示例按 **v0.97.0** 验证（`zent-modulith` 清缓存重建 + smoke 44/0 无泄漏、`metaverse-creative` `zig build demo` `demo_ok`）；`create` 双参签名要求 **≥ v0.54.0**，`getOwned` 要求 **≥ v0.73.0**，按驱动裁剪要求 **≥ v0.76.0**，`insertMany`/`upsertMany` 双参要求 **≥ v0.81.0**，`ShardSet` 借用契约要求 **≥ v0.85.0**，`joinEdge` 要求 **≥ v0.88.0**，pgvector/`field.Other`/`.SqlType` 要求 **≥ v0.92.0**，其余条目见 §14 · ZigModu **v0.15.22+** · Zig **≥ 0.17**  
-**主推组合**: **电商 / 社交类项目默认选 ZigModu + zent**（见 §2 决策表与 §4.8 场景能力矩阵）；只有存量 SQL 繁重、报表主导或 DBA 强管控的项目才默认 sqlx。这是**新项目选型建议**，与框架自带的默认实现不是一件事——口径见 §1「与框架自带那条的关系」。
+**版本口径**: zent **v0.97.0**（0.97 起：包图重构为 **DAG**——`src/base/`（Value/Dialect/log/budget）、`src/migrate.zig` + `src/migrate/`、`src/services/` 三个新落位；导出路径 `zent.sql_dialect`/`zent.sql_schema`/`zent.runtime.log` **全不变**，`zent.base`/`zent.services`/`zent.migrate` 只是新的叫法，行为不变（同一套 642 单元 + 257 集成 + PG-wire 基线通过），消费方零动作；`@setEvalBranchQuota` 的 31 处手写数字收敛到 `base/budget.zig` 的 `flat`/`graph(tables)`，图规模配额不再各点各算；0.96 起：迁移的每条计划语句包在 savepoint 里跑（PG/SQLite；MySQL DDL 隐式提交不动）——被服务端拒绝的语句**只回滚该语句**、warn 点名 SQL、返回新 `error.MigrationStatementRejected`（已分类错误原样保留，如 `ForeignKeyViolation`），事务保持可用；同时把此前三个未发批次一并发布：`sql_dialect.translatePlaceholdersAlloc(dialect, allocator, sql)` 公开（裸 `?` 语句在 PG 上需先翻译——引号/注释/dollar-quoted 原样跳过；fluent builder 本就逐参数翻译，消费方的 **raw** `driver.exec`/`driver.query` 才需要它；本仓库两示例无 raw SQL，无动作）+ 迁移 helper 的 comptime 配额按图规模 `evalQuotaFor(infos)`（154 表图此前撞 50_000/1000 上限编译失败；无 API 动作）+ **跨图边不再猜外键**：边目标不在 `infos` 里时列照建、约束不再发（此前 `toSnakeCase(target)` 猜表名，PG 直接拒绝整条 `CREATE TABLE`），全图迁移 DDL 逐字节不变——本仓库两示例都一次迁移全图，无动作；0.95 起 PG-wire 部分目录服务器**降级读取**（`getPostgresIndexes`/`getPostgresForeignKeys`/`checkPostgresExtensions` 先发制人探 `pg_am`/`pg_proc`/`pg_extension`——HeliosDB Nano 类"说 v3 协议但目录不全"的服务器不再整盘拒绝迁移，缺目录的比较降级 warn+跳过，新增 `error.IndexCatalogUnavailable`/`ForeignKeyCatalogUnavailable`）+ 修迁移事务**双重释放**（三个自管理迁移入口 `errdefer tx.deinit()` 与显式 `tx.deinit()` 并存，commit 后错误路径二次释放真实句柄 = UAF/segfault），均 additive/修复、无消费方动作；0.93 起公共墙钟 `zent.walltime`（libc `CLOCK_REALTIME`，存库时间戳用它；时长仍用 `sql_logger.nowUs()` 单调钟）+ `Row.textDup/blobDup(allocator, i)` 与**借用行生命周期契约**（下一次 `next()`/`deinit()` 之前有效，三驱动各自的保证写在 `Row` doc 上）+ `zent.sql_dialect_expr`（`nowSecs`/`insertIgnore`/`numericTextAsNumber`，DDL 与 DML 同一拼写不再漂移）+ prepared-cache 11 项计数（`cacheStats()`）；0.94 起 `entity.ownedCopy`/`client.<entity>.ownedCopy(allocator, &row)` 公开导出（`getOwned` 的同款复制，释放走 `deinitRowWith`/`deinitEntity`）+ `migrateSchemaInTx(allocator, tx, infos, opts)`（**调用方持有事务**——循环迁移多组 schema 不再一组一事务、半路失败留下半提交）+ 迁移前 PG 扩展预检（声明了 `vector`/`citext`/`hstore`/`ltree`/`geometry` 而 `pg_extension` 缺失 → `error.MissingPostgresExtension`，warn 给出确切 `CREATE EXTENSION` 语句且**零执行**；不需要扩展的 schema 完全不探）+ 方言无法兑现的列类型（SQLite/MySQL 的 `field.Vector`→TEXT）现在按（表,列）warn 点名实际落型与后果——错误集增员照旧只影响穷尽 `switch`；0.92 起 pgvector：`field.Vector(name, dims)`（PG 落 `vector(dims)`；MySQL/SQLite 落 TEXT 只存取、**不能**计算距离）+ 距离谓词 `sql.VectorL2Distance/VectorCosineDistance/VectorInnerProduct/VectorL1Distance` 与 `sql.OrderByVectorDistance`（PG-only 构造，他方言由服务端拒绝）+ `field.Other(name, "vector(1536)")`/`.SqlType("citext")` 声明库未建模的 PG 类型（`checkSchema` 经 `udt_name` 比对免误报 drift）+ index `.Using("hnsw", "vector_cosine_ops")`/`.Method`/`.OpClass`；同版修 **PG `field.Bytes` 双向**（写改二进制参数——非 UTF-8/NUL/反斜杠不再坏；读解 hex 与 legacy escape 两种文本表示）——注意错误集增员（`CreateTablesError` 等），有穷尽 `switch` 才需复核；0.91 起 `MigrateOptions.add_missing_foreign_keys`（opt-in：已存在表的缺声明 FK 可由迁移补齐——MySQL `ADD CONSTRAINT`、PG `NOT VALID`+`VALIDATE CONSTRAINT` 同事务（违反行使整计划回滚）、SQLite 声明 no-op）；0.90 起 builder `initCapacity` 可失败孪生（公开 `Builder.init` 吞 OOM 的老行为**不变**）+ SQLite `.strict_numeric_text` opt-in + MariaDB 文本默认值识别；**0.88 起 `QueryBuilder.joinEdge`（受控 JOIN v1）**：只收 FK 在本表的 `edge.From`（m2o/o2o，o2m/m2m 编译期拒——join 会让 LIMIT 下的页倍增），目标的全读契约（软删→隐私→拦截器）挂 join 别名，目标列以 `<alias>__<col>` 内联投影进实体的 eager edge 字段，一条语句省一次往返；`GroupBy`+join 报 `JoinWithGroupBy`；PG `ForUpdate` 自动 `OF <源表>`；**分工**：display lookup/单值内联用 `joinEdge`，to-many/嵌套路径仍 `WithEdge`/`WithEdgeOptions`；0.87 起隐式 M2M junction 尊重两端声明 `table_name`/`.pk`（修复，默认名 DDL 字节不变）、0.88 修 `Through` junction 尊重声明 `table_name`（此前 m2m 首写 `no such table`）；0.86 起 `field.String.VarChar(n)`（MySQL 落 `VARCHAR(n)`，PG/SQLite 保持 TEXT；**所有方言**写路径拒绝超长 `ValidationFailed`）+ `client.<entity>.AllOwned(allocator)` 一行式放页；**0.85 `ShardSet` 改借用 `ShardRouter`**（所有权契约破坏：调用方持有并 `deinit` router，按值拷贝的 router 在 `init` 后不得再变异——本仓库示例不用 `ShardSet`，无动作）；0.84 起 EntQL 按**字段名优先**寻址（`StorageKey` 感知，物理列名仍可用，都不是 → `UnknownField`）、`Has{Edge}With` 校验谓词列存在（`UnknownField`）、边外键 DDL 尊重目标 `.pk`/`StorageKey`（此前新库首插 `foreign key mismatch`）；**0.81 起 `insertMany`/`upsertMany` 必传 `tenant_id`**（与 0.54 的 `create` 双参同一契约，忽略实体自带租户值）；0.81 起 `cursorPage` 拒绝可空整数游标列（`NullableCursorColumn`，旧的 `has_more=true + next_cursor=null` 会死循环翻页）；0.78 起七个单值聚合（`Sum`/`Avg`/`Max`/`Min`/`SumOrZero`/`AggregateOne`/`AggregateText`）拒绝带 `GROUP BY` 的查询（`GroupByNotSupported`，分组聚合用 `AggregateBy`/`GroupCount`）；0.78 起 `SaveOne`/`ExecOne`/`ForceExecOne` 在驱动无计数时报 `RowsAffectedUnknown` 而非 `NotFound`（三内置驱动不可达）；0.82 起工具链钉 **0.17.0 正式版**（`minimum_zig_version`，旧 dev 快照不再满足）；0.83 comptime quota 显式化（300 实体图压测）+ `id.uuidv4/uuidv7` 换 threadlocal ChaCha+OS 熵（修并发 UB）+ `allocPrint` 弃用迁移；**0.76 起可按驱动裁剪构建**：`b.dependency("zent", .{ .pg = false, .mysql = false })`，翻译期跳过对应 `translate-c`；**0.75 起** junction 表名与某个实体表名撞车时 `checkSchema` 报 **`junction_name_collision`** 并归为 read-breaking，`migrateSchema` 计划建表时 `warn` —— 只有一方能存在，改名是调用方的决定；0.76.1 修三处 OOM 路径泄漏（`Builder.initCapacity`/`takeQuery`/`Selector.init`）；0.73 起 `CrudService.get` → **`getOwned`**、配套 `deinitRowWith(allocator, &e)`；0.73 起 `Sum`/`Avg` 空集报 `EmptyAggregate`；0.70 起 **SQLite 强制外键**（`PRAGMA foreign_keys = ON`）；0.70 起 PG 的 `23502/23503` 不再误报 `UniqueViolation`；0.69 起 `SaveError` 增 `InconsistentRowFields`/`MissingPrimaryKey`；0.72 起 `Restore` 受策略过滤与拦截器约束；0.74 起 EntQL 拒绝未知字段；0.54 起 `CrudService.create(entity, tenant_id)` 双参；0.57 起 MySQL 的 `String`/`Enum` 落 `VARCHAR(255)`；0.40 起一行式实体释放 `deinitRows`/`deinitRow`/`deinitEdgeRows`；0.38 起 `queryTargets*` fail-closed；0.39 起 `zent.scope` 让裸 SQL 也走同一套读契约，见 §14/§15）· 本仓库示例按 **v0.97.0** 验证（`zent-modulith` 清缓存重建 + smoke 44/0 无泄漏、`metaverse-creative` `zig build demo` `demo_ok`）；`create` 双参签名要求 **≥ v0.54.0**，`getOwned` 要求 **≥ v0.73.0**，按驱动裁剪要求 **≥ v0.76.0**，`insertMany`/`upsertMany` 双参要求 **≥ v0.81.0**，`ShardSet` 借用契约要求 **≥ v0.85.0**，`joinEdge` 要求 **≥ v0.88.0**，pgvector/`field.Other`/`.SqlType` 要求 **≥ v0.92.0**，其余条目见 §14 · zmodu **v0.15.22+** · Zig **≥ 0.17**  
+**主推组合**: **电商 / 社交类项目默认选 zmodu + zent**（见 §2 决策表与 §4.8 场景能力矩阵）；只有存量 SQL 繁重、报表主导或 DBA 强管控的项目才默认 sqlx。这是**新项目选型建议**，与框架自带的默认实现不是一件事——口径见 §1「与框架自带那条的关系」。
 
 **参考实现**: [`examples/zent-modulith/`](../../examples/zent-modulith/)  
 **zent 自带示例**: `zig build run-start` / `run-complex` / `run-pool`（在 zent 仓库内）
 
-相关文档：[MODULE_LAYERS.md](../guide/MODULE_LAYERS.md) · [MODULITH.md](../guide/MODULITH.md) · [BEST_PRACTICES.md](../guide/BEST_PRACTICES.md) · [SQLX_DRIVERS.md](../guide/SQLX_DRIVERS.md)（zigmodu 侧 `-Ddb=`）· [DATA / sqlx](../../src/data.zig)
+相关文档：[MODULE_LAYERS.md](../guide/MODULE_LAYERS.md) · [MODULITH.md](../guide/MODULITH.md) · [BEST_PRACTICES.md](../guide/BEST_PRACTICES.md) · [SQLX_DRIVERS.md](../guide/SQLX_DRIVERS.md)（zmodu 侧 `-Ddb=`）· [DATA / sqlx](../../src/data.zig)
 
 ---
 
@@ -51,16 +51,16 @@
 
 > **Shared helper**：示例级生命周期和测试工具位于
 > [`examples/_shared/zent_helpers.zig`](../../examples/_shared/zent_helpers.zig)。它只封装
-> `open → migrate → makeClient → deinit`，不属于 ZigModu core，也不改变 zent 与 `data.sqlx` 的正交边界。
+> `open → migrate → makeClient → deinit`，不属于 zmodu core，也不改变 zent 与 `data.sqlx` 的正交边界。
 
-| 层 | 用 ZigModu | 用 zent |
+| 层 | 用 zmodu | 用 zent |
 |----|------------|---------|
 | HTTP / 中间件 / 模块生命周期 | ✅ `http.Server` / `Application` | ❌ |
 | Schema-as-code / 图关系 / 生成 Client | ❌（或手写 sqlx struct） | ✅ `Schema` + `makeClient` |
 | 参数化 SQL CRUD | ✅ `data.sqlx` / `Repository` | ✅ Fluent Query/Create |
 | Redis / metrics / JWT / Outbox | ✅ | ❌ |
 
-**禁止**把 `zent.sql_driver.Driver` 塞进 `zigmodu.data.Client`。两套连接池、方言、迁移表各自管理。
+**禁止**把 `zent.sql_driver.Driver` 塞进 `zmodu.data.Client`。两套连接池、方言、迁移表各自管理。
 
 ```
 Application / http.Server
@@ -69,12 +69,12 @@ Application / http.Server
         │                    │
         │         ┌──────────┴──────────┐
         │         ▼                     ▼
-        │   zigmodu.data.sqlx      zent Client
+        │   zmodu.data.sqlx      zent Client
         │   (tenant-shop 等)       (zent-modulith 等)
         └─ redis / observability / EventBus …
 ```
 
-ZigModu **核心库不强制依赖 zent**；应用或示例按需 path/url 引入。
+zmodu **核心库不强制依赖 zent**；应用或示例按需 path/url 引入。
 
 ---
 
@@ -84,17 +84,17 @@ ZigModu **核心库不强制依赖 zent**；应用或示例按需 path/url 引�
 |------|------|
 | **电商（商品/订单/库存/多店铺）** | **zent（主推）**：领域图密 + 金额精确（`field.Decimal`）+ 幂等 upsert + 行级隔离 |
 | **社交（关注/feed/点赞/私信）** | **zent（主推）**：关系图一等公民 + 边预加载/过滤/排序 + Privacy 可见性 |
-| 快速 CRUD、已有 SQL、报表/复杂手写查询 | **sqlx**（`zigmodu.data`） |
+| 快速 CRUD、已有 SQL、报表/复杂手写查询 | **sqlx**（`zmodu.data`） |
 | 关系图密、codegen Client、migrate、privacy、hooks | **zent** |
-| 下单→支付→Outbox→消息编排 | **sqlx 或 zent + ZigModu EventBus**（编排与 ORM 选型正交） |
+| 下单→支付→Outbox→消息编排 | **sqlx 或 zent + zmodu EventBus**（编排与 ORM 选型正交） |
 | 同进程两套都用 | **按模块选型**（见 §3） |
 
-**一句话**：编排与消息归 ZigModu；领域图与行级策略归 zent；简单表与存量 SQL 归 sqlx。电商/社交新项目的领域模块**默认 zent**，报表/对账等边缘读路径可单开 sqlx 只读模块（§4.7）。
+**一句话**：编排与消息归 zmodu；领域图与行级策略归 zent；简单表与存量 SQL 归 sqlx。电商/社交新项目的领域模块**默认 zent**，报表/对账等边缘读路径可单开 sqlx 只读模块（§4.7）。
 
 **多租户边界**：`TenantContext`（租户来源：JWT / 中间件 → 运行时 id）是
 引擎无关的，sqlx 与 zent 模块都直接用；行级隔离按引擎走惯用法，**不要跨引擎
 混用**——sqlx 模块用框架的 `TenantInterceptor` / `DataPermission`
-（字符串 SQL 拦截，`zigmodu.tenant` / `zigmodu.datapermission`），zent 模块用
+（字符串 SQL 拦截，`zmodu.tenant` / `zmodu.datapermission`），zent 模块用
 Privacy Filter 或显式 `tenant_id` predicate（§8 / §9）。两套都做 = 双重租户
 真相源，谁为准会打架。
 
@@ -193,7 +193,7 @@ Application / http
 ```
 简单 CRUD / 已有 SQL / 报表              → sqlx
 领域图密 + 多租户行级隔离 + 写路径横切   → zent
-下单支付 Outbox / BFF / 限流熔断         → ZigModu（与 ORM 无关）
+下单支付 Outbox / BFF / 限流熔断         → zmodu（与 ORM 无关）
 ```
 
 `tenant-shop` 核心痛点是编排与消息 → **sqlx 更合适**；同一应用里「商品–类目–标签 + 店员只能改本店 + 软删审计」→ **该模块用 zent**。
@@ -204,7 +204,7 @@ Application / http
 |------|------|------|
 | 库存防超卖（原子扣减） | `u.setExprArgs("stock", "stock - ?", &.{.{.int = n}})` + `Where(idEQ, stockGTE)` | `?` 由表达式参数绑定（SET 先于 WHERE 入参）；`rows_affected == 0` 即库存不足。纯乐观锁（读改写 + version）在高并发下有争抢，秒杀优先走原子表达式。 |
 | 乐观锁更新 | `field.Version()` | Update/Delete 自动 `WHERE version = ?` + `version = version + 1`，冲突返回 `OptimisticLockConflict`。 |
-| 批量写 / upsert | `BulkInsertBuilder.SaveOrUpdate`（zent）；`data.bulk.insertMany`（zigmodu sqlx） | 下单商品明细 N 次 round-trip → 1 次。 |
+| 批量写 / upsert | `BulkInsertBuilder.SaveOrUpdate`（zent）；`data.bulk.insertMany`（zmodu sqlx） | 下单商品明细 N 次 round-trip → 1 次。 |
 | 两级关系预加载 | `q.WithEdge("posts.comments")` | 一次主查询 + 每级一次 IN 邻居查询；第三级为编译错误（终点无 edges 容器），逐层手动查询即可。 |
 | 关注/好友/点赞 | `edge.To/From` + `graph.neighbors` | m2m 邻居查询（has/with 谓词）覆盖"我关注的人发的动态"。 |
 | 时间戳自动维护 | `TimeMixin` + v0.22 | `created_at`/`updated_at` 列自动获得 epoch `DEFAULT`（方言感知）；`UpdateBuilder` 自动刷新 `updated_at`（显式设置优先）。 |
@@ -225,7 +225,7 @@ zent 是 ent-style：**关系走 Edges 预加载，不做跨表 JOIN 查询**（
 商城对账、经营报表等需要 `ORDER BY` 多表聚合/join 的场景，按以下边界处理：
 
 1. **优先**：`client.product.Query()` 拿本表数据 + `WithEdge` 组装，或 `CountBy` / `Sum` / `GroupBy` 做单表聚合。
-2. **复杂报表**：用 zent driver 裸 SQL（`client.driver.query(...)`）或 zigmodu `data.sqlx` 写 JOIN —— **不要在 zent 与 sqlx 之间共享事务**（见 §1 定位；报表只读连接可独立）。
+2. **复杂报表**：用 zent driver 裸 SQL（`client.driver.query(...)`）或 zmodu `data.sqlx` 写 JOIN —— **不要在 zent 与 sqlx 之间共享事务**（见 §1 定位；报表只读连接可独立）。
 
    ⚠️ **裸 SQL 的安全前提（v0.39 起）**：手写语句**不会**自动带上软删 / 隐私策略 /
    拦截器谓词——`client.driver.query()` 绕过了整条读契约，租户过滤会被静默跳过。
@@ -277,13 +277,13 @@ zent 是 ent-style：**关系走 Edges 预加载，不做跨表 JOIN 查询**（
 
 ## 5. 分层映射（对齐 MODULE_LAYERS）
 
-| ZigModu 文件 | zent 写法 | 职责 |
+| zmodu 文件 | zent 写法 | 职责 |
 |--------------|-----------|------|
 | `model.zig` | `Schema` + `field.*` + `edge.*` +（可选）`policy` / hooks | 形状与关系；无 HTTP、无 SQL 字符串 |
 | `persistence.zig` | 持有 `Client(infos)`；`Create`/`Query`/`beginTx` | **无业务 if**；对外 DTO |
 | `service.zig` | 校验、Cmd、编排；可 `beginTx` | 不碰 `Context`、不拼 SQL |
 | `api.zig` | 只调 service；`ctx.json` | 不 import `zent.sql_*` |
-| `module.zig` | ZigModu `info` / `init` / `deinit` | 与数据栈无关 |
+| `module.zig` | zmodu `info` / `init` / `deinit` | 与数据栈无关 |
 
 同事务跨实体：用 `zent.codegen.client.beginTx`，不要开两个独立 Driver 事务。
 
@@ -295,7 +295,7 @@ Persistence **dupe 成普通 DTO** 再交给上层（见 `zent-modulith`），�
 
 两种 ORM 的**写入语义**不同，混用时最容易踩的坑是「nullable 字段显式写 NULL 覆盖 DB DEFAULT」：
 
-| | zigmodu（sqlx Repository） | zent（Create/UpdateBuilder） |
+| | zmodu（sqlx Repository） | zent（Create/UpdateBuilder） |
 |---|---|---|
 | 写模式 | **entity 全字段**：`insert(entity)` 把 struct 所有列写入 | **builder**：`Create.setFieldValue` / `Update.set` 显式设字段 |
 | nullable + null | 显式写 `NULL` → 覆盖 DB `DEFAULT` | **不写入**（未 `set` 的字段不进 SQL）→ `DEFAULT` 天然生效 |
@@ -304,12 +304,12 @@ Persistence **dupe 成普通 DTO** 再交给上层（见 `zent-modulith`），�
 
 **关键**：zent 的 `CreateBuilder.saveInternal` 只 `for (self.values.items)`（显式 setValue 过的字段），未设置的列完全不在 INSERT 里——所以 zent **不存在**「nullable 覆盖 DEFAULT」的问题。
 
-**zigmodu 侧**：默认 `insert`/`update` 保持全字段语义（`null` = 显式清空，便于完整覆盖）；要「DEFAULT 接管 / 部分更新」用 opt-in 变体：
+**zmodu 侧**：默认 `insert`/`update` 保持全字段语义（`null` = 显式清空，便于完整覆盖）；要「DEFAULT 接管 / 部分更新」用 opt-in 变体：
 
 ```zig
-// zigmodu — 省略 nullable-null 列，DB DEFAULT 接管
+// zmodu — 省略 nullable-null 列，DB DEFAULT 接管
 _ = try repo.insertOmitNulls(allocator, entity);
-// zigmodu — 只改非 null 字段（部分更新，null 保持原值）
+// zmodu — 只改非 null 字段（部分更新，null 保持原值）
 try repo.updatePartial(allocator, entity);
 ```
 
@@ -331,7 +331,7 @@ var client = zent.codegen.client.makeClient(graph.types, alloc, drv.asDriver());
 
 生产建议：
 
-1. **`ConnPool`**：`zent.sql_pool.ConnPool(SQLiteDriver)` → `asDriver()` 交给 `makeClient`（`Options.io` 对齐 ZigModu fiber）。参考 zent `examples/pool`。
+1. **`ConnPool`**：`zent.sql_pool.ConnPool(SQLiteDriver)` → `asDriver()` 交给 `makeClient`（`Options.io` 对齐 zmodu fiber）。参考 zent `examples/pool`。
 2. **Migrate**：默认保守；`drop_columns` / `allow_data_loss` 必须显式 `MigrateOptions`。
 3. **单连接 `:memory:`**：勿多连接拆库（与 sqlx 相同）。
 4. **启动顺序**：`open/pool → migrateSchema → makeClient → 注入 persistence → start modules → listen`。
@@ -349,7 +349,7 @@ defer env.deinit();
 try env.reset(); // 下一组断言从全新 schema 开始
 ```
 
-`TestEnv` 是 `examples/_shared/zent_helpers.zig` 中的示例工具，不会把 zent 引入 ZigModu core。
+`TestEnv` 是 `examples/_shared/zent_helpers.zig` 中的示例工具，不会把 zent 引入 zmodu core。
 
 ### 6.2 Production: ConnPool
 
@@ -377,7 +377,7 @@ var client = zent.codegen.client.makeClient(infos, allocator, pool.asDriver());
 
 ### 6.3 Observability
 
-zent 的 `sql_logger.Logger` 回调没有额外 context 参数，因此最简单且无状态的适配器是转发到 ZigModu 的 `std.log` 后端（生产应用也可以在回调中转发到自己的 `StructuredLogger` 实例）：
+zent 的 `sql_logger.Logger` 回调没有额外 context 参数，因此最简单且无状态的适配器是转发到 zmodu 的 `std.log` 后端（生产应用也可以在回调中转发到自己的 `StructuredLogger` 实例）：
 
 ```zig
 fn onQuery(c: zent.sql_logger.LogContext) void {
@@ -593,11 +593,11 @@ SQLite 那条（~597 MiB）**并行**的 ~23 s / 30 MiB 步骤，只有它们在
 
 ```
 zig_ws/
-  zigmodu/
+  zmodu/
   zent/          # git clone https://github.com/chy3xyz/zent.git
 ```
 
-**zigmodu 侧驱动链接**：`examples/zent-modulith` 等 path 依赖仍 `addImport("zigmodu")`，并用 `db_link.Features.sqlite_only`，避免 zigmodu sqlx 再链 libpq/mysql。业务只走 zent 时也建议如此。完整约定见 [SQLX_DRIVERS.md](../guide/SQLX_DRIVERS.md) §8。
+**zmodu 侧驱动链接**：`examples/zent-modulith` 等 path 依赖仍 `addImport("zmodu")`，并用 `db_link.Features.sqlite_only`，避免 zmodu sqlx 再链 libpq/mysql。业务只走 zent 时也建议如此。完整约定见 [SQLX_DRIVERS.md](../guide/SQLX_DRIVERS.md) §8。
 
 ---
 
@@ -645,9 +645,9 @@ zig_ws/
 | **v0.97 包图重构为 DAG + 统一 comptime 预算（非 BREAKING，零消费方动作）** | **DAG（内部重构）**：`core` 不再 import SQL 层、`sql/` 不再 import codegen、`runtime/log.zig` 不再被 SQL 反向依赖——`src/base/`（`Value`/`Filter`/`Dialect`/`log`/`budget`）、`src/migrate.zig` + `src/migrate/`（types/ddl/introspect/drift）、`src/services/`（crud/outbox/shard/helpers）是新的落位。**导出路径全不变**（`zent.sql_dialect`/`zent.sql_schema`/`zent.runtime.log`），`zent.base`/`zent.services`/`zent.migrate` 只是新叫法；642 单元 + 257 集成 + PG-wire 基线在重构前后一致。**comptime 预算**：31 处手写的 `@setEvalBranchQuota` 收敛到 `base/budget.zig`（`flat` 与 `graph(tables) = flat + tables × 20_000`），图规模 helper 不再各点各算（154 表图曾因漏设 quota 编译失败）。**消费方动作**：无；升级只需改 pin + 清缓存重建。**本仓库验证**：两示例 pin 改 v0.97.0 后清缓存重建——`zent-modulith` 构建 + smoke 44/0 无泄漏、`metaverse-creative` `zig build demo` `demo_ok balanced=true`。 |
 | **v0.96 逐语句 savepoint + 裸 SQL 占位符翻译 + 图规模 comptime 配额 + 跨图边不猜外键（对本仓库非 BREAKING；错误集增长）** | **savepoint（行为变，UPGRADING §13.10）**：迁移的每条计划语句包在 savepoint 里跑（PG/SQLite；MySQL DDL 隐式提交不动）。服务端拒绝某条语句时只回滚该语句、warn 点名 SQL，并返回新 `error.MigrationStatementRejected`；**已分类错误原样返回**（`VALIDATE CONSTRAINT` 撞孤儿行仍是 `ForeignKeyViolation`）。批内仍 all-or-nothing。消费方动作：穷尽 `switch` 迁移入口错误集的代码需加一条 arm。**placeholder（additive）**：`sql_dialect.translatePlaceholdersAlloc(dialect, allocator, sql)` 把裸 `?` 重写成方言拼写（PG `$1, $2, …`；SQLite/MySQL 原样）。fluent builder 逐参数翻译本就正确，**raw** `driver.exec`/`driver.query` 才是 `?` 会被原样发出、PG 回 `syntax error at or near "AND"` 的那条路；扫描不是 `replace`——引号字符串/标识符、`--`、嵌套 `/* … */`、PG dollar-quoted 体原样复制（`'?'` 与 `$1` 都不会误伤）。本仓库两示例不用 raw SQL，无动作。**comptime 配额（修复）**：迁移 helper 的 `@setEvalBranchQuota` 从固定值改为 `evalQuotaFor(infos)`（1_000_000 + 表数 × 20_000），154 表图此前撞 1000/50_000 上限直接编译失败；纯上限、未触及时不花钱。**跨图边外键（行为变，UPGRADING §13.9）**：边目标不在传入的 `infos` 里时，旧行为用 `toSnakeCase(target_name)` **猜**表名发约束（PG 直接拒绝整条 `CREATE TABLE`：`relation "upload_file" does not exist`，chunked 迁移每次重试都失败）；现在列照建、junction 保留双列与复合主键、约束**不发**并 warn 点名边/源/目标。全图迁移（`buildGraph(&.{…all…})`）DDL 逐字节不变——本仓库两示例均一次迁移全图，无动作。**消费方动作**：raw SQL 在 PG 上要把 `?` 过一遍 `translatePlaceholdersAlloc`；chunked/按库迁移若需要跨块外键，改为整图一次迁移。**本仓库验证**：`zent-modulith` 清缓存重建 + smoke 44/0 无泄漏、`metaverse-creative` `zig build demo` `demo_ok`。 |
 | **v0.95 PG-wire 部分目录服务器降级读取 + 迁移事务双重释放修复（对本仓库非 BREAKING）** | **0.95（修复 + 错误集增长）**：zent 走 PG wire 协议，对端不一定是真 PostgreSQL——HeliosDB Nano 这类"说 v3 但目录不全"的服务器以前在迁移第一条被拒语句时就整盘失败（事务已被服务端判死，语句级重试无意义）。现在三处读**发送前**按目录门控：`getPostgresIndexes` 先探 `pg_am`（缺 → 退化为不带 access-method join 的读，索引按名称+唯一性匹配、key 列不可比较不报告 drift；连探针都被拒 → `error.IndexCatalogUnavailable`）；`getPostgresForeignKeys` 先探 `pg_proc`（`generate_subscripts` 是函数而非目录，缺 → warn + `error.ForeignKeyCatalogUnavailable`，drift 报告与 planner 都把该比较记为跳过，**绝不误报缺失**）；`checkPostgresExtensions` 先探 `pg_extension`（缺 → 声明类型按声明通过 + 一条 warn）。实测：本仓库 PG 集成套件对 HeliosDB Nano 4.41.1 从 217/39 failed+中途 segfault 升至 226/30 无崩溃，PG 17.10 保持 256/0 逐字节一致。同版修复：三个自管理迁移入口（`migrateSchemaWithOptions` 及两个 file-based）`errdefer tx.deinit()` + 显式 `tx.deinit()` 并存——commit 后 `reportNullability` 再读失败会二次释放真实驱动句柄（HeliosDB 上实测 `Segmentation fault at address 0x5555…55d`），改单 `defer` 覆盖两路径。**消费方动作**：无签名/行为破坏；错误集增 `IndexCatalogUnavailable`/`ForeignKeyCatalogUnavailable`，穷尽 `switch` 需复核（同 0.92 规矩）。**本仓库验证**：`zent-modulith` 清缓存重建 + smoke 44/0 无泄漏、`metaverse-creative` `zig build demo` `demo_ok`。 |
-| **v0.93–0.94 公共墙钟 + 行生命周期契约 + 调用方持有事务迁移 + PG 扩展预检（对本仓库非 BREAKING）** | **0.93（additive）**：`zent.walltime`（`nowSecs/nowMilli/nowMicros/nowNanos`，libc `CLOCK_REALTIME`，失败 warn + 答 `0`）——此前消费方各自私搭墙钟模块（zigmodu 侧 `Time.zig` 只有单调钟，存库时间戳正是缺它的场景）；`Row.textDup/blobDup(allocator, index)` 复制借用切片 + `Row` 借用契约成文（下一次 `next()`/`deinit()` 前有效；MySQL 列缓冲覆写、SQLite step 失效、PG 全结果集有效、bytea 解码器每列复用一个缓冲——重读即覆写）；`zent.sql_dialect_expr`（`nowSecs(dialect)`/`insertIgnore(dialect)` 返回 `{prefix,suffix}`/`numericTextAsNumber`）+ `nowSecsParenthesized`（0.93.1，DDL DEFAULT 形态）；prepared-cache 计数（`Stats`/`stats()`/`cacheStats()`，11 项，`hits+misses+taken_misses` 覆盖每次查找）。**0.94（additive + 错误集增长）**：`entity.ownedCopy`/`client.<entity>.ownedCopy(allocator, &row)` 公开导出（"把这行扫描结果变成我的"一键复制——字符串/切片重挂 allocator、JSON 进 copy 自带 `json_arena`，释放 `deinitRowWith`/`deinitEntity`；`CrudService.getOwned` 改为调用它，行为不变；eager edge 刻意不进 copy，文档写明）；`migrateSchemaInTx(allocator, tx, infos, opts)`——迁移在**调用方持有**的事务里跑，循环多组 schema 的调用方可以 all-or-nothing（旧 `migrateSchema` 一次调用 = 一个事务，半路失败留下早组已提交且无标记）；PG 扩展预检：声明类型需要 `vector`/`citext`/`hstore`/`ltree`/`geometry|geography` 而库缺扩展时，warn 给出确切 `CREATE EXTENSION` 语句并答 `error.MissingPostgresExtension`、**零 DDL 执行**（此前 `postgres:16-alpine` 报裸 `type "vector" does not exist`）；SQLite/MySQL 无法兑现的声明列类型（`field.Vector`→TEXT）按（表,列）warn 点名实际落型与后果（此前索引降级 warn、**致命**的列落型反而静默，正好搞反）。**消费方动作**：无签名/行为破坏；`CreateTablesError` 增 `MissingPostgresExtension`，穷尽 `switch` 需复核（同 0.92 规矩）。**本仓库验证**：`zent-modulith` 清缓存重建 + smoke 44/0 无泄漏、`metaverse-creative` `zig build demo` `demo_ok`；本仓库 `migrateSchema` 调用点签名未变，无动作。 |
+| **v0.93–0.94 公共墙钟 + 行生命周期契约 + 调用方持有事务迁移 + PG 扩展预检（对本仓库非 BREAKING）** | **0.93（additive）**：`zent.walltime`（`nowSecs/nowMilli/nowMicros/nowNanos`，libc `CLOCK_REALTIME`，失败 warn + 答 `0`）——此前消费方各自私搭墙钟模块（zmodu 侧 `Time.zig` 只有单调钟，存库时间戳正是缺它的场景）；`Row.textDup/blobDup(allocator, index)` 复制借用切片 + `Row` 借用契约成文（下一次 `next()`/`deinit()` 前有效；MySQL 列缓冲覆写、SQLite step 失效、PG 全结果集有效、bytea 解码器每列复用一个缓冲——重读即覆写）；`zent.sql_dialect_expr`（`nowSecs(dialect)`/`insertIgnore(dialect)` 返回 `{prefix,suffix}`/`numericTextAsNumber`）+ `nowSecsParenthesized`（0.93.1，DDL DEFAULT 形态）；prepared-cache 计数（`Stats`/`stats()`/`cacheStats()`，11 项，`hits+misses+taken_misses` 覆盖每次查找）。**0.94（additive + 错误集增长）**：`entity.ownedCopy`/`client.<entity>.ownedCopy(allocator, &row)` 公开导出（"把这行扫描结果变成我的"一键复制——字符串/切片重挂 allocator、JSON 进 copy 自带 `json_arena`，释放 `deinitRowWith`/`deinitEntity`；`CrudService.getOwned` 改为调用它，行为不变；eager edge 刻意不进 copy，文档写明）；`migrateSchemaInTx(allocator, tx, infos, opts)`——迁移在**调用方持有**的事务里跑，循环多组 schema 的调用方可以 all-or-nothing（旧 `migrateSchema` 一次调用 = 一个事务，半路失败留下早组已提交且无标记）；PG 扩展预检：声明类型需要 `vector`/`citext`/`hstore`/`ltree`/`geometry|geography` 而库缺扩展时，warn 给出确切 `CREATE EXTENSION` 语句并答 `error.MissingPostgresExtension`、**零 DDL 执行**（此前 `postgres:16-alpine` 报裸 `type "vector" does not exist`）；SQLite/MySQL 无法兑现的声明列类型（`field.Vector`→TEXT）按（表,列）warn 点名实际落型与后果（此前索引降级 warn、**致命**的列落型反而静默，正好搞反）。**消费方动作**：无签名/行为破坏；`CreateTablesError` 增 `MissingPostgresExtension`，穷尽 `switch` 需复核（同 0.92 规矩）。**本仓库验证**：`zent-modulith` 清缓存重建 + smoke 44/0 无泄漏、`metaverse-creative` `zig build demo` `demo_ok`；本仓库 `migrateSchema` 调用点签名未变，无动作。 |
 | **v0.87–0.92 受控 JOIN v1 + pgvector + 迁移补外键（对本仓库非 BREAKING）** | **0.88（additive）**：`QueryBuilder.joinEdge(edge_name, .inner/.left, .{ .where, .select, .alias })`——只收 FK 在本表的边（`edge.From` m2o/o2o；o2m/m2m 编译期拒并给出 `WithEdge` 替代指引），目标的全读契约（软删→隐私→拦截器）由 builder 挂到 join 别名（left join 时 scope 谓词进 `ON`，inner 时进 `WHERE`——放 `WHERE` 会让 left join 悄悄变 inner），目标列以 `<alias>__<col>` 内联投影进实体的 eager edge 字段，一条语句一次往返，`deinitRows` 级联释放；`GroupBy`+join 报 `JoinWithGroupBy`；PG `ForUpdate` 自动 `OF <源表>`。**分工**：display lookup / 单值内联用 `joinEdge`；to-many / 嵌套路径仍 `WithEdge`/`WithEdgeOptions`（决策表：zent BEST_PRACTICES §5g）。**0.87/0.88（修复，默认 schema 零动作）**：隐式 M2M junction 尊重两端声明 `table_name`/`.pk`；`Through` junction 尊重声明 `table_name`（此前 m2m 首写 `no such table`）。**0.89–0.90（内部硬化）**：builder `initCapacity` 可失败孪生 + 四条生产路径不再吞 OOM（公开 `Builder.init` 行为不变，非破坏）；SQLite `.strict_numeric_text` opt-in（i64 DTO 对 Decimal(TEXT) 列可响亮失败）。**0.91（additive）**：`MigrateOptions.add_missing_foreign_keys`——已存在表的缺声明 FK 可由迁移补齐（MySQL `ADD CONSTRAINT`；PG `NOT VALID`+`VALIDATE CONSTRAINT` 同事务，违反行使整计划回滚；SQLite no-op）。**0.92（additive + 错误集增长）**：pgvector `field.Vector(name, dims)`（PG `vector(n)`，MySQL/SQLite 落 TEXT 只存取不计算）+ 距离谓词 `VectorL2Distance/Cosine/InnerProduct/L1Distance` 与 `OrderByVectorDistance`（PG-only）+ `field.Other`/`.SqlType` 声明未建模 PG 类型 + index `.Using/.Method/.OpClass`；修 PG `field.Bytes` 双向（写二进制参数、读解 hex/escape 文本）。**消费方动作**：无签名/行为破坏；错误集增员（`CreateTablesError` 等）只影响穷尽 `switch`。**本仓库验证**：`zent-modulith` 清缓存重建 + smoke 44/0 无泄漏（新增 `feed3` joinEdge 演示端点：`Post` 加 `edge.From("author", …)`，注意 `Author`↔`Post` 互指边会产生 zent 依赖环，须用 base+wrapper 模式——`AuthorBase` 先声明、`Author = withEdges(AuthorBase, …)` 包后置；示例响应 A/B 逐字节一致）、`metaverse-creative` `zig build demo` `demo_ok`。 |
-| **v0.84–0.86 EntQL 字段名优先 + `ShardSet` 借用 + `VarChar(n)`/`AllOwned`（部分 BREAKING）** | **0.84（行为变）**：EntQL 标识符按**字段名优先**寻址（`StorageKey` 感知，含 `has(...)` 内对边目标），物理列名仍可用，两者都不是 → `error.UnknownField`；`Has{Edge}With` 现在校验谓词列在目标上存在（同 `UnknownField`）。同版修复：边外键 DDL 尊重目标 `.pk`/`StorageKey`（此前 `From`/`To` 边恒指 `id`，新库首插 `foreign key mismatch`）、prepared-cache "命中后失败"永久占槽、MySQL 无自增 `Save` 把 `0` 当 id。本仓库示例不用 EntQL 谓词/`Has{Edge}With`，无动作。**0.85（所有权 BREAKING）**：`ShardSet.init` 改**借用** `ShardRouter`——调用方持有并 `deinit` router；按值拷贝的 router 在 `init` 后不得再变异（map 增长会让另一份拷贝悬空）。本仓库 grep 实证示例不用 `ShardSet`（`ShardRouter` 命中全是 zigmodu 自有 `src/tenant/ShardRouter.zig`），无动作。同版修 MySQL `bool`/`float` 假 drift（`tinyint(1)`/`double` 归一化）与多处 OOM 泄漏。**0.86（additive）**：`field.String("…").VarChar(n)`（MySQL 落 `VARCHAR(n)`，PG/SQLite 保持 TEXT；**所有方言**写路径拒绝超长 `error.ValidationFailed`，不加 `.VarChar` 行为不变）；`client.<entity>.AllOwned(allocator)` 一行式放页；MySQL prepared `exec` 的 `SELECT` 现在报行数。本仓库验证：`zent-modulith` 清缓存重建 + smoke 43/0 无泄漏、`metaverse-creative` `zig build demo` `demo_ok`。 |
+| **v0.84–0.86 EntQL 字段名优先 + `ShardSet` 借用 + `VarChar(n)`/`AllOwned`（部分 BREAKING）** | **0.84（行为变）**：EntQL 标识符按**字段名优先**寻址（`StorageKey` 感知，含 `has(...)` 内对边目标），物理列名仍可用，两者都不是 → `error.UnknownField`；`Has{Edge}With` 现在校验谓词列在目标上存在（同 `UnknownField`）。同版修复：边外键 DDL 尊重目标 `.pk`/`StorageKey`（此前 `From`/`To` 边恒指 `id`，新库首插 `foreign key mismatch`）、prepared-cache "命中后失败"永久占槽、MySQL 无自增 `Save` 把 `0` 当 id。本仓库示例不用 EntQL 谓词/`Has{Edge}With`，无动作。**0.85（所有权 BREAKING）**：`ShardSet.init` 改**借用** `ShardRouter`——调用方持有并 `deinit` router；按值拷贝的 router 在 `init` 后不得再变异（map 增长会让另一份拷贝悬空）。本仓库 grep 实证示例不用 `ShardSet`（`ShardRouter` 命中全是 zmodu 自有 `src/tenant/ShardRouter.zig`），无动作。同版修 MySQL `bool`/`float` 假 drift（`tinyint(1)`/`double` 归一化）与多处 OOM 泄漏。**0.86（additive）**：`field.String("…").VarChar(n)`（MySQL 落 `VARCHAR(n)`，PG/SQLite 保持 TEXT；**所有方言**写路径拒绝超长 `error.ValidationFailed`，不加 `.VarChar` 行为不变）；`client.<entity>.AllOwned(allocator)` 一行式放页；MySQL prepared `exec` 的 `SELECT` 现在报行数。本仓库验证：`zent-modulith` 清缓存重建 + smoke 43/0 无泄漏、`metaverse-creative` `zig build demo` `demo_ok`。 |
 | **v0.83.1 `std.builtin` → `std.lang`（消费方零动作，但别在自己代码里继续用旧名）** | 上游迁了 codegen/scan 的 10 处 `std.builtin.Type.Struct.FieldAttributes`、`runtime/error.zig` 的 `SourceLocation`、`core/id.zig` 的 `builtin.os.tag`。0.17.0 弃用 `std.builtin`（`std.zig:68` "To be removed after 0.17.0"）与 `@import("builtin")` 顶层 `cpu`/`os`/`abi`/`object_format`（release notes 明写 **0.18.0 移除**），类型完全相同、纯改名。本仓库同批自查：`builtin.os.tag` ×47 + `builtin.cpu.arch` ×1（`src/` 18 文件）已迁 `builtin.target.*`；`std.builtin` 本仓仅 `examples/zent-modulith/src/zent_crud.zig` 一处，已迁 `std.lang`。**坑**：`object_format` 的替代名是 `target.ofmt`。 |
 | **v0.81.0 `insertMany`/`upsertMany` 必传 `tenant_id`（BREAKING，签名）** | 与 0.54 的 `create(entity, tenant_id)` 同一契约：批量写以前从实体自带租户列读，零值实体就写入租户 `0`；现在租户是**形参**，实体字段被忽略。一次调用 = 一个租户的行。本仓库 `zent-modulith` 的 `POST /products/batch` 已适配：批量项租户不一致直接 400（不再让某个租户"赢"），实跑同租户 201 `{"ids":[1,2]}` / 混合 400 验证。 |
 | **v0.81.0 `cursorPage` 拒绝可空整数游标列（BREAKING，错误集）** | 可空游标列遇到 SQL `NULL` 会产出 `next_cursor=null` + `has_more=true`——调用方 `while (has_more)` 无游标重查第一页，**无限翻页**。现在直接 `error.NullableCursorColumn`：把列改非空，或换列做游标。本仓库未用 `cursorPage`，无动作。 |
@@ -689,7 +689,7 @@ zig_ws/
 | **v0.30 显式冲突目标 upsert** | `SaveOrUpdateOn(conflict_columns)`（PG/SQLite `ON CONFLICT (cols)`、MySQL ODKU）与 `SaveIgnore()`；`Row.tryGet*` NULL 显式报错；**MySQL `ContainsEscaped` ESCAPE 改为 `!`**（旧 `\` 会污染 LIKE 模式，自查依赖该行为的查询）。 |
 | **v0.29 约束错误分类 / JSONValue / ⚠️ Time 列类型** | `UniqueViolation`/`NotNullViolation`/`ForeignKeyViolation` 三方言统一（不再误报 `NotFound`）；`field.JSONValue` 无类型 JSON 文档；**`field.Time` 全方言改 BIGINT epoch 秒（PG 原为 TIMESTAMPTZ，存量 PG 表需迁移列类型）**；`WhereEntQL` 支持 `has/not_has(edge)`；Privacy 按操作（OnCreate/OnQuery…）生效。 |
 | **v0.28 JSON 所有权统一** | 查询/预加载路径的 JSON 解析进 per-entity arena，由 `deinitEntity` 释放；调用方不要再自行 free scan 出的 JSON。 |
-| **查询超时控制 (`withTimeout`)** | zent v0.13+ 支持 `client.product.Query().withTimeout(2000)`，通过 `ExecutionContext` 在底层 SQL 驱动触发超时下发（Postgres `statement_timeout` / MySQL `MAX_EXECUTION_TIME` / SQLite `deadline`），有效防止 ZigModu 异步 Fiber 场景下的长查询阻塞。 |
+| **查询超时控制 (`withTimeout`)** | zent v0.13+ 支持 `client.product.Query().withTimeout(2000)`，通过 `ExecutionContext` 在底层 SQL 驱动触发超时下发（Postgres `statement_timeout` / MySQL `MAX_EXECUTION_TIME` / SQLite `deadline`），有效防止 zmodu 异步 Fiber 场景下的长查询阻塞。 |
 | **MySQL 原生 Upsert** | `SaveOrUpdate` 升级为生成 `INSERT ... ON DUPLICATE KEY UPDATE` 原生 DDL，保持主键与关联子行原子更新。 |
 | **`deinitEntity` 可变指针** | `&entity` 统一清理内存 |
 | **迁移表 `zent_schema_migrations`** | 幂等；勿手删 |
@@ -742,7 +742,7 @@ zig_ws/
 
 | 资源 | 用途 |
 |------|------|
-| [`examples/zent-modulith/`](../../examples/zent-modulith/) | ZigModu HTTP + zent 分层冒烟 |
+| [`examples/zent-modulith/`](../../examples/zent-modulith/) | zmodu HTTP + zent 分层冒烟 |
 | [`examples/tenant-shop/`](../../examples/tenant-shop/) | sqlx + Tx/Outbox 旗舰路径 |
 | [MODULE_LAYERS.md](../guide/MODULE_LAYERS.md) | model / persistence / service 通则 |
 | [chy3xyz/zent](https://github.com/chy3xyz/zent) | ORM 本体与 `run-complex` / `run-pool` |

@@ -1,9 +1,9 @@
 //! DEPRECATED — use domain files instead:
-//!   zigmodu.http.http_server       (was extensions.HttpServer)
-//!   zigmodu.data.sqlx              (was extensions.SqlxClient)
-//!   zigmodu.data.orm               (was extensions.Orm)
-//!   zigmodu.data.redis             (was extensions.RedisClient)
-//!   zigmodu.security.auth           (was extensions.JwtAuthMiddleware)
+//!   zmodu.http.http_server       (was extensions.HttpServer)
+//!   zmodu.data.sqlx              (was extensions.SqlxClient)
+//!   zmodu.data.orm               (was extensions.Orm)
+//!   zmodu.data.redis             (was extensions.RedisClient)
+//!   zmodu.security.auth           (was extensions.JwtAuthMiddleware)
 //!
 //! This file will be removed in v1.0.
 

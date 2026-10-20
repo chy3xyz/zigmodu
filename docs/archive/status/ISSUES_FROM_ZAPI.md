@@ -1,6 +1,6 @@
-# Issues from zapi — zigmodu backlog
+# Issues from zapi — zmodu backlog
 
-> Sourced from the **zmcanyin / zapi** ThinkPHP-compatible commerce API on ZigModu
+> Sourced from the **zmcanyin / zapi** ThinkPHP-compatible commerce API on zmodu
 > (`zigmodu_ws/zmcanyin_zent/zapi`).  
 > Complements [`FRAMEWORK_BACKLOG.md`](./FRAMEWORK_BACKLOG.md) (landed ergonomics) with
 > **auth / envelope / identity** gaps that forced app-level patches.  
@@ -19,7 +19,7 @@ Suggested landing order: **M1 → M2 → M4 → M5 → M3 → …**.
 | | |
 |--|--|
 | **Problem** | zapi maintains `middleware/public_paths.zig` **in parallel** with `RouteSpec.meta.auth`. Drift allowed unauthenticated writes (e.g. admin `setting/Service` POST). ComptimeRouter already has `isPublic`; zapi auth middleware ignores it and uses a string path list. |
-| **Evidence** | `zapi/src/middleware/{auth,public_paths}.zig`; `zapi/src/main.zig` (catalog note); `zigmodu` `ComptimeRouter.zig` `Auth` / `isPublic`; unused `jwtAuthFromCatalog` |
+| **Evidence** | `zapi/src/middleware/{auth,public_paths}.zig`; `zapi/src/main.zig` (catalog note); `zmodu` `ComptimeRouter.zig` `Auth` / `isPublic`; unused `jwtAuthFromCatalog` |
 | **Proposal** | Generic `authFromCatalog(slot, Backend)` that skips JWT/session iff catalog says public for `(method, path)`. Deprecate / delete parallel bypass lists in consumers. |
 | **Acceptance** | zapi can delete `public_paths.zig`; changing `.meta.auth` alone changes runtime. |
 | **Status** | **Landed v0.15.31** |

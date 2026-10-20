@@ -1,4 +1,4 @@
-//! alpha-engine (P3) — a replay-driven trading pipeline on the ZigModu runtime,
+//! alpha-engine (P3) — a replay-driven trading pipeline on the zmodu runtime,
 //! split into modules and assembled in exactly one place, with an AI agent that
 //! may **propose** and may not **trade**.
 //!
@@ -68,7 +68,7 @@
 //! Run: `zig build run`.
 
 const std = @import("std");
-const zmodu = @import("zigmodu");
+const zmodu = @import("zmodu");
 
 /// The run's output *is* its report: the six `[assert]` lines are the acceptance
 /// gate, and framework chatter below `info` (module teardown, timer deliveries)
