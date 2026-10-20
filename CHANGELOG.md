@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.40.0] - 2026-10-20
 
 ### 路由：`RouteGroup` 移除，运行时注册收敛到 `Scoped`（**破坏性：是**）
 
