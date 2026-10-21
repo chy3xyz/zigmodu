@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>页面已移动 · zmodu</title>
+<script>
+  // The documentation used to live at /zmodu/<path>; it now lives under
+  // /zmodu/docs/<path>. Keep old bookmarks working (GitHub Pages serves this
+  // file for unknown paths at the site root).
+  (function () {
+    var base = "/zmodu";
+    var p = location.pathname;
+    if (p !== base && p !== base + "/" && p.indexOf(base + "/") === 0 &&
+        p.indexOf(base + "/docs/") !== 0) {
+      location.replace(base + "/docs/" + p.slice(base.length + 1));
+    }
+  })();
+</script>
+<p>这个页面已移动到 <a href="/zmodu/docs/">/zmodu/docs/</a>。</p>
+</html>
