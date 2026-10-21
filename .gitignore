@@ -114,7 +114,8 @@ __pycache__/
 # .github/workflows/docs.yml). The generic entry stays for local scratch.
 node_modules/
 
-# zdoc's documentation mode exports/refreshes its theme here on every run
-# from the repository root; the content is a copy of the built-in theme, so
-# it stays untracked.
-.zdoc-theme/
+# zdoc's documentation mode may export/refresh theme copies here on every run
+# from the repository root; those stay untracked. `site.yaml` is *our* config
+# (title / url_prefix / edit link) and is tracked.
+.zdoc-theme/*
+!.zdoc-theme/site.yaml

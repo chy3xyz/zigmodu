@@ -52,7 +52,7 @@ path——否则基数会爆）。未匹配/404 归入 `route="__unmatched__"`�
 （`ProductionConfig.max_route_series`，默认 64），超出的值统一落入
 `route="__other__"`，所以动态标签永远不会把抓取或内存撑爆。
 
-```promql
+```text
 # 哪个接口在慢 / 在报错
 histogram_quantile(0.95, sum(rate(http_request_duration_milliseconds_bucket[5m])) by (le, route))
 topk(5, sum(rate(http_responses_5xx_total[5m])) by (route))
@@ -213,7 +213,7 @@ try zmodu.http.Dashboard.registerRoutesWith(&scope, &source);
 
 ## 3. PromQL 速查
 
-```promql
+```text
 # 流量（QPS，5m）
 sum(rate(http_requests_total[5m]))
 
@@ -269,8 +269,7 @@ annotations:
 
 ## 6. Grafana
 
-导入 [`grafana/zmodu-overview.json`](../grafana/zmodu-overview.json)
-（Grafana → Dashboards → Import → 上传 JSON，数据源选 Prometheus）。
+面板按下面的 `zigmodu_*` 指标自建（数据源选 Prometheus）：
 面板：QPS、5xx 错误率、4xx 比率、P50/P95/P99 延迟、状态码分类堆叠、总请求数。
 
 ## 7. 日志与追踪

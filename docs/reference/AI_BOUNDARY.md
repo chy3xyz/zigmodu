@@ -24,7 +24,7 @@ AI 代码直接 import **驱动层**（`sqlx/sqlx.zig`、`persistence/backends/*
   `test/`）。直接 import 驱动层被**冻结在两个上限**（30 / 26），**只能减不能增** —— 新增一处就编译失败。
   计数下降时测试会打印一行，提醒把上限调低锁住成果。
 
-### `runtime.zig`（2026-09-17 加入白名单）
+## `runtime.zig`（2026-09-17 加入白名单）
 
 `src/ai/agent_worker.zig` 把 Agent 跑成运行时 worker（`todo3.md` §八 的 `Agent → Worker → Event`），
 所以 ai 要拿 `runtime.zig` 这个**领域桶**（`Runtime` / `Handle` / `WorkerContext`），不是 `runtime/` 下的内部文件。

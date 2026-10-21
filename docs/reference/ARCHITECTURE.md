@@ -533,7 +533,7 @@ CLI（报告+可选失败）跨模块直接 import 的纠缠     → doctor 的 
 | JWT `aud` 租户声明 | `http.jwtAuthFromCatalogWithPermissions` | 用 `generateTokenWithTenant`；attr `tenant_id`←`aud` |
 | Catalog RBAC gate | `permissionGateWith(.rbac)` | `RouteMeta.permission` ⊆ `permissions` CSV |
 
-#### 分片（`ShardRouter`）
+### 分片（`ShardRouter`）
 
 `ShardRouter` 把 `tenant_id` 映射到分片池索引。**三条 API**：
 

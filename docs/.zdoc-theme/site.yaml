@@ -1,0 +1,7 @@
+# Theme/config for the published documentation site (zdoc v0.17+).
+# `zdoc docs docs` picks this up automatically, so local preview and CI agree.
+title: zmodu
+lang: zh-CN
+url_prefix: /zmodu/
+footer: © 2026 zmodu · MIT
+edit_url: https://github.com/chy3xyz/zmodu/blob/master/docs/{path}

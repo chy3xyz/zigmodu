@@ -1,5 +1,6 @@
 ---
 layout: home
+title: zmodu
 
 hero:
   name: zmodu
@@ -8,36 +9,36 @@ hero:
   actions:
     - theme: brand
       text: Read the documentation
-      link: /README
+      link: /
     - theme: alt
       text: Architecture
-      link: /ARCHITECTURE
+      link: /reference/ARCHITECTURE
     - theme: alt
       text: Quick Start
-      link: /QUICK-START
+      link: /guide/QUICK-START
 
 features:
   - title: Modulith, not microservices
     details: Compose modules in one process while keeping their boundaries honest. Extract a service later if the boundary was real.
-    link: /MODULITH
+    link: /guide/MODULITH
     linkText: Modulith
   - title: Explicit routing
     details: One route table, resolved at comptime. No reflection, no string dispatch, no ambient registration.
-    link: /ROUTE_TABLE
+    link: /reference/ROUTE_TABLE
     linkText: Route table
   - title: Built-in observability
     details: Structured logging and Prometheus metrics with fairness guarantees across priority pools.
-    link: /OBSERVABILITY
+    link: /reference/OBSERVABILITY
     linkText: Observability
   - title: Distributed when needed
     details: A Raft implementation with mixed-version compatibility and mutation-tested invariants.
-    link: /DISTRIBUTED
+    link: /reference/DISTRIBUTED
     linkText: Distributed
 ---
 
-## Where to go next
+# Where to go next
 
-The **[documentation index](./dev/archive/README.md)** is the full map — it lists every document
+The **[documentation index](https://github.com/chy3xyz/zmodu/blob/master/docs/archive/README.md)** is the full map — it lists every document
 by role, so an agent or a newcomer can pick a path without guessing.
 
 Start with **[AGENTS.md](https://github.com/chy3xyz/zmodu/blob/master/AGENTS.md)**

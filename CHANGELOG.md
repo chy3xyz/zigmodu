@@ -1,5 +1,21 @@
 # Changelog
 
+## [Unreleased]
+
+### 文档：zdoc v0.17.0 + 站点配置收口
+
+- docs workflow 升到 **zdoc v0.17.0**（`ZDOC_VERSION` + `ZDOC_SHA256` 同步）。0.17 移除了
+  `--exclude`：`docs/dev/` 与 `docs/archive/` 的 section index 早已带 `exclude: true`，
+  现在由它负责排除（54 页不发布，无 HTML/sitemap/搜索项）。
+- 新增 `docs/.zdoc-theme/site.yaml`：`title` / `lang` / `url_prefix` / `footer` /
+  `edit_url`。CI 命令简化为 `./zdoc docs docs --output site-dist`，本地
+  `zdoc docs docs` 与线上一致，并给每页加上 “edit this page” 链接。
+- 修掉 0.17 报出的标题层级问题（`index.md`、`AI_BOUNDARY.md`、`ARCHITECTURE.md`），
+  landing 页的 hero/feature 链接改到真实路径（`/reference/…`、`/guide/…`），
+  首页的文档索引改指 GitHub 上的 `docs/archive/README.md`。
+- `OBSERVABILITY.md` 删掉指向仓库里并不存在的 `grafana/zmodu-overview.json` 的链接；
+  `promql` 代码块改为 `text`（0.17 不认这个语言标记，会逐块 warning）。
+
 ## [0.42.0] - 2026-10-20
 
 ### 破坏性：移除 `zigmodu` 兼容 + 修复 CLI 的 Linux 构建
