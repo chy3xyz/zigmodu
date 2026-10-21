@@ -2,6 +2,6 @@
 # `zdoc docs docs` picks this up automatically, so local preview and CI agree.
 title: zmodu
 lang: zh-CN
-url_prefix: /zmodu/
+url_prefix: /zmodu/docs/
 footer: © 2026 zmodu · MIT
 edit_url: https://github.com/chy3xyz/zmodu/blob/master/docs/{path}

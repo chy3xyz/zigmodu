@@ -2,7 +2,11 @@
 
 ## [Unreleased]
 
-### 文档：zdoc v0.17.0 + 站点配置收口
+### 文档：zdoc v0.17.0 + 官网 + 站点配置收口
+
+- **新增官网**（`site/`，zdoc site 模式）：landing（hero、安装命令、能力矩阵、代码示例、
+  文档/仓库入口）+ 自有样式；`zdoc site` 输出到 `site-dist`，文档构建到
+  `site-dist/docs`，同一 Pages artifact 发布。文档 URL 前缀改为 `/zmodu/docs/`。
 
 - docs workflow 升到 **zdoc v0.17.0**（`ZDOC_VERSION` + `ZDOC_SHA256` 同步）。0.17 移除了
   `--exclude`：`docs/dev/` 与 `docs/archive/` 的 section index 早已带 `exclude: true`，

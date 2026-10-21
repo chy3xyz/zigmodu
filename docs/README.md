@@ -2,6 +2,8 @@
 
 Comprehensive documentation for the zmodu modular framework.
 
+**官网**：[https://chy3xyz.github.io/zmodu/](https://chy3xyz.github.io/zmodu/)
+
 ## 📁 目录结构
 
 | 目录 | 放什么 | 判断依据 |

@@ -52,13 +52,19 @@ jobs:
           tar -xJf zdoc.tar.xz
           ./zdoc version
 
-      - name: Build documentation site
+      - name: Build official site
+        # `site/` is a zdoc site project (SuperMD + SuperHTML): the landing,
+        # its stylesheet and the links into the documentation. Built first so
+        # the docs tree can land in the same output directory.
+        run: ./zdoc site site --output site-dist
+
+      - name: Build documentation into /docs
         # Title, URL prefix, footer and the "edit this page" link live in
         # `docs/.zdoc-theme/site.yaml`, so a local `zdoc docs docs` matches
         # this build. `dev/` and `archive/` carry `exclude: true` in their
         # section index (zdoc 0.17's replacement for the removed `--exclude`
         # flag): no HTML, no sitemap entry, no search hit.
-        run: ./zdoc docs docs --output site-dist
+        run: ./zdoc docs docs --output site-dist/docs
 
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
