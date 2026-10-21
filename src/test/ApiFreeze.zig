@@ -61,7 +61,7 @@ const http = zmodu.http;
 
 /// The section of `docs/reference/UPGRADING.md` the rows are read from. A heading rename
 /// fails the sync test, which is the point: the table is the promise.
-const deprecation_heading = "## 弃用别名与删除计划";
+const deprecation_heading = "## Deprecated aliases and the removal plan";
 
 /// One row of that table, plus where its declaration lives. `doc_deprecated` /
 /// `doc_target` are the first backticked token of the row's first two columns,
@@ -157,7 +157,7 @@ const marker_window = 1500;
 /// Heading of the record `docs/reference/UPGRADING.md` keeps for names that already left
 /// the surface. They are deliberately *not* rows in the table: "removed no
 /// earlier than 1.0" would read as a promise that the name still works.
-const removed_heading = "### 已移除";
+const removed_heading = "### Removed";
 
 /// A name that used to be a consumer-facing entry point and no longer is.
 /// Recording it only pays off if the gate notices it coming back, so
@@ -989,8 +989,8 @@ fn checkDeprecatedMarkers(allocator: std.mem.Allocator) !void {
 // 2. Frozen entry points — mirrors docs/reference/API_FREEZE.md
 // ============================================================
 
-const freeze_heading = "## 冻结的入口类别";
-const preview_heading = "## 0.x 允许破坏的 preview 面";
+const freeze_heading = "## Frozen entry point categories";
+const preview_heading = "## Preview surface (0.x may break)";
 
 /// Anchor tokens are `Domain.Name`, `Schema.Name` or a bare top-level name.
 /// Matching is by the longest prefix in `namespaces`, so entries with a dotted

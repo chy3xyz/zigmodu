@@ -1,112 +1,83 @@
-# zmodu Quick Start
+# Quick Start
 
-Get up and running with zmodu in 5 minutes.
+This guide walks through installing the toolchain, creating a zmodu application, wiring an HTTP endpoint, and preparing the service for production.
 
-## Prerequisites
+## 1. Prerequisites
 
-zmodu tracks Zig's **development** API (`std.process.Init`, `std.Io.Mutex`,
-…), so a stable Zig release will not compile it. Install the exact dev build
-CI pins:
+zmodu requires **Zig 0.17.0** (matching `ZIG_VERSION` in `.github/workflows/ci.yml`).
+
+Install Zig 0.17.0 using [zigup](https://github.com/marler8997/zigup) or download the official tarball from [ziglang.org](https://ziglang.org/download/):
 
 ```bash
-# https://ziglang.org/download/ · zigup: https://github.com/marler8997/zigup
 zigup 0.17.0
-
-# `.github/workflows/ci.yml` → `ZIG_VERSION` is the source of truth. 0.17.0 is
-# a stable release (ziglang.org/download/0.17.0/…), so unlike the dev builds
-# the mirrors garbage-collected, this tarball stays.
-```
-
-Verify installation:
-```bash
 zig version
-# Should show the value pinned in .github/workflows/ci.yml → ZIG_VERSION,
-# e.g. 0.17.0
+# Expected: 0.17.0
 ```
 
-## Step 1: Create a Module
+If your application uses SQLite, PostgreSQL, or MySQL, install the corresponding C client libraries (optional when building with `-Ddb=none`):
 
-Create a new file `src/modules/user.zig`:
+```bash
+# macOS
+brew install sqlite3 libpq mariadb-connector-c
 
-```zig
-const std = @import("std");
-const zmodu = @import("zmodu");
-
-// `pub` matters: `main.zig` refers to it as `user.UserModule`.
-pub const UserModule = struct {
-    pub const info = zmodu.api.Module{
-        .name = "user",
-        .description = "User management module",
-        .dependencies = &.{},  // No dependencies
-    };
-
-    pub fn init() !void {
-        std.log.info("User module initialized", .{});
-    }
-
-    pub fn deinit() void {
-        std.log.info("User module cleaned up", .{});
-    }
-};
+# Ubuntu / Debian
+sudo apt-get install -y libsqlite3-dev libpq-dev libmariadb-dev libmariadb-dev-compat
 ```
 
-## Step 2: Bootstrap Application
+## 2. Option A: Generate a Project with `zmodu` CLI
 
-Create `src/main.zig`:
+The fastest way to start a structured project is with the built-in `zmodu` CLI generator.
 
-```zig
-const std = @import("std");
-const zmodu = @import("zmodu");
+Build the CLI from the zmodu repository root:
 
-// Import your modules
-const user = @import("modules/user.zig");
-
-pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
-    const io = init.io;
-
-    // Scan and register modules
-    var modules = try zmodu.scanModules(allocator, .{user.UserModule});
-    defer modules.deinit();
-
-    // Validate dependencies
-    try zmodu.validateModules(&modules);
-
-    // Generate documentation (optional)
-    try zmodu.generateDocs(&modules, "modules.puml", allocator, io);
-
-    // Build the application. Bind the builder first: its methods take `*Self`,
-    // and a function-call temporary materialises as `*const` — so the chained
-    // one-liner `zmodu.builder(…).build(…)` does not compile.
-    var b = zmodu.builder(allocator, io);
-    defer b.deinit();
-    var app = try b.build(.{user.UserModule});
-    defer app.deinit();
-
-    // start() runs each module's init() in dependency order; stop() reverses it.
-    try app.start();
-    defer app.stop();
-
-    std.log.info("Application started successfully!", .{});
-}
+```bash
+zig build zmodu
 ```
 
-## Step 3: Configure the Build
+Generate a complete modulith project from a SQL schema:
 
-`build.zig.zon` — declare the dependency. The very first `zig build` rejects the
-placeholder `.fingerprint` and prints the exact value to paste in:
+```bash
+./zig-out/bin/zmodu scaffold \
+  --sql examples/shopdemo/schema.sql \
+  --name my_app \
+  --out /tmp/my_app \
+  --with-auth \
+  --with-metrics
+```
+
+The generated project includes `build.zig`, `build.zig.zon`, `src/main.zig`, and domain modules under `src/modules/<name>/` (`model.zig`, `persistence.zig`, `service.zig`, `api.zig`, `module.zig`). See [CLI & Code Generation](./ZMODU_CLI_INTEGRATION.md) for all subcommands.
+
+## 3. Option B: Create a Project Manually
+
+### Project Layout
+
+```text
+myapp/
+├── build.zig
+├── build.zig.zon
+└── src/
+    ├── main.zig
+    └── modules/
+        └── user/
+            ├── module.zig
+            └── api.zig
+```
+
+### Step 1: Configure `build.zig.zon`
+
+Declare `zmodu` as a dependency. On the first `zig build`, Zig prints the expected `.fingerprint` value to copy into the manifest:
 
 ```zig
 .{
-    .name = .myapp,                 // must be a valid Zig identifier
+    .name = .myapp,
     .version = "0.1.0",
-    .fingerprint = 0x0,             // ← paste the value `zig build` suggests
+    .fingerprint = 0x0, // Replace with the value suggested by `zig build`
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        // Local checkout (what examples/basic uses — no `.hash` needed):
+        // Local checkout:
         .zmodu = .{ .path = "../zmodu" },
-        // …or a tagged release; `zig fetch --save <url>` fills in `.hash`:
-        // .zmodu = .{ .url = "git+https://github.com/chy3xyz/zmodu?ref=v0.25.0" },
+        // Or fetch a tagged release with `zig fetch --save <url>`:
+        // .zmodu = .{ .url = "git+https://github.com/chy3xyz/zmodu?ref=v0.42.0" },
     },
     .paths = .{
         "build.zig",
@@ -116,8 +87,9 @@ placeholder `.fingerprint` and prints the exact value to paste in:
 }
 ```
 
-`build.zig` — the `.db` argument selects which SQL drivers get linked (the
-default `all` links all three; full contract: `docs/SQLX_DRIVERS.md`):
+### Step 2: Configure `build.zig`
+
+Use the `.db` option to link only the SQL drivers your application needs (`sqlite`, `postgres`, `mysql`, `none`, or `all`):
 
 ```zig
 const std = @import("std");
@@ -126,8 +98,11 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Which SQL drivers to link (default: sqlite only). `-Ddb=` overrides.
-    const db_opt = b.option([]const u8, "db", "SQL drivers to link: all|sqlite|postgres|mysql (comma-list)") orelse "sqlite";
+    const db_opt = b.option(
+        []const u8,
+        "db",
+        "SQL drivers to link: all|sqlite|postgres|mysql|none",
+    ) orelse "sqlite";
 
     const zmodu_dep = b.dependency("zmodu", .{
         .target = target,
@@ -150,103 +125,151 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    const run_step = b.step("run", "Build and run the app");
+    const run_step = b.step("run", "Build and run the application");
     run_step.dependOn(&run_cmd.step);
 
     const tests = b.addTest(.{ .root_module = exe_mod });
     const run_tests = b.addRunArtifact(tests);
-    const test_step = b.step("test", "Run the app's tests");
+    const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
 }
 ```
 
-## Step 4: Run
+### Step 3: Define a Module and Route Table
 
-```bash
-# Build and run
-zig build run
-
-# Or just build
-zig build
-
-# Run tests
-zig build test
-```
-
-Expected output (trimmed):
-```
-info: All module dependencies validated successfully (1 modules)
-info: User module initialized
-info: Application 'app' started successfully
-info: Application started successfully!
-```
-
-## Going to production
-
-Before the first deploy, do these four things:
-
-Fragment — `server` / `allocator` come from your own `main` (runnable wiring:
-[`examples/tenant-mgmt`](../../examples/tenant-mgmt/)):
+Create `src/modules/user/module.zig`:
 
 ```zig
-// 1) one call: backpressure + security middleware + /metrics + /health/*
-var profile = zmodu.http.ProductionProfileState.init(allocator);
-defer profile.deinit(allocator);
-try zmodu.http.productionProfile(&server, .{
-    .max_connections = 4096,
-    .header_timeout_ms = 10_000,
-}, &profile);            // ⚠️ before router.mountAll / server.addRoute
+const std = @import("std");
+const zmodu = @import("zmodu");
+const http = zmodu.http;
 
-// 2) panic attribution (root file)
-pub const panic = zmodu.panicHook;
+pub const UserModule = struct {
+    pub const info = zmodu.api.Module{
+        .name = "user",
+        .description = "User management module",
+        .dependencies = &.{},
+    };
+
+    pub fn init() !void {
+        std.log.info("user module initialized", .{});
+    }
+
+    pub fn deinit() void {
+        std.log.info("user module stopped", .{});
+    }
+};
+
+pub const UserApi = struct {
+    pub const module_name = "user";
+    pub const nest = .{"users"};
+    pub const State = @This();
+
+    pub const routes = [_]http.RouteSpec(State){
+        .{ .method = .GET, .path = "{id}", .handler = getUser, .meta = .{ .auth = .public } },
+    };
+
+    fn getUser(ctx: *http.Context, _: *State) !void {
+        const id = try ctx.paramInt(i64, "id");
+        try ctx.jsonStruct(200, .{ .id = id, .name = "alice" });
+    }
+};
 ```
 
-3. Refuse to boot when misconfigured — `zmodu.Preflight.run(...)`
-   checks required env, placeholder JWT secrets, DB reachability, pending
-   migrations and clock skew (see `docs/BEST_PRACTICES.md`「上线前预检」).
-4. TLS terminates at a sidecar/gateway — reference topology in
-   [`../examples/production-deploy/`](../../examples/production-deploy/).
-5. Run under a supervisor (`Restart=always` / k8s `restartPolicy: Always`).
+### Step 4: Bootstrap the Application
 
-Read next: [`OBSERVABILITY.md`](../reference/OBSERVABILITY.md) (alerts + dashboard),
-[`BEST_PRACTICES.md`](./BEST_PRACTICES.md)「韧性」, [`ROUTE_TABLE.md`](../reference/ROUTE_TABLE.md) §7.4.
+Create `src/main.zig`:
 
-## What's Next?
+```zig
+const std = @import("std");
+const zmodu = @import("zmodu");
+const http = zmodu.http;
+const user = @import("modules/user/module.zig");
 
-| Tutorial | Description |
-|----------|-------------|
-| [Examples](../../examples/) | More complete examples |
-| [Best Practices](./BEST_PRACTICES.md) | Architecture + JWT / auth checklist |
-| [Declarative Routes](../reference/ROUTE_TABLE.md) | ComptimeRouter + catalog RBAC |
-| [AGENTS.md](../../AGENTS.md) | AI agent handbook |
-| [API Reference](../reference/API.md) | Detailed API docs |
-| [Architecture](../reference/ARCHITECTURE.md) | System design |
+pub const panic = zmodu.panicHook;
 
-## Common Commands
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+
+    // 1. Build and start the module graph.
+    // Bind the builder to a variable first because builder methods take `*Self`.
+    var b = zmodu.builder(allocator, io);
+    defer b.deinit();
+    var app = try b.withName("myapp").build(.{user.UserModule});
+    defer app.deinit();
+
+    try app.start();
+    defer app.stop();
+
+    // 2. Configure the HTTP server and production profile.
+    var server = http.Server.init(io, allocator, 8080);
+    defer server.deinit();
+
+    var profile = http.ProductionProfileState.init(allocator);
+    defer profile.deinit(allocator);
+    try http.productionProfile(&server, .{
+        .max_connections = 4096,
+        .header_timeout_ms = 10_000,
+    }, &profile);
+
+    // 3. Mount module routes.
+    var user_api = user.UserApi{};
+    const AppState = struct {};
+    var app_state = AppState{};
+    var router = http.Router(AppState).init(io, allocator, &server, &app_state);
+    defer router.deinit();
+
+    var api_v1 = router.scope("/api/v1");
+    try api_v1.mountAll(.{
+        .{ .Mod = user.UserApi, .state = &user_api },
+    });
+
+    try server.start();
+}
+```
+
+### Step 5: Build, Run, and Verify
 
 ```bash
-# Development
-zig build run          # Run application
-zig build test         # Run tests
-zig fmt                # Format code
-
-# Production
-zig build -Doptimize=ReleaseSafe  # Optimized build
-zig build install                   # Install binary
-
-# Documentation
-zig build docs        # Generate docs
+zig build run
 ```
 
-## Troubleshooting
+In another terminal, query the endpoints:
 
-**"error: module not found"**
-- Ensure `build.zig.zon` has correct paths
+```bash
+curl -s http://127.0.0.1:8080/api/v1/users/42
+# {"id":42,"name":"alice"}
 
-**"error: circular dependency"**
-- Check Module.info.dependencies
+curl -s http://127.0.0.1:8080/health/live
+# UP
 
-**"missing init/deinit"**
-- Every module must implement both functions
+curl -s http://127.0.0.1:8080/metrics | head -n 5
+```
 
-For more help, see [CONTRIBUTING.md](../../CONTRIBUTING.md) or open an issue.
+## 4. Production Checklist
+
+Before deploying a service, verify these four items:
+
+1. **Mount `productionProfile` before registering routes**: `Server.addRoute` snapshots global middleware at registration time. Calling `http.productionProfile` first enables connection limits (`max_connections`), slowloris protection (`header_timeout_ms`), `/metrics`, and `/health/*`.
+2. **Install `panicHook`**: Export `pub const panic = zmodu.panicHook;` in `src/main.zig` so panic stack traces include the active `METHOD /path`.
+3. **Run startup preflight checks**: Call `zmodu.Preflight.run(...)` at boot to reject missing environment variables, placeholder JWT secrets, unreachable databases, pending migrations, or clock skew.
+4. **Terminate TLS at a gateway or sidecar**: Place Nginx or Envoy in front of the service. Reference configurations are in [`examples/production-deploy/`](../../examples/production-deploy/).
+
+## 5. Common Commands
+
+```bash
+zig build                          # Compile the project
+zig build run                      # Compile and run
+zig build test                     # Run unit tests
+zig build -Ddb=sqlite              # Link only SQLite
+zig build -Doptimize=ReleaseSafe   # Production build with safety checks
+zig fmt src/                       # Format source files
+```
+
+## Next Steps
+
+- [Modulith Architecture](./MODULITH.md): Module boundaries and communication rules.
+- [Domain Layers](./MODULE_LAYERS.md): Structuring `model`, `persistence`, `service`, and `api`.
+- [Declarative Routing & Auth](../reference/ROUTE_TABLE.md): JWT authentication and RBAC permission gates.
+- [SQLx Drivers](./SQLX_DRIVERS.md): Selective driver linking and cross-compilation.

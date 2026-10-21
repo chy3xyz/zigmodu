@@ -1,394 +1,88 @@
 # zmodu v0.42.0
 
-**Compile-time modular application framework + worker-oriented execution runtime, for Zig 0.17.**
-
-Two planes, one library — adopt either, or both:
-
-| Plane | What you get | Start here |
-|-------|--------------|-----------|
-| **Application plane** (the default) | Modules with compile-time dependency validation, lifecycle, DI, HTTP/1.1 + h2c + WebSocket + gRPC, SQLx / ORM / migrations, cache + Redis, events + transactional outbox, JWT / RBAC / multi-tenancy, resilience, metrics + tracing | [Quick Start](docs/guide/QUICK-START.md) · [Modulith](docs/guide/MODULITH.md) |
-| **Execution plane** (opt-in) | Workers that own their state, bounded mailboxes, lock-free queues, a fan-out whose `publish` takes no lock, timers (ms **and** µs), supervision, delivery replay from a segment log | [Runtime](docs/reference/RUNTIME.md) |
-
-An app that never calls `app.runtime()` spawns **no extra threads** — the application plane stands alone.
-The execution plane is where one-fiber-per-request stops being the right shape: market data and order
-books, realtime gateways, AI agent loops, IoT state machines. It is not a port of anything: comptime
-track types, hand-written queues, no hidden allocation on the hot path (that last one is a **tested
-contract**, not a slogan — see [how it is verified](#-how-it-is-verified)).
-
-The module system follows the **Modulith** idea — one process, hard module boundaries, split into
-services only after the boundary is proven — with the dependency rules enforced at compile time.
+A compile-time modular application framework and worker execution runtime for Zig 0.17.
 
 [![Zig](https://img.shields.io/badge/Zig-0.17+-orange?style=flat-square)](https://ziglang.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
 [![Version](https://img.shields.io/github/v/release/chy3xyz/zmodu?style=flat-square)]()
 [![CI](https://github.com/chy3xyz/zmodu/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/chy3xyz/zmodu/actions/workflows/ci.yml)
 
-## 📚 Documentation
+[English](README.md) | [Chinese](README.zh.md)
 
-| Guide | Description |
-|-------|-------------|
-| [**AGENTS.md**](AGENTS.md) | **AI agent handbook** (DO/DON'T, Path A auth, ComptimeRouter) |
-| [Quick Start](docs/guide/QUICK-START.md) | Get started in 5 minutes |
-| [**Runtime**](docs/reference/RUNTIME.md) | **The execution plane**: workers, mailboxes, scheduler, timers, supervision, replay |
-| [Modulith & Concurrency](docs/guide/MODULITH.md) | Day-one modulith + high-concurrency practices |
-| [Best Practices](docs/guide/BEST_PRACTICES.md) | Both planes: architecture evolution, JWT checklist, resilience, and where the runtime earns its keep |
-| [Declarative Routes](docs/reference/ROUTE_TABLE.md) | ComptimeRouter + catalog JWT/RBAC |
-| [Events & DI](docs/guide/EVENTS_DI.md) | `initWith(ctx)` + `app.eventBus` + container freeze |
-| [zmodu × zent](docs/reference/ZENT.md) | **Recommended pairing for commerce/social**: zent ORM integration best practices |
-| [SQLx drivers](docs/guide/SQLX_DRIVERS.md) | Selective driver linking (`-Ddb=`, `.db=`) |
-| [Distributed](docs/reference/DISTRIBUTED.md) | Multi-instance, cluster stack, fail-closed startup |
-| [Agent Runtime](docs/reference/AGENT_RUNTIME.md) | **Agents can't act by default**: `Guard` (two fail-closed axes — an `execute` second switch + empty-by-default allow list) |
-| [Observability](docs/reference/OBSERVABILITY.md) | Golden signals, PromQL, alert thresholds, Grafana dashboard |
-| [API Reference](docs/reference/API.md) | Detailed API documentation |
-| [Architecture](docs/reference/ARCHITECTURE.md) | System design and patterns |
-| [Upgrading](docs/reference/UPGRADING.md) | Per-version notes: what changed in behavior, and the one-line fixes |
-| [Status & readiness](docs/dev/v1.0-readiness-v0.35.md) | **What is proven and what is not** — dated, per item, with evidence (for the older self-scoring report, see [Evaluation Report](docs/archive/status/EVALUATION_REPORT.md)) |
-| [Examples](examples/) | Runnable example projects |
-| [Production deploy](examples/production-deploy/) | TLS sidecar (nginx/Envoy), k8s, systemd, Dockerfile, request-smuggling e2e |
-| [zmodu CLI](docs/guide/ZMODU_CLI_INTEGRATION.md) | Built-in codegen (`zig build zmodu`) |
+## Overview
 
-## ✨ Features
+zmodu provides two orthogonal planes in a single library:
 
+| Plane | Capabilities | Entry Point |
+|-------|--------------|-------------|
+| **Application Plane** (default) | Compile-time module graph validation, lifecycle hooks, DI container, HTTP/1.1 + HTTP/2 + WebSocket + gRPC, SQLx / ORM / migrations, Redis + LRU cache, EventBus + transactional outbox, JWT / RBAC / multi-tenancy, resilience primitives, Prometheus metrics, OpenTelemetry tracing | [Quick Start](docs/guide/QUICK-START.md) · [Modulith Guide](docs/guide/MODULITH.md) |
+| **Execution Plane** (opt-in) | Single-owner state workers, bounded mailboxes, lock-free SPSC/MPSC rings, lock-free `HotBus` fan-out, millisecond `TimerWheel` and microsecond `PrecisionTimer`, supervision trees, deterministic delivery log replay (`ZDL1`) | [Runtime Reference](docs/reference/RUNTIME.md) |
 
-### Core Framework
-- **Module System** — Declarative module definition with compile-time dependency validation
-- **Lifecycle Management** — Automatic init/deinit orchestration in dependency order; modules opt into framework facilities via `initWith(ctx)`
-- **Dependency Injection** — Type-safe container built into `Application`: register at startup (`withService` / `registerBorrowed`), frozen after `start()`, lock-free reads thereafter
-- **Event System** — Application-wide `EventRegistry` hands out thread-safe per-type buses (`app.eventBus(T)`); plus TypedEventBus and the transactional outbox pattern (`zmodu.outbox.*`)
-- **Application Builder** — Fluent API with shutdown hooks and graceful termination
+Applications that do not call `app.runtime()` spawn zero background runtime threads. The execution plane is designed for workloads where one fiber per request is insufficient, such as order books, realtime gateways, AI agent loops, and stateful pipelines.
 
-### HTTP & API
-- **HTTP Server** — Async fiber-based server (kqueue/io_uring), trie router, middleware chains
-- **WebSocket** — RFC 6455 server (text + **binary** data frames via `WsFrameKind`); origin validation and monitoring
-- **gRPC** — Unary framing + registry invoke + HTTP/1.1 `application/grpc` client (`GrpcFrame` / `GrpcClient.bindLocal`)
-- **OpenAPI** — 3.0/3.1 JSON document generator from route metadata
-- **Idempotency** — Request deduplication middleware with TTL-based store
+## Quick Start
 
-### Resilience & Flow Control
-- **Circuit Breaker** — Three-state (closed/open/half-open) with configurable thresholds
-- **Rate Limiter** — Token bucket with per-client overrides
-- **Retry Policy** — Exponential backoff with configurable jitter
-- **Load Shedder** — Adaptive concurrency limiting
-- **Saga Orchestrator** ⚠️ — Automatic compensation with reverse-order rollback + step logging (experimental)
+### 1. Prerequisites
 
-### Data & Persistence
-- **SQLx** — PostgreSQL / MySQL / SQLite with connection pooling + circuit breaker
-- **ORM** — Type-safe repository pattern with compile-time table mapping
-- **Database Migrations** — Flyway/Liquibase-style versioned migrations with SHA256 checksums
-- **Cache Manager** — LRU cache with TTL expiration
-- **Redis Client** — Connection pooling and command pipeline
-- **Connection Pool** — Generic resource pool with health checking
+Install Zig `0.17.0` (pinned in `.github/workflows/ci.yml`):
 
-### Distributed Systems
-- **DistributedEventBus** ⚠️ — Cross-node event pub/sub with heartbeat (experimental)
-- **ClusterMembership** ⚠️ — Gossip-based node discovery + health check (experimental)
-- **DistributedTransaction** ⚠️ — 2PC + Saga patterns (experimental; 2PC coordinator state persists via `TransactionJournal`)
-- **Kafka Connector** — Producer/Consumer with topic stats + EventBridge
-- **Sharding** — Tenant-aware ShardRouter with configurable pools
-
-### Observability
-- **Distributed Tracing** — OpenTelemetry-compatible (`OtlpExporter` OTLP/HTTP JSON + retries)
-- **Prometheus Metrics** — Counter / Gauge (lock-free CAS) / Histogram / Summary
-- **Structured Logging** — JSON-formatted with log rotation and levels
-- **Auto Instrumentation** — Automatic lifecycle/event/API instrumentation
-- **Health Endpoints** — K8s-compatible liveness/readiness/module-health probes
-
-### Security
-- **AppSecurity** — Production JWT (`initWithIo`, wall-clock exp, middleware helpers)
-- **JWKS Key Rotation** — Dynamic multi-key management with `JwksKeyRing` & `kid` indexing
-- **JWT Authentication** — Unified verify via `SecurityModule`; RBAC optional
-- **Password Encoder** — PBKDF2-HMAC-SHA256 + timing-safe comparison
-- **Security Scanner** — Static SAST with configurable rules
-- **Secrets Manager** — Multi-source secrets (env > file > Vault KV v2 HTTP > default)
-- **Multi-Tenancy (optional)** — TenantContext + DataPermission + ShardRouter; skip for single-tenant
-
-### Tooling & CLI
-- **zmodu CLI** — Built-in code generator (`zig build zmodu`) supporting SQL DDL parsing, `@initialized` model & MCP Server
-
-- **Security Headers** — HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy
-- **CSRF Protection** — Double-submit cookie pattern with CSPRNG tokens
-- **Path Sanitizer** — Traversal prevention (rejects `..`, null, `/`, `\`)
-- **Auth Rate Limiting** — Login brute-force protection
-
-### AI & LLM
-- **AI Provider** — Cache-optimized OpenAI-compatible client with connection pool
-- **SkillRegistry** — Agent tool registration + dispatch (Thread-safe, `EnsureTotalCapacity`)
-- **MemoryStore** — Cross-session memory with `remember`/`recall`/`forget`, LRU eviction
-- **SSE Writer** — Server-Sent Events with retry, heartbeat, multi-line data
-- **ReAct Loop** — Autonomous agent (think→act→observe→repeat)
-- **Agent Guard** — Fail-closed authority gate: `read`/`propose`/`execute` classes, `execute` needs an explicit second switch, empty allow list = inert agent
-
-### Performance
-- **ArenaAllocator** — Per-connection arena (0 heap allocs/request, resets on keep-alive)
-- **Object Pool** — ConnectionEntry free-list (0 allocs in IM register/unregister)
-- **`ensureTotalCapacity`** — Pre-allocate HashMap/ArrayList in 4 hot-path containers
-- **`@branchHint`** — Hot-path hints on CircuitBreaker + RateLimiter
-- **Path Rewriter** — Pre-routing URL transformation (ThinkPHP compat, prefix stripping)
-
-### High-Performance Runtime (the execution plane)
-
-Opt-in via `app.runtime()`. Spec: [docs/reference/RUNTIME.md](docs/reference/RUNTIME.md) · runnable:
-[runtime-workers](examples/runtime-workers) · workload: [alpha-engine](examples/alpha-engine).
-
-**Workers & scheduling**
-- **Worker** — One struct with `handle` (per-message) or `run` (long-lived loop); the
-  runtime owns its thread, its mailbox and its lifecycle (`init`/`deinit` run once,
-  shutdown joins every worker)
-- **Worker pool** — `.mode = .dedicated` (one worker, one thread) or `.mode = .pooled`
-  (N workers over N pool threads). Worker **state ownership** is preserved across the
-  pool: a claim token guarantees only one thread runs a given worker at a time, and the
-  mailbox FIFO and `error.Full` backpressure are unchanged
-- **Blocking pool** — `.execution_class = .blocking` moves a worker off the CPU pool
-  (declare the width with `Application.withBlockingThreads`); a DB round trip then cannot
-  drain the pool the scheduler dispatches from. Declared, never guessed: nothing detects
-  a blocking call for you
-- **Stop policy & supervision** — per-worker failure policy (fail-fast or a bounded error
-  budget inside a window) plus an `onError` hook to decide on the spot
-
-**Queues & fan-out**
-- **Mailbox** — Bounded blocking hand-off between threads; a full mailbox is
-  `error.Full` at the producer, never an unbounded grow (**backpressure below HTTP**)
-- **RingBuffer (SPSC)** — Lock-free, cache-line-separated indices, fixed capacity
-- **MpscRing** — Vyukov many-producer/single-consumer queue (per-producer order kept)
-- **HotBus** — L0 fan-out into worker mailboxes; frozen after construction, so `publish`
-  takes no lock and allocates nothing; drops on full and counts it. Deliberately **not** a
-  general-purpose event bus — the application plane already has one
-
-**Time**
-- **TimerWheel** — Hierarchical O(1) schedule/cancel, millisecond slots; lateness surfaces
-  as `timer_lag_max_ms`
-- **PrecisionTimer** — the µs tool, and a different one on purpose: min-heap + spin window,
-  measured **p50 0 ns / p99 1 µs**. Not a replacement for the wheel, and not a new clock type
-- **Clock** — Injectable time source (`monotonic` in production, `manual` in tests/replay)
-
-**Replay & observability**
-- **EventRecorder** — Opt-in, zero-allocation log of the delivery stream: attach a
-  `Recorder(E, capacity)` to a `HotBus` before `freeze()` and every publish is recorded
-  with a monotonic seq and the injected clock. A full log returns `error.Full` (never a
-  silent drop), counts `record_dropped` and makes `publish` return false
-- **Replay from disk** — `DeliveryLog` writes the same tracks to segment files
-  (`ZDL1`, per-track cursors, holes counted), and `ReplayFromLog` replays *from those
-  bytes* through a caller-supplied `Codec(E)`. Still out of scope, on purpose: a CLI,
-  retention/compaction, encryption, cross-process transport
-- **Runtime metrics** — `RuntimeStats` + `MetricsBridge` publishes **31**
-  `zigmodu_runtime_*` gauges (13 general + 9 CPU pool + 9 blocking pool + 6 fairness); drops, timer lag
-  and pool depth are invisible from the HTTP side
-- **Worker trace context** — `sendTraced` / `sendBlockingTraced` carry a 16-byte
-  `TraceId` **in the mailbox slot** (no allocation, no shared producer state); the
-  handler reads it back with `ctx.traceId()`, `after` hands it to the timer, and
-  runtime error logs tag the offending message's trace
-- **Affinity** — `runtime.affinity.pinCurrentThread(cpu)` pins the *calling* thread on
-  Linux; macOS and Windows return `error.Unsupported` rather than reporting a pin that
-  did not happen. There is no `.affinity` field on `spawn` yet, and the reason is in
-  [RUNTIME.md §12.7](docs/reference/RUNTIME.md)
-
-**What this plane deliberately does not have (yet)** — priority / weighted fairness,
-a deterministic-execution mode, remote workers. Each is refused with a stated reason
-rather than half-built; the list is in [RUNTIME.md](docs/reference/RUNTIME.md) §12.7.
-
-### Developer Experience
-- **Architecture Tester** — Compile-time dependency rule validation
-- **Module Interaction Verifier** — Spring Modulith verify()-style interaction model checking
-- **Contract Testing** — Pact-style consumer-driven contract verification
-- **Plugin System** ⚠️ — Dynamic extension loading (experimental)
-- **Web Monitor** ⚠️ — HTTP dashboard for module inspection (experimental)
-- **Hot Reloader** ⚠️ — File-watch based module change detection (experimental)
-- **CI/CD Pipeline** — GitHub Actions: matrix build (linux/macOS), lint, benchmark, Docker, release
-
-## 🚧 What it is not (price these in before adopting)
-
-### Maturity status — read this first
-
-**This is `pre-1.0` (feature-frozen stage).** The engineering is mature; the **trust** structure is not.
-
-| | |
-|---|---|
-| Version | `0.39.x` — **all 99 releases so far are 0.x.** No LTS, no backport commitment |
-| Feature surface | **Frozen** until 1.0 — defects, evidence, docs only (see AGENTS.md "Release cadence") |
-| Breaking changes | **None accepted** before 1.0 (historically 6 / 99 releases) |
-| Audit | **None.** Every "done" here came from the same maintainers and their AI agents (see "Self-assessed" below) |
-| Contributors | Single owner; **2 outside PRs merged** (`@knot3bot`) — see [GOVERNANCE.md](GOVERNANCE.md) |
-| Real-world use | **Yes** — e.g. [zasdoor](https://github.com/chy3xyz/zasdoor) (an IAM system, 79 backend tests) runs on it |
-
-**What this means for you**: use it if your team can carry its own risk and read the
-boundaries below. **Do not** put it under an SLA you cannot afford to break, and do not
-assume a response time — [`GOVERNANCE.md`](GOVERNANCE.md) commits to none.
-
-Two paths in, both legitimate:
-
-- **Adopting it** — read the boundaries below and [SECURITY.md](SECURITY.md) first.
-- **Helping** — the highest-value contribution needs no context on 185k lines:
-  [report a doc number that no longer matches the code](.github/ISSUE_TEMPLATE/docs_drift.yml).
-
-A feature list is the least useful half of a README. These boundaries decide deployment shape:
-
-- **Cluster upgrades are a hard cut.** The Raft frame format and the bus handshake changed, and an old
-  and a new binary do not understand each other in either direction — deliberately, so that there is no
-  "degrade to unauthenticated" path. Mixed-version interop is still unsupported, but the refusal is now
-  gated: `scripts/ci-mixed-version.sh` (nightly CI) runs a v0.32.0 node against the current tree and
-  asserts the new side rejects its bare frames and keeps a working quorum.
-- **No encryption on the wire.** Cluster frames are plaintext + per-frame HMAC-SHA256
-  (authentication and integrity, **not confidentiality**). Keep cluster ports on trusted L2
-  (VPC / leased line / localhost); across trust boundaries terminate mTLS in a sidecar or
-  service mesh — the boundary is defined in the "Transport encryption boundary (A-2)" section
-  of [docs/reference/DISTRIBUTED.md](docs/reference/DISTRIBUTED.md), with topology references in
-  [examples/production-deploy](examples/production-deploy/). The PSK auth helpers live in
-  `src/core/cluster/ClusterAuth.zig`.
-- **Cluster identity is opt-in per-node, not the default.** With `own_key`/`peer_keys` configured,
-  only the holder of node X's key can appear as X — on the bus via the challenge-response handshake,
-  on the Raft port via the self-declared id inside every frame's MAC coverage — and both planes take
-  runtime rotation (dual-key windows) and revocation. A `cluster_secret`-only setup keeps the legacy
-  behavior byte-for-byte: frames are authenticated, but any holder of the PSK can claim any node id.
-- **`ws_uring` is Linux-only** (io_uring); other platforms take the portable path.
-- **⚠️ marks experimental modules** — Saga, SecurityScanner, DistributedEventBus, ClusterMembership,
-  2PC, Plugin, WebMonitor, HotReloader. They have tests; they do not have a production track record here.
-- **AI is an optional domain, not the core.** `src/ai` is a small share of the tree and the
-  HTTP / data / security / observability core does not depend on it. Agents cannot act by default
-  ([AGENT_RUNTIME.md](docs/reference/AGENT_RUNTIME.md)).
-- **Self-assessed.** Every "done" here was produced by the same maintainers and their AI agents; there
-  has been no independent audit. The dated, per-item version of that sentence is
-  [docs/dev/v1.0-readiness-v0.35.md](docs/dev/v1.0-readiness-v0.35.md).
-
-## 🔬 How it is verified
-
-The gates are the reason to trust any of the above, and all of them run locally:
-
-| Gate | What it proves | Command |
-|------|----------------|---------|
-| Full suite (`-Ddb=all`) | 2000+ tests over 8 artifacts | `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test` |
-| Allocation **contract** | exact zero allocations on the mailbox / ring / HotBus / `send` / timer hot paths | `src/runtime/alloc_contract_test.zig` |
-| Production gate | no bare `catch {}` in hot modules, CSPRNG source, fuzz declarations match the tree | `zig build check` |
-| API import gate | examples go through the canonical `zmodu.http` | `zig build check-api` |
-| Dead-code ratchet | baseline 32 in `src`+`tools` (30 + 2), 0 in `examples` | `bash scripts/check-deadcode.sh` |
-| Benchmark ratchet | 32 metrics against a CI baseline + 32 allocation budgets | `bash scripts/check-bench.sh` |
-| Soak (HTTP + tenants) | cross-tenant leaks, FrozenMap concurrency, fd/slot growth | `zig build soak` |
-| Soak (cluster) | 3-node raft + bus: seq continuity, leader stability, log convergence, fd/RSS | `zig build soak-cluster` |
-| Runtime stress | supervision, pools, ready ring, timers and zero-allocation under interleaving | `zig build runtime-stress` |
-| Smuggling e2e | a real nginx in front: every request the backend served is one the gateway saw | `examples/production-deploy/smuggling-e2e/run.sh` |
-| Cross-compile | x86_64-linux (plus a Windows leg in CI) compiles clean | `zig build test -Dtarget=x86_64-linux -Ddb=none` (compile-only off Linux; the run step cannot execute) |
-
-Readings follow one convention so a number means exactly one thing:
-[docs/dev/READING_NUMBERS.md](docs/dev/READING_NUMBERS.md).
-
-## 🚀 Quick Start
-
-### Fast Compilation
-
-For large projects, import only the domains you need:
-
-```zig
-const zmodu = @import("zmodu");
-
-// Builder wiring. This is a fragment, not a whole `main`: `allocator` / `io`
-// come from `std.process.Init` (see "Bootstrap Application") and `UserModule`
-// is defined in "Create Your First Module". Bind the builder first — a builder
-// method takes `*Self`, and a temporary materialises as `*const`:
-var b = zmodu.builder(allocator, io);
-defer b.deinit();
-var app = try b.build(.{UserModule});
-_ = app;
-
-// Fast import: only HTTP + Core (skips SQLx, Redis, Kafka, etc.):
-const http = zmodu.http;       // Server, middleware, client, OpenAPI
-const data = zmodu.data;       // SQLx, Redis, ORM, Cache, Migrations
-const sec  = zmodu.security;   // Auth, RBAC, API keys, Secrets
-const obs  = zmodu.observability; // Prometheus, Tracing, Logging
+```bash
+zigup 0.17.0
+zig version
 ```
 
-Each domain file is self-contained — importing `zmodu.http` does not compile `sqlx` or `redis`.
+### 2. Dependency Configuration
 
-### Project setup: `build.zig.zon` + `build.zig`
-
-Declare the dependency in `build.zig.zon`. The first `zig build` rejects the
-placeholder `.fingerprint` and prints the exact value to paste in:
+Add `zmodu` to `build.zig.zon`:
 
 ```zig
 .{
-    .name = .myapp,                 // must be a valid Zig identifier
+    .name = .myapp,
     .version = "0.1.0",
-    .fingerprint = 0x0,             // ← paste the value `zig build` suggests
+    .fingerprint = 0x0, // Replace with the fingerprint suggested by the first `zig build`
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        // Local checkout (what examples/basic uses — no `.hash` needed):
         .zmodu = .{ .path = "../zmodu" },
-        // …or a tagged release; `zig fetch --save <url>` fills in `.hash`:
-        // .zmodu = .{ .url = "git+https://github.com/chy3xyz/zmodu?ref=v0.25.0" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }
 ```
 
-Then link only the database drivers you need (the dependency's default is `all`,
-which pulls in all three):
+In `build.zig`, select the database drivers to link (`sqlite`, `postgres`, `mysql`, `none`, or `all`):
 
 ```zig
-const zigmodu_dep = b.dependency("zmodu", .{
+const db_opt = b.option([]const u8, "db", "SQL drivers: all|sqlite|postgres|mysql|none") orelse "sqlite";
+
+const zmodu_dep = b.dependency("zmodu", .{
     .target = target,
     .optimize = optimize,
-    .db = db_opt, // or postgres | mysql | "sqlite,postgres" | all
+    .db = db_opt,
 });
+exe_mod.addImport("zmodu", zmodu_dep.module("zmodu"));
 ```
 
-`-Ddb=` on the command line only exists if *your* `build.zig` declares the
-option (the framework examples that support it do the same):
+### 3. Domain Imports
+
+Import only the domains your module needs:
 
 ```zig
-const db_opt = b.option([]const u8, "db", "SQL drivers to link: all|sqlite|postgres|mysql (comma-list)") orelse "sqlite";
-```
-
-```bash
-zig build -Ddb=sqlite          # apps / examples (needs the option above)
-zig build test                 # framework tests: keep default all
-zig build soak                 # concurrency soak: N clients x M tenants (real sockets)
-```
-
-A complete `build.zig` (install + `run` + `test` steps) is in
-[docs/guide/QUICK-START.md](docs/guide/QUICK-START.md) Step 3.
-
-Production: one call wires backpressure, security, `/metrics` (golden signals)
-and `/health/*`. It must run **before** routes are registered. Fragment —
-`server` / `allocator` come from your own `main` (runnable wiring:
-[`examples/tenant-mgmt/`](examples/tenant-mgmt/)):
-
-```zig
-var server = zmodu.http.Server.init(io, allocator, 8080);
-var profile = zmodu.http.ProductionProfileState.init(allocator);
-defer profile.deinit(allocator);
-try zmodu.http.productionProfile(&server, .{
-    .max_connections = 4096,
-    .over_limit_response = .close,  // or .unavailable to answer 503 first
-    .header_timeout_ms = 10_000,    // request line + headers (slowloris guard)
-}, &profile);
-```
-
-Deployment topology (TLS at a sidecar/gateway, graceful restarts, probes):
-[`examples/production-deploy/`](examples/production-deploy/) ·
-dashboards & alerting: [`docs/reference/OBSERVABILITY.md`](docs/reference/OBSERVABILITY.md).
-
-Disabled drivers → C stubs; runtime `error.DriverNotEnabled` (HTTP 400). Full guide: **[docs/guide/SQLX_DRIVERS.md](docs/guide/SQLX_DRIVERS.md)**.
-
-### Prerequisites
-
-```bash
-# Install the pinned Zig toolchain — CI uses this exact release:
-zigup 0.17.0
-# (https://ziglang.org/download/ · https://github.com/marler8997/zigup)
-
-# dev builds are garbage-collected from ziglang's mirrors (old ones start
-# returning 404), so the version above goes stale by design — treat
-# `.github/workflows/ci.yml` → `ZIG_VERSION` as the source of truth.
-# `brew install zig` installs a *stable* Zig, which does NOT compile this repo
-# (the framework needs the dev API: `std.process.Init`, `std.Io.Mutex`, …).
-```
-
-### Create Your First Module
-
-```zig
-// src/modules/user.zig
-const std = @import("std");
 const zmodu = @import("zmodu");
 
-// `pub` matters: `main.zig` refers to it as `user.UserModule`.
+const http = zmodu.http;              // Server, Router, Context, Middleware, extract*, sse
+const data = zmodu.data;              // SQLx, Repository, MigrationRunner, Cache, Redis
+const sec  = zmodu.security;          // AppSecurity, CatalogPermDb, PasswordEncoder, Secrets
+const obs  = zmodu.observability;     // PrometheusMetrics, DistributedTracer, OtlpExporter
+```
+
+### 4. Minimal Application & HTTP Server
+
+```zig
+const std = @import("std");
+const zmodu = @import("zmodu");
+const http = zmodu.http;
+
+pub const panic = zmodu.panicHook;
+
 pub const UserModule = struct {
     pub const info = zmodu.api.Module{
         .name = "user",
@@ -396,91 +90,39 @@ pub const UserModule = struct {
         .dependencies = &.{},
     };
 
-    pub fn init() !void {
-        std.log.info("User module initialized", .{});
-    }
-
-    pub fn deinit() void {
-        std.log.info("User module cleaned up", .{});
-    }
+    pub fn init() !void {}
+    pub fn deinit() void {}
 };
-```
-
-### Bootstrap Application
-
-```zig
-// src/main.zig
-const std = @import("std");
-const zmodu = @import("zmodu");
-
-const user = @import("modules/user.zig");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
+    const io = init.io;
 
-    var modules = try zmodu.scanModules(allocator, .{user.UserModule});
-    defer modules.deinit();
+    // Bind the builder first because builder methods take `*Self`.
+    var b = zmodu.builder(allocator, io);
+    defer b.deinit();
+    var app = try b.withName("myapp").build(.{UserModule});
+    defer app.deinit();
 
-    try zmodu.validateModules(&modules);
-    try zmodu.startAll(&modules);
-    defer zmodu.stopAll(&modules);
+    try app.start();
+    defer app.stop();
 
-    std.log.info("Application started!", .{});
-}
-```
-
-### Events & DI (Application built-in)
-
-Fragment — `OrderModule` / `OrderEvent` / `AppConfig` / `auditListener` are
-yours, and `allocator` / `io` come from `std.process.Init`:
-
-```zig
-// Module opts into framework facilities via initWith(ctx):
-pub fn initWith(ctx: *zmodu.ModuleContext) !void {
-    const bus = try ctx.eventBus(OrderEvent);            // shared thread-safe bus
-    const cfg = ctx.service(AppConfig, "config") orelse
-        return error.MissingService;                     // fail fast at startup
-    _ = bus; _ = cfg;
-}
-
-// main wires shared services; container freezes after start():
-var b = zmodu.builder(allocator, io);                    // bind first: a builder method takes *Self
-defer b.deinit();
-var app = try b
-    .withService(AppConfig, "config", &config)           // borrowed: not destroyed by container
-    .build(.{OrderModule});
-defer app.deinit();
-try app.start();                                          // initWith runs → services frozen
-
-const bus = try app.eventBus(OrderEvent);                // ThreadSafeEventBus only
-try bus.subscribe(auditListener);
-```
-
-Full rules and anti-patterns: [docs/guide/EVENTS_DI.md](docs/guide/EVENTS_DI.md) · runnable wiring: `examples/shopdemo`.
-
-### Quick HTTP Server
-
-Self-contained — it needs only `build.zig` + `build.zig.zon` and this file:
-
-```zig
-const std = @import("std");
-const zmodu = @import("zmodu");
-
-const http = zmodu.http;
-
-const Server = http.Server;
-const Context = http.Context;
-
-pub fn main(init: std.process.Init) !void {
-    var server = Server.init(init.io, init.gpa, 8080);
+    var server = http.Server.init(io, allocator, 8080);
     defer server.deinit();
+
+    var profile = http.ProductionProfileState.init(allocator);
+    defer profile.deinit(allocator);
+    try http.productionProfile(&server, .{
+        .max_connections = 4096,
+        .header_timeout_ms = 10_000,
+    }, &profile);
 
     try server.addRoute(.{
         .method = .GET,
-        .path = "/health",
+        .path = "/api/ping",
         .handler = struct {
-            fn handle(ctx: *Context) anyerror!void {
-                try ctx.json(200, "{\"status\":\"ok\"}");
+            fn handle(ctx: *http.Context) anyerror!void {
+                try ctx.jsonStruct(200, .{ .ok = true });
             }
         }.handle,
     });
@@ -489,148 +131,108 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
-### Docker Compose Quick Start
+## Documentation
+
+| Category | Documents |
+|----------|-----------|
+| **Getting Started** | [Quick Start](docs/guide/QUICK-START.md) · [CLI & Codegen](docs/guide/ZMODU_CLI_INTEGRATION.md) · [Modulith Architecture](docs/guide/MODULITH.md) · [Domain Layers](docs/guide/MODULE_LAYERS.md) |
+| **Core Guides** | [Events & DI](docs/guide/EVENTS_DI.md) · [SQLx Drivers](docs/guide/SQLX_DRIVERS.md) · [Workflow & Saga](docs/guide/WORKFLOW.md) · [Logging](docs/guide/LOGGING.md) · [Best Practices](docs/guide/BEST_PRACTICES.md) |
+| **Reference** | [Architecture](docs/reference/ARCHITECTURE.md) · [Declarative Routing & Auth](docs/reference/ROUTE_TABLE.md) · [Runtime](docs/reference/RUNTIME.md) · [Observability](docs/reference/OBSERVABILITY.md) · [Distributed](docs/reference/DISTRIBUTED.md) · [Zent ORM](docs/reference/ZENT.md) · [Web4](docs/reference/WEB4.md) · [API Reference](docs/reference/API.md) · [Upgrading](docs/reference/UPGRADING.md) |
+| **AI Subsystem** | [AI Overview](docs/ai/README.md) · [AI Developer Guide](docs/ai/AI_DEV_GUIDE.md) · [Agent Runtime](docs/reference/AGENT_RUNTIME.md) · [Built-in Skills](docs/ai/AI_SKILLS.md) · [Orchestration](docs/ai/AI_ORCHESTRATION.md) · [LLM Policies](docs/ai/LLM_POLICIES.md) · [MCP Bridge](docs/ai/MCP.md) |
+| **Contributors & AI Agents** | [AGENTS.md](AGENTS.md) · [API Freeze](docs/reference/API_FREEZE.md) · [Readiness Status](docs/dev/v1.0-readiness-v0.35.md) |
+
+## Architecture & Features
+
+### Application Plane
+- **Module System**: Compile-time dependency graph checks (cycles, missing modules, duplicates) via `ApplicationBuilder.build` and source-level import checks via `zmodu doctor`.
+- **HTTP & API**: Fiber-based HTTP/1.1 and HTTP/2 server, `ComptimeRouter` route tables, typed request extractors, SSE streaming, WebSocket (RFC 6455 text and binary frames), unary/streaming gRPC, and OpenAPI 3.0/3.1 generation.
+- **Security**: `AppSecurity` JWT issuance and verification, `JwksKeyRing` key rotation, catalog-driven RBAC permission gates (`permissionGateWith(.rbac)`), PBKDF2-HMAC-SHA256 password encoding, CSRF double-submit cookies, and `SecretsManager` (env, file, Vault KV v2).
+- **Data Access**: SQLx client for SQLite, PostgreSQL, and MySQL with connection pooling, `Repository(T)`, versioned `MigrationRunner`, LRU `CacheManager`, and Redis client.
+- **Resilience & Observability**: `CircuitBreaker`, token-bucket and sliding-window `RateLimiter`, `AdaptiveShedder`, `Bulkhead`, `SagaOrchestrator`, `PrometheusMetrics`, and `OtlpExporter`.
+
+### Execution Plane (`zmodu.runtime`)
+- **Workers & Pools**: Dedicated thread per worker (`.dedicated`) or M:N scheduling over a worker pool (`.pooled`) while preserving single-thread state ownership per worker.
+- **Blocking Pool**: `.execution_class = .blocking` isolates blocking I/O onto a separate thread pool.
+- **Queues & Fan-Out**: Bounded `Mailbox`, lock-free SPSC `RingBuffer`, Vyukov `MpscRing`, and lock-free `HotBus` fan-out.
+- **Timers & Replay**: O(1) hierarchical `TimerWheel` (ms), min-heap `PrecisionTimer` (us), injectable `Clock`, and `DeliveryLog` (`ZDL1` segment files) for deterministic replay.
+- **Supervision**: `Supervision.group` with `.one_for_one`, `.one_for_all`, `.rest_for_one`, and `.stop_group` restart policies and bounded error budgets.
+
+## Operational Boundaries
+
+Review these boundaries before deploying zmodu in production:
+
+- **Pre-1.0 Status**: The public API surface is feature-frozen ahead of 1.0 (see [API_FREEZE.md](docs/reference/API_FREEZE.md)). There is no independent third-party security audit; see [Readiness Status](docs/dev/v1.0-readiness-v0.35.md) and [SECURITY.md](SECURITY.md).
+- **Cluster Wire Protocol**: Cluster frames (Raft and `DistributedEventBus`) use plaintext TCP with per-frame HMAC-SHA256 authentication (`own_key` / `peer_keys` or `cluster_secret`). HMAC provides integrity and authentication, not confidentiality. Run cluster ports on trusted private networks or terminate mTLS in a sidecar (see [`examples/production-deploy/cluster-sidecar/`](examples/production-deploy/cluster-sidecar/)).
+- **Experimental Modules**: `SagaOrchestrator`, `DistributedEventBus`, `ClusterMembership`, `TwoPhaseCommit`, `PluginManager`, `WebMonitor`, and `HotReloader` are marked experimental.
+
+## Verification Gates
+
+All CI verification gates can be run locally:
 
 ```bash
-# Start full stack (zmodu + PostgreSQL + Redis)
-docker compose up -d
+# Full unit and integration test suite (-Ddb=all by default)
+ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test
 
-# With Vault and Jaeger
-docker compose --profile secrets --profile tracing up -d
+# Run a filtered subset of tests
+bash scripts/test-fast.sh --db all --filter "RaftElection" --force-run
+
+# Static and production gates
+zig build fmt-check
+zig build check
+zig build check-api
+bash scripts/check-deadcode.sh
+bash scripts/check-doc-paths.sh
+bash scripts/check-version.sh
+
+# Long-running stress and soak harnesses
+zig build soak
+zig build soak-cluster
+zig build runtime-stress
+
+# CLI project gates
+zig build zmodu
+./zig-out/bin/zmodu ci examples/basic
+./zig-out/bin/zmodu doctor examples/tenant-mgmt
 ```
 
-## 📁 Project Structure
+## Examples
+
+See [`examples/README.md`](examples/README.md) for the full list of runnable examples:
+
+| Example | Description |
+|---------|-------------|
+| [`tenant-mgmt`](examples/tenant-mgmt/) | Multi-tenant SaaS reference with `productionProfile`, catalog RBAC, and SQLite |
+| [`tenant-shop`](examples/tenant-shop/) | E-commerce domain layers (`model`, `persistence.Tx`, `service`, `api`) and outbox |
+| [`zent-modulith`](examples/zent-modulith/) | Schema-as-code `zent` ORM integration |
+| [`runtime-workers`](examples/runtime-workers/) | Workers, mailboxes, `HotBus`, pooled scheduling, and supervision |
+| [`alpha-engine`](examples/alpha-engine/) | Low-latency trading pipeline on the execution plane |
+| [`quant-replay`](examples/quant-replay/) | Deterministic segment log recording and replay |
+| [`ai-ops`](examples/ai-ops/) · [`llm-policies`](examples/llm-policies/) · [`mcp-server`](examples/mcp-server/) | AI agent operations, LLM policy gates, and stdio MCP server |
+| [`production-deploy`](examples/production-deploy/) | Nginx/Envoy TLS sidecars, Kubernetes manifests, systemd units, and smuggling e2e |
+
+## Project Structure
 
 ```text
 zmodu/
 ├── src/
-│   ├── root.zig                     # Public API (PRIMARY / ADVANCED / DEPRECATED)
-│   ├── Application.zig              # Application builder: lifecycle, DI, runtime wiring
-│   ├── api/                         # Public API surface: Module, Server, ComptimeRouter,
-│   │                                #   Extract, Middleware (+ middleware/: auth, csrf, …), Crud
-│   ├── core/                        # Module graph/scanner/validator, EventBus + EventRegistry,
-│   │                                #   Lifecycle, Preflight, Time, sockread (bounded writes),
-│   │                                #   DistributedEventBus, cluster/ (Raft, transport, bootstrap),
-│   │                                #   DistributedTransaction, Saga, TransactionJournal
-│   ├── runtime/                     # ── the execution plane ──
-│   │   ├── runtime.zig              # Runtime / Worker / spawn (dedicated|pooled), StopPolicy, stats
-│   │   ├── scheduler.zig            # CPU pool + blocking pool (ready ring, claim, park)
-│   │   ├── supervisor.zig           # failure policy, error budget, onError
-│   │   ├── mailbox.zig  ring.zig    # bounded mailbox; SPSC ring + Vyukov MpscRing
-│   │   ├── hot_bus.zig  sequencer.zig  object_pool.zig
-│   │   ├── timer_wheel.zig  precision_timer.zig  clock.zig  affinity.zig
-│   │   ├── recorder.zig  delivery_log.zig        # delivery log, ZDL1 segments, ReplayFromLog
-│   │   └── alloc_contract_test.zig               # the zero-allocation contract, as tests
-│   ├── http/                        # HTTP/2 + HPACK, HttpClient (+pool), SSE, static, multipart,
-│   │                                #   OpenAPI, Page/Params, AccessLog, Testkit
-│   ├── data.zig · sqlx/ · data/ · persistence/ · cache/ · redis/ · pool/   # data plane
-│   ├── security/ · tenant/ · datapermission/                               # authn / authz / tenancy
-│   ├── di/ · config/ · log/ · metrics/ · tracing/ · validation/ · test/    # supporting
-│   ├── extensions/                  # gRPC transport, WebSocket, WebMonitor, Plugin, HotReloader
-│   ├── ai/                          # optional domain: provider, skills, memory, agent guard
-│   ├── im/ · messaging/ · scheduler/ · migration/ · secrets/ · resilience/ · util/ · kit/ · web4/
-│   ├── soak.zig · soak_cluster.zig · runtime_stress.zig · benchmark.zig   # the long-run harnesses
-│   └── tests.zig · main.zig · docs.zig
-├── docs/                            # this documentation set (see the table at the top)
-├── examples/                        # runnable projects (table below)
-├── tools/zmodu/                     # the zmodu CLI: codegen, audit, ci
-├── Dockerfile · docker-compose.yml
-└── .github/workflows/ci.yml         # the gate set this README points at
+│   ├── root.zig              # Top-level exports and domain aliases
+│   ├── Application.zig       # Application builder, lifecycle, DI, and runtime owner
+│   ├── http.zig              # HTTP domain barrel (Server, Router, Context, Middleware, Testkit)
+│   ├── data.zig              # Data domain barrel (SQLx, Repository, Cache, Redis)
+│   ├── security.zig          # Security domain barrel (AppSecurity, RBAC, PasswordEncoder, Secrets)
+│   ├── observability.zig     # Observability domain barrel (PrometheusMetrics, Tracer, OtlpExporter)
+│   ├── runtime.zig           # Execution plane barrel (Runtime, Worker, Mailbox, HotBus, Timers)
+│   ├── api/ · http/          # HTTP/1.1, HTTP/2, ComptimeRouter, extractors, middleware, SSE, OpenAPI
+│   ├── core/                 # Module graph, EventBus, Time, Preflight, cluster/ (Raft, Bootstrap)
+│   ├── runtime/              # Scheduler, worker pools, supervision, ring buffers, delivery log
+│   ├── sqlx/ · persistence/  # Database drivers (SQLite, PostgreSQL, MySQL) and ORM backend
+│   ├── ai/                   # Optional AI subsystem (Provider, SkillRegistry, Agent, Guard, Workflow)
+│   └── test/                 # Contract, boundary, and snippet verification gates
+├── tools/zmodu/              # Built-in CLI (scaffold, module, audit, deadcode, doctor, ci)
+├── examples/                 # 18 runnable example projects
+└── docs/                     # Documentation (guide/, reference/, ai/)
 ```
 
-## 🎯 Progressive Evolution
+## Contributing & License
 
-zmodu grows along **two independent axes**. You can move on one without the other, and neither one
-requires splitting anything into services:
-
-| Axis | Stage | What you add | Where it lands |
-|------|-------|--------------|----------------|
-| **Application** | one process | modules with compile-time dependency rules, DI, HTTP, data | [BEST_PRACTICES.md](docs/guide/BEST_PRACTICES.md) |
-| | several instances | rate limiting, circuit breakers, distributed locks, cache/Redis, outbox | same |
-| | a cluster | `DistributedEventBus` + Raft via `ClusterBootstrap`, Kafka, sharding | [DISTRIBUTED.md](docs/reference/DISTRIBUTED.md) — mind the hard-cut upgrade boundary |
-| **Execution** | request → response | nothing to do: fibers plus a pool already serve this shape | [MODULITH.md](docs/guide/MODULITH.md) |
-| | owned state | workers that keep state across requests (`app.runtime()`) | [RUNTIME.md](docs/reference/RUNTIME.md) |
-| | many of the same worker | `.mode = .pooled` — N workers over N pool threads, state still exclusive | same |
-| | latency-critical | `.dedicated` workers, µs `PrecisionTimer`, delivery replay for backtests | [alpha-engine](examples/alpha-engine) |
-| | off-machine work | `.execution_class = .blocking` for anything that waits on the outside world | same |
-
-The rules that keep the first axis honest (dependency validation at compile time) and the second one
-predictable (bounded queues, zero-allocation hot paths) are the same rules this repo's own gates enforce.
-Detailed guide: [Best Practices](docs/guide/BEST_PRACTICES.md).
-
-## 🛠️ Commands
-
-```bash
-# Build & run
-zig build                        # build the framework
-zig build run                    # run the in-repo app
-
-# ---- gates (each one is a CI job, or a step of one) ----
-ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test   # full suite (-Ddb=all by default)
-bash scripts/test-fast.sh --filter RaftElection --db none --force-run   # one family of tests
-zig fmt --check src tools examples                      # formatting
-zig build check                     # hot-path gate: no bare catch {}, CSPRNG, fuzz declarations
-zig build check-api                 # examples must route through zmodu.http
-bash scripts/check-deadcode.sh      # dead-code ratchet
-bash scripts/check-bench.sh         # benchmark + allocation ratchets
-bash scripts/check-production.sh    # layered production checks
-
-# ---- long-run harnesses ----
-zig build soak                      # HTTP + tenants: leaks, FrozenMap, fd/slot growth
-zig build soak-cluster              # 3-node raft + bus: seq/leader/log/fd/RSS invariants
-zig build runtime-stress            # runtime under interleaving: supervision, pools, timers
-
-# ---- runtime & project tooling ----
-zig build zmodu && ./zig-out/bin/zmodu runtime examples/alpha-engine   # static runtime wiring report
-./zig-out/bin/zmodu audit .         # audit rules (b19–b23: bare panic, shared maps, tenant scope, …)
-./zig-out/bin/zmodu ci              # business projects: build + fmt + verify + audit + deadcode
-
-# ---- misc ----
-zig build benchmark                 # benchmarks (the ratchet lives in scripts/check-bench.sh)
-zig build docs                      # generate docs
-HTTP_PORT=18080 bash scripts/ci-integration.sh   # integration probes (needs curl)
-bash scripts/release.sh X.Y.Z --tag-only --push   # cut a gated tag (bumps every version ref, gates, tags; no GitHub Release)
-bash scripts/release.sh --publish-release X.Y.Z   # weekly: create the GitHub Release for an existing tag
-
-# Docker
-docker compose up -d                             # full stack (PG + Redis + Vault + Jaeger)
-docker compose --profile tracing up -d           # with tracing
-```
-
-## 📦 Examples
-
-Each directory is a runnable project with its own README; the index is
-[examples/README.md](examples/README.md). The ones worth reading first:
-
-| Example | What it shows |
-|---------|---------------|
-| **[tenant-mgmt](examples/tenant-mgmt/)** | **Application plane, end to end**: multi-tenant SaaS, module graph, middleware chain, catalog-permission auth, health probes, CI integration target |
-| **[runtime-workers](examples/runtime-workers/)** | **Execution plane**: workers, mailboxes, HotBus, supervision — the smallest complete use of `app.runtime()` |
-| **[alpha-engine](examples/alpha-engine/)** | **The load the execution plane exists for**: feed → order book → alpha → risk → execution, with the blocking pool for the off-machine parts |
-| **[tenant-shop](examples/tenant-shop/)** | Module layers: `model` / `persistence` / `service` / `api` with `Tx` — see [MODULE_LAYERS.md](docs/guide/MODULE_LAYERS.md) |
-| **[zent-modulith](examples/zent-modulith/)** | The zent ORM pairing (schema-as-code) — see [ZENT.md](docs/reference/ZENT.md) |
-| **[production-deploy](examples/production-deploy/)** | TLS sidecar (nginx/Envoy), k8s, systemd, Dockerfile, and the request-smuggling e2e with a real proxy |
-| **[zmsaas](examples/zmsaas/)** | A generated SaaS skeleton (what `zmodu saas` produces, then customised) |
-| **[ai-ops](examples/ai-ops/) · [llm-policies](examples/llm-policies/) · [mcp-server](examples/mcp-server/)** | The AI side: ops agent, policy enforcement, MCP server |
-| [basic](examples/basic/) · [event-driven](examples/event-driven/) · [distributed](examples/distributed/) · [http-stress-test](examples/http-stress-test/) | Small focused demos (modules, events + outbox, cross-node bus, load) |
-| [shopdemo](examples/shopdemo/) | Codegen reference: a 152-table schema + `generated-sample/` |
-
-## 🤝 Contributing
-
-Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md). Before a PR, run what CI runs:
-
-```bash
-git clone https://github.com/chy3xyz/zmodu.git
-git checkout -b feature/my-feature
-ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test    # full suite
-zig build check check-api && zig fmt --check src tools examples
-bash scripts/check-deadcode.sh
-git commit -m "feat: add feature"
-```
-
-Conclusions belong in `docs/` (or `AGENTS.md`) rather than in a review thread — that is why this repo
-keeps per-batch dated notes and a [readiness assessment](docs/dev/v1.0-readiness-v0.35.md) next to the code.
-
-## 📄 License
-
-MIT License - see [LICENSE](LICENSE) for details.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines. Licensed under the [MIT License](LICENSE).

@@ -1,116 +1,107 @@
-# 内置 AI Skills 规划与现状
+# Built-in AI Skills
 
-> 从「AI 驱动业务框架」角度规划的内置 skill 目录。所有 skill 遵守受控执行
-> 姿态：LLM 不写代码、白名单 + 人机门 + 配额 + 审计 + 租户隔离。
+The skill catalog an agent can call, and the guard rail each skill runs under: the model never writes code, and every skill sits behind an allowlist, permission codes, quotas, audit and tenant isolation.
 
-> **运行时姿态见 [`AGENT_RUNTIME.md`](../reference/AGENT_RUNTIME.md)**：`ai.Guard`（闸门已经接进 `Agent.run`）、
-> `skill.Tool.action`（默认 `.execute`，fail-closed）、`ai.AgentWorker`、`ai.ProposalPipeline`。
-> 本文只列"有什么工具"，那篇写"工具被允许怎么跑"。
+For how a tool is allowed to run, read [`AGENT_RUNTIME.md`](../reference/AGENT_RUNTIME.md): `ai.Guard` is already wired into `Agent.run`, `skill.Tool.action` defaults to `.execute`, and `ai.AgentWorker` / `ai.ProposalPipeline` cover background execution and staged approval.
 
-## 设计原则（每个内置 skill 都套这层壳）
+## Design rules
 
-| 机制 | 组件 | 默认行为 |
-|------|------|----------|
-| 租户隔离 | `SkillContext.tenant_id` | 实体查询在实体声明 `tenant_column` 时自动追加；`db.query` 由框架**外层包裹**追加 `WHERE <col> = ?`（需要 `BusinessSkillsConfig.db_query_tenant_column`，没声明就 `error.TenantScopeUnavailable`） |
-| SQL 安全 | `validateSqlFragment` + 参数绑定 | `db.query` 仅 SELECT、禁止字面量/注释/`;`、行数上限 |
-| 白名单 | 实体注册表 / allowlist | `entity.*` 只能访问注册实体；管理类 skill 默认不在 allowlist |
-| 所有权 | `ai.freeValue` | 结果 JSON 由 ctx.allocator 持有，调用方可深释放 |
-| 审计/配额 | AgentAuditLog / TokenQuota | 工具调用自动落审计、计配额 |
+| Mechanism | Component | Default behaviour |
+|-----------|-----------|-------------------|
+| Tenant isolation | `SkillContext.tenant_id` | Entity queries filter on the declared `tenant_column`; `db.query` is wrapped by the framework with `WHERE <col> = ?`, which requires `BusinessSkillsConfig.db_query_tenant_column` (otherwise `error.TenantScopeUnavailable`) |
+| SQL safety | `validateSqlFragment` + bound parameters | `db.query` accepts SELECT only, rejects literals, comments and `;`, and caps rows |
+| Allowlist | Entity registry / allowlist | `entity.*` reaches registered entities only; admin skills are excluded by default |
+| Ownership | `ai.freeValue` | Result JSON is owned by `ctx.allocator`; the caller deep-frees |
+| Audit and quota | `AgentAuditLog` / `TokenQuota` | Tool calls are audited and metered automatically |
 
-## 技能类别（`Tool.action`）× 权限闸门（`ai.Guard`）
+## Action classes and the guard
 
-每个 skill 注册时声明 `action`（`guard.Action`）—— 这是 `ai.Guard` 的**类别轴**：没声明就是
-`execute`（最严），永远拿不到 `allow_execute = false` 的宽策略。
+Every skill declares `action` (`guard.Action`), the class axis of `ai.Guard`. A skill that declares nothing is `.execute`, the strictest class, and can never pass a policy with `allow_execute = false`.
 
-| 声明类别 | 内置 skill | 为什么 |
-|----------|-----------|--------|
-| `read` | `db.query` · `entity.lookup` · `entity.list` · `kpi.query` · `report.generate` · `admin.config.get` · `admin.audit.export` · `list_schedulable_tasks` · `list_jobs` | 只读数据，不改状态 |
-| `propose` | `notification.send` · `approval.submit` · `approval.request` | 产出一件事交出去（通知/审批），由别人或审批链决定 |
-| `execute` | `entity.create` · `entity.update` · `command.execute` · `schedule_job` · `cancel_job` · `admin.cache.invalidate` · `admin.cache.clear` · `admin.config.set` · `admin.user.manage` · `admin.tenant.provision` | 真正改状态：需要 `allow_execute = true` **且**列名 |
+| Class | Built-in skills | Why |
+|-------|-----------------|-----|
+| `read` | `db.query`, `entity.lookup`, `entity.list`, `kpi.query`, `report.generate`, `admin.config.get`, `admin.audit.export`, `list_schedulable_tasks`, `list_jobs` | Reads data, changes nothing |
+| `propose` | `notification.send`, `approval.submit`, `approval.request` | Hands work to someone else (a channel or an approval chain) |
+| `execute` | `entity.create`, `entity.update`, `command.execute`, `schedule_job`, `cancel_job`, `admin.cache.invalidate`, `admin.cache.clear`, `admin.config.set`, `admin.user.manage`, `admin.tenant.provision` | Changes state: needs `allow_execute = true` and the tool name |
 
-所以 `allow = &.{ "db.query", "kpi.query" }` + `allow_execute = false` 的 agent 能查数、什么也改不了
-（读类工具**不会**被那道开关误伤）。后两项管理 skill 是委托给应用回调的，效果未知 —— 按 fail-closed
-留在 `execute`。自定义技能同样要自己声明；忘了就是 `execute`。
+So `allow = &.{ "db.query", "kpi.query" }` with `allow_execute = false` lets an agent read data and change nothing; read tools are unaffected by that switch. The two delegated admin skills have unknown effects and stay in `execute` by design. Custom skills follow the same rule: no declaration means `execute`.
 
-`Guard` 只看名字、看不到类别：`allow` 里全是 `execute` 工具时 `isInert()` 仍返回 false，但实际一件
-事也做不了。启动期体检用 `registry.auditPolicy(allocator, guard.permissions)`（或规格侧
-`AgentSpec.auditPolicy`），`class_denied_tools` 会列出被**类别**（而非名字）拒掉的工具 ——
-详见 [`AGENT_RUNTIME.md`](../reference/AGENT_RUNTIME.md) §一。
+`Guard` sees names, not classes. A policy whose `allow` list contains only `execute` tools still reports `isInert() == false` while permitting nothing. Check at startup with `registry.auditPolicy(allocator, guard.permissions)` or `AgentSpec.auditPolicy`; `class_denied_tools` lists tools rejected by class rather than by name. See [`AGENT_RUNTIME.md`](../reference/AGENT_RUNTIME.md) §1.
 
-## P0 · 只读高价值（✅ 已落地）
+```zig
+var guard = ai.Guard.init(.{
+    .allow = &.{ "db.query", "kpi.query" }, // names the policy may call
+    .allow_execute = false,                 // and no execute-class tool at all
+});
+var spec = ai.AgentSpec{
+    .name = "analyst",
+    .provider = &provider,
+    .skills = &registry,
+    .guard = &guard,
+};
 
-`zmodu.ai.business.registerBusinessSkills(registry, comptime entities)`
-（DB 经 `SkillContext.backend_ptr` 指向 `*data.SqlxBackend`）：
+const health = try spec.auditPolicy(allocator); // null when no guard is set
+defer if (health) |*h| h.deinit(allocator);
+// health.class_denied_tools: listed names the class gate still refuses
+```
 
-> **多租户应用要换入口**：上面这个默认入口把 `db_query_tenant_column` 留成 `null`，
-> 所以只要 `SkillContext.tenant_id` 有值，`db.query` 就返回 **`error.TenantScopeUnavailable`**（fail-closed）。
-> 要让它工作，用显式配置的入口：
-> ```zig
-> try ai.business.registerBusinessSkillsWith(&registry, &.{}, .{
->     .db_query_tenant_column = "tenant_id", // 按你自己 schema 的列名写
-> });
-> ```
+## Read-only data skills
 
-| Skill | 说明 |
-|-------|------|
-| `db.query` | 只读参数化 SELECT；`?` 占位符 + args；行数上限（默认 20 / 上限 100）；拒绝非 SELECT 与自由字面量。**租户**：有 `tenant_id` 时框架把整条语句外层包裹成 `SELECT * FROM (<你的 SQL>) AS _zt_tenant_scope WHERE _zt_tenant_scope.<col> = ?`，租户值**只以 `?` 绑定**（不拼进 SQL 文本）；因此**你的 SELECT 必须把租户列放进结果集**，否则外层报 "no such column" |
-| `entity.lookup` | 按主键查注册实体；白名单表名；配置 `tenant_column` 后自动按 `tenant_id` 过滤 |
-| `entity.list` | 等值过滤 + 行数上限 + 租户隔离 |
+`zmodu.ai.business.registerBusinessSkills(registry, comptime entities)` registers the data skills; `SkillContext.backend_ptr` carries a `*data.SqlxBackend`.
 
-调度闭环（`zmodu.ai.registerScheduleSkills` + `ScheduleCtx`，`userdata` 传
-`*ScheduleCtx`）：`list_schedulable_tasks` / `schedule_job` / `list_jobs` /
-`cancel_job`。
+Multi-tenant apps must use the explicit entry point. The default leaves `db_query_tenant_column` as `null`, so any `db.query` with a `tenant_id` fails closed with `error.TenantScopeUnavailable`.
 
-## P0 · 业务技能（✅ 已落地）
+```zig
+try ai.business.registerBusinessSkillsWith(&registry, &.{}, .{
+    .db_query_tenant_column = "tenant_id", // the column name in your schema
+});
+```
 
-| Skill | 说明 | 注册 |
-|-------|------|------|
-| `kpi.query` | 查询应用注册的经营指标（`KpiCtx` 按名）；带 `tenant_id` 的 dispatch 只跑 `KpiMetric.tenant_sql`（单 `?` 绑租户），未声明则拒答（fail-closed，不回未隔离值） | `ai.kpi.registerKpiSkills` |
-| `approval.request` | 经应用注册的审批链提交审批（subject + amount），转人工入队 | `ai.approval_api.registerApprovalRequestSkills` |
-| `notification.send` | 向具名渠道投递通知（webhook / sink / outbox），渠道白名单 | `ai.notify.registerNotifySkills` |
+| Skill | Behaviour |
+|-------|-----------|
+| `db.query` | Read-only parameterized SELECT with `?` placeholders and args; row cap (default 20, maximum 100); rejects non-SELECT statements and free literals. With a tenant, the framework wraps the statement as `SELECT * FROM (<your SQL>) AS _zt_tenant_scope WHERE _zt_tenant_scope.<col> = ?` and binds the tenant as a parameter only. Your SELECT must therefore select the tenant column, or the wrapper fails with "no such column" |
+| `entity.lookup` | Look up a registered entity by primary key; table names are allowlisted; `tenant_column` adds the tenant filter automatically |
+| `entity.list` | Equality filters, row cap and tenant isolation |
 
-技能目录可导出：`zmodu.ai.skill_export.toSkillsJson / toOpenApi`
-（应用侧可在运行时导出并挂成 HTTP 端点），或 `zmodu ai
-export-skills / openapi`（CLI，内置目录）。
+Scheduling skills (`zmodu.ai.registerScheduleSkills` with `*ScheduleCtx` in `userdata`): `list_schedulable_tasks`, `schedule_job`, `list_jobs`, `cancel_job`.
 
-## P1 · 业务动作（✅ 已落地，默认人机门 + 幂等）
+## Business skills
 
-`zmodu.ai.actions.registerWriteSkills / registerCommandSkills /
-registerReportSkills`（`userdata` 传对应 Ctx；`SkillContext.permissions` 需含
-权限码）：
+| Skill | Behaviour | Registration |
+|-------|-----------|--------------|
+| `kpi.query` | Query an application-registered metric by name (`KpiCtx`). A dispatch carrying `tenant_id` runs only `KpiMetric.tenant_sql` (single `?` tenant bind); without a declared tenant query it refuses rather than returning an unfiltered value | `ai.kpi.registerKpiSkills` |
+| `approval.request` | Submit an approval through the application-registered chain (`subject` + `amount`); escalations enter the human queue. Requires `approval:decide` | `ai.approval_api.registerApprovalRequestSkills` |
+| `notification.send` | Deliver to a named channel (webhook, sink or outbox), channel allowlist enforced | `ai.notify.registerNotifySkills` |
 
-| Skill | 说明 | 权限 |
-|-------|------|------|
-| `entity.create/update` | 白名单实体写操作；仅可写列白名单（`EntitySpec.writable`）、租户列由上下文强制（模型不可传）、主键禁止 | `entity:write` |
-| `command.execute` | 经事务性 outbox 提交应用注册命令；幂等键 = `SkillContext.run_id`（缺失拒绝），返回 event_id | `command:execute` |
-| `report.generate` | 应用注册聚合查询 → CSV / JSON（行数上限 100，只读） | — |
+Export the catalog with `zmodu.ai.skill_export.toSkillsJson` / `toOpenApi` (an application can expose them as HTTP endpoints), or from the CLI with `zmodu ai export-skills` / `zmodu ai openapi`.
 
-## P2 · 管理/运维（✅ 已落地，默认关闭）
+## Write actions
 
-`zmodu.ai.admin.registerAdminSkills`（`userdata` 传 `AdminCtx`；权限码
-`admin:cache` / `admin:config` / `admin:audit` / `admin:user` / `admin:tenant`；
-**必须显式加入 Agent allowlist 才可达**）：
+`zmodu.ai.actions.registerWriteSkills`, `registerCommandSkills` and `registerReportSkills` pass the matching context through `userdata`; `SkillContext.permissions` must carry the permission code.
 
-| Skill | 说明 |
-|-------|------|
-| `admin.cache.invalidate` / `admin.cache.clear` | 白名单缓存；key 禁通配（`*`/`?`），`all=true` 才允许整体清空 |
-| `admin.config.get` / `admin.config.set` | 白名单配置；`set` 仅限 mutable 键（`ConfigStore`） |
-| `admin.audit.export` | 查询 RunAuditStore（可选 kind/tenant/limit 过滤） |
-| `admin.user.manage` / `admin.tenant.provision` | 委托应用回调（框架不实现业务用户/租户逻辑） |
+| Skill | Behaviour | Permission |
+|-------|-----------|------------|
+| `entity.create` / `entity.update` | Writes to an allowlisted entity and allowlisted columns (`EntitySpec.writable`); the tenant column is forced from context and the model cannot supply it; primary keys are rejected | `entity:write` |
+| `command.execute` | Submits an application-registered command through the transactional outbox; the idempotency key is `SkillContext.run_id` (missing run id is rejected); returns the event id | `command:execute` |
+| `report.generate` | Runs an application-registered aggregation report as CSV or JSON, capped at 100 rows, read-only | none |
 
-## 配套增强（✅ 已落地）
+## Admin and ops skills
 
-- `Tool.required_permission`：dispatch 层按权限码校验（`error.PermissionDenied`）。
+`zmodu.ai.admin.registerAdminSkills` takes `*AdminCtx` through `userdata`. Permission codes are `admin:cache`, `admin:config`, `admin:audit`, `admin:user` and `admin:tenant`, and every admin skill must be added to the agent allowlist explicitly.
 
-## 开发自定义技能
+| Skill | Behaviour |
+|-------|-----------|
+| `admin.cache.invalidate` / `admin.cache.clear` | Allowlisted caches; keys reject wildcards (`*`, `?`), and a full clear requires `all=true` |
+| `admin.config.get` / `admin.config.set` | Allowlisted config; `set` is limited to mutable keys (`ConfigStore`) |
+| `admin.audit.export` | Query `RunAuditStore` with optional kind, tenant and limit filters |
+| `admin.user.manage` / `admin.tenant.provision` | Delegate to application callbacks; the framework does not implement user or tenant logic |
 
-业务自己的技能（查询/写动作/审批桥）与内置技能同一套 `Tool` 契约：参数自动
-映射 JSON Schema、返回值所有权归 `ctx.allocator`（调用方 `ai.freeValue` 深
-释放）、`required_permission` + `allowlist` 双重收口、`checkDeadline` 协作
-超时。完整代码模板与选型（Agent / Workflow / LLM 策略 / MCP 桥）见
-[`AI_DEV_GUIDE.md`](./AI_DEV_GUIDE.md) §3–§5。
+## Custom skills
 
-## 边界（不做）
+Business skills use the same `Tool` contract as built-ins: parameters map to JSON Schema, results are owned by `ctx.allocator` (callers use `ai.freeValue`), `required_permission` plus an allowlist narrow access, and `checkDeadline` provides the cooperative timeout.
 
-不内置 shell / 任意 URL 抓取 / 裸 SQL 写 / 跨租户访问；管理类 skill 必须显式
-加入 allowlist。
+Templates and selection guidance (Agent, Workflow, LLM policy, MCP bridge): [`AI_DEV_GUIDE.md`](./AI_DEV_GUIDE.md) §3–§5.
+
+## Boundaries
+
+No shell, arbitrary URL fetching, raw SQL writes or cross-tenant access. Admin skills are reachable only after an explicit allowlist entry.

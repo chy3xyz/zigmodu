@@ -1,281 +1,93 @@
-# zmodu API Reference
+# zmodu API reference
 
-Complete API reference for the zmodu modular framework.
+The public entry points of zmodu, the contracts they hold, and how to call them. Freeze policy: [`API_FREEZE.md`](./API_FREEZE.md). Deprecated aliases and removal dates: [`UPGRADING.md`](./UPGRADING.md).
 
-> 1.0 冻结的入口类别、0.x 允许破坏的 preview 面（`runtime.*`），以及每一条对应的门禁：
-> [`API_FREEZE.md`](./API_FREEZE.md)。弃用别名与删除时点见 [`UPGRADING.md`](./UPGRADING.md) 顶部那张表。
+## 1. Module contract
 
----
-
-## Table of Contents
-
-1. [Core API](#core-api)
-2. [Application](#application)
-3. [Dependency Injection](#dependency-injection)
-4. [Configuration](#configuration)
-5. [Event System](#event-system)
-6. [Resilience](#resilience)
-7. [Observability](#observability)
-8. [HTTP Server & Profiles](#http-server--profiles)
-9. [Transport](#transport)
-10. [Security](#security)
-11. [Testing](#testing)
-12. [Hardening primitives](#hardening-primitives)
-13. [Error response rendering](#error-response-rendering)
-14. [Uploads](#uploads)
-
----
-
-## Core API
-
-### Module Definition
-
-#### `zmodu.api.Module`
-
-Declarative module definition with metadata.
+A module is `pub const info` plus `init` and `deinit`. `dependencies` lists module names, not import paths; the build graph rejects cycles, missing names and self-dependencies at compile time.
 
 ```zig
 pub const Module = struct {
-    name: []const u8,                          // Unique module name
-    description: []const u8 = "",              // Module description
-    dependencies: []const []const u8 = &.{},   // Module dependencies
-    is_internal: bool = false,                 // Internal-only flag
+    name: []const u8,                         // unique
+    description: []const u8 = "",
+    dependencies: []const []const u8 = &.{},  // module names
+    is_internal: bool = false,
 };
+
+pub fn scanModules(allocator: std.mem.Allocator, comptime modules: anytype) !ApplicationModules
+pub fn validateModules(modules: *ApplicationModules) !void
 ```
 
-**Example:**
 ```zig
 const OrderModule = struct {
     pub const info = zmodu.api.Module{
         .name = "order",
         .description = "Order management module",
-        .dependencies = &.{"inventory", "payment"},
+        .dependencies = &.{ "inventory", "payment" },
     };
-    
-    pub fn init() !void { ... }
-    pub fn deinit() void { ... }
+    pub fn init() !void {}
+    pub fn deinit() void {}
 };
 ```
 
-### Module Scanning
+`Application.start()` starts modules in dependency order; `Application.stop()` stops them in reverse. The lower-level `zmodu.startAll` / `zmodu.stopAll` are deprecated (removal no earlier than 1.0) and require manual lifecycle handling. `zmodu.generateDocs(modules, path, allocator, io)` writes a PlantUML description of the graph.
 
-#### `zmodu.scanModules`
-
-Scan modules at compile time and extract metadata.
+## 2. Application
 
 ```zig
-pub fn scanModules(
-    allocator: std.mem.Allocator,
-    comptime modules: anytype
-) !ApplicationModules
+pub fn init(io: std.Io, allocator: std.mem.Allocator, name: []const u8, comptime modules: anytype, config: Config) !Application
 ```
 
-**Example:**
-```zig
-var modules = try zmodu.scanModules(allocator, .{
-    UserModule,
-    OrderModule,
-    PaymentModule,
-});
-defer modules.deinit();
-```
+| `Config` field | Default | Meaning |
+|---|---|---|
+| `name` | `"app"` | application name |
+| `expect_drivers` | `&.{}` | SQL drivers the app uses; `start()` refuses to boot when one was not compiled in with `-Ddb=` |
+| `validate_on_start` | `true` | validate module dependencies before starting |
+| `auto_generate_docs` | `false` | write docs during `start()` |
+| `docs_path` | `null` | output path for generated docs |
+| `max_dependencies` | `8` | warn above this many dependencies per module; `0` disables |
 
-### Module Validation
-
-#### `zmodu.validateModules`
-
-Validate that all module dependencies are satisfied.
+`zmodu.builder(allocator, io)` returns an `ApplicationBuilder`. Bind it to a variable: builder methods take `*Self`, and a temporary is `*const`.
 
 ```zig
-pub fn validateModules(modules: *ApplicationModules) !void
-```
+var builder = zmodu.builder(allocator, io);
+defer builder.deinit();
 
-### Lifecycle Management
-
-#### `Application.start` / `Application.stop`（推荐）
-
-启动/停止整个应用（依赖顺序启动、逆序停止，内部调用 Lifecycle）。
-
-```zig
-pub fn start(self: *Self) !void
-pub fn stop(self: *Self) void
-```
-
-#### `zmodu.startAll` / `zmodu.stopAll`（底层 Lifecycle）
-
-`Application.start/stop` 的内部实现；直接使用需自行管理模块生命周期。
-
-**DEPRECATED**（不早于 1.0 删除）：改用 `Application.start()` / `Application.stop()`，见
-[`UPGRADING.md`](./UPGRADING.md) 的弃用别名表。
-
-```zig
-pub fn startAll(modules: *ApplicationModules) !void
-pub fn stopAll(modules: *ApplicationModules) void
-```
-
-### Documentation Generation
-
-#### `zmodu.generateDocs`
-
-Generate PlantUML documentation.
-
-```zig
-pub fn generateDocs(
-    modules: *ApplicationModules,
-    path: []const u8,
-    allocator: std.mem.Allocator
-) !void
-```
-
----
-
-## Application
-
-### Application Builder
-
-#### `zmodu.Application`
-
-High-level application abstraction.
-
-```zig
-pub fn init(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    name: []const u8,
-    modules: anytype,
-    config: Config
-) !Application
-```
-
-**Config Options:**
-```zig
-pub const Config = struct {
-    validate_on_start: bool = true,
-    auto_generate_docs: bool = false,
-    docs_path: ?[]const u8 = null,
-    // 启动期超限告警（warnOverDependencyLimit）；0 关闭
-    max_dependencies: usize = 8,
-};
-```
-
-**Example:**
-```zig
-var app = try zmodu.Application.init(
-    io,
-    allocator,
-    "myapp",
-    .{UserModule, OrderModule},
-    .{
-        .validate_on_start = true,
-        .auto_generate_docs = true,
-    }
-);
+var app = try builder.withName("myapp").withValidation(true).withAutoDocs(true)
+    .build(.{ UserModule, OrderModule });
 defer app.deinit();
 try app.start();
 ```
 
-#### `zmodu.builder`
+`withService(T, name, instance)` registers a service that modules retrieve through `ModuleContext.service`.
 
-Fluent builder pattern for application creation.
-
-```zig
-pub fn builder(allocator: std.mem.Allocator) ApplicationBuilder
-```
-
-**Example:**
-```zig
-var builder = zmodu.builder(allocator, io);   // io 来自 std.process.Init / 应用的 Io
-defer builder.deinit();
-
-var app = try builder
-    .withName("myapp")
-    .withValidation(true)
-    .withAutoDocs(true)
-    .build(.{UserModule, OrderModule});
-```
-
----
-
-## Dependency Injection
-
-### Container
-
-#### `zmodu.Container`
-
-Service container for dependency injection.
+## 3. Dependency injection
 
 ```zig
 pub fn init(allocator: std.mem.Allocator) Self
-pub fn deinit(self: *Self) void
-pub fn freeze(self: *Self) void
 pub fn register(self: *Self, comptime T: type, name: []const u8, instance: *T) !void
 pub fn registerBorrowed(self: *Self, comptime T: type, name: []const u8, instance: *T) !void
 pub fn get(self: *Self, comptime T: type, name: []const u8) ?*T
 pub fn getComptime(self: *Self, comptime T: type, comptime name: []const u8) ?*T
+pub fn freeze(self: *Self) void
 pub fn contains(self: *Self, name: []const u8) bool
 pub fn remove(self: *Self, name: []const u8) void
 pub fn serviceCount(self: *Self) usize
 ```
 
-`register` takes ownership (the container destroys the instance on
-`remove`/`deinit`); `registerBorrowed` does not. After `freeze()`, `register` and
-`registerBorrowed` return `error.ContainerFrozen`, `remove` warns and is a no-op,
-and `get`/`contains` are lock-free reads.
+- `register` takes ownership; the container destroys the instance on `remove`/`deinit`.
+- `registerBorrowed` does not own the instance.
+- After `freeze()`, registration returns `error.ContainerFrozen`, `remove` warns and is a no-op, and `get`/`contains` are lock-free reads.
 
-**Example:**
-```zig
-var container = zmodu.Container.init(allocator);
-defer container.deinit();
-
-try container.register(Database, "main_db", &db_instance);
-const db = container.get(Database, "main_db");
-```
-
-### Scoped Container
-
-#### `zmodu.ScopedContainer`
-
-Scoped dependency container with parent resolution. Hoisted like `zmodu.Container`
-(there is no `zmodu.di` namespace); own registrations win, misses fall through to
-`parent`.
-
-```zig
-pub fn init(allocator: std.mem.Allocator, scope_name: []const u8, parent: ?*Container) Self
-pub fn deinit(self: *Self) void
-pub fn register(self: *Self, comptime T: type, name: []const u8, instance: *T) !void
-pub fn registerBorrowed(self: *Self, comptime T: type, name: []const u8, instance: *T) !void
-pub fn get(self: *Self, comptime T: type, name: []const u8) ?*T
-pub fn contains(self: *Self, name: []const u8) bool
-pub fn remove(self: *Self, name: []const u8) void
-pub fn serviceCount(self: *Self) usize
-```
-
-**Semantics — the two halves do not fall through the same way:**
+`zmodu.ScopedContainer.init(allocator, scope_name, parent)` resolves against a parent container.
 
 | Falls through to `parent` | Local only |
 |---|---|
 | `get`, `contains` | `register`, `registerBorrowed`, `remove`, `serviceCount` |
 
-`remove` drops this scope's own registration and never reaches the parent: a
-scope unregistering a shared service would leave every other reader of the parent
-container holding a destroyed instance. `serviceCount` counts this scope's
-registrations only — the same name may be registered at both levels and would
-otherwise count twice. There is no `freeze` and no `getComptime` here: a scope is
-short-lived, the framework's freeze point is the application `Container` after
-`start()`, and the local→parent lookups are runtime branches that a comptime
-specialization cannot hoist away.
+A scope's own registrations win. `remove` never reaches the parent: unregistering a shared service would leave other readers holding a destroyed instance. `serviceCount` counts local registrations. There is no `freeze` or `getComptime`; the application `Container` is the freeze point.
 
----
-
-## Configuration
-
-### ConfigManager
-
-#### `zmodu.ConfigManager`
-
-Centralized configuration management. Hoisted from `src/config/ConfigManager.zig`
-(there is no `zmodu.config` namespace); `ModuleConfig` gives one module a key
-prefix over the same store.
+## 4. Configuration
 
 ```zig
 pub fn init(allocator: std.mem.Allocator) Self
@@ -288,89 +100,28 @@ pub fn set(self: *Self, key: []const u8, value: ConfigValue) !void
 pub fn has(self: *Self, key: []const u8) bool
 ```
 
-The store loads JSON itself; TOML arrives through `zmodu.TomlLoader` below.
-
-### TomlLoader
-
-#### `zmodu.TomlLoader`
-
-Fills an existing `ConfigManager` from a `.toml` file — sections become
-dotted keys (`[server]` + `port` → `server.port`) and values keep their TOML
-type, so `getInt` / `getBool` / `getFloat` work on them. Owned by the caller:
-construct it per load, and `deinit` the store as usual.
-
-```zig
-pub fn init(allocator: std.mem.Allocator) Self
-pub fn loadFile(self: *Self, path: []const u8, config: *ConfigManager) !void
-```
+`zmodu.ConfigManager` stores dotted keys and parses JSON itself. `zmodu.TomlLoader.init(allocator)` then `loadFile(path, config)` fills an existing store: sections become dotted keys (`[server]` + `port` → `server.port`) and values keep their TOML type, so `getInt` and `getBool` work.
 
 ```zig
 var config = zmodu.ConfigManager.init(allocator);
 defer config.deinit();
-
 var loader = zmodu.TomlLoader.init(allocator);
 try loader.loadFile("app.toml", &config);
-
 const port = config.getInt("server.port") orelse 8080;
 ```
 
-For a flat string→string map instead (no typed reads), `zmodu.TomlParser` in
-the parser section below does the same job without a store.
+`zmodu.ExternalizedConfig` merges sources by priority: `addSource(name, priority, loader)`, `load()`, `get(key)`, `watchFile(path, loader)`, `refresh()`.
 
-### ExternalizedConfig
+`zmodu.YamlParser` and `zmodu.TomlParser` flatten a file to `StringHashMap([]const u8)` with `parseFile(path)` / `parse(content)`; numbers and booleans stay strings. Hand the map back to `deinitMap(map)` rather than freeing its fields.
 
-#### `zmodu.ExternalizedConfig`
+## 5. Events
 
-External configuration with priority-based loading.
-
-```zig
-pub fn init(allocator: std.mem.Allocator) Self
-pub fn addSource(self: *Self, name: []const u8, priority: u8, loader: LoaderFn) !void
-pub fn load(self: *Self) !void
-pub fn get(self: *Self, key: []const u8) ?[]const u8
-pub fn watchFile(self: *Self, filepath: []const u8, loader: LoaderFn) !void
-pub fn refresh(self: *Self) !void
-```
-
-### YAML/TOML Parser
-
-#### `zmodu.YamlParser` / `zmodu.TomlParser`
-
-Both flatten a file into a `StringHashMap([]const u8)` — values stay strings, so
-numbers and booleans need parsing by hand. Reach for `zmodu.TomlLoader` above
-instead when you want typed reads out of the same key space.
-
-```zig
-pub fn init(allocator: std.mem.Allocator) Self
-pub fn parseFile(self: *Self, path: []const u8) !std.StringHashMap([]const u8)
-pub fn parse(self: *Self, content: []const u8) !std.StringHashMap([]const u8)
-pub fn deinitMap(self: *Self, map: *std.StringHashMap([]const u8)) void
-```
-
-Ownership: the returned map and the strings in it are the parser's allocations —
-hand the map back to `deinitMap` rather than freeing it field by field.
-
----
-
-## Event System
-
-### EventBus
-
-#### `zmodu.EventBus(T)`
-
-**无类型事件总线**：`T` 是**事件类型键**（枚举等可哈希类型），payload 以
-`*anyopaque` 传递、由回调自己转回来；一个实例可挂任意多个事件类型。
-**非线程安全**；并发场景用 `ThreadSafeEventBus`（根导出
-`zmodu.ThreadSafeEventBus`），或模块里 `ModuleContext.eventBus(...)`
-拿到的应用级总线。
+`zmodu.EventBus(T)` keys subscriptions by event type; payloads travel as `*anyopaque` and each callback casts back. One instance can hold many event types. Not thread-safe.
 
 ```zig
 pub fn EventBus(comptime T: type) type
-
-// Methods
 pub fn init(alloc: std.mem.Allocator) Self
-pub fn initCapacity(alloc: std.mem.Allocator, capacity: usize) Self   // 容量是提示，失败只 warn
-pub fn deinit(self: *Self) void
+pub fn initCapacity(alloc: std.mem.Allocator, capacity: usize) Self  // capacity is a hint
 pub fn subscribe(self: *Self, event_type: T, callback: *const fn (T, *anyopaque) void) !void
 pub fn unsubscribe(self: *Self, event_type: T, callback: *const fn (T, *anyopaque) void) void
 pub fn publish(self: *Self, event_type: T, payload: *anyopaque) void
@@ -378,114 +129,36 @@ pub fn subscriberCount(self: *Self, event_type: T) usize
 pub fn totalSubscriberCount(self: *Self) usize
 ```
 
-**Example:**
 ```zig
 const Topic = enum { order_created };
 const OrderEvent = struct { order_id: u64, status: []const u8 };
 
-const Bus = zmodu.EventBus(Topic);
-
-var bus = Bus.init(allocator);
+var bus = zmodu.EventBus(Topic).init(allocator);
 defer bus.deinit();
-
+try bus.subscribe(.order_created, onOrderCreated); // fn (Topic, *anyopaque) void
 var event = OrderEvent{ .order_id = 123, .status = "completed" };
-try bus.subscribe(.order_created, onOrderCreated);
 bus.publish(.order_created, &event);
-
-fn onOrderCreated(topic: Topic, payload: *anyopaque) void {
-    _ = topic;
-    const e: *OrderEvent = @ptrCast(@alignCast(payload));
-    _ = e.order_id;
-}
 ```
 
-### TypedEventBus
+For concurrent use take `zmodu.ThreadSafeEventBus`, or the application bus from `ModuleContext.eventBus(...)`.
 
-#### `zmodu.TypedEventBus(T)`
+`zmodu.TypedEventBus(T)` carries one event type by value (`fn (T) void`), also single-threaded: `init`, `subscribe`, `subscribeAsync(pool, handler)`, `unsubscribe`, `publish`, `subscriberCount`, `publishedCount`, `droppedAsyncCount`.
 
-单事件类型的简化总线：payload **按值**传递（`fn (T) void`），不用 `*anyopaque`
-转换。同样**非线程安全**。
+`zmodu.DistributedEventBus` connects nodes: `init`, `start(port)`, `stop`, `connectToNode`, `publish(topic, payload)`, `subscribe(topic, callback)`, `snapshotNodes(allocator)`, `getConnectedNodes`, `getNodeCount`. Use `snapshotNodes`: it copies the registry under its lock and the caller owns the result until `deinit()`. `getConnectedNodes` holds no lock and its slice can be invalidated by a concurrent connect or disconnect.
 
-```zig
-pub fn TypedEventBus(comptime T: type) type
+There is no transactional event bus. For durable publish use `zmodu.outbox.OutboxConsumer`; for compensating flows use `zmodu.SagaOrchestrator`.
 
-// Methods
-pub fn init(alloc: std.mem.Allocator) Self
-pub fn deinit(self: *Self) void
-pub fn subscribe(self: *Self, listener: *const fn (T) void) !void
-pub fn subscribeAsync(self: *Self, pool: *WorkerPool, handler: *const fn (T) void) !void
-pub fn unsubscribe(self: *Self, listener: *const fn (T) void) void
-pub fn publish(self: *Self, event: T) void
-pub fn subscriberCount(self: *Self) usize
-pub fn publishedCount(self: *Self) u64              // publish 被调用过多少次
-pub fn droppedAsyncCount(self: *Self) u64           // 异步投递因分配/派发失败而丢弃的次数
-```
-
-**Example:**
-```zig
-const OrderEvent = struct { order_id: u64, status: []const u8 };
-const Bus = zmodu.TypedEventBus(OrderEvent);
-
-var bus = Bus.init(allocator);
-defer bus.deinit();
-
-try bus.subscribe(handleOrder);
-bus.publish(.{ .order_id = 123, .status = "completed" });
-```
-
-### DistributedEventBus
-
-#### `zmodu.DistributedEventBus`
-
-Cross-node event communication.
-
-```zig
-pub fn init(allocator: std.mem.Allocator) Self
-pub fn start(self: *Self, port: u16) !void
-pub fn stop(self: *Self) void
-pub fn connectToNode(self: *Self, node_id: []const u8, address: std.net.Address) !void
-pub fn publish(self: *Self, topic: []const u8, payload: []const u8) !void
-pub fn subscribe(self: *Self, topic: []const u8, callback: Callback) !void
-// 安全遍历（推荐）：在注册表锁内整份拷贝，返回的元素归调用方，用完 deinit()
-pub fn snapshotNodes(self: *Self, allocator: std.mem.Allocator) !NodeSnapshot
-// 无锁视图（不持有注册表锁，切片可能在并发 connect/disconnect 时 realloc/失效）：
-// 只在调用方自行保证独占时合法，其他场合请用 snapshotNodes
-pub fn getConnectedNodes(self: *Self) []const *Node
-pub fn getNodeCount(self: *Self) usize
-```
-
-### TransactionalEvent — removed
-
-`src/core/TransactionalEvent.zig` was deleted: it was a stub, not an implementation.
-`TransactionManager.stageEvent` and `Transaction.addEvent` discarded their argument
-(`_ = event;`), `commit` only flipped a local state field, and `EventOutbox.store`
-allocated a zero-length payload. It had no `root.zig` export and no caller anywhere in
-`src/`, `examples/` or `tools/`, so there was nothing to keep for. The working
-implementations are the outbox (`zmodu.outbox.OutboxPublisher` / `OutboxPoller`, see
-§ `zmodu.outbox.OutboxConsumer` below) and, for compensating long-running flows,
-`zmodu.SagaOrchestrator`.
-
----
-
-## Resilience
-
-### CircuitBreaker
-
-#### `zmodu.CircuitBreaker`
-
-Prevent cascade failures with circuit breaker pattern.
+## 6. Resilience
 
 ```zig
 pub fn init(allocator: std.mem.Allocator, name: []const u8, config: Config) !Self
-pub fn deinit(self: *Self) void
 pub fn call(self: *Self, operation: *const fn () anyerror!void) Result
 pub fn reset(self: *Self) void
 pub fn forceOpen(self: *Self) void
 pub fn getState(self: *Self) State
 pub fn getStats(self: *Self) Stats
 
-pub const State = enum { closed, open, half_open }
-
+pub const State = enum { closed, open, half_open };
 pub const Config = struct {
     failure_threshold: usize = 5,
     timeout_ms: u64 = 30000,
@@ -493,200 +166,42 @@ pub const Config = struct {
 };
 ```
 
-**Example:**
-```zig
-var cb = try CircuitBreaker.init(allocator, "order_service", .{
-    .failure_threshold = 5,
-    .timeout_ms = 30000,
-});
-defer cb.deinit();
+`zmodu.CircuitBreakerRegistry` keeps one breaker per dependency name: `getOrCreate(name)`, `get(name)`, `resetAll()`.
 
-const result = cb.call(&myOperation);
-```
+`zmodu.RateLimiter` is a thread-safe token bucket: `init(allocator, name, max_tokens, refill_rate)`, `tryAcquire()`, `tryAcquireMany(count)`, `release()`, `availableTokens()`, `reset()`, `getStats()`. `acquire()` is deprecated and behaves like `tryAcquire()`.
 
-### CircuitBreaker Registry
+`RateLimiterRegistry` is LRU-bounded at `max_keys` (default 65536): once full, a new key evicts the least-recently-used limiter. `0` means unbounded and is only safe for a controlled key set. `getOrCreate*` pointers stay valid for the life of the registry. Methods: `getOrCreate`, `getOrCreateForClient(client_id, max_tokens, refill_rate)`, `get`, `remove`, `retain(max_idle_seconds)`, `count`, `generateReport(allocator)`.
 
-```zig
-pub fn CircuitBreakerRegistry.init(allocator: std.mem.Allocator, default_config: Config) Self
-pub fn getOrCreate(self: *Self, name: []const u8) !*CircuitBreaker
-pub fn get(self: *Self, name: []const u8) ?*CircuitBreaker
-pub fn resetAll(self: *Self) void
-```
+`zmodu.SlidingWindowRateLimiter.init(allocator, name, window_size_seconds, max_requests)` counts requests inside a fixed window; `tryAcquire()` and `currentCount()`. Thread-safe.
 
-### RateLimiter
+`zmodu.http.HttpClient.RetryPolicy` provides exponential backoff: `default()`, `calculateDelay(attempt)`.
 
-#### `zmodu.RateLimiter`
+## 7. Observability
 
-Token bucket rate limiting. **线程安全**（内部短自旋守卫），可跨线程共享。
-
-```zig
-pub fn init(allocator: std.mem.Allocator, name: []const u8, max_tokens: u32, refill_rate: u32) !Self
-pub fn deinit(self: *Self) void
-pub fn tryAcquire(self: *Self) bool
-pub fn acquire(self: *Self) bool          // DEPRECATED: 同 tryAcquire（同步上下文无法阻塞等待）
-pub fn tryAcquireMany(self: *Self, count: u32) bool
-pub fn release(self: *Self) void          // 归还一枚令牌（预留后未用上的场景）
-pub fn availableTokens(self: *Self) u32
-pub fn reset(self: *Self) void
-pub fn getStats(self: *Self) Stats
-```
-
-### RateLimiter Registry
-
-```zig
-pub fn RateLimiterRegistry.init(allocator: std.mem.Allocator, default_max_tokens: u32, default_refill_rate: u32) Self
-pub fn initWithCapacity(allocator, default_max_tokens, default_refill_rate, max_keys: usize) Self
-pub fn getOrCreate(self: *Self, name: []const u8) !*RateLimiter
-pub fn getOrCreateForClient(self: *Self, client_id: []const u8, max_tokens: u32, refill_rate: u32) !*RateLimiter
-pub fn get(self: *Self, name: []const u8) ?*RateLimiter
-pub fn remove(self: *Self, name: []const u8) bool
-pub fn retain(self: *Self, max_idle_seconds: i64) usize
-pub fn count(self: *Self) usize
-pub fn generateReport(self: *Self, allocator: std.mem.Allocator) ![]const u8
-```
-
-`max_keys` (default `default_max_keys` = 65 536, LRU-bounded; `0` = unbounded
-when set explicitly via `initWithCapacity`) caps tracked limiters and evicts the
-least-recently-used on insert. Per-client keys come from the request, so the old
-unbounded default grew for as long as someone invented new keys — the bounded
-default is the safe choice; keep `0` only when you key by something you control.
-`getOrCreate*` returns a pointer that stays valid for the life of
-the registry.
-
-### SlidingWindowRateLimiter
-
-#### `zmodu.SlidingWindowRateLimiter`
-
-窗口内计数限流；**线程安全**。Hoisted like `zmodu.RateLimiter` (there is no
-`zmodu.resilience` namespace).
-
-```zig
-pub fn init(allocator: std.mem.Allocator, name: []const u8, window_size_seconds: u64, max_requests: u32) !Self
-pub fn deinit(self: *Self) void
-pub fn tryAcquire(self: *Self) bool
-pub fn currentCount(self: *Self) usize
-```
-
-### Retry Policy
-
-#### `zmodu.http.HttpClient.RetryPolicy`
-
-Exponential backoff retry strategy.
-
-```zig
-pub fn default() RetryPolicy
-pub fn calculateDelay(self: RetryPolicy, attempt: u32) u64
-```
-
----
-
-## Observability
-
-### Distributed Tracing
-
-#### `zmodu.observability.DistributedTracer`
-
-OpenTelemetry-compatible distributed tracing.
-
-```zig
-pub fn init(allocator: std.mem.Allocator, tracer_name: []const u8, service_name: []const u8) !Self
-pub fn deinit(self: *Self) void
-pub fn startTrace(self: *Self, span_name: []const u8) !*Span
-pub fn startSpan(self: *Self, parent: *Span, span_name: []const u8) !*Span
-pub fn endSpan(self: *Self, span: *Span) void
-pub fn exportJaeger(self: *Self, span: *Span, allocator: std.mem.Allocator) ![]const u8
-pub fn exportZipkin(self: *Self, span: *Span, allocator: std.mem.Allocator) ![]const u8
-pub fn injectContext(self: *Self, span: *Span, headers: *std.StringHashMap([]const u8)) !void
-pub fn extractContext(self: *Self, headers: std.StringHashMap([]const u8)) ?TraceId
-```
-
-**Span Methods:**
-```zig
-pub fn setAttribute(self: *Span, allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void
-pub fn addEvent(self: *Span, allocator: std.mem.Allocator, name: []const u8) !void
-pub fn end(self: *Span) void
-```
-
-### Prometheus Metrics
-
-#### `zmodu.observability.PrometheusMetrics`
-
-Prometheus-compatible metrics collection.
+`zmodu.observability.DistributedTracer` is OpenTelemetry-compatible: `init(allocator, tracer_name, service_name)`, `startTrace(name)`, `startSpan(parent, name)`, `endSpan(span)`, `exportJaeger(span, allocator)`, `exportZipkin(span, allocator)`, `injectContext(span, headers)`, `extractContext(headers)`. Spans support `setAttribute(allocator, key, value)`, `addEvent(allocator, name)` and `end()`.
 
 ```zig
 pub fn init(allocator: std.mem.Allocator) Self
-pub fn deinit(self: *Self) void
-
-// 六个 create* 返回的都是 (FrozenError || std.mem.Allocator.Error)!*T，
-// 其中 pub const FrozenError = error{Frozen}（见下方生命周期说明）。
 pub fn createCounter(self: *Self, name: []const u8, help: []const u8) (FrozenError || std.mem.Allocator.Error)!*Counter
 pub fn createGauge(self: *Self, name: []const u8, help: []const u8) (FrozenError || std.mem.Allocator.Error)!*Gauge
 pub fn createHistogram(self: *Self, name: []const u8, help: []const u8, buckets: []const f64) (FrozenError || std.mem.Allocator.Error)!*Histogram
 pub fn createSummary(self: *Self, name: []const u8, help: []const u8) (FrozenError || std.mem.Allocator.Error)!*Summary
-
-pub fn freeze(self: *Self) void                             // 显式封注册表；幂等，没有 unfreeze
+pub fn freeze(self: *Self) void
 pub fn isFrozen(self: *const Self) bool
 pub fn toPrometheusFormat(self: *Self, allocator: std.mem.Allocator) ![]const u8
 ```
 
-**`error.Frozen`（注册表生命周期）**：`toPrometheusFormat` 在读取任何容器**之前**
-自己先 `freeze()`；显式 `freeze()` 只是把这道封印提前。封印之后所有 `create*`
-返回 `error.Frozen` 且**不插入任何东西**——注册是启动期动作，不是 handler 动作。
-之所以能这样封，是因为封印之后容器不再被写入，抓取线程读它们才能不加锁。
-`freeze()` 幂等、无 `unfreeze`；`isFrozen()` 查状态。
-家族入口（`createCounterFamily` / `createHistogramFamily`）同样受此约束，
-见下文「Metrics with bounded labels」。
+`toPrometheusFormat` freezes the registry before reading it. After a freeze every `create*` returns `error.Frozen` (`FrozenError = error{Frozen}`) and inserts nothing, which is what lets scrape threads read without a lock. `freeze()` is idempotent; there is no unfreeze.
 
-**Metric Types:**
-```zig
-// Counter - monotonically increasing
-pub fn inc(self: *Counter) void
-pub fn add(self: *Counter, value: u64) void
+Metric operations: `Counter.inc()`, `Counter.add(value)`; `Gauge.set(value)`, `Gauge.inc()`, `Gauge.dec()`; `Histogram.observe(value)`.
 
-// Gauge - can go up and down
-pub fn set(self: *Gauge, value: f64) void
-pub fn inc(self: *Gauge) void
-pub fn dec(self: *Gauge) void
+Bounded-label families add a series cap: `createCounterFamily(name, help, label, max_series, io)` and `createHistogramFamily(name, help, label, max_series, buckets, io)`. `family.get(value)` returns a `*Counter` or `*Histogram`; past `max_series` all new values share one `__other__` series. `setScrapeHook(hook, userdata)` samples extra values at scrape time. Label values must be low-cardinality: use `Context.route_template`, never the raw path.
 
-// Histogram - distribution of values
-pub fn observe(self: *Histogram, value: f64) void
-```
+`zmodu.observability.AutoInstrumentation` records module lifecycle and API spans: `init(allocator, metrics, tracer)`, `recordModuleInit`, `recordModuleShutdown`, `recordEventPublished`, `recordApiRequestStart`.
 
-### Auto Instrumentation
+`zmodu.observability.StructuredLogger` writes one JSON object per line: `init(allocator, level, output)`, `withField(key, value)`, `debug` / `info` / `warn` / `err(message, fields)`. In handlers prefer `ctx.logScope("module")`, which carries the request trace id.
 
-#### `zmodu.observability.AutoInstrumentation`
-
-Automatic instrumentation for modules.
-
-```zig
-pub fn init(allocator: std.mem.Allocator, metrics: *PrometheusMetrics, tracer: *DistributedTracer) !Self
-pub fn recordModuleInit(self: *Self, module_name: []const u8, duration_seconds: f64, success: bool) void
-pub fn recordModuleShutdown(self: *Self, module_name: []const u8) void
-pub fn recordEventPublished(self: *Self, event_name: []const u8, module_name: []const u8) !?*Span
-pub fn recordApiRequestStart(self: *Self, api_name: []const u8, module_name: []const u8) !*Span
-```
-
-### Structured Logging
-
-#### `zmodu.observability.StructuredLogger`
-
-JSON-formatted structured logging.
-
-```zig
-pub fn init(allocator: std.mem.Allocator, level: LogLevel, output: Output) Self
-pub fn withField(self: *Self, key: []const u8, value: []const u8) !void
-pub fn log(self: *Self, level: LogLevel, message: []const u8, fields: anytype) !void
-pub fn debug(self: *Self, message: []const u8, fields: anytype) !void
-pub fn info(self: *Self, message: []const u8, fields: anytype) !void
-pub fn warn(self: *Self, message: []const u8, fields: anytype) !void
-pub fn err(self: *Self, message: []const u8, fields: anytype) !void
-```
-
----
-
-## HTTP Server & Profiles
-
-### `zmodu.http.Server`
+## 8. HTTP server
 
 ```zig
 pub fn init(io: std.Io, allocator: std.mem.Allocator, port: u16) Server
@@ -700,38 +215,46 @@ pub fn addRoute(self: *Server, route: Route) !void
 pub fn withGracefulDrain(self: *Server, counter: *std.atomic.Value(u64)) void
 ```
 
-`addRoute` returns `error.TooManyRouteParams` when a path carries more than
-**8** `{…}` segments (`RouteParams.MAX`, `{id}` counts as one). The check runs at
-registration, before the trie is touched, and `router.mountAll` propagates it —
-so a too-wide route fails at startup. It used to register and then 404 every
-request (details: `docs/ROUTE_TABLE.md` §4.6).
-
-#### `Server.Config`
+Each connection runs on its own fiber. `addRoute` rejects a path with more than 8 `{…}` segments (`RouteParams.MAX`) with `error.TooManyRouteParams` at registration; `router.mountAll` propagates it, so the process fails at startup instead of answering 404 to every request.
 
 | Field | Default | Meaning |
-|-------|---------|---------|
+|---|---|---|
 | `port` | `8080` | listen port |
 | `name` | `"zmodu-api"` | server name |
-| `max_body_size` | `8 MiB` | body limit (413 over) |
-| `request_timeout_ms` | `30000` | **handler stage** budget |
+| `max_body_size` | `8 MiB` | request body limit; larger bodies get 413 |
+| `max_params` | `1000` | query/form value cap; over it `error.TooManyParams` |
+| `request_timeout_ms` | `30000` | handler-stage budget |
 | `max_requests_per_conn` | `100` | keep-alive reuse cap |
 | `header_limits` | `.{ .max_count = 100, .max_total_bytes = 16 KiB }` | header-bomb guard |
-| `connection_stack_size` | `128 KiB` | accept-loop thread stack (`runInBackground`; raised to `min_thread_stack_size`) — not per-connection |
-| `max_connections` | `0` (unlimited) | concurrent accepted connections; over the limit the socket is closed |
-| `over_limit_response` | `.close` | `.close` = cheapest, `.unavailable` = raw-socket `503` first |
-| `header_timeout_ms` | `10_000` | request line + headers deadline (slowloris); `0` disables; cleared once headers are read |
-| `body_timeout_ms` | `30_000` | request body deadline, armed at the blank line; exceeding it answers `408`; `0` disables |
-| `response_write_timeout_ms` | `30_000` | per-`send` budget for **every response write**: the buffered response (`writeResponse`), the streaming ones (`startChunked` / `writeChunk`), SSE events (`http.sse`) and HTTP/2 frames. A peer that stops reading gets a truncated response and a closed connection instead of a fiber parked forever — which is also what `stop()`'s drain waits for. A slow-but-live peer (one that keeps draining) is never cut off; `0` restores the unbounded write |
-| `ws_write_timeout_ms` | `0` = inherit `response_write_timeout_ms` | `SO_SNDTIMEO` for WebSocket writes (a frame push parks its thread exactly like a response write parks its fiber, so they share one number by default). On timeout the frame fails with `error.WriteTimeout` and the socket is shut down. Set `response_write_timeout_ms = 0` for the old unbounded behavior |
+| `connection_stack_size` | `128 KiB` | accept-loop thread stack (`runInBackground`), not per connection |
+| `max_connections` | `0` (unlimited) | concurrent accepted connections; over it the socket is closed |
+| `over_limit_response` | `.close` | `.close` is cheapest; `.unavailable` sends a raw `503` first |
+| `header_timeout_ms` | `10_000` | request line and headers deadline; `0` disables; cleared after headers |
+| `body_timeout_ms` | `30_000` | request body deadline, armed at the blank line; over it answers `408`; `0` disables |
+| `response_write_timeout_ms` | `30_000` | per-send budget for buffered, chunked, SSE and HTTP/2 writes; a peer that stops reading gets a truncated response and a closed connection; `0` makes writes unbounded |
+| `ws_write_timeout_ms` | `0` = inherit `response_write_timeout_ms` | WebSocket write timeout; on timeout the frame fails with `error.WriteTimeout` and the socket shuts down |
+| `enable_http2` | `false` | h2c support |
 
-Environment equivalents (`fromEnv`): `HTTP_PORT`, `HTTP_MAX_BODY`,
-`HTTP_MAX_CONNECTIONS`, `HTTP_HEADER_TIMEOUT_MS`, `HTTP_BODY_TIMEOUT_MS`,
-`HTTP_RESPONSE_WRITE_TIMEOUT_MS`, `WS_WRITE_TIMEOUT_MS`.
+`fromEnv` reads `HTTP_PORT`, `HTTP_MAX_BODY`, `HTTP_MAX_CONNECTIONS`, `HTTP_HEADER_TIMEOUT_MS`, `HTTP_BODY_TIMEOUT_MS`, `HTTP_RESPONSE_WRITE_TIMEOUT_MS`, `WS_WRITE_TIMEOUT_MS`.
 
-### `zmodu.http.productionProfile`
+### Shutdown
 
-One call: backpressure + security/observability middleware + `/metrics` +
-liveness/readiness probes (+ optional dashboard).
+- `stop()` is bounded against peers: every upgraded WebSocket connection still held by the fiber path has its socket shut down, so a client that sends no frames and no FIN cannot hold the drain.
+- In-flight HTTP/1.1 and HTTP/2 requests are awaited, not cancelled.
+- Callbacks (`on_connect` / `on_message` / `on_close`) run on the connection fiber and are not interruptible; a blocking callback holds `stop()` for as long as it blocks.
+- Connections adopted by `setWsUring` belong to the ring: `WsUring.stop()` / `deinit()` end them and close the descriptor once. A refused handoff leaves the descriptor with the fiber, and a rejected connection still gets a close frame and its `on_close` call.
+
+### ws_uring boundary
+
+`WsUring.init` starts with `if (builtin.os.tag != .linux) @compileError(...)` (`src/http/ws_uring.zig:91`), so non-Linux targets fail at compile time rather than falling back at runtime. The `linux` / `IoUring` aliases are stubs elsewhere, which keeps the rest of the file (frame parser, admission and drain accounting) analysable on every platform.
+
+Nine tests run on all platforms: four parser tests, control-frame size rejection, `user_data` encoding, two admission/drain contract tests (`adopt`, `teardown`), and one forced-analysis test. Linux adds the assertion that teardown closes the fd. No test drives a real ring: `runLoop`, `submitRead` and `copy_cqes` are not exercised in-tree, and CI has no io_uring-specific step.
+
+Parser correctness comes from the shared validator: `parseFrame` calls `WsFramer.validateFrameHeader`, `WsFramer.Assembler` and `closeCodeFor`, the same rules the fiber path uses. Re-check this section when a test or example drives `WsUring.init`/`setWsUring`, when std's `Io` gains an equivalent primitive, or when CI adds a platform leg.
+
+### productionProfile
+
+One call wires backpressure, security and observability middleware, `/metrics`, and liveness/readiness probes.
 
 ```zig
 pub const ProductionConfig = struct {
@@ -749,334 +272,182 @@ pub const ProductionConfig = struct {
     tracing: bool = true,
 };
 
-pub const ProductionProfileState = struct {
-    pub fn init(allocator: std.mem.Allocator) ProductionProfileState
-    pub fn deinit(self: *ProductionProfileState, allocator: std.mem.Allocator) void
-};
-
 pub fn productionProfile(server: *Server, cfg: ProductionConfig, state: *ProductionProfileState) !void
 ```
 
-**Ordering constraint**: `Server.addRoute` snapshots the global middleware chain at
-registration time, so `productionProfile` must run **before** any
-`server.addRoute` / `router.mountAll`. `state` must outlive the server.
+`addRoute` snapshots the global middleware chain at registration, so `productionProfile` must run before any `server.addRoute` or `router.mountAll`. `state` must outlive the server.
 
-Golden signals created by default (label-free, fixed cardinality):
-
-| Metric | Type |
-|--------|------|
+| Default golden signal | Type |
+|---|---|
 | `http_requests_total` | counter |
-| `http_responses_2xx_total` / `_3xx_` / `_4xx_` / `_5xx_` | counters |
+| `http_responses_2xx_total`, `_3xx_`, `_4xx_`, `_5xx_` | counters |
 | `http_request_duration_milliseconds` | histogram (1/5/10/25/50/100/250/500/1000/2500/5000 ms) |
 
-Thresholds, PromQL and the Grafana dashboard: [`OBSERVABILITY.md`](./OBSERVABILITY.md).
+Thresholds, PromQL and dashboards: [`OBSERVABILITY.md`](./OBSERVABILITY.md).
 
-### Existing profiles
+`applyHttpDefaults(server, ProfileConfig, *HttpProfileState)` installs only CORS, request id, panic recovery, access log and in-memory metrics. `ResilienceProfileState.init(allocator, deps)` / `applyResilienceDefaults` create a `CircuitBreaker` and `RateLimiter` per dependency; nothing is enforced until a handler calls `breaker(name)` or `limiter(name)`. `PrometheusMetrics.registerMetricsRoute(server)` serves `GET /metrics`; `registerMetricsRoutePath(server, path)` changes the path.
 
-| Symbol | Purpose |
-|--------|---------|
-| `applyHttpDefaults(server, ProfileConfig, *HttpProfileState)` | CORS / request-id / recover / access log / in-memory metrics middleware only |
-| `ResilienceProfileState.init(allocator, deps)` / `applyResilienceDefaults` | per-dependency `CircuitBreaker` + `RateLimiter` holders — nothing is enforced until handlers use `breaker(name)` / `limiter(name)` |
-
-### `zmodu.observability.PrometheusMetrics`（HTTP profile 接线）
-
-与上文是**同一个类型**，这里只列 HTTP profile 侧用到的入口。
+## 9. Routing, context and middleware
 
 ```zig
-pub fn init(allocator: std.mem.Allocator) Self
-// 三个 create* 的冻结语义同上：封印后 error.Frozen，不插入任何东西
-pub fn createCounter(self: *Self, name: []const u8, help: []const u8) (FrozenError || std.mem.Allocator.Error)!*Counter
-pub fn createGauge(self: *Self, name: []const u8, help: []const u8) (FrozenError || std.mem.Allocator.Error)!*Gauge
-pub fn createHistogram(self: *Self, name: []const u8, help: []const u8, buckets: []const f64) (FrozenError || std.mem.Allocator.Error)!*Histogram
-pub fn freeze(self: *Self) void
-pub fn isFrozen(self: *const Self) bool
-pub fn toPrometheusFormat(self: *Self, allocator: std.mem.Allocator) ![]const u8
-pub fn registerMetricsRoute(self: *Self, server: anytype) !void            // GET /metrics
-pub fn registerMetricsRoutePath(self: *Self, server: anytype, path: []const u8) !void
+pub const Method = enum { GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS };
+pub const HandlerFn = *const fn (*Context) anyerror!void;
+pub const Route = struct {
+    method: Method,
+    path: []const u8,
+    handler: HandlerFn,
+    middleware: []const Middleware = &.{},
+    user_data: ?*anyopaque = null,
+};
 ```
 
----
+Request access: `queryParam(key)`, `pathParam(key)` (alias `param`), `header(key)`, `formValue(key)`, and the `body` field. Path placeholders never fall back to query or form; use `requestParam` (form first, then query) or `nestedParam` for dotted paths.
 
-## Hardening primitives
-
-### `zmodu.FrozenMap` / `zmodu.FrozenStringMap`
-
-Build-time-populated, run-time read-only maps for app-level shared registries.
-Fill during startup, `freeze()` before serving; afterwards reads are lock-free
-and safe for any number of concurrent readers, and writes fail with
-`error.Frozen` instead of racing a resize (the `panic: incorrect alignment`
-class).
+Response helpers: `json(status, data)`, `jsonStruct(status, value)`, `text(status, data)`, `sendError(status, message)`, `sendErrorResponse(status, code, message)`, `setHeader(key, value)`.
 
 ```zig
-pub fn FrozenMap(comptime K: type, comptime V: type) type
-pub fn FrozenStringMap(comptime V: type) type
-// methods: init(allocator), deinit(), freeze(), isFrozen(), put(K, V), remove(K),
-//          get(K) ?V, contains(K), count(), iterator()
+pub fn bindJson(self: *const Context, comptime T: type) !T
+pub fn parseReq(self: *Context, comptime T: type, sources: anytype) !T
+
+const MyReq = struct { id: u32, page: u32 };
+const req = try ctx.parseReq(MyReq, .{ .id = .path, .page = .query });
+// GET /users/42?page=3 -> req.id = 42, req.page = 3
 ```
 
-### `zmodu.panicHook`
-
-Request-aware panic handler. The server records `METHOD /path` into a threadlocal
-slot before dispatch; on panic the hook prints it to stderr (no allocation)
-before delegating to `std.debug.defaultPanic`.
-
 ```zig
-// in the application root file (the one with `main`):
-const zmodu = @import("zmodu");
-pub const panic = zmodu.panicHook;
+pub const MiddlewareFn = *const fn (*Context, HandlerFn, ?*anyopaque) anyerror!void;
+pub const Middleware = struct { func: MiddlewareFn, user_data: ?*anyopaque = null };
 ```
 
-A panic still aborts the process — the hook is the *diagnosis* half. Recovery
-comes from a supervisor (`Restart=always`, k8s `restartPolicy: Always`); see
-[`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「韧性」and
-[`PRODUCTION_ROADMAP.md`](../archive/status/PRODUCTION_ROADMAP.md) for the prefork boundary.
-
-### `zmodu.Params` (multi-value query/form)
-
-Hoisted to the root (there is no `zmodu.http.Params` alias; `PageParams` stays
-under `zmodu.http`).
-
-`ctx.query` and `ctx.form` are `Params`, not `StringHashMap`: HTML's two native
-"several values for one name" shapes are kept.
+Execution order is global middleware, then route middleware, then handler. Call `try next(ctx, next, user_data)` to continue.
 
 ```zig
-pub fn put(self, name, value) !void            // duplicates; repeated names accumulate
-pub fn putOwned(self, name, value) !void       // takes ownership (parsers use this)
-pub fn get(self, name) ?[]const u8             // LAST occurrence (compat with the old map)
+fn authMiddleware(ctx: *Context, next: HandlerFn, user_data: ?*anyopaque) anyerror!void {
+    _ = ctx.header("Authorization") orelse return ctx.sendError(401, "Unauthorized");
+    try next(ctx, next, user_data);
+}
+try server.addMiddleware(.{ .func = authMiddleware });
+```
+
+Runtime routes live on a scope (`router.scope("/api/v1").get(...)`) and are not in the permission catalog.
+
+## 10. Params
+
+`ctx.query` and `ctx.form` are `zmodu.Params`, which keeps repeated names instead of collapsing them.
+
+```zig
+pub fn put(self, name, value) !void            // appends; repeated names accumulate
+pub fn putOwned(self, name, value) !void       // takes ownership
+pub fn get(self, name) ?[]const u8             // last occurrence
 pub fn getFirst(self, name) ?[]const u8
 pub fn getAll(self, name) []const []const u8
 pub fn getArray(self, allocator, name) ![][]const u8   // name[0..n] sorted, then name[]
-pub fn getPath(self, path) ?[]const u8         // "filter.tags" → filter[tags]
-pub fn totalValues(self) usize                 // occurrences — what the guard counts
+pub fn getPath(self, path) ?[]const u8         // "filter.tags" -> filter[tags]
+pub fn totalValues(self) usize                 // occurrences counted by the guard
 ```
 
-Context helpers: `queryValues` / `formValues` / `queryArray` / `formArray` /
-`nestedParam` (dotted path, was `paramPath`) / `requestParam` (form first, then
-query). Guard: `Server.Config.max_params` (default 1000 → `error.TooManyParams`).
+Context helpers: `queryValues`, `formValues`, `queryArray`, `formArray`, `nestedParam`, `requestParam`. `Server.Config.max_params` (default 1000) bounds the total. `route_template` is the metric label and is normalised to a leading `/` at registration, so `group.get("health")` and a `ComptimeRouter` mount report the same shape.
 
-Path placeholders are `pathParam` (alias `param`) only — they do not fall back to
-query/form. `route_template` is the metric label to use; it is normalised to a
-leading `/` at registration, so `group.get("health")` and a ComptimeRouter mount
-both report the same shape as `group.get("/health")`.
-
-### `zmodu.http.Multipart`
+## 11. Multipart and uploads
 
 ```zig
 pub const Config = struct {
     max_parts: usize = 64,
     max_part_bytes: usize = 8 MiB,
     max_total_bytes: usize = 32 MiB,
-    // Limits subdivided from a server body limit — use this so the two cannot
-    // disagree: parts may not together exceed the body the server accepted.
     pub fn forBodyLimit(body_limit: usize) Config
 };
 pub fn parse(allocator, body, content_type, config) Error!Form
 pub const Form = struct {
-    pub fn value(self, name) ?[]const u8      // text fields only
-    pub fn file(self, name) ?*const Part      // filename/data/content_type
+    pub fn value(self, name) ?[]const u8      // text fields
+    pub fn file(self, name) ?*const Part      // filename, data, content_type
     pub fn textFields(self, allocator) !std.StringHashMap([]const u8)
     pub fn deinit(self) void
 };
-
-// Context:
-pub fn multipart(self: *const Context, config: Multipart.Config) Multipart.Error!Multipart.Form
-pub fn bindMultipart(self: *const Context, comptime T: type, config: Multipart.Config) !T
 ```
 
-`Server.Config.max_body_size` (default 8 MiB) rejects a body **before** any
-`Config` limit here is consulted, so the 32 MiB default total is unreachable
-until that is raised — see `docs/BEST_PRACTICES.md`「上传与 multipart」.
+Derive limits from the server body limit with `Multipart.Config.forBodyLimit(n)`. `Server.Config.max_body_size` (8 MiB) rejects a body before any multipart limit is consulted, so a larger total is unreachable until the server limit is raised.
 
-### Uploads
+`ctx.multipart(config)` parses, `ctx.bindMultipart(T, config)` binds fields, and `http.extractMultipart(ctx, config)` renders failures as ProblemDetails: 415 not multipart, 413 too large, 400 missing boundary / malformed / too many parts.
+
+`http.UploadGuard` decides what a file is from its bytes:
 
 ```zig
-// http.Extract: multipart failures rendered as ProblemDetails
-pub fn extractMultipart(ctx: *Context, config: Multipart.Config) !Multipart.Form
-//   415 not multipart · 413 too large · 400 missing boundary / malformed / too many parts
-
-// http.UploadGuard — decide what a file *is* from its bytes
-pub const Format = enum { jpeg, png, gif, webp, bmp, tiff, pdf, zip, gzip, mp4, webm, ogg, mp3, wav, plain, svg, html, unknown };
 pub const Policy = struct {
     extensions: []const []const u8 = &.{},   // allowlist, lowercase, no dot
     formats: []const Format = &.{},
     max_bytes: usize = 0,                    // per file
     require_extension_match: bool = true,
-    allow_active_content: bool = false,      // SVG/HTML: refused by default
+    allow_active_content: bool = false,      // SVG/HTML refused by default
 };
 pub fn check(filename: []const u8, data: []const u8, policy: Policy) Error!Accepted
 pub fn checkForm(form: *const Multipart.Form, policy: Policy) Error!void
 pub fn sniff(data: []const u8) Format
 pub fn extensionOf(filename: []const u8) ?[]const u8
 pub fn extensionMatchesFormat(ext: []const u8, format: Format) bool
+```
 
-// Extraction: parse + content-check in one call (recommended entry point)
+`check` decides in this order: size, active content, extension allowlist, format allowlist, extension vs sniffed content. A renamed script fails on content; a renamed image of another family fails the mismatch.
+
+```zig
 pub const GuardedUpload = struct {
     multipart: Multipart.Config = .{},
     policy: UploadGuard.Policy,
-    reject_status: u16 = 415,                // 422 for "type ok, payload not"
+    reject_status: u16 = 415,  // 422 when the type is allowed but the payload is not
 };
 pub fn extractMultipartGuarded(ctx: *Context, config: GuardedUpload) !Multipart.Form
-//   parse failures keep extractMultipart's 415/413/400; a policy refusal renders
-//   ProblemDetails at `reject_status` and returns the guard error unchanged.
-//   The form is freed on the rejection path — the caller owns it only on success.
 ```
 
-`check` decides in a fixed order: size → active content (SVG/HTML refused unless
-`allow_active_content`) → extension allowlist → format allowlist → extension vs
-content agreement. The rule it enforces: **sniff the bytes and require the
-sniffed format to agree with the extension** — a renamed script fails on content,
-a renamed image cross-family fails on the mismatch.
+Parse failures keep the 415/413/400 responses. A policy refusal renders ProblemDetails at `reject_status` and returns the guard error unchanged; the form is freed on rejection and owned by the caller only on success.
 
-`extractMultipartGuarded` is `extractMultipart` + `checkForm` in one call, so an
-endpoint cannot ship with the policy defined but never applied; it renders the
-refusal (415 by default) and still returns the guard error for handlers that
-branch on it.
+## 12. Static files
 
-### `zmodu.http.staticFiles` (static file serving)
+`http.staticFiles(io, server, allocator, prefix, root_dir, config)` and `http.staticMiddleware(...)` install a file handler as middleware, because the router's `/prefix/*` matches only the prefix.
+
+`GET` and `HEAD` only, no directory index; paths are normalised before touching the filesystem. `ETag` / `If-None-Match` give 304, `Range` gives 206/416, and bodies over `max_bytes` (16 MiB default) get 413. Bodies above the chunk size stream from disk: `Content-Length` appears only for `HEAD` and small bodies, so HTTP/1.0 clients without chunked support should use `HEAD` or `Range`.
+
+## 13. Error responses
+
+Two hooks turn framework-generated errors into RFC 7807 ProblemDetails (`application/problem+json`): the in-chain renderer for `ctx.sendError`, and the transport renderer for errors written to a raw socket before routing.
 
 ```zig
-pub fn staticFiles(io, server: *Server, allocator, prefix: []const u8, root_dir: []const u8, config: Config) !void
-pub fn staticMiddleware(io, allocator, prefix, root_dir, config) !Middleware
+pub fn useRfc7807Errors() void                        // chain + transport in one call
+pub fn setDefaultReject(renderer: ?AuthRejectFn) void // chain only; null restores the envelope
+pub fn problemReject(ctx: *Context, status: u16, message: []const u8) anyerror!void
+pub fn setTransportErrorRenderer(renderer: ?TransportErrorFn) void  // transport only
+pub fn problemTransportBody(status: u16, message: []const u8, buf: []u8) TransportErrorBody
+pub fn sendErrorEnvelope(self: *Context, status: u16, code: i32, message: []const u8) !void  // bypasses renderers
 ```
 
-Implemented as middleware (the router's `/prefix/*` matches only the prefix
-itself). Serves `GET`/`HEAD` only; no directory index; normalizes paths before
-touching the filesystem; `ETag` + `If-None-Match` → 304; `Range` → 206/416;
-bodies above `max_bytes` (16 MiB default) → 413.
+`ModuleGateConfig` accepts `reject`, so a gate can keep `.unknown = .deny` and still change the 404 body. Call `useRfc7807Errors()` at startup, before the middleware chain and routes are built.
 
-Bodies larger than the serving chunk size are sent **chunked** (streamed from
-disk) instead of buffered whole — so a `Content-Length` is only present for
-`HEAD` and for bodies at or below the chunk threshold. HTTP/1.0 clients that
-cannot read chunked framing should use `HEAD` or `Range` for large files.
+## 14. Security
 
-### Metrics with bounded labels
+`zmodu.security.SecurityModule` signs and verifies JWTs: `init(allocator, jwt_secret, token_expiry_seconds)`, `generateToken(payload)`, `verifyToken(token)`, `hashPassword(password)`, `verifyPassword(password, hash)`.
 
-```zig
-// 冻结后同样 error.Frozen（见上文「Prometheus Metrics」）
-pub fn createCounterFamily(self, name, help, label, max_series: usize, io: std.Io) (FrozenError || std.mem.Allocator.Error)!*CounterFamily
-pub fn createHistogramFamily(self, name, help, label, max_series: usize, buckets: []const f64, io: std.Io) (FrozenError || std.mem.Allocator.Error)!*HistogramFamily
-// family.get(label_value) -> *Counter / *Histogram   (cap → shared "__other__" series)
-pub fn setScrapeHook(self, hook: ?ScrapeHook, userdata: ?*anyopaque) void  // sampled at scrape time
-```
+`verifyPassword` returns `false` only for a wrong password. An undecodable stored hash surfaces as `error.MalformedStoredHash` and an allocation failure as `error.OutOfMemory`, so callers can answer 5xx instead of 401. `zmodu.security.PasswordEncoder.matches` has the same shape.
 
-Labels must be low-cardinality by construction: `productionProfile` labels the
-golden signals with `Context.route_template` (the matched pattern), never the raw
-path. See [`OBSERVABILITY.md`](./OBSERVABILITY.md).
+Handlers should evaluate the same expression the route meta uses: `ctx.rolesCsv()`, `ctx.permissionsCsv()`, `ctx.permissionMatches(expr)`. `http.permissionMatchesWith(ctx, expr, config)` pins one gate's semantics (`.roles` reads roles, `.rbac` prefers AuthInfo when present); `permissionMatchesContext` and `permissionMatchesAuthInfo` are the other entry points. `expr` supports `a|b` alternatives.
 
-### `zmodu.outbox.OutboxConsumer`
+`security.JwksKeyRing` with `SecurityModule.setKeyring(&ring)` makes new tokens carry a `kid`. Verification uses the named key and rejects unknown kids with `error.UnknownKeyId`. Rotate by adding a new primary key and keeping the old one until its tokens expire.
 
-```zig
-pub fn setMetrics(self: *Self, metrics: *PrometheusMetrics) !void   // selected/delivered/failed + pending gauge
-pub fn pendingCount(self: *Self) !u64
-pub fn refreshPending(self: *Self) void
-pub fn startPolling(self: *Self, io: std.Io, interval_ms: u64) !void
-pub fn stopPolling(self: *Self) void
-pub fn pollOnce(self: *Self) !PollStats
-```
+`security.SecurityScanner` runs static rules: `init(allocator, config)`, `registerRule(rule)`, `scanSourceCode(path, source)`, `scanModule(path)`, `generateReport(result)`, `isSecure(result)`.
 
-### `zmodu.Preflight`
+## 15. Transport
 
-Startup checks that turn "it broke at 3am" into "it refused to start".
+`http.Server` ships HTTP/1.1 and h2c (`enable_http2`); gRPC runs over HTTP/2 through `extensions/GrpcTransport.zig` and `GrpcServiceRegistry`. There is no `TransportProtocol` enum and no built-in MQTT transport.
 
-```zig
-pub const Severity = enum { warn, fatal };
-pub const Check = struct { name, severity = .fatal, run, ctx };
-pub const Report = struct { pub fn ok(self) bool; pub fn log(self) void; pub fn deinit(self) void };
-pub fn run(allocator, checks: []const Check) Report
-
-// ready-made probes
-pub fn envCheck(*EnvCheck) Check                     // EnvCheck.fromMap(init.environ_map, names)
-pub fn secretCheck(*SecretCheck) Check               // rejects placeholders / < min_len
-pub fn dbCheck(client: anytype) Check                // SELECT 1
-pub fn migrationCheck(*MigrationCheck) Check         // pending > 0 → error
-pub fn clockCheck(*ClockCheck) Check                 // wall-clock sanity
-```
-
-Checks never panic and are isolated: one failure does not hide the others.
-See [`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「上线前预检」.
-
-### `zmodu.security.JwksKeyRing` (key rotation)
-
-`SecurityModule.setKeyring(&ring)` makes new tokens carry `kid`; verification
-uses the key the token names and rejects unknown kids (`error.UnknownKeyId`).
-Rotate by adding a new primary key and keeping the old one in the ring until
-its tokens expire.
-
-### `zmodu.DistributedLock`
-
-Cross-instance mutual exclusion for background work (cron jobs, migrations).
-
-```zig
-pub const Lock = struct {
-    pub fn tryAcquire(self: Lock, name: []const u8, ttl_ms: u64) anyerror!bool
-    pub fn release(self: Lock, name: []const u8) void
-};
-pub const NoopLock = struct { pub fn lock(self: *NoopLock) Lock };
-pub const Dialect = enum { sqlite, postgres, mysql };
-pub fn SqlLock(comptime Client: type) type // init(allocator, io, client, table, dialect)
-```
-
-Consumers: `cron.Scheduler.setLock(lock, ttl_ms)` (key `cron:<job>`) and
-`data.MigrationRunner.setLock(lock, ttl_ms)` (key `zmodu:migration`, returns
-`error.MigrationLocked` when another instance holds it).
-
-Coverage: SQLite in-memory, plus a real PostgreSQL 17 test gated on
-`ZMODU_TEST_PG=1` (CI's `test-postgres` job sets it, along with `PGHOST` /
-`PGPORT` / `PGUSER` / `PGPASSWORD` / `PGDATABASE`). The MySQL variant
-(`INSERT IGNORE`) is implemented but still awaits a real-server test. Claiming is one atomic
-statement (`ON CONFLICT DO NOTHING` / `INSERT IGNORE`), so contention is
-`rows_affected == 0`, not an error; a crashed holder is reaped after `ttl_ms`.
-See [`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「多副本后台任务」.
-
-### `zmodu.NetworkProbe`
-
-```zig
-pub fn available() bool   // loopback TCP usable?
-```
-
-Used by socket-dependent tests to `return error.SkipZigTest` in sandboxes.
-`zig build test -Dnet-tests=false` forces it to `false` so the whole suite skips
-network cases.
-
-### `zmodu.im.WsFramer` (outbound control)
-
-```zig
-pub fn setSendTimeout(self: *WsFramer, timeout_ms: u32) void  // 0 = unbounded
-pub fn isWritable(self: *WsFramer) bool                       // O(1) send-buffer probe
-```
-
----
-
-## Transport
-
-### Transport Protocols
-
-zmodu ships HTTP/1.1 and h2c in `http.Server` (`enable_http2`), and gRPC over
-HTTP/2 via `extensions/GrpcTransport.zig` + `GrpcServiceRegistry`. There is no
-`TransportProtocol` enum and no built-in MQTT transport — bring your own client
-for those (an MQTT client is not part of the framework).
-
-**HTTP/2 response limits, so an app is not surprised by them.** Both are
-`ServeOptions` fields (`Server.http2ServeOptions` fills them from its `Config`):
+Both HTTP/2 limits are `ServeOptions` fields that `Server.http2ServeOptions` fills from `Config`.
 
 | Limit | Default | Effect |
-|-------|---------|--------|
-| `max_pending_bytes` | 4 MiB | Outbound bytes **queued** before the peer's window drains — a bound on the queue, not on a response body. A body larger than it is staged frame by frame as earlier frames leave for the wire (`OutboundScheduler.refill`), so a 6 MiB (or 16 MiB) body is served over H2 exactly as it is over HTTP/1.1. Measured before the fix: 3 MiB served, 6 MiB refused with `RST_STREAM(ENHANCE_YOUR_CALM)`, 16 MiB with `INTERNAL_ERROR` (a single DATA frame's 24-bit length). It only refuses a stream when it is `0`, where no slice can be staged at all. |
-| `max_pending_streams` | 64 | Concurrent outbound response streams; over it the stream is refused with `REFUSED_STREAM`. |
+|---|---|---|
+| `max_pending_bytes` | 4 MiB | Outbound bytes queued before the peer's window drains. A larger body is staged frame by frame as earlier frames leave (`OutboundScheduler.refill`), so a 6 MiB body is served over h2 as it is over HTTP/1.1. Only `0` refuses a stream, because no slice can be staged. |
+| `max_pending_streams` | 64 | Concurrent outbound streams; over it the stream is refused with `REFUSED_STREAM`. |
 
-A stream's send window starts at the peer's `SETTINGS_INITIAL_WINDOW_SIZE` as of
-the stream's creation (`Http2.FlowControlState.initStream`, RFC 9113 §6.5.2 — the
-setting applies to streams opened after it), and the peer's per-stream
-`WINDOW_UPDATE` raises it further. Before that, new streams started at the
-protocol default regardless of what the peer advertised, which showed up as a
-response stopping after 64 KiB (measured: 65636 bytes on the wire) for a client
-that advertised a large window; the h2 stall test in `api/Server.zig` is the
-regression test (it no longer sends a per-stream `WINDOW_UPDATE`).
-
-### gRPC Transport (unary)
+A stream's send window starts at the peer's `SETTINGS_INITIAL_WINDOW_SIZE` at stream creation (RFC 9113 §6.5.2), then follows per-stream `WINDOW_UPDATE`. The h2 stall test in `api/Server.zig` covers this.
 
 ```zig
-// Local (modulith)
+// In-process (modulith)
 var registry = zmodu.GrpcServiceRegistry.init(allocator);
 defer registry.deinit();
 try registry.registerService("echo.Echo");
@@ -1086,790 +457,58 @@ var client = zmodu.GrpcClient.init(allocator);
 defer client.deinit();
 client.bindLocal(&registry);
 var resp = try client.call("echo.Echo", "Say", proto_bytes);
-defer resp.deinit();
 
 // HTTP/1.1 application/grpc
 var net = zmodu.GrpcClient.initWithIo(allocator, io);
 defer net.deinit();
 try net.registerEndpoint("echo.Echo", "127.0.0.1", 50051);
 var remote = try net.call("echo.Echo", "Say", proto_bytes);
-defer remote.deinit();
 
-// Framing helpers
-const framed = try zmodu.GrpcFrame.encode(allocator, proto_bytes);
-defer allocator.free(framed);
-const payload = try zmodu.GrpcFrame.decode(framed);
+// Framing helpers: zmodu.GrpcFrame.encode(allocator, bytes) / decode(framed)
 ```
 
-HTTP unary server side: `registry.handleHttpUnary(path, body)` → set `grpc-status` / `grpc-message` headers + framed body.
-
-### SecretsManager (Vault KV v2)
+Server side: `registry.handleHttpUnary(path, body)` sets `grpc-status` / `grpc-message` and returns the framed body.
 
 ```zig
 var sm = zmodu.security.SecretsManager.initWithIo(allocator, io);
 defer sm.deinit();
-try sm.configureVaultEx(.{
-    .address = "http://127.0.0.1:8200",
-    .token = "dev-root-token",
-    .mount_path = "secret",
-});
+try sm.configureVaultEx(.{ .address = "http://127.0.0.1:8200", .token = "dev-root-token", .mount_path = "secret" });
 try sm.loadFromVault("database/creds"); // GET /v1/secret/data/database/creds
-const host = sm.get("DB_HOST"); // priority: env > file > vault > default
+const host = sm.get("DB_HOST");         // env > file > vault > default
 ```
 
-- `applyVaultKvJson(body)` — unit-test / inject KV JSON without HTTP.
-- `https://` → `error.VaultTlsNotSupported` (plain HTTP only; use local Vault or TLS-terminating proxy).
-- Live smoke: `VAULT_ADDR` + `VAULT_TOKEN` (+ optional `VAULT_MOUNT` / `VAULT_SECRET_PATH`).
+- `applyVaultKvJson(body)` injects a KV JSON payload without HTTP.
+- Vault addresses are plain HTTP; `https://` returns `error.VaultTlsNotSupported`. Terminate TLS in a proxy.
+- Live smoke: `VAULT_ADDR` + `VAULT_TOKEN`, optionally `VAULT_MOUNT` / `VAULT_SECRET_PATH`.
 
-### MQTT Transport
+`zmodu.http.HttpClient` pools connections: `init(allocator, max_connections, timeout_ms)`, `request(req)`, `get(url)`, `post(url, body)`, `put(url, body)`, `delete(url)`. `https://` uses `std.http.Client` and the system trust store.
 
-Not provided. Use an external MQTT client library; the framework's HTTP stack
-(`http.HttpClient`) is unrelated to MQTT.
+## 16. Hardening primitives
 
-### HTTP Client
+`zmodu.FrozenMap(K, V)` and `zmodu.FrozenStringMap(V)` are read-only after `freeze()`: fill during startup, then reads are lock-free and writes fail with `error.Frozen` instead of racing a resize. Methods: `init`, `deinit`, `freeze`, `isFrozen`, `put`, `remove`, `get`, `contains`, `count`, `iterator`.
 
-#### `zmodu.http.HttpClient`
+`zmodu.panicHook` records `METHOD /path` in a thread-local before dispatch; on panic it prints that to stderr without allocating, then delegates to `std.debug.defaultPanic`. Wire it in the application root file (the one with `main`) with `pub const panic = zmodu.panicHook;`. The process still aborts; recovery comes from a supervisor (`Restart=always`, Kubernetes `restartPolicy: Always`).
 
-HTTP client with connection pooling.
+`zmodu.Preflight.run(allocator, checks)` returns a `Report` and never panics; one failure does not hide the others. Ready-made probes: `envCheck`, `secretCheck` (rejects placeholders and short values), `dbCheck` (`SELECT 1`), `migrationCheck` (pending migrations fail), `clockCheck`. Severity is `.warn` or `.fatal`.
 
-```zig
-pub fn init(allocator: std.mem.Allocator, max_connections: usize, timeout_ms: u64) Self
-pub fn deinit(self: *Self) void
-pub fn request(self: *Self, req: HttpRequest) !HttpResponse
-pub fn get(self: *Self, url: []const u8) !HttpResponse
-pub fn post(self: *Self, url: []const u8, body: []const u8) !HttpResponse
-pub fn put(self: *Self, url: []const u8, body: []const u8) !HttpResponse
-pub fn delete(self: *Self, url: []const u8) !HttpResponse
-```
+`zmodu.DistributedLock` gives cross-instance exclusion for cron jobs and migrations: `tryAcquire(name, ttl_ms)`, `release(name)`, `SqlLock(Client)` with a `sqlite` / `postgres` / `mysql` dialect. Claiming is one atomic statement (`ON CONFLICT DO NOTHING` / `INSERT IGNORE`), so contention is `rows_affected == 0`, not an error; a crashed holder is reaped after `ttl_ms`.
 
-### HTTP Server
+Consumers: `cron.Scheduler.setLock(lock, ttl_ms)` (key `cron:<job>`) and `data.MigrationRunner.setLock(lock, ttl_ms)` (key `zmodu:migration`, returns `error.MigrationLocked` when held elsewhere). SQLite in-memory and PostgreSQL 17 are tested; the MySQL variant has no live-server test.
 
+`zmodu.NetworkProbe.available()` reports whether loopback TCP works. Socket-dependent tests return `error.SkipZigTest` when it is false; `zig build test -Dnet-tests=false` forces it false.
 
+`zmodu.im.WsFramer` exposes outbound control: `setSendTimeout(timeout_ms)` (`0` = unbounded) and `isWritable()` (O(1) send-buffer probe). Drop frames when `isWritable()` is false; otherwise a slow reader blocks the write thread and the connection shard lock.
 
-#### Overview
+`zmodu.outbox.OutboxConsumer` reports delivery state: `setMetrics(metrics)`, `pendingCount()`, `refreshPending()`, `startPolling(io, interval_ms)`, `stopPolling()`, `pollOnce()`.
 
-
-
-zmodu provides an async fiber-based HTTP server built on `std.Io`. It supports routing, middleware chains, keep-alive connections, and structured request handling aligned with go-zero's rest package.
-
-
-
-**Architecture**: Each incoming connection is handled by an independent fiber via `std.Io.Group.async`, enabling true concurrent request processing without manual thread pools. The underlying I/O uses kqueue (macOS) or io_uring/epoll (Linux) for efficient async operations.
-
-
-
-#### Server
-
-
-
-`zmodu.http.Server` — Main async HTTP server.
-
-
+## 17. Data and repository
 
 ```zig
-
-pub fn init(io: std.Io, allocator: std.mem.Allocator, port: u16) Server
-
-pub fn deinit(self: *Server) void
-
-
-
-// Route management
-
-pub fn addRoute(self: *Server, route: Route) !void
-
-
-pub fn addMiddleware(self: *Server, mw: Middleware) !void
-
-
-
-// Lifecycle
-
-pub fn start(self: *Server) !void  // Blocks until stop() is called
-
-pub fn stop(self: *Server) void    // Gracefully stops accepting new connections
-
-```
-
-
-
-**WebSocket route shutdown contract.** `stop()` is bounded against *peers*: every
-upgraded WebSocket connection the fiber path is still serving has its socket shut
-down, so a client that completes the handshake and then sends neither frames nor a
-FIN does not keep `stop()` — and the drain in `start()`'s defer — waiting.
-Reservation happens once per upgrade, not per request, and HTTP/1.1 / HTTP/2
-connections are deliberately **not** touched: the drain awaits in-flight requests
-rather than cancelling them.
-
-What no wake can reach is your own callback: `on_connect` / `on_message` /
-`on_close` run on the connection fiber, and a callback that does not return (an
-outbound request with no timeout, a lock nobody releases) keeps the drain waiting
-for exactly as long as it blocks — there is no budget that cuts it short, by
-design. A `stop()` that returned with a fiber still alive would hand it a server
-its caller is about to `deinit`. Put your own timeout on anything the callback
-waits for.
-
-Connections adopted through `setWsUring` are owned by the ring instead: they are
-ended by `WsUring.stop()` / `deinit()`, not by `Server.stop()`. That ownership
-includes the descriptor: the handshake fiber stops owning the fd the moment
-`WsUring.adopt` returns success — it is closed once, by the ring's teardown — and
-a handoff that is *refused* leaves the fd to the fiber, which closes it as it
-always did. You do not have to do anything for either half; a rejected connection
-gets a close frame and its `on_close` call, the same as any other refusal.
-
-**ws_uring 环境边界（A-7 定界）。** 本节是 `setWsUring` 背后那条 io_uring 路径
-（`src/http/ws_uring.zig`）的权威验证边界：哪里测过、哪里没测过、为什么、什么情况下
-结论会改变。
-
-*非 Linux 的实际行为（以代码为准）*：不是运行时回落，也不是 `error.Unsupported` ——
-`WsUring.init` 函数体的第一个语句是 `if (builtin.os.tag != .linux) @compileError(...)`
-（`ws_uring.zig:91`），**编译期拒绝**。文件头的 `linux` / `IoUring` 两个别名在非 Linux
-换成 stub（`ws_uring.zig:9-41`），作用只是让文件其余部分（帧解析器、准入/排空记账）
-在所有平台保持可分析、可测。
-
-*各平台真正执行什么（以测试与 CI 为准）*：9 条测试全平台真跑 —— 解析器 4 条
-（`parseFrame:` 系列，`ws_uring.zig:607`/`:617`/`:647`/`:674`）、`writeControl` 超限拒绝
-1 条（`:689`）、`user_data` 编解码 1 条（`:568`）、准入/排空契约 2 条（`WsUring.adopt` /
-`WsUring.teardown`，`:765`/`:822`，用手工实例 `testInstance`（`:724`，`ring` 置
-`undefined`）+ socketpair）、强制分析 1 条（`:549`，把 `start`/`stop`/`adopt`/
-`processData` 的函数体钉进每个平台的分析图）。Linux 腿只多一条：teardown 测试里
-"fd 真被 `close(2)` 关掉"的断言（`:858-866`；非 Linux 的 `linux.close` 是空 stub，
-断言无意义故编译期跳过）。**任何平台都没有执行过的**：真 ring 的
-`runLoop`/`submitRead`/`copy_cqes` 与内核的交互 —— 树内没有任何用例构造 `WsUring`
-（`init` 唯一的"调用方"是 `tools/zmodu` 脚手架的模板字符串，
-`tools/zmodu/src/main.zig:7953`），`init` 的函数体因此在任何平台都**不进分析图**
-（测试只取它的类型，`:563`）；那句 `@compileError` 是给下游应用调用方的护栏，
-不是树内会触发的检查。CI 侧：`build-and-test` 矩阵（`.github/workflows/ci.yml:64-84`）
-在 ubuntu-latest / macos-latest / ubuntu-24.04-arm 三腿跑同一条
-`zig build test --test-timeout 300s`（`ci.yml:164`），没有 ws_uring 专属步骤
-（workflow 全文零命中），测试里也没有 io_uring 可用性探测或跳过逻辑 —— 因为根本
-没有用例碰真 ring。2026-09-29 本机 macOS 实测：`bash scripts/test-fast.sh --db all
---filter ws_uring` 命中 9/2325 全绿。
-
-*macOS 上的保证从哪来*：帧解析的正确性不是这份文件自己的，而是**共享校验器**的 ——
-`parseFrame` 调 `WsFramer.validateFrameHeader`（`ws_uring.zig:494`）、
-`WsFramer.Assembler`（`:400`/`:709`）、`closeCodeFor`（`:519`），与 fiber 路径同一份
-规则（`WsFramer.zig:39-46`、`:298-303`），两条路径由构造保证不漂移。第 54 批
-（`CHANGELOG.md` 「第 54 批」）并轨时修掉两个真缺陷（升级后 fd 双重关闭、
-`adopt`/`runLoop` 跨线程元数据撕裂），并补了准入/排空与强制分析测试；该批自述同样
-写明：ring 线程的锁序与真 io_uring 行为"只能评审"。
-
-*结论改变的条件*：① 树内长出真跑 `WsUring.init`/`setWsUring` 的用例或示例 —— 两条
-Linux CI 腿将第一次执行真 ring（runner 内核的 io_uring 可用性是仓库外事实，未验证，
-届时需先在腿上落实）；② Zig std 的 Io 长出等价跨平台能力、该文件被替换；③ CI 增加
-新平台腿。本节随其中任何一条重核。
-
-
-
-**Server Options:**
-
-
-
-| Field | Default | Description |
-
-|-------|---------|-------------|
-
-| `max_body_size` | 8 MB | Maximum request body size |
-
-| `request_timeout_ms` | 30000 | Request timeout in milliseconds |
-
-| `max_requests_per_conn` | 100 | Maximum keep-alive requests per connection |
-
-
-
-**Example:**
-
-
-
-```zig
-
-const std = @import("std");
-
-const zmodu = @import("zmodu");
-
-
-
-const Server = zmodu.http.Server;
-
-const Context = zmodu.http.Context;
-
-
-
-pub fn main(init: std.process.Init) !void {
-
-    const allocator = init.gpa;
-
-    const io = init.io;
-
-
-
-    var server = Server.init(io, allocator, 8080);
-
-    defer server.deinit();
-
-
-
-    // Register routes
-
-    try server.addRoute(.{
-
-        .method = .GET,
-
-        .path = "/health",
-
-        .handler = struct {
-
-            fn handle(ctx: *Context) anyerror!void {
-
-                try ctx.json(200, "{\"status\":\"ok\"}");
-
-            }
-
-        }.handle,
-
-    });
-
-
-
-    // Start server (blocks until stop() is called)
-
-    try server.start();
-
-}
-
-```
-
-
-
-#### HTTP Methods
-
-
-
-```zig
-
-pub const Method = enum { GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS };
-
-
-
-pub fn fromString(s: []const u8) ?Method
-
-pub fn toString(self: Method) []const u8
-
-```
-
-
-
-#### Route Definition
-
-
-
-```zig
-
-pub const Route = struct {
-
-    method: Method,
-
-    path: []const u8,
-
-    handler: HandlerFn,
-
-    middleware: []const Middleware = &.{},  // Per-route middleware
-
-    user_data: ?*anyopaque = null,
-
-};
-
-```
-
-
-
-#### Handler Function
-
-
-
-```zig
-
-pub const HandlerFn = *const fn (*Context) anyerror!void;
-
-```
-
-
-
-#### Context
-
-
-
-`Context` holds request data and provides response helpers. Automatically cleaned up per request via arena allocation.
-
-
-
-**Request Access:**
-
-
-
-```zig
-
-pub fn queryParam(self: *const Context, key: []const u8) ?[]const u8
-
-pub fn param(self: *const Context, key: []const u8) ?[]const u8       // Path param like /users/{id}
-
-pub fn header(self: *const Context, key: []const u8) ?[]const u8
-
-pub fn formValue(self: *const Context, key: []const u8) ?[]const u8
-
-body: ?[]const u8            // field, not a method
-
-```
-
-
-
-**Response Helpers:**
-
-
-
-```zig
-
-pub fn json(self: *Context, status: u16, data: []const u8) !void
-
-pub fn text(self: *Context, status: u16, data: []const u8) !void
-
-pub fn sendError(self: *Context, status: u16, message: []const u8) !void
-
-pub fn sendErrorResponse(self: *Context, status: u16, code: i32, message: []const u8) !void
-
-pub fn setHeader(self: *Context, key: []const u8, value: []const u8) !void
-
-```
-
-
-
-**JSON Binding:**
-
-
-
-```zig
-
-pub fn bindJson(self: *const Context, comptime T: type) !T
-
-pub fn parseReq(self: *Context, comptime T: type, sources: anytype) !T
-
-```
-
-
-
-**Example — Auto parameter binding:**
-
-
-
-```zig
-
-const MyReq = struct { id: u32, page: u32 };
-
-const req = try ctx.parseReq(MyReq, .{ .id = .path, .page = .query });
-
-// GET /users/42?page=3 → req.id = 42, req.page = 3
-
-```
-
-
-
-#### Route Groups
-
-
-
-Group routes under a common prefix:
-
-
-
-```zig
-
-// router = http.Router(AppState); see ROUTE_TABLE §1
-var api = router.scope("/api/v1");
-
-try api.get("/users", handleUsers, null);
-
-try api.post("/orders", handleOrders, null);
-
-// Routes: GET /api/v1/users, POST /api/v1/orders
-
-```
-
-
-
-#### Middleware
-
-
-
-```zig
-
-pub const Middleware = struct {
-
-    func: MiddlewareFn,
-
-    user_data: ?*anyopaque = null,
-
-};
-
-
-
-pub const MiddlewareFn = *const fn (*Context, HandlerFn, ?*anyopaque) anyerror!void;
-
-```
-
-
-
-Middleware executes in order: global middleware → route middleware → handler. Call the next handler via `try next(ctx, next, user_data)`.
-
-
-
-**Example — Auth middleware:**
-
-
-
-```zig
-
-fn authMiddleware(ctx: *Context, next: HandlerFn, user_data: ?*anyopaque) anyerror!void {
-
-    const token = ctx.header("Authorization") orelse {
-
-        return ctx.sendError(401, "Unauthorized");
-
-    };
-
-    // Validate token...
-
-    try next(ctx, next, user_data);
-
-}
-
-
-
-try server.addMiddleware(.{ .func = authMiddleware });
-
-```
-
-
-
-#### Complete Example
-
-
-
-```zig
-
-const std = @import("std");
-
-const zmodu = @import("zmodu");
-
-const Server = zmodu.http.Server;
-
-const Context = zmodu.http.Context;
-
-
-
-pub fn main(init: std.process.Init) !void {
-
-    var server = Server.init(init.io, init.gpa, 8080);
-
-    defer server.deinit();
-
-
-
-    // JSON endpoint
-
-    try server.addRoute(.{
-
-        .method = .GET,
-
-        .path = "/api/health",
-
-        .handler = struct {
-
-            fn handle(ctx: *Context) anyerror!void {
-
-                try ctx.json(200, "{\"status\":\"ok\"}");
-
-            }
-
-        }.handle,
-
-    });
-
-
-
-    // Plain text endpoint
-
-    try server.addRoute(.{
-
-        .method = .GET,
-
-        .path = "/ping",
-
-        .handler = struct {
-
-            fn handle(ctx: *Context) anyerror!void {
-
-                try ctx.text(200, "pong");
-
-            }
-
-        }.handle,
-
-    });
-
-
-
-    // Route group with path params
-
-    var users = router.scope("/api/users");
-
-    try users.get("/{id}", struct {
-
-        fn handle(ctx: *Context) anyerror!void {
-
-            const id = ctx.param("id") orelse return ctx.sendError(400, "missing id");
-
-            try ctx.json(200, try std.fmt.allocPrint(ctx.allocator, "{{\"id\":\"{s}\"}}", .{id}));
-
-        }
-
-    }.handle, null);
-
-
-
-    try server.start();
-
-}
-
-```
----
-
-## Error response rendering
-
-### `zmodu.http.useRfc7807Errors`
-
-框架自产的错误体有三条出口（链内 `ctx.sendError`、路由前裸 socket、handler 自写）。
-这两条钩子把前两条统一成 RFC 7807 ProblemDetails（media type `application/problem+json`）：
-
-```zig
-pub fn useRfc7807Errors() void                       // 链内 + 路由前，一次到位
-pub fn setDefaultReject(renderer: ?AuthRejectFn) void // 仅链内；null = 复原信封
-pub fn clearDefaultReject() void                      // 复位（测试用）
-
-pub fn problemReject(ctx: *Context, status: u16, message: []const u8) anyerror!void
-pub fn problemTransportBody(status: u16, message: []const u8, buf: []u8) TransportErrorBody
-
-pub fn setTransportErrorRenderer(renderer: ?TransportErrorFn) void  // 仅路由前
-pub fn renderTransportError(status: u16, message: []const u8, buf: []u8) TransportErrorBody
-
-// Context
-pub fn sendError(self: *Context, status: u16, message: []const u8) !void
-pub fn sendErrorResponse(self: *Context, status: u16, code: i32, message: []const u8) !void
-pub fn sendErrorEnvelope(self: *Context, status: u16, code: i32, message: []const u8) !void  // 绕过渲染器
-
-// Middleware 配置：ModuleGateConfig 新增 reject（保留 .unknown = .deny 同时改 404 体）
-pub const ModuleGateConfig = struct { reject: AuthRejectFn = defaultReject, ... };
-```
-
-细节与三条守则见 [`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「错误响应形状」。
-
----
-
-## Security
-
-### JWT Authentication
-
-#### `zmodu.security.SecurityModule`
-
-JWT token generation and verification.
-
-```zig
-pub fn init(allocator: std.mem.Allocator, jwt_secret: []const u8, token_expiry_seconds: i64) Self
-pub fn generateToken(self: *Self, payload: JwtPayload) ![]const u8
-pub fn verifyToken(self: *Self, token_string: []const u8) !JwtPayload
-pub fn hashPassword(self: *Self, password: []const u8) ![]const u8
-// 失败在两处不同来源之间可区分：存储记录不可用 vs 我们这侧出错（分配失败）。
-pub fn verifyPassword(self: *Self, password: []const u8, hash: []const u8) PasswordError!bool
-pub const PasswordError = error{MalformedStoredHash} || std.mem.Allocator.Error;
-```
-
-> `verifyPassword` / `PasswordEncoder.matches` 返回**错误联合**（不是裸 `bool`）：以前存储哈希
-> 不可解码、或解码时分配失败，都会被答成 `false`，调用方只能回 401 —— 把一个"我们这边出错"记成
-> "口令错"。现在 `error.MalformedStoredHash`（记录不可用）与 `error.OutOfMemory` 各自冒泡，
-> 调用方按需回 5xx；口令**不匹配**仍然只是 `false`。
-> `zmodu.security.PasswordEncoder.matches` 同形。
-
-### Permission matching
-
-handler 侧使用**与路由 meta 完全相同的表达式**判断身份，避免"路由允许 OR、handler 只认一侧"把一整类用户 403 掉：
-
-```zig
-// Context
-pub fn rolesCsv(self: *const Context) ?[]const u8           // 逗号分隔门户角色
-pub fn permissionsCsv(self: *const Context) ?[]const u8     // 逗号分隔权限码（同形）
-pub fn permissionMatches(self: *const Context, expr: []const u8) bool
-
-// http（Middleware）
-pub fn permissionMatchesContext(ctx: *const Context, expr: []const u8) bool
-pub fn permissionMatchesWith(ctx: *const Context, expr: []const u8, config: PermissionGateConfig) bool
-pub fn permissionMatchesRoles(roles_csv: []const u8, permission: []const u8) bool
-pub fn permissionMatchesAuthInfo(auth: *const Rbac.AuthInfo, permission: []const u8) bool
-```
-
-`expr` 支持 `a|b` 备选语法。`permissionMatches` 命中任一身份来源（AuthInfo / `permissions` / `roles`）；
-`permissionMatchesWith` 则**锁定某个 gate 的语义**（`.roles` 只读 roles；`.rbac` 有 AuthInfo 时以它为准）。
-两者共用 `zmodu.security.Rbac.exprMatchesCsv` / `exprMatchesAuthInfo`，与 gate 同一份实现。
-
-### Security Scanner
-
-#### `zmodu.security.SecurityScanner`
-
-Static security analysis for source code.
-
-```zig
-pub fn init(allocator: std.mem.Allocator, config: Config) Self
-pub fn registerRule(self: *Self, rule: SecurityRule) !void
-pub fn scanSourceCode(self: *Self, file_path: []const u8, source_code: []const u8) !void
-pub fn scanModule(self: *Self, module_path: []const u8) !ScanResult
-pub fn generateReport(self: *Self, result: *const ScanResult) ![]const u8
-pub fn isSecure(self: *Self, result: *const ScanResult) bool
-```
-
----
-
-## Testing
-
-### Module Testing
-
-#### `zmodu.ModuleTestContext`
-
-Testing context for module testing.
-
-```zig
-pub fn init(allocator: std.mem.Allocator, module_name: []const u8) !Self
-pub fn deinit(self: *Self) void
-pub fn registerMockModule(self: *Self, info: ModuleInfo) !void
-pub fn start(self: *Self) !void
-pub fn stop(self: *Self) void
-```
-
-### Integration Testing
-
-#### `zmodu.IntegrationTest`
-
-Full integration test framework.
-
-```zig
-pub fn init(allocator: std.mem.Allocator, config: TestConfig) !Self
-pub fn deinit(self: *Self) void
-pub fn http(self: *Self) !*HttpTestClient
-pub fn setUp(self: *Self) !void
-pub fn tearDown(self: *Self) !void
-pub fn waitFor(self: *Self, condition: fn () bool, timeout_ms: u64) !void
-```
-
-### Benchmark
-
-#### `zmodu.Benchmark`
-
-Performance benchmarking utilities.
-
-```zig
-pub fn init(allocator: std.mem.Allocator, name: []const u8, config: Config) !Self
-pub fn run(self: *Self, bench_name: []const u8, comptime BenchFn: type, bench_ctx: anytype) !void
-pub fn generateReport(self: *Self) ![]const u8
-```
-
----
-
-## Additional Components
-
-### `zmodu.WebSocketServer` / `zmodu.WebSocketMonitor` (`src/extensions/WebSocket.zig`)
-
-RFC 6455 server for pushing live updates to browsers; `WebSocketMonitor` wraps it
-and adds a 5 s metrics `updateLoop` on top.
-
-```zig
-pub fn init(allocator: std.mem.Allocator, io: std.Io, port: u16) WebSocketServer
-pub fn start(self: *WebSocketServer) !void
-pub fn stop(self: *WebSocketServer) void
-pub fn deinit(self: *WebSocketServer) void
-pub fn onConnect(self: *WebSocketServer, callback: *const fn (*WebSocketClient) void) void
-pub fn onMessage(self: *WebSocketServer, callback: *const fn (*WebSocketClient, []const u8) void) void
-pub fn broadcast(self: *WebSocketServer, message: []const u8) void
-pub fn clientCount(self: *WebSocketServer) usize
-```
-
-**Callback contract: `onConnect` and `onMessage` run on the connection fiber, and
-must return on their own.** `stop()` — and therefore `deinit()` — drains that
-fiber, and the only wait the framework can end is one on a *socket*: tearing the
-connection down frees a fiber parked in a read or a write, never one parked
-inside a callback. So a callback that blocks (an outbound request with no
-timeout, a lock nobody releases) keeps `stop()` waiting for exactly as long as it
-blocks — there is no budget that cuts it short, by design. Put your own timeout
-on anything the callback waits for.
-
-`stop()` is bounded against *peers*, not against your code: a client that
-completes the handshake and then sends neither frames nor a FIN has its socket
-shut down, so its fiber leaves. A drain that is still holding connections 5 s
-later is reported at `err` level with the live connection count
-(`… connection fiber(s) still running after …ms — a user callback that does not
-return holds shutdown …`): the log is the diagnosis, and the wait continues — a
-`stop()` that returned with a fiber still alive would hand it a server its caller
-is about to `deinit`.
-
-**Dispatch boundary (A-8).** `start()` 派发永循环走 `Group.concurrent`，并发额度耗尽时
-以 `error.ConcurrencyUnavailable` **响亮失败并回滚**（`abortStart`），而不是把调用线程
-征用作循环体。该分支在 `std.testing.io` 下不可达（额度 `.unlimited`），由自带有界
-`Io.Threaded` 的专测锁定（`src/extensions/WebSocket.zig:1951`/`:1977`）——
-权威边界（机制、两种处理形状、各 site 的覆盖状态）见
-[`DISTRIBUTED.md`](./DISTRIBUTED.md)「并发额度耗尽分支（A-8 定界）」。
-
-### Cache
-
-```zig
-pub const CacheManager = struct {
-    pub fn init(allocator: std.mem.Allocator, max_size: usize, ttl_seconds: u64, policy: EvictionPolicy) Self
-    pub fn set(self: *Self, key: []const u8, value: []const u8) !void
-    pub fn get(self: *Self, key: []const u8) ?[]const u8
-    pub fn remove(self: *Self, key: []const u8) bool
-    pub fn clear(self: *Self) void
-    pub fn getStats(self: *Self) CacheStats
-};
-```
-
-### Scheduler
-
-#### `zmodu.cron.Scheduler` (`src/scheduler/Cron.zig`)
-
-Cron expression jobs (`* * * * *`), driven by a background thread. For
-multi-replica deployments guard it with `DistributedLock` (see
-[`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「多副本后台任务」).
-
-```zig
-pub fn init(allocator: std.mem.Allocator, io: std.Io) Scheduler
-pub fn deinit(self: *Scheduler) void
-pub fn addJob(self: *Scheduler, name: []const u8, schedule: Expression, task: *const fn (*anyopaque) void, context: *anyopaque) !void
-pub fn setLock(self: *Scheduler, lock: DistributedLock.Lock, ttl_ms: u64) void
-pub fn start(self: *Scheduler) !void
-pub fn stop(self: *Scheduler) void
-pub fn tick(self: *Scheduler, now: i64) void   // deterministic driving, used by tests
-```
-
-### Database / Repository
-
-```zig
-pub const Database = struct {
-    pub fn init(allocator: std.mem.Allocator, connection_string: []const u8) !Self
-    pub fn query(self: *Self, sql: []const u8, params: QueryParams) QueryResult
-    pub fn execute(self: *Self, sql: []const u8, params: QueryParams) !void
-    pub fn beginTransaction(self: *Self) !Transaction
-};
-
 pub fn Repository(comptime T: type) type {
     pub fn findById(self: *Self, id: i64) !?T
-    pub fn findByIds(self: *Self, allocator: Allocator, ids: []const i64) !QueryResult(T)  // WHERE pk IN (…) 一次 round-trip
+    pub fn findByIds(self: *Self, allocator: Allocator, ids: []const i64) !QueryResult(T)  // one round trip
     pub fn insert(self: *Self, entity: T) !T
-    pub fn insertMany(self: *Self, allocator: Allocator, entities: []const T) !void    // 多行 VALUES (?,?),(?,?) 一次 round-trip
+    pub fn insertMany(self: *Self, allocator: Allocator, entities: []const T) !void         // one round trip
     pub fn upsertMany(self: *Self, allocator: Allocator, entities: []const T, conflict_columns: []const []const u8) !void
     pub fn update(self: *Self, entity: T) !void
     pub fn delete(self: *Self, id: i64) !void
@@ -1877,78 +516,34 @@ pub fn Repository(comptime T: type) type {
 }
 ```
 
-`data.bulk` (`src/sqlx/Bulk.zig`) 提供底层批量写助手，供手写 SQL 代码直接使用
-（`sqlx.Client` / `Transaction` / `SqlxBackend` 均可作为 exec 目标）：
+`data.bulk` (`src/sqlx/Bulk.zig`) generates multi-row statements for hand-written SQL: `bulk.insertMany(alloc, &client, table, columns, rows, dialect, .{ .conflict_columns = ... })`. `sqlx.Client`, `sqlx.Transaction` and `SqlxBackend` are all valid exec targets. A conflict suffix renders as `ON CONFLICT (...) DO UPDATE` on SQLite/PostgreSQL and `ON DUPLICATE KEY UPDATE` on MySQL.
 
-```zig
-pub const bulk = zmodu.data.bulk;
-_ = try bulk.insertMany(alloc, &client, "order_product", &.{ "order_id", "sku" }, &rows, .sqlite, .{
-    .conflict_columns = &.{"id"},
-}); // upsert 后缀：SQLite/PG → ON CONFLICT ("id") DO UPDATE SET …；MySQL → ON DUPLICATE KEY UPDATE
-```
+## 18. Cluster
 
-批量写是 API 演进而非范式问题：手写 sqlx 与 Repository 两条路径共用同一
-生成器；对 zigshop 这类裸 sqlx 项目，换用 `bulk.insertMany` 即可把
-下单商品从 N 次 round-trip 降为 1 次，无需引入 zent。
+`zmodu.ClusterMembership.init(allocator, node_id, address, bus)` plus `start(config)`, `stop()`, `connectToSeed(node_id, address)`, `getNodeCount()`, `getHealthyNodeCount()`, `getLeader()`. For request-path reads use `zmodu.ClusterView` (`acquire` / `release`, `pick(key)`), not the membership table maintained by the gossip loop. Leader election lives in `src/core/cluster/RaftElection.zig` and is experimental; see [`PRODUCTION_ROADMAP.md`](../archive/status/PRODUCTION_ROADMAP.md).
 
-### Cluster Membership
+## 19. Testing
 
-```zig
-pub const ClusterMembership = struct {
-    pub fn init(allocator: std.mem.Allocator, node_id: []const u8, address: std.net.Address, bus: *DistributedEventBus) !Self
-    pub fn start(self: *Self, config: Config) !void
-    pub fn stop(self: *Self) void
-    pub fn connectToSeed(self: *Self, node_id: []const u8, address: std.net.Address) !void
-    pub fn getNodeCount(self: *Self) usize
-    pub fn getHealthyNodeCount(self: *Self) usize
-    pub fn getLeader(self: *Self) ?[]const u8
-};
-```
+`zmodu.ModuleTestContext.init(allocator, module_name)` boots a subset of modules with mocks: `registerMockModule(info)`, `start()`, `stop()`.
 
-### Raft (experimental)
+`zmodu.IntegrationTest.init(allocator, config)` wires a test app: `http()`, `setUp()`, `tearDown()`, `waitFor(condition, timeout_ms)`. Use `http.Testkit.dispatch` for in-process requests without a socket.
 
-Leader election lives in `src/core/cluster/RaftElection.zig` (plus
-`ClusterMembership` / `ClusterHealth`). It is marked **experimental** — see
-[`PRODUCTION_ROADMAP.md`](../archive/status/PRODUCTION_ROADMAP.md) for the position on using it
-in production. The older `PasRaftAdapter` documented here never existed in this
-repository.
+`zmodu.Benchmark.init(allocator, name, config)` runs benchmarks: `run(bench_name, BenchFn, bench_ctx)`, `generateReport()`.
 
-### Hot Reloader
+## 20. Extensions
 
-**File watching only** (⚠️ 有条件). Zig links statically, so `reloadModule` logs the
-request and returns without replacing code; drive your own response (rebuild, restart,
-hot-swap via `ModuleSnapshot`) from the `onChange` callback.
+`zmodu.WebSocketServer` (`src/extensions/WebSocket.zig`) is an RFC 6455 server; `zmodu.WebSocketMonitor` adds a 5 s metrics loop. `init(allocator, io, port)`, `start()`, `stop()`, `onConnect(callback)`, `onMessage(callback)`, `broadcast(message)`, `clientCount()`.
 
-```zig
-pub const HotReloader = struct {
-    pub fn init(allocator: std.mem.Allocator) Self
-    pub fn watchPath(self: *Self, path: []const u8) !void
-    pub fn startWatching(self: *Self) !void
-    pub fn stopWatching(self: *Self) void
-    pub fn reloadModule(self: *Self, module_path: []const u8) !void
-};
-```
+Callbacks run on the connection fiber and must return. `stop()` can only end a wait on a socket, never a wait inside a callback, so a blocking callback holds shutdown for as long as it blocks. After 5 s of draining it logs `connection fiber(s) still running after …ms` at `err` level and keeps waiting.
 
-### Plugin System
+`start()` dispatches through `Group.concurrent`; when the concurrency budget is exhausted it fails with `error.ConcurrencyUnavailable` and rolls back (`abortStart`) instead of borrowing the calling thread. Under `std.testing.io` the budget is unlimited, so the branch is covered by tests that install a bounded `Io.Threaded` (`src/extensions/WebSocket.zig:1951`). See [`DISTRIBUTED.md`](./DISTRIBUTED.md).
 
-**Registration only.** `loadPlugin` records the name and logs a warning;
-`dynamicLoadingSupported()` returns `false` and no shared library is ever loaded
-(see `docs/UPGRADING.md`). For a real extension point use modules + `Application`.
+`zmodu.CacheManager.init(allocator, max_size, ttl_seconds, policy)` provides `set`, `get`, `remove`, `clear`, `getStats`.
 
-### Plugin System
+`zmodu.cron.Scheduler` (`src/scheduler/Cron.zig`) parses `* * * * *` expressions and runs a background thread: `init(allocator, io)`, `addJob(name, schedule, task, context)`, `setLock(lock, ttl_ms)`, `start()`, `stop()`, `tick(now)` for deterministic tests. Multi-replica deployments must set a `DistributedLock`.
 
-```zig
-pub const PluginManager = struct {
-    pub fn init(allocator: std.mem.Allocator, plugin_dir: []const u8) Self
-    pub fn loadPlugin(self: *Self, name: []const u8, path: []const u8) !void
-    pub fn unloadPlugin(self: *Self, name: []const u8) void
-    pub fn enablePlugin(self: *Self, name: []const u8) !void
-    pub fn loadAllPlugins(self: *Self) !void
-    pub fn getLoadedPlugins(self: *Self) []const Plugin
-};
-```
+`zmodu.HotReloader` watches files only. Zig links statically, so `reloadModule` records the request and returns; rebuild or restart from the `onChange` callback. Methods: `init`, `watchPath`, `startWatching`, `stopWatching`, `reloadModule`.
 
----
+`zmodu.PluginManager` records plugin names and logs a warning: `init(allocator, plugin_dir)`, `loadPlugin(name, path)`, `unloadPlugin(name)`, `enablePlugin(name)`, `loadAllPlugins()`, `getLoadedPlugins()`. `dynamicLoadingSupported()` returns `false` and no shared library is loaded. Use modules and `Application` for real extension points.
 
-*Last updated: 2026-09-15*
-*For more examples, see [examples](../../examples/)*
+See [examples](../../examples/) for complete applications.

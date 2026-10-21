@@ -1,9 +1,10 @@
-# 可观测性与告警（生产接入）
+# Observability & Alerting Guide
 
-> 目标：把"服务活着吗、它现在好不好"变成**一屏可见 + 可告警**，而不是等用户报障。
-> 相关：[`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「韧性」· [`PRODUCTION_ROADMAP.md`](../archive/status/PRODUCTION_ROADMAP.md)
+This guide covers wiring Prometheus metrics, Kubernetes health probes, runtime worker gauges, structured logs, and OpenTelemetry tracing in production.
 
-## 1. 一行接入
+## 1. One-Line Production Setup (`http.productionProfile`)
+
+Call `zmodu.http.productionProfile` **before** registering any routes (`router.mountAll` or `server.addRoute`), because `addRoute` snapshots the active global middleware chain at registration time:
 
 ```zig
 var server = zmodu.http.Server.init(io, allocator, 8080);
@@ -16,321 +17,121 @@ try zmodu.http.productionProfile(&server, .{
     .max_connections = 4096,
     .header_timeout_ms = 10_000,
 }, &profile);
-
-// ⚠️ 必须在任何 router.mountAll / server.addRoute 之前调用：
-//    addRoute 会在注册时快照当时的全局中间件链。
 ```
 
-挂出的端点：
+Endpoints registered by `productionProfile`:
 
-| 路径 | 内容 |
-|------|------|
-| `GET /metrics` | Prometheus 文本（`text/plain; version=0.0.4`） |
-| `GET /health/live` | 进程存活（K8s liveness） |
-| `GET /health/ready` | 依赖就绪（K8s readiness） |
-| `GET /`、`/dashboard`、`/api/dashboard/*` | 可选人读面板（`.dashboard = true`） |
+| Path | Description |
+|------|-------------|
+| `GET /metrics` | Prometheus exposition format (`text/plain; version=0.0.4`) |
+| `GET /health/live` | Liveness probe (`200 UP`) |
+| `GET /health/ready` | Readiness probe |
+| `GET /`, `/dashboard`, `/api/dashboard/*` | Optional human-readable dashboard (when `.dashboard = true`) |
 
-路径可用 `metrics_path` / `liveness_path` / `readiness_path` 覆盖；若应用自己已挂
-同名路由，记得改路径以免重复注册。
+Override default paths via `metrics_path`, `liveness_path`, and `readiness_path`.
 
-## 2. 黄金信号（框架默认导出）
+## 2. HTTP Golden Signals
 
-`productionProfile` 默认创建并维护这些序列（无标签，基数固定）：
+`productionProfile` exports the following series by default:
 
-| 指标 | 类型 | 含义 |
-|------|------|------|
-| `http_requests_total` | counter | 流量：累计请求数 |
-| `http_responses_2xx_total` | counter | 成功 |
-| `http_responses_3xx_total` | counter | 重定向 |
-| `http_responses_4xx_total` | counter | 客户端错误（400/401/404…） |
-| `http_responses_5xx_total` | counter | **服务端错误 = 错误预算燃烧** |
-| `http_request_duration_milliseconds` | histogram | 延迟分布，桶：1/5/10/25/50/100/250/500/1000/2500/5000 ms |
+| Metric | Type | Description |
+|--------|------|-------------|
+| `http_requests_total` | Counter | Total HTTP requests |
+| `http_responses_2xx_total` | Counter | 2xx responses |
+| `http_responses_3xx_total` | Counter | 3xx responses |
+| `http_responses_4xx_total` | Counter | 4xx client error responses |
+| `http_responses_5xx_total` | Counter | 5xx server error responses |
+| `http_request_duration_milliseconds` | Histogram | Request latency (buckets: 1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000 ms) |
 
-**按路由下钻**：这些黄金信号都带一个 `route` 标签，值取自
-`ctx.route_template`（**匹配到的模式**，如 `/orders/{id}`，不是带 id 的原始
-path——否则基数会爆）。未匹配/404 归入 `route="__unmatched__"`。基数有硬上限
-（`ProductionConfig.max_route_series`，默认 64），超出的值统一落入
-`route="__other__"`，所以动态标签永远不会把抓取或内存撑爆。
+### Bounded Route Labels
 
-```text
-# 哪个接口在慢 / 在报错
-histogram_quantile(0.95, sum(rate(http_request_duration_milliseconds_bucket[5m])) by (le, route))
-topk(5, sum(rate(http_responses_5xx_total[5m])) by (route))
-```
+Golden signals carry a `route` label populated from `ctx.route_template` (the matched pattern such as `/orders/{id}`, never the raw URL path). Unmatched routes map to `route="__unmatched__"`. Label cardinality is capped by `ProductionConfig.max_route_series` (default `64`); additional patterns map to `route="__other__"`.
 
-## 2.5 运行时指标（37 条，`MetricsBridge`）
+Never place high-cardinality identifiers (`tenant_id`, `user_id`, `order_id`) into Prometheus labels. Use `createCounterFamily` / `createHistogramFamily` for small bounded dimensions, and register all custom metrics at startup before the first `GET /metrics` scrape freezes the registry.
 
-**HTTP 指标看不见运行时。** outbox 停投、邮箱打满、池打满、ticker 饿死，
-在请求侧全部无感——`timer_lag_ms` 尤其如此：它比任何 timer 计数都更能说明问题。
+## 3. Runtime Execution Plane Metrics (37 Gauges via `MetricsBridge`)
 
-这 37 条**全部是 gauge**，不是 counter：它们是**采样值**而非累计值，
-因此**不带 `_total` 后缀**（`PrometheusMetrics.Counter` 只有 `inc`/`add`，
-没有 `set`，采样值没法用 counter 表达）。
-
-接线（`MetricsT` 是鸭子类型，只要 `createGauge` + `Gauge.set`）：
+HTTP metrics do not observe worker mailboxes, worker pools, or timer lag. When using `app.runtime()`, wire `Runtime.MetricsBridge`:
 
 ```zig
-// 启动期调用：注册 37 个 gauge。
-// 若后续 createGauge 失败，已注册的会留在 metrics 里，不会回滚。
 var bridge = try Runtime.MetricsBridge(PrometheusMetrics).init(&rt, &metrics);
-metrics.setScrapeHook(bridge.publish);   // scrape 时把采样值推出去
+metrics.setScrapeHook(bridge.publish);
 ```
 
-> `MetricsT` 只要求 `createGauge` + `Gauge.set`，所以这一层**不依赖 observability 包**。
-> bridge 比进程活得久，别把它放在你随后就返回的栈帧里。
+### 3.1 CPU Worker Pool & Blocking Pool (9 Gauges Each)
 
-未声明池的运行时，池相关指标**报 0 而不是不导出**——
-"0 = 没声明池"是 dashboard 的第一个问题，少了序列就得靠猜。
+| Metric | Description |
+|--------|-------------|
+| `zigmodu_runtime_pool_{declared,threads,claimed,dispatches}` | Pool configuration, active claims, and dispatch count |
+| `zigmodu_runtime_pool_ready_len_{high,normal,low}` | Ready queue depth per priority class |
+| `zigmodu_runtime_pool_ready_push_failures` | Contract invariant gauge (**must remain 0**) |
+| `zigmodu_runtime_pool_wait_max_ms_{high,normal,low}` | High-water mark claim wait time |
+| `zigmodu_runtime_pool_starvation_events_{high,normal,low}` | Claims waiting longer than `starvation_threshold_ms` (**must remain 0**) |
+| `zigmodu_runtime_blocking_pool_*` | Corresponding 9 gauges for the blocking pool |
 
-### 池与阻塞池（各 9 条，`_high`/`_normal`/`_low` 是优先级）
+### 3.2 Mailboxes, Timers & Supervision (13 Gauges)
 
-| 指标 | 含义 |
-|------|------|
-| `zigmodu_runtime_pool_{declared,threads,claimed,dispatches}` | 池规模与吞吐 |
-| `zigmodu_runtime_pool_ready_len` | 就绪队列长度（三种优先级各一条） |
-| `zigmodu_runtime_pool_ready_push_failures` | **契约读数，必须恒 0** |
-| `zigmodu_runtime_pool_wait_max_ms` | claim 等待高水位 |
-| `zigmodu_runtime_pool_starvation_events` | **契约读数，必须恒 0** |
-| `zigmodu_runtime_blocking_pool_*` | 阻塞池的同名 9 条 |
+| Metric | Description |
+|--------|-------------|
+| `zigmodu_runtime_{workers,running}` | Total spawned workers vs currently running workers |
+| `zigmodu_runtime_messages_{received,sent}` | Mailbox message throughput |
+| `zigmodu_runtime_messages_dropped` | Messages rejected due to full mailboxes (`error.Full`) |
+| `zigmodu_runtime_messages_discarded_on_stop` | Pending messages discarded during shutdown |
+| `zigmodu_runtime_handler_errors` | Unhandled errors returned by worker handlers |
+| `zigmodu_runtime_group_restarts` | Supervision group restarts |
+| `zigmodu_runtime_supervised_stops` | Workers stopped after exhausting their error budget |
+| `zigmodu_runtime_timer_fires` | Fired timers |
+| `zigmodu_runtime_timer_lag_ms` | Maximum timer firing lag in milliseconds |
+| `zigmodu_runtime_timer_deliveries_dropped` | Timer deliveries dropped due to full target mailbox |
+| `zigmodu_runtime_timers_discarded` | Armed timers discarded during shutdown |
 
-**`pool_claimed` / `pool_ready_push_failures` 是 `RuntimeStats` 里根本没有的读数**：
-池化之后"有多少 worker"不再回答"有多少在途工作"，`pool_claimed` 才回答。
-
-**两条"必须恒 0"的契约读数**：
-
-- **`ready_push_failures`** —— 越过整个软预算的等待**每次调用计一次**。
-  能交还 claim 的线程就是唯一能再 pop 的线程，等它再 pop 时槽位必然已出现，
-  所以宽度 1 时这是可证的恒 0。
-- **`starvation_events`** —— 数的是"等待超过 `starvation_threshold_ms`（50）的 claim"。
-  非 0 即调度器 fairness 被破坏（§12.17 实测；详见 [RUNTIME.md](./RUNTIME.md) §12）。
-
-无池的运行时这 18 条全为 0；**非 0 说明公平性坏了，不要当成噪声忽略**。
-
-### 邮箱、定时器与监督
-
-| 指标 | 含义 |
-|------|------|
-| `zigmodu_runtime_{workers,running}` | 声明数 / 在跑数（差额 = 已停止） |
-| `zigmodu_runtime_messages_{received,sent}` | 邮箱吞吐 |
-| `zigmodu_runtime_messages_dropped` | 邮箱满被丢弃 |
-| `zigmodu_runtime_messages_discarded_on_stop` | 停机时**放弃**的待处理消息 |
-| `zigmodu_runtime_handler_errors` | worker 处理抛错 |
-| `zigmodu_runtime_group_restarts` | supervisor 重启组 |
-| `zigmodu_runtime_supervised_stops` | 被监督停掉的成员 |
-| `zigmodu_runtime_timer_fires` | 定时器触发数 |
-| `zigmodu_runtime_timer_lag_ms` | **ticker 饿死的读数**，比 timer 计数更能说明问题 |
-| `zigmodu_runtime_timer_deliveries_dropped` | 定时投递被丢弃 |
-| `zigmodu_runtime_timers_discarded` | 停机时丢弃的 timer |
-
-`messages_dropped` 与 `messages_discarded_on_stop` **是两条独立 counter，不是一个**：
-后者是"停机时主动放弃"，前者是"运行中邮箱满"。混用会掩盖真实故障。
-
-**基数纪律（多租户场景必须守）**：`route` 之外的维度**一律不要**直接打标签——
-`tenant_id`/`user_id`/`order_id` 这类高基数值会把 Prometheus 打死（每个租户一条序列，
-几千租户 = 几十万条）。需要分租户看时：
-
-- 用**已受限基数**的 `createCounterFamily` / `createHistogramFamily`（超出 `max_series`
-  统一进 `__other__`，见上文），并且只用于**小集合**（如"大客户"白名单）；
-- 或把租户维度留给日志/追踪（trace id 已由 `tracingMiddleware` 注入），指标只留聚合。
-- **禁止**：`metrics.createCounter("http_requests_total_v2", ...)` 里塞租户名、
-  或在 label 值里拼 `user-123` —— 这类写法在评审里应当直接打回。
-
-真要按租户分流，正确做法是**每租户一个实例/分片**（把基数变成部署维度），
-而不是把它压进标签。
-
-### 业务面黄金信号（静默失败的高发区）
-
-HTTP 指标正常 ≠ 系统正常。outbox 停止投递、连接池打满这类故障在 HTTP 层面
-完全看不到：
+## 4. Outbox & Database Pool Metrics
 
 ```zig
-// 1) outbox：积压 / 投递 / 死信（OutboxConsumer 自带后台轮询）
+// 1. Transactional Outbox consumer metrics and background polling
 var consumer = zmodu.outbox.OutboxConsumer.init(allocator, &backend, .{}, ctx, handler);
-try consumer.setMetrics(profile.prometheus.?);   // selected/delivered/failed + pending
-try consumer.startPolling(io, 1000);             // 每秒一批，取代手工 cron
+try consumer.setMetrics(profile.prometheus.?);
+try consumer.startPolling(io, 1000);
 defer consumer.stopPolling();
-// 告警：outbox_pending 持续增长 = 消费停摆；outbox_failed_total 增长 = 死信
 
-// 2) 连接池 + 其它"抓取时采样"的 gauge：不需要后台线程
+// 2. Database connection pool gauges sampled on scrape
 const pool_active = try metrics.createGauge("db_pool_active", "Active pooled DB connections");
 const pool_waiters = try metrics.createGauge("db_pool_waiters", "Requests waiting for a DB connection");
 metrics.setScrapeHook(struct {
     fn sample(ud: ?*anyopaque) void {
         const db: *data.Client = @ptrCast(@alignCast(ud.?));
-        if (db.poolMetrics()) |pm| {           // null = 未启用池
+        if (db.poolMetrics()) |pm| {
             pool_active.set(@floatFromInt(pm.current_active));
             pool_waiters.set(@floatFromInt(pm.current_waiters));
         }
     }
 }.sample, &db);
-// 告警：db_pool_waiters > 0 持续 1 分钟 = 池已饱和，延迟即将整体抬升
 ```
 
-完整可抄版本见 [`../examples/zmsaas/backend/src/main.zig`](../../examples/zmsaas/backend/src/main.zig)。
-
-业务指标自己加（同一个 registry）：`profile.prometheus.?.createCounter(...)`；
-需要按维度拆分时用 `createCounterFamily` / `createHistogramFamily`
-（同样受基数上限保护）。
-
-**注册必须发生在第一次抓取之前**：`GET /metrics` 会在序列化前把注册表
-`freeze()`，之后任何 `create*` 都返回 `error.Frozen` 且不插入任何东西。
-这是有意的——封印之后注册容器不再被写，抓取线程遍历它们才能不加锁
-（需要每抓取刷新的是 gauge，走 `setScrapeHook`，不受此限）。
-所以业务指标在启动接线阶段创建，别在 handler 里注册。
-
-### Dashboard 计数口径（`/api/dashboard/*`）
-
-人读面板（`productionProfile(.{ .dashboard = true })`，路由见 §1 表）的每个
-数字数的是什么、从哪来——面板只渲染接进来的 feed，**不编造数值**：
-
-| 字段 | 口径 | 来源 |
-|------|------|------|
-| `stats.routes` | 每次请求实时遍历路由 trie 的条数；含面板自身 5 条，路由后注册也计入（读 trie，非快照） | `DataSource.server.listRoutes()` |
-| `stats.middleware` | 全局中间件链当前长度 | `DataSource.server.global_middleware` |
-| `stats.modules` / `tests.*` | 启动期由应用写入的静态数（`tests.total` = 三项之和）；HTTP 层没有模块图/测试运行器 | `Dashboard.system_info` |
-| `stats.http.*` | 累计请求计数 + in-flight 快照；面板自身的轮询请求也会被计入（当它经过 collector 中间件时）；`r2xx`/`r4xx`/`r5xx` 是 collector 的状态桶（计数数组第 1/3/4 格） | `DataSource.http_metrics`（`HttpMetricsCollector`，由 `httpMetricsMiddleware` 累计） |
-| `modules[]` | 应用从模块图填充的切片；未接线时**返回空表**，不会生成假条目 | `DataSource.modules` |
-| `stats.uptime_seconds` | 单调钟 `now - started_at`；`started_at` 必须在启动时设置（`Time.monotonicNowSeconds()`），否则数值无意义 | `Dashboard.system_info` |
-| `events` | 保留位，恒 0（HTTP 层没有事件总线计数源） | — |
-
-接线（应用侧显式接全部 feed）：
-
-```zig
-var source = zmodu.http.Dashboard.DataSource{
-    .server = &server,                       // routes / middleware 计数
-    .http_metrics = &collector,              // 可选：stats.http 块
-    .modules = &.{ .{ .name = "order", .desc = "Order module", .deps = 2 } }, // 从模块图填充
-};
-var scope = router.scope("");
-try zmodu.http.Dashboard.registerRoutesWith(&scope, &source);
-```
-
-`productionProfile` 已自动把 `server` 和 `HttpProfileState.metrics_collector`
-（`http.metrics = true` 时）接进 `ProductionProfileState.dashboard_source`；
-`modules` 切片仍需应用自己填。所有字段可选：缺 feed 时对应数字为 0 / 空表。
-响应的 key 集合稳定（`http` 块仅在接了 collector 时出现），JSON 形状见
-`src/http/Dashboard.zig` 文件头注释。
-
-## 3. PromQL 速查
+## 5. PromQL Queries & Alert Thresholds
 
 ```text
-# 流量（QPS，5m）
+# Request rate (QPS, 5m window)
 sum(rate(http_requests_total[5m]))
 
-# 5xx 错误率（服务端视角）
-sum(rate(http_responses_5xx_total[5m]))
-  / clamp_min(sum(rate(http_requests_total[5m])), 0.001)
+# 5xx error ratio
+sum(rate(http_responses_5xx_total[5m])) / clamp_min(sum(rate(http_requests_total[5m])), 0.001)
 
-# 4xx 比率（客户端错，通常不报警，但异常升高说明客户端/鉴权在变）
-sum(rate(http_responses_4xx_total[5m]))
-  / clamp_min(sum(rate(http_requests_total[5m])), 0.001)
-
-# 延迟 P95 / P99（直方图）
+# P95 / P99 latency
 histogram_quantile(0.95, sum(rate(http_request_duration_milliseconds_bucket[5m])) by (le))
 histogram_quantile(0.99, sum(rate(http_request_duration_milliseconds_bucket[5m])) by (le))
-
-# 平均延迟
-sum(rate(http_request_duration_milliseconds_sum[5m]))
-  / clamp_min(sum(rate(http_request_duration_milliseconds_count[5m])), 0.001)
 ```
 
-## 4. 告警阈值（起点，按真实 SLO 校准）
+| Alert | Condition | Action |
+|-------|-----------|--------|
+| Instance Down | `up{job="zmodu"} == 0` for 1m | Check supervisor logs and `zmodu.panicHook` stderr output |
+| High 5xx Rate | 5xx ratio > 1% for 5m (or > 5% for 1m) | Inspect error logs and trace IDs; roll back if caused by deploy |
+| High Latency | P95 > 500 ms for 10m | Check `db_pool_waiters` and downstream dependencies |
+| Outbox Backlog | `outbox_pending` growing for 5m or `outbox_failed_total` > 0 | Check downstream broker connectivity and dead-letter rows |
+| Pool Saturation | `db_pool_waiters > 0` for 1m | Increase pool capacity or optimize slow queries |
 
-| 告警 | 表达式（示例阈值） | 处置 |
-|------|--------------------|------|
-| 服务不可用 | `up{job="zmodu"} == 0` for 1m | 看 supervisor 重启原因；接 `zmodu.panicHook` 的 stderr |
-| 5xx 燃烧 | 5xx 率 > 1% for 5m（或 > 5% for 1m 立即） | 查 trace/日志；必要时回滚 |
-| 高延迟 | P95 > 500ms for 10m | 查 DB/下游；确认不是连接池耗尽 |
-| 4xx 突增 | 4xx 率 > 基线 3 倍 for 10m | 常见于鉴权批量失效、客户端版本问题 |
-| 无流量 | `sum(rate(http_requests_total[5m])) == 0`（营业时段） | 上游/LB/健康检查配置问题 |
-| 存活但未就绪 | `up == 1` 且 readiness 非 200 | 依赖（DB/Redis）故障 |
+## 6. Logs, Tracing & Panic Attribution
 
-> 三条最该先上的：`up`、5xx 率、P95 延迟。其余按业务补。
-
-## 5. Prometheus 抓取配置
-
-```yaml
-scrape_configs:
-  - job_name: zmodu
-    metrics_path: /metrics
-    scrape_interval: 15s
-    static_configs:
-      - targets: ["orders-api-1:8080", "orders-api-2:8080"]
-```
-
-K8s 用注解式发现：
-
-```yaml
-annotations:
-  prometheus.io/scrape: "true"
-  prometheus.io/path: "/metrics"
-  prometheus.io/port: "8080"
-```
-
-## 6. Grafana
-
-面板按下面的 `zigmodu_*` 指标自建（数据源选 Prometheus）：
-面板：QPS、5xx 错误率、4xx 比率、P50/P95/P99 延迟、状态码分类堆叠、总请求数。
-
-## 7. 日志与追踪
-
-- 访问日志与 trace id 由 `productionProfile` 默认接好（`tracingMiddleware` 注入
-  `x-trace-id` 并记录耗时），响应头带 trace id 以便与日志关联。
-- **trace id 与业务日志的闭环**：中间件**不只写响应头** —— 它同时 `ctx.setTraceId()`，
-  所以 handler 一行就能让该请求的每条日志都带上 id：
-
-  ```zig
-  const log = ctx.logScope("orders");           // 已绑好 trace_id
-  log.info("order {d} placed", .{id});
-  // → [orders] order 7 placed trace_id=4bf92f35…
-  ```
-
-  入站已有 `X-Trace-Id` 时**复用它**（跨服务串成一条链），否则生成一个；
-  长度 >128 或含非可打印字符的入站值会被忽略（这个头是客户端可控的）。
-  走 `ctx.logScope(...)` 而不是 `LogScope.scope(...)` 是有意的：后者不会带 id，
-  漏了只会静默少一个字段，没人会注意到。
-- OTLP 导出（可选）：`zmodu.observability.OtlpExporter`，`http(s)://` 均支持
-  （HTTPS 走系统信任库）。接 collector 后 trace 与指标可在同一后端关联。
-  **注意**：`DistributedTracer` 是手动 API（没有"当前 span"这类隐式状态），
-  所以 span → 日志的关联要显式做：谁手里有 id，谁负责 `setTraceId`。
-- **panic 归因**：应用 root 加 `pub const panic = zmodu.panicHook;`，panic 时
-  stderr 会先打印"正在处理哪个请求"，再输出标准堆栈。详见
-  [`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「韧性」。
-
-## 8. 上线前自检
-
-1. `curl -s localhost:8080/metrics | head` 有 `http_requests_total` 等序列。
-2. `curl -s localhost:8080/health/live` → 200 `UP`；`/health/ready` → 200。
-3. Prometheus `up == 1`；Grafana 面板有曲线。
-4. 至少有 `up`、5xx 率、P95、`outbox_pending`、`db_pool_waiters` 五条告警在跑。
-5. 压测一次：`zig build soak`（跨租户泄漏断言）+ 自己的业务压测脚本。
-   CI 里已挂 **夜间 soak**（`schedule` 每天 03:17 UTC + 手动触发，
-   `-Dsoak-clients=64 -Dsoak-iterations=200`），本地用默认规模即可。
-   **注意这三个目标（`soak` / `soak-cluster` / `runtime-stress`）只在夜间跑**，所以 push 流水线里另外挂了
-   一道 `zig build soak-compile`（Linux 腿）**只编译不运行**，保证它们的编译错误不会等到 03:17 才暴露 ——
-   这道门是补出来的：`src/soak_cluster.zig` 曾经在 Linux 上编译不过好几天（其中一个原因是那次 nightly
-   被 cancelled），而本机 macOS 编译是绿的（坏掉的分支是 `builtin.os.tag == .linux` 门控的、在 macOS 上
-   不被分析）。要验证夜间路径本身，用 `gh workflow run ci.yml`（`workflow_dispatch` 会真的跑 soak job）。
-   现在 push 还多了一道 `zig build soak-smoke`（同样只在 Linux 腿），用 `build.zig` 里**写死**的小预算真跑
-   `soak` 与 `soak-cluster` 的断言（`runtime-stress` 已由 `zig build test` 覆盖，不重复），所以"这三个目标只在
-   夜间跑"对其中两个已不再成立。
-
-6. **runtime-stress 历史序列（commit → 结果的纵向趋势）**：harness 设了
-   `RUNTIME_STRESS_HISTORY=<path>` 就会每次运行追加一行 schema-v1 JSON（计数器全集，不含宿主时钟列；
-   commit 取自 `GITHUB_SHA`/`GIT_SHA`，hex 校验过所以 JSON 无需转义）。夜间 CI 已把它接进
-   `$RUNNER_TEMP/nightly-logs/`，随 `nightly-soak-<sha>` artifact 归档 30 天 —— 那条 artifact 就是
-   天然的 commit→结果序列。本地/发版前用 `bash scripts/runtime-stress-record.sh [duration_ms] [path]`
-   （默认写仓库根的 `runtime-stress-history.jsonl`，已 gitignore），读序列用
-   `python3 scripts/runtime_stress_trend.py <path> [--window N]`：**硬门**只收宿主无关的契约
-   （harness 自身失败 / `push_failures` / 窗口内分配，违例 exit 1）；dispatch 量、RSS spread、
-   shutdown 耗时这类宿主相关读数只打印中位数与 delta 不门禁（§12.15/§12.16 的同一条分工；
-   `timers.dropped` 是背压语义不是契约，也只在漂移表里）。
-
-   **soak / soak-cluster 是同一条序列的另一半**：`SOAK_HISTORY` / `SOAK_CLUSTER_HISTORY`
-   各自在*通过*后追加一行（`kind` 区分；同样不含宿主时钟列），夜间写进同一个
-   `nightly-logs/`，所以一个 artifact 里现在是三条 commit→结果序列（stress + soak +
-   cluster soak）。本地用 `bash scripts/soak-record.sh [dir]`（默认仓库根，两个文件已
-   gitignore），读回用 `python3 scripts/soak_trend.py <a.jsonl> [<b.jsonl>] [--window N]`：
-   硬门只收**跨租户泄漏 / drain 后残留连接 / 同一采样两个 leader**（exit 1）；RSS、fd、
-   线程、耗时只打印中位数与 delta。失败的一晚不写行——"缺行"就是那一晚红了的信号，
-   原因看 `soak.log` / `soak-cluster.log`。
+- **Request trace correlation**: `tracingMiddleware` (enabled by `productionProfile`) reads or generates `X-Trace-Id` (ignoring untrusted headers longer than 128 bytes or containing non-printable characters) and calls `ctx.setTraceId()`. Inside handlers, call `const log = ctx.logScope("orders");` so every log line includes `trace_id=...`.
+- **OTLP Export**: Use `zmodu.observability.OtlpExporter` (`exportSpans`) to push spans over `http://` or `https://`.
+- **Panic attribution**: Export `pub const panic = zmodu.panicHook;` in your root `main.zig` to print the active `METHOD /path` to stderr when a panic occurs.

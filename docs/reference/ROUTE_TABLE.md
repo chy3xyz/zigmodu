@@ -1,585 +1,204 @@
-# Router（Zig-native）— comptime × 泛型 × std.Io × Modulith
+# Declarative Routing & Authentication (`ComptimeRouter`)
 
-> 状态：**推荐栈已钉死；scaffold 默认 RBAC；zent-modulith / tenant-shop 已迁；tenant-mgmt 用 CatalogPermDb**。  
-> 推荐：`jwtAuthFromCatalogWithPermissions` + `permissionGateWith(.rbac)` + `RolePermissionTable` / `CatalogPermDb` / 自定义 `CatalogPermissionLoader`。  
-> 多门户 / 多主体 RBAC 最佳实践摘要：[`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「JWT / 多端身份」；细则 §7.1。  
-> **AI**：[`AGENTS.md`](../../AGENTS.md) DO/DON'T + 本文 §7；勿把 AuthInfo 写入 `user_data`。  
-> Legacy：`security.auth.jwtAuth*` / `AppSecurity.rbacJwtMiddleware*` 现只写 **`auth_info`**，可与 ComptimeRouter `user_data` State 共存；读 auth 用 `getAuth` / `ctx.authInfo`，**勿再 `@ptrCast(user_data)` 当 AuthInfo**。  
-> 前提：未生产化，**不做**旧 URL 兼容。
+This reference defines zmodu's compile-time HTTP routing (`Router(State)` + `RouteSpec`), Path A catalog JWT authentication, RBAC permission gates, WebSocket/SSE route tables, and production server profiles.
 
----
+## 1. Recommended Stack vs Legacy Middleware
 
-## 0. 推荐栈 vs Legacy（必读）
+| Feature | `ComptimeRouter` + Path A (Recommended) | Legacy Auth Middleware |
+|---------|-----------------------------------------|------------------------|
+| Route declaration | `pub const routes = [_]http.RouteSpec(State){ ... }` | Runtime `router.scope(p).get(...)` |
+| JWT verification | `http.jwtAuthFromCatalogWithPermissions` | `security.auth.jwtAuth*` / `rbacJwtMiddleware*` |
+| Authorization gate | `http.permissionGateWith(&slot, .{ .mode = .rbac })` | `ctx.auth_info` + manual `requirePermission` |
+| Handler state | `ctx.user_data` holds `*State` (read via `ctx.state(T)`) | `ctx.user_data` untouched (`AuthInfo` in `ctx.auth_info`) |
+| Identity attributes | `ctx.userId()`, `ctx.tenantId()`, `ctx.permissionMatches(...)` | `ctx.authInfo()` |
 
-| | **ComptimeRouter（推荐）** | **Legacy AuthMiddleware** |
-|--|---------------------------|---------------------------|
-| JWT | `http.jwtAuthFromCatalogWithPermissions` | `security.auth.jwtAuth*` / `AppSecurity.rbacJwtMiddleware*` |
-| 权限 | attr `permissions` + `.mode = .rbac` | `AuthInfo` in **`auth_info`** + `requirePermission` / `getAuth` |
-| 状态共存 | ✅ 不碰 `user_data` | ✅ 亦不碰 `user_data`（State 保留） |
-| 权限来源 | `RolePermissionTable` 或 `CatalogPermDb.loaderFromClient` | `PermissionLoader`（数字 `role_ids`） |
-| 文档入口 | 本节 + §7 | `security/AuthMiddleware.zig` 头注释 |
+Use the **left column** (`ComptimeRouter` + Path A catalog JWT/RBAC) for all new applications and `zmodu scaffold --with-auth` projects.
 
-**新应用 / scaffold `--with-auth`：仍用左列**（catalog 权限码 + `permissionGate`）。右列适合已有 `requirePermission` 链、又挂了 ComptimeRouter 的迁移期。
+## 2. Core Routing Types
 
-DB 权限表示例：
-
-```zig
-try zmodu.security.CatalogPermDb.ensureSchema(&db_client);
-try zmodu.security.CatalogPermDb.grant(&db_client, "admin", "tenant:suspend");
-try server.addMiddleware(try http.jwtAuthFromCatalogWithPermissions(
-    &sec, &slot, try zmodu.security.CatalogPermDb.loaderFromClient(&db_client), .{},
-));
-try server.addMiddleware(try http.permissionGateWith(&slot, .{ .mode = .rbac }));
-```
-
----
-
-## 1. 一句话
-
-**模块用 comptime `routes` 表声明路由；`mountAll(comptime modules, …)` 在编译期展开注册；`Router(State)` 泛型持有应用状态与 `std.Io`。**  
-运行期零反射；请求路径完全确定。
-
-确实需要运行时注册（插件、SSE 流、管理面板）时，用 `router.scope(prefix).get/post/…/ws`：
-路由进 trie 与作用域中间件链，但**不进 catalog**——`permissionGate`、OpenAPI 与
-`auditAuthCoverage` 都看不到它。需要这些能力就必须走 `routes` 表（或 `ws_routes` /
-`sse_routes`）。旧 `server.group(...)` 已移除；框架内部运行时注册走 `api/RouteRegistrar.zig`（不导出）。
-
----
-
-## 2. 与「Axum 显式 mount」版的差别
-
-| | 前一版（Axum 味） | 本版（Zig 味） |
-|--|------------------|----------------|
-| 注册 | 手写 `g.get("page", h, …)` | comptime `routes` 数组 + `inline for` 展开 |
-| 状态 | `?*anyopaque` user_data | **`Router(State)`**，handler 拿 `*State`（或模块子状态指针） |
-| 发现 | 小元组调 `mount` | **`mountAll(comptime .{ ModuleA, ModuleB })`** 仍是显式元组，但是泛型+comptime |
-| Io | 只用 `Context.io` | **Router / Context 统一 `std.Io`**；需要 sleep/clock 的层走 Io |
-| 自动化 | scaffold 生成 mount 正文 | scaffold 生成 **`pub const routes`**；编译期校验冲突 |
-
-拍板保留：
-
-1. Gate 首版 = **module**  
-2. **WS 共用 meta**  
-3. 注册 = **comptime 模块元组**（禁止文件系统扫描）
-
----
-
-## 3. URL 约定（一种）
-
-`/{scope}/{domain}/{resource}/{action}`，kebab。例：`GET /admin-api/crm/customer/page`。
-
----
-
-## 4. 核心类型（泛型 + comptime）
-
-### 4.1 Meta / Auth
+### 2.1 `RouteMeta` and `Auth`
 
 ```zig
 pub const Auth = enum { inherit, public, optional, jwt };
 
 pub const RouteMeta = struct {
     auth: Auth = .inherit,
-    /// 权限码（`|` = OR）；`.mode = .rbac` 时按权限码匹配，否则按 roles 匹配
+    /// Permission code (`|` = OR); checked when `permissionGateWith` runs in `.mode = .rbac`
     permission: ?[]const u8 = null,
-    /// 门户/粗粒度角色（`|` = OR），`permissionGateWith` 先查它
+    /// Coarse portal/role name (`|` = OR); checked before `permission`
     roles: ?[]const u8 = null,
-    /// 默认取 nest/module 的 module 名
+    /// Defaults to the mounted module's `module_name`
     module: ?[]const u8 = null,
-    /// ↓ 只影响生成的 OpenAPI 文档，不参与任何鉴权
-    /// `summary` 缺省回落 `permission` → `module`（即未标注时输出与从前逐字节相同）
+    /// OpenAPI annotations (do not affect runtime authentication)
     summary: ?[]const u8 = null,
-    /// `description` 缺省回落按 auth 种类生成的词（`jwt` / `public` / …）——那是**词**不是说明
     description: ?[]const u8 = null,
-    /// 请求体 JSON schema **字符串**，原样进 `requestBody.content.*.schema`
     request_body: ?[]const u8 = null,
-    /// SSE 路由（handler 内 `http.sse(ctx)`）
     sse: bool = false,
-    /// 额外 OpenAPI 参数（`http.openApiParamsFromStruct(...)`），与路径 `{name}` 合并
     openapi_params: []const http.ApiParam = &.{},
 };
 ```
 
-> `summary` / `description` / `request_body` 是**纯附加**的文档注解：不设时 `exportOpenApi` 的输出
-> 与标注加入前**逐字节一致**（`src/api/ComptimeRouter.zig` 里冻结了一份 golden 用例守住这条）。
-> 从前"summary 是权限码、description 是 auth 种类"就是没有任何注解时的全部信息量 ——
-> 面向外部消费者的文档必须显式写这三个字段。
-
-### 4.2 编译期路由说明（无函数指针生命周期问题：用 comptime 已知函数）
+### 2.2 `RouteSpec(State)`
 
 ```zig
 pub fn RouteSpec(comptime State: type) type {
     return struct {
         method: http.Method,
-        /// 相对当前 nest，如 "page"
+        /// Relative path without leading slash (e.g. "{id}" or "login")
         path: []const u8,
-        /// `fn (*http.Context, *State) anyerror!void`
+        /// Typed handler receiving `*http.Context` and `*State`
         handler: *const fn (*http.Context, *State) anyerror!void,
         meta: RouteMeta = .{},
     };
 }
 ```
 
-> Zig 要点：handler 类型挂在 `State` 上，**消掉 `anyopaque`**；错误的 State 在编译期挂掉。
+Path parameter limit: each route supports up to **8** `{...}` segments (`RouteParams.MAX`). Exceeding 8 parameters returns `error.TooManyRouteParams` at route registration time.
 
-### 4.3 模块契约（modulith）
-
-```zig
-pub const CrmCustomer = struct {
-    pub const module_name = "crm";
-    pub const nest = .{ "crm", "customer" }; // 相对 scope group
-
-    /// 每个实例状态（persistence/service 指针等）
-    pub const State = struct {
-        api: *CrmCustomerApi,
-    };
-
-    pub const routes = [_]RouteSpec(State){
-        .{ .method = .GET, .path = "page", .handler = handlers.page },
-        .{ .method = .GET, .path = "get", .handler = handlers.get },
-        .{ .method = .POST, .path = "create", .handler = handlers.create },
-        .{ .method = .POST, .path = "assign", .handler = handlers.assign },
-    };
-
-    // WS 同表或并列 —— `.meta.auth` 必须**显式** `.public`：
-    // WS 升级发生在 router.match 与全局中间件之前，所以别的 auth 值没有执行点，
-    // 声明它们现在是编译错（docs/RUNTIME.md §12.14）。身份在 on_connect 里自己验。
-    pub const ws_routes = [_]WsSpec(State){
-        .{ .path = "ws/im", .on_connect = ..., .on_message = ..., .on_close = ..., .meta = .{ .auth = .public, .module = "crm" } },
-    };
-};
-```
-
-### 4.4 `Router(State)` + `std.Io`
+### 2.3 Module Route Table Contract
 
 ```zig
-pub fn Router(comptime AppState: type) type {
+const http = @import("zmodu").http;
+
+pub fn OrderApi(comptime Service: type) type {
     return struct {
-        io: std.Io,
-        allocator: Allocator,
-        server: *http.Server,
-        state: *AppState,
-
         const Self = @This();
+        service: *Service,
 
-        pub fn group(self: *Self, prefix: []const u8) Group(AppState) { ... }
+        pub const module_name = "order";
+        pub const nest = .{"orders"};
+        pub const State = Self;
 
-        /// `mounts` = `.{ .{ .Mod = M1, .state = &s1 }, .{ .Mod = M2, .state = &s2 } }`
-        /// （与 §6 调用点同形状；实现见 src/api/ComptimeRouter.zig）
-        pub fn mountAll(self: *Self, mounts: anytype) !void {
-            inline for (mounts) |m| {
-                try self.mount(m.Mod, m.state);
-            }
+        pub const routes = [_]http.RouteSpec(State){
+            .{ .method = .GET, .path = "{id}", .handler = getOrder, .meta = .{ .auth = .jwt } },
+            .{ .method = .DELETE, .path = "{id}", .handler = cancelOrder, .meta = .{ .permission = "order:cancel" } },
+            .{ .method = .POST, .path = "login", .handler = login, .meta = .{ .auth = .public } },
+        };
+
+        // WebSocket routes MUST explicitly set `.meta.auth = .public` (enforced at compile time)
+        pub const ws_routes = [_]http.WsSpec(State){
+            .{
+                .path = "ws",
+                .on_connect = onConnect,
+                .on_message = onMessage,
+                .on_close = onClose,
+                .meta = .{ .auth = .public, .module = "order" },
+            },
+        };
+
+        fn getOrder(ctx: *http.Context, self: *State) !void {
+            const id = try ctx.paramInt(i64, "id");
+            _ = self;
+            try ctx.jsonStruct(200, .{ .id = id, .tenant = ctx.tenantId() });
         }
 
-        fn mount(self: *Self, comptime Mod: type, state: *Mod.State) !void {
-            comptime {
-                if (!@hasDecl(Mod, "routes")) @compileError(@typeName(Mod) ++ " missing routes");
-                if (!@hasDecl(Mod, "module_name")) @compileError(...);
-            }
-            var g = self.group(scopePrefix).nestComptime(Mod.nest, Mod.module_name);
-            const state_ptr: ?*anyopaque = state;
-            inline for (Mod.routes) |spec| {
-                try g.route(spec.method, spec.path, wrap(Mod.State, spec.handler), spec.meta);
-            }
-            if (@hasDecl(Mod, "ws_routes")) {
-                inline for (Mod.ws_routes) |spec| {
-                    try g.ws(spec.path, spec.on_connect, spec.on_message, spec.on_close, spec.meta);
-                }
-            }
+        fn cancelOrder(ctx: *http.Context, _: *State) !void {
+            try ctx.jsonStruct(200, .{ .cancelled = true });
         }
 
-        pub fn finish(self: *Self) !RouteCatalog {
-            // 运行期：建 public set、path→module；也可把冲突再 assert 一次
-            return buildCatalog(self.server);
+        fn login(ctx: *http.Context, _: *State) !void {
+            try ctx.jsonStruct(200, .{ .token = "..." });
         }
     };
 }
 ```
 
-`wrap`：把 `fn(*Context,*Mod.State)` 收成现有 `HandlerFn`，从 `AppState` 取出子 State（comptime 偏移或指针字段约定）。
-
-### 4.5 编译期冲突检测
+### 2.4 Mounting Modules & Compile-Time Duplicate Detection
 
 ```zig
-fn assertNoDupes(comptime modules: anytype) void {
-    comptime {
-        var paths: []const []const u8 = &.{};
-        // inline for 拼接 method+absolute path，重复则 @compileError
-    }
-}
-```
-
-调用：`comptime assertNoDupes(.{ CrmCustomer, InsuranceAgents, ... });`
-
-### 4.6 路径参数上限：8 个（注册期错误，不是 404）
-
-一条路由最多带 **8** 个 `{…}` 段（`RouteParams.MAX`；`{id}` 计 1 个，`*` 通配路由不参与计数）。
-超限不再表现为「匹配不上」，而是**注册期**错误：`Router.addRoute` /
-`Server.addRoute` 在动 trie **之前**返回 `error.TooManyRouteParams`
-（`src/api/Server.zig`），所以 `mountAll` 里的启动期 `try` 会直接把它拦下来。
-
-这条错误是「启动期失败」而不是「请求期失败」是刻意的：`match` 没有错误通道，
-过去它只能对一条永远匹配不上的路由返回 `null` —— 也就是一个**每个请求都 404**、
-却看起来注册成功的路由（`Server.zig` 里有对应用例）。
-
----
-
-## 5. `std.Io` 用在哪
-
-| 点 | 用法 |
-|----|------|
-| `Router.io` | 与 `Server` / `Context.io` 同一来源（Zig 0.17 异步世界） |
-| `Time.wallClockSeconds(io)` | catalog / access log 时间戳 |
-| `std.Io.sleep` | 仅中间件或健康探测需要时；**路由注册本身不 sleep** |
-| 文件导出 catalog | `std.Io.Dir` + `writeStreamingAll`（build/zmodu 工具侧） |
-
-路由表是 comptime 数据；Io 属于 **运行期 Server/Router 生命周期**，二者正交、在 `Router(AppState){ .io = init.io, ... }` 汇合。
-
----
-
-## 6. 应用侧（小元组 = 唯一「自动化」入口）
-
-```zig
-comptime http.assertNoDupes(.{ modules.crm.customer, modules.crm.contact });
+comptime http.assertNoDupes(.{ OrderApi, UserApi });
 
 var router = http.Router(AppState).init(init.io, allocator, &server, &app_state);
-var admin = router.scope("/admin-api");
-try admin.mountAll(.{
-    .{ .Mod = modules.crm.customer, .state = &app_state.crm_customer },
-    .{ .Mod = modules.crm.contact, .state = &app_state.crm_contact },
+defer router.deinit();
+
+var api_v1 = router.scope("/api/v1");
+try api_v1.mountAll(.{
+    .{ .Mod = OrderApi, .state = &order_api },
+    .{ .Mod = UserApi, .state = &user_api },
 });
-const catalog = try router.finish();
-defer catalog.deinit();
+
+catalog_slot.set(try router.finish());
 ```
 
-- **有自动化**：`inline for` + comptime 校验 + 统一 wrap  
-- **无魔法**：模块列表仍是人手维护的元组（可跳转、可 code review）
-- **State**：每个模块自带 `Mod.State`；`mount`/`mountAll` 传入对应指针（`wrap` 经 `ctx.user_data` 送达 handler）
-- **挂载清单与模块元组同源**：定义一份 comptime 模块列表
-  `const app_modules = .{ tenant, user, sub };` 同时供三处共用——
-  `ApplicationBuilder.build(app_modules)`（模块生命周期）、
-  `comptime assertNoDupes(app_modules)`（路由重复检查）、`inline for` 映射生成
-  `mountAll` 的 `.{ .Mod = m, .state = ... }` 元组（路由挂载）——模块从
-  `app_modules` 里裁掉时三处一起消失，从根上消除"裁剪模块留孤儿挂载"。
+For dynamic runtime routes (plugins, ad-hoc admin endpoints), use `router.scope("/api").get("ping", handler, null)`. Runtime routes do not enter `RouteCatalog` and are not inspected by `permissionGate`, OpenAPI export, or `Testkit.auditAuthCoverage`.
 
-Scope（admin/app/external）：推荐 **多个 `scope` + 各自 mountAll**（A）；模块级 `pub const scope` 分发（B）可后补。
+## 3. Path A Authentication & Multi-Portal RBAC
 
----
-
-## 7. 中间件 / Gate
-
-- `auth == .public` → `jwtAuthFromCatalog` 跳过 JWT（`{id}` 段匹配；默认跳过 `health` / `dashboard` / `openapi.json`）
-- ModuleGate → `moduleGate`：写入 `ctx` attr `module`；可选白名单 / deny-unknown
-- PermissionGate → `permissionGateWith(slot, .{ .mode = .rbac })`：`RouteMeta.permission` 为**权限码**（如 `tenant:suspend`）；`|` = OR  
-  - `.mode = .roles`（默认）仍按 JWT role 名匹配（兼容旧行为）  
-  - `.rbac` 读 `permissions` attr（及可选 `ctx.auth_info`）
-- JWT 加载权限 → `jwtAuthFromCatalogWithPermissions` + `RolePermissionTable` / `CatalogPermDb.loaderFromClient` / 自定义 `CatalogPermissionLoader`  
-  **不写** `ctx.user_data`（与 ComptimeRouter 共存）；权限写入 attr `permissions`
-- OpenAPI → `openApiFromCatalog(*CatalogSlot, …)` 每次请求从 catalog 生成
-- 插件（IM / AI / Web4）：`routes` + `ws_routes` + `mountAll`
-- scaffold `--with-auth`：默认生成 **RBAC 表骨架** + `.mode = .rbac`（非 role gate）
-
-接线（细粒度 RBAC）：
+### 3.1 Wiring Catalog JWT + RBAC Gate
 
 ```zig
-const table = security.Rbac.RolePermissionTable{ .rows = &.{
-    .{ .role = "admin", .permissions = &.{ "tenant:suspend", "tenant:write" } },
-    .{ .role = "user", .permissions = &.{ "tenant:read" } },
-} };
+var catalog_slot = http.CatalogSlot.init();
+defer catalog_slot.deinit(allocator);
+
+const table = security.Rbac.RolePermissionTable{
+    .rows = &.{
+        .{ .role = "admin", .permissions = &.{ "tenant:suspend", "tenant:write" } },
+        .{ .role = "user", .permissions = &.{"tenant:read"} },
+    },
+};
+
 try server.addMiddleware(try http.jwtAuthFromCatalogWithPermissions(
-    &sec, &catalog_slot, try http.catalogLoaderFromTable(&table), .{},
+    &sec,
+    &catalog_slot,
+    try http.catalogLoaderFromTable(&table),
+    .{},
 ));
 try server.addMiddleware(try http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
 try server.addMiddleware(try http.permissionGateWith(&catalog_slot, .{ .mode = .rbac }));
-// … mountAll …
-catalog_slot.set(try router.finish());
-try server.addRoute(.{
-    .method = .GET,
-    .path = "openapi.json",
-    .handler = try http.openApiFromCatalog(&catalog_slot, .{ .title = "app", .version = "1.0" }),
-});
-```
 
-路由声明：
-
-```zig
-.{ .method = .DELETE, .path = "{id}", .handler = suspend, .meta = .{ .permission = "tenant:suspend" } },
-```
-
-WS：`pub const ws_routes = [_]http.WsSpec(State){ .{ .path = "ws", .on_connect = …, .on_message = …, .meta = .{ .auth = .public } } };`  
-**`.meta.auth = .public` 是必须的**（缺 `.meta`、写非 `.public` 的 auth、或挂 `permission`/`roles` 都编译不过 —— WS 升级在 `router.match` 与全局中间件之前发生，那些声明没有执行点；`docs/RUNTIME.md` §12.14）。
-`on_message` 签名：`fn(session, msg, kind: http.WsFrameKind)` — **text (0x1) 与 binary (0x2) 均分发**（OpenIM protobuf 等）；写出用 `WsFramer.writeBinary` / `writeData`。
-
-### SSE（Server-Sent Events）
-
-- 客户端：`Accept: text/event-stream`（约定；路由不强制校验）
-- Handler：`var sse = try http.sse(ctx);` — 设置 `responded`+`streaming`，避免 Server 二次 `writeResponse`
-- 重连：`http.lastEventId(ctx)` 读 `last-event-id`；`sse.setId(...)` 写出 `id:`
-- 模块表：`pub const sse_routes = [_]http.SseSpec(State){ .{ .path = "stream", .handler = stream } };`
-- 或在普通 `routes` 行设 `meta = .{ .sse = true }`
-- Catalog：`is_sse=true` → OpenAPI description 标注 SSE
-- 多行 payload：`sendEvent` 按 `\n` 拆成多行 `data:`
-- 详见 `docs/FRAMEWORK_BACKLOG.md`
-
-### 7.1 多端 / 自定义身份 claim（应用层扩展 · 最佳实践）
-
-框架 **不** 内置 `type=user|admin|shop_user|…` 枚举。多门户（C 端 / 店主 / 平台 / 供应商）用 **现有槽位** 扩展，避免第二套 JWT 核心模型。  
-可执行清单与接线样例亦见 [`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「JWT / 多端身份」。
-
-#### 分层（与现有组件对齐）
-
-```
-签发/验签（唯一源 · 路径 A）
-  └─ AppSecurity / SecurityModule（sub / iss / aud / roles）
-     登录只发门户 roles + aud + sub；勿塞全量菜单树
-
-请求上下文（正交）
-  ├─ ctx.user_data     → ComptimeRouter *State（模块状态）
-  ├─ ctx.auth_info     → 可选 AuthInfo（legacy rbacJwt；读 getAuth）
-  └─ ctx.attributes    → user_id、tenant_id、roles、permissions CSV
-
-门禁（由粗到细）
-  ├─ RouteMeta.auth = .public | .jwt | .inherit
-  ├─ permissionGateWith(.rbac) ← permissions 码（推荐；含 portal:*）
-  ├─ permissionGate / .roles   ← JWT roles 名（粗）
-  └─ 应用薄 helper              ← 只读 attrs（勿再验签）
-```
-
-#### 多业务主体 × 各自 RBAC（ZigShop 类 · 推荐模型）
-
-典型库表是 **多套同构、互不合并** 的 RBAC（shop / supplier / saas-admin），不是一张全局 `role_permission`。
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  zmodu（通用）                                              │
-│  JWT: sub + aud(租户) + roles(门户粗身份)                      │
-│  Middleware: verify → CatalogPermissionLoader → permissions │
-│  Gate: RouteMeta.permission + permissionGateWith(.rbac)     │
-└───────────────────────────┬─────────────────────────────────┘
-                            │ loader 按门户选数据源
-        ┌───────────────────┼───────────────────┐
-        ▼                   ▼                   ▼
-   shop_* RBAC         supplier_* RBAC      admin role/access
-   (app_id)            (app_id+supplier_id) (saas)
-```
-
-| 层 | 谁拥有 | 框架是否内置 |
-|----|--------|--------------|
-| 门户身份 | JWT `roles` 如 `shop`/`supplier`/`admin`/`user` | ✅ 标准 claim |
-| 租户 | JWT `aud` | ✅ |
-| 主体内职务/菜单权限 | **应用自己的** `*_role` / `*_access` 表 | ❌ 不合并进框架表 |
-| HTTP 门禁 | `permissions` attr + catalog gate | ✅ |
-| 展开职务→权限码 | **应用** `CatalogPermissionLoader` | ✅ **扩展点** |
-
-**最佳实践：**
-
-1. **不要**把三套业务表迁进 `CatalogPermDb.role_permission`（那只适合简单单租户演示）。  
-2. **不要**在 JWT 塞全量 access 树（token 膨胀、撤权滞后）。  
-3. 登录只发 **门户 role + aud + sub**；每次请求由 loader **按 (portal, aud, sub)** 查对应表族，展开 path/码 → `permissions` CSV。  
-4. `RouteMeta.permission` 与各端 `access.path`（或规范化码 / `portal:*`）对齐；BFF scope 与门户 role 一致。  
-5. Super 账号（`is_super`）：loader 内短路为该门户全量权限或约定码。  
-6. Handler **禁止**新增重复 Bearer 验签；gate 通过后只读 `user_id` / `tenant_id` / `permissions`。
-
-**框架 loader 入参：**  
-`CatalogPermissionLoader = fn(allocator, CatalogPermLoadInput) ![]u8`，`CatalogPermLoadInput = { sub, aud, roles }`（导出：`http.CatalogPermLoadInput`）。  
-- 静态表 / `CatalogPermDb.loaderFromClient` **忽略** `sub`/`aud`，只映射 roles。  
-- 多主体应用用 `(sub, aud, roles)` 查业务表族 → `permissions` CSV。  
-- JWT 验签后写入 `user_id`（sub）与 `tenant_id`（aud）。
-
-#### 三条路径（选一条作主路径，勿双签发）
-
-| 路径 | 适用 | 做法 |
-|------|------|------|
-| **A. Catalog 默认** | **所有新应用**、tenant-mgmt、ZigShop 目标态 | `AppSecurity` + `jwtAuthFromCatalogWithPermissions` + `permissionGateWith(.rbac)`；多端用 **permission 码** / roles；多主体 RBAC 用自定义 loader |
-| **B. 应用 identity** | 遗留过渡（勿新开） | 应用内签发验签；尽快迁 A |
-| **C. 适配桥** | 仅渐迁 B→A | 旧 claim 映射为 `roles`/`aud` 后再走 gate |
-
-#### 推荐约定（claim → 框架槽）
-
-| 业务概念 | 推荐落点 | 勿做 |
-|----------|----------|------|
-| 租户 / 店铺 | JWT `aud`（及 SQL 租户列） | 框架强制改名业务列 |
-| 门户 | JWT `roles`（粗） | 核心 JwtPayload 加必填 `type` |
-| 主体内 RBAC | 业务表 → loader → `permissions` | 三套表合成一张全局角色表 |
-| 细权限门禁 | `RouteMeta.permission` | 仅靠门户 role 守所有写接口 |
-| 模块 State | `user_data` | 鉴权对象写入 `user_data` |
-
-#### 演进阶梯（多 BFF 应用）
-
-1. P0：`AppSecurity` + catalog JWT/gate；loader（静态或 DB）；登录发框架 token。  
-2. P1：试点一个 BFF：`portal:*` + 路由 meta；handler 改读 attrs。  
-3. P2：批改其余门户 / BFF。  
-4. P3：删除应用侧 PHP 形签发/验签；只保留 password/OAuth 等业务逻辑。  
-
-参考落地：ZigShop `docs/AUTH_FRAMEWORK_ALIGNMENT.md`（路径 A · P0–P3）。
-
-#### 刻意不做（框架边界）
-
-- 不在核心 JWT 增加必填 `type` enum / 多端枚举 API  
-- 不内置 `zigshop_shop_role` 一类业务表  
-- `CatalogPermDb` 保持可选简易后端，**不是**多主体 RBAC 的唯一实现  
-
-示例：`examples/tenant-mgmt`（单套 `CatalogPermDb`）；多主体见应用自定义 loader（ZigShop）。
-
-#### 跨门户身份（一个身份在 N 个门户工作）
-
-框架**不校验 `aud` 对门户的映射**（`SecurityModule.verifyToken` 只验结构 / alg / 签名 /
-exp），roles 门禁只比 JWT `roles` claim 的**并集**（`|` OR，`Middleware.zig:1139-1145`）。
-因此一个身份要在多个门户下工作，任选其一即可：
-
-1. **签发时放多个门户 role**：`generateTokenWithTenant(sub, roles, aud)` 的 `roles` 本来
-   就是数组，签 `roles = {"cashier","user"}` 即跨门户。框架对 roles 里有哪些门户、分布
-   如何**不做任何校验**——那是你的 loader / 路由声明的职责。
-2. **路由侧声明并集**：`RouteMeta.roles = "user|cashier"`，同样按 OR 匹配。
-3. **rbac 模式用门户权限码**：`permission = "portal:user|portal:shop"`。
-
-**前提：跨门户复用要求各门户共享验签密钥**（同一个 `AppSecurity` / keyring）。多 BFF /
-多门户若各挂各的 `SecurityModule`（验签密钥不同），跨门户 token 连签都验不过（401）——
-那是部署决策，不是框架限制；要跨门户，先统一验签侧。
-
-**勿做**：不要为跨门户在核心 `JwtPayload` 加 `type` 枚举——跨门户扩展槽位就是 `roles`
-（见本节「刻意不做（框架边界）」与「推荐约定」表）。
-
-### 7.2 可插拔 AuthBackend / 身份与信封（v0.15.31+）
-
-源自 `docs/ISSUES_FROM_ZAPI.md`（zapi 落地反馈）：
-
-- **Catalog 是唯一 bypass 真相（M1/M3）**：`authFromCatalog(&slot, backend, .{})` 包住任意
-  `AuthBackend`（真实签名 `verifyFn(ctx, user_data) anyerror!bool` —— 返回 `true` 表示凭证有效、
-  `false` 表示**可判定的**无效凭证（401），返回**错误**表示"我们这侧无法完成校验"（分配失败、
-  后端存储故障 → 5xx）；内置 `jwtBackend` 对未知 `kid` 仍回 `false` 但会打一条 warn），
-  只有 `RouteMeta.auth == .public`（或 legacy
-  skip-prefix）才跳过验签 —— 消费端**不要再维护** `public_paths.zig` 之类的并行清单。
-  内置 `http.jwtBackend(&sec)` / `http.jwtBackendWithPermissions(&sec, loader)`（≡
-  `jwtAuthFromCatalogWithPermissions`）；Redis/token-service 等自定义后端实现同一形状即可。
-- **拒绝信封钩子（M4）**：`JwtFromCatalogConfig.reject` / `PermissionGateConfig.reject` /
-  `AuthFromCatalogConfig.reject` 接受 `AuthRejectFn`；`http.envelopeReject(.thinkphp)` 让
-  401 直接产出 `{code:-1,msg,data}`，无需 fork 中间件。
-- **类型化身份（M5）**：handler 用 `ctx.userId()` / `ctx.userIdInt(i64)` /
-  `ctx.requireUserId()`（`error.Unauthorized`）/ `ctx.tenantId()` / `ctx.rolesCsv()`；
-  中间件写 `ctx.setIdentity(.{ .user_id, .tenant_id, .roles })`。删掉应用侧
-  `requireLogin` / `currentUid` 复制件。另有 `ctx.getAttrInt(T, key)` /
-  `ctx.getAttrEnum(E, key)`（M11）。
-- **信封方言（M6）**：`ctx.setEnvelope(.thinkphp | .ruoyi | .default)` 后用
-  `ctx.ok(json)` / `ctx.okValue(v)` / `ctx.fail(msg)` / `ctx.failCode(code, msg)` /
-  `ctx.unauth(msg)` / `ctx.paginated(items, total)`（RuoYi 分页为 `{code,msg,rows,total}`）。
-- **租户中间件（M7）**：`http.tenantResolver(.{ .require = true })` 按 `AppID`/`appid`/
-  `X-Tenant-Id` 头或 `app_id` query 写 `tenant_id` attr；JWT `aud` 已存在时默认优先。
-- **路由级门户 roles（M8）**：`RouteMeta.roles = "admin|ops"`（`|` = OR），
-  `permissionGateWith` 在细粒度 permission 之前先按身份 roles 拦截 —— 替代应用里
-  硬编码的 path-prefix → role 表。
-- **Token 提取器（M12）**：`http.extractBearer(ctx)` / `extractHeaderToken(ctx, "x-token")` /
-  `extractQueryToken` / `extractFormToken` / `extractTokenAny(ctx, &.{ .bearer, .x_token })`。
-- **meta ↔ runtime 审计（M2）**：测试里
-  `http.Testkit.auditAuthCoverage(alloc, &server, &slot)` 无凭证分发全部 catalog 路由，
-  返回漂移清单（非 public 必须 401、public 不得 401）；空切片 = 通过，可直接接入 CI。
-
-### 7.3 Resilience profiles 接线（M9）
-
-`applyHttpDefaults` 只装安全/可观测中间件；**限流熔断是按依赖的**，必须显式
-attach 才会生效（zapi 类应用常漏）：
-
-```zig
-var http_state = http.HttpProfileState.init(allocator);
-defer http_state.deinit(allocator);
-try http.applyHttpDefaults(&server, .{}, &http_state);
-
-// 按依赖声明限额：db / payment / 下游 API
-var res = try http.ResilienceProfileState.init(allocator, &.{
-    .{ .name = "db", .max_qps = 200 },
-    .{ .name = "payment", .max_qps = 50, .failure_threshold = 3 },
-});
-defer res.deinit();
-
-// handler / service 里取用（与 catalog 支付、DB slot 配对）：
-const cb = res.breaker("payment").?;   // CircuitBreaker
-const rl = res.limiter("payment").?;   // RateLimiter（单节点；全局限流用 data.redis_rate_limit）
-```
-
-多实例全局阈值 → `data.redis_rate_limit.RateLimiter`（Redis 共享窗口，fail-closed）。
-
-### 7.4 生产接线：`productionProfile` 与**顺序约束**
-
-`applyHttpDefaults` 只是中间件散件；生产入口是
-`http.productionProfile(&server, cfg, &state)`（背压 + 安全/观测中间件 +
-`/metrics` + `/health/*`，可选 dashboard）。
-
-```zig
-var server = zmodu.http.Server.init(io, allocator, 8080);
-var profile = zmodu.http.ProductionProfileState.init(allocator);
-defer profile.deinit(allocator);
-
-try zmodu.http.productionProfile(&server, .{
-    .max_connections = 4096,        // 0 = 不限；超限 .close 或 .unavailable(503)
-    .header_timeout_ms = 10_000,    // 请求行+header deadline（slowloris）
-}, &profile);                       // ← 必须在下面任何一条之前
-
-// 然后才是路由注册 / ComptimeRouter
-var api_v1 = router.scope("/api/v1");
+// Mount all modules, then populate catalog_slot:
 try api_v1.mountAll(.{ ... });
 catalog_slot.set(try router.finish());
 ```
 
-**顺序约束（违反会静默失效）**：`Server.addRoute` 在**注册时**把当时的
-`global_middleware` 快照进该路由的 `combined_middleware`
-（`src/api/Server.zig`）。因此 profile 必须挂在**所有** `addRoute` /
-`mountAll` / `mount` **之前**，否则后挂的全局中间件对已注册路由不生效
-（只有未命中路由的 global chain 例外）。
+For database-backed role permissions, pass `try zmodu.security.CatalogPermDb.loaderFromClient(&db_client)`.
 
-同理，`state` 必须**活得比 Server 久**（CORS backing 存储与探针 handler 都
-指向它）——放栈上 + `defer state.deinit(allocator)`。
+### 3.2 Multi-Portal Identity & Custom Permission Loaders
 
-**背压三层分工**（别只设一个就当防住了）：
+zmodu does not add a custom `type` enum to `JwtPayload`. Instead, map multi-portal identities (e.g., storefront customer, merchant staff, supplier, platform admin) onto standard JWT claims:
 
-| 层 | 开关 | 管什么 |
-|----|------|--------|
-| 连接 | `max_connections` / `over_limit_response` | accept 洪泛、fd/内存耗尽 |
-| 头部 | `header_timeout_ms` | slowloris（慢速滴 header）；header 读完即解除，不误杀慢上传 |
-| 请求体 | `body_timeout_ms`（默认 30 s，`0` 关） | 慢滴 body / Slow-POST：header 之后 body 读完之前的预算；超预算回 **408** |
-| HTTP/2 | 同上三者（`max_body_size`/`header_limits`/`header_timeout_ms`，经 `Server.http2ServeOptions`） | h2 **没有独立的旋钮**：body 限额、解压后头列预算（16 KiB/100 条，并通告 `SETTINGS_MAX_HEADER_LIST_SIZE`，超限 `RST(ENHANCE_YOUR_CALM)`）与空闲读超时都跟随 H1 的设置；空闲超时对 h2 是新行为（过去不会超时） |
-| 请求 | `request_timeout_ms` | handler 执行时长 |
-| WS 出站 | `ws_write_timeout_ms` + `WsFramer.isWritable()` | 不读的慢客户端阻塞写线程 |
+| Concept | JWT / Framework Slot | Rule |
+|---------|----------------------|------|
+| User ID | JWT `sub` → attr `"user_id"` | Read via `ctx.userId()` / `ctx.requireUserId()` |
+| Tenant / Store ID | JWT `aud` → attr `"tenant_id"` | Mint with `generateTokenWithTenant(sub, roles, aud)`; read via `ctx.tenantId()` |
+| Portal / Coarse Role | JWT `roles` → attr `"roles"` | Gate with `RouteMeta.roles = "shop\|admin"` |
+| Fine-Grained RBAC | `CatalogPermissionLoader` → attr `"permissions"` (CSV) | Gate with `RouteMeta.permission = "order:cancel"` |
+| Route Handler State | `ctx.user_data` (`*State`) | Read via `ctx.state(T)`; never store `AuthInfo` in `user_data` |
 
-指标 / 告警 / Grafana：[`OBSERVABILITY.md`](./OBSERVABILITY.md)；
-TLS 边车与守护拓扑：[`../examples/production-deploy/`](../../examples/production-deploy/)。
+Custom `CatalogPermissionLoader` signature:
 
-配套的两件事（都在同一批加固里，别只做 profile）：
+```zig
+// CatalogPermLoadInput = struct { sub: []const u8, aud: []const u8, roles: []const []const u8 }
+pub const CatalogPermissionLoader = *const fn (
+    allocator: std.mem.Allocator,
+    input: http.CatalogPermLoadInput,
+) anyerror![]u8;
+```
 
-- **启动预检**：`zmodu.Preflight.run(...)` 检查必填 env、占位 JWT secret、
-  DB 连通、待应用迁移、时钟偏移；`!report.ok()` 就拒绝启动。
-  见 [`BEST_PRACTICES.md`](../guide/BEST_PRACTICES.md)「上线前预检」。
-  其中 `migrationCheck` 需应用侧提供 `pending` 回调（返回待应用迁移数，可对接
-  `MigrationRunner.getPendingMigrations`；回调形态见 `src/core/Preflight.zig` 单测）——
-  zent 这类启动期自动迁移的栈没有 pending 语义，不适用。接线示例见 `examples/zmsaas`。
-- **密钥轮换**：`app_sec.module.setKeyring(&ring)` 让 token 带 `kid`，新旧密钥
-  双验；否则换 secret 只能全员重登。见同文「JWT 密钥轮换」。
+### 3.3 Pluggable `AuthBackend`, Envelopes & CI Coverage Audit
 
-### Typed extractors + scope middleware
+- **Custom auth backends**: Use `http.authFromCatalog(&slot, backend, .{})` to wrap non-JWT backends (session stores, Redis tokens) while keeping `RouteMeta.auth == .public` as the single bypass source of truth.
+- **Response envelope dialects**: Call `ctx.setEnvelope(.thinkphp | .ruoyi | .default)` and use `ctx.okValue(v)`, `ctx.fail(msg)`, `ctx.failCode(code, msg)`, `ctx.unauth(msg)`, and `ctx.paginated(items, total)`.
+- **CI auth coverage audit**: Call `http.Testkit.auditAuthCoverage(allocator, &server, &slot)` in tests to dispatch unauthenticated requests to every catalog route and verify that all non-public routes return `401` and all `.public` routes do not return `401`.
+
+## 4. Extractors, `resultHandler`, and SSE
+
+### 4.1 Typed Request Extractors
 
 ```zig
 const id = (try http.extractPath(ctx, .{ .id = u64 })).id;
-const page = (try http.extractQuery(ctx, .{ .page = u32, .size = u32 })).page;
-const body = try http.extractJson(ctx, CreateDto) catch return;
-try http.respondErr(ctx, err);
-
-var scope = try router.scope("admin-api").use(myMiddleware); // 运行时注册面
+const query = try http.extractQuery(ctx, .{ .page = u32, .size = u32 });
+const body = try http.extractJsonValidated(ctx, CreateOrderDto, order_rules);
 ```
 
-Extractors → `src/api/Extract.zig` · Testkit → `http.Testkit.dispatch`
+### 4.2 Thin Handlers with `http.resultHandler`
 
-`dispatch` 的 `DispatchOptions.query` 收**percent-encoded 原样串**（`"pageNo=2&name=%E5%BC%A0%E4%B8%89"`），与 `path` 里自带的 `?…` 同时生效、同名 key 以 `opts.query` 为准 —— 用来测 `ctx.queryInt` / `ctx.queryParam` / `queryArray` 驱动的路由（含脚手架生成的 `list*`）：
-
-### 7.5 Handler 瘦身：`resultHandler`（M10 官方模式）
-
-「parse → service → renderJson」胖 handler 的官方瘦身形态：handler 函数
-**返回值**，渲染交给适配器。成功路径只有业务：
+Wrap handlers that return a value directly so the framework serializes the `200 OK` envelope automatically:
 
 ```zig
-const http = zmodu.http;
-
 fn getUser(ctx: *http.Context, self: *State) !UserDto {
     const id = try ctx.paramInt(i64, "id");
-    return self.svc.findUser(id);           // 返回值即 200 的 data
+    return self.svc.findUser(id);
 }
 
 pub const routes = [_]http.RouteSpec(State){
@@ -587,72 +206,28 @@ pub const routes = [_]http.RouteSpec(State){
 };
 ```
 
-- 成功：适配器调 `ctx.okValue(value)`，走 `ctx` 当前的信封方言
-  （`setEnvelope(.ruoyi)` 等照常生效）。
-- **失败侧保持显式**：函数仍持有 `ctx`，业务失败就地 `ctx.failCode(...)` /
-  `http.respondErr(...)` 后 `return error.Xxx` —— dispatch 只在
-  `ctx.responded == false` 时补 500，已渲染的回答不会被覆盖。
-- 未渲染就返回的错误走既有错误路径（recover / `setErrorMap` / 500），
-  一个字节的行为都没改。
+### 4.3 Server-Sent Events (SSE)
 
-它**不是** dispatch 层的 `!ApiResult(T)` auto-render（那要动路由分发签名，
-仍是 deferred 的 M10 完整版）；它覆盖的是胖 handler 的最大公约数，且零
-迁移成本——逐条路由改用，不用的路由不受影响。
-
----
-
-## 8. Scaffold / zmodu
-
-生成：
+Declare SSE routes in `pub const sse_routes = [_]http.SseSpec(State){ ... }` (or set `.meta = .{ .sse = true }`). Inside the handler:
 
 ```zig
-pub const routes = [_]http.RouteSpec(State){ ... };
-pub fn page(ctx: *http.Context, state: *State) !void { ... }
+var sse = try http.sse(ctx);
+if (http.lastEventId(ctx)) |last_id| {
+    _ = last_id;
+}
+try sse.sendEvent("update", "{\"progress\":50}");
+try sse.done();
 ```
 
-而不是生成一长串 `group.get`。
+## 5. Production Profile & Backpressure Ordering
 
----
+Mount `http.productionProfile` **before** registering any routes:
 
-## 9. 实现切片
-
-| 步 | 内容 | Zig 特性 | 状态 |
-|----|------|----------|------|
-| 1 | `RouteSpec(State)`、`wrap`、现有 Server 可挂 typed handler | 泛型 | ✅ `ComptimeRouter.zig` |
-| 2 | `Router(AppState)` + `scope`/`mount`/`mountAll` + `inline for routes` | comptime / inline for | ✅ |
-| 3 | `assertNoDupes` | comptime `@compileError` | ✅ |
-| 4 | `finish` → public + path→module；中间件改读索引 | 运行期 | ✅ `jwtAuthFromCatalog` + `moduleGate` + `permissionGate` |
-| 5 | WS `WsSpec(State)` 并入 mount | 泛型一致 | ✅ |
-| 6 | 试点一模块 + `app_modules` 元组；删 `register_routes` 片段 | modulith | ✅ `examples/tenant-mgmt` 三模块 |
-| 7 | scaffold 出 `routes` 表 | 工具链 | ✅ `tools/zmodu` api_header + `mountAll` |
-| 8 | catalog → OpenAPI | 运行期 | ✅ `exportOpenApi` + `openApiFromCatalog`（live） |
-| 9 | 插件 IM/AI/Web4 → ComptimeRouter | 工具链 | ✅ scaffold `routes` + pre-finish `mountAll` |
-| 10 | permission OR (`\|`) | 中间件 | ✅ `permissionMatchesRoles` |
-| 11 | WS → catalog | comptime | ✅ `ws_routes` + IM scaffold |
-| 12 | 细粒度 RBAC（非 role） | 中间件 | ✅ `.mode=.rbac` + `RolePermissionTable` |
-| 13 | 推荐栈文档 + scaffold 默认 RBAC | 工具/文档 | ✅ |
-| 14 | example 迁 ComptimeRouter | 生态 | ✅ `zent-modulith` + `tenant-shop`（`default_auth=.public` smoke） |
-| 15 | SQLite permission loader | 样例 | ✅ `security.CatalogPermDb`（tenant-mgmt 已接） |
-
----
-
-## 10. 刻意不用的「假 Zig」
-
-- 运行时 `@import` 扫 `src/modules/**`  
-- 用 `anyopaque` 冒充泛型却无 `Router(State)`  
-- 在路由匹配热路径上 `std.Io.sleep`  
-- comptime 生成几千条字符串再在运行期解析（表应直接是函数指针）  
-
----
-
-## 11. 决策汇总
-
-| 项 | 选择 |
-|----|------|
-| 风格 | **Zig comptime 路由表 + 泛型 Router(State)** |
-| 自动化边界 | comptime 元组展开；非反射 |
-| Io | Router/Server/Context 共享 `std.Io` |
-| Gate | module 级 + permission 码（`.rbac`）/ role（`.roles`） |
-| WS | 同 meta / 同 mount 管道 |
-| 旧 URL | 不做 |
-| 真相源 | 模块 `pub const routes` |
+| Layer | Configuration Field | Protection |
+|-------|---------------------|------------|
+| Connection limit | `max_connections` / `over_limit_response` | Prevents file descriptor and memory exhaustion under connection floods |
+| Header deadline | `header_timeout_ms` | Guards against Slowloris attacks; cleared once headers are parsed |
+| Body deadline | `body_timeout_ms` (default 30s) | Guards against Slow-POST attacks; returns HTTP `408` on timeout |
+| HTTP/2 limits | Inherited via `Server.http2ServeOptions` | Applies `max_body_size`, 16 KiB / 100 header limits (`SETTINGS_MAX_HEADER_LIST_SIZE`), and idle read timeout to h2c/HTTP/2 |
+| Handler timeout | `request_timeout_ms` | Bounds handler execution duration |
+| WebSocket outbound | `ws_write_timeout_ms` + `WsFramer.isWritable()` | Prevents slow WebSocket readers from blocking writer threads |

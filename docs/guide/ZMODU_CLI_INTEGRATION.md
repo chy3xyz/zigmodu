@@ -1,81 +1,65 @@
-# zmodu × zmodu CLI 工具集成与代码生成指南
+# CLI & Code Generation (`zmodu`)
 
-`zmodu` 是专为 `zmodu` 框架定制的高性能 CLI 代码生成器（独立工程位于 `w4_proj/zig_ws/zmodu`）。它支持直接解析 SQL DDL/Schema 或点对点反向工程数据库，一键产出符合 [`docs/MODULE_LAYERS.md`](./MODULE_LAYERS.md) 六层架构契约的工程代码骨架。
+`zmodu` includes a built-in CLI tool (`tools/zmodu`) for scaffolding projects from SQL DDL or live databases, generating modules, auditing architecture rules, detecting dead code, and running CI checks.
 
----
+## 1. Building the CLI
 
-## 核心特性与架构模式
-
-1. **`@initialized` 开发模型**：生成的代码文件头部带有 `//! @initialized by zmodu`，AI Agent 与开发者可直接在线编辑，消除传统 `ext/` 继承模式的过度抽象开销。
-2. **完全覆盖 Modulith 六层分层**：
-   - `model.zig` — 结构体、数据表名定位、JSON field 名称与默认值。
-   - `persistence.zig` — `Repository(T)` 数据存储与自定义 SQL 探针。
-   - `service.zig` — 业务逻辑校验与 EventBus 消息事件发布。
-   - `api.zig` — ComptimeRouter `pub const routes`（`http.RouteSpec`）+ typed handler；scaffold 经 `mountAll` 接线（见 [`ROUTE_TABLE.md`](../reference/ROUTE_TABLE.md)）。
-   - `module.zig` — Module 生命期（`init` / `deinit`）与导出链。
-   - `test.zig` — **仅单表模块**产出（`orm_tpl.sqlx_test` + `writeModuleFiles`）：基于 `http.Testkit` 的两条真断言 —— `openMemorySqlite` 上的 repository 往返（insert → findById → delete），以及一次 `dispatch` 打生成的 POST 路由（断言信封与"行真的落库"）。`generateScaffoldTestsZig` 会同步写入 `test { _ = @import("modules/<name>/test.zig"); }`，所以 `zig build test` 直接跑它。多表模块不产出：模板按 `model.<PascalModule>` 取类型，多表时该类型名不成立。
-3. **内置 MCP Server 交互能力**：内置 Model Context Protocol (MCP) Server，AI 智能体可直接通过 MCP Tool (如 `scaffold`, `module`, `verify`, `sql_diff`) 与代码库联动。
-
----
-
-## 快速使用
-
-### 1. 使用内置统一构建 Step
-
-在 `zmodu` 根目录下先构建安装 `zmodu` CLI，再直接调用二进制：
-
-```bash
-zig build zmodu   # 构建 + 安装到 zig-out/bin/zmodu
-zig-out/bin/zmodu scaffold --sql ./schema.sql --name myapp --tenant-column app_id
-```
-
-> **`zig build zmodu -- scaffold …` 也可以**：0.17.0 正式版的
-> `addPassthruArgs` 把 `--` 后参数透传进 run step（dev 工具链移除 `b.args`
-> 造成的断档已补，且改参数不再触发 build 脚本重编）。需要反复调用的脚本仍
-> 建议 `zig-out/bin/zmodu` 形态——每次调用不过构建图检查。
-
-`--tenant-column`（默认 `tenant_id`）控制生成的 `WHERE` 与 scaffold `main` 里的 `zmodu.setTenantColumn(...)`。模型字段须与列名一致（如 `app_id: i64`）。
-
-或安装到系统可执行路径：
+Build and install the CLI from the repository root:
 
 ```bash
 zig build zmodu
-# 二进制生成于 zig-out/bin/zmodu（该 step 现在同时 build + run + install，
-# 所以 zig-out/bin/zmodu 一定是当前源码编译出来的）
+# Binary installed at: ./zig-out/bin/zmodu
 ```
 
-### 2. 从 SQL DDL 一键生成 Modulith 项目
+> Always build via `zig build zmodu` from the repository root so `./zig-out/bin/zmodu` stays in sync with the workspace. Do not run file-generating commands (`module`, `api`, `event`, `health`, `config`) inside the framework repository root without `--dry-run` or a temporary directory.
+
+## 2. Project Scaffolding (`zmodu scaffold`)
+
+### From a SQL Schema File
 
 ```bash
-zig-out/bin/zmodu scaffold \
+./zig-out/bin/zmodu scaffold \
   --sql ./schema.sql \
   --name my_shop_app \
   --out ./my_shop_app \
+  --tenant-column tenant_id \
   --with-auth \
   --with-resilience \
   --with-events \
   --with-metrics
 ```
 
-
-### 3. 生成模块增量与差异比对
-
-针对已存在的项目进行增量表更新：
+### From a Live Database
 
 ```bash
-zmodu add --name order_item --sql ./schema.sql
+./zig-out/bin/zmodu scaffold \
+  --from-db postgresql://user:pass@localhost:5432/mydb \
+  --name my_app \
+  --out ./my_app
 ```
 
----
+| Input Source | Generated `.db` in `build.zig` |
+|--------------|--------------------------------|
+| `zmodu new` / `--sql` | `sqlite` |
+| `--from-db postgres://...` | `postgres` |
+| `--from-db mysql://...` | `mysql` |
 
-### 3b. 零样板 CRUD（`zmodu saas` 生成 + `http.CrudApi`）
+### Generated Module Structure
 
-`zmodu saas` 生成的业务模块，API 层已收敛成一行声明——list/get/create/
-update/delete 五个 handler 由框架 `zmodu.http.CrudApi(Entity, Service, opts)`
-自动生成：
+Each generated module follows the `@initialized` model (annotated with `//! @initialized by zmodu` and meant to be edited directly in place, with no `ext/` inheritance layer):
+
+- `model.zig`: Entity struct, `sql_table_name`, `sql_tenant_column`, and field defaults.
+- `persistence.zig`: Parameterized `Repository(T)` queries and custom SQL helpers.
+- `service.zig`: Validation hooks, transaction helpers (`self.transact(...)`), and `EventBus` publishing.
+- `api.zig`: `ComptimeRouter` `pub const routes` or zero-boilerplate `http.CrudApi`.
+- `module.zig`: Module metadata (`info`) and lifecycle (`init` / `deinit`).
+- `test.zig`: Single-table modules include an in-memory SQLite round-trip test and an `http.Testkit.dispatch` route test.
+
+## 3. Zero-Boilerplate CRUD (`zmodu saas` & `http.CrudApi`)
+
+Modules generated with `zmodu saas` use `zmodu.http.CrudApi(Entity, Service, opts)` to register five standard endpoints in a single declaration:
 
 ```zig
-// api.zig（生成物）—— 整份文件即一行注册
 const zmodu = @import("zmodu");
 const model = @import("model.zig");
 const service = @import("service.zig");
@@ -83,343 +67,105 @@ const service = @import("service.zig");
 pub const OrdersApi = zmodu.http.CrudApi(model.Orders, service.OrdersService, .{});
 ```
 
-生成的路由与元数据（`nest`/`module_name` 取自 Service）：
+| Method | Path | Permission | Behavior |
+|--------|------|------------|----------|
+| `GET` | `{nest}` | `<module>:read` | Paginated list (`PageParams`, real `COUNT(*)`) |
+| `POST` | `{nest}` | `<module>:write` | Create entity (`bindJson` + `tenant_id` injection) |
+| `GET` | `{nest}/{id}` | `<module>:read` | Get by ID (404 when missing or cross-tenant) |
+| `PUT` | `{nest}/{id}` | `<module>:write` | Update entity |
+| `DELETE` | `{nest}/{id}` | `<module>:write` | Delete entity |
 
-| 方法 | 路径 | 权限 | 说明 |
-|------|------|------|------|
-| GET | `{nest}` | `<module>:read` | 分页列表（`PageParams` 钳制 page/page_size） |
-| POST | `{nest}` | `<module>:write` | 创建（`bindJson` + `tenant_id` 注入） |
-| GET | `{nest}/{id}` | `<module>:read` | 详情（404 信封） |
-| PUT | `{nest}/{id}` | `<module>:write` | 更新 |
-| DELETE | `{nest}/{id}` | `<module>:write` | 删除 |
+`CrudOpts` options:
+- `.public = true`: Marks routes `.auth = .public` and clears permission requirements.
+- `.permission = "crm.order"`: Overrides the permission prefix.
+- `.envelope = .plain | .ruoyi`: Selects the response JSON envelope.
+- `.dto = MyDto`: Filters response fields through a whitelist DTO struct.
+- `.bulk = true`: Adds `POST {nest}/bulk` for batch creation.
+- `.sortable = &.{ "created_at", "price" }`: Enables whitelisted `sort` and `order` query parameters.
 
-- 默认 `.auth = .jwt`；`CrudOpts{ .public = true }` 切公开（同时去掉权限 meta）。
-- `CrudOpts{ .permission = "crm.order" }` 覆盖权限前缀。
-- 分页信封默认 `{code, items, total}`；`CrudOpts.envelope` 可选
-  `.plain` / `.ruoyi`（RuoYi 兼容 `{code,msg,data}`）。
+## 4. Incremental Module & Migration Commands
 
-Service 只需 duck-typed `list/get/create/update/delete` + `module_name`/`nest`：
-
-- 生成器输出带 `validate` 钩子的薄 service（保留业务扩展点，如写 outbox、加事件）；
-- 想要「透传归零 + CRUD 即事件源」的项目可直接组合
-  `zmodu.data.CrudService(Entity, Persistence)`：写操作自动 publish
-  `CrudEvent{created,updated,deleted}`，无需手写事件发布代码。
-- 生成 service 另带 `transact(T, f)` 透传：多表业务方法直接
-  `try self.transact(...)`，不用手写 begin/commit/rollback。
-
-```zig
-// service.zig（生成物）—— CrudService 零透传组合
-pub const OrdersService = struct {
-    pub const module_name = "orders";
-    pub const nest = .{"orders"};
-    pub const impl = zmodu.data.CrudService(model.Orders, persistence.OrdersPersistence);
-    crud: impl,
-
-    pub fn init(p: *persistence.OrdersPersistence) @This() {
-        var self: @This() = .{ .crud = impl.init(p) };
-        self.crud.validate = &validate; // 可选校验钩子
-        return self;
-    }
-    // 无 list/get/create/update/delete 透传：CrudApi 探测到 `impl` 类型后
-    // 直接路由到 self.crud，写操作自动 publish CrudEvent{created,updated,deleted}
-};
-```
-
-响应收敛配套：`http.PageParams.parse(ctx, .{ .max_page_size = 100 })` 统一分页解析，
-`Extract.toDto/respondDto` 按同名字段约定映射 DTO（白名单天然隐藏
-`secret`/`org_id` 等列），`Extract.toDtoList` 做列表收集。
-
-生成代码质量（减少错误率）：
-
-- persistence 分页列表返回 arena-backed `data.ResultSet`（`queryRows.take()`
-  字符串零拷贝，`defer result.deinit(allocator)` 一次释放——10k 行实测
-  ~2.2ms，比逐行 dup 快 ~30%）；单行 `get` 用 `queryRowsSlice`
-  （按**列名**映射，替代手写 `scan()` 列下标取值——增列/改列顺序不再静默
-  错位，索引每查询只建一次）；
-- 每个模块自动产出 `tests.zig`（内存 sqlite 的 CRUD 冒烟 + validate 负向 +
-  transact 冒烟），项目 build.zig 加一个 test step 即接入 `zig build test`；
-- `CrudOpts.dto` 让 list/get 响应自动走 DTO 白名单；
-- `CrudOpts.bulk` 增加 `POST {nest}/bulk`（JSON 数组批量创建，一次 RTT）；
-- `CrudOpts.sortable` 让 list 支持 `sort=<列>&order=asc|desc`（列名白名单，
-  非白名单忽略，防 ORDER BY 注入）；
-- 分页 `total` 是真实 COUNT（生成 list 内建 COUNT + LIMIT/OFFSET，不再是页长）。
-
-可观测：`server.addMiddleware(zmodu.http.tracingMiddleware())` 一行启用
-`x-trace-id` 注入与请求耗时日志（示例见 `examples/zmsaas/backend/src/main.zig`）。
-
-运维标配（见 `examples/zmsaas`）：版本化迁移走
-`data.MigrationRunner`（history 落库、重启幂等）、`/health/ready` 健康检查、
-`/metrics` Prometheus 指标、事务性 outbox 写入（`OutboxPublisher.buildInsert`
- 在业务事务内调用，投递侧接 `OutboxPoller/OutboxConsumer`）。
-
-自定义代码重放：`zmodu saas` 重新生成会覆盖 model/persistence/service/api/
-module/root 五个文件；`examples/zmsaas/scripts/reapply-custom.py` 一键恢复示例
-的自定义层（DTO/actions/transact 方法），工作流 = 重新生成 → reapply → 构建。
-
-前端同源产出：同一个 `orders.model.json` 可再跑
-`node tools/zsaas/scripts/gen-business.mjs orders.model.json <frontend>`，生成
-`src/models/Orders.ts`（类型 + 字段 schema）与
-`src/routes/dashboard/orders/index.tsx`（DataTable + EntityForm 数据驱动 CRUD
-页，直接对接后端 autoCrud）。共享脚手架（`libs/apiClient.ts`、
-`components/data/DataTable.tsx`、`EntityForm.tsx`）已随 `examples/zmsaas` 提供。
-
-业务逻辑扩展：生成物之上按需叠加——service 声明同名 CRUD 方法即覆盖内嵌
-CrudService（可调 `self.crud.*` 复用基础行为 + 事件），自定义端点以同 nest
-挂第二个 Api 结构（路径不重叠），解耦副作用订阅 `CrudEvent`；完整示例见
-`examples/zmsaas`（`POST /orders/{id}/cancel` 状态机 + `events.zig`）。
-
----
-
-### 4. AI 技能注册表（`zmodu ai`）
+### Add or Scaffold a Module
 
 ```bash
-# 导出内置 AI 技能目录（JSON，与 zmodu.ai.skill_export.toSkillsJson 同构）
-zmodu ai export-skills --out skills.json
+# Generate full 5-layer module skeleton in src/modules/order/
+./zig-out/bin/zmodu module order --full
 
-# 把技能目录（内置或应用导出的）转换为 OpenAPI 3.0 文档
-zmodu ai openapi --in skills.json --out openapi.json
+# Add a table module from SQL DDL
+./zig-out/bin/zmodu add --name order_item --sql ./schema.sql
 ```
 
-每个技能对应一个 `POST /skills/{name}` 操作，参数从注册表推导
-（`properties` + `required`）。应用侧可直接用
-`zmodu.ai.skill_export.toSkillsJson / toOpenApi` 在运行时导出并挂成
-`GET /api/ai/skills` 与 `GET /api/ai/skills/openapi` 之类的端点。
-
----
-
-### 5. 死代码检查（`zmodu deadcode`）
+### Generate Schema Diff Migrations
 
 ```bash
-# 扫描当前项目（默认跳过 .gitignore / .git / .zig-cache / zig-out）
-zmodu deadcode
-
-# 二进制模式：main 是入口，同时报告从未被 import 的模块
-zmodu deadcode -b
-
-# CI 友好：JSON 输出 + 退出码（0 干净 / 1 有发现 / 2 扫描失败）
-zmodu deadcode -j
+./zig-out/bin/zmodu diff old.sql new.sql --migration add-audit-log --dir src/migrations
+# Outputs: src/migrations/V{YYYYMMDDHHMMSS}__add-audit-log.sql
 ```
 
-机制参考 [zdeadcode](https://github.com/chy3xyz/zdeadcode)（rustc `dead_code`
-lint 风格的可达性分析）：报告未使用的顶层 `fn`/`const`/`var`、容器字段、
-枚举变体、方法、嵌套类型与从未 import 的模块；roots 为 `pub` 声明、
-`export` 符号、`test` 块、`@export` 目标与（二进制模式）`main`。Zig 编译器
-本身不报告这些（例如结构体未用字段、枚举未用变体），本项目仓库扫描即发现
-约 9% 潜在死声明，可作为 CI 门禁。完整参数见 `zmodu deadcode --help`。
+## 5. Quality & Architecture Gates
 
----
+### `zmodu ci` — One-Command Project Gate
 
-## `zmodu audit` — 业务最佳实践检查
-
-针对业务代码（`src/modules/**`）的规则检查器，两组规则：
-
-- **architecture**：模块自依赖、循环依赖、缺失描述、命名规范
-  （小写字母/数字/`-`/`_`）、依赖数量上限（默认 5）、未知依赖（拼写错误）、
-  base 模块依赖业务模块（`--base-modules core,http` 时启用）——与框架内
-  `zmodu.ArchitectureTester` 的默认规则对齐（静态源码扫描版）；
-- **business**：handler/model 含 SQL、非参数化 SQL（字符串字面量拼接）、
-  `@ptrCast(ctx.user_data)`、legacy `sendSuccess`/`sendFail`、banned 导入
-  （`zmodu.http_server` / `orm.Orm` / `PasswordEncoder`）、已移除的 Zig
-  0.17 API（`std.Thread.Mutex` 等）、跨模块直接文件导入、handler 手工解析
-  Authorization/Bearer、空 `catch {}` 吞错、未使用 catch 捕获
-  （`catch |err| { _ = err; }` → 应写 `catch {`）、service 层纯透传 CRUD
-  方法（list/get/create/update/delete 只转发 `self.persistence.*` → 建议
-  `data.CrudService(Entity, Persistence)`，写操作自动发事件）、api 层裸实体
-  响应（`ctx.jsonStruct(200, e)` 直接序列化 model → 建议
-  `Extract.toDto/respondDto` 白名单隐藏内部列）、模块缺测试（应带
-  `tests.zig` 冒烟）、persistence 手写列下标 scan（`row.values[N]` → 应
-  `row.scan(allocator, Model)` 按列名映射）、service 方法多写无事务
-  （2+ 次写应包 `self.transact(...)`）。规则可用
-  `.zmodu/rules.json` 按项目开关。
+Runs `zig build` → `zig fmt --check` → `verify` → `audit` → `deadcode` → `doctor`:
 
 ```bash
-zmodu audit                      # 全部规则，默认目录 "."
-zmodu audit -g business          # 只跑业务 lint
-zmodu audit --max-deps 8 -j      # 依赖上限 8 + JSON 输出
-zmodu audit --base-modules core,http   # 启用 base 模块规则
-zmodu audit --update             # 写入/更新 .zmodu/audit-baseline.json
+./zig-out/bin/zmodu ci [dir]
 ```
 
-基线语义与 `deadcode` 一致：新增违规使命令失败（exit 1），已入基线条目被
-抑制，条目消失视为移除；`--update` 收缩基线。`-j` 输出机器可读 JSON
-（pass / 分组计数 / violations / baseline 统计）。仓库示例中
-`tenant-mgmt`、`tenant-shop`、`basic`、`ai-ops` 全量通过；`shopdemo` 为
-legacy 演示，可用基线逐步治理。
+### `zmodu doctor` — Module Graph & Import Entanglement Check
 
----
-
-## `zmodu market` — 模块市场（Phase 1 策展目录 + Phase 2 远程发现/安装）
-
-模块市场分阶段：**Phase 1** 是本地策展目录
-（`tools/zmodu/src/marketplace/catalog.json`，`schema_version: 1`），登记值得
-引用的 example / plugin，先解决可发现性；**Phase 2** 增加远程发现与安装——
-`update` 拉取远程索引合并进本地浏览，`install` 把条目源码复制进项目。签名、
-build.zig.zon 自动写入与 CI 回归钩子仍延后（ADR-016）——先有质量门
-（ADR-014 / `zmodu ci`）再谈扩张，避免在版本纪律稳定前引入"下载并执行第三方
-代码"的信任面。
+Scans module declarations and source imports without compiling the project. Fails (exit 1) on circular, missing, self, or duplicate dependencies, and warns when a module imports another module's internal files directly:
 
 ```bash
-zmodu market list                      # 列出全部策展条目（本地 + 已缓存远程索引）
-zmodu market search saas               # id/name/summary/tags 大小写不敏感匹配
-zmodu market info example/zmsaas       # 单个条目详情
-zmodu market update                    # 拉取远程索引 -> .zmodu/market-index.json
-zmodu market update --index <url>      # 自定义索引源
-zmodu market install example/basic --dir ./vendor [--dry-run] [--verify]
-zmodu market list --json               # 机器可读 JSON
-zmodu market list --catalog <path>     # 用外部目录文件替代内嵌目录
+./zig-out/bin/zmodu doctor [dir]
+./zig-out/bin/zmodu doctor --json
+./zig-out/bin/zmodu graph --out docs/modules.md
 ```
 
-条目字段：`id`（`example/<name>` 或 `plugin/<name>`）、`kind`、`path`、
-`summary`、`tags`、`min_version`、`doc`、`status`（plugin stub 为 `"stub"`）。
+### `zmodu audit` — Best-Practice Linter
 
-| 阶段 | 发现模块 | 安装 | 信任 | 门槛 |
-|------|----------|------|------|------|
-| Phase 1（已完成） | `zmodu market search … --json` | 读 `path` 参考接线（或 `zmodu saas`/`scaffold` 生成） | 本地策展 | — |
-| Phase 2（本轮） | `market update` 远程索引（合并浏览） | `market install <id> --dir … [--dry-run] [--verify]` 复制源码树（跳过 node_modules/.git 等） | 本地策展 + URL 来源 | `--verify` 就地 `zig build` |
-| Phase 2c（ADR-016，未做） | 远程索引升级 | `install` 自动写 `build.zig.zon` | 签名包 | 要求 `zmodu ci` 绿 + catalog schema 版本化 |
-
-新增官方示例的流程：先合入 `examples/`（保证示例构建绿），再往 catalog 加一行。
-
-## `zmodu ci` — 一站式质量门禁
-
-一条命令跑完全部门禁（面向 CI 或本地提交流程）：
+Checks architecture rules and business layer rules (raw SQL in handlers, non-parameterized SQL, `@ptrCast(ctx.user_data)`, banned legacy imports, removed Zig 0.17 APIs, bare `catch {}`, unscoped tenant queries):
 
 ```bash
-zmodu ci [dir]      # zig build → fmt --check → verify → audit → deadcode → doctor
+./zig-out/bin/zmodu audit [dir]
+./zig-out/bin/zmodu audit -g business -j
+./zig-out/bin/zmodu audit --update   # Write baseline to .zmodu/audit-baseline.json
 ```
 
-任何一步失败退出码 1，全部通过退出码 0。业务项目可在 GitHub Actions 里
-直接 `zmodu ci`，无需再拼多段脚本。最后一步 `doctor` 是**架构健康**（环依赖 + 源码级纠缠，
-即"某个模块的文件绕过声明边界直接 import 另一个模块的文件"）—— 它与 CI 里针对每个 example 单独跑的那条
-口径一致，所以本地 `zmodu ci` 绿 ≈ CI 那条也绿。
-
-## `zmodu graph` — 模块依赖图（Mermaid）
-
-复用 audit 的模块提取，输出 Mermaid 依赖图：
-
-```bash
-zmodu graph [dir]            # stdout
-zmodu graph --out docs/modules.md   # 写入文件（可进 CI 自动更新架构图）
-```
-
-## `zmodu runtime` — 运行时接线的静态盘点
-
-Runtime 是 opt-in 的（`docs/RUNTIME.md`）：直到某个模块 `ctx.runtime()` 之前什么都不跑。
-此后"哪个 worker 存在、邮箱多大、谁在 `HotBus` 上扇出、定时器在哪 arm、有没有 recorder"
-散落在各模块自己的文件里。这个子命令把这些**已经声明过**的接线读出来，每条都带 `file:line`：
-
-```bash
-zmodu runtime [dir]        # 人读报告（默认目录 "."）
-zmodu runtime --json       # 机器可读（CI / dashboard）
-```
-
-报告七块：是否用了 runtime、worker（`spawn`/`spawnActor`/`spawnSupervised` 的**类型名 + 邮箱容量 +
-写入的 `.mode`**）、**池（`max_pooled_workers` 声明 + 有几条 spawn 写了 `.mode = .pooled`）**、
-邮箱/队列原语（`Mailbox(` / `RingBuffer(` / `MpscRing(` / `ObjectPool(` / `HotBus(`）、
-定时器调用点（`after(` / `scheduleAction(` / `requestCancelTimer(` / `cancelTimerSync(`）、
-录制/追踪引用（`attachRecorder(` / `Recorder(` / `sendTraced(` / `sendBlockingTraced(` / `ctx.traceId(`）、
-时钟选择（`Clock.manual` / `.manual =` / `.monotonic`），末尾一行汇总：
-
-```
-workers (4 spawn site(s)):
-  spawn Risk mailbox 256  (src/main.zig:200)
-  spawn Audit mailbox 64 mode=pooled  (src/main.zig:214)
-  ...
-pool (.mode = .pooled; docs/RUNTIME.md §12):
-  spawn site(s) writing .mode = .pooled: 1 of 4
-  declared max_pooled_workers=1  [withMaxPooledWorkers(]  (src/main.zig:251)
-...
-summary: 4 worker(s) (1 .pooled), 4 bus(es), 1 timer call site(s), pool: declared, recording: no, tracing: no
-```
-
-容量与池的上界只在**读得出来**时才给数字：字面量（`256`、`1_024`）直接用；写成 `api.order_capacity`
-这种常量时，顺着该文件自己的 `@import("api.zig")` 找到 `pub const order_capacity: usize = 256;`
-再用那个数；读不出来就报 `?`（并把原表达式附在后面）——不猜。所以 `alpha-engine` 报的是
-`mailbox 256 (api.mailbox_capacity)`。
-
-池的两种声明形态都认：`.max_pooled_workers = N`（`Runtime.InitOptions.scheduler` 或
-`Application.Config`）与 `withMaxPooledWorkers(N)`（app builder），各报一条带 `file:line` 的事实。
-`mode=…` 只在调用**写了** `.mode` 时才打印：`rt.spawn(W, .{}, 256)` 就是 `.dedicated`
-（那是 API 默认），但**默认值不是文本说的事**，所以 `--json` 里是 `null` 而不是替它填一个。
-
-**它不做什么**（很重要）：它**不读活进程**。队列深度、`dropped_full`、`timer_lag_ms`，以及池自己的
-读数（`pool_claimed` / `pool_ready_len` / `pool_ready_push_failures`）都是运行中进程的属性，
-已由 `Runtime.MetricsBridge` 导出成 Prometheus 指标 —— 抓取配方见
-[`RUNTIME.md`](../reference/RUNTIME.md) §8。它也**不做任何判据**：只报看得见的事实（"`attachRecorder(` 在
-`src/x.zig:42`"），不做静态不可靠的推断（"recorder 是不是在 `freeze()` 之后挂的"，
-"声明了池的那个 build 和 `.pooled` 的 spawn 是不是同一个"），所以 `--json` 可以直接进 CI 而不产生假警报。
-
-退出码：`0` 正常（**项目没用 runtime 也是 0**，那是默认状态，报告会说 `uses runtime: no`）；
-`1` 目标目录读不了；`2` 用法错误（未知 flag / 多个目录参数）。
-
-## `zmodu diff --migration` — schema 演进闭环
-
-`diff` 现在可以直接产出 Flyway 迁移文件：
-
-```bash
-zmodu diff old.sql new.sql --migration add-audit-log [--dir src/migrations]
-```
-
-自动生成 `V{YYYYMMDDHHMMSS}__add-audit-log.sql`（CREATE/ALTER/DROP 语句），
-与 `zmodu migration` 同名规范一致。顺带修复了迁移时间戳恒为
-`V19700101000000` 的既有 bug（改用 REALTIME 时钟）。
-
-## audit 规则配置（`.zmodu/rules.json`）
-
-按项目开关规则 / 调阈值：
+Configure per-project overrides in `.zmodu/rules.json`:
 
 ```json
 { "max_deps": 8, "disabled": ["b3", "b9"] }
 ```
 
-CLI `--max-deps` 优先于配置文件，配置文件优先于内置默认值。
+### `zmodu deadcode` — Reachability Analyzer
 
----
-
-## 最佳实践规范
-
-在整合使用 `zmodu` 生成代码时，必须遵守 zmodu 生产规范：
-1. **模块依赖拓扑**：生成的 `module.zig` 中的 `dependencies` 需精准列出下游模块名，启动时框架通过 `ModuleValidator` 自动检测并防范循环依赖。
-2. **规范领域导入**：生成的业务代码统一使用 canonical 导入：
-   ```zig
-   const zmodu = @import("zmodu");
-   const http = zmodu.http;
-   const data = zmodu.data;
-   const sec = zmodu.security;
-   const obs = zmodu.observability;
-   ```
-3. **数据库与事务模式**：生成的存储层可通过参数选择 `sqlx` (标准) 或 `zent` (正交 ORM) 作为后端，两套引擎独立运行。
-4. **驱动链接**：scaffold / `new` 写入的 `build.zig` 含 `.db = "…"`（默认 `sqlite`；`--from-db` 按 DSN 映射 `postgres` / `mysql` / `sqlite`）。勿再手链三库。详见 [SQLX_DRIVERS.md](./SQLX_DRIVERS.md)。
-
----
-
-## Scaffold 与 `-Ddb=` / `.db=`
-
-| 输入 | 生成 `.db=` |
-|------|-------------|
-| `zmodu new` / `--sql`（无 `--from-db`） | `sqlite` |
-| `--from-db postgresql://…` 或 `postgres://…` | `postgres` |
-| `--from-db mysql://…` | `mysql` |
-| 其它 / sqlite 路径 | `sqlite` |
+Finds unused top-level functions, constants, struct fields, enum variants, and unimported modules:
 
 ```bash
-zig-out/bin/zmodu scaffold --from-db postgresql://user@localhost/db --name myapp
-# → build.zig 中 b.dependency("zmodu", .{ .db = "postgres", ... })
+./zig-out/bin/zmodu deadcode          # Library mode
+./zig-out/bin/zmodu deadcode -b       # Binary mode (main as root)
+./zig-out/bin/zmodu deadcode -j       # JSON output
 ```
 
-运行时 DSN 与链接驱动必须一致；未链接的驱动会在 `Client.connect` 返回 `error.DriverNotEnabled`。
+### `zmodu runtime` — Static Runtime Wiring Report
 
-## `zmodu module <name> [--full]` — 模块骨架
-
-默认只写 `src/modules/<name>/module.zig`（一个声明）。`--full` 追加其余层文件，一次得到
-`docs/MODULE_LAYERS.md` 说的模块形状：
+Reports all `spawn` sites, mailbox capacities, worker pool settings (`max_pooled_workers`, `.mode = .pooled`), `HotBus` instances, timers, and delivery recorders with `file:line` locations:
 
 ```bash
-zmodu module order --full
-# → src/modules/order/{module,model,persistence,service,api,root,module_test}.zig
+./zig-out/bin/zmodu runtime examples/alpha-engine
+./zig-out/bin/zmodu runtime --json
 ```
 
-- 生成的代码**能解析**（CI 用 `zig fmt --check` 校验），但表还不存在——`persistence.zig` 里是
-  参数化 SQL 骨架，`service.zig` 是占位实现，替换成真实命令即可。
-- `api.zig` 的 `ping` 路由默认 `.jwt`：把它改成 `.public` 应当是一行**刻意**的改动，而不是生成器的默认。
-- 已有文件不会被覆盖，除非加 `--force`（`--dry-run` 可先看要写什么）。
+## 6. AI Skill Export & Marketplace
+
+```bash
+# Export built-in AI skills catalog and OpenAPI 3.0 specification
+./zig-out/bin/zmodu ai export-skills --out skills.json
+./zig-out/bin/zmodu ai openapi --in skills.json --out openapi.json
+
+# Browse and install curated examples/plugins
+./zig-out/bin/zmodu market list
+./zig-out/bin/zmodu market search saas
+./zig-out/bin/zmodu market install example/basic --dir ./vendor --verify
+```

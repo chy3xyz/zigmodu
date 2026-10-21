@@ -1,80 +1,69 @@
-# EventBus 与 DI：Application 内置接入最佳实践
+# Events & Dependency Injection
 
-> 适用范围：zmodu v0.15.34+（`Application` 内置 `EventRegistry` 与 `di.Container`）。
-> 本文回答三件事：模块间怎么通信、共享服务怎么注入、哪些场景**不该**用它们。
-> 配套阅读：[MODULITH.md](./MODULITH.md) §2.3 通信规则 · [MODULE_LAYERS.md](./MODULE_LAYERS.md)（分层纪律）。
+Applies to: zmodu v0.15.34+ · Zig 0.17
 
----
+`Application` includes a built-in `EventRegistry` and `di.Container`. They provide three structural guarantees:
+1. **Thread safety**: `app.eventBus(T)` returns `*ThreadSafeEventBus(T)`.
+2. **Fail-fast startup**: Modules resolve required services inside `initWith(ctx)` during `app.start()`.
+3. **Lock-free runtime reads**: `app.start()` freezes the DI container after module initialization; subsequent `register` calls return `error.ContainerFrozen`.
 
-## 1. 为什么接入 Application
+## 1. Lifecycle Overview
 
-接入前，`EventBus` 与 `di.Container` 是"文档里的特性"：框架不提供，应用各自手工接线，
-且裸 `EventBus` 非线程安全、DI 容器无并发保护。接入后二者成为 Application 的默认设施，
-并获得三条**结构性**保证（不是约定，是类型/机制强制）：
-
-| 保证 | 机制 |
-|------|------|
-| 并发安全 | `app.eventBus(T)` 只发放 `*ThreadSafeEventBus(T)`；裸 `EventBus` 无法从 Application 获取 |
-| 启动期 fail-fast | 模块在 `initWith(ctx)` 取服务，缺失即启动失败，而不是第一个请求 500 |
-| 运行期只读 | `app.start()` 完成后 DI 容器 `freeze()`，再注册报 `error.ContainerFrozen`；读路径无锁 |
-
----
-
-## 2. 核心范式
-
-三种使用位置，按角色分工：
-
-```
-main（组装者）          模块（initWith）            handler / 运行期
-─────────────          ────────────────            ────────────────
-builder.withService    ctx.service(T, name) 取服务  app.service(T, name) 只读
-app.eventBus(T)        ctx.eventBus(T) 取总线       app.eventBus(T) 订阅/发布
-订阅 listener          service.withEvents(bus) 注入  容器已 freeze，禁止注册
-注入 service           注册模块产出的服务（freeze 前）
+```text
+main (Bootstrap)               Module (initWith)               Runtime / Handlers
+----------------               -----------------               ------------------
+builder.withService(...)  -->  ctx.service(T, name)       -->  app.service(T, name) (read-only)
+app.eventBus(T)           -->  ctx.eventBus(T)            -->  bus.publish(event)
+bus.subscribe(listener)        register module services        Container is frozen
 ```
 
-### 2.1 模块：`initWith(ctx)` 接收框架设施
+## 2. Wiring Services and Events
 
-模块契约在经典 `init()` 之外新增可选入口：
+### 2.1 Module Initialization (`initWith`)
+
+Modules can declare `initWith(ctx: *zmodu.ModuleContext)` instead of `init()` to access the application's DI container, event buses, `allocator`, and `io`:
 
 ```zig
-pub fn init() !void { ... }                              // 经典入口，仍然有效
-pub fn initWith(ctx: *zmodu.ModuleContext) !void {       // 新增：需要总线/服务时声明
-    const bus = try ctx.eventBus(OrderEvent);            // 取/建共享总线（ThreadSafe）
-    const cfg = ctx.service(AppConfig, "config") orelse
-        return error.MissingService;                     // 缺服务 → 启动失败，fail-fast
-    ...
+pub fn initWith(ctx: *zmodu.ModuleContext) !void {
+    const bus = try ctx.eventBus(OrderEvent);
+    const cfg = ctx.service(AppConfig, "config") orelse return error.MissingService;
+    _ = bus;
+    _ = cfg;
 }
 ```
 
-规则：
+- If both `init` and `initWith` are declared, `Application.start()` calls `initWith`.
+- Modules that only declare `initWith` require an `Application` (or `Lifecycle.startAllWith` in unit tests).
 
-- `init` 与 `initWith` **同时声明时只调用 `initWith`**（需要无上下文能力时自行降级）。
-- 只声明 `initWith` 的模块**不能**脱离 Application 启动（`Lifecycle.startAll` 无 ctx 会直接失败并 warn）——单元测试里请用 `startAllWith` 或改用 `init`。
-- `ctx` 还提供 `allocator` 与 `io`，模块不必再各自持有全局副本。
+### 2.2 Application Bootstrap (`main.zig`)
 
-### 2.2 main：组装者接线
+Register shared infrastructure with `withService` (or batch register with `withServices`):
 
 ```zig
-var b = zmodu.builder(allocator, io);   // 先绑定：builder 方法收 *Self，临时值是 *const
+var db: Db = .{ .connected = true };
+var cache: Cache = .{};
+
+var b = zmodu.builder(allocator, io);
 defer b.deinit();
+_ = try b.withServices(.{
+    .{ .name = "db", .instance = &db },
+    .{ .name = "cache", .instance = &cache },
+});
 var app = try b.withName("shop")
-    .withService(AppConfig, "config", &config)   // 借用注册：容器不销毁 &config
     .build(.{ UserModule, OrderModule });
 defer app.deinit();
 
-try app.start();        // 模块 initWith 运行 → 之后容器 freeze
+try app.start(); // Runs initWith() on each module, then freezes the container
 defer app.stop();
 
-// 应用级共享总线：订阅副作用 listener，注入给 service
 const order_bus = try app.eventBus(order_mod.service.OrderEvent);
 try order_bus.subscribe(auditListener);
 order_svc.withEvents(order_bus);
 ```
 
-完整可运行样例见 `examples/shopdemo/src/main.zig`。
+### 2.3 Publishing Events from a Service
 
-### 2.3 service：只发事件，不知道听众
+Define events as a tagged union in `service.zig` and inject the bus explicitly:
 
 ```zig
 pub const OrderEvent = union(enum) {
@@ -89,106 +78,50 @@ pub fn withEvents(self: *Self, bus: *zmodu.ThreadSafeEventBus(OrderEvent)) void 
     self.event_bus = bus;
 }
 
-// 写路径成功后：
-if (self.event_bus) |bus| bus.publish(.{ .created = .{ .id = id, .total = total } });
+// After committing a write:
+if (self.event_bus) |bus| {
+    bus.publish(.{ .created = .{ .id = id, .total = total } });
+}
 ```
 
-要点：事件定义为模块 `service.zig` 里的**具名 union 类型**（下游 import 事件类型而非模块实现）；
-`withEvents` 是显式注入点，单测传一个收集型 listener 即可断言副作用。
+## 3. DI Container Rules
 
----
+### 3.1 Ownership (`register` vs `registerBorrowed`)
 
-## 3. DI 容器规则
+| Method | Ownership | Use Case |
+|--------|-----------|----------|
+| `register(T, name, ptr)` | Container owns `ptr` and destroys it on `deinit` | Heap objects created specifically for the container |
+| `registerBorrowed(T, name, ptr)` | Caller retains ownership; container never frees `ptr` | Stack variables in `main`, long-lived pools, `builder.withService` |
 
-### 3.1 生命周期：启动期注册 → freeze → 运行期只读
+`builder.withService` and `builder.withServices` always use borrowed registration. Ensure borrowed instances outlive `Application`.
 
-```
-build() 注入 withService  ──▶  start() 模块 initWith 注册/读取  ──▶  freeze()  ──▶  运行期 get() 无锁只读
-                                                                        ▲
-                                              此后 register → error.ContainerFrozen
-                                              remove → warn + no-op
-```
+### 3.2 Scoped Containers (`zmodu.ScopedContainer`)
 
-- **应用级单例语义**：容器存放配置、连接池句柄、共享服务这类进程级对象。
-- **请求级状态不走容器**：per-request 数据走 `ctx` attrs 或请求 arena（见 MODULITH.md §3.1）。
-- `get` / `contains` 在 freeze 后是并发安全的只读；**不要在 handler 里注册**。
+For short-lived scopes that inherit from a parent container:
+- `get` and `contains` fall back to `parent` if not found in the child scope.
+- `register`, `registerBorrowed`, `remove`, and `serviceCount` operate only on the child scope and never mutate `parent`.
 
-### 3.2 所有权：`register` vs `registerBorrowed`
+### 3.3 Container Scope Boundaries
 
-| API | 所有权 | 用途 |
-|-----|--------|------|
-| `register(T, name, ptr)` | 容器**拥有**，deinit 时 destroy | 容器自己 `create` 出来的堆对象 |
-| `registerBorrowed(T, name, ptr)` | 容器**不销毁** | 栈对象、main 持有的长生命周期对象、`builder.withService` |
+- **Store in Container**: Process-wide infrastructure singletons (`config`, database client/pool, Redis client).
+- **Do not store in Container**: Per-request state (use `http.Context` attributes or request arena) or cross-module service dependencies (pass those explicitly via `Service.init(&dep)` and declare them in `Module.info.dependencies`).
 
-`ApplicationBuilder.withService` 一律走借用注册——main 里的 `config`、`db_client` 等由 main 管理
-生命周期，容器只是目录。把栈指针交给 `register`（拥有语义）会得到悬垂指针，这是旧 API 的已修陷阱。
+## 4. EventBus Rules
 
-**scoped 容器同理，且改/查两半的穿透规则不同**（`zmodu.ScopedContainer`）：
-
-| 穿透到 `parent` | 只作用于本 scope |
-|----------------|-----------------|
-| `get`、`contains` | `register`、`registerBorrowed`、`remove`、`serviceCount` |
-
-`remove` 只删本 scope 自己的注册，**永远不下沉到 parent**——scope 注销一个共享服务，会让 parent 容器的
-其它读者拿到已销毁的实例；`serviceCount` 同理只数本 scope（同名可在两层都注册，跨层计数会重复）。
-`ScopedContainer` 没有 `freeze`：scope 是短生命周期对象，冻结点是 `start()` 之后的应用级容器。
-
-### 3.3 命名
-
-- name 用稳定字符串字面量（`"config"`、`"db"`、`"redis"`），模块间通过文档约定；
-- 同一类型多个实例用 name 区分（如 `"db_primary"` / `"db_replica"`）；
-- 编译期已知的查找可用 `getComptime(T, "name")`。
-
-### 3.4 Container 的定位边界
-
-- Container 是**应用级服务目录**：进程级单例语义——config、`db` 句柄、连接池、
-  跨模块共享的第三方 client；`freeze()` 后只读。它回答"应用里有哪些共享设施"，
-  不回答"模块 A 依赖模块 B 的哪个能力"。
-- **模块间依赖不走 Container**——走 `info.dependencies` 声明 + 构造注入
-  （`Service.init(db)`）+ 只 import 对方 `root.zig` barrel；装配处（main / 模块
-  `init`）把依赖显式传进构造函数。构造注入范式见
-  [MODULE_LAYERS.md](./MODULE_LAYERS.md) §3.1。
-- 字符串名打错没有编译期兜底，只能靠启动 fail-fast（`ctx.service(...) orelse
-  return error.MissingService`）——所以服务名集中定义为
-  `pub const svc_names = .{ ... }` 常量、与 `ctx.service` 调用点配对 review，
-  或者把 Container 窄化到单模块内部使用，不做跨模块命名约定。
-
----
-
-## 4. EventBus 规则
-
-### 4.1 DO / DON'T
-
-| DO | DON'T |
+| Do | Don't |
 |----|-------|
-| 从 `app.eventBus(T)` / `ctx.eventBus(T)` 取总线 | 自行 `EventBus(T).init(...)` 造一条私有总线（听众/发布者不在同一条总线上=事件丢失） |
-| 事件类型定义为 service 层的具名 union | 用 `*anyopaque` / 字符串 topic / map 传事件 |
-| 事件只承载"已发生的事实"（id + 关键字段） | 在事件里塞 ORM 实体指针、DB 连接等不可跨边界对象 |
-| listener 里快速失败/落 Outbox | listener 里做重活、阻塞 I/O（publish 是同步调用） |
-| 单线程局部场景才用裸 `EventBus` / `TypedEventBus` | 在并发 handler 里共享裸 EventBus（非线程安全） |
+| Obtain buses via `app.eventBus(T)` or `ctx.eventBus(T)` | Instantiate a private `EventBus(T).init(...)` in each module |
+| Define events as value-type unions carrying IDs and facts | Pass ORM entity pointers or database connections inside events |
+| Keep listeners fast or write to the transactional outbox | Run slow blocking I/O inside synchronous `publish` listeners |
+| Use `persistence.Tx` for atomic multi-table writes | Use in-memory events when atomic rollback is required |
 
-### 4.2 publish 的语义边界
+### Delivery Semantics
 
-- **fire-and-forget**：publish 同步调用 listener，无持久化、无重试。进程崩溃即丢失。
-- **需要可靠投递** → 先写 Outbox（同事务），由 relay 异步转发；见 MODULITH.md §2.3。
-- **需要跨实例** → RobustMQ / Kafka wire，不是进程内总线。
-- **需要强一致** → 同 DB 事务 + 兄弟模块 `persistence.Tx`，事件只做"事后通知"。
+- `ThreadSafeEventBus.publish` invokes listeners synchronously in the caller's thread with no persistence or retry.
+- For guaranteed delivery across crashes, write to the transactional outbox (`zmodu.outbox.*`) inside the database transaction.
+- For high-frequency, zero-allocation worker fan-out on the execution plane, use `runtime.HotBus(E, N)` instead (see [Runtime Reference](../reference/RUNTIME.md)).
 
----
-
-## 5. 不适用场景（刻意不用）
-
-| 场景 | 用什么 |
-|------|--------|
-| 下单 + 扣库存必须原子 | 单 DB 事务 / `persistence.Tx` 编排，**不是**事件 |
-| 跨进程/跨机器事件 | Outbox relay / RobustMQ |
-| 请求级状态传递 | `ctx` attrs（`user_id` / `tenant_id`）或请求 arena |
-| handler 需要同步拿到结果 | 直接调 service；事件没有返回值 |
-| 模块启动期的重活 | `initWith` 应快速完成；重初始化用 lazy + 首次请求触发或后台任务 |
-
----
-
-## 6. 测试
+## 5. Unit Testing Event Publishers
 
 ```zig
 test "order service publishes created event" {
@@ -199,54 +132,15 @@ test "order service publishes created event" {
     const bus = try registry.bus(OrderEvent);
     var received: ?OrderEvent = null;
     try bus.subscribe(struct {
-        fn capture(e: OrderEvent) void { received = e; }
+        fn capture(e: OrderEvent) void {
+            received = e;
+        }
     }.capture);
 
     var svc = OrderService.init(&persist);
     svc.withEvents(bus);
-    _ = try svc.create(...);
+    _ = try svc.create(1, "item", 100);
 
     try std.testing.expect(received != null);
 }
 ```
-
-- service 单测注入收集型 listener，断言事件载荷——不 mock 下游模块。
-- 模块 `initWith` 逻辑用 `Lifecycle.startAllWith(modules, &ctx)` 覆盖。
-- 并发浸泡测试（N 并发 publish/subscribe）值得进 CI；`ThreadSafeEventBus` 的正确性由框架测试保证，
-  应用侧测的是**你自己的 listener 在并发下的行为**。
-
----
-
-## 7. 迁移指南（旧代码 → 新范式）
-
-| 旧写法 | 新写法 |
-|--------|--------|
-| `var bus = zmodu.EventBus(E).init(alloc)`（全局/手工传递） | `const bus = try app.eventBus(E)` |
-| `CrudService.setEventBus(*TypedEventBus)` | `setEventBus(*ThreadSafeEventBus)`（API 已收窄） |
-| 模块 `init()` 里各自打开共享资源 | `initWith(ctx)` + `ctx.service` / `ctx.eventBus` |
-| main 里手工把依赖塞给每个模块 | `builder.withService` → 模块 `initWith` 自取 |
-| 运行期中途 `container.register(...)` | 启动期完成注册；运行期注册会 `ContainerFrozen` |
-
-向后兼容：只声明 `init()` 的模块行为不变；DI/事件接入是增量 opt-in，不要求一次性改完。
-
-## 声明式接线：`withServices`
-
-`withService(T, name, ptr)` 一个个注册在模块多的时候很啰嗦；同一份 tuple 一次写完：
-
-```zig
-var db: Db = .{ .connected = true };
-var cache: Cache = .{};
-
-var b = zmodu.builder(allocator, io);
-defer b.deinit();
-_ = try b.withServices(.{
-    .{ .name = "db", .instance = &db },
-    .{ .name = "cache", .instance = &cache },
-});
-var app = try b.build(.{ OrderModule, UserModule });
-```
-
-类型从指针推断（`@TypeOf(entry.instance.*)`），注册语义与 `withService` 完全一致：
-**借用**，实例必须比 Application 活得久，`builder.deinit()` 释放登记表。
-`initWith(ctx)` 里用 `ctx.service(Db, "db")` 取回；启动完成后容器 `freeze()`，
-并发读无锁。

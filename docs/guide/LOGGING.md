@@ -1,11 +1,11 @@
 # Structured Logging
 
-## Quick Start
+## 1. Quick Start
 
 ```zig
-const log = @import("zmodu").observability.StructuredLogger;
+const StructuredLogger = @import("zmodu").observability.StructuredLogger;
 
-var logger = try log.init(allocator, .{
+var logger = try StructuredLogger.init(allocator, .{
     .level = .info,
     .format = .json,
     .output = .stdout,
@@ -16,16 +16,16 @@ logger.info("server_started", .{ .port = 8080 });
 // {"level":"info","msg":"server_started","port":8080,"timestamp":1715500000}
 ```
 
-## Levels
+## 2. Log Levels
 
-| Level | Use case |
-|-------|----------|
+| Level | Usage |
+|-------|-------|
 | `debug` | Development diagnostics |
-| `info` | Normal operations (startup, shutdown, health) |
-| `warn` | Recoverable issues (retry, timeout, circuit open) |
-| `err` | Errors requiring attention (DB down, auth failure) |
+| `info` | Normal lifecycle events (startup, shutdown, configuration) |
+| `warn` | Recoverable anomalies (retries, timeouts, open circuit breakers) |
+| `err` | Actionable failures (database unreachable, unexpected I/O failure) |
 
-## Production Configuration
+## 3. File Output and Rotation
 
 ```zig
 var logger = try StructuredLogger.init(allocator, .{
@@ -38,27 +38,27 @@ var logger = try StructuredLogger.init(allocator, .{
         .max_files = 5,
     },
 });
+defer logger.deinit();
 
-// Module-scoped logger
-const module_log = logger.scope("order");
-module_log.info("order_created", .{ .order_id = 42 });
+const order_log = logger.scope("order");
+order_log.info("order_created", .{ .order_id = 42 });
 // {"level":"info","scope":"order","msg":"order_created","order_id":42}
 ```
 
-## Migration from std.log
+## 4. Request-Scoped Logging with Trace IDs
+
+Inside HTTP handlers, use `ctx.logScope("module")` instead of a detached logger scope. When `tracingMiddleware` (included in `http.productionProfile`) is active, `ctx.logScope` automatically attaches the request's `trace_id`:
 
 ```zig
-// Before (v0.8)
-std.log.info("Order {d} created", .{order_id});
-
-// After (v0.9)
-logger.info("order_created", .{ .order_id = order_id });
+fn createOrder(ctx: *http.Context, self: *State) !void {
+    const log = ctx.logScope("order");
+    log.info("order_placed", .{ .user_id = ctx.userId() });
+    _ = self;
+}
 ```
 
-## Best Practices
+## 5. Conventions
 
-1. **Use structured fields**: `logger.info("event_name", .{ .key = value })` not string interpolation
-2. **Scope your logger**: `const log = logger.scope("module_name")` for module-level filtering
-3. **Never log secrets**: `Authorization`, `X-API-Key`, `Cookie` are auto-redacted
-4. **Log at boundary**: log at module entry/exit, not every internal function
-5. **Include correlation IDs**: use `requestId()` middleware for request tracing
+1. **Use structured fields**: Pass key-value structs to `logger.info("event", .{ .key = val })` instead of interpolating strings.
+2. **Use `ctx.logScope` in HTTP handlers**: Preserves `trace_id` correlation across logs and traces.
+3. **Never log credentials**: `Authorization`, `X-API-Key`, and `Cookie` headers are redacted automatically by the HTTP access log.

@@ -1,154 +1,126 @@
-# API 冻结面 / preview 面（1.0 前）
+# API freeze and preview surface
 
-> **一句话**：冻结面上的入口在 1.0 之前**只增不改**；`zmodu.runtime.*` 的 preview 面**允许 breaking**。
-> 门禁在 `src/test/ApiFreeze.zig`（跑在整树套件里 —— 它被 `src/tests.zig` 的聚合根 import，漏接就不会跑）。
-> 本文件**只写能从证据里读出来的东西**：每条口径都标出处，每个可检查的断言都对应门禁里的一个检查。
+Entry points on the frozen surface only grow before 1.0; `zmodu.runtime.*` is preview and may break during 0.x. The gate lives in `src/test/ApiFreeze.zig` and runs in the full suite because `src/tests.zig` imports it.
 
-## 口径从哪来（读的，不是发明的）
+Every statement here is backed by a source, and every checkable claim maps to one assertion in the gate.
 
-| 口径 | 出处 |
+## Where the policy comes from
+
+| Policy | Source |
 |---|---|
-| 弃用别名**不早于 1.0** 删除 | `docs/UPGRADING.md:8-10`（统一口径），表在 `:12-22`、已移除记录在 `:82-157`（本文件不抄第二份） |
-| `Application` / `Module` / `DI` / `EventBus` / HTTP 公开契约**只增不改** | `docs/RUNTIME.md:58`（§2 第 1–4 条见 `:37-40`，第 9 条见 `:46`） |
-| `runtime.*` 在 0.x **允许 breaking** | `docs/RUNTIME.md:47-49`（§2 第 10 条）+ `:54-61`（"0.x 不破坏"不成立）；先例 `:537`（v0.28.0 删掉 `Runtime.cancelTimer(id) bool`） |
-| 每次 runtime breaking 要**同时**进 §9 路线图与 `UPGRADING.md` 对应版本段 | `docs/RUNTIME.md:59-61` |
-| §12 / §13 / §14 的现状口径 | `docs/RUNTIME.md:696`（Phase 2 已落地）、`:1569`（Replay v1 已实现）、`:1751`（v0.31 契约） |
+| Deprecated aliases are removed no earlier than 1.0 | the deprecation table at the top of `UPGRADING.md` |
+| `Application` / `Module` / DI / `EventBus` / HTTP public contracts only grow | `RUNTIME.md` §2 items 1–4 and 9 |
+| `runtime.*` may break during 0.x | `RUNTIME.md` §2 item 10 |
+| Every runtime breaking change is recorded in the §9 roadmap and the matching `UPGRADING.md` section | `RUNTIME.md` §2 |
+| The current state of §12 / §13 / §14 | `RUNTIME.md` (worker pools, replay v1, supervision) |
 
-**本清单的第一步"决定"（不是引用）**：把上面只点了五类的"只增不改"扩展到下表**全部**类别 —— 即 1.0 前它们都只增不改。
-要缩小冻结面就删表里的行，门禁随之缩小（下面的同步测试会盯着两边）。扩充冻结面同理。
+The first decision this document records is an extension of the "only grow" rule: it applies to every category in the table below, not only the five named in `RUNTIME.md`. To shrink the frozen surface, delete a row; the sync test watches both sides. Extending it works the same way.
 
-## 冻结的入口类别
+## Frozen entry point categories
 
-冻结的是**类别与锚点**（每类的身份符号），不是逐条枚举的导出名单 —— 完整名单仍在 `root.zig` 与 `docs/API.md`，
-本文件刻意不做第三份没人维护的清单。第二列的每个锚点都被 `src/test/ApiFreeze.zig` 逐条断言（`@hasDecl`，数据驱动自本表）。
+What freezes is the category and its anchor symbol, not an enumerated export list. The full list stays in `root.zig` and `API.md`. The second column is asserted one by one in `src/test/ApiFreeze.zig` with `@hasDecl`.
 
-| 类别 | 门禁锚点（逐条断言） | 冻结依据 |
+| Category | Gate anchors | Basis |
 |---|---|---|
-| `zmodu` 顶层 · 生命周期与模块契约 | `Application`, `ApplicationBuilder`, `builder`, `api`, `ModuleContext`, `ZmoduError`, `Result`, `Time`, `scanModules`, `ModuleInfo` | 引用（`RUNTIME.md:58`） |
-| `域别名`（opt-in 域） | `http`, `data`, `security`, `observability`, `runtime`, `ai`, `im`, `web4`, `outbox`, `cron`, `migration`, `datapermission` | 决定（别名本身是导入缝，改名=全员编译错） |
-| `http` · 路由与请求 | `http.Server`, `http.Context`, `http.RouteSpec`, `http.RouteMeta`, `http.Router`, `http.CatalogSlot` | 引用（HTTP 在 `RUNTIME.md:58` 的"只增不改"名单里） |
-| `http` · extractor 与错误渲染 | `http.extractPath`, `http.extractQuery`, `http.extractJson`, `http.extractJsonValidated`, `http.extractMultipart`, `http.respondErr`, `http.setErrorMap`, `http.problemReject`, `http.useRfc7807Errors`, `http.productionProfile`, `http.sse`, `http.Testkit` | 引用（同上） |
-| `http` / `security` · 鉴权（Path A） | `http.jwtAuthFromCatalogWithPermissions`, `http.catalogLoaderFromTable`, `http.AuthBackend`, `http.jwtBackend`, `http.envelopeReject`, `http.permissionGateWith`, `http.tenantResolver`, `security.AppSecurity`, `security.PasswordEncoder`, `security.CatalogPermDb`, `security.JwksKeyRing` | 决定（`AGENTS.md` 把 Path A 定为默认接法；门禁只保证名字还在，签名准确性人工看） |
-| `data` · 数据层 | `data.Client`, `data.Repository`, `data.SqlxBackend`, `data.CrudService`, `data.CacheManager`, `data.MigrationRunner`, `data.sqlx`, `data.redis`, `data.orm`, `data.pool` | 决定 |
-| `observability` · 可观测性 | `observability.PrometheusMetrics`, `observability.DistributedTracer`, `observability.StructuredLogger`, `observability.ModuleLogger`, `observability.OtlpExporter`, `observability.LogScope` | 决定 |
-| `zmodu` 顶层 · 韧性 / 调度 / 分布式 | `CircuitBreaker`, `RateLimiter`, `Bulkhead`, `retry`, `cron`, `DistributedLock`, `Preflight`, `SagaOrchestrator`, `ClusterView`, `MembershipView` | 决定 |
-| `zmodu` 顶层 · DI / 事件 / 配置 / 工具 | `Container`, `ScopedContainer`, `EventBus`, `ThreadSafeEventBus`, `FrozenMap`, `Params`, `ConfigManager`, `TomlLoader`, `Validator`, `panicHook` | 引用（前四个在 `RUNTIME.md:58` 的名单里，其余按同一类别一并冻结） |
-| `zmodu` 顶层 · 测试辅助与扩展 | `IntegrationTest`, `Benchmark`, `ContractTestRunner`, `ModuleTestContext`, `WebSocketServer`, `PluginManager` | 决定 |
+| `zmodu` top level · lifecycle and module contract | `Application`, `ApplicationBuilder`, `builder`, `api`, `ModuleContext`, `ZmoduError`, `Result`, `Time`, `scanModules`, `ModuleInfo` | referenced |
+| `zmodu` domain aliases (opt-in domains) | `http`, `data`, `security`, `observability`, `runtime`, `ai`, `im`, `web4`, `outbox`, `cron`, `migration`, `datapermission` | decided; renaming an alias breaks every consumer |
+| `http` · routing and requests | `http.Server`, `http.Context`, `http.RouteSpec`, `http.RouteMeta`, `http.Router`, `http.CatalogSlot` | referenced |
+| `http` · extractors and error rendering | `http.extractPath`, `http.extractQuery`, `http.extractJson`, `http.extractJsonValidated`, `http.extractMultipart`, `http.respondErr`, `http.setErrorMap`, `http.problemReject`, `http.useRfc7807Errors`, `http.productionProfile`, `http.sse`, `http.Testkit` | referenced |
+| `http` / `security` · auth (Path A) | `http.jwtAuthFromCatalogWithPermissions`, `http.catalogLoaderFromTable`, `http.AuthBackend`, `http.jwtBackend`, `http.envelopeReject`, `http.permissionGateWith`, `http.tenantResolver`, `security.AppSecurity`, `security.PasswordEncoder`, `security.CatalogPermDb`, `security.JwksKeyRing` | decided; Path A is the default wiring in `AGENTS.md`. The gate checks names only, signatures are reviewed by hand |
+| `data` · data layer | `data.Client`, `data.Repository`, `data.SqlxBackend`, `data.CrudService`, `data.CacheManager`, `data.MigrationRunner`, `data.sqlx`, `data.redis`, `data.orm`, `data.pool` | decided |
+| `observability` | `observability.PrometheusMetrics`, `observability.DistributedTracer`, `observability.StructuredLogger`, `observability.ModuleLogger`, `observability.OtlpExporter`, `observability.LogScope` | decided |
+| `zmodu` top level · resilience / scheduling / distribution | `CircuitBreaker`, `RateLimiter`, `Bulkhead`, `retry`, `cron`, `DistributedLock`, `Preflight`, `SagaOrchestrator`, `ClusterView`, `MembershipView` | decided |
+| `zmodu` top level · DI / events / config / utilities | `Container`, `ScopedContainer`, `EventBus`, `ThreadSafeEventBus`, `FrozenMap`, `Params`, `ConfigManager`, `TomlLoader`, `Validator`, `panicHook` | referenced for the first four; the rest fall in the same category |
+| `zmodu` top level · test helpers and extensions | `IntegrationTest`, `Benchmark`, `ContractTestRunner`, `ModuleTestContext`, `WebSocketServer`, `PluginManager` | decided |
 
-## 0.x 允许破坏的 preview 面
+## Preview surface (0.x may break)
 
-依据是 `docs/RUNTIME.md:47-49`（§2 第 10 条）。这里只列 §11–§14 文档点到名的符号；
-"仍未做 / 明确不做"的口径在 `docs/RUNTIME.md:696-706`（§12）、`:1649`（§13.5）、`:1913`（§14.7）等处，是散文 —— **人工看**。
+This follows `RUNTIME.md` §2 item 10. The rows name the symbols §11–§14 document; what is "not done" or "deliberately not done" stays prose in `RUNTIME.md` and is reviewed by hand.
 
-**可检查的推论**（门禁 `src/test/ApiFreeze.zig` 的第二个 test）：这些符号只经 `zmodu.runtime.*` 暴露，
-**不得**出现在冻结的顶层 —— 一旦 `pub const Supervision = …` 之类被加到 `root.zig`，第 10 条允许的破坏就打到了冻结面。
+The checkable part is the second test in `src/test/ApiFreeze.zig`: these symbols are exposed through `zmodu.runtime.*` only and must not appear on the frozen top level. Adding `pub const Supervision = ...` to `root.zig` would hit the frozen surface with a change the preview rule allows.
 
-| preview 出处 | 门禁锚点（逐条断言） |
+| Preview source | Gate anchors |
 |---|---|
-| `runtime` · §3 Worker / `Runtime` | `runtime.Runtime` |
-| `runtime` · §12 WorkerPool / Scheduler | `runtime.SpawnMode`, `runtime.SpawnConfig`, `runtime.SchedulerConfig`, `runtime.ExecutionClass`, `runtime.StopPolicy`, `runtime.PrecisionTimer` |
-| `runtime.recorder` · §11 / §13 EventRecorder 与 Runtime Replay | `runtime.Sequencer`, `runtime.recorder.Recorder`, `runtime.recorder.DeliveryLog`, `runtime.recorder.Replayer`, `runtime.recorder.TrackRef`, `runtime.recorder.LogStep` |
-| `runtime` · §14 监督树 | `runtime.Supervision`, `runtime.Group`, `runtime.GroupPolicy`, `runtime.Intensity` |
+| `runtime` · §3 worker / `Runtime` | `runtime.Runtime` |
+| `runtime` · §12 worker pool / scheduler | `runtime.SpawnMode`, `runtime.SpawnConfig`, `runtime.SchedulerConfig`, `runtime.ExecutionClass`, `runtime.StopPolicy`, `runtime.PrecisionTimer` |
+| `runtime.recorder` · §11 / §13 event recorder and replay | `runtime.Sequencer`, `runtime.recorder.Recorder`, `runtime.recorder.DeliveryLog`, `runtime.recorder.Replayer`, `runtime.recorder.TrackRef`, `runtime.recorder.LogStep` |
+| `runtime` · §14 supervision tree | `runtime.Supervision`, `runtime.Group`, `runtime.GroupPolicy`, `runtime.Intensity` |
 
-## 弃用别名与删除时点
+## How the gate works
 
-**不在这里抄第二份。** 表在 `docs/UPGRADING.md:12-22`，本文件只声明门禁怎么管它：
+`src/test/ApiFreeze.zig` reads both documents at test time and compares them with its own tables.
 
-- 每一行由 `src/test/ApiFreeze.zig` 逐行断言：弃用名仍可调用、指向的"现在的名字"仍存在
-  （`replacementResolves` 按 `ALIASES` 的第三列逐条 `@hasDecl`，第三列自己也会烂）；
-- 该行代码里的 `DEPRECATED` 标注与"指向新名"也要在（`docs/UPGRADING.md` 的规则 1）；
-- **表 ↔ 门禁双向同步**：表里加一行而门禁没跟上是红，门禁里留着一行而表删了也是红。
+- Anchor tokens are `Domain.Name`, `Schema.Name` or a bare top-level name. Resolution uses the longest namespace prefix, so `runtime.recorder.*` entries must come first in the table.
+- A table row is parsed only when its first column holds a backticked token; keep one there.
+- Anchor resolution asserts that every symbol named in the frozen table resolves through `root.zig`.
+- The sync test parses both tables here and compares the anchor sets in both directions.
+- The deprecation test parses the table in `UPGRADING.md`, checks each row's replacement and removal plan, and reads the declaration markers.
+- The removed and banner tests check that removed names stay off the top level and that every banner file is named in this document.
 
-### 已移除的记录（`docs/UPGRADING.md:82-157`）
+Failures print the document, the category and the symbol, for example `[api-freeze] docs/reference/API_FREEZE.md names ... as frozen, but nothing in src/test/ApiFreeze.zig checks it`.
 
-表只承诺**还活着**的别名。已经删掉的名字进不了表 —— 给它写"不早于 1.0 删除"等于告诉读者它今天还能用；
-它们记在表下方的「已移除」小节里，门禁对它们的断言方向**相反**：**不得**重新出现在顶层。
+## Deprecated aliases and removal dates
 
-- `zmodu.App` / `zmodu.ModuleImpl`：随 `Simplified` 整块在 commit `557190a`（2026-05-12）从 `src/root.zig` 移除，
-  替代品 `Application`。门禁断言 `@hasDecl(zmodu, …)` 为**假**（回到顶层即红），
-  并断言 `src/api/Simplified.zig` 仍在树里、仍被 `src/tests.zig` 的编译门禁 import —— **只到文件级**，
-  不是"整块 API 仍受支持"的承诺。记录里的名字 / 证据 / 文件路径三者都由门禁对照文档检查（措辞改了也要一起改）。
-- `zmodu.extensions`：整个命名空间（旧写法 `zmodu.extensions.HttpServer` 等）已从顶层移除，
-  **没有可引用的 commit** —— 记录里给的是本仓最老的书面证据 `CHANGELOG.md` 的 `[0.15.0]` 段，门禁要求文档
-  原样保留这个引用。替代品是域文件（`zmodu.http.*` / `zmodu.data.*`），今天 `src/extensions.zig` 仍在树里、
-  仍被 `src/tests.zig` 的编译门禁 import，且 shim 里的名字仍指向域文件的**同一批类型**（门禁逐条 `==`）。
+The table is not duplicated here; it sits at the top of `UPGRADING.md`. This document records how the gate governs it:
 
-### 整模块级弃用横幅（第三类：既不进表，也不进「已移除」）
+- Every row is asserted line by line: the deprecated name still resolves, and the current name it points at still exists (`replacementResolves` checks the third column).
+- The declaration keeps its `DEPRECATED` marker and names the replacement.
+- The table and the gate stay in sync both ways: a row without a gate fails, and a gate entry without a row fails.
 
-`docs/UPGRADING.md:45-81` 写着这两处为什么两边都不进。门禁（`src/test/ApiFreeze.zig` 的 `BANNERS`）钉的是：
+### Removed records
 
-- 横幅仍在**文件头 1500 字节**内，且仍点名替代路径；
-- `src/extensions.zig` 仍被 `src/tests.zig` 的编译门禁 import；`src/validation/Validator.zig` 不在那份直接
-  import 名单里（那里 import 的是 `validation/ObjectValidator.zig` / `validation/FieldRules.zig` /
-  `validation/FieldValidation.zig`），由门禁自己 `@import` 并**真调** `notEmpty`、`validateStruct`、`email`、
-  `validateStructCollect`，所以它的签名同样不会静默烂掉；
-- `src/validation/Validator.zig` 与 `http.FieldRules` 的**依赖方向**（从"钉住耦合"改成"钉住解耦"）：
-  `http.FieldRules` 与 `http.validateRequest` / `http.extractJsonValidated` 仍在；`FieldRules` 的**规范声明**在
-  `src/validation/FieldRules.zig`，且 `http.FieldRules` / `src/api/Extract.zig` 的再导出 / 弃用文件上的
-  `Validator.FieldRules` 别名**三处是同一个类型**；规范实现**不得**再出现在弃用文件里；新家**不得** `@import`
-  弃用文件，弃用文件**必须**仍指向新家。三条合起来证明"删掉 `Validator.zig` 不会再打断 `http.FieldRules`"。
-  （`@import` 匹配用的是带引号的拼写，所以散文里提到文件名不算依赖 —— 反向的假绿堵住了。）
-  替代品 `zmodu.Validator` 仍解析到 `validation/ObjectValidator.zig` 的**另一个**类型（`!=` 是断言的一部分：
-  那是真迁移，不是自指）。
-- **`validateStruct*` 链的依赖方向**（第二批收口，见 `FIELD_VALIDATION_HOME`）：求值引擎的规范声明（16 条
-  `pub fn` / `pub const … = struct {`）在 `src/validation/FieldValidation.zig`，逐条断言"新家有、弃用文件没有"；
-  弃用文件里**不得**出现任何 `pub fn `（它整层都是 `pub const <名字> = ` 别名，17 个拼写逐个断言）；
-  新家**不得** `@import` 弃用文件，弃用文件**必须**指向 `FieldValidation.zig`；两个 `http.*` 调用方
-  （`src/api/Extract.zig`、`src/api/middleware/Validation.zig`）**必须**直连新家且**不得**出现弃用文件的 import；
-  别名与规范类型逐个 `==`，两个入口再各真调一次（`http.extractJsonValidated`、`http.validateRequest`）。
-  **这半条现在说明的是：已经没有消费方阻塞项了** —— `Validator.*` 越路径拼写从"规范实现"降级成"别名转发"，删文件时
-  把门禁里那两处 `@import` 与对应断言一起删掉即可。
+The table promises only names that still work. A removed name would read as "still available" if it sat in it, so removals go into the record section of `UPGRADING.md`, and the gate asserts the opposite direction: the name must not reappear at the top level.
 
-## 覆盖不到的部分（只能人工看）
+Each record carries four fields, and the gate checks all of them against the document:
 
-1. **已移除的块只钉"回不到顶层"，不钉"用不了"。** `Simplified` 整块（`App` / `ModuleImpl` / `Module`）已从顶层移除
-   （`docs/UPGRADING.md:82-157`）。门禁钉的是 `zmodu.App` / `zmodu.ModuleImpl` **不**在顶层、且 `src/api/Simplified.zig`
-   仍在树上并被 `src/tests.zig` 的编译门禁 import —— 这不是"整块 API 仍受支持"的承诺：门禁**不断言**里面的签名，
-   也不断言越路径 `@import("zmodu/src/api/Simplified.zig")` 在下一个版本还能用（越包内路径不受支持）。
-   门禁确实跑 `App.init` → `register(ModuleImpl(T).interface(…))` → `start` / `stop` 的 before 流程，但那是**走越路径 import**
-   跑的 —— `docs/API-MIGRATION.md` 的 Before 片段（写的是 `zmodu.App`）照抄**编译不过**，文档里已写明它只剩教学价值。
-2. **签名准确性**（"这个函数还接受同样的参数吗"）不在门禁范围，与 `src/test/DocsConsistency.zig` 的既有口径一致 —— 人工看。
-3. **"1.0 那天一次性删掉"这个动作本身**是人工承诺：门禁只保证删除列写着"不早于 1.0"且非空。
-4. **`docs/API.md` 里的逐符号存在性**由 `src/test/DocsConsistency.zig` 覆盖（跨文件 import，与消费者可见性一致），本文件不重复。
-5. **每个类别的完整导出名单**不在本文件：同步测试比的是"本文件点到的锚点集合"与门禁的集合，不是 `root.zig` 的全部导出。
-6. **`runtime.*` 的 breaking 是否真的进了 §9 与 `UPGRADING.md`**（`RUNTIME.md:59-61` 的流程要求）没有机械检查 —— 人工看。
-7. **表外的弃用标记仍然不能全量反查；但已知的四处已经逐个收口。** 门禁只检查"表里已有的行"；反过来
-   "代码里标了 `DEPRECATED` 但表里没补行"**没有**通用的机械检查 —— 要自动化就得扫全树标记，而标记既出现在
-   声明前、也出现在模块级横幅里，误报面太大。所以采取的是**点名收口**：每发现一处就归类、入表或入档，并由门禁钉住。
-   - **已按规则 2 补进表（2026-09-25，第 40 批）**：`src/root.zig:63-66` 的 `startAll` / `stopAll` 与
-     `src/http.zig:13` 的 `http_server`。
-   - **已按规则 2 补进表（第二批）**：`src/resilience/RateLimiter.zig:70` 的 `acquire` → `tryAcquire`、
-     `src/api/Server.zig` 的 `sendSuccess` / `sendFail` / `sendPageResult` / `sendJsonItems` → `ctx.json`
-     （表在 `docs/UPGRADING.md:18-22`）。四条 `send*` 是**一族**：`scripts/check-production.sh` 的"信封泄漏"
-     扫描把它们当同一形状处理。
-   - **整模块横幅已归类，不在这张表里**：`src/validation/Validator.zig` 与 `src/extensions.zig`
-     （见上面「整模块级弃用横幅」一节）。前者**已经是薄兼容层**：`http.FieldRules` 与 `validateStruct*` 两条链都
-     已解耦（规范声明分别搬到 `src/validation/FieldRules.zig` 与 `src/validation/FieldValidation.zig`），
-     **没有消费方阻塞项** —— 唯一仍 `@import` 它的是门禁自己（为了钉住那 17 个拼写必须真调），所以按"可达"处理
-     而不是"已移除"；后者是**命名空间级**的移除，已记进「已移除」的记录并由门禁钉住 `@hasDecl(zmodu, "extensions")` 为假。
-   - **仍未收口**：没有。四处都已在文档与门禁里各就各位；下次再发现表外标记，照同样的三步走（归类 → 入表/入档 → 加断言）。
-   - **规则 3（回指本节）的逐条现状**写在 `docs/UPGRADING.md`（表下方"规则 3 的现状"）：只有 `ctx.paramPath`
-     （`:929` 起那节，`v0.15.46`）与 `RateLimiter.acquire`（`v0.15.45` 那节）能回指 —— 两条都已完成；其余四组
-     要么记录只存在于 `CHANGELOG.md`（`startAll`/`stopAll` → `[0.15.12]`；`http_server` → 只有 `[0.15.8]` 的示例清理，
-     而 `src/http.zig:13` 自称的 `v0.14.0` 在 `CHANGELOG.md` 里**没有对应段落**），要么根本找不到弃用条目
-     （四个 `ctx.send*`）。本文件不镜像那份逐条说明。
-8. **`zmodu.stopAll` 的标记检查不独立。** 门禁的标记看的是声明前 1500 字节（`marker_window`），
-   `src/root.zig:63-66` 两条标记只隔一行，所以只删 `stopAll` 那条注释**不会**让它红（`startAll` 的注释里也有
-   `Application.stop()`）。要让两条各自独立，得把窗口收窄成"紧邻的 doc comment"—— 那是门禁自己的比较口径，暂不动，人工看。
-   同样的窗口口径也适用于 `Server.zig` 里连续四个 `send*`（四个标记相邻），以及两条 `root.zig` 之外的
-   文件级横幅（`banner_window` 从文件头量起）—— 这些**验收标准是"标记还在"，不是"标记恰好只属于这一条"**。
+| Field | `zmodu.App` / `zmodu.ModuleImpl` | `zmodu.extensions` |
+|---|---|---|
+| Evidence | commit `557190a` | `CHANGELOG.md` section `[0.15.0]` (no commit records it) |
+| Implementation file | `src/api/Simplified.zig` | `src/extensions.zig` |
+| Compiled import in `src/tests.zig` | `"api/Simplified.zig"` | `"extensions.zig"` |
+| Replacement | `Application` | domain files (`zmodu.http.*`, `zmodu.data.*`) |
 
-## 新增一行要做什么
+- `Simplified` (`App`, `ModuleImpl`, `Module`) was removed from `src/root.zig` as a block. The file-level guarantee is that the file is still compiled; the block is not promised to be supported.
+- `zmodu.extensions.HttpServer` and the rest of the namespace are gone from the top level. The shim names still resolve to the same types as the domain files (asserted with `==`).
 
-1. 在 `docs/UPGRADING.md:12-22` 加弃用行（删除列不要留空），**并**在 `src/test/ApiFreeze.zig` 的 `ALIASES` 加对应项 + 一个可调用的检查
-   （第三列的"现在的名字"由 `replacementResolves` 统一断言存在）；两张表不一致时同步测试会红。
-2. 冻结/preview 面同理：改本文件的表 → 门禁的表必须同改（`FREEZE_CATEGORIES` / `PREVIEW`）。
-   只改一边 = 红。**preview 往上加符号时先问一句**：它是不是该留在 `runtime.*` 里（第 10 条只保护 `runtime.*`）。
-3. **删一行要在三处一起动**：从表里移出去 → `ALIASES` 同步删（"门禁留着一行而表删了"是红）→ 在
-   `docs/UPGRADING.md` 的「已移除」记录里写清名字 / 证据 / 替代品 / 今天怎么找到它，并在
-   `src/test/ApiFreeze.zig` 的 `REMOVED` 加一项（门禁钉它**不得**回到顶层，也钉记录里的名字、证据与文件路径，
-   外加"该文件仍被 `src/tests.zig` 的编译门禁 import"）。
-4. **整文件级的 `DEPRECATED` 横幅（第三种情况）**：既没有"消费者写过的旧名"可进表，又不是移除记录时，
-   标进 `docs/UPGRADING.md:45-81` 与本文件的「整模块级弃用横幅」，并在 `src/test/ApiFreeze.zig` 的 `BANNERS`
-   加一项（横幅位置 + 替代路径 + **方向性断言**：规范声明在新家、新家不得回头 import 弃用文件）。
-   `BANNERS` 里的文件必须在本文件里被点到，否则红。
+### File-level deprecation banners
+
+`UPGRADING.md` explains why these two files are neither table rows nor removal records. The gate (`BANNERS`) pins:
+
+- The banner stays within the first 1500 bytes of the file and names the replacement path.
+- `src/extensions.zig` is still imported by the compile gate in `src/tests.zig`. `src/validation/Validator.zig` is not on that direct import list (the list imports `validation/ObjectValidator.zig`, `validation/FieldRules.zig` and `validation/FieldValidation.zig`), so the gate imports it itself and calls `notEmpty`, `validateStruct`, `email` and `validateStructCollect`, which keeps those signatures from rotting silently.
+- Dependency direction for `src/validation/Validator.zig` and `http.FieldRules`: `http.FieldRules`, `http.validateRequest` and `http.extractJsonValidated` still resolve. The canonical `FieldRules` declaration lives in `src/validation/FieldRules.zig`, and the re-export in `http.FieldRules`, the one in `src/api/Extract.zig` and the `Validator.FieldRules` alias are the same type. The canonical implementation must not live in the deprecated file, the new home must not import it, and the deprecated file must still point at the new home. Together that proves deleting `Validator.zig` no longer breaks `http.FieldRules`. (`@import` matching uses the quoted spelling, so a file name in prose does not count as a dependency.)
+- The `zmodu.Validator` alias resolves to a different type in `validation/ObjectValidator.zig`; the `!=` assertion is part of the check, since a self-reference would mean no migration happened.
+- Dependency direction for the `validateStruct*` chain (`FIELD_VALIDATION_HOME`): the canonical declarations (16 `pub fn` / `pub const ... = struct`) live in `src/validation/FieldValidation.zig`, and each is asserted present there and absent from the deprecated file. The deprecated file has no `pub fn` at all: it is a layer of `pub const <name> =` aliases, with 17 spellings asserted. The new home must not import the deprecated file, the deprecated file must point at `FieldValidation.zig`, and the two `http.*` callers (`src/api/Extract.zig`, `src/api/middleware/Validation.zig`) must import the new home directly and not the deprecated file. Aliases and canonical types are compared with `==`, and both entry points are called once.
+- The banner set is asserted as text, not as a support promise. The gate is what keeps the "kept alive" rationale from coming back.
+
+## What the gate does not cover
+
+1. Removed blocks are pinned as "cannot come back to the top level", not as "cannot be used". The gate does not assert the signatures inside `src/api/Simplified.zig`, nor that a cross-package `@import("zmodu/src/api/Simplified.zig")` keeps working (cross-package paths are unsupported). It does run `App.init` → `register(ModuleImpl(T).interface(...))` → `start` / `stop` through such an import, so the before-sample in `docs/API-MIGRATION.md` compiles only with the cross-package path, not with `zmodu.App`.
+2. Signature accuracy ("does this function still take the same arguments") is out of scope, matching the existing rule in `src/test/DocsConsistency.zig`. Human review.
+3. The 1.0 deletion itself is a human commitment. The gate only checks that the removal column says "no earlier than 1.0" and is not empty.
+4. Per-symbol existence in `docs/reference/API.md` is covered by `src/test/DocsConsistency.zig`, which imports the same way a consumer does. This document does not repeat it.
+5. The complete export list per category is not here. The sync test compares the anchor set named here with the gate's set, not the full `root.zig` exports.
+6. Whether a `runtime.*` breaking change actually reached §9 and `UPGRADING.md` has no mechanical check. Human review.
+7. Deprecation markers outside the table cannot be found exhaustively. The gate checks rows that exist; the reverse ("marked `DEPRECATED` but no row") has no general check, because markers sit both before declarations and in file-level banners, and scanning for them produces too many false positives. The approach is to close known cases one at a time: classify, then add a row, a record or a banner, then pin it.
+   - In the table: `startAll` / `stopAll` (`src/root.zig`) and `http_server` (`src/http.zig`).
+   - In the table: `RateLimiter.acquire` → `tryAcquire`, and the family `sendSuccess` / `sendFail` / `sendPageResult` / `sendJsonItems` → `ctx.json` (`src/api/Server.zig`). The four `send*` names are one family; the envelope-leak scan in `scripts/check-production.sh` treats them as one shape.
+   - File-level banners, outside the table: `src/validation/Validator.zig` and `src/extensions.zig`. The first is now a thin compatibility layer whose two chains are decoupled, with no consumer blocker left; only the gate imports it. The second is a namespace removal, recorded under removed names and pinned as `@hasDecl(zmodu, "extensions") == false`.
+   - No other markers are pending.
+8. The marker check for `zmodu.stopAll` is not independent. The gate reads the 1500 bytes before a declaration (`marker_window`), and the two markers in `src/root.zig` are one line apart, so deleting only the `stopAll` comment does not fail. The same window applies to the four adjacent `send*` markers in `Server.zig` and to file-level banners (`banner_window` measured from the top of the file). The acceptance rule is "the marker is still there", not "the marker belongs to exactly this declaration".
+
+## Adding or removing a row
+
+1. To add a deprecated alias: add the row to the table in `UPGRADING.md` (never leave the removal column empty), add an entry to `ALIASES` in `src/test/ApiFreeze.zig` with a callable check, and let `replacementResolves` check the new name. Mismatched tables fail the sync test.
+2. To change the frozen or preview surface: edit the table here and the matching table in the gate (`FREEZE_CATEGORIES` / `PREVIEW`). One side alone fails. Before adding a symbol to preview, ask whether it should stay under `runtime.*`; item 10 protects only that namespace.
+3. To remove a row, change three places: delete it from the table, delete it from `ALIASES`, and add a record to the removed section of `UPGRADING.md` with name, evidence, replacement and where to find it today, plus an entry in `REMOVED`. The gate pins that the name does not return to the top level and checks the record's name, evidence and file path.
+4. For a file-level `DEPRECATED` banner (neither a table row nor a removal): document it in `UPGRADING.md` and in the banner section here, and add an entry to `BANNERS` with the banner location, the replacement path and the dependency-direction assertions. Every file in `BANNERS` must be named in this document.
+
+## Verify a doc change
+
+```bash
+bash scripts/test-fast.sh --db all --filter ApiFreeze
+bash scripts/test-fast.sh --db all --filter DocsConsistency   # when API.md changed
+```
+
+Both tables and the gate change together; a passing run on one side only means the other table moved without its assertion.

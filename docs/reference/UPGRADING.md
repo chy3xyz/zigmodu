@@ -1,707 +1,184 @@
-# UPGRADING — 逐版本升级注意
+# Upgrading
 
-## 先定位你受影响的版本
+Version-by-version notes for zmodu changes that stop compilation or change behaviour.
 
-**从 `0.x` 升级到当前版本？先看 §弃用别名与删除计划** —— 那一节回答"这个旧名字我什么时候
-必须改完"，而且给出了统一口径：**弃用别名不早于 1.0 删除**，所以在那之前任何小版本升级
-都不需要为改名动代码。
+## Find the versions that affect you
 
-**只想知道"有没有编译不过的变更"？** 下面每条都标了 **Breaking?**：
+Every entry carries a **Breaking?** marker.
 
-| 标记 | 含义 | 你要做什么 |
-|------|------|-----------|
-| **编译错** | 类型或签名变了 | 按该条的「一行改法」改 |
-| **行为变化** | 能编译，行为不同 | 读该条，确认你的用法落在描述的范围外 |
-| **非破坏性** | 修缺陷或补能力 | 一般无需动作，但值得知道 |
-
-**只想知道当前版本变了什么？** 看最上面那个 `## v<当前版本>` 节。
-
-**从很早的版本一路升上来？** 下面是逐版本历史，按需查阅——不是必须通读。
-版本演进的全量记录在 [`../../CHANGELOG.md`](../../CHANGELOG.md)，
-本文件只写**要改代码**的部分。
-
-> **维护者**：新增条目与发布流程见文末 §模板。`scripts/release.sh` 只改本文件的
-> 节标题，不改正文，所以正文里对 `[Unreleased]` 的引用要在发布前一并改掉。
-
-## v0.41 — 项目改名 ZigModu → zmodu（**Breaking? 编译错**）
-
-包名、模块名与仓库名统一为 `zmodu`。改动是机械的，但编译器会把每一处都指出来：
-
-- 依赖键与模块：`build.zig.zon` 里 `.zmodu = .{ … }`；`b.dependency("zmodu", …).module("zmodu")`；
-  源码 `@import("zmodu")`。
-- **不保留旧名**：模块 `zigmodu` 与 `ZIGMODU_*` 环境变量已删除。依赖键、模块名、
-  `@import`、env 前缀需一次改完（外部项目少，按一次性改名处理，避免长期双名）。
-- **包指纹变了**：`.fingerprint = 0xde7987a02b121580`（Zig 在包名变化后强制要求新值）；
-  依赖 hash 前缀从 `zigmodu-` 变为 `zmodu-`，升级后必须重新 `zig fetch` 并更新 `.hash`。
-- **有意保留的线上契约**（改名不动）：Prometheus 指标 `zigmodu_*`、迁移表
-  `_zigmodu_migrations`、Raft 快照前缀 `zigmodu-raft-snapshot:`、模型字段
-  `zigmodu_ignore_tenant`。它们在仪表盘/既有数据库/落盘格式/应用代码里，静默改名会断，
-  统一留到 1.0 做双写与迁移。
-- 仓库：`https://github.com/chy3xyz/zmodu`（旧 URL 由 GitHub 自动重定向）；文档站
-  `--url-prefix zmodu`；`install.sh` 的安装目录为 `~/.zmodu`（旧的 `~/.zigmodu`
-  不再自动复用，移动或重装即可）。
-
-## 弃用别名与删除计划
-
-**回答的是一个具体问题：「这个旧名字我什么时候必须改完？」** 此前每条弃用只写"保留为别名"、
-不写删除时点，消费方每次升级都要重新确认一遍该用哪个 —— 那是纯成本。
-
-**统一口径：弃用别名**不早于 1.0** 删除。** 依据是本仓库的兼容性原则（破坏性变更保留给 1.0），
-所以在那之前**任何小版本升级都不需要为下面这些名字动代码**；1.0 那次会一次性删掉，并在
-本节的表格里逐条标出来。**删除执行的前一个版本**会在本节与当版本条目里同时点名预告，不做无声删除。
-
-| 弃用名 | 现在的名字 | 计划删除 |
+| Marker | Meaning | Action |
 |---|---|---|
-| `ctx.paramPath` | `ctx.nestedParam` | 不早于 1.0 |
-| `zmodu.startAll` | `Application.start()` | 不早于 1.0 |
-| `zmodu.stopAll` | `Application.stop()` | 不早于 1.0 |
-| `zmodu.http.http_server` | `http.Server` | 不早于 1.0 |
-| `ctx.sendSuccess` | `ctx.json`(200, data) —— 不再包 `{code,msg,data}` 信封 | 不早于 1.0 |
-| `ctx.sendFail` | `ctx.json`(status, body) | 不早于 1.0 |
-| `ctx.sendPageResult` | `ctx.json`(200, body)，分页结构自己拼 | 不早于 1.0 |
-| `ctx.sendJsonItems` | `ctx.json`(200, body) | 不早于 1.0 |
-| `RateLimiter.acquire` | `RateLimiter.tryAcquire`（同义；它从来没等过） | 不早于 1.0 |
+| **Compile error** | A type or signature changed | Apply the entry's one-line fix |
+| **Behaviour change** | Compiles, behaves differently | Confirm your usage is outside the described range |
+| **Non-breaking** | Bug fix or added capability | Usually nothing |
 
-### 不在表上的近义名（没有删除计划）
+Upgrading from an old 0.x release: read Deprecated aliases and the removal plan first. Deprecated aliases are removed no earlier than 1.0, so no 0.x upgrade requires a rename.
 
-「`param` → `paramPath` → `nestedParam` 改名三次、旧名都不删」是这类反馈里最典型的一条，
-逐条对上后其实是**一次改名 + 一次澄清性同义名**：
+The full change history is in [CHANGELOG.md](../../CHANGELOG.md); this file records only changes that need action.
 
-- `ctx.param` —— **现行名，不删**。读路由占位符（`/orders/{id}`）；`ctx.pathParam` 是
-  v0.15.38 为消掉"路径参数 vs 任意参数"的误读**新增的同义名**，两者都是正式 API，谁也不弃用谁。
-- `ctx.paramPath` —— 这条链上**唯一的真弃用名**：v0.15.46 改名 `nestedParam`（它读 form/query
-  里的点号路径，从来就不是路由参数），见上表 `ctx.paramPath` 行，**不早于 1.0** 删除。
-- 同类"新增同义名、旧名不弃用"的还有 `ctx.jsonValue`（= `jsonStruct`，v0.15.38）与
-  `http.csrf()`（= `csrfWith(.{})`，v0.33.3）。判别规则只有一条：**弃用名一定在上表里、且代码里
-  带 `DEPRECATED` 标记**（门禁 `src/test/ApiFreeze.zig` 两处都查）；两条都不占的近义名没有删除计划。
+```bash
+zig build test                          # framework self-test; keep the default -Ddb=all
+bash scripts/check-production.sh        # layering gate (bare catches, envelope leaks)
+zmodu ci                                # app: build + fmt + verify + audit + deadcode
+```
 
-**例外：0.x 就删掉的，都是"留着比删掉更坏"的那类** —— `ScheduledTask.TaskScheduler`
-（0.15.0 标注 "for removal in v1.0"，0.15.1 即删：从未工作过的占位实现）、
-`Runtime.cancelTimer(id) bool`（v0.28.0：ticker 化之后 `bool` 再也无法诚实表达
-"它确实还挂着"，留着等于静默改义）、`sqlx.hasUnboundedPgReads`（v0.39.6：判定对象本身没了）、
-`TransactionalEvent` / `src/persistence/Database.zig`（从未从 `root.zig` 导出）。
-规律：**能正常工作的消费方旧名等 1.0；从未工作、从未导出、或保留必然说谎的，发现即删**，
-删除当版在本文记一条。
+## Deprecated aliases and the removal plan
 
-### 整模块级弃用横幅（既不进表，也不进「已移除」）
+Deprecated aliases are removed no earlier than 1.0. The release that removes them is announced here and in that version's entry; nothing is deleted silently.
 
-代码里还有两个**整文件级**的 `DEPRECATED` 横幅。它们与 `Simplified` 不是一类，所以两边都不进：上面那张表只写
-"消费者写过的旧名 → 现在的名字"，而这两处的旧名要么命名空间已经没了，要么本来就只能越路径触达。
+| Deprecated | Current name | Removal |
+|---|---|---|
+| `ctx.paramPath` | `ctx.nestedParam` | No earlier than 1.0 |
+| `zmodu.startAll` | `Application.start()` | No earlier than 1.0 |
+| `zmodu.stopAll` | `Application.stop()` | No earlier than 1.0 |
+| `zmodu.http.http_server` | `http.Server` | No earlier than 1.0 |
+| `ctx.sendSuccess` | `ctx.json` (200, data) — the `{code,msg,data}` envelope is no longer added | No earlier than 1.0 |
+| `ctx.sendFail` | `ctx.json` (status, body) | No earlier than 1.0 |
+| `ctx.sendPageResult` | `ctx.json` (200, body) — build the paging shape yourself | No earlier than 1.0 |
+| `ctx.sendJsonItems` | `ctx.json` (200, body) | No earlier than 1.0 |
+| `RateLimiter.acquire` | `RateLimiter.tryAcquire` (same meaning; it never waited) | No earlier than 1.0 |
 
-- **`src/extensions.zig`** —— 旧的 `zmodu.extensions` 命名空间**已从顶层移除**（记录见下面的「已移除」），
-  剩下一个只导出类型别名的 shim，仍被 `src/tests.zig` 的编译门禁 import。
-- **`src/validation/Validator.zig`** —— 横幅写的是"用 `zmodu.Validator`（`validation/ObjectValidator.zig`）替代，
-  v1.0 删除"。本批之后它是一层**薄兼容层**：文件里只剩 `pub const <名字> = 新家.<名字>;` 形式的别名，一个 `pub fn`
-  都没有；规范实现分两处 —— 规则形状 `src/validation/FieldRules.zig`（零 import 的新家），求值引擎
-  `src/validation/FieldValidation.zig`（`validateStruct:225` / `validateStructCollect:239` / `Violation:157` /
-  `Violations:171` / `MessageHook:193` / `Result:36` / 标量检查器 `notEmpty:50` 等 / 多检查 `Validator:428`）。
-  `http.FieldRules`（`src/http.zig:291` → `src/api/Extract.zig:23`）与 `http.validateRequest`
-  （`src/api/middleware/Validation.zig:186`，引擎 import 在 `:36`）、`http.extractJsonValidated`
-  （`src/api/Extract.zig:184`，引擎 import 在 `:12`）现在都**直接**读新家，两条链都不再经过弃用文件，
-  `Validator.FieldRules` 仍是**同一个类型**。
-  **所以"还差什么才能删"的答案是：没有消费方阻塞项了。** 唯一仍 `@import` 弃用文件的是门禁自己
-  （`src/test/ApiFreeze.zig` 必须真调一次 `notEmpty` / `validateStruct` 才能钉住这些拼写），删文件时把门禁里那两处
-  `@import` 与对应断言一起删掉即可 —— 它钉的正是"删掉不会打断 `http.*`"。`Validator.*` 这些**越路径拼写**本身也从
-  "仍在本文件里的规范实现"降级成"别名转发"，不再是阻塞项。
-  `src/test/ApiFreeze.zig` 钉的是**解耦**：规范声明在两处新家、新家**不得** `@import` 弃用文件、弃用文件**必须**
-  仍指向新家、`http.*` 两个调用方**必须**直连 `FieldValidation.zig`。
+### Near-identical names that are not deprecated
 
-门禁对这两处的断言：横幅仍在**文件头 1500 字节**内、横幅点名的替代路径仍可解析（`zmodu.Validator` /
-`zmodu.http.http_server` / `zmodu.data.sqlx` / `zmodu.data.orm` / `zmodu.data.redis` / `zmodu.security.auth`）、
-`http.FieldRules`（含 `api/Extract.zig` 的再导出与 `Validator.FieldRules` 别名）**与 `validation/FieldRules.zig`
-的规范声明是同一个类型**、**整条 `validateStruct*` 链的规范声明都在 `validation/FieldValidation.zig`**（16 条
-`pub fn` / `pub const … = struct {` 逐条断言"新家有、弃用文件没有"）、弃用文件里**不得**出现任何 `pub fn `（别名层不许再长
-出函数体）、`Validator.*` 的 17 个拼写**逐个**断言仍是 `pub const <名字> = ` 别名、
-两处新家**不得** `@import` 弃用文件而弃用文件**必须**指向 `FieldValidation.zig`、`http.validateRequest` /
-`http.extractJsonValidated` 仍在且**必须**直连 `FieldValidation.zig`（弃用文件的 import 一个都不许有）、
-`src/extensions.zig` 仍被 `src/tests.zig` 的编译门禁 import
-（`validation/Validator.zig` 不在那份直接 import 名单里 —— `src/tests.zig` 直接 import 的是
-`validation/ObjectValidator.zig` / `validation/FieldRules.zig` / 本批新增的 `validation/FieldValidation.zig`；
-门禁自己 `@import` 弃用文件并**真调** `notEmpty`、`validateStruct`、`email`、`validateStructCollect`，
-加上 `src/api/Extract.zig` / `src/api/middleware/Validation.zig` 这两条链一起编译、并由门禁各真调一次）。
+`param` → `paramPath` → `nestedParam` reads like three renames; it is one rename plus one synonym.
+- `ctx.param` — current name, not deprecated; reads route placeholders (`/orders/{id}`). `ctx.pathParam` is a synonym added in v0.15.38. Both are supported API.
+- `ctx.paramPath` — the only deprecated name in this chain. Renamed to `ctx.nestedParam` in v0.15.46 because it reads dotted paths from form/query (`filter.tags`), never route parameters. Removed no earlier than 1.0.
+- Synonymous additions without a removal plan: `ctx.jsonValue` (= `jsonStruct`, v0.15.38) and `http.csrf()` (= `csrfWith(.{})`, v0.33.3).
 
-### `RouteGroup`：**已移除**（运行时注册改用 `Scoped`）
+A name is deprecated when it is in the table above **and** carries a `DEPRECATED` marker in code; `src/test/ApiFreeze.zig` checks both. A name with neither has no removal plan.
 
-`api/Server.zig` 的 `RouteGroup` 与 `Server.group()` 已删除（破坏性，见 CHANGELOG）。
-公开替代只有两个：
+### Names removed during 0.x
+
+Some names left before 1.0 because keeping them was worse: they never worked, were never exported, or would have silently changed meaning. Each is recorded in its version entry: `ScheduledTask.TaskScheduler` (0.15.1, a placeholder), `Runtime.cancelTimer(id) bool` (v0.28.0, `bool` could no longer report a pending timer), `sqlx.hasUnboundedPgReads` (v0.39.6, unbounded reads no longer exist), and `TransactionalEvent` / `src/persistence/Database.zig` (never exported from `root.zig`).
+
+### File-level deprecation banners
+
+Two files carry a whole-file `DEPRECATED` banner. They are neither table rows (no consumer-writable old name remains) nor removals (the file still exists).
+- `src/extensions.zig` — the `zmodu.extensions` namespace is gone from the top level; the file is a type-alias shim reachable only as `@import("zmodu/src/extensions.zig")`, an internal path.
+- `src/validation/Validator.zig` — the banner says "removed in v1.0". The file is aliases only (`pub const <name> = <home>.<name>;`), with no `pub fn`. Canonical homes: `src/validation/FieldRules.zig` for the rule shape, `src/validation/FieldValidation.zig` for the engine (`validateStruct`, `validateStructCollect`, violations, `MessageHook`, scalar checks). `http.FieldRules`, `http.validateRequest` and `http.extractJsonValidated` import the homes directly.
+
+The gate pins the banner to the first 1500 bytes, checks the replacement paths resolve, checks `http.FieldRules` is the same type as `validation/FieldRules.zig`, and checks every `validateStruct*` declaration lives in `validation/FieldValidation.zig` while the deprecated file keeps one alias per spelling and no function bodies. Both files are still imported by the compile gate in `src/tests.zig`.
+
+### Removed
+
+`Simplified` is not in the table: "no earlier than 1.0" is a promise about aliases that still exist, so a deleted name recorded that way would read as available.
+- `zmodu.App` / `zmodu.ModuleImpl` — removed from `src/root.zig` in commit `557190a` (2026-05-12, "…+ Simplified removal"). Replacement: `Application` (`zmodu.builder(...).build(.{...})`). The Before section of [`API-MIGRATION.md`](../archive/status/API-MIGRATION.md) no longer compiles; it only documents what old code did. The implementation remains in `src/api/Simplified.zig`, reachable only as `@import("zmodu/src/api/Simplified.zig")`. `src/test/ApiFreeze.zig` pins both names as absent from the root.
+- `zmodu.extensions` — the whole namespace, including `zmodu.extensions.HttpServer` and `zmodu.extensions.ModuleTestContext`. No commit or tag records the removal; the written evidence is `CHANGELOG.md` `[0.15.0]` (2026-08-01), which already lists `zmodu.ModuleTestContext` as a `root.zig` export. `@hasDecl(zmodu, "extensions")` is false. Replacements: `HttpServer` → `zmodu.http.Server`, `HttpContext` → `zmodu.http.Context`, `SqlxClient` → `zmodu.data.sqlx.Client`, `Orm` → `zmodu.data.orm.Orm`, `RedisClient` → `zmodu.data.redis.Redis`. `src/extensions.zig` still holds these aliases; its banner says "This file will be removed in v1.0".
+
+### Adding a deprecation
+
+All three, in one change: mark the declaration `DEPRECATED` and name the replacement; add a table row with the removal column filled; point that version's entry back here. `src/test/ApiFreeze.zig` fails on a row without a gate, a gate without a row, an empty removal column, or a target that no longer resolves.
+
+### `RouteGroup` and `Server.group` are removed
+
+Runtime registration uses `Scoped`; declarative routes use `routes`:
 
 ```zig
 pub const routes = [_]http.RouteSpec(State){
     .{ .method = .GET, .path = "{id}", .handler = get, .meta = .{ .auth = .jwt } },
 };
-// 挂载：router.scope("/api").mountAll(.{ .{ .Mod = OrderApi, .state = &st } })
+// Mount: router.scope("/api").mountAll(.{ .{ .Mod = OrderApi, .state = &st } })
+// Runtime registration (plugins, admin panels, SSE): scope.get / scope.post / scope.ws
 ```
 
-```zig
-// 确实需要运行时注册（插件、管理面板、SSE 流）
-var scope = router.scope("/api");
-try scope.post("ai/chat/stream", streamHandler, &state);
-try scope.ws("im", onConnect, onMessage, onClose, null);
-```
+Migration is mechanical; method names are unchanged: `server.group("/api")` → `router.scope("/api")`, and `get/post/put/delete/patch/head/options`, `use` and `ws` keep their names.
 
-迁移（机械替换，方法名不变）：
+The difference is metadata. `RouteMeta` keeps auth, permission, roles and OpenAPI in the same comptime table as the handler, duplicate paths fail before `finish()`, and `Testkit.auditAuthCoverage` can audit them. `Scoped` routes are **not** in the catalog: permission gates, OpenAPI and auth-coverage audits cannot see them; use `routes` / `ws_routes` / `sse_routes` when you need those. Framework-internal registration goes through `src/api/RouteRegistrar.zig`, which is not exported from `http.zig`.
 
-- `var g = server.group("/api");` → `var g = router.scope("/api");`
-- `g.get/post/put/delete/patch/head/options(...)` → 同名方法
-- `g.use(mw)` → `g.use(mw)`（`Scoped` 同名）
-- `g.ws(...)` → `g.ws(...)`
+## Zig 0.17 toolchain migration checklist
 
-差别不在写法，而在**元数据位置**：`RouteMeta` 让 auth/permission/roles/OpenAPI 与
-handler 同处一张 comptime 表，重复路径在 `finish()` 前就会失败，`Testkit.auditAuthCoverage`
-也能直接审计。`Scoped` 的运行时方法（以及曾经的 `RouteGroup`）**不进 catalog**——
-权限门、OpenAPI、`auditAuthCoverage` 都看不到它们；需要这些能力就必须走 `routes` /
-`ws_routes` / `sse_routes`。
+Errors your own application code hits after moving to Zig 0.17. Search for the compiler message and apply the fix.
 
-框架内部的运行时注册（Dashboard / Profiles / StaticFiles / SSE）改用
-`src/api/RouteRegistrar.zig`：该文件不从 `http.zig` 导出，是内部实现，不是消费方 API。
-
-### 已移除（记录，不是承诺）
-
-`Simplified` 整块入口**已经不在了**，所以它不在上面的表里：`不早于 1.0` 是对**还在**的别名做的承诺，
-对一个已经删掉的名字继续承诺删除时点，只会让读者以为 `zmodu.App` 今天还能用。
-
-- **移除的名字**：`zmodu.App` / `zmodu.ModuleImpl`（旧写法长什么样见 [`API-MIGRATION.md`](../archive/status/API-MIGRATION.md)
-  的 Before 段 —— 那段今天**照抄编译不过**，它的价值只剩"看懂旧代码在写什么"）。
-- **何时移除的**：commit `557190a`（2026-05-12，标题 `…+ Simplified removal`）已把它从 `src/root.zig` 移除，
-  此后顶层不再有这些名字。
-- **替代品**：`Application`（`zmodu.builder(...).build(.{...})`）。
-- **今天在哪能找到它**：`src/api/Simplified.zig` 仍在树里（只被 `src/tests.zig` 的编译门禁引用），
-  但**只能越路径**触达：`const Simplified = @import("zmodu/src/api/Simplified.zig");` —— 越包内路径不受支持，随时会变。
-- **门禁**：`src/test/ApiFreeze.zig` 钉住 `zmodu.App` / `zmodu.ModuleImpl` **不得**回到顶层，
-  并钉住 `src/api/Simplified.zig` 仍被 `src/tests.zig` 的编译门禁 import。
-
-第二块是 `zmodu.extensions`：
-
-- **移除的名字**：`zmodu.extensions` 整个命名空间 —— 旧写法长这样：`zmodu.extensions.HttpServer`、
-  `zmodu.extensions.ModuleTestContext`（迁移方向见 `docs/dev/upgrade-roadmap.md:77`）。
-- **何时移除的**：**没有可引用的 commit 或 tag**（本批不查 `git`）。可引用的书面证据是 `CHANGELOG.md` 的
-  `[0.15.0]`（2026-08-01）那一段：它把 `zmodu.ModuleTestContext` 列为 `root.zig` 的导出，并把
-  `examples/testing` 记作"已移出弃用的 `zmodu.extensions` 命名空间"—— 也就是说那时这个命名空间已经不在推荐面上。
-  今天的事实**由门禁自己钉住**：`@hasDecl(zmodu, "extensions")` 必须为**假**。
-- **替代品**：域文件 —— `HttpServer` → `zmodu.http.Server`、`HttpContext` → `zmodu.http.Context`、
-  `SqlxClient` → `zmodu.data.sqlx.Client`、`Orm` → `zmodu.data.orm.Orm`、`RedisClient` → `zmodu.data.redis.Redis`。
-- **今天在哪能找到它**：`src/extensions.zig` 仍在树里（只导出上述几种类型别名），且**只能越路径**触达：
-  `const extensions = @import("zmodu/src/extensions.zig");` —— 越包内路径不受支持，随时会变。
-  文件头横幅自己写着 "This file will be removed in v1.0"。
-- **门禁**：`src/test/ApiFreeze.zig` 钉住 `zmodu.extensions` **不得**回到顶层、`src/extensions.zig` 仍在树里、
-  仍被 `src/tests.zig` 的编译门禁 import，且 shim 里的名字仍指向域文件里的**同一批类型**（`HttpServer == http.Server` 等）。
-
-新增弃用项要同时做三件事（否则这张表会变成第二个没人维护的清单）：
-1. 在**代码**的文档注释里写明它已弃用并指向新名；
-2. 在**本表**加一行，删除列不要留空；
-3. 在**它自己那版**的条目里指回本节。
-
-规则 3 的现状（逐条写清楚，**不为凑数编版本号**）。先说两条**已经满足**的，再说哪些**落不了地**、为什么：
-
-- `ctx.paramPath` —— `v0.15.46` 那节已回指（`### ctx.paramPath → ctx.nestedParam`）。
-- `RateLimiter.acquire` —— `v0.15.45` 那节已回指（"删除时点与替代名见 § 弃用别名与删除计划"）。
-
-其余各行**在本文里没有可回指的版本段**，逐条给出实际找到的记录（有就引、没有就说没有）：
-
-- `zmodu.startAll` / `zmodu.stopAll` —— **找得到版本记录，但不在本文**：`CHANGELOG.md` 的 `[0.15.12]`
-  段（Changed）写着"Lifecycle 文档统一：主 API 改为 `Application.start/stop`，`startAll/stopAll` 标注为底层
-  Lifecycle"。`docs/UPGRADING.md` **没有 `v0.15.12` 段**，所以回指无处可落 —— 不为了让规则 3 好看而新造一个版本段
-  （该段本身不是破坏性变更，本文件只收"会咬人"的条目）。
-- `zmodu.http.http_server` —— **没有弃用条目**可引：`CHANGELOG.md` 里唯一的版本性记录是 `[0.15.8]`（Changed，
-  "API.md 旧别名清理：`zmodu.http_server.*` 示例统一为 `zmodu.http.*`"），那是**示例清理**，不是"某版起弃用"；
-  `src/http.zig:13` 的标记自称 "removed from root in v0.14.0"，而 `CHANGELOG.md` 里**没有 `[0.14.0]` 段**
-  （现存最早的是 `[0.14.13]`）。本文也没有对应版本段。
-- `ctx.sendSuccess` / `ctx.sendFail` / `ctx.sendPageResult` / `ctx.sendJsonItems` —— **找不到**"某版本引入/弃用"的条目：
-  `CHANGELOG.md` 里出现的都是**引用**（`[0.33.0]` 引用 `sendSuccess` 写的 `code: 0` 信封语义、`[0.15.3]` 把 legacy
-  `sendSuccess/sendFail` 列进 `zmodu audit` 的业务规则），不是弃用记录；`docs/API-MIGRATION.md`「HTTP responses」
-  那段是散文，没有版本号。本文也没有对应版本段。
-- 上面两个整模块横幅 —— 同样没有版本段（横幅是本文件顶部这两条，不是某个版本的条目）。
-
-结论：规则 3 在本文里只对 `ctx.paramPath` / `RateLimiter.acquire` 可执行（都已完成）；其余四组要么记录只存在于
-`CHANGELOG.md`（本文不镜像 `CHANGELOG.md` 的历史），要么根本不存在。**这是"找不到"的明确结论，不是省略。**
-
-
-> 每条变更标注 **Breaking?** / **影响面** / **一行改法**。
-> 只记"会咬人"的：行为变化、公开签名变化、默认值变化、需要动手删代码的地方。
-> 完整变更列表见 [`../CHANGELOG.md`](../../CHANGELOG.md)；框架级迁移（Simplified → Application）
-> 见 [`API-MIGRATION.md`](../archive/status/API-MIGRATION.md)。
-
-自查命令（升级后先跑这两条）：
-
-```bash
-zig build test                          # 框架自测必须默认 -Ddb=all
-bash scripts/check-production.sh        # 分层门禁（含热路径裸 catch、信封泄漏）
-zmodu ci                                # 业务项目：build + fmt + verify + audit + deadcode
-```
-
-## Zig 0.17 工具链迁移 checklist（消费方自己的 app 代码）
-
-升级 Zig 0.17 后**你的应用代码**会撞的编译错误与改法。框架自身三波迁移（批 141 SafeAllocator/@divCeil、
-批 146 allocPrint→print 309 处、批 148 builtin.os.tag 等 48 处）已全部落地，下面是给消费方的同款清单——
-按编译错误原文检索，逐条对照改：
-
-| 编译错误原文（关键词） | 改法 | 备注 |
+| Compile error (keyword) | Fix | Note |
 |---|---|---|
-| `no member named 'allocPrint'` / `'allocPrintSentinel'` | `std.fmt.allocPrint` → **`Allocator.print`**（返回值改 `!void`，缓冲区自行管理）；或 `std.Io.Writer.fixed` + `print` | 批 146；`runtime_safety` 参数也没了 |
-| `no member named 'intFromEnum'`（deprecated 警告） | `@intFromEnum` → **`@backingInt`**；`@enumFromInt` → **`@fromBackingInt`** | `zig fmt` 可自动改大部分；`@fromBackingInt` 要求精确底层类型，fmt 会补 `@intCast` |
-| `no member named 'builtin' in 'std'` | `std.builtin.Type.Struct.FieldAttributes` → **`std.lang.Type.Struct.FieldAttributes`**（纯改名，类型相同） | 批 148 |
-| `no member named 'os'/'cpu'/'abi'/'object_format'`（`@import("builtin")` 顶层） | → **`builtin.target.os` / `target.cpu` / `target.abi` / `target.ofmt`**（注意 ofmt 不叫 object_format） | 0.18.0 将移除旧名，现在迁 |
-| `no member named 'DebugAllocator'` | → **`std.heap.DebugAllocator`（SafeAllocator）** 语义相同，改名 + 泄漏检测更严 | 批 141 |
-| `hasDecl`（函数形式） | → **`@hasDecl`**（comptime 内建） | 0.17 移除函数形态 |
-| `trimRight` / `trimLeft` | → **`trimEnd` / `trimStart`** | 纯改名 |
+| `no member named 'allocPrint'` / `'allocPrintSentinel'` | `std.fmt.allocPrint(a, fmt, args)` → `a.print(fmt, args)` (returns `!void`); `allocPrintSentinel` → `a.printSentinel(fmt, args, sentinel)` | Or `std.Io.Writer.fixed` plus `print` |
+| `no member named 'builtin' in 'std'` | `std.builtin.…` → `std.lang.…` (`Type`, `SourceLocation`, `CallingConvention`) | Type is unchanged |
+| `no member named 'os'/'cpu'/'abi'/'object_format'` | `@import("builtin").os` → `builtin.target.os`, `cpu` → `target.cpu`, `abi` → `target.abi`, `object_format` → `target.ofmt` | Old names removed in 0.18.0 |
+| `no member named 'DebugAllocator'` | `std.heap.SafeAllocator` | Same semantics, stricter leak detection |
+| `hasDecl` (function form) | `@hasDecl` | Function form removed in 0.17 |
+| `trimRight` / `trimLeft` | `trimEnd` / `trimStart` | Rename only |
+| `@intFromEnum` / `@enumFromInt` | `@backingInt` / `@fromBackingInt` | `zig fmt` migrates most; `@fromBackingInt` needs the exact backing type |
 
-**0.17 移除级**（不是弃用警告、直接编译错）：
+Removed outright in 0.17 — compile errors, not deprecation warnings:
 
-| 被移除 | 替代 |
+| Removed | Replacement |
 |---|---|
-| `std.Thread.sleep` / `std.Thread.Mutex` / `std.Thread.WaitGroup` | busy-loop 或 `std.Io.sleep` / **`std.Io.Mutex`**（`lock(io)`/`unlock(io)` 都要 io 参） / `std.Io.Group` |
-| `std.time.timestamp` / `milliTimestamp` / `microTimestamp` / `nanoTimestamp` | 时长用 **`Time.monotonicNowSeconds/Milliseconds`**（`zmodu` 导出）；入库墙钟用 **`Time.wallClockSeconds/io` / `wallClockMilliseconds/io`**（墙钟可回拨，差值非时长） |
-| `std.os.getpid` | `@intFromPtr(&seed)` 取熵 |
-| `std.fs.cwd()` / `std.fs.File` | **`std.Io.Dir.cwd(io)` / `std.Io.File`**（全部 API 要 io 参）；`file.writeAll` → `writeStreamingAll(io, data)` |
-| `ArrayList(T).init(alloc)` | `ArrayList(T).empty` + 每个方法传 allocator |
-| `file.reader()` / `buf.writer(allocator)` | `allocPrint`+`appendSlice` 模式 / `std.Io.Writer` 形态 |
+| `std.Thread.sleep` / `std.Thread.Mutex` / `std.Thread.WaitGroup` | Busy loop or `std.Io.sleep` / `std.Io.Mutex` (`lock(io)`, `unlock(io)`) / `std.Io.Group` |
+| `std.time.timestamp` / `milliTimestamp` / `microTimestamp` / `nanoTimestamp` | `Time.monotonicNowSeconds` / `Time.monotonicNowMilliseconds` for durations; `Time.wallClockSeconds(io)` / `Time.wallClockMilliseconds(io)` for stored timestamps (the wall clock can move backwards) |
+| `std.os.getpid` | `@intFromPtr(&seed)` for a pid-shaped value; entropy comes from `std.Io.randomSecure` |
+| `std.fs.cwd()` / `std.fs.File` | `std.Io.Dir.cwd(io)` / `std.Io.File`; `file.writeAll(data)` → `file.writeStreamingAll(io, data)` |
+| `ArrayList(T).init(alloc)` | `ArrayList(T).empty` plus an allocator on every method |
+| `file.reader()` / `buf.writer(allocator)` | `allocPrint` + `appendSlice`, or `std.Io.Writer` |
 
-> 框架内部的完整 removed 表（含 POSIX 信号、`crc.Crc32Iscsi` 等冷门项）见 [`AGENTS.md`](../../AGENTS.md)
-> 「Zig 0.17.0 — what's REMOVED」表——那张表面向框架贡献者，这张表面向消费方应用代码。
+The full removed list for framework contributors, including POSIX signals and `crc.Crc32Iscsi`, is in [AGENTS.md](../../AGENTS.md) under "Zig 0.17.0 — what's REMOVED".
 
----
+## v0.41 — rename ZigModu → zmodu (compile error)
+
+Package, module and repository names are all `zmodu`. The compiler reports every site.
+- Dependency key and module: `.zmodu = .{ … }` in `build.zig.zon`; `b.dependency("zmodu", …).module("zmodu")`; `@import("zmodu")`.
+- The `zigmodu` module and the `ZIGMODU_*` environment variables are gone. Rename dependency key, module name, imports and env prefix in one pass; no alias is kept.
+- The package fingerprint is `0xde7987a02b121580` (Zig requires a new value after a rename). Dependency hash prefixes changed from `zigmodu-` to `zmodu-`; run `zig fetch` again and update `.hash`.
+- These wire contracts keep the old spelling on purpose: Prometheus metrics `zigmodu_*`, migration table `_zigmodu_migrations`, Raft snapshot prefix `zigmodu-raft-snapshot:`, model field `zigmodu_ignore_tenant`. They live in dashboards, existing databases, on-disk formats and application code; the rename happens at 1.0 with dual write and migration.
+- Repository `https://github.com/chy3xyz/zmodu` (GitHub redirects the old URL). Docs use `--url-prefix zmodu`. `install.sh` installs to `~/.zmodu`; `~/.zigmodu` is not reused.
 
 ## v0.39.11
 
-> 本节收当前周期（批 168–170）的「会咬人」变更。发布时由 `scripts/release.sh` 自动改名为新版本号。
-
-### ① `staticMiddleware` 返回错误（第 168 批，**编译错**）
-
-`StaticFiles.staticMiddleware` 的返回类型改为 `!api.Middleware`：构造路径可能失败，此前被内部吞掉。调用处加 `try` 即可。
-
-### ② Migration 失败不再一律视为「已应用」（第 168 批，**行为收紧**）
-
-此前失败语句被无条件豁免并标记已应用；现在只豁免可证明冗余的 `ALTER TABLE ADD COLUMN`（失败后用 `SELECT <列> FROM <表> LIMIT 0` 探针验证——驱动拿不到结构化错误码），其余返回 `error.MigrationFailed` 且该迁移**不**标记已应用。依赖「失败即跳过」的迁移脚本需要修正。
-
-### ③ dial 超时默认值（第 169 批，**行为收紧**）
-
-黑掉的对端此前会把拨号挂到内核默认（macOS 实测 >25 s）。本批各模块补上 TCP dial 上界：
-
-- **Kafka**：`KafkaProducerConfig.connect_timeout_ms = 5000` **现在真生效**——该字段此前声明了但从未转发，实际一直用内核默认；要旧行为请显式设 `0`。consumer 新增同名字段、同默认。
-- **DistributedEventBus**：新增 `connect_timeout_ms`，默认 `5000`（`0` = 内核默认）。
-- **redis / NATS**：新增 `connect_timeout_ms`，默认 `0` = 内核默认（行为不变，显式可设）。
-- `FluvioNative.connectWithTimeout` 为新增 API；原 `connect` 不变。
-
-### ④ HttpClient `timeout_ms` 语义：每次读独立 → 整个请求（第 169 批，**行为变化**）
-
-原来每轮 read 各自等满 `timeout_ms`，慢滴流响应总耗时可达 N × timeout；现在是请求级 deadline，预算耗尽返回 `error.Timeout`。`0` = 不限，语义不变。同批新增 `max_response_bytes`（默认 `0` = 不限）：设值后 `Content-Length` 超限在分配前拒绝、chunked 按解码总量截断（`error.ResponseTooLarge`）——对端决定这两个尺寸，不该由它决定你的分配。
-
-### ⑤ RateLimiter registry 默认有界（第 169 批，**行为收紧**）
-
-`RateLimiterRegistry.init` 的 `max_keys` 默认 `0`（无界）→ `default_max_keys = 65_536`（LRU 上界）。显式 `initWithCapacity(…, 0)` 仍是无界。键来自请求输入，默认无界是远程可触发的内存增长向量。
-
-### ⑥ Raft 快照累积上界（第 169 批，**行为收紧，仅 >256 MiB 快照流可见**）
-
-`ElectionConfig.max_snapshot_bytes` 新增，默认 256 MiB（`0` = 禁用）。超限即拒绝该快照流并清空缓冲（term-only 应答，leader 下轮从 offset 0 重发，合法快照自愈）；快照完成/拒绝/替换后缓冲真释放（峰值内存不再常驻）。
-
----
+1. **`StaticFiles.staticMiddleware` returns `!api.Middleware`** (compile error). Construction can fail; add `try` at the call site.
+2. **Failed migrations are no longer marked applied** (behaviour tightening). Only a provably redundant `ALTER TABLE ADD COLUMN` is exempt, verified with a `SELECT <column> FROM <table> LIMIT 0` probe. Everything else returns `error.MigrationFailed` and leaves the migration unapplied.
+3. **TCP dial timeouts** (behaviour tightening). `KafkaProducerConfig.connect_timeout_ms = 5000` now takes effect — it was declared but never forwarded, so the kernel default applied; set `0` for the old behaviour. The Kafka consumer gains the same field and default. `DistributedEventBus` gains `connect_timeout_ms = 5000`. `redis` and `NATS` gain `connect_timeout_ms = 0` (kernel default, unchanged behaviour). `FluvioNative.connectWithTimeout` is new; `connect` is unchanged.
+4. **`HttpClient.timeout_ms` is a request deadline** (behaviour change). A slow-drip response can no longer take N × `timeout_ms`; the budget is exhausted and `error.Timeout` is returned. `0` still means unlimited. New `max_response_bytes` (default `0` = unlimited): an oversized `Content-Length` is rejected before allocation, and decoded chunked bodies are truncated with `error.ResponseTooLarge`.
+5. **`RateLimiterRegistry` is bounded by default** (behaviour tightening). `init` now uses `default_max_keys = 65_536` (LRU) instead of `0` (unbounded); `initWithCapacity(…, 0)` is still unbounded. Keys come from request input, so an unbounded registry is remotely triggerable memory growth.
+6. **Raft snapshot accumulation is bounded** (behaviour tightening; only visible above 256 MiB). `ElectionConfig.max_snapshot_bytes` defaults to 256 MiB (`0` disables). An oversized stream is rejected and its buffer cleared; the leader resends from offset 0 on the next round. The buffer is released when a snapshot completes, is rejected, or is replaced.
 
 ## v0.39.10
 
-> 本节收本发布周期的「会咬人」变更。
+**Per-node keys now authenticate the event bus** (behaviour change). Applies only to clusters that configure `own_key`/`peer_keys` without `cluster_secret`: the bus previously ran bare frames, and now `ClusterBootstrap` forwards the same key material to it, making the bus handshake mandatory. The Raft wire format is unchanged.
 
-### ① per-node key 现在同时认证事件总线（第 153 批，**行为变化**）
-
-**Breaking?** 编译否、**行为是** —— 仅影响「配了 `own_key`/`peer_keys` 且没配 `cluster_secret`」
-的集群：这类配置的事件总线此前跑**裸帧**（per-node key 只转发给 Raft 端口），现在
-`ClusterBootstrap` 把同一份 key 材料也转发给总线，总线握手转为**强制认证**。Raft 端口的 wire
-与行为一字未变。
-
-**谁被咬**：per-node 配置下做**滚动升级**的集群——升级窗口内新节点的总线要求握手、旧节点
-（≤ v0.39.9）的总线仍是裸帧，两面之间的**总线 mesh 会短暂断开**（Raft 复制不受影响）。
-**零中断升法**：先给所有节点补配 `cluster_secret` 滚一轮（有它时总线保持用它、不触发转发），
-再滚本版本；如之后想去掉 `cluster_secret`，再单独滚一轮。
-
-配了 `cluster_secret` 的集群：**零变化**（总线继续用它，不转发）。
-
----
+Rolling upgrade of such a cluster: new nodes demand a handshake while nodes at v0.39.9 and older still send bare frames, so the bus mesh disconnects between the two sides (Raft replication is unaffected). Configure `cluster_secret` on every node and roll once, then roll this version; remove `cluster_secret` in a separate roll if you do not want it. Clusters that already set it see no change.
 
 ## v0.39.6
 
-> 本节收 v0.39.6 的「会咬人」变更。
-> **3 处破坏性**：① 中间件工厂与槽位池函数返回错误（编译错）；② `Fx.Parallel` / `Fx.Map`
-> 真并发化、签名换血（编译错）；③ JWT 段改用 std 严格 base64url，带 `=` padding 的段被拒
-> （行为收紧）。另有 ④⑤⑥ 三条行为变化（④ scheduler `push` 的预算语义，非破坏性；
-> ⑤ sqlx `query_timeout_ms = 0` 从「无界 + 警告」改为「回落默认有界」+ 删
-> `hasUnboundedPgReads`；⑥ TimerWheel 同 deadline 触发序从 LIFO 反转为 FIFO）。逐条背景见
-> [`../CHANGELOG.md`](../../CHANGELOG.md) `[0.39.6]` 段的第 138 / 136 / 135 / 134 / 133 / 130 批。
-
-### ① 中间件工厂与槽位池函数返回错误（第 134 批，**编译错**）
-
-**Breaking?** 是 —— 一批启动期函数从「失败即 `@panic`」改成「失败返回错误」，忘了 `try`
-一律编译不过：
-
-- **`error{OutOfMemory}!api.Middleware`**（13 个工厂）：`http.jwtAuthFromCatalog` /
-  `http.jwtAuthFromCatalogWithPermissions` / `http.authFromCatalog` / `http.tenantResolver` /
-  `http.moduleGate` / `http.permissionGate` / `http.permissionGateWith` /
-  `http.compressionMiddleware`，以及 `http.http_middleware` 下的 `cors` / `jwtAuth` /
-  `csrf` / `csrfWith` / `securityHeaders` / `rateLimitPerClient`。
-- **`error{SlotPoolExhausted}`**（槽位池）：`http.catalogLoaderFromTable`（64 槽）、
-  `zmodu.security.CatalogPermDb.loaderFromClient`、`zmodu.security.ApiKeyAuth`（即
-  `apiKeyAuth`）与 `ApiKeyAuthWithLoader`、`http.openApiFromCatalog` 与
-  `http.openApiRoutes`（16 槽）。
-
-**影响面**：所有自己接线中间件 / 权限 loader 的应用（每个接线点一处编译错，逐处加
-`try` 即修完）。
-
-**一行改法**：
+1. **Middleware factories and slot-pool functions return errors** (compile error). Add `try` at every wiring point.
 
 ```zig
-// 旧
+// Old
 try server.addMiddleware(http.permissionGateWith(&slot, .{ .mode = .rbac }));
-// 新（注意嵌套的那一层 try）
-try server.addMiddleware(try http.permissionGateWith(&slot, .{ .mode = .rbac }));
-
-// 旧
 const loader = zmodu.security.CatalogPermDb.loaderFromClient(db);
-// 新
+// New: note the nested try
+try server.addMiddleware(try http.permissionGateWith(&slot, .{ .mode = .rbac }));
 const loader = try zmodu.security.CatalogPermDb.loaderFromClient(db);
 ```
 
-`SlotPoolExhausted` 只在接线次数超过池上限时发生；一次性接线（每 app 一张表 / 一个 slot）
-不受影响。真撞上时把错误冒泡给 `main`——**别 `catch` 掉继续跑**：那意味着后面的路由没有
-授权 loader。要抬高上限看各池 doc 注释里点名的 `max_*` 常量。
+The 13 factories returning `error{OutOfMemory}!api.Middleware`: `http.jwtAuthFromCatalog`, `http.jwtAuthFromCatalogWithPermissions`, `http.authFromCatalog`, `http.tenantResolver`, `http.moduleGate`, `http.permissionGate`, `http.permissionGateWith`, `http.compressionMiddleware`, and under `http.http_middleware`: `cors`, `jwtAuth`, `csrf`, `csrfWith`, `securityHeaders`, `rateLimitPerClient`. The slot pools returning `error{SlotPoolExhausted}`: `http.catalogLoaderFromTable` (64 slots), `zmodu.security.CatalogPermDb.loaderFromClient`, `zmodu.security.ApiKeyAuth` (also `apiKeyAuth`) and `ApiKeyAuthWithLoader`, `http.openApiFromCatalog` and `http.openApiRoutes` (16 slots). Let the error reach `main`; catching it leaves later routes without an authorization loader.
 
-### ② `Fx.Parallel` / `Fx.Map` 真并发化（第 133 批，**编译错**）
-
-**Breaking?** 是 —— 两函数首参换成 `io: std.Io`；`Parallel` 删掉了从未使用的 allocator
-参数。行为变化：从静默串行变成真并发（`std.Io.Group` 按 `max_workers` 分块），传入的
-`func` 必须线程安全。
-
-**影响面**：直接调 `zmodu.fx.Parallel` / `fx.Map` 的代码（框架仓内零调用点）。
-
-**一行改法**：
-
-```zig
-// 旧
-try zmodu.fx.Parallel(allocator, T, items, 4, func);
-// 新
-try zmodu.fx.Parallel(io, T, items, 4, func);
-```
-
-### ③ JWT 段改用 std 严格 base64url（第 130 批，**行为收紧**）
-
-**Breaking?** 对依赖宽松解码的部署是 —— 带 `=` padding 的 JWT 段从此被拒（RFC 7515 的
-base64url 本无 padding）。**影响面**：收过非标准实现的 token 的应用。**一行改法**：让
-签发方输出无 padding 段（标准实现本来如此）；没有这类客户端就不需要动。顺带：此前修过的
-「解码失败泄漏缓冲区」语义在新实现下保留，下游为该泄漏加的 e2e 豁免可以随本版退役。
-
-### ④ Scheduler `push`：预算耗尽从断言改为等待（第 135 批，**非破坏性行为变化**）
-
-**Breaking?** 否 —— 无 API 变化。行为变化在一条**过去等于进程 abort** 的路径上：
-池化调度器的 `push` 在自旋/让出预算全部耗尽后，不再 `assert`（Debug/ReleaseSafe 下 abort），
-而是转为 1ms 睡眠重试直到槽位出现或调度器停机。对消费方的可见影响只有三个：
-`ready_push_failures` 的语义从「丢过 token」精确化为「有 push 等过了整个预算」（**仍是
-必须恒 0 的契约读数**，非零 = 宿主把出队窗口持有者抢占得超过 ~100ms，值得查宿主机而不是查框架）；
-首次越预算时 stderr 多一段环取证 dump（每调度器一次）；以及 ReleaseFast/Small 下那条
-「计数后静默返回、worker 永久失联」的路径**不再存在**。背景与根因推导见
-[`RUNTIME.md` §12.18](./RUNTIME.md)。
-
-### ⑤ sqlx `query_timeout_ms = 0`：从「无界 + 警告」改为「回落默认有界」（第 136 批，**行为变化 + 一处 API 删除**）
-
-**Breaking?** 两处都很窄：① 行为变化 —— postgres / mysql 的 `Config.query_timeout_ms = 0`
-不再表示「读无界」（PG 旧行为：不装 `SO_RCVTIMEO` 并在 `Client.connect` 打一条警告；
-MySQL 旧行为：无论配什么都硬编码 30s），现在统一为 **0 = 回落默认 30000ms**，读**总是有界**；
-维护工具想要接近无界就显式配一个大值（如 `86_400_000`）。② API 删除 ——
-`sqlx.hasUnboundedPgReads` 随之删除（无界路径不存在了，判定函数失去对象），树内零调用方；
-树外若有人调它会编译错，删掉该调用即可。配套新增 `sqlx.DEFAULT_QUERY_TIMEOUT_MS`（= 30000）
-与 `sqlx.effectiveQueryTimeoutMs`（0 → 默认值的解析点），MySQL 的
-`MYSQL_OPT_READ_TIMEOUT` 现在真正吃这个配置（按秒向上取整，亚秒也至少有 1s 界）。
-
-### ⑥ TimerWheel 同 deadline 触发序：LIFO → FIFO（第 138 批，**行为变化，窄**）
-
-**Breaking?** 无 API 变化，纯行为 —— 多个定时器落在**同一 deadline** 时，触发顺序从
-「后 arm 的先触发」（槽内 prepend）反转为「先 arm 的先触发」（= arm 命令到达命令环的
-顺序 = 因果序）。**影响面**：只有对同槽触发序有依赖的代码才感知得到；该序此前从未写进
-契约，树内零依赖。**一行改法**：若确实依赖旧方向，把 arm 顺序倒过来；更好的做法是不依赖
-同 deadline 的相对序（不同 deadline 的先后从来都有保证）。
-
----
+2. **`Fx.Parallel` / `Fx.Map` run concurrently** (compile error). The first parameter is `io: std.Io`, so `zmodu.fx.Parallel(io, T, items, 4, func)`; `Parallel` dropped its unused allocator. Work is chunked by `max_workers` with `std.Io.Group`, so `func` must be thread-safe.
+3. **JWT segments use strict base64url** (behaviour tightening). Segments with `=` padding are rejected, per RFC 7515. Make the issuer emit unpadded segments; standard implementations already do.
+4. **Scheduler `push` waits instead of aborting** (non-breaking). When the spin/yield budget is exhausted, `push` sleeps 1 ms and retries until a slot appears or the scheduler stops. `ready_push_failures` now means "a push waited the whole budget" and must still stay 0; a non-zero value points at the host, not the framework.
+5. **sqlx `query_timeout_ms = 0` falls back to the default** (behaviour change, one API removal). For postgres and mysql, `0` now means 30000 ms rather than unbounded; reads are always bounded. `sqlx.hasUnboundedPgReads` is removed. New `sqlx.DEFAULT_QUERY_TIMEOUT_MS` (30000) and `sqlx.effectiveQueryTimeoutMs`. MySQL's `MYSQL_OPT_READ_TIMEOUT` now uses this value, rounded up to whole seconds.
+6. **TimerWheel fires equal deadlines FIFO** (behaviour change). Timers armed on the same deadline fire in arm order instead of reverse arm order. If you depended on the old order, reverse your arm order; better, do not depend on relative order within one deadline.
 
 ## v0.35.0
 
-> **没有公开 API 被删**（`docs/API.md` 里的名字一个没动）。**一条口径变化**：WS 帧推送的
-> `ws_write_timeout_ms = 0` 从"无界"改成"继承 `response_write_timeout_ms`"。另有两条 HTTP/2
-> 行为变化和一条全局口径（服务端**每条**写路径都有上界）—— 都是修缺陷，但你在生产上看得见。
+- **`ws_write_timeout_ms = 0` means "inherit", not "unlimited"** (behaviour change). Pushes now use `response_write_timeout_ms` (default 30 s). To restore the old behaviour, set `response_write_timeout_ms = 0`, which disables both budgets.
+- **Every server write path has a budget** set by `response_write_timeout_ms`: H1 buffered responses, chunked/streaming, SSE, HTTP/2 frames and `Server` WS frames. `WebSocketServer` and `WebMonitor` have their own `setWriteTimeout` (default 30 s). The budget applies per `send`, so a slow but moving peer is not cut off; a peer that stops reading gets a truncated response and a closed connection. A failed write is sticky: later writes and flushes return the same error instead of a successful empty flush.
+- **HTTP/2 responses larger than `max_pending_bytes` (default 4 MiB) are sent.** `max_pending_bytes` bounds the queue, not the body; workarounds that moved large H2 responses to H1 can be removed. New H2 streams start at the peer's `SETTINGS_INITIAL_WINDOW_SIZE` (RFC 9113 §6.5.2) instead of 65535.
 
-### 1. `ws_write_timeout_ms = 0` 现在是"继承"，不是"无界"（**行为变化，窄**）
+## v0.33.6 → v0.34.0 (released as v0.34.0)
 
-**谁受影响**：把 `ws_write_timeout_ms` 显式设成 `0`、并指望"推送永远不因对端不读而失败"的部署。
-以前一个不读的客户端能把推送线程永久 park 住；现在它在 `response_write_timeout_ms`（默认 30 s）
-的预算内零进展就会被截断/断开。
+No breaking change in this release.
+- New `zmodu.TomlLoader`: `var loader = zmodu.TomlLoader.init(allocator); try loader.loadFile("app.toml", &config);`. `[server]` + `port` becomes `server.port`, and types are preserved.
+- `ScopedContainer.registerBorrowed` / `remove` / `serviceCount` complete the `Container` surface. Lookups (`get`, `contains`) fall through to the parent; mutations and `serviceCount` apply to the current scope only. `remove` never reaches the parent, because unregistering a shared service would leave other readers with a destroyed instance.
+- `zmodu.runtime.affinity`: `supported` (comptime) and `pinCurrentThread(cpu_index)`. Linux uses `sched_setaffinity(0, …)` and pins the calling thread; macOS and Windows return `error.Unsupported`; a kernel refusal returns `error.PinFailed`. It never reports success it did not achieve. `spawn` has no `.affinity` field.
+- `src/core/TransactionalEvent.zig` is removed. It was a 249-line stub whose functions were `_ = event;` and never a public export; only path imports break. Use `zmodu.outbox.*` or `zmodu.SagaOrchestrator`.
+- `PrecisionTimer`'s 10 µs median bound depends on the host. On a shared runner or container, run its measurement test first and raise `spin_window_ns` (or set `0` to opt out). The 5 ms `Runtime` timer wheel is unaffected. `batch` stays at 16: measurement rejected only `1`, and 8/16/32/64 share one noise band. The pooled-worker latency tail comes from `idle_wait_ms = 1` polling, not `batch`.
+- Delivery-log persistence: `src/runtime/delivery_log.zig` exists but is not exported from `runtime.zig`/`root.zig` and has no consumer, so `Runtime Replay` still cannot cross a process or a restart. `ReplayFromLog` is load-then-replay, needs a codec, rejects holes with `error.LogHasHoles` unless `allowHoles()` is called, and holds an allocator. Bind with `setCodec(id, C, E)` and `bindDecoded(id, handle)`; use `DeliveryLog.setCodecRef(track, C, E)` for tracks declared through `Runtime.spawn(.record)`.
+- `Handle.after` records `.timer` and `send*` records `.message`. `Track.record(event)` is unchanged and equals `recordKind(..., .message)`; use `Track.recordKind(event, kind)` to choose. Replay from disk always delivers `.message`; the recorded kind stays on `LogStep.kind`. `Replayer.bind` no longer rejects a track that declared a codec, and `BindError` no longer has `error.CodecRequired`.
 
-**一行改法**：想要旧的无界行为，把 `response_write_timeout_ms` 设成 `0`（两处一起关）。
-不设 `0` 的部署不需要动。
+## v0.33.4 and v0.33.5
 
-### 2. 服务端每条写路径都默认有写预算（**口径**，`response_write_timeout_ms` 是开关）
+Compile errors:
+- **Password verification returns `PasswordError!bool`** (`error{MalformedStoredHash} || std.mem.Allocator.Error`) from `PasswordEncoder.matches` and `SecurityModule.verifyPassword`. An undecodable stored hash or an allocation failure is no longer reported as "wrong password".
 
-HTTP/1.1 缓冲响应、chunked/streaming、SSE、HTTP/2 帧、`Server` 的 WS 帧推送，现在都由
-`response_write_timeout_ms`（默认 30 s）界定；扩展层 `WebSocketServer` / `WebMonitor` 各有自己的
-`setWriteTimeout`（默认 30 s）。预算是**每次 `send`** 的，所以只是慢（一直在流动）的对端不会被切断；
-停住不读的会拿到**被截断的响应** + 连接关闭，而不是把连接 fiber 一直占着（`stop()` 也就不会被对端拖住）。
-
-顺带一条契约：**写失败是粘住的** —— 一个 socket 写失败之后，之后任何写/flush 都会返回那次错误
-（不会出现"空 flush 返回成功"）。这条过去会让一个已经写不出去的 H2 会话继续读下去。
-
-### 3. HTTP/2 两条行为变化（都在修缺陷）
-
-* **响应体大于 `max_pending_bytes`（默认 4 MiB）现在能发出去。** 以前 6 MiB 得到
-  `RST_STREAM(ENHANCE_YOUR_CALM)`、16 MiB 得到 `INTERNAL_ERROR`，而同一路由在 HTTP/1.1 上正常 ——
-  为此做过的"H2 大响应改走 H1"变通可以撤掉。`max_pending_bytes` 恢复成它注释里的语义：**管队列，
-  不管响应体**。
-* **新流的发送窗口按对端 `SETTINGS_INITIAL_WINDOW_SIZE` 起**（RFC 9113 §6.5.2）。过去新流一律从
-  65535 起、忽略对端声明 —— 对端声明小于 65535 时，现在它拿到的是**它声明的值**（WINDOW_UPDATE
-  轮次相应变多）。
-
----
-
-## v0.33.6 → v0.34.0（内容已随 **v0.34.0** 发布，本节标题是旧名）
-
-> **本版无破坏性变更**：新增 `zmodu.TomlLoader`、`ScopedContainer` 的三个方法、`zmodu.runtime.affinity`
-> （CPU pin 原语），删除一个从没实现过的空壳 `TransactionalEvent`。**第 31 批也是无公开 API 变化的一批**
-> （一个内部存储层 + 两组实测），但它的结论会改变你读 §12 的方式 —— 见本节最后一条。
-> 另有两条**消费者应当知道的口径**：① `PrecisionTimer` 的 10 µs 中位数界是**宿主的**、不是机制的 ——
-> 共享 runner/容器上要按下面的表调 knob；② 弃用别名表里的删除时点仍是"不早于 1.0"。
-
-**新增公开 API（additive，无破坏性）**
-
-- **`zmodu.TomlLoader`** —— 上一版补了 `ConfigManager` 的导出，但 TOML 还是读不了（loader 本身没导出）。
-  现在 `var loader = zmodu.TomlLoader.init(allocator); try loader.loadFile("app.toml", &config);`，
-  `[server]` + `port` 落成 `server.port`，类型保留（`getInt`/`getBool`/`getFloat` 可用）。
-  **一行改法**：以前只能自己 `@import` 框架内部文件路径的，改从 `zmodu` 导入。`root.zig` 的
-  "文档里出现的符号必须可导入"测试里加了一条 TOML 端到端（文件 → `loadFile` → 读值），漏加导出让测试红。
-- **`ScopedContainer.registerBorrowed` / `remove` / `serviceCount`** —— 补齐与 `Container` 的差集。
-  **语义要点：改/查两半的穿透规则不同** ——`get`/`contains` 查本作用域再下沉 `parent`；
-  `register`/`registerBorrowed`/`remove`/`serviceCount` **只作用于本作用域**。`remove` 永不下沉：
-  作用域注销一个共享服务，会让 parent 容器的其它读者拿到已销毁的实例。`serviceCount` 只数本层
-  （同名可在两层都注册，跨层计数会重复）。**一行改法**：以前为了"改本层"而绕开 `ScopedContainer`、
-  直接对 `Container` 动手的代码可以收回来。
-- **`zmodu.runtime.affinity`** —— `supported`（comptime 常量）与 `pinCurrentThread(cpu_index)`：
-  Linux 走 `sched_setaffinity(0, …)`（pin 的是**调用线程**），**macOS 与 Windows 返回 `error.Unsupported`**，
-  平台有 API 但内核拒绝时返回 `error.PinFailed`。**它绝不假报成功** —— 这是刻意的：
-  "静默忽略的声明是比没声明更坏的失败模式"。**注意这不等于 `spawn` 上有了 `.affinity` 字段**：
-  那个声明判定为**缓做**，阻塞点是 dedicated 路径还没有父子启动握手（见 CHANGELOG 第 30 批）。
-
-**删除：`src/core/TransactionalEvent.zig`（249 行的空壳）** —— 上一版已判定它不是公开 API（`root.zig`
-从未导出、`docs/API.md` 那节已改为 internal）。这次连文件一起删掉，因为留着它就是留一份"看起来能用"的假实现
-（`stageEvent`/`addEvent` 都是 `_ = event;`）。**影响面**：只有**越路径**导入框架内部文件的代码
-（`@import("zmodu/src/core/TransactionalEvent.zig")`）会**编译错**；公开面没有任何变化。
-**一行改法**：`zmodu.outbox.*`（真实 outbox）或 `zmodu.SagaOrchestrator`。
-
-**测量口径（非破坏，但会改变你在别的机器上看到的数字）：`PrecisionTimer` 的 10 µs 界是宿主相关的。**
-它的用例曾在 GitHub 的 macOS runner 上红两条，原因是那台机器的 `nanosleep` **比自旋窗口还粗**：
-
-| 宿主 | `nanosleep(100 µs)` 实际迟到 | `nanosleep(500 µs)` | 出厂配置 @1 ms 的 p50 |
-|------|------|------|------|
-| 本仓开发机（Apple Silicon macOS） | ~55 µs | ~257 µs | **0 ns** |
-| GitHub `macos-latest` | **+818 µs** | **+4 031 µs** | **+3 531 000 ns** |
-
-等待循环睡的是 `remaining - spin_window_ns`，只有这次唤醒落在窗口内，自旋才有 deadline 可收口；一旦内核把
-唤醒推过 deadline，剩下的延迟就全是宿主的。所以**出厂的两个 knob（窗口 200 µs / 分块上限 500 µs）是按本仓
-开发机的过冲梯子定的**。**一行改法**：把 `PrecisionTimer` 搬到容器/共享 CI/云主机上之前，先跑一次它自己的
-测量用例（每个用例都会打印 min/p50/p99/max 与 spun 占比），粗粒度宿主上把 `spin_window_ns` 调大
-（或设 `0` 明确表示不要这个精度）。`Runtime` 的 5 ms 时间轮不受影响。详见 `docs/RUNTIME.md` §12.15。
-
-**第 31 批（同样无公开 API 变化，但有两件你应当知道的事）**
-- **`batch` 的默认值保持不变，而且现在有实测依据。** `docs/RUNTIME.md` §12.16 把设计期那句
-  "批量 16 是起点不是结论"收口了：6 个点 × 3 种形状、每点 27 轮，结论是 **保持 16**
-  （1 是唯一被数据否掉的默认值；8/16/32/64 落在同一片噪声带里，16 是这片平台上最小的一点）。
-  顺带量出一条你会更用得上的：**池化 worker 的延迟尾巴属于 `idle_wait_ms = 1` 的 park 轮询，不属于
-  `batch`** —— `batch` 从 1 调到 64，p99 一点没动（三个形状、每个点都是 ~1 ms）。所以想压 p99 就别动
-  `batch`；反过来，"不饿死"的上界**就是 `batch` 本身**（实测：一个永远忙的 worker 最多耽误对端
-  一个 batch 的消息数，与宿主快慢无关）。**你的代码不需要改任何东西**，除了"别再照 §12.9 的说法
-  把 16 当成未验证的先验"。
-- **投递轨落盘：盘上那一半有了，进盘那一半没有。** 新增 `src/runtime/delivery_log.zig`（分段日志：
-  magic + 显式版本 + 每帧 CRC32 + 撕裂尾部可判可修 + append 零分配）。它**尚未从 `runtime.zig`/
-  `root.zig` 导出，也还没有任何消费者** —— 把一条投递记录变成字节的 **codec 契约**与 recorder 侧的接线
-  **仍未做**，所以 `Runtime Replay` 现在**依然不能跨进程/跨重启**（§13.5 的边界没变，只是 Q4 第 2 档
-  从"未动"变成"存储层已落地"）。不要按"已经能落盘重放了"去设计你的回测。
-- **投递轨的 codec 契约与 `drainTo` 已落地（第 32 批，仍是新增、可选、无破坏）**，而且有一条**会咬人的组合**：
-  `DeliveryLog.setCodec(track, MyCodec)` 之后 **该轨仍然可以内存重放**（第 36 批起）：codec 只在 `drainTo`
-  里跑，环里始终是**活值**，所以 `Replayer.bind` 不再因为"这条轨声明了 codec"而拒绝 —— 那条
-  `error.CodecRequired` 是第 32 批之前的设计残留（那时以为带 codec 的轨环里存的是字节），第 36 批已拆掉，
-  `BindError` 因此少了那个成员。契约本身是 `zmodu.runtime.Codec(E)`（`name`/`version`/
-  `encode`/`decode`），框架只规定接口，不规定格式；`drainTo` 的返回值带 `holes` / `first_hole_seq`
-  （环溢出与游标落后都会变成**看得见的洞**，而不是一份看起来完整的 log）。
-- **"读盘重放"这一刀已经到了（第 33 批）**：`zmodu.runtime.ReplayFromLog`。**从盘上**重放**要求** codec
-  （它读的是字节，不是活值）—— 这与"内存重放不再要求不开 codec"是两件不同的事，第 36 批之后两条路可以同时开着。
-  要点：它是 **load-then-replay**（借 `scan` 读到的记录、按全局 `seq` 排一次索引），**不是**跟随一个
-  正在写的 log；**洞默认拒绝**（`error.LogHasHoles`，且不消费那条记录），显式 `allowHoles()` 之后才跨过，
-  跨过多少在 `crossedHoles()` 里**精确**计数；绑定走 `setCodec(id, C, E)` + `bindDecoded(id, handle)`
-  两步（这样"没声明 codec"与"handle 类型不对"才是**能指名到 id 的运行时错误**）；
-  它**持有 allocator**（`Codec.decode` 就是 allocator 版），这是与 `Replayer` 零分配的刻意差别。
-  另有两条**新增公开方法**：`zmodu.runtime.ReplayFromLog` 本身，以及 `DeliveryLog.setCodecRef(track, C, E)`
-  —— 后者在第 32 批之后是**必需**的：`setCodec` 要 typed `*Track(E, capacity)`，而 `Runtime.spawn` 只留
-  erased 的 `Handle.track: ?*TrackRef`，所以在它出现之前，**运行时用 `.record` 声明的轨根本挂不上 codec**，
-  `drainTo` 对这类 worker 不可达（第 32 批的"能进盘"只对直接 `addTrack` 的用户成立）。
-- **投递种类（`Kind`）现在是真的（第 34 批）**：`Handle.after(...)` 的定时投递在轨里与段文件里都记成
-  **`.timer`**，`send*` 记成 `.message`（此前一律写 `.message`，是 §13.9 明写的缺口）。调用方要自己指定
-  种类就用新增的 `Track.recordKind(event, kind)` —— **`Track.record(event)` 的签名一个字没动**
-  （它现在等价于 `recordKind(..., .message)`），所以直调 `record` 的代码不用改。环的每槽增量是**实测**的：
-  `u32` 消息 **+0 字节**（种类落进原本就有的尾部 padding）、`u64` 消息 **+8**。
-  另有一条**决定**：从盘重放（`ReplayFromLog`）的投递不照抄帧里的 kind，仍以 `.message` 进目标 runtime
-  —— 录下来的 kind 描述"被录那一次"，重放做的是"这一次的一条普通 send"；真值在 `LogStep.kind` 上。
-
----
-
-## v0.33.4 + v0.33.5（均已发布）
-
-> 本节标题此前一直写着「（未发布）」，而 `v0.33.4`/`v0.33.5` 的 tag 早就推了 —— 下面这些内容**是已发布**的。
-> 原因记在这里免得复发：当时 `scripts/release.sh` 只 bump 版本引用，不改本文件的节标题，所以
-> "（未发布）"这层标签是纯手工维护的。**脚本后来补上了这一步**：它会把
-> `## v<旧版本> 之后（未发布批次）` 改名为 `## v<新版本>`，并在仍有残留时**硬失败**。
-> 残留的那次是 v0.39.6 —— tag 推了而标题还写着 "v0.39.5 之后"。
-> 正文里对 `[Unreleased]` 的引用脚本**不**改，发布前要自己一并改掉。
-
-> **本版有 2 处破坏性变更（都是编译错）**：口令校验不再返回裸 `bool`、
-> `Middleware.attachIdentityBestEffort` 改成 `!void`。另有 8 处**行为变化**值得确认：Redis 不可达时不再
-> 静默返回 `0`/`false`、表单解析超限从 200 变 400、`CachedConn` 的坏缓存条目从 `DatabaseError` 变成
-> "缓存未命中 + 修复"、`BufferPool` 的取消语义、认证中间件对"我们这侧失败"改回 500、API key 比较改恒定
-> 时间、MySQL 的 NULL 元数据不再读成"零行"。
-> 逐条背景见 [`../CHANGELOG.md`](../../CHANGELOG.md) 的 `[Unreleased]` 段。
-
-**破坏 ②：`Middleware.attachIdentityBestEffort` 由 `void` 变成 `!void`。** 它以前在构建 `roles` 属性失败时
-**静默返回**，留下一个"有 `user_id`/`tenant_id`、没有 `roles`"的身份继续处理请求（role gate 一律 403，
-而把"无角色"当匿名看的 handler 则行为未定义）。现在先把 roles CSV 建好再写任何属性，任一写失败即
-`return err`（fail-closed）。
-**Breaking?** 是（编译错）· **影响面**：直接调用它的中间件代码（仓库内只有本库自己） · **一行改法**：
-`attachIdentityBestEffort(ctx, claims, alloc);` → `try attachIdentityBestEffort(ctx, claims, alloc);`。
-用 `http.addMiddleware(http.jwtAuthFromCatalog(...))` 这类常规接线的消费者**不需要改**。
-
-**行为变化（非破坏）⑤：认证中间件不再把"我们这侧出错"答成 401。** `jwtBackend`、旧路径
-`jwtAuth*`、`authFromCatalog` 与 `security.AuthMiddleware` 的 `verifyToken` 失败以前一律 401（或
-`false`）。现在 **token 级失败**（签名/过期/算法/格式）仍是 401；**我们这侧的失败**（分配失败、
-自定义 `AuthBackend` 的存储故障）→ **500** + warn 日志；**未知 `kid`** 仍是 401（`kid` 由客户端控制，
-答 5xx 等于给未认证调用者一个制造 5xx 的开关）但会打一条 warn，让运维看到"密钥轮换漏了一把"。
-`authFromCatalog` 在 `.public`/`.optional` 路由上，我们这侧的失败现在**让请求失败**（以前是记一条日志
-后当作匿名继续）。若你的客户端把 500 当成"重试即可"，这正是想要的；若你的监控按 401 统计失败登录，
-现在它不再包含我们的内部故障。
-
-**行为变化（非破坏）⑥：API key 比较改为恒定时间。** `security.ApiKeyAuth.validateKey` 不再用
-`std.mem.eql`（实测"错在第一个字节"与"错在最后一个字节"的耗时差约 **3560×**；改后差 0.8%）并且不再
-提前返回。语义不变，只是耗时不再泄漏匹配长度。
-> `ApiKeyLoaderConfig.loader` 的类型仍是 `*const fn ([]const u8) bool`，**存储故障与"key 不存在"同形**；
-> 文档现在要求 loader 自己 fail-closed 并旁路上报。计划改成 `anyerror!bool`（与 `PermissionLoader` 对齐），
-> 但那是公开字段的破坏性变更，本版**没有**做。
-
-**行为变化（非破坏）⑦：`BufferPool.release` / `available` / `stats` 的锁等待不再可被取消。** 以前取消即
-返回：`release` 丢掉缓冲区（`allocated` 永久虚高 → 以后报**假** `PoolExhausted`），`available`/`stats`
-给出伪造读数（会被 scrape/健康检查当成事实）。`acquire` 仍然返回 `error.Canceled`。
-
-**破坏：`RedisCluster.init` 多一个 `io` 参数。** `redis.RedisCluster.init(allocator)` →
-`init(allocator, io)`。原因：它内部用 `std.testing.io` 建节点，而 `std.testing.io` 在非 test 构建里是
-`@compileError("not testing")` —— 所以**此前任何调用 `addNode` 的应用都编译不过**（实测：一个普通
-`main` 调 `init`+`addNode`，修前 `error: not testing`，修后编译并真实连库成功）。
-**Breaking?** 是（编译错）· **影响面**：用到 `RedisCluster` 的应用（本仓库内无调用点）· **一行改法**：
-`var c = RedisCluster.init(alloc);` → `var c = RedisCluster.init(alloc, io);`（`io` 就是你启动时拿到的那个
-`std.process.Init` 的 io；`addNode` 签名不变）。
-
-**行为变化（非破坏）：`SkillRegistry.register` 对重复名字是"替换"且超容量不再 panic。**
-以前 `initCapacity` 用完后再注册会 `panic: integer overflow`（不是报错），重复注册还会漏掉被替换工具的
-参数数组。现在重复名**替换**（与原 docstring 一致，"注册即设置"的 40+ 处调用不受影响），超容量走正常的
-可失败分配路径并如实返回错误。若你的代码依赖"超容量必定 panic"或"重复注册保留旧工具"，需要改。
-
-**破坏：无类型 `EventBus(T).subscribe` 现在返回错误。** 它以前是 `void`，却用 `getOrPutAssumeCapacity` /
-`addAssumeCapacity` 在"只记了日志"的预留上写入 —— 预留不足时会**写越界**（同一事件类型第 5 个回调就会
-触发，因为初始预留是 4）。现在与同文件的 `TypedEventBus`/`ThreadSafeEventBus` 一致，是 `!void`
-（`docs/API.md` 一直就是这么写的）。
-**Breaking?** 是（编译错）· **影响面**：直接调 `bus.subscribe(...)` 的应用代码 · **一行改法**：
-`bus.subscribe(MyEvent, handler);` → `try bus.subscribe(MyEvent, handler);`（模块监听器走
-`ApplicationModuleListener.subscribe()`，那个签名本来就是 `!void`，不需要改）。
-另：**同名 `ProviderRegistry.register` 不再立刻释放被替换的 provider**（改为 retired，推迟到 `deinit`；
-`retiredCount()` 可观测），所以旧租约继续把反馈写进它自己的池，而不是串到替换者身上。若你的代码依赖
-"替换后旧条目立即释放"，这条是行为变化；若你只是热加载同名配置，这条修掉的正是 use-after-free。
-
-**行为变化（非破坏，但你的 dump 可能被判为损坏）**：`MemoryStore.loadJson` / `loadFromFile` 现在**拒绝**
-一份作用域不可用的记忆 dump（`error.InvalidMemoryScope`），而不是把缺失或类型错误的 `tenant_id`/`user_id`
-静默当成 `0`。这条修的是一个**安全**问题：`0` 在 `recall(prefix, 0, …)` 里的含义是 **"any scope"**，所以
-一份损坏的 dump 会把那些行变成任何租户都读得到。**由本框架自己写出的 dump 不受影响**（`dumpJson` 一直把
-这两个字段写成整数，显式写出的 `0` 仍然合法），需要动作的只有手工编辑过、被截断或来自别处的文件 —— 它们
-现在会整份失败并逐条 warn 出下标/字段/实际类型，请修好那一行（或删掉该条目）再加载。
-**Breaking?** 否（`loadJson` 的声明签名未变，只是推断错误集多了一个成员；仓内没有按错误名分支的调用方）。
-
-**行为变化（非破坏，但会改变晚期注册的行为）**：`PrometheusMetrics` 的注册现在**在首次抓取后被封**：
-`toPrometheusFormat` 一跑（或你显式 `freeze()`），之后所有 `createCounter`/`createGauge`/`createHistogram`/
-`createSummary`/`createCounterFamily`/`createHistogramFamily` 都返回 **`error.Frozen`** 且不插入任何东西。
-原因：注册级容器是无锁遍历的，而 `create*` 会 `put`（rehash 会释放遍历正走着的 bucket 数组）——与上一批
-修掉的 per-family `render` 是同一个 use-after-free。**树内的注册全是启动期接线**（`productionProfile`、
-`MetricsBridge.init`、`OutboxConsumer.setMetrics`、`AutoInstrumentation.init`、`ModuleMetricsCollector.init`），
-请求线程创建的 per-label series 走 `CounterFamily.get`（有锁），所以正常应用不受影响。若你在**运行期**
-懒创建指标，请把它移到第一次抓取之前，或改用 `getCounter`/`getGauge`（追加 label 值）而不是 `create*`。
-`freeze()`/`isFrozen()` 是新增的公开方法。
-**注意这层封条不是互斥**：它把"启动期注册"从假设变成会报错的契约，但在封条落定前通过检查的 `create*`
-仍可能与第一次抓取交错；真正的互斥需要一把锁，本版没有加。
-
-**行为变化（非破坏）⑩：同名重复的 `create*` 现在是错误，抓取后的注册也是错误。** `PrometheusMetrics` 的六个
-`create*` 现在返回 `CreateError`（`error.Frozen` | `error.DuplicateName` | `std.mem.Allocator.Error`）：
-① 注册（第一次抓取或 `freeze()` 之后）被封 —— 晚期注册返回 `error.Frozen` 且不插入任何东西；
-② **一个名字在整个 exposition 命名空间里只能用一次** —— 不只是"同一种类注册第二次"，**跨种类**（counter 与
-gauge 同名）与 **histogram 的生成名**（`createHistogram("x")` 之后再 `createCounter("x_count")`）都会返回
-`error.DuplicateName`。以前这些都会被接受，然后渲染出 Prometheus **整份拒收**的抓取；以前同种类重复注册还会把
-第一个对象留在堆上没人释放、把已发出的旧句柄变成孤儿。若你以前依赖"重复注册就换一个"，请改成在首次抓取之前注册一次，或用
-`getCounter`/`getGauge` 追加 label 值。`Counter.labels`/`Gauge.labels` 与 `Summary` 的
-`quantiles`/`max_age_seconds`/`age_buckets` 三个"声明了没人读"的字段已删除。
-
-**行为变化（非破坏）：`WebSocketClient` 的写失败不再叫 `NotConnected`，且 pong 失败即断连。**
-`sendText`/`sendJson` 的推断错误集现在是 `{error.NotConnected, error.WriteFailed}`：前者只表示"这个客户端已经
-已知是死的、一个字节都没写"，后者是真正的写失败（真实原因记在日志里）并会**立刻**把 `is_connected` 置 false。
-若你的代码穷举匹配旧错误集，会**编译错**（响亮）；若你把任何失败都当"对端断了"处理，那条路径现在的语义更准确。
-另外：pong 写失败现在会让读循环在下一次检查时退出，而不是一直等到一个读错误。
-
-**行为变化（非破坏）：集群的节点回调是**边沿触发**的。** `on_leader_change_cb` 只在 leader **真的变化**时触发
-（以前每个 `.leader_election` 事件都触发，即使 leader 没变）；`on_node_leave_cb` 只在从"在役"
-（`.healthy`/`.suspect`）转出去时触发一次（以前按状态触发，一个已宣告失败或已 `.leaving` 的对端再说一次再见会
-**宣告两次**）。与既有契约一致：**一次 `leave` 对应一次 `join`**。如果你的回调以前依赖"每次选举心跳也来一次"，
-那正是这条要修掉的。
-
-**行为变化（非破坏）：集群恢复现在会触发 `on_node_join_cb`。** `ClusterMembership` 以前只在失败/`leave` 时发
-`on_node_leave_cb`，恢复只翻状态、不发回调。现在**一次 `leave` 对应一次 `join`**（`join` 是 "这个 peer 是你应当持有
-状态的成员"，是 **upsert** 而不是"首次见到"）；`.suspect` → `.healthy` 两个方向都**不发**（没有 `leave` 被宣告过）。
-如果你的回调在 `join` 时建了每对端状态，这条修掉的正是"建了却没人拆/拆了却没人建"的不对称。
-
-**行为变化（非破坏，测试工具）：`test.IntegrationTest.InstrumentationContext` 改为原地构造且不可拷贝。**
-`init(allocator) !InstrumentationContext` → `init(self: *InstrumentationContext, allocator) !void`（先
-`allocator.create` 再原地构造），因为旧实现把 `metrics`/`tracer` 在栈上建好、把指针交给 instrumentation、再**按值**
-返回 —— 那个指针指向已失效的栈帧。只影响直接用这个测试工具的类型（`IntegrationTest.instrumentation` 字段也变成
-`?*InstrumentationContext`）。
-
-**新增公开 API（additive，无破坏性）**：`zmodu.Params`、`zmodu.ScopedContainer`、
-`zmodu.SlidingWindowRateLimiter`、`zmodu.ConfigManager` 四个符号以前**只存在于 `src/` 里、没有公开导入路径**
-（文档写了它们但消费者 import 不到），现在从 `root.zig` 再导出，文档路径同步改正。
-`zmodu.TransactionalEvent` **不再**是公开 API（那一节从文档里删掉了）：它是个空壳，真身是 `zmodu.outbox.*` 与
-`zmodu.SagaOrchestrator`。另新增 `zmodu.runtime.PrecisionTimer`（亚毫秒 deadline 队列，调用方提供缓冲、
-类型内零分配；不要用它替代普通定时器 —— 10 ms 以上的 deadline 仍旧用 scheduler 的 wheel，后者几乎不花 CPU）
-与 `RaftTransport.connectTimeout`（POSIX 有界 dial）。
-**顺带一条给所有人的警告**：`IpAddress.ConnectOptions.timeout` 在本工具链上会让进程**直接 abort**
-（`std/Io/Threaded.zig` 里的 `@panic("TODO implement netConnectIpPosix with timeout")`，实测 `exit=134`），
-所以既不要传它、也不要指望它 —— 要界就用 `connectTimeout`。
-
-**行为变化（非破坏）⑨：一批"取消被当成成功/默认值"的路径改成等待或报错。** 涉及 `EventBus`
-（`publish`/`unsubscribe`/`subscriberCount`/`publishedCount` 改不可取消的等待；**`subscribe`/`subscribeAsync`
-现在会返回 `error.Canceled`** —— 以前它们**返回成功却没注册**）、`EventStore`
-（`getVersion`/`SnapshotStore.load` 改等待；**并且修掉了 `replayFromSnapshot` 只读一次 256 条事件、
-长流静默丢尾部**）、`cache`（`Lru.set` 现在会返回 `error.Canceled`，`delete`/`clear`/`size`/`get` 改等待）、
-`Runtime.shutdown`/`Mailbox`（关停与唤醒不再被取消吞掉）、`redis` 的池释放/逐出（池槽不再永久丢失）、
-`ai` 的 `key_pool.onError`/`onSuccess`、`memory.remember`/`forget`/`count`、`skill.register`/`get`/`count`/`names`、
-`audit.record`、`quota.used`/`remaining`。**错误集变化**（用 `try` 的调用方不受影响，只有穷举错误集匹配
-需要加/改一支）：`Lru.set`、`EventBus.subscribe(Async)` 增 `error.Canceled`；**`src/ai/*` 里那批自造的名字
-已经删掉** —— `MemoryStore.remember` 的 `error.LockFailed`、`SkillRegistry.register` 的
-`error.RegistryLockFailed`、`Quota` 的 `error.QuotaLockFailed`、`AiProvider` 的
-`error.RateLimitLockFailed` 全部换成 `error.Canceled`（`std.Io.Mutex.lock` 唯一的错误就是它；
-把取消说成"锁机制失败"是撒谎）。**按名字 `catch` 这些旧标签的代码会编译不过**（仓内没有，外部可能有）。
-**结构变化**：`AgentAuditLog` 新增公开字段 `owned: []bool`（用字面量构造会编译不过；请用
-`AgentAuditLog.init`）。另外 `Preflight` 的失败计数改为**先计数后记录**，所以"有致命失败却
-`report.ok() == true`"这条不再可能。
-
-**行为变化（非破坏）⑧：MySQL 的 `NULL` 结果集元数据不再被读成"零行"。** 语句有字段却拿不到元数据时
-（libmysql 的分配失败）以前返回空结果集，现在返回映射后的错误；`field_count == 0` 这条真实子情形仍是
-空结果集（记一条 debug 日志）。
-
-**破坏：口令校验返回错误联合。** `PasswordEncoder.matches` 与 `SecurityModule.verifyPassword` 由
-`bool` 变成 `PasswordError!bool`（`error{MalformedStoredHash} || std.mem.Allocator.Error`）。
-以前**存储哈希不可解码**或**解码时分配失败**都被答成"口令不匹配"，调用方只能回 401 —— 把"我们这边
-出错"记成"口令错"，也让失败登录计数说谎。
-**Breaking?** 是（编译错）· **影响面**：消费者的登录 handler · **一行改法**：
 ```zig
 const ok = encoder.matches(input, stored) catch |err| switch (err) {
     error.OutOfMemory => return err,                                    // → 5xx
@@ -709,154 +186,46 @@ const ok = encoder.matches(input, stored) catch |err| switch (err) {
 };
 if (!ok) return unauthorized();
 ```
-仓库内没有调用方（只有本文件测试），改的是消费者侧。**顺带修掉一条真漏洞**：旧代码用
-`expected_hash[0..32]` 做**前缀比较**，所以"32 字节真实摘要 + 1 字节垃圾"的存储记录会被判定通过；
-现在长度必须**恰好**等于派生 key 长度。若你的库里有 PBKDF2 派生 key 长度 > 32 的历史记录并依赖旧的
-前缀接受，它们现在会被拒（那正是修复本身）。
 
-**行为变化（非破坏）①：Redis 不可达不再是一个"数据答案"。** `setNX`/`lock` 返回 `false`、`del` 返回
-`0`、`exists` 返回 `false`、`ttl` 返回 `-1`（"存在且永不过期"）、`unlock` 静默返回 —— 这些以前在连接/池/
-锁失败时也会发生，于是调用方读到一个看起来正常的答案。现在基础设施故障一律抛错，**服务端真实回答的语义
-不变**（真 `-1`、真 `false`、真 `nil` 仍是值）。`RedisRateLimiter`、`RedisCooldownStore` 等调用方因此
-会在 Redis 不可达时看到错误而不是静默的 `0`/`false`；请确认你的调用点有处理。
+The stored hash length must now equal the derived key length exactly; the old prefix comparison accepted a valid 32-byte digest followed by one byte of garbage.
 
-**行为变化（非破坏）②：超限的表单体从 200 变 400，解析时的分配失败变 500。**
-`application/x-www-form-urlencoded` 的字段数超过 `Server.Config.max_params` 以前会**以空表单继续处理并
-回 200**（H1 与 H2 都是），现在回 400；解析时我们的分配失败以前被读成"没有表单体"（200），现在回 500。
-请求边界上的同类塌陷也一并分开（查询串解析的分配失败现在 500）。
+- **`Middleware.attachIdentityBestEffort` returns `!void`** and fails closed: `try attachIdentityBestEffort(ctx, claims, alloc);`. Normal `http.addMiddleware(http.jwtAuthFromCatalog(...))` wiring needs no change.
+- **`EventBus(T).subscribe` returns `!void`**: `try bus.subscribe(MyEvent, handler);`. Module listeners use `ApplicationModuleListener.subscribe()`, which already returned `!void`.
+- **`RedisCluster.init(allocator, io)`** — the old implementation used `std.testing.io`, a compile error outside tests.
 
-**行为变化（非破坏）③：`CachedConn` 读到坏缓存条目时不再报 `DatabaseError`。** 现在它当作**缓存未命中**
-继续查库，并在同一次调用里用 `setCache` 把该条目修好（记一条 warn）；只有**分配失败**才冒泡
-`error.OutOfMemory`。按 `error.DatabaseError` 分支处理 `CachedConn` 的消费者需要改。
-
-**行为变化（非破坏）④：`BufferPool.acquire` 的锁等待被取消时返回 `error.Canceled`**（以前是
-`error.OutOfMemory`）；顺带：`HttpClient` 的 `ConnectionPool.release` / `discard` 改成不可取消的锁等待
-（以前取消即丢一条连接），`OutboxConsumer` 遇到解析不了的行会**死信化**（`status = 3` + warn + 计数），
-而不是每次 poll 都重新选中它、永远不排空。数据权限在 OOM 下现在是**收紧**（匹配不到任何行）而不是放宽。
-
----
+Behaviour changes:
+- Redis infrastructure failures raise instead of returning `false`, `0` or `-1`; real server answers keep their meaning. A form with more fields than `Server.Config.max_params` returns 400 instead of 200 with an empty form, and allocation failures while parsing return 500.
+- `CachedConn` treats a corrupt cache entry as a miss, re-queries and repairs it. `BufferPool.acquire` returns `error.Canceled`; `release` / `available` / `stats` wait instead of returning fabricated readings, as do `HttpClient.ConnectionPool.release` / `discard`.
+- Auth middleware: token failures 401, our-side failures 500, unknown `kid` 401 plus a warning. `authFromCatalog` fails the request on our-side errors, including on `.public` / `.optional` routes. API key comparison is constant-time.
+- `SkillRegistry.register` replaces duplicates and returns errors instead of panicking; `ProviderRegistry.register` retires the replaced provider until `deinit` (`retiredCount()`).
+- `MemoryStore.loadJson` / `loadFromFile` reject an unusable scope (`error.InvalidMemoryScope`); `recall` reads `0` as "any scope", so the old default leaked rows across tenants.
+- `PrometheusMetrics` freezes after the first scrape or `freeze()`: late `create*` returns `error.Frozen`, and duplicate names across the exposition return `error.DuplicateName`. Append label values with `getCounter` / `getGauge`.
+- `WebSocketClient.sendText` / `sendJson` return `{error.NotConnected, error.WriteFailed}`; a failed pong write closes the connection.
+- Cluster callbacks are edge-triggered: one `leave` per `join`, `on_leader_change_cb` only on a real change, recovery fires `on_node_join_cb`.
+- `IntegrationTest.InstrumentationContext.init(self, allocator) !void` constructs in place; `instrumentation` is `?*InstrumentationContext`.
+- Lock waits that swallowed cancellation now wait or return `error.Canceled` (`EventBus`, `EventStore`, `cache.Lru`, `Runtime.shutdown`, `Mailbox`, the redis pool, `ai` key pool / memory / skill / audit / quota). The `src/ai/*` lock errors `LockFailed`, `RegistryLockFailed`, `QuotaLockFailed`, `RateLimitLockFailed` are now `error.Canceled`.
+- `AgentAuditLog` has a public `owned: []bool` field; use `AgentAuditLog.init`. MySQL returns a mapped error when fields exist without metadata. `OutboxConsumer` dead-letters unparsable rows (`status = 3`).
 
 ## v0.33.3
 
-> **本版有 2 处破坏性变更，都是编译错**（`Cursor.next` 的错误联合、`csrf()` 要求中间件拿到
-> `CsrfConfig`），另有 1 处**默认行为收紧**（CSRF 不再采信 `X-Forwarded-Host`）。逐条背景见
-> [`../CHANGELOG.md`](../../CHANGELOG.md) 的 `[0.33.3]` 段。
-
-**破坏 ①：`Cursor.next` 返回错误联合。** `sqlx.Cursor.next` 从 `?*Row` 变成
-`errors.ResultT(?*Row)`——**流中途的驱动/服务器错误以前被折叠成 `null`**，即"查询坏了"和"结果取完"
-不可区分，调用方会把**被截断的结果当成完整结果**（PG 实测：`SELECT 100/(3-i) …` 在第 3 行报
-`22012`，循环却"正常"结束在第 2 行）。
-**Breaking?** 是（编译错）· **影响面**：所有直接迭代游标的消费方 · **一行改法**：
-`while (cursor.next()) |row|` → `while (try cursor.next()) |row|`；`cursor.next() == null` →
-`(try cursor.next()) == null`。
-仓库内 39 处（19 个文件）已按此改完。另外这一版还修了 PG 流式游标的一个 use-after-free
-（列名曾分配在每行重置的 arena 里，`row.get("col")` 读到的是已释放内存）——与上面的签名变化
-同批落地，不需要消费方额外动作。
-
-**破坏 ②：`csrf()` 现在要求中间件在 `user_data` 上拿到 `CsrfConfig`。**
-`csrf()` 变成 `csrfWith(.{})` 的别名；手动 `mw.func(ctx, next, null)` 会 panic。
-**Breaking?** 是（运行时 panic，不是编译错）· **影响面**：只有手工调用中间件 `func` 的代码
-（按 `http.addMiddleware(http.csrf())` 常规用法不受影响）· **一行改法**：
-`mw.func(ctx, next, null)` → `mw.func(ctx, next, mw.user_data)`（把中间件自己的 `user_data`
-传下去，别丢）。另外**默认不再采信 `X-Forwarded-Host`/`Proto`**（客户端可伪造）：
-反代部署要显式 `csrfWith(.{ .trust_forwarded_host = true })`，且代理必须**每个请求都覆写**这两个头；
-已有 `sign_key` 可让 cookie 里的 token 变 `nonce.HMAC-SHA256`（`csrfMintSignedToken` 签发）。
-
-**行为变化（非破坏）**：`sqlx.Builder` 的 `where` / `join` / `groupBy` / `having` / `orderBy` /
-`selectColumns` 在分配失败时不再**静默丢弃**该子句（那会让 `WHERE` 消失、查询被悄悄放宽）——错误现在
-由 `toSql()` 返回。**签名没变**，链式写法 `_ = b.where(...)` 照旧可用；只要你的代码处理了 `toSql()` 的
-错误（本来就该处理），就不需要改动。
-
-**行为变化（非破坏）**：`OtlpExporter` / `SecretsManager` 改为持有常驻 `HttpClient`。`max_connections`
-的口径从"每次调用的 N 条"变成"**每个组件实例的 N 条**"，同一实例上超过 N 个并发请求可能拿到
-`error.PoolExhausted`；两个 `deinit` **不得与在飞请求并发**（在等待导出/读取线程结束后再 `deinit`）。
-
-**行为变化（非破坏）**：H1 与 H2 的请求路径补齐——H2 现在也解析 `application/x-www-form-urlencoded`
-表单体（并遵守 `max_params`）、运行 `path_rewriter`、把 `:path` 里的查询串拆进 `ctx.query`（拆不动时
-返回 400 而不是带着缺失参数继续路由）、`ctx.allocator` 改为**每请求** arena；`ctx.stream` 在 H2 上仍为
-`null`，流式处理器得到明确的 **501** 而不是把 H1 chunk 头当成 body 发出去。
-
-**行为变化（非破坏）**：H2 现在**把 handler 设置的响应头都发出去**（以前只发 `content-type`，
-`Set-Cookie` / `Location` / `Retry-After` / CORS 头在 H2 上会静默消失）。注意三件事：
-① 违反 RFC 9113 §8.2.2 的连接相关字段（`connection` / `keep-alive` / `proxy-connection` /
-`transfer-encoding` / `upgrade`）**不会**被转发，只记一条 warn —— 与 H1 的"整响应 500"不同；
-② handler 自己设的 `content-length` 与 body 不符时也不转发（H2 里那是 malformed），H1 的行为未动；
-③ 响应头有预算（peer 的 `SETTINGS_MAX_HEADER_LIST_SIZE`、字段数、编码后 ≤ peer
-`SETTINGS_MAX_FRAME_SIZE`），超出的字段被丢掉并记一条 warn，而不是发一个对端必须拒绝的帧。
-如果没有依赖"某个头在 H2 上恰好不发"的行为，就不需要改动。
-
-**修复（非破坏）**：h2c 升级路径此前**不派发 stream 1**，真实客户端 `curl --http2` 升级后拿不到任何
-响应（prior-knowledge 不受影响）。现在按 RFC 7540 §3.2 把**携带升级的那个请求**当作 stream 1 派发
-一次，并先应用 `HTTP2-Settings`；此后客户端再发 `HEADERS(1)` 会收到 `RST_STREAM(STREAM_CLOSED)`。
-若你的客户端一直在用 h2c 升级，这条修好之前它大概什么都没收到。升级同时**放开了方法限制**（此前只认
-`GET`，而 RFC 对方法没有限制）：`POST`/`HEAD`/`OPTIONS` 升级现在都能进。
-
-**行为变化（非破坏）**：`HEAD` 的响应**不再带 body**（H1 与 H2 都是）。以前 H1 会给 HEAD 写出 body
-字节，与 `Content-Length` 自相矛盾。已知未覆盖：H1 的 `startChunked` 流式路径仍会写 chunk，
-`writeErrorResponse`（解析错误 / WS 握手失败 / 拒绝头 500 / 503 甩负载）仍会给 HEAD 写 body。
-
-**修复（非破坏）**：H1 的 `Content-Length` 以前会被**写两遍**（handler 自己声明过一次、服务端再加一次），
-`HEAD` 上更会出现 `Content-Length: 5120` 紧跟 `Content-Length: 0` 这种自相矛盾（`StaticFiles` 会声明文件
-长度，所以这在真实路由上存在）。重复的定界头是走私邻域的形状。现在**只有一个定界字段**，chunked 时两边都
-不写；`HEAD` 用 handler 声明的值；其余情况只用 handler 的值——**且仅当它等于即将写出的字节数**（与 H2
-已有规则一致）。若你的 handler 依赖"自己写的 `Content-Length` 一定会原样发出"，而它与实际 body 不符，
-这条之后会被服务端自己的值替换。
-
-**行为变化（非破坏，但值得确认你的接线方式）**：**一个进程里跑两个 `Server` 现在真的互不干扰了。**
-`openApiFromCatalog` 的结果以前写在一份**进程级** store 里（第二个注册覆盖第一个 → A 的
-`/openapi.json` 会服务 B 的 catalog），`catalogLoaderFromTable` 以前用模块级的 `Holder.tbl`
-（第二个 loader 会改掉**第一个** app 的授权表，是执法路径）。现在分别按 `*CatalogSlot` 与
-`RolePermissionTable` 指针去重：同一 slot / 同一张表仍是同一份状态（**有意共享**），不同则完全隔离。
-**你要确认的只有一件事**：这两个入口现在都是**接线期** API —— `catalogLoaderFromTable` 有 64 个槽、
-`openApiFromCatalog` 有 16 个，**耗尽即 panic**（panic 文本会告诉你抬高哪个常量）。
-一次性接线（每个 app 一张表 / 一个 slot）不受影响；如果你的代码在**循环或请求路径**里反复调用它们
-（旧版会静默互相覆盖，所以那样用本来也没对），请改成接线期各领取一次。
-
-**修复（非破坏）**：PG 上"分配失败"与"驱动失败"以前都表现为 `?*PGresult` 的 `null`，于是 OOM 会被报成
-`error.DatabaseError`（`toErrorContext` 落到 `UnknownError`、metrics 记的错误名也是错的）。现在
-`null` 只表示"驱动没有交回 `PGresult`"，分配失败一律如实抛 `error.OutOfMemory`。两个可见的副作用：
-① OOM 下 PG 查询的错误名变了；② 语句缓存键/插入的分配失败**不再**回退到"未缓存路径"再执行一次。
-公开签名未变。
-
----
+- **`Cursor.next` returns `errors.ResultT(?*Row)`** (compile error). Mid-stream driver errors were folded into `null`, so a truncated result looked complete. `while (cursor.next()) |row|` → `while (try cursor.next()) |row|`; `cursor.next() == null` → `(try cursor.next()) == null`.
+- **`csrf()` requires `CsrfConfig` on `user_data`** (runtime panic). `csrf()` is `csrfWith(.{})`, and a manual `mw.func(ctx, next, null)` panics; pass `mw.user_data`. `X-Forwarded-Host` / `Proto` are not trusted by default; behind a proxy use `csrfWith(.{ .trust_forwarded_host = true })` and overwrite both headers on every request. `sign_key` makes the cookie token `nonce.HMAC-SHA256` (`csrfMintSignedToken`).
+- `sqlx.Builder` reports allocation failures from `toSql()` instead of silently dropping a `where` / `join` / `groupBy` / `having` / `orderBy` / `selectColumns` clause. Signatures are unchanged.
+- `OtlpExporter` and `SecretsManager` hold a long-lived `HttpClient`; `max_connections` is per instance. Do not `deinit` while requests are in flight.
+- H2 reaches parity with H1: form bodies (with `max_params`), `path_rewriter`, query splitting from `:path` (400 when it cannot split), and a per-request `ctx.allocator` arena. `ctx.stream` is still `null` on H2, and streaming handlers get 501.
+- H2 sends handler response headers. Connection-specific fields (`connection`, `keep-alive`, `proxy-connection`, `transfer-encoding`, `upgrade`) are dropped with a warning, a mismatched `content-length` is dropped, and fields over the peer's header budget are dropped with a warning.
+- h2c upgrade dispatches the upgrading request as stream 1 after applying `HTTP2-Settings`, and methods other than `GET` are allowed. `HEAD` responses carry no body (H1's `startChunked` path and `writeErrorResponse` still write one). H1 writes a single `Content-Length`, and only when it matches the body.
+- Two `Server` instances in one process are isolated: OpenAPI state is keyed by `*CatalogSlot`, the permission table by `RolePermissionTable` pointer. Both loaders are wiring-time APIs with fixed pools (64 and 16 slots) and return `error.SlotPoolExhausted` when exhausted; do not call them in a loop or on the request path.
+- PG: allocation failure returns `error.OutOfMemory`, not `error.DatabaseError`.
 
 ## v0.33.1
 
-> 本版无破坏性变更。以下为 additive 亮点；完整列表见 [CHANGELOG](../../CHANGELOG.md)。
-
-**新增：校验失败的结构化错误体与消息本地化（opt-in）。** `Validation` 中间件新增
-`structured_errors` 与 `message_hook` 选项（`withStructuredErrors()` /
-`withMessageHook()` 链式入口）。开启结构化后，422 响应的 `data` 位携带
-`errors: [{field, rule, message}]`（每失败字段一条），`msg` 仍是首条消息。
-`Validator.validateStructCollect` 返回全部违规（`Violation`/`Violations`，一次
-deinit），`Validator.MessageHook` 可本地化默认规则消息（`FieldRules.message`
-覆写仍优先）。**默认值完全不变**：平坦字符串消息、业务码 4220。装了 RFC 7807
-`error_renderer` 时渲染器收到首条消息（该形状无 `data` 槽）。
-**Breaking?** 否 · **影响面**：用到 `validateRequest` 的消费方可选接入 · **一行改法**：
-`validation_middleware.withStructuredErrors(true)`。
-
-**新增**：`zig build soak-cluster`（cluster/bus 长时正确性 soak）、benchmark 套件
-的 `alloc/op` CI 门禁、首批 fuzz 目标（`zig build --fuzz test`）。均无消费方改法。
-
----
+- Validation middleware options `structured_errors` and `message_hook` (`withStructuredErrors()`, `withMessageHook()`). With structured errors, a 422 carries `errors: [{field, rule, message}]` in `data` and the first message in `msg`. `Validator.validateStructCollect` returns all violations; `Validator.MessageHook` localises default rule messages. Defaults are unchanged: flat string messages, business code 4220.
+- New `zig build soak-cluster`, an `alloc/op` CI gate for the benchmark suite, and the first fuzz targets (`zig build --fuzz test`).
 
 ## v0.32.0
 
-> **本版有 7 处破坏性变更，其中 3 处是编译错**（WS 路由声明、CSPRNG 的 `io` 参数、`Method.fromString` 返回类型）。
-> v0.29.0–v0.31.0 **没有**破坏性变更，所以本节是 v0.28.0 之后的唯一一段。
-> 逐条背景见 [`../CHANGELOG.md`](../../CHANGELOG.md) 的 `[0.32.0]` 段。
-
-### WebSocket 路由必须显式声明 `.meta.auth = .public`（**编译错**）
-
-**Breaking?** 是 —— **编译不过**，不是运行期拒绝。
-
-WS 升级在 `Server` 里是**在 `router.match` 之前、在任何全局中间件之前**被应答的，所以 `ws_routes` 上的
-`auth` / `permission` / `roles` **没有任何执行点**：它们被记进 catalog，然后没人查。声明本身是**骗人的** ——
-脚手架的 IM 网关把身份取自查询串（`?userId=<任意人>`），而同一份模板里那条路由写着 `.auth = .jwt`。
-
-**一行改法**：WS 路由加 `.meta = .{ .auth = .public }`，身份在 `on_connect` 里用 `ctx` 自己验
-（`docs/RUNTIME.md` §12.14）。**没声明** `.meta`（`.auth` 默认 `.inherit`）、**非 `.public`** 的 auth、
-以及挂 `permission`/`roles` —— 三种都编译不过。
+- **WebSocket routes must declare `.meta.auth = .public`** (compile error). WS upgrades are answered before `router.match` and before global middleware, so `auth` / `permission` / `roles` on `ws_routes` have no execution point. Verify identity in `on_connect`.
 
 ```zig
 pub const ws_routes = [_]http.WsSpec(State){
@@ -864,423 +233,110 @@ pub const ws_routes = [_]http.WsSpec(State){
 };
 ```
 
-**脚手架生成物已经改成 fail-closed**：`ImGateway.verifier` 默认 `null`，没接验签器时**拒连**（不再回落
-到信任客户端给的 id）；HTTP 侧身份改成 `ctx.requireUserIdInt(T)`。已实编译验证过。
+A missing `.meta`, a non-`.public` auth, or `permission` / `roles` all fail to compile. Scaffolded IM gateways default `ImGateway.verifier` to `null` and reject connections until a verifier is set.
 
-### CSPRNG 改为 `std.Io.randomSecure`，熵入口要传 `io`（**编译错**）
+- **CSPRNG uses `std.Io.randomSecure(io, buf)`** (compile error). The old seed was milliseconds, a constant, a stack address and milliseconds × 1000 — public, low-entropy and shared inside the process. Entropy entry points now take `io`; failure is `error.EntropyUnavailable` with no fallback.
 
-**Breaking?** 是 —— 签名变了，**忘了传 `io` 编译不过**。这是有意的：运行期用弱盐比编译不过糟得多。
-
-原种子是「毫秒 + 常量 42 + 栈地址 + 毫秒×1000」，全部来源非秘密、低熵、且**同一进程内共享**，
-观测到一个输出就能枚举其余。现在每次走系统调用，失败即 `error.EntropyUnavailable`，**没有回落**。
-
-**一行改法**：
-
-```zig
-// 旧（已改）                                     // 新
-ApiKeyGenerator.generate(allocator)              ApiKeyGenerator.generate(allocator, io)
-PasswordEncoder.init(allocator)                  PasswordEncoder.init(allocator, io)
-PasswordEncoder.initWithIterations(a, n)         PasswordEncoder.initWithIterations(a, io, n)
-kit.random.uuid(allocator)                       kit.random.uuid(allocator, io)
+```text
+Old                                          New
+ApiKeyGenerator.generate(allocator)          ApiKeyGenerator.generate(allocator, io)
+PasswordEncoder.init(allocator)              PasswordEncoder.init(allocator, io)
+PasswordEncoder.initWithIterations(a, n)     PasswordEncoder.initWithIterations(a, io, n)
+kit.random.uuid(allocator)                   kit.random.uuid(allocator, io)
 ```
 
-> 审计建议的 `std.crypto.random.bytes()` **在本工具链上不存在**（实测 `struct 'crypto' has no member
-> named 'random'`）。也**不要**改用 `std.Io.random` —— 它的文档明写失败时回落到 pid + 墙钟 + ASLR，
-> 那正是这条修掉的缺陷类别。
+`std.crypto.random` does not exist on this toolchain. Do not substitute `std.Io.random`, which falls back to pid + wall clock + ASLR on failure.
 
-### `db.query` 有租户上下文而没声明列时**拒绝**（行为变化）
-
-**Breaking?** 是 —— 对多租户应用是**新的运行期拒绝**。
-
-`db.query` 以前没有租户边界（兄弟技能 `entity.*` 有）。现在有租户上下文时，框架把整条语句**外层包裹**：
-
-```sql
-SELECT * FROM ( <模型原样 SQL> ) AS _zt_tenant_scope WHERE _zt_tenant_scope.<col> = ?
-```
-
-租户值**只以 `?` 绑定**，一个字节都不进 SQL 文本；模型的 `OR`/`1=1` 都削弱不了外层谓词。
-**没声明列 → `error.TenantScopeUnavailable`（拒绝，不是不过滤）。**
-
-**一行改法**：默认入口 `registerBusinessSkills(&registry, &.{})` 把列留成 `null`，所以多租户应用必须改走显式入口：
-
-```zig
-try ai.business.registerBusinessSkillsWith(&registry, &.{}, .{
-    .db_query_tenant_column = "tenant_id",   // 按你自己 schema 的列名
-});
-```
-
-另外**你的 SELECT 必须把租户列放进结果集**，否则外层报 "no such column"（报错、不出数据）。
-副作用（方向安全）：模型自己的 `LIMIT` 在内层先生效，可能少返回几行。
-
-### HTTP 请求边界加固：畸形请求一律 4xx/501，不再静默接受（**行为 + 签名**）
-
-**Breaking?** 是。三处解析与 RFC 不符**合起来**允许与按规范解析的前置代理产生 **CL/TE 请求走私**。
-
-| 形状 | 之前 | 现在 |
-|---|---|---|
-| 无空格的合法头（`Host:x`、`Content-Length:5`） | 静默丢弃（＝该头不存在） | 正确解析 → `ctx.header` 从 `null` 变真值 |
-| `Transfer-Encoding` | 全文零处理（chunked 体不消费，残留在 reader 里被当成下一个请求行） | **400** |
-| `CL` + `TE` 并存 / 重复 / 冲突 / 非十进制 `CL` | 最后一次生效 | **400** |
-| 未知方法（含 `PROPFIND` 这类合法扩展方法） | 折成 `.GET` 处理 | **501** |
-| 请求行非 3 段 / 版本非 `HTTP/1.x` | 不校验 | **400** |
-
-**签名变化**：`http.Method.fromString` 现在返回 **`?Method`**（未知 → `null`）。折成 `.GET` 本身就是
-走私面的一部分，所以这个变化是修复的要点，不是副作用。
-
-**一行改法**：升级后跑一遍真实流量（或 `examples/production-deploy/` 拓扑），确认没有走 `TE` 的客户端 ——
-本服务器**没有 chunked 请求解码器**，所以带 `TE` 的请求以前也是错的，只是错得无声。
-
-### 三处「默认为放行」改成 fail-closed（行为变化）
-
-**Breaking?** 是（对依赖宽松默认值的应用是行为变化；③ 的**调用方形态一字未改**）。
-
-- **`.dept_custom` 的空/坏 `dept_ids`**：`ids.len == 0` 与解析失败以前都 `return null`，而 `null` 按契约是
-  "**不过滤**"。现在给 `deny_clause = "1 = 0"`，**只有 `.all` 才能产生 `null`**。
-- **`permissionGateWith` 的配置存在函数级全局**：一个进程里跑两个 server 时第二次调用会覆盖第一次的
-  **catalog 与配置**（若目标路径在对方 catalog 里是 `.public`，权限检查被跳过）。改成**每调用一份**，
-  并把**空 catalog 改成 fail-closed**。legacy `jwtAuth` 的 `stored_security` 同形，一并改掉。
-- **`tenantClause` 的租户谓词没有括号**：`WHERE owner_id = ? OR is_public = 1` 会按优先级变成
-  `… OR is_public = 1 AND tenant_id = ?` —— **租户隔离对 `OR` 的第一个分支失效**且**没有任何报错**。
-  现在把调用方那段谓词包起来。
-
-### `handleAppendEntries` 的错误集多了一个成员（**编译错，仅下游穷尽 switch**）
-
-**Breaking?** 是。为修 `entry.index == 0` 的无符号下溢（一个无需认证的帧就能打死/越界读节点），
-`RaftElection.handleAppendEntries` 新增 `error.InvalidLogIndex`，现在共 2 个错误。
-
-**影响面**：只影响**直接调用它并对 `err` 写穷尽 `switch`** 的代码；用 `catch |err|` 兜住的不受影响。
-仓内无此类调用点。已按 `src/test/ErrorSetSnapshot.zig` 自己的契约登记进快照并把上限钉在 2。
-
-**一行改法**：给 `switch` 加一个 `error.InvalidLogIndex` 分支（按"对端发了畸形帧、丢弃"处理）。
-
-### `.peers` 在多节点集群里必须带 `@id`，否则**拒绝启动**（**运行期拒绝**）
-
-**Breaking?** 是 —— 对**多节点**部署是新的启动错误（`error.PeerIdRequired`）；单节点不受影响。
-
-`BootstrapConfig.peers` 的静态语法现在是 `"<id>@<host>:<port>"`（`@<id>` 可省）。省掉时 `id` 回落成 host，
-而 `ClusterBootstrap` 曾用 `addPeer(p.host)` 把 peer 的 id 记成 host 字符串 —— Raft 只把票记给
-`raft.peers[].id`，节点在线上自报的却是自己的 `node_id`，所以**这类集群的票一张也计不进来，永远选不出 leader**
-（`docs/dev/cluster-auth-design.md` §10）。现在多节点 + 有 peer 没写 id → `start()` 直接拒（`log.warn` + 返回错误）。
-
-**影响面**：`raft_cluster_size > 1` 且 `.peers` 里有不带 `@id` 的项的部署，升级后**启动失败**（拒绝，不是静默降级）。
-`PeerDiscovery.Peer` 也多了一个 `id` 字段，手工构造它的代码（`registerService` 调用方、
-`LoadBalancer.addCanaryPeer` 内部）要补 `.id`。
-
-**一行改法**（每个 peer 一次）：
-
-```zig
-// 旧（多节点集群）                            // 新：`@` 前写对端的 node_id
-.peers = &.{"127.0.0.1:9001"}                 .peers = &.{"node-b@127.0.0.1:9001"}
-```
-
-单节点（`raft_cluster_size = 1`）**不用改** —— 没有票要计。
-
-### 顺带（**破坏性：否**）
-
-- `getStatusText` 增加了 `501`；畸形请求的日志从 `log.err` **降为** `log.warn`
-  （客户端过错不是服务端故障）。
-- 新增 `zig build runtime-stress`（长时不变式压测）与 `docs/dev/READING_NUMBERS.md` 的读数约定。
-- `ready_high_water` 的无符号下溢修掉 —— 一个被发布的指标此前会永久撒谎。
+- **`db.query` rejects a tenant context without a declared column** (runtime rejection). With a tenant context the statement is wrapped: `SELECT * FROM ( <model SQL> ) AS _zt_tenant_scope WHERE _zt_tenant_scope.<col> = ?`. The tenant value is bound as `?` and never enters the SQL text. No declared column → `error.TenantScopeUnavailable`. Multi-tenant applications must use `ai.business.registerBusinessSkillsWith(&registry, &.{}, .{ .db_query_tenant_column = "tenant_id" })`, and the SELECT must include the tenant column.
+- **Request boundary hardening** (behaviour change plus signature change). A valid header with no space (`Host:x`, `Content-Length:5`) is now parsed instead of dropped. `Transfer-Encoding` returns 400; this server has no chunked request decoder. Conflicting, duplicate or non-decimal `Content-Length`, or `CL` plus `TE`, returns 400. An unknown method, including legitimate extensions such as `PROPFIND`, returns 501. A request line without three parts or a version other than `HTTP/1.x` returns 400. `http.Method.fromString` returns `?Method`, with `null` for unknown.
+- **Three defaults became fail-closed.** `.dept_custom` with empty or unparsable `dept_ids` sets `deny_clause = "1 = 0"`; only `.all` produces `null` (no filter). `permissionGateWith` keeps its configuration per call instead of in a function-level global, and an empty catalog denies. `tenantClause` parenthesises the caller's predicate, so `owner_id = ? OR is_public = 1` no longer lets the tenant predicate bind to one branch.
+- `RaftElection.handleAppendEntries` adds `error.InvalidLogIndex` (compile error only for exhaustive `switch`). It fixes an unsigned underflow on `entry.index == 0`.
+- **Multi-node `.peers` entries need `@id`** (startup rejection). `.peers = &.{"node-b@127.0.0.1:9001"}`; a missing id on a cluster with `raft_cluster_size > 1` returns `error.PeerIdRequired`. Single-node clusters need no change. `PeerDiscovery.Peer` gained an `id` field.
 
 ## v0.28.0
 
-### `Runtime.cancelTimer(id) bool` 删除，拆成两个入口
-
-**Breaking?** 是 —— **本版唯一一处**。全仓只有 `runtime.zig` 内部 1 处 + 1 个单测引用过它
-（`examples/`、`tools/`、`docs/` 零引用）。
-
-**为什么删而不是保留**：时间轮改为 ticker-owned 后，取消必然变成"投一条命令给 ticker"，
-调用返回时取消还没发生。`bool` 再也无法表示"它确实还挂着"——保留它只有一个后果：
-**静默改义**，调用方一个字节都不用改、行为悄悄变了。那比删掉危险。
-
-**一行改法**：
+`Runtime.cancelTimer(id) bool` is removed and split in two.
 
 ```zig
-// 旧（已删）
-if (rt.cancelTimer(id)) { ... }          // 语义是"它确实还挂着"
+// Old: "it is still pending" — no longer expressible after the ticker rewrite
+if (rt.cancelTimer(id)) { ... }
 
-// 新：热路径 —— 含义是"请求已交给 Runtime"，约一个 tick（5ms）后生效
+// Hot path: the request is handed to the runtime, effective after about one tick (5 ms)
 try rt.requestCancelTimer(id);
 
-// 新：控制面 —— 等 owner 执行完，返回最终结果
-if (try rt.cancelTimerSync(id)) { ... }  // true = 调用那一刻它还在 pending
+// Control plane: waits for the owner to execute, returns the final result
+if (try rt.cancelTimerSync(id)) { ... }  // true = pending at call time
 ```
 
-**顺带的能力**：`after` 的表现语义变成"**至少** delay_ms 后"，上界是
-`delay_ms + 入队延迟 + tick_interval_ms`（tick 是 5ms）。deadline 由**调用方**算
-（`clock.nowMs() + delay`），所以 `after(50)` 仍是相对调用时刻 +50，不是相对 ticker 收到 +50。
-命令队列满时 `after` 返回 `error.Full`，不静默丢。
+`after` now means "at least `delay_ms` from the call", with an upper bound of `delay_ms` + enqueue delay + `tick_interval_ms`. A full command queue returns `error.Full` instead of dropping the timer.
 
 ## v0.27.0
 
-### `zmodu audit` / `zmodu ci` 现在会审计嵌套模块
-
-**Breaking?** 是 —— 对消费方是**新增报错**，可能让原本绿的 `ci` 变红。
-
-**背景**：`collectBusiness` 的目录遍历是固定两层（`src/modules/<模块>/<文件>.zig`），
-而 `zmodu scaffold --with-agent` 把模块产出在 `src/modules/ai/agent/` —— 第 3 层。
-那个模块**从未被审计过**，里面的违规一直不可见。
-
-**影响面**：模块平铺在 `src/modules/<name>/` 的手写项目不受影响；受影响的是**嵌套模块**
-（`src/modules/a/b/…`）以及 `--with-agent` 的生成物。
-
-**一行改法**：升级后重跑 `zmodu audit .`，修掉新出现的违规；确属误报的用行级豁免
-`// audit: ignore <rule>`。
-
-### 取路由 State 用 `ctx.state(T)`
-
-**Breaking?** 否 —— 新增 API。旧写法仍能编译，但会被 `zmodu audit` 的 b4 点名。
+- `zmodu audit` and `zmodu ci` audit nested modules (`src/modules/a/b/…`, including `--with-agent` output). Re-run `zmodu audit .` after upgrading and fix new findings; use `// audit: ignore <rule>` for a false positive.
+- Route state comes from `ctx.state(T)`, which returns `error.NoRouteState` instead of letting `orelse unreachable` become UB in ReleaseFast.
 
 ```zig
-// 旧（b4 会报）
+// Old — b4 reports this
 const self: *MyApi = @ptrCast(@alignCast(ctx.user_data orelse unreachable));
-// 新
+// New
 const self: *MyApi = ctx.state(MyApi) catch return null;
 ```
 
-`user_data` 放的一直是 ComptimeRouter 的 `*State`（身份在另一个字段 `auth_info` 上）。
-`ctx.state(T)` 在缺 state 时返回具名错误 `error.NoRouteState`，而不是让
-`orelse unreachable` 在 ReleaseFast 下变成 UB。WS 的 `on_connect` / `on_close`
-与运行时注册（`Scope`）的回调同样适用。
-
-### 生成的 `catch {}` 改为带日志的忽略
-
-**Breaking?** 否 —— `zmodu scaffold --with-agent` / `--with-websocket` 生成物的行为微变：
-原本静默吞掉的审计写入 / 中继发送失败，现在会打一条 `std.log.warn`。
-重新生成即可拿到。
-
-### 生成的脚手架代码：跨租户 update/delete 从 `200 OK` 改为 `404`
-
-**Breaking?** 是（只影响**用 `zmodu scaffold` 生成过、且表带租户列**的项目，重新生成后行为变化）。
-
-**背景**：`updateForTenant` / `deleteForTenant` 的契约一直写着"0 行 = 这行属于别的租户（guarded no-op）"，
-但生成的 `update/delete<X>ByTenant` 把行数 `_ =` 丢掉了，handler 随后无条件 `wrapSuccess` ——
-于是"改别人的行"会被回答 **200 OK**（没有数据泄漏，但应用无法区分"改到了"与"不是你的行"）。
-
-**一行改法**：重新生成（`zmodu scaffold …`），或手工把 handler 改成
-
-```zig
-const rows = try self.service.updateXByTenant(tenant_id, entity);
-if (rows == 0) { try R.wrapErr(ctx, .not_found, "not found"); return; }
-try R.wrapSuccess(ctx);
-```
-（delete 同形。）**附带**：租户 update/delete 现在**只有 `rows > 0` 时才发事件**。
-
-### 生成的 `shared/response.zig` 的成功信封曾是**非法 JSON**
-
-**Breaking?** 是（生成的响应体变了）。`wrapSuccess` 用了普通字符串字面量而不是 format string，
-
-<div v-pre>
-
-`{{\"code\":0…` 原样落进响应体 → 每个生成项目的成功信封都是 `{{"code":0,…}}`，任何 JSON 解析器都拒。
-
-</div>
-
-**一行改法**：重新生成即可（现在产出 `{"code":0,"msg":"","data":null}`）。
-自查：`curl … | python3 -m json.tool` —— 以前这里会报解析错误。
-
-### 脚手架输出现在**可复现**（`.fingerprint` 从包名确定性派生）
-
-**Breaking?** 否，但**重新生成会改写 `build.zig.zon` 的 `.fingerprint` 一次**（从随机值换成本地派生值）。
-此后同一 `--name` + 同一 schema 的两次生成**逐字节相同**（`diff -r` exit 0），重新生成不再制造 diff。
-Zig 接受该值且**不会**在 `zig build` 时改写它（实测 md5 前后一致）。
-
-### `sqlx.Transaction` 补齐了相对 `Client` 的方法
-
-**Breaking?** 否，纯新增：`queryRowsPartial(Ctx)` / `queryScalar(Ctx)` / `queryRowBorrowed(Ctx)` /
-`queryRowPartialBorrowed(Ctx)` / `findOne(Partial)(Ctx)` / `findAll(Partial)(Ctx)` / `batchExec(Ctx)` /
-`ping(Ctx)`，以及 `queryRow/queryRowPartial/queryRows` 的 `*Ctx` 形式。既有签名**一字未改**。
-
-### 删除 `src/persistence/Database.zig`
-
-**Breaking?** 否（它没有从 `root.zig`/`data.zig` 导出，全仓唯一引用是"编译所有源文件"那个测试）。
-数据层的入口是 `data.sqlx` / `data.Repository`（`Orm(Backend)`），见 [`ZENT.md`](./ZENT.md) §1。
-
----
+- Generated scaffolds log swallowed audit and relay failures with `std.log.warn`, and tenant `update` / `delete` return 404 when no rows matched (events only when `rows > 0`). Regenerate.
+- Scaffolded `shared/response.zig` wrote an invalid success envelope; regenerate. Scaffold output is now reproducible: `.fingerprint` is derived from the package name.
+- `sqlx.Transaction` gains the `Client` method set: `queryRowsPartial(Ctx)`, `queryScalar(Ctx)`, `queryRowBorrowed(Ctx)`, `queryRowPartialBorrowed(Ctx)`, `findOne(Partial)(Ctx)`, `findAll(Partial)(Ctx)`, `batchExec(Ctx)`, `ping(Ctx)`, plus `*Ctx` forms of `queryRow`, `queryRowPartial` and `queryRows`.
+- `src/persistence/Database.zig` is removed. Use `data.sqlx` or `data.Repository` (`Orm(Backend)`).
 
 ## v0.25.0
 
-### `ClusterBootstrap.tick()` 也驱动 `raft.tick()`；配 `.transport` 时 `start()` 起入站监听
-
-**Breaking?** 否（此前 `raft.tick()` **没人驱动**，选举根本不发生 —— 接上之后行为才符合文档）。
-
-**影响面**：所有用 `ClusterBootstrap` 的进程。`tick()` 一次做完 `membership.runOnce()` → `view.sync()` →
-`raft.tick()`；配了 `.transport` 时 `start()` 还会在 `config.port` 上开入站监听（端口起不来返回
-`error.RaftInboundListenFailed`，不静默降级），`stop()` 对应停掉。**别把同一个 `port` 再给
-`DistributedEventBus.start(port)`**。
-
-**改法**：让 `tick()` 真的在循环里跑起来（此前只驱动 gossip 也算"能用"，现在选举/心跳依赖它）：
-
-```zig
-// before: 只在别处手工调 membership，raft 从未被 tick
-// after
-_ = try worker.after(1000, .tick);   // runtime 定时器 → Worker.handle → cluster.tick()
-```
-
-### Raft 计票口径：只数 peer 票，单节点首次选举即当选
-
-**Breaking?** 否，是修 bug。`hasQuorum`/`startElection` 的口径明确为"只数 peer 票"（自己的票不重复计入）；
-`cluster_size == 1` 时首次 election 立即当选（此前永远选不出 leader）。
-
-**影响面**：依赖"单节点集群会自己成为 leader"的启动逻辑现在能成立；断言过旧行为（永远 follower）的测试会变红。
-
-### `SagaStep.timeout_seconds` 真正生效
-
-**Breaking?** 是（行为变化）：预算超时的步骤现在会被判定并补偿。
-
-**影响面**：所有写了 `timeout_seconds` 的 saga。步骤耗时超预算 → 持久化 → **逆序补偿（含该步）** →
-终态 `.timed_out` → 返回 `error.SagaStepTimeout`；`0` 表示不做预算（与旧行为一致）。
-
-**改法**：`run` 的调用点要能接住新错误：
-
-```zig
-wf.run(allocator, &ctx) catch |err| switch (err) {
-    error.SagaStepTimeout => { /* 已补偿，读 instance 的终态 */ },
-    else => return err,
-};
-```
-
-### 2PC 新增 `TransactionJournal`（in-doubt 有解）
-
-**Breaking?** 否，纯新增（`zmodu.TransactionJournal`）。append-only、只 INSERT、DDL 方言中立；
-不配 backend 时退回内存。配了日志即 **fail-closed**（写不进去就报错、不前进）。`recover()` **只报告不决策**，
-返回"prepared 且无终态"的事务供调用方自行重试/回滚。
-
-**影响面**：用 `DistributedTransaction` 的应用不再需要自己造协调日志。
-
----
+- `ClusterBootstrap.tick()` also drives `raft.tick()`: one call runs `membership.runOnce()` → `view.sync()` → `raft.tick()`. With `.transport` set, `start()` listens on `config.port` (`error.RaftInboundListenFailed` if it cannot bind). Do not give the same port to `DistributedEventBus.start(port)`. Run `tick()` on a timer with `worker.after(1000, .tick)` and call `cluster.tick()` from the worker's handler.
+- Raft counts peer votes only and does not count its own twice; a single-node cluster elects itself on the first election.
+- `SagaStep.timeout_seconds` is enforced: an over-budget step is persisted, compensated in reverse order including itself, ends in `.timed_out`, and returns `error.SagaStepTimeout`. `0` disables the budget. `run` callers must handle the new error.
+- New `zmodu.TransactionJournal` for in-doubt transactions: append-only, INSERT-only, dialect-neutral, in-memory when no backend is configured, and fail-closed once a backend is set. `recover()` reports "prepared with no outcome" and does not retry or roll back.
 
 ## v0.24.0
 
-### 删除 7 个示例文件/目录（示例收敛）
-
-**Breaking?** 是，只对**引用这些路径**的脚本/文档/CI 成立。
-
-**影响面**：`examples/testing/`、`examples/deprecated/`、`examples/cluster-demo/`、`examples/example_tests.zig`
-已不存在 —— 内容分别并入 `examples/basic/src/tests.zig` 与 `examples/distributed/README.md`。
-
-**改法**：
-
-```bash
-# before: zig build test -Dexample=testing
-# after
-zig build test -Dexample=basic          # 合并后的测试根
-```
-
-### `build.zig.zon` 的 `minimum_zig_version` → `0.17.0`
-
-**Breaking?** 否，但旧工具链会被 Zig 直接拦下（这正是不再支持 0.16 的表述）。
-
-**影响面**：框架与 9 个示例的 `build.zig.zon`（含 `examples/*` 里 pin zent 的示例）。
-
-### CI 两份示例构建清单统一
-
-**Breaking?** 否。此前两份清单漂移（`zent-modulith` 只在一侧，`metaverse-creative` 两侧都没有），
-现在两份**逐字一致（17 项 + `zmsaas/backend`）**；不可构建的目录（docker / node / sibling 依赖）在两处都写明原因。
-（2026-09-18：`shopdemo-zent` 与 `tenant-ai` 两个示例删除后，两份清单为 **15 项 + `zmsaas/backend`**。）
-
----
+- `examples/testing/`, `examples/deprecated/`, `examples/cluster-demo/` and `examples/example_tests.zig` are removed; their content moved into `examples/basic/src/tests.zig` and `examples/distributed/README.md`. `zig build test -Dexample=testing` → `zig build test -Dexample=basic`.
+- `build.zig.zon` sets `minimum_zig_version` to `0.17.0`; older toolchains are rejected by Zig.
 
 ## v0.23.0
 
-### `ClusterBootstrap` 多节点 fail-closed（`raft_cluster_size > 1` 需 `.transport` 或显式承认）
-
-**Breaking?** 是：**多节点**配置的 `start()` 现在会返回 `error.RaftTransportUnavailable`（v0.22 引入检查，v0.23 给出
-`.transport` 这条出路）。此前静默选出一个没有 quorum 的"leader"。
-
-**影响面**：所有 `raft_cluster_size > 1` 的启动路径（默认值就是 3）。
-
-**改法**：三选一 —— 自带传输 / 显式承认只跑 membership + 读侧 / 单节点：
+- **Multi-node `ClusterBootstrap` is fail-closed.** With `raft_cluster_size > 1` (the default is 3), `start()` returns `error.RaftTransportUnavailable` unless one of three options is set: a real transport, an explicit acknowledgement that elections happen elsewhere, or single-node mode.
 
 ```zig
 var cluster = try zmodu.ClusterBootstrap.init(allocator, io, .{
     .node_id = "node-1",
     .port = 9000,
-    .transport = my_raft_transport,          // 真传输（v0.23 起的推荐路径）
-    // .allow_stub_raft_transport = true,    // 或：承认「选举在别处，或干脆不选」
-    // .raft_cluster_size = 1,               // 或：单节点
+    .transport = my_raft_transport,          // real transport
+    // .allow_stub_raft_transport = true,    // or: elections happen elsewhere
+    // .raft_cluster_size = 1,               // or: single node
 });
 ```
 
-### `RaftTransport` 落地（真选主传输）
-
-**Breaking?** 否，纯新增（`src/core/cluster/RaftTransport.zig`）：4 字节长度前缀 + 1 字节 tag 的 wire 格式、
-peer→地址簿、出站投票（fire-and-forget）与日志复制（同步读回）、入站分发（`handleConnection` 在同一连接回包）。
-`NetworkTransport.connect` 仍是死代码（引用即编译不过），拨号在 `RaftTransport` 内自建。
-
-**影响面**：想接真选主的应用 —— 自带传输只需管**发**，入站由 `ClusterBootstrap.start()` 监听 `port` 并分发
-（契约见 `docs/DISTRIBUTED.md`「真选主要什么」）。
-
----
+- `RaftTransport` (`src/core/cluster/RaftTransport.zig`) implements the wire format (4-byte length prefix, 1-byte tag), the peer-to-address book, outbound votes and log replication, and inbound dispatch with replies on the same connection. A custom transport only needs to send; `ClusterBootstrap.start()` listens and dispatches. `NetworkTransport.connect` is dead code.
 
 ## v0.22.0
 
-### `ModuleContext.runtime()` 接线（模块内建 worker/timer 的唯一入口）
-
-**Breaking?** 否，但**裸 harness** 下行为是显式失败。
-
-**影响面**：模块在 `initWith` 里 `ctx.runtime()` spawn worker；`Application.stop()` **先** join worker、**再**
-`Lifecycle.stopAll`（worker 可能正在调模块服务）。直接 `Lifecycle.startAllWith` 的裸 harness 返回
-`error.RuntimeUnavailable`，不会偷偷新建一个 runtime。`Application.runtime()` 现在**首次调用即启动 ticker**
-（此前 `handle.after(...)` 会静默不触发）。
-
-**改法**：别在模块里自己 `Runtime.init` / `rt.shutdown()`：
+- `ctx.runtime()` is the only way a module creates workers or timers. `Application.stop()` joins workers before stopping modules; a bare `Lifecycle.startAllWith` harness returns `error.RuntimeUnavailable` instead of creating a runtime. The first call starts the ticker, and modules must not call `Runtime.init` or `rt.shutdown()`.
 
 ```zig
 pub fn initWith(ctx: *zmodu.ModuleContext) !void {
-    const rt = ctx.runtime() catch |err| return err;   // 同一个 app.runtime()
-    _ = rt;                                            // rt.spawn(...) / handle.after(...)
+    const rt = try ctx.runtime();   // the application runtime
+    _ = rt;                         // rt.spawn(...) / handle.after(...)
 }
 ```
 
-### `skill.Tool.action`（默认 `.execute`）
-
-**Breaking?** 否，但**默认值是 fail-closed 的**：忘了声明的工具永远是 `execute`，拿不到宽策略。
-
-**影响面**：所有内置技能此前全落 `.execute`（`skill.zig:150` 的转发）；按 `AGENT_RUNTIME.md` §二 配
-`allow = 读工具 + allow_execute = false` 会**全拒**。读类工具要显式标 `.action = .read` / `.propose`。
-
-### `Agent.memory` 注入规则（身份缺失即一个字都不注入）
-
-**Breaking?** 否，纯新增（`Agent.memory` / `memory_prefix` / `memory_limit` + `memory.recallBlockAlloc`）。
-记忆按本次运行的 **tenant + user** 注入 system message；`recall` 把 `0` 当"任意"，所以身份缺失或为 0 时
-**一条记忆都不注入**（跨租户注入是沉默且最坏的失败）。**别**用 `MemoryStore.formatContext` 直接给 agent 喂记忆。
-
-### `DocSnippets` 门禁（文档代码块会被编译/形状校验）
-
-**Breaking?** 否，但**文档里的 `zig` 围栏代码块现在会被门禁扫**（`src/test/DocSnippets.zig`，递归到 `docs/**`，
-跳过插件目录）。最常被抓的是把 builder 方法直接链在 `zmodu.builder(…)` 临时值后面 —— 那个形状编译不过。
-
-**改法**（坏形状与好形状分开看 —— 历史形状用 `text` 围栏，避免门禁把它当成推荐的写法）：
-
-```text
-// 编译不过：临时值是 *const
-var app = try zmodu.builder(allocator, io).withName("app").build(.{});
-```
-
-```zig
-var b = zmodu.builder(allocator, io);
-defer b.deinit();
-var app = try b.withName("app").build(.{});
-```
-
----
+- `skill.Tool.action` defaults to `.execute`. Read-only tools must declare `.action = .read` or `.propose`, or `allow_execute = false` policies reject them.
+- `Agent.memory` injects memory for the run's tenant and user. A missing or zero identity injects nothing, because `recall` treats `0` as "any scope". Do not feed agents through `MemoryStore.formatContext`.
+- `src/test/DocSnippets.zig` checks fenced `zig` blocks in docs and doc comments. The most common failure is chaining builder methods onto the `zmodu.builder(…)` temporary, which is `*const`: bind it first with `var b = zmodu.builder(allocator, io); defer b.deinit();` and call `b.withName(…).build(…)`.
 
 ## v0.15.46
 
-### 上传内容策略（**新增，可选**）
-
-**Breaking?** 否。
-
-**影响面**：所有收文件上传的端点。此前框架只解析 multipart（`http.Multipart`）并限制**体积**，
-没有任何**内容**校验，于是每个应用各写一遍，而三种常见写法都有洞：只查扩展名（改名即绕过）、
-只查 `Content-Type`（客户端自填）、放行 SVG（脚本容器 → stored-XSS）。
-
-**改法**：
+- **Upload content policy** (optional). `http.Multipart` only enforced size, so applications reimplemented content checks, usually with one of three holes: extension only, `Content-Type` only, or SVG allowed.
 
 ```zig
 const mp = zmodu.http.Multipart.Config.forBodyLimit(64 << 20);
-var form = try zmodu.http.extractMultipart(ctx, mp);      // 415/413/400 → ProblemDetails
+var form = try zmodu.http.extractMultipart(ctx, mp);      // 415 / 413 / 400 → ProblemDetails
 defer form.deinit();
 try zmodu.http.UploadGuard.checkForm(&form, .{
     .extensions = &.{ "jpg", "jpeg", "png" },
@@ -1289,210 +345,38 @@ try zmodu.http.UploadGuard.checkForm(&form, .{
 });
 ```
 
-判定顺序（决定你拿到哪个错误）：大小 → 主动内容（SVG/HTML 默认拒绝）→ 扩展名白名单 →
-格式白名单 → 扩展名与内容一致。细节见 `BEST_PRACTICES.md`「上传与 multipart」。
+Check order decides the error: size → active content (SVG/HTML rejected by default) → extension allowlist → format allowlist → extension/content agreement. `http.extractMultipart` maps failures to ProblemDetails: 415 (not multipart), 413 (too large), 400 (missing boundary, malformed, too many parts).
 
-### `http.extractMultipart`（**新增**）
+- `Multipart.Config.forBodyLimit(n)` aligns `max_total_bytes` with `max_body_size`. The server rejects `content_len > max_body_size` (default 8 MB) before `Multipart.parse` runs, so the default `max_total_bytes` of 32 MB never triggers on its own.
+- `ctx.paramPath` is deprecated in favour of `ctx.nestedParam` (removal no earlier than 1.0). The names differ by source:
 
-`ctx.multipart` 是裸解析器（错误由调用方映射）；新抽取器与 `extractJson*` 对齐，
-失败直接产出 ProblemDetails：415（不是 multipart）/ 413（太大）/ 400（缺 boundary、畸形、part 过多）。
+| Call | Reads |
+|---|---|
+| `ctx.param` / `ctx.pathParam` | Route placeholders only (`/orders/{id}`) |
+| `ctx.queryParam` / `ctx.formValue` | Query only / form only |
+| `ctx.requestParam` | Form first, then query |
+| `ctx.nestedParam` (was `ctx.paramPath`) | Dotted paths in form/query (`filter.tags`) |
 
-### `Multipart.Config.max_total_bytes` 默认值不可达（**文档修正 + 新 helper**）
-
-**Breaking?** 否，但如果你**以为**设了 `max_total_bytes` 就限住了上传，请检查 `max_body_size`。
-
-服务端在 `content_len > max_body_size`（默认 8 MB）时先 413，`Multipart.parse` 不会被调用 ——
-所以默认 `max_total_bytes = 32 MB` 永远不触发。新增 `Multipart.Config.forBodyLimit(n)` 用同一个数字
-对齐"单 part ≤ 总量 ≤ body"。
-
-### `ctx.paramPath` → `ctx.nestedParam`（**弃用旧名，行为不变**）
-
-**Breaking?** 否（`paramPath` 保留为别名 —— 删除时点见锚点：**§ 弃用别名与删除计划**）。
-
-三个近义名此前各自语义不同，读代码的人会猜错：
-
-| 调用 | 读什么 |
-|------|--------|
-| `ctx.param` / `ctx.pathParam` | **只读路由占位符**（`/orders/{id}`） |
-| `ctx.queryParam` / `ctx.formValue` | 只读 query / 只读 form |
-| `ctx.requestParam`（新增） | **form 优先，回退 query**（"客户端放哪都行"） |
-| `ctx.nestedParam`（原 `paramPath`） | form/query 里的点号路径（`filter.tags`） |
-
-顺带澄清一条常见误读（"`param` → `paramPath` → `nestedParam` 改名三次"）：`ctx.param` 与
-`ctx.pathParam` 都**不在**弃用表上 —— `param` 是现行名，`pathParam` 是 v0.15.38 新增的同义名，
-两者都没有删除计划；这条链上被弃用的只有 `paramPath` 一个。
-
-### `ctx.route_template` 统一带前导斜杠（**标签值变化**）
-
-**Breaking?** 对指标标签是——同一路由的 label 取值会变。
-
-此前模板形状取决于**注册方式**：`group.get("/health")` 带斜杠，`group.get("health")` 与
-ComptimeRouter 的 `mountAll`（`nest` + `spec.path`）都不带，于是同一套指标里既有
-`/metrics` 又有 `orders/{id}`，写死的 dashboard 查询会漏掉一半。现在注册期统一规整为
-`/...` 形式（`Router.addRoute` 的 `normalizeRoutePath`），匹配逻辑不受影响。
-**升级动作**：如果 dashboard / 告警里按旧形状（无前导斜杠）过滤，改成带斜杠的形式。
-
-### `CircuitBreakerRegistry` 指针化 + 加锁（**行为修复，一处类型变化**）
-
-**Breaking?** 一处：`breakers` 字段类型 `std.StringHashMap(CircuitBreaker)` →
-`std.StringHashMap(*CircuitBreaker)`（仅影响直接读该字段的代码；用 `getOrCreate`/`get` 的不受影响）。
-
-修的是与 `RateLimiterRegistry` 同族的两处缺陷：按值存导致 `getOrCreate` 返回的内部指针在**下一次插入
-rehash 后失效**（悬垂指针），以及全程无同步。现在指针在 registry 生命周期内稳定，且所有访问持内部锁。
-新增 `count()`；`generateReport()` 从占位串改为真实 JSON。
-
-### `http.UploadGuard` / `SpinLock` 之外的小项
-
-- `RateLimiterRegistry`：新增 `max_keys`（`initWithCapacity`）与 LRU 淘汰、`remove(name)`、
-  `retain(max_idle_seconds)`、`generateReport()`。**`max_keys` 默认 0 = 行为不变**；但按 IP 建 key 的
-  部署建议设上限：registry 以前只增不减。
-- `ShardRouter.ShardedQuery`：**移除**（只能返回 `error.NotImplemented`，且无调用点）。物理分表仍由
-  DB 层负责，模块头已写明。
-- `PluginManager.loadPlugin`：仍只登记名字、不加载代码，但现在会 **warn 一行**并提供
-  `dynamicLoadingSupported() == false`，便于调用方分支（以前是静默 no-op）。
-- `ModuleCapabilities.generateApiBoundaryReport` / `CircuitBreakerRegistry.generateReport` /
-  `RateLimiterRegistry.generateReport`：占位字符串改为真实 JSON 快照。
-- `http.AccessLog` / `http.HttpMetrics`：手写的 `tryLock` 纯自旋（不让出 CPU）改为共享 `SpinLock`
-  （自旋后 `yield`）。
-
----
+- `ctx.route_template` always has a leading slash. Dashboards and alerts filtering on the old shape (`orders/{id}`) must add the slash.
+- `CircuitBreakerRegistry.breakers` is `std.StringHashMap(*CircuitBreaker)`; pointers stay valid across rehashes and access is locked. `count()` is new and `generateReport()` returns real JSON.
+- `RateLimiterRegistry` gains `max_keys` (via `initWithCapacity`), LRU eviction, `remove(name)`, `retain(max_idle_seconds)` and `generateReport()`. `max_keys = 0` keeps the old behaviour, but registries keyed by IP should set a bound.
+- `ShardRouter.ShardedQuery` is removed (it only returned `error.NotImplemented`). `PluginManager.loadPlugin` logs a warning and reports `dynamicLoadingSupported() == false` instead of doing nothing silently. `http.AccessLog` / `http.HttpMetrics` share `SpinLock`.
 
 ## v0.15.45
 
-### 错误体可全局统一为 RFC 7807（**行为变化，需显式开启**）
+- **RFC 7807 error bodies** (opt-in). Framework errors used to come in three shapes, only one of which could be hooked. Call once at startup: `zmodu.http.useRfc7807Errors();` — chain plus pre-router, `application/problem+json`. Partial wiring: `setDefaultReject(http.problemReject)`, `setTransportErrorRenderer(http.problemTransportBody)`, `setDefaultReject(null)` to reset. Per gate: `.reject = problemReject` or `.reject = envelopeReject(.thinkphp)`; `ModuleGateConfig` gained `reject` and `.unknown = .deny` still works. Per response: `ctx.sendErrorEnvelope(status, code, msg)`. With this enabled, chain-tail middleware that rewrites the 404 body can be deleted. `ProblemDetails.toJson` escapes strings, and `statusTitle` covers 402/411/413/414/415/416/418/428/431/451/501/505/507.
+- **Handler-side permission matching.** When a route meta uses OR (`portal:user|portal:shop`) and the handler needs to know which side it is on, reuse the same expression instead of narrowing one branch: `ctx.permissionMatches("portal:user|portal:shop")`. For exactly a gate's semantics (`.rbac` prefers AuthInfo when present) use `zmodu.http.permissionMatchesWith(ctx, "portal:shop", .{ .mode = .rbac })`. `ctx.permissionsCsv()` is new alongside `ctx.rolesCsv()`.
+- Redis client: framed RESP reads, a lock on the shared no-pool stream, working `read_timeout_ms` / `write_timeout_ms`, and a connection that fails to parse is closed and removed from the pool.
+- `RateLimiterRegistry.limiters` is `std.StringHashMap(*RateLimiter)`; read through `get` / `getOrCreate` rather than the field. `RateLimiter.acquire` is deprecated in favour of `tryAcquire` (it never waited); removal is no earlier than 1.0. `ProblemDetails.statusTitle(418)` is `"I'm a Teapot"` rather than `"Unknown Error"`.
 
-**Breaking?** 否 —— 不调用新 API 时行为**一字未变**。
+## v0.15.36 – v0.15.41
 
-**影响面**：所有依赖框架自产错误体的地方。修复前有三种形状、只有一种能挂钩：
+- `Auth` gains `.optional` in v0.15.41: verify the token when present, ignore failures, never return 401. Use it for public endpoints that personalise when a user is known instead of hand-writing a best-effort check in a `.public` handler.
+- Use `ctx.route_template` for metric labels, not `ctx.path`. `path` contains ids and blows up Prometheus cardinality.
+- Connection-level backpressure and slow-connection protection are on by default; `max_connections`, `over_limit_response` and `header_timeout_ms` are described in [BEST_PRACTICES.md](../guide/BEST_PRACTICES.md) under "resilience".
 
-| 形状 | 触发路径 |
-|------|---------|
-| `{"code":status,"msg":…,"data":null}` | `ctx.sendError`/`sendErrorResponse`（moduleGate、CSRF、413、408、未捕获 handler 500、静态文件） |
-| `{"error":"…"}` | 路由之前写裸 socket（400/408/413/431、accept 线程超额 503） |
-| `{status,title,detail,instance}` | `http.respondErr` 等 |
+## Release template
 
-**改法**（启动期一次）：
+The cycle section is headed `## v<previous release> (unreleased batch)` and points at CHANGELOG's `[Unreleased]` entry. At release the heading becomes `## v<new version>` and in-body `[Unreleased]` references are repointed.
 
-```zig
-// 链内 + 路由前，全部 RFC 7807（media type application/problem+json）
-zmodu.http.useRfc7807Errors();
-```
-
-只想要其中一半：
-
-```zig
-zmodu.http.setDefaultReject(zmodu.http.problemReject);          // 仅链内
-zmodu.http.setTransportErrorRenderer(zmodu.http.problemTransportBody); // 仅路由前
-zmodu.http.setDefaultReject(null);                                 // 复位
-```
-
-- 单个 gate 想自行决定：`.reject = problemReject` / `.reject = envelopeReject(.thinkphp)`；`ModuleGateConfig` 新增 `reject`，**`.unknown = .deny` 可保留**。
-- 单条响应想保留旧形状：`ctx.sendErrorEnvelope(status, code, msg)`。
-- 装 `useRfc7807Errors()` 后，应用侧"链尾中间件改 404 体"的 workaround 可以删除。
-- `ProblemDetails.toJson` 现在正确转义字符串（`detail` 可安全携带校验消息等不可信文本），`statusTitle` 补全 402/411/413/414/415/416/418/428/431/451/501/505/507。
-
-### handler 侧权限匹配（**新增，可选**）
-
-**Breaking?** 否。
-
-**影响面**：路由 meta 用 OR（`portal:user|portal:shop`）而 handler 又需要区分门户的地方 —— 此前只能在 handler 里重写门户检查，窄化一处就 403 一整类用户。
-
-**改法**：
-
-```zig
-// before：handler 自己拼门户判断，只认其中一个分支 → 另一门户整类 403
-//   （反馈方的真实故障：路由 meta 是 portal:user|portal:shop，
-//      handler 复用了只认 .shop 的 requireAppAuth）
-if (!shopOnlyAuth(ctx)) { try zmodu.http.respondErr(ctx, error.Forbidden); return; }
-
-// after：用与路由声明完全相同的表达式问"我是哪一边"
-if (!ctx.permissionMatches("portal:user|portal:shop")) {
-    try zmodu.http.respondErr(ctx, error.Forbidden);
-    return;
-}
-// 需要与某个 gate 完全同语义（.roles 只看 roles；.rbac 有 AuthInfo 时以它为准）：
-const ok = zmodu.http.permissionMatchesWith(ctx, "portal:shop", .{ .mode = .rbac });
-```
-
-配套新增 `ctx.permissionsCsv()`（与 `rolesCsv()` 同形）。
-
-### Redis 客户端：分帧读 + 单流加锁 + 真超时（**bug 修复**）
-
-**Breaking?** 否（除非依赖了"大回包被截断"的行为，那本就不是契约）。
-
-**影响面**：`RedisConfig.pool_size <= 1`（共享单流）的部署、>4KB 的回复、Redis 不响应时的挂起。修复内容：按 RESP 分帧读到完整回包、无池分支加锁、`read_timeout_ms`/`write_timeout_ms` 真正生效、解析失败即 `close()` 该连接并摘出池。
-
-### `RateLimiter` / `RateLimiterRegistry` / `SlidingWindowRateLimiter` 线程安全（**bug 修复**）
-
-**Breaking?** 是，一处：`RateLimiterRegistry.limiters` 字段类型由 `std.StringHashMap(RateLimiter)` 变为 `std.StringHashMap(*RateLimiter)`。
-
-**影响面**：只有直接读 `.limiters` 的代码（框架内无）。用 `get`/`getOrCreate`/`count` 的调用方不受影响 —— 反而修好了"插入后旧 `*RateLimiter` 失效"的隐患。
-
-**改法**（若你直读过该字段）：
-
-```zig
-// before
-const lim = registry.limiters.getPtr("key").?;
-// after
-const lim = registry.get("key").?;            // 或 getOrCreate("key")
-```
-
-**顺带（同一版）**：`RateLimiter.acquire` 从这一版起被标注为 `DEPRECATED` —— 它与 `tryAcquire` 同义
-（同步上下文里那个"等待"从来没有实现过）。`CHANGELOG.md` 的 `[0.15.45]` 段记着这条；
-删除时点与替代名见 **§ 弃用别名与删除计划**。
-
-### `ProblemDetails.statusTitle` 补全状态码
-
-**Breaking?** 否，除非断言过 `statusTitle(418) == "Unknown Error"`（现为 `"I'm a Teapot"`）。新增 402/411/413/414/415/416/418/428/431/451/501/505/507。
-
----
-
-## v0.15.41
-
-### `Auth.optional` 一等化
-
-**Breaking?** 否。`Auth = inherit | public | jwt` 新增 `.optional`：有 token 就验、失败忽略、**永不 401**，供"公开但可个性化"的接口（C 端用户中心）使用，替代在 `.public` 分支里手写尽力而为的验签。
-
----
-
-## v0.15.36
-
-### `route_template` 指标标签
-
-**Breaking?** 否，但**建议**把指标 label 从 `ctx.path` 换成 `ctx.route_template`：`path` 带 id，会把 Prometheus 基数打爆。
-
-### 韧性默认值（限流/熔断/背压）
-
-**影响面**：新增连接级背压与慢连接防护；`max_connections` / `over_limit_response` / `header_timeout_ms` 语义见 `BEST_PRACTICES.md`「韧性」。
-
----
-
-## 模板
-
-发布周期中，新条目写在**当前周期节**：标题形如 `## v<上一发布号> 之后（未发布批次）`，
-正文引用 CHANGELOG 的 `[Unreleased]` 段。发布时 `scripts/release.sh` 会把该节标题
-自动改名为新版本号（`## v<新版本>`），并在仍有任何 `（未发布批次）` 标题残留时**硬失败**
-——所以正文里对 `[Unreleased]` 的引用也要在发布前一并改成新版本段名（脚本只改标题，
-不改正文）。周期内没有「会咬人」变更时不开该节。
-
-改名/弃用类条目的额外约定：**凡公开名字改名且旧名保留（别名/兼容拼写），同一批必须完成
-「§ 弃用别名与删除计划」的三件事规则** —— 代码注释带 `DEPRECATED` 并指向新名、表内加一行且
-**删除列不留空**、本版条目回指该节（`src/test/ApiFreeze.zig` 逐行对账：表外弃用、删除列留空、
-行与门禁失同步都是红）。**删除执行的前一个版本**，还要在本节与当版本条目里同时点名预告。
-
-```markdown
-## vX.Y.Z
-
-### <变更一句话>
-
-**Breaking?** 是/否（若是：一句话说清什么会编译不过或行为改变）
-
-**影响面**：谁会受影响（调用点类型/数量、版本区间）
-
-**改法**：
-
-```zig
-// before
-// after
-```
-```
+Each entry records `Breaking?` (and what stops compiling or changes behaviour), scope (which call sites and version range), and the one-line fix. A rename or deprecation entry must also complete the three steps in Adding a deprecation. The release before a removal announces it here and in that version's entry.

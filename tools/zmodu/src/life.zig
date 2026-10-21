@@ -1,5 +1,5 @@
 //! `zmodu life issue|release|sync` — the file-adapter CLI for the life
-//! governance system (spec: docs/superpowers/specs/2026-10-16-life-issue-release-design.md).
+//! governance system (spec: docs/dev/superpowers/specs/2026-10-16-life-issue-release-design.md).
 //!
 //! Storage: `.life/issues/LI-%04d.md` (frontmatter markdown) + `.life/releases/`.
 //! The state machine/validators live in the shared `life_core` module

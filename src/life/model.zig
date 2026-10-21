@@ -1,5 +1,5 @@
 //! Life — core data model for the issue/release governance system.
-//! Spec: docs/superpowers/specs/2026-10-16-life-issue-release-design.md
+//! Spec: docs/dev/superpowers/specs/2026-10-16-life-issue-release-design.md
 //! Pure data + enum text codecs; no IO, zero dependencies beyond std.
 
 const std = @import("std");

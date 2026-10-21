@@ -1,46 +1,50 @@
 ---
 layout: home
-title: zmodu
+title: zmodu documentation
 
 hero:
   name: zmodu
-  text: A modular framework for Zig
-  tagline: Build services as modules — compose, route, observe, evolve.
+  text: Modular applications and a bounded runtime for Zig
+  tagline: Routes and dependencies resolve at compile time. Workers, mailboxes and timers stay bounded at run time.
   actions:
     - theme: brand
-      text: Read the documentation
-      link: /
+      text: Quick start
+      link: ./guide/QUICK-START
     - theme: alt
-      text: Architecture
-      link: /reference/ARCHITECTURE
-    - theme: alt
-      text: Quick Start
-      link: /guide/QUICK-START
+      text: Runtime
+      link: ./reference/RUNTIME
 
 features:
-  - title: Modulith, not microservices
-    details: Compose modules in one process while keeping their boundaries honest. Extract a service later if the boundary was real.
-    link: /guide/MODULITH
-    linkText: Modulith
-  - title: Explicit routing
-    details: One route table, resolved at comptime. No reflection, no string dispatch, no ambient registration.
-    link: /reference/ROUTE_TABLE
+  - title: Compile-time routing
+    details: One route table per module. Auth, permissions and OpenAPI metadata sit next to the handler, and duplicate paths fail before the server starts.
+    link: ./reference/ROUTE_TABLE
     linkText: Route table
+  - title: Module boundaries
+    details: Dependencies are declared and checked at startup. Missing, self and cyclic edges stop the application.
+    link: /docs/guide/MODULITH
+    linkText: Modules
+  - title: Bounded runtime
+    details: A worker owns its state, a mailbox owns the handoff, and a full queue returns error.Full instead of growing.
+    link: ./reference/RUNTIME
+    linkText: Runtime
+  - title: Deterministic replay
+    details: A controlled clock, random source and event sequence make the same input produce the same order and output.
+    link: ./reference/RUNTIME
+    linkText: Replay
   - title: Built-in observability
-    details: Structured logging and Prometheus metrics with fairness guarantees across priority pools.
-    link: /reference/OBSERVABILITY
+    details: Structured logs, Prometheus metrics and OTLP tracing are part of the framework, not an add-on.
+    link: ./reference/OBSERVABILITY
     linkText: Observability
-  - title: Distributed when needed
-    details: A Raft implementation with mixed-version compatibility and mutation-tested invariants.
-    link: /reference/DISTRIBUTED
-    linkText: Distributed
+  - title: Data and AI
+    details: SQLx, Redis, Kafka and the zent ORM stay at the application layer. Agents, RAG and approvals compose as modules.
+    link: ./ai/AI
+    linkText: AI
 ---
 
-# Where to go next
+# Start
 
-The **[documentation index](https://github.com/chy3xyz/zmodu/blob/master/docs/archive/README.md)** is the full map — it lists every document
-by role, so an agent or a newcomer can pick a path without guessing.
-
-Start with **[AGENTS.md](https://github.com/chy3xyz/zmodu/blob/master/AGENTS.md)**
-if you are driving this repository with an LLM: it is the canonical doc map,
-including the DO / DON'T list and the auth Path A rules.
+- [Quick start](./guide/QUICK-START.md) — install and run the first route.
+- [Modules](./guide/MODULITH.md) — write a module and compose an application.
+- [Runtime](./reference/RUNTIME.md) — workers, mailboxes, scheduler and replay.
+- [API](./reference/API.md) — the public surface.
+- [Upgrading](./reference/UPGRADING.md) — breaking changes and migrations.

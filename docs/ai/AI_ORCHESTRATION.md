@@ -1,186 +1,123 @@
-# AI 编排能力规划与现状
+# AI Orchestration
 
-> 与 [AI_SKILLS.md](./AI_SKILLS.md)（Agent 能「做什么」的工具目录）互补，本文是
-> Agent **怎么跑**的编排层：多步任务、预算、触发、子 Agent、人工交接。
-> 所有能力复用业务层基建（Saga/outbox/WAL、Scheduler、EventBus、quota/audit），
-> 遵守受控执行姿态。
+How agent work is shaped: multi-step tasks, budgets, triggers, sub-agents and human handoff. [AI_SKILLS.md](./AI_SKILLS.md) lists the "what"; this page covers how it runs.
 
-> **运行时姿态见 [`AGENT_RUNTIME.md`](../reference/AGENT_RUNTIME.md)**：`ai.Guard` / `ai.AgentSpec`（含 `isGuarded()` / `isInert()`）、
-> `skill.Tool.action`（默认 `.execute`）、`ai.AgentWorker`（agent 跑成运行时 worker）、
-> `ai.ProposalPipeline`（提议 → 风险 → 执行）。本文只讲编排形状，那篇讲闸门与执行许可。
+All orchestration reuses business infrastructure (Saga/outbox/WAL, `Scheduler`, `EventBus`, quota, audit) and keeps the controlled-execution posture.
 
-## P0 · 已落地
+For gates and execution permission, read [`AGENT_RUNTIME.md`](../reference/AGENT_RUNTIME.md): `ai.Guard`, `ai.AgentSpec` (`isGuarded()` / `isInert()`), `skill.Tool.action` (default `.execute`), `ai.AgentWorker` and `ai.ProposalPipeline`.
 
-### `zmodu.ai.workflow` — 线性多步任务编排
+## Workflow
 
 ```zig
+const steps = [_]zmodu.ai.workflow.Step{
+    .{ .name = "lookup", .kind = .{ .skill = .{ .name = "order.summary", .args = .{ .object = .{} } } } },
+    .{ .name = "review", .kind = .{ .approval = .{ .subject = "order-42", .amount = 150_000 } }, .depends_on = &.{"lookup"} },
+    .{ .name = "reply", .kind = .{ .llm = .{ .prompt = "Draft the customer reply" } }, .depends_on = &.{"review"} },
+};
+
 var wf = zmodu.ai.workflow.Workflow.init(&registry, &steps);
-var result = try wf.run(allocator, &ctx);   // 顺序执行，逐步入记录
+wf.wal = &wal;                        // crash recovery and replay
+wf.approval_flow = flow.toPort();     // required for .approval steps
+wf.max_parallel = 4;                  // DAG wave width
+var result = try wf.run(allocator, &ctx); // one record per step
 defer result.deinit();
 ```
 
-步骤类型：
+| `StepKind` | Behaviour |
+|------------|-----------|
+| `.llm` | One LLM turn, no tools |
+| `.skill` | One skill dispatch, result stringified into the record |
+| `.agent` | A full ReAct agent run with tools |
+| `.approval` | Human-in-the-loop gate (`{ subject, amount }`) |
 
-| StepKind | 说明 |
-|----------|------|
-| `.llm` | 单次 LLM 调用（无工具） |
-| `.skill` | 一次 skill dispatch（结果 stringify 入记录） |
-| `.agent` | 完整 ReAct Agent 运行（带工具） |
+Each step records status, error and output. A step may set `retry`; a failure stops the run and returns partial results with status `.failed`; a shared budget overrun stops it with `.budget_exhausted`.
 
-特性：每步记录（status/error/output）、步骤级重试（`retry`）、失败即停并返回
-部分结果（status `.failed`）、共享预算超支即停（status `.budget_exhausted`）。
-`Workflow.toMermaid` 把步骤渲染为 Mermaid `flowchart`（线性用隐式顺序边，
-DAG 用依赖边，节点标注 kind），便于把编排结构直接嵌入文档/看板。
+`Workflow.toMermaid` renders the step graph as a Mermaid `flowchart` (implicit order edges for linear flows, dependency edges for DAGs, kind-annotated nodes).
 
-**人工审批门（human-in-the-loop）**：步骤类型新增 `.approval`
-（`{ subject, amount }`），`Workflow.approval_flow` 挂上 `ApprovalFlow` 后，
-该步骤即走审批链——approved 继续执行，rejected 记步骤失败，转人工时 run
-以 `.pending_human` 停止（前序步骤已持久化）；人工在审批队列处理完毕后
-`resumeRun` 继续（审批步骤按同一策略重跑）。
+**Human approval.** With `Workflow.approval_flow` set, an `.approval` step runs the approval chain: approved continues, rejected fails the step, and an escalation stops the run as `.pending_human` with earlier steps persisted. After the human decides, `resumeRun` re-runs the approval step under the same policy and continues.
 
-**线性 ↔ DAG 混合**：默认按声明顺序线性执行；给步骤加 `depends_on`（依赖的步骤
-名列表）即自动切换为 **DAG 执行**——就绪步骤（依赖全部完成）按 `max_parallel`
-并行波次执行（`std.Io.Group`），环检测返回 `error.CyclicDependency`。预算、
-WAL 持久化、转人工在 DAG 下同样生效；反射质量门当前应用于线性路径的最终步骤
-（DAG 汇点可用后续线性步骤校验）。
+**Linear or DAG.** Declared order is linear by default. Adding `depends_on` to any step switches the run to DAG mode: ready steps execute in parallel waves of `max_parallel` (`std.Io.Group`), and a cycle returns `error.CyclicDependency`. Budget, WAL persistence and human handoff work the same in both modes. The reflection quality gate applies to the final step of the linear path; for a DAG, verify at the sink or add a linear step after it.
 
-### `zmodu.ai.Budget` — 任务级 token 预算
+**WAL recovery.** Each completed step is appended to `Workflow.wal` under the run id. After a crash, `resumeRun` replays finished steps and continues from the first unpersisted one.
 
-硬预留（`tryConsume`），非事后记账：多步任务/Agent 每步 LLM 前预留 token，
-超支 `.stop` 提前终止（`AgentResult.budget_exhausted` / 运行状态
-`.budget_exhausted`）或 `.warn` 继续。`Agent.budget` 可挂到单个 Agent 上。
+**Reflection gate.** `Workflow.reflection` (`VerifyFn`) plus `max_reviews` re-runs the final step when output misses `Workflow.goal`; a persistent miss escalates to failure.
 
-### 已落地（本轮）
+**Escalation hooks.** `Workflow.on_escalate` (`EscalateFn`) fires for `step_failed`, `budget_exhausted` and `verification_failed`, handing control to the application.
 
-- **业务价值工具**：
-  - `zmodu.ai.reporter.BusinessReporter`——配置化 SQL 查询 → Markdown 经营简报
-    （配合 `trigger.registerCron` + outbox 即可每日定时推送）；
-  - `zmodu.ai.alerts.BusinessAlert`——规则化 SQL 巡检，任一规则命中即触发
-    预警（`on_alert` 回调 + outbox 回写），配合 cron trigger 做异常预警。
-  - `zmodu.ai.ticket.TicketFlow`——工单分诊：上下文查询（复用 BusinessReporter）
-    → 分类 → 草稿回复 → 发送/人工审批门（`on_send`）→ outbox 回写。
-  - `zmodu.ai.refund.RefundFlow`——退款补偿编排：校验 → 审批 → 退款命令
-    （事务性 outbox）→ 通知；通知失败自动发补偿命令（`refund.reverse`），并暴露
-    `compensate()` 供下游失败时人工/自动冲正。
-  - `zmodu.ai.risk.RiskReview`——风控审核：规则化 SQL 命中累加风险分
-    （可配 `DecideFn` 接 LLM/策略）→ 分档（low/medium/high）→ 决策
-    （approve/escalate/reject）→ outbox 回写 `ai.risk`，供人工复核队列消费。
-  - `zmodu.ai.recon.ReconCheck`——数据对账巡检：源/目标两个 SQL 快照按
-    key 对比（missing / extra / mismatch 三态），逐条 `on_diff` 回调 +
-    outbox 汇总（`ai.recon`，CLEAN/DRIFT）+ Markdown 差异报告
-    （`renderReport`）；配合 cron trigger 做定时对账。
-  - `zmodu.ai.approval.ApprovalFlow`——多级审批链：请求按配置的步骤列表
-    逐级审批，每步由 `policy` 回调（可接 LLM/RBAC/规则引擎）决定
-    approved / escalated / rejected，首次拒绝或转人工即停；逐步 + 终态事件
-    写回事务性 outbox（`ai.approval`）作为审计与人工队列。
-    `registerApprovalSkills` 暴露 `approval.submit` 技能桥（LLM 只提供
-    subject/amount/request，审批链与策略由应用注册），默认策略为全部转人工。
-  - `zmodu.ai.notify.NotificationHub`——通知分发：消息投递到具名渠道——
-    webhook（走 `HttpClient`，HTTP 2xx 才算送达）、自定义 sink
-    （邮件/IM/站内信回调，`userdata` + `call` 模式）、无渠道时事务性 outbox
-    持久化兜底（`ai.notify`）；`registerNotifySkills` 暴露 `notification.send`
-    技能桥（LLM 只提供 channel/title/body，渠道目标由应用注册并可白名单）。
-  - `zmodu.ai.kpi.KpiMetric` + `kpi.query`——经营指标：应用注册具名指标
-    （name → SQL → value 列），`kpi.query` 技能桥让 LLM 直接回答
-    「本周营收/退款率多少」；指标定义与 SQL 语义由应用持有，LLM 只能按名查询，
-    另有程序化 `Kpi.query`。
-  - `zmodu.ai.sla.SlaTracker`——SLA/时效管理：跟踪业务项（工单/审批/退款）
-    的单调钟截止时间，`check()` 按 cron 节奏评估——截止前进入 warn 窗口触发
-    提醒，超时触发 breach；事件进 `on_sla` 回调（可接 `ai.notify`）+ outbox
-    （`ai.sla`），把「等处理」变成主动运营。
-  - `zmodu.ai.diagnose.DiagnosisFlow`——异常归因诊断：给定异常（来自
-    `alerts`/`recon`/`sla`/应用代码），先跑配置的 evidence SQL 收集证据，
-    再交给 `diagnose` 回调（可接 LLM/规则引擎）产出根因 + 建议动作，
-    结果写回 outbox（`ai.diagnose`）。
-- **`zmodu.ai.AgentHandle` 运行时控制**：协作式 cancel / pause / 进度计数
-  （原子标志，Agent 每步边界检查）；`Agent.tracer` + `parent_span` 可选创建
-  run 级 trace span（复用 DistributedTracer）；
-- **`zmodu.ai.context` 上下文管理**：按 token 阈值自动压缩长对话——旧消息
-  交给 `SummarizeFn` 摘要（或直接丢弃）作为 system 消息前置，保留最近窗口；
-  `Agent.context` 已接入（循环内自动触发）；
-- **`zmodu.ai.hierarchy` 分层编排**：planner 拆目标为子任务 → executor 并行
-  （`std.Io.Group` 按 `max_parallel` 分波）→ 聚合；部分失败标记
-  `.partial_failed`；planner/executor 均为回调，可接 Agent/Workflow；
-- **`zmodu.ai.trigger` 触发编排**：`fire(input)`（事件/Webhook 源直接调用）+
-  `registerCron(scheduler, name, expr, input)`（定时源，上下文由 Trigger 持有）+
-  可选 outbox 回写（`outbox` + `backend` 配置后每次 run 追加
-  `{run_id, ok, message}` 到事务性 outbox）；
-- **WAL 持久化 + `resumeRun(run_id)`**：每步完成后写入 WAL（`Workflow.wal` +
-  `run_id`），崩溃后从最后已持久化步骤续跑（回放已完成步骤 → 继续剩余）；
-- **反射质量门**：`Workflow.reflection`（`VerifyFn`）+ `max_reviews`——最终步骤
-  输出不达标自动重跑最后一步，仍不达标升级为失败；
-- **转人工钩子**：`Workflow.on_escalate`（`EscalateFn`），步骤失败（重试后）、
-  预算超支、验证持续失败三种原因回调应用层。
+## Budget
 
-  `ai.llm.llmVerify` 是现成的 LLM-backed 验证器（可直接赋给
-  `Workflow.reflection`）：让模型判断输出是否达成目标（`{"pass":...}`），
-  模型失败/非法响应保守返回 false 触发重跑；配合 `LlmPolicyCtx` 的
-  `json_fn` 注入即可测试。
+```zig
+var budget = zmodu.ai.Budget.init(2000);
+budget.mode = .stop; // or .warn
+```
 
-## P0/P1 · outbox 消费闭环
+`Budget` is a hard reservation, not after-the-fact accounting: each step reserves tokens before its LLM call, and an overrun stops the run (`AgentResult.budget_exhausted`, run status `.budget_exhausted`) or warns and continues. Attach it to one agent with `Agent.budget`.
 
-`zmodu.outbox.OutboxConsumer` 补齐事务性 outbox 的**读侧**：轮询 pending
-条目（可按 topic 过滤）→ 分发到注册的 handler（`userdata + call`，topic/payload
-为调用期稳定的副本）→ 生命周期推进 pending → processing → delivered，失败则
-`retry_count++`（`error_message` 记录），耗尽重试后置 failed（DLQ 语义）。
-所有 AI 业务工具（`ai.approval` / `ai.recon` / `ai.notify` / `ai.risk` /
-`ai.alert`）的 outbox 回写都可被它消费，配合 `ai.trigger` 即可形成
-「业务事件 → outbox → 消费者/人工队列」的完整闭环。
+## Business tools
 
-### 事件驱动编排（outbox → workflow）
+| Component | Role |
+|-----------|------|
+| `ai.reporter.BusinessReporter` | Configured SQL query to Markdown business report; pair with `trigger.registerCron` and the outbox for daily delivery |
+| `ai.alerts.BusinessAlert` | Rule-based SQL inspection; any hit triggers an alert through `on_alert` plus outbox write-back |
+| `ai.ticket.TicketFlow` | Ticket triage: context query (reusing `BusinessReporter`), classification, draft reply, send or human approval (`on_send`), outbox write-back |
+| `ai.refund.RefundFlow` | Refund compensation: validate, approve, refund command through the transactional outbox, notify; a failed notification emits `refund.reverse`, and `compensate()` reverses manually or automatically |
+| `ai.risk.RiskReview` | Risk scoring from SQL rules with a configurable `DecideFn` (LLM or policy), tiering low/medium/high, decision approve/escalate/reject, `ai.risk` write-back |
+| `ai.recon.ReconCheck` | Reconciliation of two SQL snapshots by key (missing / extra / mismatch), per-row `on_diff`, summary outbox event (`ai.recon`, CLEAN/DRIFT) and a Markdown report from `renderReport` |
+| `ai.approval.ApprovalFlow` | Multi-level approval chain; each step's `policy` (LLM, RBAC or rules) returns approved / escalated / rejected; per-step and final events go to the transactional outbox (`ai.approval`). `registerApprovalSkills` exposes `approval.submit`; the default policy escalates everything |
+| `ai.notify.NotificationHub` | Delivery to named channels: webhook through `HttpClient` (2xx means delivered), custom sinks (`userdata` + `call`), and a transactional outbox fallback (`ai.notify`). `registerNotifySkills` exposes `notification.send`; channel targets are registered by the application and can be allowlisted |
+| `ai.kpi.KpiMetric` + `kpi.query` | Named metrics (name to SQL to value column); the model can only query by name, while the application owns definitions and SQL semantics. Programmatic access through `Kpi.query` |
+| `ai.sla.SlaTracker` | SLA tracking on a monotonic clock: `check()` produces warnings inside the warn window and breaches past the deadline, delivered to `on_sla` and the outbox (`ai.sla`) |
+| `ai.diagnose.DiagnosisFlow` | Diagnosis: run configured evidence SQL, pass it to the `diagnose` callback (LLM or rules), get root causes plus suggested actions, write back to `ai.diagnose` |
 
-`zmodu.ai.bridge.OutboxWorkflowBridge` 把 outbox 条目按 topic（精确或前缀）
-路由进 `ai.trigger` 的 `fire(input)`（run_fn 通常驱动 `Workflow`）——cron、
-进程内 fire、outbox 事件三种触发源至此统一；运行结果再经 trigger 自身的 outbox
-回写闭环。
+Runtime control and longer-running shapes:
 
-### 人工审批队列（HTTP）
+- `ai.AgentHandle`: cooperative cancel, pause and step counting (atomic flags checked between steps); `Agent.tracer` with `parent_span` optionally opens a run-level span.
+- `ai.context.ContextManager`: compacts long histories past a token budget by summarizing older messages (or dropping them) into a leading system message; attached through `Agent.context`.
+- `ai.hierarchy.Hierarchy`: planner splits the goal into subtasks, executor runs them in parallel waves by `max_parallel`, results aggregate; partial failures surface as `.partial_failed`. Planner and executor are callbacks, so they can wrap an Agent or a Workflow.
+- `ai.trigger`: `fire(input)` for events and webhooks, `registerCron(scheduler, name, expr, input)` for schedules (context is held by the trigger), and optional outbox write-back of `{run_id, ok, message}` per run.
 
-`zmodu.ai.approval_api` 提供内存审批队列：`ApprovalFlow.on_escalated` 挂上
-`queuedEscalation` 后，转人工的运行自动入队；`ApprovalApi` ComptimeRouter 模块
-暴露 `GET /approvals/pending`、`POST /approvals/{id}/approve`、
-`POST /approvals/{id}/reject`（后两者 `permission = approval:decide`）。
-队列为应用持有的小存储，需要跨重启时配对 outbox consumer/数据库。
+```zig
+var trigger = zmodu.ai.trigger.Trigger.init(allocator, io, run_fn, skill_ctx);
+trigger.outbox = &outbox;   // write {run_id, ok, message} per run
+trigger.backend = &backend;
+try trigger.registerCron(&scheduler, "nightly", "0 3 * * *", "nightly report");
+_ = try trigger.fire(allocator, "webhook-event");
+```
 
-**持久化版**：`zmodu.ai.approval_store.PersistentApprovalQueue` 与内存版
-同接口（`push` / `listPending` / `resolve` / `count`），但落 SQL 表
-（`migrate()` 建表，重启不丢、可审计）；`queuedEscalationPersistent` 是
-对应的 escalation hook。`ApprovalApi` 泛型化后对两种队列开箱即用
-（`ApprovalApi(ApprovalQueue)` 或 `ApprovalApi(PersistentApprovalQueue)`）。
+## Outbox loop
 
-**技能桥**：`registerApprovalRequestSkills` 暴露 `approval.request`
-（subject + amount，链/策略应用注册）——workflow 的 `.agent` 步骤内的 Agent
-可直接发起审批，人工处理后 `resumeRun` 继续编排。
+`zmodu.outbox.OutboxConsumer` completes the transactional outbox on the read side:
 
-### LLM 默认策略（开箱即用）
+1. Poll pending entries, optionally filtered by topic.
+2. Dispatch each to a registered handler (`userdata` + `call`; topic and payload are stable copies for the call).
+3. Advance pending → processing → delivered, or increment `retry_count` and record `error_message`; exhausted retries become `failed` (dead-letter).
 
-`zmodu.ai.llm` 提供 LLM-backed 策略回调：`llmDiagnose`（异常归因：
-summary/causes/actions）、`llmApprove`（审批：approve/escalate/reject +
-note）、`llmRiskDecide`（风控决策）。把 `SkillContext.userdata` 指向
-`LlmPolicyCtx{ .provider, .json_fn, .system_hint }` 即可直接挂到对应 Flow；
-模型失败或返回非法 JSON 时**安全回退到 escalate**，绝不静默放行。
+All AI business tools (`ai.approval`, `ai.recon`, `ai.notify`, `ai.risk`, `ai.alerts`) write outbox events this consumer can drain, forming the loop from business event to consumer or human queue.
 
-**RAG 上下文注入**：`LlmPolicyCtx` 可选挂 `retriever`（应用侧检索器，框架不
-内置向量库）+ `retrieval_query`，`buildContext` 会把 top-k 检索块
-（如审批政策、历史处置、playbook）注入三个策略的 prompt——
-LLM 决策基于实际业务上下文而非空泛通用判断。
+`zmodu.ai.bridge.OutboxWorkflowBridge` routes outbox entries by topic (exact or prefix) into `trigger.fire`, where the run function usually drives a `Workflow`. Cron, in-process fire and outbox events become one trigger surface, and results flow back through the trigger's own outbox write-back.
 
-## 观测性
+## Approval queue
 
-`zmodu.ai.WorkflowMetrics`（挂到 `Workflow.metrics`）在每次 run/resume 时
-累计 `runs` / `completed_steps` / `failed_steps` / `escalations` / `reviews`
-（反射重跑次数），`toPrometheusFormat` 导出 `zigmodu_ai_workflow_*` 指标；
-与 `AgentMetrics`、`TokenQuota` 一样可直接接入框架 metrics 端点。
+`zmodu.ai.approval_api` provides an in-memory queue: attach `queuedEscalation` to `ApprovalFlow.on_escalated` and escalated runs enqueue themselves. The `ApprovalApi` ComptimeRouter module exposes `GET /approvals/pending`, `POST /approvals/{id}/approve` and `POST /approvals/{id}/reject`, the last two gated by `permission = approval:decide`. The queue is application-owned memory; pair it with an outbox consumer or a database when it must survive restarts.
 
-`zmodu.ai.observability.AiMetrics` 聚合器把 workflow / agent / token-quota
-三组指标合并为一份 Prometheus 文档（挂指针 + 名字即可），一个 `/metrics`
-端点即可覆盖整个 AI 栈。
+`zmodu.ai.approval_store.PersistentApprovalQueue` has the same interface (`push`, `listPending`, `resolve`, `count`) but stores rows in SQL (`migrate()` creates the table, so restarts do not lose state). `queuedEscalationPersistent` is its escalation hook, and `ApprovalApi` is generic over both (`ApprovalApi(ApprovalQueue)` or `ApprovalApi(PersistentApprovalQueue)`).
 
-**运行审计**：`zmodu.ai.run_audit.RunAuditStore` 把每次 workflow/agent/
-approval 运行（run_id、kind、status、租户、步骤数、耗时）持久化到 SQL 表；
-挂到 `Workflow.audit` 后 run/resume 自动写一条。`list(kind, tenant, limit)`
-支持按类型/租户过滤，租户隔离的运行历史即由此而来。
+`registerApprovalRequestSkills` exposes `approval.request` (subject plus amount; chain and policy are application-registered), so an `.agent` step can request approval and the run resumes with `resumeRun` after a human decides.
 
-## 边界（不做）
+## LLM policies
 
-无界自主循环（每轮有限步骤 + 预算 + 可中止）；不新增 shell/MCP 能力。
+`zmodu.ai.llm` provides LLM-backed policy callbacks: `llmDiagnose` (summary, causes, actions), `llmApprove` (approve/escalate/reject plus note) and `llmRiskDecide`. Point `SkillContext.userdata` at `LlmPolicyCtx{ .provider, .json_fn, .system_hint }` and attach the callback to the matching flow. When the model fails or returns invalid JSON, the policy escalates rather than approving silently.
+
+`LlmPolicyCtx.retriever` plus `retrieval_query` injects top-k retrieval chunks (policies, past decisions, playbooks) into all three prompts, so decisions rest on business context. `buildContext` assembles that block.
+
+## Observability
+
+`zmodu.ai.WorkflowMetrics` (attached to `Workflow.metrics`) accumulates `runs`, `completed_steps`, `failed_steps`, `escalations` and `reviews` per run or resume, and exports `zigmodu_ai_workflow_*` series.
+
+`zmodu.ai.observability.AiMetrics` merges workflow, agent and token-quota series into one Prometheus document, so one `/metrics` endpoint covers the AI stack.
+
+`zmodu.ai.run_audit.RunAuditStore` persists each workflow, agent and approval run (run id, kind, status, tenant, step count, duration); attach it to `Workflow.audit` and run/resume writes a row. `list(kind, tenant, limit)` filters by kind and tenant.
+
+## Boundaries
+
+No unbounded autonomous loop: every run has a finite step count, a budget and cooperative cancellation. No shell or new MCP capability is added by orchestration.

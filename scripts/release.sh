@@ -160,12 +160,12 @@ if grep -q "^## \[Unreleased\]" CHANGELOG.md; then
     fi
     perl -0pi -e "s/## \[Unreleased\]/## [$VERSION] - $(date +%F)/" CHANGELOG.md
 
-    # UPGRADING.md cycle section: `## v$OLD 之后（未发布批次）` becomes the
+    # UPGRADING.md cycle section: `## v$OLD (unreleased batch)` becomes the
     # released version. Missed once (0.39.6 shipped with the heading still
     # saying "v0.39.5 之后"), and the in-section pointer kept aiming at
     # CHANGELOG's [Unreleased] — so the rename is mechanical here, and any
-    # leftover "（未发布批次）" heading is a hard failure below.
-    perl -0pi -e "s/## v\Q$OLD\E 之后（未发布批次）/## v$VERSION/" docs/reference/UPGRADING.md
+    # leftover "(unreleased batch)" heading is a hard failure below.
+    perl -0pi -e "s/## v\Q$OLD\E \(unreleased batch\)/## v$VERSION/" docs/reference/UPGRADING.md
 elif [ "$SKIP_BUMP" = "1" ]; then
     echo "CHANGELOG already promoted to [$VERSION]"
 else
@@ -175,8 +175,8 @@ fi
 
 # The template section mentions the in-cycle heading shape inline; only a
 # heading at line start is a leftover.
-if grep -n "^## .*（未发布批次）" docs/reference/UPGRADING.md; then
-    echo "FAIL: docs/reference/UPGRADING.md still has an （未发布批次） section heading."
+if grep -n "^## .* (unreleased batch)" docs/reference/UPGRADING.md; then
+    echo "FAIL: docs/reference/UPGRADING.md still has an (unreleased batch) section heading."
     echo "Rename it to v$VERSION and repoint in-body [Unreleased] references to [$VERSION]."
     exit 1
 fi

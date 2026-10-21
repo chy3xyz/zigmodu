@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### 文档：公开文档全英文重写（go-zero 风格）
+
+- `docs/` 下 30 个公开页面（guide / reference / ai）改为英文，按任务重组：
+  上手、模块、路由、运行时、数据、分布式、AI、CLI、升级。
+- 压缩重复的设计论证与版本叙事；保留契约、错误名、默认值、可运行代码与源码注释引用的
+  `§` 编号（RUNTIME 的 §12.14–§13.x、ZENT 的 §14 等）。
+- `docs/index.md` / `docs/README.md` 重做为简洁索引；根 README 语言切换改为
+  English / Chinese（`README.zh.md` 仍是中文版，英文 README 的 no-Chinese 门禁保持通过）。
+- 内部计划从 `docs/superpowers/` 移到 `docs/dev/superpowers/`（不发布），并同步
+  `src/life.zig`、`src/life/model.zig`、`tools/zmodu/src/life.zig`、`AGENTS.md` 的引用。
+- `scripts/release.sh` 的 UPGRADING 循环标题匹配改为英文
+  `## v<old> (unreleased batch)`，否则发版时重命名会静默失败。
+- 构建（zdoc 0.17）：0 个标题/语言 warning；剩余 “unknown page” 只指向 `docs/` 之外的
+  仓库文件（AGENTS、examples、CHANGELOG 等），按设计原样输出。
+
+## [Unreleased]
+
 ### 文档：zdoc v0.17.0 + 官网 + 站点配置收口
 
 - **新增官网**（`site/`，zdoc site 模式）：landing（hero、安装命令、能力矩阵、代码示例、

@@ -1,59 +1,40 @@
-# AI 开发指南（zmodu.ai 业务接入）
+# AI Integration Guide
 
-> 面向「在业务系统里接入 AI」的开发者：从 key / provider 供给到
-> `Agent` / `Workflow` / 自定义技能 / 接入方式（HTTP、cron、outbox、MCP）
-> 的完整接线。所有能力遵守**受控执行**姿态：白名单、权限码、配额、审计、
-> 租户隔离，LLM 永不直接执行代码或 SQL。
+Wire `zmodu.ai` into a business system: key supply, provider, Agent, Workflow, custom skills and entry points. Every capability keeps the controlled-execution posture: allowlists, permission codes, quotas, audit and tenant isolation, and the model never runs code or SQL of its own.
 
-配套文档：`AI_SKILLS.md`（技能「能做什么」目录）· `AI_ORCHESTRATION.md`
-（编排层细节）· `LLM_POLICIES.md`（LLM 策略接线）· `MCP.md`（技能 → MCP 桥）·
-`AI_METHODOLOGY.md`（框架哲学，写框架代码前先读）。
+Companion docs: `AI_SKILLS.md` (skill catalog), `AI_ORCHESTRATION.md` (orchestration shapes), `LLM_POLICIES.md` (LLM policy wiring), `MCP.md` (skills to MCP bridge), `AI_METHODOLOGY.md` (framework philosophy; read before writing framework code).
 
-## 1. 分层总览
+## 1. Layers
 
-| 层 | 组件 | 职责 |
-|----|------|------|
-| 供给 | `ai.AiKeyManager` / `KeyPool` / `ProviderRegistry` / `CooldownStore` | key 池、轮换、冷却、provider fallback |
-| 模型 | `ai.AiProvider` | OpenAI 兼容 chat / `chatStream`；`http://` 池化、`https://` 经 `std.http.Client` |
-| 执行 | `ai.Agent` / `ai.workflow.Workflow` / `Budget` / `ContextManager` | ReAct 循环、多步编排、预算、长对话压缩 |
-| 能力 | `SkillRegistry`（`db.query` / `kpi.query` / `approval.request` / `admin.*`…）+ `ai.llm` 策略 | 可被 LLM 调用的受控工具 + LLM-backed 决策 |
-| 接入 | HTTP（ComptimeRouter）/ `trigger.registerCron` / `OutboxWorkflowBridge` / `ai.mcp` | 把 AI 暴露给用户、定时、事件、外部平台 |
+| Layer | Components | Role |
+|-------|------------|------|
+| Supply | `ai.AiKeyManager`, `KeyPool`, `ProviderRegistry`, `CooldownStore` | Key pool, rotation, cooldown, provider fallback |
+| Model | `ai.AiProvider` | OpenAI-compatible chat and `chatStream`; pooled `http://`, `https://` via `std.http.Client` |
+| Execution | `ai.Agent`, `ai.workflow.Workflow`, `Budget`, `ContextManager` | ReAct loop, multi-step orchestration, budget, history compaction |
+| Capability | `SkillRegistry` (`db.query`, `kpi.query`, `approval.request`, `admin.*`) plus `ai.llm` policies | Tools the model may call, and LLM-backed decisions |
+| Entry points | HTTP (ComptimeRouter), `trigger.registerCron`, `OutboxWorkflowBridge`, `ai.mcp` | Users, schedules, events, external platforms |
 
-依赖方向：**供给 → 模型 → 执行 → 能力**；接入层在应用侧组装。每层都是
-普通 Zig 对象，无隐藏全局状态（`KeyPool` 的冷却计数除外，那是进程内观测）。
+Dependency direction is supply → model → execution → capability; the application assembles the entry points. Every layer is a plain Zig object without hidden global state, except `KeyPool` cooldown counters, which are process-local observations.
 
-## 2. 从示例开始
+## 2. Examples
 
-| 示例 | 示范什么 |
-|------|----------|
-| [`examples/ai-ops`](../../examples/ai-ops) | 业务工具全链路：告警 → 诊断 → 审批 → 通知 → 审计；审批队列经 HTTP 暴露 |
-| [`examples/llm-policies`](../../examples/llm-policies) | LLM 策略真实接线（`json_fn` 注入可无模型测试） |
-| [`examples/mcp-server`](../../examples/mcp-server) | SkillRegistry → MCP stdio server（`tools/list` / `tools/call`） |
+[`examples/ai-ops`](../../examples/ai-ops) shows the full business loop: alert, diagnose, approve, notify, audit, with the approval queue exposed over HTTP. [`examples/llm-policies`](../../examples/llm-policies) wires real LLM policies and injects `json_fn` so it runs without a model. [`examples/mcp-server`](../../examples/mcp-server) exposes a `SkillRegistry` as an MCP stdio server (`tools/list`, `tools/call`).
 
-## 3. 最小链路
+## 3. Minimal chain
 
-### 3.1 供给：AiKeyManager
+### 3.1 Supply: AiKeyManager
 
-生产建议用 `AiKeyManager` 而不是裸 `AiProvider`——它负责多 key 轮换、
-429/401 冷却禁用和 provider fallback（详见 `LLM_POLICIES.md` §8）：
+Use `AiKeyManager` in production instead of a bare `AiProvider`. It rotates keys, cools down keys on 429/401, and falls back to another provider (details in `LLM_POLICIES.md` §8).
 
 ```zig
 var mgr = zmodu.ai.AiKeyManager.init(allocator, io);
 defer mgr.deinit();
 try mgr.applyConfig(&.{
-    .{
-        .name = "deepseek",
-        .endpoint = "https://api.deepseek.com/v1/chat/completions",
-        .api_keys = &.{ "sk-a", "sk-b" },   // 从 environ_map 读，勿硬编码
-        .models = &.{"deepseek-v4-flash"},
-        .fallback_providers = &.{"openai"},
-    },
-    .{
-        .name = "openai",
-        .endpoint = "https://api.openai.com/v1/chat/completions",
-        .api_keys = &.{"sk-o1"},
-        .models = &.{"deepseek-v4-flash"},
-    },
+    .{ .name = "deepseek", .endpoint = "https://api.deepseek.com/v1/chat/completions",
+       .api_keys = &.{ "sk-a", "sk-b" }, // read from environ_map; never hardcode
+       .models = &.{"deepseek-v4-flash"}, .fallback_providers = &.{"openai"} },
+    .{ .name = "openai", .endpoint = "https://api.openai.com/v1/chat/completions",
+       .api_keys = &.{"sk-o1"}, .models = &.{"deepseek-v4-flash"} },
 });
 
 var http = zmodu.http.HttpClient.init(allocator, io, 4, 30000);
@@ -61,17 +42,16 @@ defer http.deinit();
 var provider = try mgr.providerFor(allocator, &http, "deepseek-v4-flash");
 ```
 
-多实例共享同一批 key 时，接 Redis 冷却（`mgr.setSharedStore(...)`），
-否则实例间互相不知道彼此的冷却/禁用状态。
+When several instances share one key set, attach Redis cooldowns through `mgr.setSharedStore(...)`; otherwise each instance is blind to the others' cooldown and disable state.
 
-### 3.2 能力：注册自定义 Skill
+### 3.2 Capability: register a skill
 
 ```zig
 fn orderSummaryHandler(ctx: *zmodu.ai.SkillContext, args: std.json.Value) anyerror!std.json.Value {
-    try ctx.checkDeadline();                       // 协作式超时
+    try ctx.checkDeadline();                     // cooperative timeout
     const order_id = args.object.get("order_id").?.integer;
     var obj = std.json.ObjectMap{};
-    // 所有权约定：key/字符串必须用 ctx.allocator dupe（freeValue 会深释放）
+    // Ownership: every key and string must come from ctx.allocator; freeValue deep-frees.
     try obj.put(ctx.allocator, try ctx.allocator.dupe(u8, "order_id"), .{ .integer = order_id });
     try obj.put(ctx.allocator, try ctx.allocator.dupe(u8, "total_cents"), .{ .integer = 5997 });
     return .{ .object = obj };
@@ -81,235 +61,190 @@ var registry = zmodu.ai.SkillRegistry.init(allocator, io);
 defer registry.deinit();
 try registry.register(.{
     .name = "order.summary",
-    .description = "查询订单金额（只读）",
+    .description = "Read the order total",
     .parameters = &.{
-        .{ .name = "order_id", .type = .number, .description = "订单 ID", .required = true },
+        .{ .name = "order_id", .type = .number, .description = "Order id", .required = true },
     },
-    .required_permission = "order:read",   // 未授权直接 error.PermissionDenied
-    .action = .read,                       // 工具类别：.read / .propose / .execute（默认 .execute，最严）
+    .required_permission = "order:read", // otherwise error.PermissionDenied
+    .action = .read,                     // .read / .propose / .execute (default .execute)
     .handler = orderSummaryHandler,
 });
 ```
 
-### 3.3 执行：Agent
+### 3.3 Execution: Agent
 
-用 `ai.AgentSpec` 装配（**不要**手搓裸 `Agent{}`：漏掉 `.guard` 就是无界 —— 任何已注册工具都能跑）。
-闸门 / 工具类别 / 权限默认 deny 的完整说明见 [`AGENT_RUNTIME.md`](../reference/AGENT_RUNTIME.md)。
+Build through `ai.AgentSpec`. A bare `Agent{}` without `.guard` is unbounded and can call any registered tool. Gate details: [`AGENT_RUNTIME.md`](../reference/AGENT_RUNTIME.md).
 
 ```zig
-var budget = zmodu.ai.Budget.init(2000);          // 硬 token 预算（预留制）
+var budget = zmodu.ai.Budget.init(2000); // hard reservation, not after-the-fact accounting
 var audit_log = try zmodu.ai.AgentAuditLog.init(allocator, io, 256);
-var memory = zmodu.ai.MemoryStore.init(allocator, io);   // 可选：按 tenant + user 注入
+var memory = zmodu.ai.MemoryStore.init(allocator, io);
 var guard = zmodu.ai.Guard.init(.{
-    .allow = &.{"order.summary"},                   // 列名 ≠ 可执行；空 = 什么都不放行
-    .allow_execute = false,                         // 执行类是第二道开关
+    .allow = &.{"order.summary"}, // listing a name is not permission to execute
+    .allow_execute = false,       // second switch for the execute class
 });
 
 var spec = zmodu.ai.AgentSpec{
-    .name = "order-assistant",                      // 身份：进日志与 Prometheus 标签
+    .name = "order-assistant",    // identity in logs and Prometheus labels
     .provider = &provider,
     .skills = &registry,
-    .system_prompt = "你是订单助手，只调用已授权的工具。",
-    .guard = &guard,                                // 不设 = 无界（启动期用 spec.isGuarded() 断言）
-    .memory = &memory,                              // 身份缺失或为 0 时一个字都不注入
+    .system_prompt = "You are an order assistant. Use only granted tools.",
+    .guard = &guard,              // omit and the agent is unbounded; assert spec.isGuarded()
+    .memory = &memory,            // nothing is injected without a non-zero tenant and user
     .budget = &budget,
-    .allowlist = &.{"order.summary"},               // 工具名白名单（第二道口子，可与 guard 并存）
+    .allowlist = &.{"order.summary"}, // tool-name allowlist; can coexist with guard
     .tool_timeout_ms = 5_000,
     .audit = &audit_log,
-    // .context = &ctx_mgr,                         // 可选：长对话自动压缩
 };
-var agent = spec.build();
-// agent.tracer = &tracer;                          // 可选：run 级 trace span（Spec 未收，build 后赋值）
 
+var agent = spec.build();
 var skill_ctx = zmodu.ai.SkillContext{
     .allocator = allocator,
     .tenant_id = 1,
     .user_id = 42,
     .permissions = &.{"order:read"},
 };
-var result = try agent.run(allocator, "查询订单 42 的金额", &skill_ctx, 5);
+var result = try agent.run(allocator, "What is the total of order 42?", &skill_ctx, 5);
 defer result.deinit(allocator);
-if (result.budget_exhausted) { /* 配额超支：提示降级 */ }
-if (result.canceled) { /* 用户/编排方中止 */ }
+if (result.budget_exhausted) { /* degrade */ }
+if (result.canceled) { /* aborted by user or orchestrator */ }
 ```
 
-### 3.4 编排：Workflow
+### 3.4 Orchestration: Workflow
 
 ```zig
 var wf = zmodu.ai.workflow.Workflow.init(&registry, &.{
     .{ .name = "check", .kind = .{ .skill = .{ .name = "order.summary", .args = .{ .object = .{} } } } },
     .{ .name = "risk",  .kind = .{ .skill = .{ .name = "risk.review", .args = .{ .object = .{} } } }, .depends_on = &.{"check"} },
-    .{ .name = "report", .kind = .{ .llm = .{ .prompt = "把风险结论汇总为一段话" } }, .depends_on = &.{"risk"} },
+    .{ .name = "report", .kind = .{ .llm = .{ .prompt = "Summarize the risk verdict in one paragraph" } }, .depends_on = &.{"risk"} },
 });
-wf.wal = &wal;                          // 崩溃恢复 / 幂等重放
-wf.reflection = zmodu.ai.llm.llmVerify;
-wf.goal = "输出订单风险结论";
+wf.wal = &wal;                          // crash recovery and idempotent replay
+wf.reflection = zmodu.ai.llm.llmVerify; // quality gate
+wf.goal = "Produce an order risk verdict";
 wf.max_reviews = 2;
 var wf_result = try wf.run(allocator, &skill_ctx);
 defer wf_result.deinit();
 ```
 
-审批门：步骤 `.{ .approval = .{ .subject = "order-42", .amount = 150000 } }`
-挂 `wf.approval_flow` 后走审批链，转人工时 run 以 `.pending_human` 停下，
-人工处理后 `wf.resumeRun(allocator, &skill_ctx, run_id)` 继续。
+Approval gate: a step `.{ .approval = .{ .subject = "order-42", .amount = 150000 } }` runs through the approval chain once `wf.approval_flow` is set. When the flow escalates, the run stops with `.pending_human`; after a human decides, `wf.resumeRun(allocator, &skill_ctx, run_id)` continues.
 
-## 4. 自定义技能开发规范
+## 4. Custom skill rules
 
-| 规范 | 要求 |
-|------|------|
-| 参数声明 | `Param{ name, type, description, required }` → 自动映射 JSON Schema（function calling） |
-| 返回值所有权 | handler 结果树里**所有 key 与字符串**用 `ctx.allocator` dupe；调用方 `ai.freeValue` 深释放 |
-| 权限 | `required_permission` 设置权限码；`SkillContext.permissions` 不含则 `error.PermissionDenied` |
-| 结构化失败 | handler 内 `return ctx.fail("rate_limited", "try later", true)`；Agent 回填 `{"error":{"code","message","retryable"}}`，模型可据此重试/换参。框架已知错误（`PermissionDenied`/`ToolTimeout`/`InvalidArguments`…）自动映射为稳定 code，未知错误保留 `{"error":"Name"}` |
-| 白名单 | `Agent.allowlist` / `dispatchWith(.{ .allowlist })` 二次收口 |
-| 超时 | handler 循环内 `ctx.checkDeadline()`；框架另有返回后超时检查（非抢占） |
-| 租户 | `SkillContext.tenant_id` 贯穿；隔离**由各技能自己落实**：实体类看实体声明的 `tenant_column`，`db.query` 看 `BusinessSkillsConfig.db_query_tenant_column`（没声明 → `error.TenantScopeUnavailable`，拒绝而非不过滤） |
-| 只读优先 | 写动作走 `ai.actions`（事务性 outbox + 幂等键），不要直接 handler 里裸 SQL |
+| Rule | Requirement |
+|------|-------------|
+| Parameters | `Param{ name, type, description, required }` maps to JSON Schema for function calling |
+| Ownership | Every key and string in the result uses `ctx.allocator`; the caller releases with `ai.freeValue` |
+| Permission | Set `required_permission`; dispatch returns `error.PermissionDenied` unless `SkillContext.permissions` holds it |
+| Structured failure | `return ctx.fail("rate_limited", "try later", true)`; the agent feeds back `{"error":{"code","message","retryable"}}`. Known errors (`PermissionDenied`, `ToolTimeout`, `InvalidArguments`, …) map to stable codes; unknown ones keep `{"error":"Name"}` |
+| Allowlist | `Agent.allowlist` or `dispatchWith(.{ .allowlist })` is the second narrowing |
+| Timeout | Call `ctx.checkDeadline()` in handler loops; the framework also checks after return, without preempting |
+| Tenant | `SkillContext.tenant_id` must be honoured by the skill: entity skills use the entity's `tenant_column`, `db.query` uses `BusinessSkillsConfig.db_query_tenant_column` (`error.TenantScopeUnavailable` when unset, never an unfiltered read) |
+| Read first | Write actions go through `ai.actions` (transactional outbox plus idempotency key), not raw SQL in a handler |
 
-## 5. 选型：Agent / Workflow / LLM 策略 / Skill 桥
+## 5. Choosing a layer
 
-| 场景 | 用 | 说明 |
-|------|----|------|
-| 一次对话、多轮工具调用 | `Agent` | ReAct 循环，适合「用户提问 → 查数据 → 总结」 |
-| 固定流程多步、含审批/并行/恢复 | `Workflow` | 线性 / DAG（`depends_on`）/ `.approval` / WAL 恢复 |
-| 让模型做审批/风控/诊断/质量门决策 | `ai.llm` 策略 | `llmApprove` / `llmRiskDecide` / `llmDiagnose` / `llmVerify`，失败安全回退 escalate |
-| 给外部 LLM 平台暴露技能 | `ai.mcp` 桥 | `serveStdio` 起 MCP server，`tools/list` + `tools/call` |
-| 定时/事件触发运行 | `ai.trigger` | `registerCron` / `fire`；可经 outbox 回写结果 |
+| Situation | Use | Notes |
+|-----------|-----|-------|
+| One conversation with repeated tool calls | `Agent` | ReAct loop: question, data lookup, answer |
+| Fixed multi-step flow with approval, parallelism or resume | `Workflow` | Linear, DAG (`depends_on`), `.approval`, WAL recovery |
+| Model decides approve, risk, diagnosis or quality | `ai.llm` policies | `llmApprove` / `llmRiskDecide` / `llmDiagnose` / `llmVerify`; failures escalate |
+| Expose skills to an external LLM platform | `ai.mcp` bridge | `serveStdio` runs an MCP server with `tools/list` and `tools/call` |
+| Scheduled or event-driven runs | `ai.trigger` | `registerCron` / `fire`; results can be written back through the outbox |
 
-## 6. 接入方式
+## 6. Entry points
 
-**HTTP（ComptimeRouter）**：handler 里用 **`ai.http.skillContext(ctx)`**
-构造上下文后调 `agent.run` / `wf.run`，把 `result.answer` 用 `ctx.json` 返回：
+HTTP (ComptimeRouter): build the context with `ai.http.skillContext(ctx)`, then call `agent.run` or `wf.run`.
 
 ```zig
 fn runAgent(ctx: *http.Context, self: *State) !void {
-    const sctx = try ai.http.skillContext(ctx);   // 失败即拒绝，不猜
+    const sctx = try ai.http.skillContext(ctx); // fails closed, never guesses
     var result = try self.agent.run(ctx.allocator, goal, &sctx, 8);
     try ctx.jsonStruct(200, .{ .answer = result.answer });
 }
 ```
 
-它只从 JWT 中间件写的 **attrs**（`user_id` / `tenant_id` / `permissions`）取值，
-**不读** header / body；缺失或非数字即 `error.TenantRequired` / `UserRequired` /
-`MalformedTenant` — fail-closed，避免"少传一个字段 = 租户 0"。权限码按 CSV 拆好，
-内存挂在 `ctx.allocator`（请求 arena），只在该请求内有效。单租户 / 无身份场景请显式
-写 `SkillContext{…}` 字面量，不要靠 fromHttp 猜。
+`skillContext` reads only the JWT middleware attributes (`user_id`, `tenant_id`, `permissions`), never headers or bodies. Missing or non-numeric ids raise `error.TenantRequired`, `error.UserRequired`, `error.MalformedTenant` or `error.MalformedUser`. Permission CSV is split into `ctx.allocator` memory that lives for the request. Single-tenant deployments should write the `SkillContext` literal explicitly instead of guessing.
 
-**cron**：
+Cron:
 
 ```zig
 var trigger = zmodu.ai.trigger.Trigger.init(allocator, io, run_fn, skill_ctx);
 try trigger.registerCron(&scheduler, "nightly-report", "0 3 * * *", "nightly report");
-_ = trigger.fire(allocator, "webhook-event");   // 事件源即时触发
+_ = trigger.fire(allocator, "webhook-event"); // immediate event trigger
 ```
 
-**outbox**：`ai.bridge.OutboxWorkflowBridge` 按 topic 把 outbox 条目路由进
-`trigger.fire`；业务工具（`ai.approval` / `ai.risk` / `ai.notify`…）的写回可被
-`outbox.OutboxConsumer` 消费，形成「业务事件 → outbox → AI → 审计/人工」闭环。
+Outbox: `ai.bridge.OutboxWorkflowBridge` routes outbox entries by topic (exact or prefix) into `trigger.fire`. Write-backs from `ai.approval`, `ai.risk`, `ai.notify` and peers can then be consumed by `outbox.OutboxConsumer`, closing the loop from business event to AI to audit or a human queue.
 
-**MCP**：`ai.mcp.serveStdio(io, allocator, &registry, ctx_template)` 起 stdio
-server，`tools/list` 自动从注册表推导参数 schema，并列出注册表里的**全部**技能
-（`admin.*` 也在内）。按 allowlist / 权限裁剪 `tools/list` **尚未实现** —— 管理类技能
-不要注册进暴露给 MCP 的 registry（见 `MCP.md`「安全」）。
+MCP: `ai.mcp.serveStdio(io, allocator, &registry, ctx_template)` runs a stdio server that derives parameter schemas from the registry. It lists only the skills the session context can call (permission-gated tools are hidden unless `ctx_template.permissions` holds the code). For an explicit name allowlist, call `ai.mcp.serveStdioFiltered(..., .{ .allowlist = &.{ "db.query", "kpi.query" }, .permissions = ctx_template.permissions })`; pass `.{ .permissions = null }` to list everything. Keep `admin.*` out of registries exposed to external callers. See `MCP.md`.
 
-## 7. 安全与受控执行清单
+## 7. Security checklist
 
-- [ ] key 从 `init.environ_map` 读，端点/模型白名单由应用配置
-- [ ] `guard.allow`（空 = 什么都不放行）+ `Agent.allowlist`（null = 全部注册工具）两处都只列业务需要的技能；`admin.*` 不要注册进暴露面
-- [ ] 写操作技能设 `required_permission` + 事务性 outbox + 幂等键（`run_id`）
-- [ ] handler 返回值全部 `ctx.allocator` 持有，调用方 `freeValue`
-- [ ] HTTP 边界一律用 `ai.http.skillContext(ctx)`（attrs 取身份）；多租户应用用 `registerBusinessSkillsWith(..., .{ .db_query_tenant_column = "<列名>" })`（默认入口会让 `db.query` fail-closed），实体技能按实体声明的 `tenant_column` 隔离
-- [ ] 审批 API（`ai.approval_api.ApprovalApi`）的租户作用域来自**已验证的 `tenant_id` attr**；`X-Tenant-ID` 只有显式 `Config.allow_tenant_header = true` 才能顶替，且与 attr 冲突时 403。无作用域的请求现在是 403，**不再**列出全部租户
-- [ ] RAG（`Retriever`）实现按租户分区/过滤，禁止"共享索引 + 相似度截断"当隔离；共享索引请设置 `Retriever.retrieveScopedFn`——`Agent` 会把本次运行的 `tenant_id/user_id` 传进去，没设置而运行又带身份时会打**一条**进程级警告（框架无法过滤别人的索引）
-- [ ] 审批列表（`GET /approvals/pending`）与 approve/reject 共用 `approval:decide` 权限码；只读审计员需要单独的角色/端点，别给 decide
-- [ ] 长任务设 `deadline_ms` / `tool_timeout_ms` / `Budget`
-- [ ] 生产打开 `audit`（`AgentAuditLog` / `RunAuditStore`）与指标
-- [ ] LLM 决策「拿不准就转人工」，绝不静默批准（`ai.llm` 已内建该姿态）
-- [ ] 工具结果是**不可信输入**：框架默认用 `[untrusted tool output …]` 包裹并截断到
-  `Agent.tool_result_limit_bytes`（默认 32 KiB，超出打 truncation 标记）；自定义
-  handler 不要把外部文本拼进 system prompt，需要更多内容就让查询自己收窄
+- [ ] Keys come from `init.environ_map`; endpoints and models are an application-side allowlist.
+- [ ] Both `guard.allow` (empty permits nothing) and `Agent.allowlist` (`null` permits every registered tool) list only what the business needs; no `admin.*` on an exposed surface.
+- [ ] Write skills set `required_permission`, write through the transactional outbox, and use an idempotency key (`run_id`).
+- [ ] Handler results are allocated from `ctx.allocator`; callers release with `freeValue`.
+- [ ] HTTP boundaries use `ai.http.skillContext(ctx)`; tenant-aware apps use `registerBusinessSkillsWith(..., .{ .db_query_tenant_column = "<column>" })`, since the default entry point makes `db.query` fail closed.
+- [ ] Approval APIs (`ai.approval_api.ApprovalApi`) scope by the verified `tenant_id` attribute. `X-Tenant-ID` is honoured only with `Config.allow_tenant_header = true`, and a conflict with the attribute returns 403. An unscoped request is now 403 rather than listing every tenant.
+- [ ] Retrievers partition or filter by tenant; never treat "shared index plus similarity cutoff" as isolation. For a shared index, set `Retriever.retrieveScopedFn`, which receives the run's `tenant_id`/`user_id`; an unscoped scoped run logs one process-wide warning.
+- [ ] `GET /approvals/pending` shares the `approval:decide` permission with approve/reject. Read-only auditors need their own role and endpoint.
+- [ ] Long tasks set `deadline_ms`, `tool_timeout_ms` and `Budget`; production enables audit (`AgentAuditLog`, `RunAuditStore`) and metrics.
+- [ ] LLM decisions escalate when uncertain and never approve silently (`ai.llm` already behaves this way).
+- [ ] Tool results are untrusted input: the framework wraps them as `[untrusted tool output …]` and truncates at `Agent.tool_result_limit_bytes` (32 KiB by default, with a truncation marker). Do not paste external text into a system prompt.
 
-### RAG（检索增强）
+### RAG
 
-`ai.rag` 覆盖链路里最容易漏的三段：
+`ai.rag` covers the steps that are easiest to get wrong:
 
-- **`chunkText`**：UTF-8 安全、带重叠、优先在空白处断句。手工 `text[i..i+800]`
-  会把一个汉字切成两半，模型看到的上下文从第一个字节就坏了。
-- **`VectorIndex`**：条目按 tenant 存储，`search` 只返回**同租户**的条目；不带租户的
-  检索只看到未带租户的全局条目，绝不"看到全部"（fail-closed，同审批队列）。
-- **`IndexRetriever`**：把应用提供的 `EmbedFn`（嵌入模型是 provider 专属的 HTTP 调用）
-  接到 `Retriever.retrieveScopedFn`，`Agent` 自动传本次运行的 scope。
-- **`ai.embedding.OpenAiEmbeddings`**：OpenAI 兼容的 `/embeddings` 客户端（批量、
-  `dimensions` 可裁剪、响应校验：数量/维度不一致直接拒绝）。`Adapter` 就是可用的
-  `EmbedFn`：
+- `chunkText`: UTF-8 safe, overlapping, splits at whitespace. Hand-slicing `text[i..i+800]` can cut a multi-byte character in half.
+- `VectorIndex`: entries are stored per tenant and `search` returns only same-tenant entries. A search without a tenant sees only global entries, never everything (fail-closed).
+- `IndexRetriever`: adapts an application `EmbedFn` to `Retriever.retrieveScopedFn`, so the agent passes the run scope automatically.
+- `ai.embedding.OpenAiEmbeddings`: OpenAI-compatible `/embeddings` client with batching, optional `dimensions`, and response validation; a count or dimension mismatch is rejected. `Adapter` is the ready-made `EmbedFn`:
 
-  ```zig
-  var emb = ai.embedding.OpenAiEmbeddings{ .allocator = alloc, .http = &client,
-      .endpoint = "https://api.openai.com/v1/embeddings", .api_key = key };
-  var adapter = ai.embedding.Adapter{ .impl = &emb };
-  var index_retriever = ai.rag.IndexRetriever{ .index = &index, .embed_ctx = &adapter,
-      .embed_fn = ai.embedding.Adapter.embed };
-  ```
+```zig
+var emb = ai.embedding.OpenAiEmbeddings{ .allocator = alloc, .http = &client,
+    .endpoint = "https://api.openai.com/v1/embeddings", .api_key = key };
+var adapter = ai.embedding.Adapter{ .impl = &emb };
+var index_retriever = ai.rag.IndexRetriever{ .index = &index, .embed_ctx = &adapter,
+    .embed_fn = ai.embedding.Adapter.embed };
+```
 
-写入侧按 `index.add(.{ .tenant_id = … }, id, text, source, vector)` 存；向量维度
-不一致直接 `error.DimensionMismatch`，不做截断/补零。
+Writes use `index.add(.{ .tenant_id = … }, id, text, source, vector)`; a dimension mismatch returns `error.DimensionMismatch` instead of truncating or zero-padding.
 
-### 并行工具调用（opt-in）
+### Parallel tool calls
 
-模型一个回合常常给出多个互不依赖的调用（多个检索/查询）。默认仍然串行；要并行需要两件事：
+Models often emit several independent calls per turn. Execution stays sequential unless both conditions hold:
 
-- `Agent`/`Spec` 设置 `io`（`std.Io`）；
-- **每个**被并行的工具声明 `parallel_safe = true`。
+- the `Agent`/`Spec` has `io` (`std.Io`) set;
+- every tool in the batch declares `parallel_safe = true`.
 
-**全有或全无**：一个回合里只要有一个工具没声明，整批串行——不做部分并行，行为可预测。并发上限由 `Spec.max_parallel_tools` 控制（默认 8，0 = 不限）：批次按波次执行，一波 `await` 完再开下一波，慢工具自然形成背压。Guard / 审批 hook 在 spawn **之前**串行执行（Guard 的计数不是原子量、hook 是调用方代码）；结果在 join 之后按 tool_call 原顺序回填消息，`on_tool` 与审计也在此时按序记录。
+All or nothing: one tool without the declaration keeps the whole batch sequential. `Spec.max_parallel_tools` bounds concurrency (default 8, `0` = uncapped); batches run in waves, so slow tools create backpressure. Guard checks and the approval hook run serially before spawning (guard counters are not atomic, and hooks are caller code). Results are joined and written back in `tool_call` order, and `on_tool` plus audit records follow the same order.
 
-写 `parallel_safe = true` 的契约：handler 必须线程安全，且**结果里的一切都用 `ctx.allocator` 分配**。Agent 给每个调用一份独立的上下文副本与 arena（`dispatchWith` 会写 `deadline_ms`，请求 arena 也不是线程安全的），join 后只保留序列化文本。共享的 `userdata` / `backend_ptr` 仍由你保证并发安全——单连接 DB 工具不要标 `parallel_safe`。
+The contract for `parallel_safe = true`: the handler is thread-safe and allocates everything from `ctx.allocator`. The agent gives each call its own context copy and arena (`dispatchWith` sets `deadline_ms`, and the request arena is not thread-safe), then keeps only serialized text. Shared `userdata` / `backend_ptr` remain your responsibility; a single-connection DB tool must not be marked parallel-safe.
 
-### 核心与扩展的边界
+### Core and ops boundary
 
-`zmodu.ai` 里有两类模块，改动时别混：
+`zmodu.ai` has two kinds of modules; do not mix them.
 
-- **核心**（`Agent` / `skill` / `provider` / `workflow` / `guard` / `budget` / `memory` /
-  `retriever` / `quota` / `context` / 供给层）：不知道任何业务名词，只依赖
-  `SkillContext`。`ai.http` 只是把请求转成上下文的适配器，核心不 import HTTP。
-- **ops 扩展**（`src/ai/ops/`，经 `ai.ops.*` 引用）：`business` / `actions` /
-  `admin` / `alerts` / `kpi` / `recon` / `refund` / `ticket` / `sla` / `notify` /
-  `bridge` / `trigger` / `schedule` / `approval_api` / `approval_store`。它们直接
-  绑定 `data.sqlx` 与具体表结构，按你的业务改写或整体替换。**核心不 import 它们**
-  （`check-production.sh` 门禁）：内置技能注册也搬到了
-  `ai.ops.builtin.registerBuiltinCatalog(&registry)`，`skill.zig` 不再为了一个便利
-  函数依赖整个 ops 包。原有 `ai.alerts` 等顶层路径仍可用。
-  `approval` / `risk` / `diagnose` / `reporter` 仍在 `src/ai/` 根目录，但**核心
-  （`agent`/`skill`/`workflow`/`llm`/`proposal`）只依赖 `ai/ports.zig`**：
-  `ports.ApprovalPort` / `RiskPort` 是行为接口，值类型（`ApprovalStatus`、
-  `RiskResult`、`EvidenceBlock`…）也在那里；具体引擎用适配器接入：
+- Core (`Agent`, `skill`, `provider`, `workflow`, `guard`, `budget`, `memory`, `retriever`, `quota`, `context`, supply layer) knows no business nouns and depends only on `SkillContext`. `ai.http` is an adapter; core does not import HTTP.
+- Ops extensions (`src/ai/ops/`, reached as `ai.ops.*`): `business`, `actions`, `admin`, `alerts`, `kpi`, `recon`, `refund`, `ticket`, `sla`, `notify`, `bridge`, `trigger`, `schedule`, `approval_api`, `approval_store`. They bind directly to `data.sqlx` and concrete tables; rewrite or replace them per business. Core must not import them (`check-production.sh` enforces this), and the built-in catalog is registered through `ai.ops.builtin.registerBuiltinCatalog(&registry)`. Top-level paths such as `ai.alerts` still work.
 
-  ```zig
-  var flow = ai.approval.ApprovalFlow.init(allocator, &backend, policy);
-  wf.approval_flow = flow.toPort();
-  p.risk = review.toPort();
-  ```
+`approval`, `risk`, `diagnose` and `reporter` remain under `src/ai/`, but core (`agent`, `skill`, `workflow`, `llm`, `proposal`) depends only on `ai/ports.zig`. `ports.ApprovalPort` and `ports.RiskPort` are behavioural interfaces; value types (`ApprovalStatus`, `RiskResult`, `EvidenceBlock`, …) live there too. Concrete engines attach through adapters:
 
-  `check-production.sh` 会拒绝核心文件顶层 `@import` 这四个具体引擎（测试块内
-  的 import 允许，测试本来就要构造真实引擎）。
+```zig
+var flow = ai.approval.ApprovalFlow.init(allocator, &backend, policy);
+wf.approval_flow = flow.toPort();
+p.risk = review.toPort();
+```
 
-## 8. 观测与调试
+`check-production.sh` rejects top-level imports of these four engines from core files; imports inside test blocks are allowed.
 
-- `zmodu.ai.observability.AiMetrics`：合并 `WorkflowMetrics` + `AgentMetrics`
-  + `TokenQuota` 为一份 Prometheus 文档（挂指针 + 名字，一个 `/metrics` 端点
-  即可覆盖整个 AI 栈）。
-- `zmodu.ai.run_audit.RunAuditStore`：workflow / agent / approval 运行历史
-  （`GET /api/ai/runs`，租户隔离）。每行现在带 **`prompt_tokens` /
-  `completion_tokens`**（`Agent` 自动累计；`recordRunWithUsage` 供自定义入口），
-  是一份**持久化**的用量账本——内存里的 `TokenQuota` 重启即失真，账单/租户
-  结算应以这张表为准。旧表由 `migrate()` 自动补列（查 catalog，不产生错误日志）。
-- `mgr.listProviders(io, allocator)`：每个 provider/key 的 status / failures /
-  调用计数快照；`enableKey` / `enableProvider` 人工介入。
-- 无模型调试：`LlmPolicyCtx.json_fn` 注入 fake JSON（`examples/llm-policies`），
-  或 `AiProvider` 指向本地 mock OpenAI 端点（框架 Agent 端到端测试同法）。
+## 8. Observability
 
-## 边界（刻意不做）
+- `zmodu.ai.observability.AiMetrics` merges `WorkflowMetrics`, `AgentMetrics` and `TokenQuota` into one Prometheus document; attach the pointers and names and a single `/metrics` endpoint covers the AI stack.
+- `zmodu.ai.run_audit.RunAuditStore` stores workflow, agent and approval run history (`GET /api/ai/runs`, tenant-scoped). Each row carries `prompt_tokens` / `completion_tokens` (`Agent` accumulates them; `recordRunWithUsage` serves custom entry points), making it the persistent usage ledger. In-memory `TokenQuota` is lost on restart, so billing and settlement read this table. `migrate()` adds missing columns by consulting the catalog.
+- `mgr.listProviders(allocator)` snapshots status, failures and call counts per provider/key; `enableKey` and `enableProvider` allow manual intervention.
+- Model-free debugging: inject fake JSON through `LlmPolicyCtx.json_fn` (`examples/llm-policies`), or point `AiProvider` at a local mock OpenAI endpoint (the agent end-to-end tests do this).
 
-无界自主循环（每轮有限步骤 + 预算 + 可中止）；不内置 shell / 任意 URL 抓取 /
-裸 SQL 写 / 跨租户访问 / 向量库（`Retriever` 自接）；管理类技能不进暴露给
-MCP / 外部调用方的 registry（`tools/list` 不做过滤）。
+## Boundaries
+
+No unbounded autonomous loop: every run has a step cap, a budget and cooperative cancellation. Not built: shell, arbitrary URL fetching, raw SQL writes, cross-tenant access, a vector store (`Retriever` is the seam). Administrative skills stay out of any registry exposed through MCP or external callers.
