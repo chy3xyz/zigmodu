@@ -5,21 +5,22 @@
 	<section class="hero">
 		<div class="hero-copy">
 			<p class="eyebrow"><span class="dot"></span> Zig 0.17 · v0.42 · MIT</p>
-			<h1>把服务写成模块，<br>把执行写成运行时。</h1>
+			<h1>Modules at compile time.<br>Execution under control.</h1>
 			<p class="lede">
-				zmodu 是一个 Zig 框架：路由与依赖在编译期展开，worker 与邮箱在运行时保持有界。
-				同一份代码可以从单进程的模块化应用，长成一个可重放、可观测的执行平台。
+				zmodu is a framework for Zig: routes and dependencies resolve at compile time,
+				while workers and mailboxes stay bounded at run time. The same codebase grows
+				from a modular monolith into a replayable, observable execution platform.
 			</p>
 			<div class="actions">
-				<a class="btn" href="/zmodu/docs/guide/QUICK-START/">快速开始</a>
+				<a class="btn" href="/zmodu/docs/guide/QUICK-START/">Get started</a>
 				<a class="btn ghost" href="https://github.com/chy3xyz/zmodu">GitHub</a>
 			</div>
 			<div class="install" id="install">
-				<span class="install-label">安装</span>
+				<span class="install-label">Install</span>
 				<code>brew install chy3xyz/tap/zmodu</code>
 			</div>
 		</div>
-		<aside class="hero-card" aria-label="最小应用">
+		<aside class="hero-card" aria-label="Minimal application">
 			<div class="card-head"><span class="card-dot"></span><span>main.zig</span></div>
 			<pre><code>const zmodu = @import("zmodu");
 
@@ -32,55 +33,55 @@ pub fn main(init: zmodu.Init) !void {
     try app.start();
     defer app.stop();
 }</code></pre>
-			<div class="card-foot">编译期装配 · 启动时校验依赖图</div>
+			<div class="card-foot">Compile-time wiring · dependency graph checked at startup</div>
 		</aside>
 	</section>
 
 	<section class="strip">
-		<div><strong>0</strong><span>Zig 依赖</span></div>
-		<div><strong>2300+</strong><span>测试与门禁</span></div>
-		<div><strong>comptime</strong><span>路由与模块图</span></div>
-		<div><strong>2 层</strong><span>应用框架 + 运行时</span></div>
+		<div><strong>0</strong><span>Zig dependencies</span></div>
+		<div><strong>2300+</strong><span>Tests and gates</span></div>
+		<div><strong>comptime</strong><span>Routes and module graph</span></div>
+		<div><strong>2 planes</strong><span>Application + runtime</span></div>
 	</section>
 
 	<section class="section">
 		<header class="section-head">
-			<p class="eyebrow">能力</p>
-			<h2>框架该在编译期解决的问题，不留到线上。</h2>
+			<p class="eyebrow">Capabilities</p>
+			<h2>What the compiler settles, the runtime does not rediscover.</h2>
 		</header>
 		<div class="grid">
 			<article class="feature">
-				<h3>编译期路由</h3>
-				<p>路由表是一个 comptime 元组。鉴权、权限码、OpenAPI 参数与 handler 同处一行，重复路径在启动前失败。</p>
+				<h3>Compile-time routing</h3>
+				<p>A route table is a comptime tuple. Auth, permission codes, OpenAPI parameters and the handler sit together, and duplicate paths fail before startup.</p>
 			</article>
 			<article class="feature">
-				<h3>模块边界</h3>
-				<p>依赖声明由编译器校验：缺失、自依赖、环依赖都在启动时被拦下。单进程先跑通，边界真实了再拆服务。</p>
+				<h3>Module boundaries</h3>
+				<p>Declared dependencies are checked at startup: missing, self and cyclic edges stop the application. Run in one process until the boundary is real.</p>
 			</article>
 			<article class="feature">
-				<h3>有界运行时</h3>
-				<p>Worker、Mailbox、MPSC、TimerWheel：状态归一个线程所有，队列满了返回 <code>error.Full</code>，不无限增长。</p>
+				<h3>Bounded runtime</h3>
+				<p>Worker, mailbox, MPSC and TimerWheel. One thread owns state, and a full queue returns <code>error.Full</code> instead of growing.</p>
 			</article>
 			<article class="feature">
-				<h3>确定性回放</h3>
-				<p>可控时钟、随机源与事件序列，让同一输入在重放时得到同一顺序与同一输出。</p>
+				<h3>Deterministic replay</h3>
+				<p>A controlled clock, random source and event sequence make the same input produce the same order and the same output.</p>
 			</article>
 			<article class="feature">
-				<h3>内建可观测</h3>
-				<p>结构化日志、Prometheus 指标、OTLP tracing 与运行时分位读数，默认就在框架里。</p>
+				<h3>Built-in observability</h3>
+				<p>Structured logs, Prometheus metrics, OTLP tracing and runtime readings ship with the framework.</p>
 			</article>
 			<article class="feature">
-				<h3>AI 与数据</h3>
-				<p>Agent、RAG、审批与配额是可组合的模块；SQLx、Redis、Kafka 与 zent ORM 留在应用层。</p>
+				<h3>AI and data</h3>
+				<p>Agents, RAG, approvals and quotas compose as modules. SQLx, Redis, Kafka and the zent ORM stay at the application layer.</p>
 			</article>
 		</div>
 	</section>
 
 	<section class="section split">
 		<div class="prose-block">
-			<p class="eyebrow">声明</p>
-			<h2>一条路由，一行元数据。</h2>
-			<p>handler 只读 <code>ctx</code> 与自己的状态；身份与权限由中间件写入，再在路由表里被审计。</p>
+			<p class="eyebrow">Declaration</p>
+			<h2>One route, one line of metadata.</h2>
+			<p>The handler reads <code>ctx</code> and its own state. Middleware writes identity and permissions, and the route table makes them auditable.</p>
 			<pre><code>pub const routes = [_]http.RouteSpec(State){
     .{ .method = .GET, .path = "{id}",
        .handler = get, .meta = .{ .auth = .jwt,
@@ -88,21 +89,21 @@ pub fn main(init: zmodu.Init) !void {
 };</code></pre>
 		</div>
 		<div class="prose-block">
-			<p class="eyebrow">运行时</p>
-			<h2>一个线程拥有的状态，<br>一个邮箱拥有的交接。</h2>
-			<p>没有全局锁的 actor 层；定时器由 ticker 独占，跨线程只走命令队列。</p>
+			<p class="eyebrow">Runtime</p>
+			<h2>One thread owns state.<br>One mailbox owns handoff.</h2>
+			<p>No global lock in the actor layer. The ticker owns timers, and cross-thread work goes through command queues.</p>
 			<pre><code>const h = try rt.spawn(.{ .capacity = 1024 });
 try h.post(.{ .kind = .tick, .at = now + 50 });
-// 满了：error.Full，不是内存增长</code></pre>
+// full: error.Full, not memory growth</code></pre>
 		</div>
 	</section>
 
 	<section class="cta">
-		<h2>从一条路由开始，或者从一个 worker 开始。</h2>
-		<p>文档按任务组织：HTTP、模块、运行时、数据与 AI，各自能独立落地。</p>
+		<h2>Start with one route, or one worker.</h2>
+		<p>The documentation is organised by task: HTTP, modules, runtime, data and AI each stand alone.</p>
 		<div class="actions">
-			<a class="btn" href="/zmodu/docs/">阅读文档</a>
-			<a class="btn ghost" href="/zmodu/docs/guide/BEST_PRACTICES/">最佳实践</a>
+			<a class="btn" href="/zmodu/docs/">Read the docs</a>
+			<a class="btn ghost" href="/zmodu/docs/guide/BEST_PRACTICES/">Best practices</a>
 		</div>
 	</section>
 

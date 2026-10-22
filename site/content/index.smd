@@ -1,7 +1,7 @@
 ---
-.title = "zmodu — Zig 的模块化应用框架与运行时",
+.title = "zmodu — Modular applications and a bounded runtime for Zig",
 .date = .date("2026-10-21T00:00:00"),
 .layout = "index.shtml",
 ---
 
-编译期模块化、所有权运行时、可重放的执行。
+Compile-time modularity, ownership-oriented runtime, replayable execution.

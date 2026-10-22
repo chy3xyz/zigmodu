@@ -1,11 +1,11 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 	<head id="head">
 		<meta charset="utf-8">
 		<meta name="viewport" content="width=device-width, initial-scale=1">
 		<meta name="color-scheme" content="dark light">
 		<title :text="$page.title"></title>
-		<meta name="description" content="zmodu：Zig 的编译期模块化应用框架，以及有界、可重放的 worker 运行时。">
+		<meta name="description" content="zmodu: a compile-time modular application framework and a bounded, replayable worker runtime for Zig.">
 		<link rel="stylesheet" href="$site.asset('style.css').link()">
 		<super>
 	</head>
@@ -16,10 +16,10 @@
 				<span class="brand-name">zmodu</span>
 			</a>
 			<nav class="nav-links">
-				<a href="/zmodu/docs/">文档</a>
-				<a href="/zmodu/docs/reference/ARCHITECTURE/">架构</a>
+				<a href="/zmodu/docs/">Docs</a>
+				<a href="/zmodu/docs/reference/ARCHITECTURE/">Architecture</a>
 				<a href="https://github.com/chy3xyz/zmodu">GitHub</a>
-				<a class="nav-cta" href="#install">安装</a>
+				<a class="nav-cta" href="#install">Install</a>
 			</nav>
 		</header>
 		<super>
@@ -28,7 +28,7 @@
 				<span class="foot-brand">zmodu</span>
 				<span class="foot-note">MIT · Zig 0.17 · v0.42</span>
 				<span class="foot-links">
-					<a href="/zmodu/docs/">文档</a>
+					<a href="/zmodu/docs/">Docs</a>
 					<a href="https://github.com/chy3xyz/zmodu">GitHub</a>
 					<a href="https://github.com/chy3xyz/zmodu/releases">Releases</a>
 				</span>

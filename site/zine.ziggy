@@ -1,7 +1,7 @@
 .zine_version = "0.17.0",
 .site = .simple(.{
     .title = "zmodu",
-    .lang = "zh-CN",
+    .lang = "en",
     .host_url = "https://chy3xyz.github.io",
     .url_path_prefix = "zmodu",
     .content_dir_path = "content",
