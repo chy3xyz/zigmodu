@@ -25,8 +25,16 @@ pub const AiProvider = struct {
 
     rate_limiter: ?RateLimiterState = null,
     max_output_tokens: usize = 4096,
+    /// Request field that carries `max_output_tokens`. OpenAI's reasoning-era
+    /// models (`gpt-5*`, `gpt-6*`, `o1`/`o3`/`o4`) reject `max_tokens` with
+    /// HTTP 400 and only accept `max_completion_tokens`; other OpenAI-compatible
+    /// backends (DeepSeek, Qwen, self-hosted) still expect `max_tokens`.
+    /// `.auto` decides from the model name; pin it for gateways that rename models.
+    token_limit_param: TokenLimitParam = .auto,
     temperature: f64 = 0.7,
     metrics: Metrics = .{},
+
+    pub const TokenLimitParam = enum { auto, max_tokens, max_completion_tokens };
 
     pub const RateLimiterState = struct {
         limiter: @import("../resilience/RateLimiter.zig").RateLimiter,
@@ -484,6 +492,15 @@ pub const AiProvider = struct {
         return list;
     }
 
+    /// Name of the output-token cap field for this provider's backend.
+    pub fn tokenLimitField(self: AiProvider) []const u8 {
+        return switch (self.token_limit_param) {
+            .max_tokens => "max_tokens",
+            .max_completion_tokens => "max_completion_tokens",
+            .auto => if (modelUsesCompletionTokens(self.model)) "max_completion_tokens" else "max_tokens",
+        };
+    }
+
     pub fn buildRequestBody(self: *AiProvider, messages: []const ChatMsg, opts: ChatOpts) ![]const u8 {
         var buf = std.ArrayList(u8).empty;
         errdefer buf.deinit(self.allocator);
@@ -531,7 +548,9 @@ pub const AiProvider = struct {
             try buf.appendSlice(a, ",\"tools\":");
             try buf.appendSlice(a, tools);
         }
-        try buf.appendSlice(a, ",\"max_tokens\":");
+        try buf.appendSlice(a, ",\"");
+        try buf.appendSlice(a, self.tokenLimitField());
+        try buf.appendSlice(a, "\":");
         try buf.print(a, "{d}", .{self.max_output_tokens});
         try buf.appendSlice(a, ",\"temperature\":");
         try buf.print(a, "{d}", .{self.temperature});
@@ -983,6 +1002,19 @@ fn escapeJson(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), s: []const 
     }
 }
 
+/// Models that reject `max_tokens` in favour of `max_completion_tokens`.
+/// Gateways prefix names (`openrouter/openai/gpt-5-mini`), so the last path
+/// segment is matched too. `gpt-4o` and older models still take `max_tokens`.
+fn modelUsesCompletionTokens(model: []const u8) bool {
+    const prefixes = [_][]const u8{ "gpt-5", "gpt-6", "o1", "o3", "o4" };
+    const tail = if (std.mem.lastIndexOfScalar(u8, model, '/')) |i| model[i + 1 ..] else model;
+    for (prefixes) |prefix| {
+        if (std.ascii.startsWithIgnoreCase(model, prefix)) return true;
+        if (std.ascii.startsWithIgnoreCase(tail, prefix)) return true;
+    }
+    return false;
+}
+
 test "AiProvider buildMessages cache order" {
     const a = std.testing.allocator;
     const history = &[_]AiProvider.ChatMsg{
@@ -1017,6 +1049,65 @@ test "AiProvider buildRequestBody includes tools" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"name\":\"ping\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":false") != null);
+}
+
+test "AiProvider buildRequestBody sends max_completion_tokens to reasoning-era OpenAI models" {
+    const a = std.testing.allocator;
+    var http = http_client.HttpClient.init(a, std.testing.io, 1, 5000);
+    defer http.deinit();
+
+    const msgs = &[_]AiProvider.ChatMsg{.{ .role = "user", .content = "Hi" }};
+    const models = [_][]const u8{ "gpt-6-luna", "gpt-5-mini", "gpt-5", "openai/o3-pro", "O1-PREVIEW" };
+    for (models) |model| {
+        var p = AiProvider.init(a, &http, "https://api.test/v1", "Bearer sk-xxx", model);
+        p.max_output_tokens = 1234;
+        const body = try p.buildRequestBody(msgs, .{});
+        defer a.free(body);
+
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"max_completion_tokens\":1234") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":") == null);
+    }
+}
+
+test "AiProvider buildRequestBody keeps max_tokens for other backends" {
+    const a = std.testing.allocator;
+    var http = http_client.HttpClient.init(a, std.testing.io, 1, 5000);
+    defer http.deinit();
+
+    const msgs = &[_]AiProvider.ChatMsg{.{ .role = "user", .content = "Hi" }};
+    // gpt-4o predates the rename and still takes `max_tokens`.
+    const models = [_][]const u8{ "deepseek-v4-flash", "qwen-max", "gpt-4o", "llama-3.1-70b" };
+    for (models) |model| {
+        var p = AiProvider.init(a, &http, "https://api.test/v1", "Bearer sk-xxx", model);
+        p.max_output_tokens = 1234;
+        const body = try p.buildRequestBody(msgs, .{});
+        defer a.free(body);
+
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":1234") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "max_completion_tokens") == null);
+    }
+}
+
+test "AiProvider token_limit_param overrides model detection" {
+    const a = std.testing.allocator;
+    var http = http_client.HttpClient.init(a, std.testing.io, 1, 5000);
+    defer http.deinit();
+    const msgs = &[_]AiProvider.ChatMsg{.{ .role = "user", .content = "Hi" }};
+
+    var reasoning = AiProvider.init(a, &http, "https://api.test/v1", "Bearer sk-xxx", "gpt-5-mini");
+    try std.testing.expectEqual(AiProvider.TokenLimitParam.auto, reasoning.token_limit_param);
+    reasoning.token_limit_param = .max_tokens;
+    const legacy_body = try reasoning.buildRequestBody(msgs, .{});
+    defer a.free(legacy_body);
+    try std.testing.expect(std.mem.indexOf(u8, legacy_body, "\"max_tokens\":4096") != null);
+    try std.testing.expect(std.mem.indexOf(u8, legacy_body, "max_completion_tokens") == null);
+
+    var legacy = AiProvider.init(a, &http, "https://api.test/v1", "Bearer sk-xxx", "deepseek-v4-flash");
+    legacy.token_limit_param = .max_completion_tokens;
+    const new_body = try legacy.buildRequestBody(msgs, .{});
+    defer a.free(new_body);
+    try std.testing.expect(std.mem.indexOf(u8, new_body, "\"max_completion_tokens\":4096") != null);
+    try std.testing.expect(std.mem.indexOf(u8, new_body, "\"max_tokens\":") == null);
 }
 
 test "AiProvider parseResponse tool_calls" {

@@ -87,6 +87,16 @@ ai_chat_svc.setProvider(&ai_provider);
 ai_chat_svc.setSystemPrompt("You are a helpful assistant.");
 ```
 
+### Output-token parameter
+
+`max_output_tokens` is sent as `max_tokens` by default, which is what DeepSeek, Qwen and self-hosted servers expect. OpenAI's reasoning-era models (`gpt-5*`, `gpt-6*`, `o1`/`o3`/`o4`) reject that field with `400 Unsupported parameter: 'max_tokens'` and only accept `max_completion_tokens`. `token_limit_param = .auto` (the default) chooses by model name, including gateway-qualified names such as `openrouter/openai/gpt-5-mini`.
+
+```zig
+ai_provider.token_limit_param = .auto;                   // default: pick by model name
+ai_provider.token_limit_param = .max_completion_tokens;  // pin for a gateway that renamed the model
+ai_provider.token_limit_param = .max_tokens;             // old field for an OpenAI-compatible proxy
+```
+
 ## Server wiring
 
 The generated `AiChatApi` is a ComptimeRouter module (`pub const routes`), mounted with `scope.mountAll`.

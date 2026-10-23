@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### AI：输出上限字段自适应（`max_tokens` / `max_completion_tokens`）
+
+- `AiProvider` 新增 `token_limit_param`（默认 `.auto`，`init` 签名不变）：按模型名选择
+  输出上限字段名。`gpt-5*` / `gpt-6*` / `o1` / `o3` / `o4` 发 `max_completion_tokens`——
+  这些模型对 `max_tokens` 直接返回 `400 Unsupported parameter: 'max_tokens'`；其余
+  OpenAI 兼容后端（DeepSeek、Qwen、自建）继续发 `max_tokens`。
+- 网关风格的名字（`openrouter/openai/gpt-5-mini`）按最后一段判定；`gpt-4o` 等旧模型仍走
+  `max_tokens`。可显式覆盖为 `.max_tokens` / `.max_completion_tokens`。
+- `docs/ai/AI.md` § Provider setup 补「Output-token parameter」说明。
+
+### 测试：WebSocket dispatch 回滚用例的端口竞争
+
+- `WebSocketServer` / `WebSocketMonitor` 两个「无法 dispatch 时 start() 报错并回滚」的用例改用
+  `freeLoopbackPort` 探测后再绑 `0.0.0.0`，并行跑全套时端口可能被别的测试二进制抢走
+  （`error.AddressInUse`）。按 `DistributedEventBus` 既有写法改为最多 5 次换端口重试——
+  该错误发生在 bind 阶段，未进入 dispatch，状态未被改动，重试安全。
+
 ### 文档：公开文档全英文重写（go-zero 风格）
 
 - `docs/` 下 30 个公开页面（guide / reference / ai）改为英文，按任务重组：
@@ -16,8 +33,6 @@
   `## v<old> (unreleased batch)`，否则发版时重命名会静默失败。
 - 构建（zdoc 0.17）：0 个标题/语言 warning；剩余 “unknown page” 只指向 `docs/` 之外的
   仓库文件（AGENTS、examples、CHANGELOG 等），按设计原样输出。
-
-## [Unreleased]
 
 ### 文档：zdoc v0.17.0 + 官网 + 站点配置收口
 

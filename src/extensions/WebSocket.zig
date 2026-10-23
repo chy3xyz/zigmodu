@@ -1957,15 +1957,38 @@ test "WebSocketServer: a start() that cannot dispatch the accept loop reports it
     defer threaded.deinit();
     const io = threaded.io();
 
-    const port = try freeLoopbackPort(io);
-    var server = WebSocketServer.init(allocator, io, port);
-    defer server.deinit();
+    // `freeLoopbackPort` releases its probe before `start()` binds the number
+    // (on 0.0.0.0), so under a parallel full-suite run another test binary can
+    // claim it in the gap (`error.AddressInUse`). That race is not what this
+    // test asserts — the bind never reached the dispatch stage, so nothing was
+    // started and retrying with a fresh port is safe (same shape as
+    // `DistributedEventBus`'s start() test).
+    const port = blk: {
+        var attempt: usize = 0;
+        while (true) {
+            const candidate = try freeLoopbackPort(io);
+            var server = WebSocketServer.init(allocator, io, candidate);
+            defer server.deinit();
 
-    try std.testing.expectError(error.ConcurrencyUnavailable, server.start());
-    // Rolled back rather than half-started: down, no listener, and it says so
-    // instead of quietly pretending to serve.
-    try std.testing.expect(!server.is_running);
-    try std.testing.expect(server.server == null);
+            if (server.start()) |_| {
+                // The silent eager-fallback regression this test exists to catch.
+                try std.testing.expect(false);
+            } else |err| switch (err) {
+                error.AddressInUse => {
+                    attempt += 1;
+                    if (attempt >= 5) return error.AddressInUse;
+                    continue;
+                },
+                else => try std.testing.expectEqual(error.ConcurrencyUnavailable, err),
+            }
+
+            // Rolled back rather than half-started: down, no listener, and it says so
+            // instead of quietly pretending to serve.
+            try std.testing.expect(!server.is_running);
+            try std.testing.expect(server.server == null);
+            break :blk candidate;
+        }
+    };
 
     // The listener really is closed: the number the failed `start()` had bound
     // (on 0.0.0.0) is bindable again.
@@ -1985,20 +2008,41 @@ test "WebSocketMonitor: an update loop that cannot be dispatched fails start(), 
     defer threaded.deinit();
     const io = threaded.io();
 
-    const port = try freeLoopbackPort(io);
     var modules = ApplicationModules.init(allocator);
     defer modules.deinit();
 
-    var monitor = WebSocketMonitor.init(allocator, io, port);
-    defer monitor.deinit();
+    const port = blk: {
+        // Same bind race as the WebSocketServer test above: a parallel test
+        // binary can take the probed number before `start()` binds it on
+        // 0.0.0.0. `AddressInUse` there means the bind never reached dispatch,
+        // so the monitor is untouched and a retry is safe.
+        var attempt: usize = 0;
+        while (true) {
+            const candidate = try freeLoopbackPort(io);
+            var monitor = WebSocketMonitor.init(allocator, io, candidate);
+            defer monitor.deinit();
 
-    try std.testing.expectError(error.ConcurrencyUnavailable, monitor.start(&modules));
-    // The server half *had* started, so unwinding that is the whole job of the
-    // rollback: the accept loop is told to stop and the listener is closed.
-    try std.testing.expect(!monitor.is_running);
-    try std.testing.expect(!monitor.ws_server.is_running);
-    try std.testing.expect(monitor.ws_server.server == null);
-    try std.testing.expect(monitor.modules == null);
+            if (monitor.start(&modules)) |_| {
+                // The eager-fallback regression this test exists to catch.
+                try std.testing.expect(false);
+            } else |err| switch (err) {
+                error.AddressInUse => {
+                    attempt += 1;
+                    if (attempt >= 5) return error.AddressInUse;
+                    continue;
+                },
+                else => try std.testing.expectEqual(error.ConcurrencyUnavailable, err),
+            }
+
+            // The server half *had* started, so unwinding that is the whole job of the
+            // rollback: the accept loop is told to stop and the listener is closed.
+            try std.testing.expect(!monitor.is_running);
+            try std.testing.expect(!monitor.ws_server.is_running);
+            try std.testing.expect(monitor.ws_server.server == null);
+            try std.testing.expect(monitor.modules == null);
+            break :blk candidate;
+        }
+    };
 
     // `stop()` really did terminate the accept loop — it is blocked in `accept`,
     // and nothing else can have released the port.
