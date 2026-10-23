@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.43.0] - 2026-10-23
 
 ### AI：输出上限字段自适应（`max_tokens` / `max_completion_tokens`）
 
