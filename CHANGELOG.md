@@ -1,5 +1,32 @@
 # Changelog
 
+## [Unreleased]
+
+### AI：请求方言收敛为一张 `ModelCompat` 表
+
+- 新增 `AiProvider.compat: ?ModelCompat`（默认 `null` = 按模型名解析）：一个入口描述三个
+  维度——`token_limit`（`max_tokens` / `max_completion_tokens`）、`temperature`（`send` /
+  `omit`）、`reasoning_effort`（`auto` / `off` / `low` / `medium` / `high`）。设置时按**逐维
+  打补丁**处理：只写你关心的字段，其余沿用 profile，适合网关改名、Azure 部署名这类框架
+  看不到的模型。
+- 模型知识收敛到 `compat_profiles` 一张表（每个家族一行，含网关前缀名如
+  `openrouter/openai/gpt-5-mini`），`reasoningEraModel` / `toolsRequireReasoningEffort`
+  两个散落的判定函数删除；新增家族 = 加一行数据。
+- 修复推理代模型的两次 400：
+  - `temperature`：`gpt-5*` / `gpt-6*` / `o1`/`o3`/`o4` 只接受服务端默认温度，原实现固定发
+    `0.7`，这些模型上每次调用都 400。profile 对它们省略该字段。
+  - `reasoning_effort`：`gpt-6` 对**带 `tools`** 的请求必须带该字段，否则 400。profile 只在
+    该家族且请求带工具时发 `"medium"`（gpt-5 / o-series 不带也能用，未实现该参数的后端收到
+    会 400，故不做全家族广播）。
+- 每个 provider 首次构造请求体时打一条 info 日志，说明解析出的方言（`token` / `temperature` /
+  `reasoning_effort`；由 profile 决定的 effort 标注 `(tools only)`）——隐式决定必须可见，
+  否则排 400 只能靠猜。
+- 顺带修掉一个请求体缺陷：`tools_json` 传空串时会拼出 `"tools":,`（非法 JSON）；空串现在等同
+  「不带工具」，与 `reasoning_effort` 的工具判定共用同一个谓词。
+- **弃用**：`token_limit_param` / `temperature_param` / `reasoning_effort` 三个单维字段保留一个
+  版本，行为不变（优先于 `compat`），下个 minor 移除。
+- `docs/ai/AI.md` § Provider setup 改为「Model-family compatibility (`compat`)」，含三家族对照表。
+
 ## [0.43.1] - 2026-10-23
 
 ### 修复：嵌入式存储的 DDL 只写 SQLite 语法（PostgreSQL / MySQL 上建表失败）

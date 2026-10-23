@@ -87,15 +87,37 @@ ai_chat_svc.setProvider(&ai_provider);
 ai_chat_svc.setSystemPrompt("You are a helpful assistant.");
 ```
 
-### Output-token parameter
+### Model-family compatibility (`compat`)
 
-`max_output_tokens` is sent as `max_tokens` by default, which is what DeepSeek, Qwen and self-hosted servers expect. OpenAI's reasoning-era models (`gpt-5*`, `gpt-6*`, `o1`/`o3`/`o4`) reject that field with `400 Unsupported parameter: 'max_tokens'` and only accept `max_completion_tokens`. `token_limit_param = .auto` (the default) chooses by model name, including gateway-qualified names such as `openrouter/openai/gpt-5-mini`.
+Reasoning-era families differ from the classic OpenAI API in three request fields, and getting any of them wrong is a `400`:
+
+| Field | Classic backend | gpt-5 / o-series | gpt-6 |
+|-------|-----------------|------------------|-------|
+| output cap | `max_tokens` | `max_completion_tokens` | `max_completion_tokens` |
+| `temperature` | the configured value | omitted (server default only) | omitted |
+| `reasoning_effort` | not sent | not sent | `medium` **when `tools` is present** |
+
+That knowledge lives in one table (`compatForModel`, one row per family) and is resolved from the model name, including gateway-qualified names such as `openrouter/openai/gpt-5-mini`. A name no family matches — an Azure deployment, a renamed proxy, an older model — gets the classic profile rather than a guess.
 
 ```zig
-ai_provider.token_limit_param = .auto;                   // default: pick by model name
-ai_provider.token_limit_param = .max_completion_tokens;  // pin for a gateway that renamed the model
-ai_provider.token_limit_param = .max_tokens;             // old field for an OpenAI-compatible proxy
+ai_provider.compat = null;                       // default: resolve from the model name
+
+ai_provider.compat = .{                          // pin a deployment the table cannot see
+    .token_limit = .max_completion_tokens,
+    .temperature = .omit,
+    .reasoning_effort = .medium,
+};
+
+ai_provider.compat = .{ .temperature = .send };  // patch one dimension; the rest keeps the profile
 ```
+
+A value you pin (in `compat`, or in the deprecated aliases below) is sent on every request; a value that comes from the profile is sent only where that family requires it. The resolved dialect is logged once per provider, so a `400` is not the first place you learn what was sent:
+
+```text
+[ai] model=gpt-6-luna compat: token=max_completion_tokens temperature=omit reasoning_effort=medium (tools only)
+```
+
+Deprecated, kept for one release: `token_limit_param` / `temperature_param` / `reasoning_effort` still work and win over `compat`; use `compat` instead.
 
 ## Server wiring
 

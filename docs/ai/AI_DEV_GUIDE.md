@@ -42,6 +42,8 @@ defer http.deinit();
 var provider = try mgr.providerFor(allocator, &http, "deepseek-v4-flash");
 ```
 
+`providerFor` returns a provider bound to the leased model name, so the request dialect (`max_tokens` vs `max_completion_tokens`, whether `temperature` or `reasoning_effort` is sent) resolves from it automatically — see [AI.md](./AI.md#model-family-compatibility-compat). If the deployment name is not a model name (Azure, a renamed proxy), patch the returned value: `provider.compat = .{ … }`.
+
 When several instances share one key set, attach Redis cooldowns through `mgr.setSharedStore(...)`; otherwise each instance is blind to the others' cooldown and disable state.
 
 ### 3.2 Capability: register a skill

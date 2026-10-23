@@ -25,16 +25,41 @@ pub const AiProvider = struct {
 
     rate_limiter: ?RateLimiterState = null,
     max_output_tokens: usize = 4096,
-    /// Request field that carries `max_output_tokens`. OpenAI's reasoning-era
-    /// models (`gpt-5*`, `gpt-6*`, `o1`/`o3`/`o4`) reject `max_tokens` with
-    /// HTTP 400 and only accept `max_completion_tokens`; other OpenAI-compatible
-    /// backends (DeepSeek, Qwen, self-hosted) still expect `max_tokens`.
-    /// `.auto` decides from the model name; pin it for gateways that rename models.
-    token_limit_param: TokenLimitParam = .auto,
     temperature: f64 = 0.7,
+    /// Request-parameter dialect for this model.
+    ///
+    /// `null` (the default) resolves from the model name via `compatForModel` —
+    /// one row per family in `profiles`. Set it to patch specific dimensions
+    /// for a deployment the table cannot see (a gateway that renames models,
+    /// an Azure deployment name): fields left `.auto` keep what the profile
+    /// resolved.
+    compat: ?ModelCompat = null,
+
+    /// Deprecated single-dimension overrides, kept for one release. A value
+    /// other than `.auto` wins over `compat` and the profile.
+    token_limit_param: TokenLimitParam = .auto,
+    temperature_param: TemperatureParam = .auto,
+    reasoning_effort: ReasoningEffort = .auto,
+
     metrics: Metrics = .{},
+    /// One informational line per provider, so an operator can see which
+    /// dialect the framework chose for this model instead of guessing from a 400.
+    compat_logged: std.atomic.Value(bool) = .init(false),
 
     pub const TokenLimitParam = enum { auto, max_tokens, max_completion_tokens };
+    pub const ReasoningEffort = enum { auto, off, low, medium, high };
+    pub const TemperatureParam = enum { auto, send, omit };
+
+    /// Per-family request dialect. `.auto` means "classic OpenAI-compatible
+    /// behaviour" in every dimension, so one family row describes its whole
+    /// divergence from the pre-reasoning API.
+    pub const ModelCompat = struct {
+        token_limit: TokenLimitParam = .auto,
+        temperature: TemperatureParam = .auto,
+        /// Value to send on requests that carry `tools` — the only place these
+        /// families insist on it. `.auto` = the family does not need it.
+        reasoning_effort: ReasoningEffort = .auto,
+    };
 
     pub const RateLimiterState = struct {
         limiter: @import("../resilience/RateLimiter.zig").RateLimiter,
@@ -492,13 +517,83 @@ pub const AiProvider = struct {
         return list;
     }
 
+    /// Everything the request builder needs, resolved once: the family profile,
+    /// patched by `compat`, then by the deprecated single-dimension overrides.
+    /// Keeping the precedence in one function is the point — three separate
+    /// lookups drifted apart once already.
+    pub const ResolvedCompat = struct {
+        compat: ModelCompat,
+        /// `reasoning_effort` was pinned by the caller (compat patch or the
+        /// deprecated alias), so it is sent on every request. A value that came
+        /// from the family profile is sent only where that family requires it.
+        effort_pinned: bool = false,
+    };
+
+    pub fn resolveCompat(self: AiProvider) ResolvedCompat {
+        var resolved = ResolvedCompat{ .compat = compatForModel(self.model) };
+        if (self.compat) |patch| {
+            if (patch.token_limit != .auto) resolved.compat.token_limit = patch.token_limit;
+            if (patch.temperature != .auto) resolved.compat.temperature = patch.temperature;
+            if (patch.reasoning_effort != .auto) {
+                resolved.compat.reasoning_effort = patch.reasoning_effort;
+                resolved.effort_pinned = true;
+            }
+        }
+        if (self.token_limit_param != .auto) resolved.compat.token_limit = self.token_limit_param;
+        if (self.temperature_param != .auto) resolved.compat.temperature = self.temperature_param;
+        if (self.reasoning_effort != .auto) {
+            resolved.compat.reasoning_effort = self.reasoning_effort;
+            resolved.effort_pinned = true;
+        }
+        return resolved;
+    }
+
     /// Name of the output-token cap field for this provider's backend.
     pub fn tokenLimitField(self: AiProvider) []const u8 {
-        return switch (self.token_limit_param) {
+        return switch (self.resolveCompat().compat.token_limit) {
             .max_tokens => "max_tokens",
             .max_completion_tokens => "max_completion_tokens",
-            .auto => if (modelUsesCompletionTokens(self.model)) "max_completion_tokens" else "max_tokens",
+            // `.auto` with no family row: a classic OpenAI-compatible server.
+            .auto => "max_tokens",
         };
+    }
+
+    /// Whether the request body carries `temperature`.
+    pub fn sendsTemperature(self: AiProvider) bool {
+        return switch (self.resolveCompat().compat.temperature) {
+            .omit => false,
+            .send, .auto => true,
+        };
+    }
+
+    /// `reasoning_effort` to emit, or null to omit the field.
+    pub fn reasoningEffortValue(self: AiProvider, has_tools: bool) ?[]const u8 {
+        const resolved = self.resolveCompat();
+        // A profile value is a requirement of the tool-calling path only; a
+        // pinned value is the caller's instruction and applies everywhere.
+        if (!resolved.effort_pinned and !has_tools) return null;
+        return effortName(resolved.compat.reasoning_effort);
+    }
+
+    /// One informational line per provider describing the resolved dialect, so
+    /// a 400 is not the first place an operator learns what was sent.
+    ///
+    /// It reports the *capability*, not the first request's shape: a
+    /// profile-driven `reasoning_effort` is tagged `(tools only)` because it is
+    /// sent only on requests that carry tools, and logging the first request
+    /// would make that look like "never".
+    fn logResolvedCompat(self: *AiProvider) void {
+        if (self.compat_logged.swap(true, .monotonic)) return;
+        const resolved = self.resolveCompat();
+        const effort = effortName(resolved.compat.reasoning_effort) orelse "none";
+        const qualifier: []const u8 = if (effortName(resolved.compat.reasoning_effort) != null and !resolved.effort_pinned) " (tools only)" else "";
+        std.log.info("[ai] model={s} compat: token={s} temperature={s} reasoning_effort={s}{s}", .{
+            self.model,
+            self.tokenLimitField(),
+            if (self.sendsTemperature()) "send" else "omit",
+            effort,
+            qualifier,
+        });
     }
 
     pub fn buildRequestBody(self: *AiProvider, messages: []const ChatMsg, opts: ChatOpts) ![]const u8 {
@@ -544,7 +639,11 @@ pub const AiProvider = struct {
             try buf.appendSlice(a, "}");
         }
         try buf.appendSlice(a, "]");
-        if (opts.tools_json) |tools| {
+        // An empty `tools_json` is the caller saying "no tools", not a JSON
+        // fragment — emitting it would produce `"tools":,` and an invalid body.
+        const tools: []const u8 = opts.tools_json orelse "";
+        const has_tools = tools.len > 0;
+        if (has_tools) {
             try buf.appendSlice(a, ",\"tools\":");
             try buf.appendSlice(a, tools);
         }
@@ -552,8 +651,18 @@ pub const AiProvider = struct {
         try buf.appendSlice(a, self.tokenLimitField());
         try buf.appendSlice(a, "\":");
         try buf.print(a, "{d}", .{self.max_output_tokens});
-        try buf.appendSlice(a, ",\"temperature\":");
-        try buf.print(a, "{d}", .{self.temperature});
+        if (self.sendsTemperature()) {
+            try buf.appendSlice(a, ",\"temperature\":");
+            try buf.print(a, "{d}", .{self.temperature});
+        }
+        // `tools` is decided by the caller, so the effort rule needs to see it:
+        // gpt-6 only insists on `reasoning_effort` when tools are present.
+        self.logResolvedCompat();
+        if (self.reasoningEffortValue(has_tools)) |effort| {
+            try buf.appendSlice(a, ",\"reasoning_effort\":\"");
+            try buf.appendSlice(a, effort);
+            try buf.appendSlice(a, "\"");
+        }
         if (opts.stream) {
             try buf.appendSlice(a, ",\"stream\":true}");
         } else {
@@ -1002,17 +1111,51 @@ fn escapeJson(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), s: []const 
     }
 }
 
-/// Models that reject `max_tokens` in favour of `max_completion_tokens`.
+/// Value to put in the request for `effort`, or null to omit the field.
+fn effortName(effort: AiProvider.ReasoningEffort) ?[]const u8 {
+    return switch (effort) {
+        .auto, .off => null,
+        .low => "low",
+        .medium => "medium",
+        .high => "high",
+    };
+}
+
+/// Request dialect per model family — the single place model knowledge lives.
+///
+/// A family that behaves like the classic OpenAI API is simply omitted. Adding
+/// a family is one row; nothing else in this file names a model.
+const compat_profiles = [_]struct { prefix: []const u8, compat: AiProvider.ModelCompat }{
+    // Reasoning-era families: renamed output cap, and they reject a temperature
+    // other than the server default.
+    .{
+        .prefix = "gpt-6",
+        .compat = .{
+            .token_limit = .max_completion_tokens,
+            .temperature = .omit,
+            // gpt-6 rejects a tool-calling request that omits `reasoning_effort`.
+            .reasoning_effort = .medium,
+        },
+    },
+    .{ .prefix = "gpt-5", .compat = .{ .token_limit = .max_completion_tokens, .temperature = .omit } },
+    .{ .prefix = "o1", .compat = .{ .token_limit = .max_completion_tokens, .temperature = .omit } },
+    .{ .prefix = "o3", .compat = .{ .token_limit = .max_completion_tokens, .temperature = .omit } },
+    .{ .prefix = "o4", .compat = .{ .token_limit = .max_completion_tokens, .temperature = .omit } },
+};
+
+/// Resolve a model name to its family profile.
+///
 /// Gateways prefix names (`openrouter/openai/gpt-5-mini`), so the last path
-/// segment is matched too. `gpt-4o` and older models still take `max_tokens`.
-fn modelUsesCompletionTokens(model: []const u8) bool {
-    const prefixes = [_][]const u8{ "gpt-5", "gpt-6", "o1", "o3", "o4" };
+/// segment is matched too. An unknown name — an Azure deployment, a renamed
+/// proxy, next quarter's model — gets the classic profile, which is what every
+/// non-OpenAI backend implements; pin `AiProvider.compat` when that is wrong.
+fn compatForModel(model: []const u8) AiProvider.ModelCompat {
     const tail = if (std.mem.lastIndexOfScalar(u8, model, '/')) |i| model[i + 1 ..] else model;
-    for (prefixes) |prefix| {
-        if (std.ascii.startsWithIgnoreCase(model, prefix)) return true;
-        if (std.ascii.startsWithIgnoreCase(tail, prefix)) return true;
+    for (compat_profiles) |row| {
+        if (std.ascii.startsWithIgnoreCase(model, row.prefix)) return row.compat;
+        if (std.ascii.startsWithIgnoreCase(tail, row.prefix)) return row.compat;
     }
-    return false;
+    return .{};
 }
 
 test "AiProvider buildMessages cache order" {
@@ -1066,6 +1209,10 @@ test "AiProvider buildRequestBody sends max_completion_tokens to reasoning-era O
 
         try std.testing.expect(std.mem.indexOf(u8, body, "\"max_completion_tokens\":1234") != null);
         try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":") == null);
+        // Same family, same restriction: a non-default temperature is rejected,
+        // so the field must be absent (the server default applies).
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":") == null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":false") != null);
     }
 }
 
@@ -1085,7 +1232,35 @@ test "AiProvider buildRequestBody keeps max_tokens for other backends" {
 
         try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":1234") != null);
         try std.testing.expect(std.mem.indexOf(u8, body, "max_completion_tokens") == null);
+        // Classic chat models still take the configured temperature.
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":0.7") != null);
     }
+}
+
+test "AiProvider temperature_param overrides model detection" {
+    const a = std.testing.allocator;
+    var http = http_client.HttpClient.init(a, std.testing.io, 1, 5000);
+    defer http.deinit();
+    const msgs = &[_]AiProvider.ChatMsg{.{ .role = "user", .content = "Hi" }};
+
+    var reasoning = AiProvider.init(a, &http, "https://api.test/v1", "Bearer sk-xxx", "gpt-6-luna");
+    try std.testing.expectEqual(AiProvider.TemperatureParam.auto, reasoning.temperature_param);
+    try std.testing.expect(!reasoning.sendsTemperature());
+    reasoning.temperature_param = .send;
+    try std.testing.expect(reasoning.sendsTemperature());
+    const sent = try reasoning.buildRequestBody(msgs, .{});
+    defer a.free(sent);
+    try std.testing.expect(std.mem.indexOf(u8, sent, "\"temperature\":0.7") != null);
+
+    var classic = AiProvider.init(a, &http, "https://api.test/v1", "Bearer sk-xxx", "deepseek-v4-flash");
+    try std.testing.expect(classic.sendsTemperature());
+    classic.temperature_param = .omit;
+    try std.testing.expect(!classic.sendsTemperature());
+    const omitted = try classic.buildRequestBody(msgs, .{});
+    defer a.free(omitted);
+    try std.testing.expect(std.mem.indexOf(u8, omitted, "\"temperature\":") == null);
+    // The body stays valid JSON without the field.
+    try std.testing.expect(std.mem.indexOf(u8, omitted, "\"max_tokens\":4096,\"stream\":false}") != null);
 }
 
 test "AiProvider token_limit_param overrides model detection" {
@@ -1108,6 +1283,121 @@ test "AiProvider token_limit_param overrides model detection" {
     defer a.free(new_body);
     try std.testing.expect(std.mem.indexOf(u8, new_body, "\"max_completion_tokens\":4096") != null);
     try std.testing.expect(std.mem.indexOf(u8, new_body, "\"max_tokens\":") == null);
+}
+
+test "AiProvider sends reasoning_effort for gpt-6 tool calls" {
+    const a = std.testing.allocator;
+    var http = http_client.HttpClient.init(a, std.testing.io, 1, 5000);
+    defer http.deinit();
+    const msgs = &[_]AiProvider.ChatMsg{.{ .role = "user", .content = "Hi" }};
+    const tools =
+        \\[{"type":"function","function":{"name":"ping","parameters":{"type":"object","properties":{}}}}]
+    ;
+
+    // gpt-6 rejects a tool-calling request that omits the field.
+    var gpt6 = AiProvider.init(a, &http, "https://api.test/v1", "Bearer sk-xxx", "gpt-6-luna");
+    const with_tools = try gpt6.buildRequestBody(msgs, .{ .tools_json = tools });
+    defer a.free(with_tools);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "\"reasoning_effort\":\"medium\"") != null);
+    // Same model family, so the temperature rule still applies: no field at all.
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "\"temperature\":") == null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "\"stream\":false") != null);
+
+    // A request without tools does not need it.
+    const plain = try gpt6.buildRequestBody(msgs, .{});
+    defer a.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "reasoning_effort") == null);
+
+    // The rest of the family accepts tool calls without it.
+    var gpt5 = AiProvider.init(a, &http, "https://api.test/v1", "Bearer sk-xxx", "gpt-5-mini");
+    const gpt5_tools = try gpt5.buildRequestBody(msgs, .{ .tools_json = tools });
+    defer a.free(gpt5_tools);
+    try std.testing.expect(std.mem.indexOf(u8, gpt5_tools, "reasoning_effort") == null);
+
+    // Non-reasoning backends reject the parameter outright.
+    var deepseek = AiProvider.init(a, &http, "https://api.test/v1", "Bearer sk-xxx", "deepseek-v4-flash");
+    const ds_tools = try deepseek.buildRequestBody(msgs, .{ .tools_json = tools });
+    defer a.free(ds_tools);
+    try std.testing.expect(std.mem.indexOf(u8, ds_tools, "reasoning_effort") == null);
+
+    // Explicit values win in both directions.
+    deepseek.reasoning_effort = .high;
+    const pinned = try deepseek.buildRequestBody(msgs, .{});
+    defer a.free(pinned);
+    try std.testing.expect(std.mem.indexOf(u8, pinned, "\"reasoning_effort\":\"high\"") != null);
+
+    gpt6.reasoning_effort = .off;
+    const off = try gpt6.buildRequestBody(msgs, .{ .tools_json = tools });
+    defer a.free(off);
+    try std.testing.expect(std.mem.indexOf(u8, off, "reasoning_effort") == null);
+}
+
+test "compatForModel resolves families and defaults unknown names to classic" {
+    const gpt6 = compatForModel("gpt-6-luna");
+    try std.testing.expectEqual(AiProvider.TokenLimitParam.max_completion_tokens, gpt6.token_limit);
+    try std.testing.expectEqual(AiProvider.TemperatureParam.omit, gpt6.temperature);
+    try std.testing.expectEqual(AiProvider.ReasoningEffort.medium, gpt6.reasoning_effort);
+
+    // Gateway-qualified names match on the last segment; gpt-5 has no effort rule.
+    const gpt5 = compatForModel("openrouter/openai/gpt-5-mini");
+    try std.testing.expectEqual(AiProvider.TokenLimitParam.max_completion_tokens, gpt5.token_limit);
+    try std.testing.expectEqual(AiProvider.ReasoningEffort.auto, gpt5.reasoning_effort);
+
+    // Unknown names — an Azure deployment, a renamed proxy, an older model —
+    // get the classic profile rather than a guess.
+    for ([_][]const u8{ "my-gpt6-deploy", "deepseek-v4-flash", "gpt-4o" }) |name| {
+        const c = compatForModel(name);
+        try std.testing.expectEqual(AiProvider.TokenLimitParam.auto, c.token_limit);
+        try std.testing.expectEqual(AiProvider.TemperatureParam.auto, c.temperature);
+        try std.testing.expectEqual(AiProvider.ReasoningEffort.auto, c.reasoning_effort);
+    }
+}
+
+test "AiProvider compat pins a renamed deployment and patches one dimension" {
+    const a = std.testing.allocator;
+    var http = http_client.HttpClient.init(a, std.testing.io, 1, 5000);
+    defer http.deinit();
+    const msgs = &[_]AiProvider.ChatMsg{.{ .role = "user", .content = "Hi" }};
+    const tools =
+        \\[{"type":"function","function":{"name":"ping","parameters":{"type":"object","properties":{}}}}]
+    ;
+
+    // A gateway that renamed a gpt-6 deployment: the name matches no family, so
+    // the operator pins the whole dialect.
+    var renamed = AiProvider.init(a, &http, "https://api.test/v1", "Bearer sk-xxx", "my-deploy");
+    try std.testing.expectEqualStrings("max_tokens", renamed.tokenLimitField());
+    renamed.compat = .{ .token_limit = .max_completion_tokens, .temperature = .omit, .reasoning_effort = .medium };
+    try std.testing.expectEqualStrings("max_completion_tokens", renamed.tokenLimitField());
+    try std.testing.expect(!renamed.sendsTemperature());
+    const body = try renamed.buildRequestBody(msgs, .{ .tools_json = tools });
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"medium\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":") == null);
+
+    // A patch naming one dimension leaves the profile's other choices alone.
+    var patched = AiProvider.init(a, &http, "https://api.test/v1", "Bearer sk-xxx", "gpt-6-luna");
+    patched.compat = .{ .temperature = .send }; // this gateway accepts a custom temperature
+    const patched_body = try patched.buildRequestBody(msgs, .{});
+    defer a.free(patched_body);
+    try std.testing.expect(std.mem.indexOf(u8, patched_body, "\"max_completion_tokens\":4096") != null);
+    try std.testing.expect(std.mem.indexOf(u8, patched_body, "\"temperature\":0.7") != null);
+}
+
+test "AiProvider treats an empty tools_json as no tools" {
+    const a = std.testing.allocator;
+    var http = http_client.HttpClient.init(a, std.testing.io, 1, 5000);
+    defer http.deinit();
+    var p = AiProvider.init(a, &http, "https://api.test/v1", "Bearer sk-xxx", "gpt-6-luna");
+    const msgs = &[_]AiProvider.ChatMsg{.{ .role = "user", .content = "Hi" }};
+
+    const body = try p.buildRequestBody(msgs, .{ .tools_json = "" });
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\"") == null);
+    // An empty fragment used to be appended verbatim, producing `"tools":,` —
+    // a body no server (and no JSON parser) accepts.
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
 }
 
 test "AiProvider parseResponse tool_calls" {
