@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.43.2] - 2026-10-23
 
 ### AI：请求方言收敛为一张 `ModelCompat` 表
 
