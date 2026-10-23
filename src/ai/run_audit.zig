@@ -45,10 +45,7 @@ pub const RunAuditStore = struct {
 
     pub fn migrate(self: *Self) !void {
         try sqlx.validateIdentifier(self.table);
-        const sql = try self.allocator.print(
-            "CREATE TABLE IF NOT EXISTS {s} (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, tenant_id INTEGER, steps INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, model TEXT, prompt_tokens INTEGER NOT NULL DEFAULT 0, completion_tokens INTEGER NOT NULL DEFAULT 0)",
-            .{self.table},
-        );
+        const sql = try createTableSql(self.allocator, self.backend.dialect(), self.table);
         defer self.allocator.free(sql);
         _ = try self.backend.exec(sql, &.{});
         // Existing installs predate later columns (CREATE IF NOT EXISTS does not
@@ -77,23 +74,43 @@ pub const RunAuditStore = struct {
     /// legacy table turned an upgrade into a red suite. Ask the catalog
     /// instead, per dialect; nothing here is an error path.
     fn columnExists(self: *Self, column: []const u8) !bool {
-        const sql = switch (self.backend.client.config.driver) {
-            .sqlite => "SELECT COUNT(*) AS n FROM pragma_table_info(?) WHERE name = ?",
-            .postgres => "SELECT COUNT(*) AS n FROM information_schema.columns WHERE table_name = ? AND column_name = ?",
-            else => "SELECT COUNT(*) AS n FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?",
-        };
-        var cursor = try self.backend.client.queryCursorEx(sql, &.{
-            .{ .string = self.table },
-            .{ .string = column },
-        }, .{});
-        defer cursor.deinit();
-        const row = (try cursor.next()) orelse return false;
-        return (row.get("n") orelse return false).int > 0;
+        try sqlx.validateIdentifier(self.table);
+        try sqlx.validateIdentifier(column);
+        switch (self.backend.dialect()) {
+            .sqlite => {
+                var cursor = try self.backend.client.queryCursorEx(
+                    "SELECT COUNT(*) AS n FROM pragma_table_info(?) WHERE name = ?",
+                    &.{ .{ .string = self.table }, .{ .string = column } },
+                    .{},
+                );
+                defer cursor.deinit();
+                const row = (try cursor.next()) orelse return false;
+                return (row.get("n") orelse return false).int > 0;
+            },
+            // `information_schema.columns` is server-wide, so the statement is
+            // built by `sqlx.catalogColumnProbe`: it pins the schema `ALTER
+            // TABLE` will resolve against, and a same-named table in another
+            // schema cannot answer "the column is there".
+            .postgres, .mysql => |d| {
+                const probe = sqlx.catalogColumnProbe(
+                    if (d == .postgres) .postgres else .mysql,
+                    self.table,
+                    column,
+                );
+                var cursor = try self.backend.client.queryCursorEx(probe.sql, probe.bindArgs(), .{});
+                defer cursor.deinit();
+                return (try cursor.next()) != null;
+            },
+        }
     }
 
     pub fn record(self: *Self, entry: RunAuditEntry) !void {
         try sqlx.validateIdentifier(self.table);
-        const now = Time.monotonicNowSeconds();
+        // Wall clock, not uptime: these rows outlive the process, and a tenant
+        // statement or a cost window ("this month") is meaningless in seconds
+        // since boot. `x402_store` stamps its ledger the same way for the same
+        // reason.
+        const now = Time.wallClockSeconds(self.backend.client.io);
         const sql = try self.allocator.print(
             "INSERT INTO {s} (run_id, kind, status, tenant_id, steps, duration_ms, created_at, model, prompt_tokens, completion_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             .{self.table},
@@ -198,12 +215,15 @@ pub const RunAuditStore = struct {
     /// Aggregate persisted token usage. This is the query a tenant statement
     /// or a cost dashboard needs; `list` answers "what ran", this answers "how
     /// much did it cost", per tenant and model.
+    ///
+    /// `since_seconds` is Unix wall-clock seconds — the unit `record` stamps
+    /// `created_at` with, so a window means the same thing after a restart.
     pub fn aggregate(
         self: *Self,
         allocator: std.mem.Allocator,
         out: *std.ArrayList(UsageRow),
         tenant_id: ?i64,
-        since_ms: ?i64,
+        since_seconds: ?i64,
     ) !void {
         try sqlx.validateIdentifier(self.table);
         var where = std.ArrayList(u8).empty;
@@ -216,13 +236,21 @@ pub const RunAuditStore = struct {
             try args.append(allocator, .{ .int = tid });
             first = false;
         }
-        if (since_ms) |ts| {
+        if (since_seconds) |ts| {
             if (!first) try where.appendSlice(allocator, " AND ");
             try where.appendSlice(allocator, "created_at >= ?");
             try args.append(allocator, .{ .int = ts });
         }
 
-        const base = "SELECT kind, model, SUM(prompt_tokens) AS prompt_tokens, SUM(completion_tokens) AS completion_tokens, COUNT(*) AS runs FROM ";
+        // `SUM(bigint)` is not a bigint on the servers: PostgreSQL widens it to
+        // NUMERIC (the driver decodes that as decimal text) and MySQL to
+        // DECIMAL. Cast where the server would widen, and read every shape
+        // anyway — `numericValue` below.
+        const base = switch (self.backend.dialect()) {
+            .sqlite => "SELECT kind, model, SUM(prompt_tokens) AS prompt_tokens, SUM(completion_tokens) AS completion_tokens, COUNT(*) AS runs FROM ",
+            .postgres => "SELECT kind, model, SUM(prompt_tokens)::BIGINT AS prompt_tokens, SUM(completion_tokens)::BIGINT AS completion_tokens, COUNT(*) AS runs FROM ",
+            .mysql => "SELECT kind, model, CAST(SUM(prompt_tokens) AS SIGNED) AS prompt_tokens, CAST(SUM(completion_tokens) AS SIGNED) AS completion_tokens, COUNT(*) AS runs FROM ",
+        };
         const sql = if (where.items.len > 0)
             try allocator.print("{s}{s} WHERE {s} GROUP BY kind, model ORDER BY kind, model", .{ base, self.table, where.items })
         else
@@ -238,9 +266,9 @@ pub const RunAuditStore = struct {
             try out.append(allocator, .{
                 .kind = kind,
                 .model = model,
-                .prompt_tokens = if (row.get("prompt_tokens")) |v| @intCast(v.int) else 0,
-                .completion_tokens = if (row.get("completion_tokens")) |v| @intCast(v.int) else 0,
-                .runs = @intCast(row.get("runs").?.int),
+                .prompt_tokens = numericValue(row.get("prompt_tokens")),
+                .completion_tokens = numericValue(row.get("completion_tokens")),
+                .runs = numericValue(row.get("runs")),
             });
         }
     }
@@ -251,9 +279,54 @@ pub const RunAuditStore = struct {
         defer self.allocator.free(sql);
         var cursor = try self.backend.client.queryCursorEx(sql, &.{}, .{});
         defer cursor.deinit();
-        return @intCast((try cursor.next()).?.get("n").?.int);
+        return @intCast(numericValue((try cursor.next()).?.get("n")));
     }
 };
+
+/// A numeric result column as an unsigned integer.
+///
+/// The same `SUM()`/`COUNT()` arrives in a different union tag per driver:
+/// SQLite hands back `.int`, MySQL a `.float` (DECIMAL), PostgreSQL a
+/// `.string` (NUMERIC decoded as decimal text). Reading `.int`
+/// unconditionally panicked on PostgreSQL — "access of union field 'int' while
+/// field 'string' is active" — on the very query a tenant statement runs.
+fn numericValue(v: ?sqlx.Value) u64 {
+    const value = v orelse return 0;
+    return switch (value) {
+        .int => |i| if (i > 0) @intCast(i) else 0,
+        .float => |f| if (f > 0) @intFromFloat(f) else 0,
+        .string => |s| blk: {
+            if (std.fmt.parseInt(u64, s, 10)) |i| break :blk i else |_| {}
+            if (std.fmt.parseFloat(f64, s)) |f| break :blk if (f > 0) @intFromFloat(f) else 0 else |_| {}
+            break :blk 0;
+        },
+        else => 0,
+    };
+}
+
+///
+/// This used to be one SQLite statement (`INTEGER PRIMARY KEY AUTOINCREMENT`).
+/// PostgreSQL and MySQL reject that spelling, so `migrate()` failed on them and
+/// the first `record()` reported `relation "ai_run_audit" does not exist` — the
+/// table had never been created. Keep the three arms in one place so the row
+/// shape cannot drift between them: only the id syntax and the types MySQL
+/// insists on (`VARCHAR`, no unbounded `TEXT` key) differ.
+fn createTableSql(allocator: std.mem.Allocator, driver: sqlx.Driver, table: []const u8) ![]u8 {
+    return switch (driver) {
+        .sqlite => allocator.print(
+            "CREATE TABLE IF NOT EXISTS {s} (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, tenant_id INTEGER, steps INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, model TEXT, prompt_tokens INTEGER NOT NULL DEFAULT 0, completion_tokens INTEGER NOT NULL DEFAULT 0)",
+            .{table},
+        ),
+        .postgres => allocator.print(
+            "CREATE TABLE IF NOT EXISTS {s} (id BIGSERIAL PRIMARY KEY, run_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, tenant_id BIGINT, steps BIGINT NOT NULL DEFAULT 0, duration_ms BIGINT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL, model TEXT, prompt_tokens BIGINT NOT NULL DEFAULT 0, completion_tokens BIGINT NOT NULL DEFAULT 0)",
+            .{table},
+        ),
+        .mysql => allocator.print(
+            "CREATE TABLE IF NOT EXISTS {s} (id BIGINT AUTO_INCREMENT PRIMARY KEY, run_id VARCHAR(255) NOT NULL, kind VARCHAR(32) NOT NULL, status VARCHAR(64) NOT NULL, tenant_id BIGINT NULL, steps BIGINT NOT NULL DEFAULT 0, duration_ms BIGINT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL, model VARCHAR(255) NULL, prompt_tokens BIGINT NOT NULL DEFAULT 0, completion_tokens BIGINT NOT NULL DEFAULT 0)",
+            .{table},
+        ),
+    };
+}
 
 // The rows are inserted with the test allocator before the scan; the failing
 // allocator covers `appendRow`'s copies and the growth of `out`, never the
@@ -327,6 +400,41 @@ test "RunAuditStore records, filters and lists run history" {
     try std.testing.expectEqualStrings("r3", wf_only.items[0].run_id); // newest first
 }
 
+test "RunAuditStore stamps created_at with the wall clock, not uptime" {
+    const allocator = std.testing.allocator;
+    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    var store = RunAuditStore.init(allocator, &backend);
+    try store.migrate();
+
+    const before = Time.wallClockSeconds(std.testing.io);
+    try store.record(.{ .run_id = "clock", .kind = .agent, .status = "ok" });
+
+    var cursor = try client.queryCursorEx("SELECT created_at FROM ai_run_audit ORDER BY id DESC LIMIT 1", &.{}, .{});
+    defer cursor.deinit();
+    const stamped = (try cursor.next()).?.get("created_at").?.int;
+    // Uptime seconds on a fresh test process are tiny; the band only absorbs
+    // clock granularity and the test's own runtime.
+    try std.testing.expect(stamped >= before);
+    try std.testing.expect(stamped <= before + 300);
+}
+
+test "numericValue reads the SUM/COUNT shapes each driver returns" {
+    // SQLite: INTEGER.
+    try std.testing.expectEqual(@as(u64, 150), numericValue(.{ .int = 150 }));
+    // PostgreSQL: NUMERIC, decoded as decimal text by the driver.
+    try std.testing.expectEqual(@as(u64, 150), numericValue(.{ .string = "150" }));
+    try std.testing.expectEqual(@as(u64, 150), numericValue(.{ .string = "150.000" }));
+    // MySQL: DECIMAL, decoded as a float.
+    try std.testing.expectEqual(@as(u64, 150), numericValue(.{ .float = 150.0 }));
+    // Absent / unusable.
+    try std.testing.expectEqual(@as(u64, 0), numericValue(null));
+    try std.testing.expectEqual(@as(u64, 0), numericValue(.{ .string = "NaN" }));
+    try std.testing.expectEqual(@as(u64, 0), numericValue(.{ .int = -1 }));
+}
+
 test "RunAuditStore rejects a table name that is not a plain identifier" {
     const allocator = std.testing.allocator;
     var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
@@ -344,6 +452,36 @@ test "RunAuditStore rejects a table name that is not a plain identifier" {
     var out = std.ArrayList(RunAuditEntry).empty;
     defer out.deinit(allocator);
     try std.testing.expectError(error.InvalidSqlIdentifier, store.list(allocator, &out, null, null, 10));
+}
+
+test "RunAuditStore emits each dialect's CREATE TABLE" {
+    const allocator = std.testing.allocator;
+
+    // PostgreSQL and MySQL parse neither `AUTOINCREMENT` nor each other's id
+    // syntax, so the arms are asserted apart rather than assumed equivalent.
+    const pg = try createTableSql(allocator, .postgres, "ai_run_audit");
+    defer allocator.free(pg);
+    try std.testing.expect(std.mem.indexOf(u8, pg, "BIGSERIAL PRIMARY KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pg, "AUTOINCREMENT") == null);
+    try std.testing.expect(std.mem.indexOf(u8, pg, "AUTO_INCREMENT") == null);
+
+    const my = try createTableSql(allocator, .mysql, "ai_run_audit");
+    defer allocator.free(my);
+    try std.testing.expect(std.mem.indexOf(u8, my, "AUTO_INCREMENT PRIMARY KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, my, "AUTOINCREMENT") == null);
+
+    const lite = try createTableSql(allocator, .sqlite, "ai_run_audit");
+    defer allocator.free(lite);
+    try std.testing.expect(std.mem.indexOf(u8, lite, "INTEGER PRIMARY KEY AUTOINCREMENT") != null);
+
+    // Same row shape everywhere: a row written on one server must be readable
+    // from the others, so every column appears in every arm.
+    const columns = [_][]const u8{ "run_id", "kind", "status", "tenant_id", "steps", "duration_ms", "created_at", "model", "prompt_tokens", "completion_tokens" };
+    for ([_][]const u8{ pg, my, lite }) |sql| {
+        for (columns) |column| {
+            try std.testing.expect(std.mem.indexOf(u8, sql, column) != null);
+        }
+    }
 }
 
 /// Convenience: record a run with the tenant from the SkillContext.

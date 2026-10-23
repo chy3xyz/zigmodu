@@ -1,5 +1,56 @@
 # Changelog
 
+## [Unreleased]
+
+### 修复：嵌入式存储的 DDL 只写 SQLite 语法（PostgreSQL / MySQL 上建表失败）
+
+- **`RunAuditStore.migrate()`**：`CREATE TABLE` 由一句 SQLite DDL
+  （`INTEGER PRIMARY KEY AUTOINCREMENT`）改为按连接方言生成——SQLite 用
+  `INTEGER PRIMARY KEY AUTOINCREMENT`，PostgreSQL 用 `BIGSERIAL PRIMARY KEY`，
+  MySQL 用 `BIGINT AUTO_INCREMENT PRIMARY KEY`。此前在 PostgreSQL 上建表语句直接
+  语法错误，`migrate()` 失败、表从未创建，随后每次 `record()` 都报
+  `relation "ai_run_audit" does not exist`。
+- 同类问题一并修掉：`ai.ops.approval_store.PersistentApprovalQueue.migrate()`
+  （`approval_queue`）与 `web4.x402_store.X402Store.migrate()`（`web4_invoice`）
+  同样只发 SQLite DDL。三处各自新增「按方言生成 CREATE TABLE」的测试，断言
+  PostgreSQL / MySQL 分支不含 `AUTOINCREMENT`、且三个分支列集合一致。
+- **行为变化**：`RunAuditStore` / `PersistentApprovalQueue` 的 `created_at` /
+  `updated_at` 从单调时钟（uptime 秒）改为 wall clock（Unix 秒）。这些行跨进程存活，
+  按 uptime 记账会让重启后的租户账单和 `aggregate` 的时间窗口失去意义。
+  `RunAuditStore.aggregate` 的窗口参数更名为 `since_seconds`（语义不变，仍为
+  `created_at >= ?`）。新增测试锁定 `created_at` 落在 wall clock 上。
+- `RunAuditStore` 的列存在性探测在 PostgreSQL / MySQL 上改用
+  `sqlx.catalogColumnProbe`：`information_schema.columns` 是服务器级的，原语句没有
+  schema 谓词，另一个 schema 里的同名表会让缺列的表跳过 `ALTER`。
+- **`RunAuditStore.aggregate()` 在 PostgreSQL 上会 panic**：`SUM(bigint)` 在 PG 返回
+  `NUMERIC`（驱动解码成十进制字符串），MySQL 返回 `DECIMAL`（解码成浮点），而代码一律按
+  `.int` 取——PostgreSQL 上触发 "access of union field 'int' while field 'string' is
+  active"。现在按方言加显式转换（PG `::BIGINT`、MySQL `CAST(… AS SIGNED)`），并新增
+  `numericValue` 统一读取 int / float / 十进制字符串三种形态；`count()` 同样走它。
+- **`ai.ops.kpi.query` 在 PostgreSQL 上恒失败**：同样是 `SUM` → `NUMERIC` → 十进制字符串，
+  原实现把 `.string` 直接判为 `error.InvalidMetricValue`，于是每个 SUM 型指标在 PG 上查不了。
+  现在数值字符串按十进制解析；非数值字符串仍然拒绝（不是静默变 0）。
+- **`messaging.OutboxPublisher` 的建表入口容易喂错方言**：`migrationSql()` 一直返回 MySQL
+  DDL（历史默认），SQLite / PostgreSQL 上直接语法错。新增 `migrationSqlFor(driver)` 与
+  `ensureTable(client)`（按连接的方言建表、幂等），并在 `migrationSql()` 的文档里标明它只
+  兼容 MySQL、建议新代码改用前两者。
+- **`zmodu saas` 生成的 schema 同样只有 SQLite 语法**：`saas-schema.sql` 固定发
+  `id INTEGER PRIMARY KEY AUTOINCREMENT`，在 PostgreSQL / MySQL 上照抄即失败。新增
+  `--dialect sqlite|postgres|mysql`（默认 `sqlite`，保持既有行为）与
+  `saas.emitSchemaSqlFor`：PostgreSQL 发 `BIGSERIAL PRIMARY KEY` + `BIGINT`，
+  MySQL 发 `BIGINT AUTO_INCREMENT PRIMARY KEY` + `BIGINT`；`emitSchemaSql` 保留为
+  SQLite 的兼容入口。
+- `docs/reference/API.md` §17 新增「嵌入式表 — 各方言的启动 DDL」清单（outbox /
+  ai_run_audit / approval_queue / web4_invoice / role_permission 各自的建表入口）。
+- **`security.CatalogPermDb`（Path A 的 RBAC catalog）同样只发 SQLite 语法**：
+  `grant()` 用 `INSERT OR IGNORE`（PostgreSQL 在 `OR` 处语法错、MySQL 只认
+  `INSERT IGNORE`），MySQL 下 `ensureSchema()` 的 `PRIMARY KEY (role_name,
+  permission)` 又建在无长度 `TEXT` 上，两者都会让权限播种失败。现按方言生成：
+  SQLite `INSERT OR IGNORE` / PostgreSQL `ON CONFLICT (role_name, permission) DO
+  NOTHING` / MySQL `INSERT IGNORE`，MySQL 的 schema 改用 `VARCHAR(191)`。
+  新增公开的 `schemaSql(driver)` / `grantSql(driver)` 供自定义驱动接线，`SCHEMA`
+  保持原值（SQLite / PostgreSQL 通用）。
+
 ## [0.43.0] - 2026-10-23
 
 ### AI：输出上限字段自适应（`max_tokens` / `max_completion_tokens`）

@@ -61,17 +61,14 @@ pub const X402Store = struct {
     /// safe to repeat — `migrate` is a startup call an app may make on every
     /// boot.
     ///
-    /// The DDL is SQLite's: `INTEGER PRIMARY KEY AUTOINCREMENT` is not accepted
-    /// by PostgreSQL or MySQL, so `migrate` builds no table there (the same is
-    /// true of the framework's other embedded stores). The `ALTER TABLE … ADD
-    /// COLUMN` it pairs with is plain SQL, and the existence check under it is
-    /// dialect-aware, but only the SQLite arm has been exercised.
+    /// The DDL is built per dialect: `INTEGER PRIMARY KEY AUTOINCREMENT` is
+    /// SQLite's spelling, and PostgreSQL / MySQL reject it, which used to leave
+    /// the table non-existent there and turn the first `create()` into
+    /// `relation "web4_invoice" does not exist`. The `ALTER TABLE … ADD COLUMN`
+    /// it pairs with is plain SQL in all three.
     pub fn migrate(self: *Self) !void {
         try sqlx.validateIdentifier(self.table);
-        const sql = try self.allocator.print(
-            "CREATE TABLE IF NOT EXISTS {s} (id INTEGER PRIMARY KEY AUTOINCREMENT, invoice_id TEXT NOT NULL UNIQUE, payee_did TEXT NOT NULL, payer_did TEXT, amount INTEGER NOT NULL, currency TEXT NOT NULL, chain_id INTEGER NOT NULL DEFAULT 1, deadline INTEGER NOT NULL, description TEXT NOT NULL DEFAULT '', status INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, redeemed_at INTEGER, tx_hash TEXT)",
-            .{self.table},
-        );
+        const sql = try createTableSql(self.allocator, self.backend.dialect(), self.table);
         defer self.allocator.free(sql);
         _ = try self.backend.exec(sql, &.{});
         if (!try self.hasColumn("payer_did")) {
@@ -264,6 +261,53 @@ pub const X402Store = struct {
         return if (result.rows_affected > 0) .redeemed else .already_used;
     }
 };
+
+/// `CREATE TABLE` for the invoice ledger, in the connection's dialect. The row
+/// shape is identical in all three; only the id syntax and the types MySQL
+/// requires (`VARCHAR` instead of unbounded `TEXT`) differ. Kept beside
+/// `migrate` so a column added to one arm cannot silently miss the others.
+fn createTableSql(allocator: std.mem.Allocator, driver: sqlx.Driver, table: []const u8) ![]u8 {
+    return switch (driver) {
+        .sqlite => allocator.print(
+            "CREATE TABLE IF NOT EXISTS {s} (id INTEGER PRIMARY KEY AUTOINCREMENT, invoice_id TEXT NOT NULL UNIQUE, payee_did TEXT NOT NULL, payer_did TEXT, amount INTEGER NOT NULL, currency TEXT NOT NULL, chain_id INTEGER NOT NULL DEFAULT 1, deadline INTEGER NOT NULL, description TEXT NOT NULL DEFAULT '', status INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, redeemed_at INTEGER, tx_hash TEXT)",
+            .{table},
+        ),
+        .postgres => allocator.print(
+            "CREATE TABLE IF NOT EXISTS {s} (id BIGSERIAL PRIMARY KEY, invoice_id TEXT NOT NULL UNIQUE, payee_did TEXT NOT NULL, payer_did TEXT, amount BIGINT NOT NULL, currency TEXT NOT NULL, chain_id BIGINT NOT NULL DEFAULT 1, deadline BIGINT NOT NULL, description TEXT NOT NULL DEFAULT '', status INTEGER NOT NULL DEFAULT 0, created_at BIGINT NOT NULL, redeemed_at BIGINT, tx_hash TEXT)",
+            .{table},
+        ),
+        .mysql => allocator.print(
+            "CREATE TABLE IF NOT EXISTS {s} (id BIGINT AUTO_INCREMENT PRIMARY KEY, invoice_id VARCHAR(255) NOT NULL UNIQUE, payee_did VARCHAR(255) NOT NULL, payer_did VARCHAR(255) NULL, amount BIGINT NOT NULL, currency VARCHAR(32) NOT NULL, chain_id BIGINT NOT NULL DEFAULT 1, deadline BIGINT NOT NULL, description VARCHAR(255) NOT NULL DEFAULT '', status INT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL, redeemed_at BIGINT NULL, tx_hash VARCHAR(255) NULL)",
+            .{table},
+        ),
+    };
+}
+
+test "X402Store emits each dialect's CREATE TABLE" {
+    const allocator = std.testing.allocator;
+
+    const pg = try createTableSql(allocator, .postgres, "web4_invoice");
+    defer allocator.free(pg);
+    try std.testing.expect(std.mem.indexOf(u8, pg, "BIGSERIAL PRIMARY KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pg, "AUTOINCREMENT") == null);
+    try std.testing.expect(std.mem.indexOf(u8, pg, "AUTO_INCREMENT") == null);
+
+    const my = try createTableSql(allocator, .mysql, "web4_invoice");
+    defer allocator.free(my);
+    try std.testing.expect(std.mem.indexOf(u8, my, "AUTO_INCREMENT PRIMARY KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, my, "AUTOINCREMENT") == null);
+
+    const lite = try createTableSql(allocator, .sqlite, "web4_invoice");
+    defer allocator.free(lite);
+    try std.testing.expect(std.mem.indexOf(u8, lite, "INTEGER PRIMARY KEY AUTOINCREMENT") != null);
+
+    const columns = [_][]const u8{ "invoice_id", "payee_did", "payer_did", "amount", "currency", "chain_id", "deadline", "description", "status", "created_at", "redeemed_at", "tx_hash" };
+    for ([_][]const u8{ pg, my, lite }) |sql| {
+        for (columns) |column| {
+            try std.testing.expect(std.mem.indexOf(u8, sql, column) != null);
+        }
+    }
+}
 
 test "X402Store creates and redeems an invoice exactly once" {
     const allocator = std.testing.allocator;
@@ -575,9 +619,9 @@ fn probeCatalogColumn(comptime driver: sqlx.Driver) !void {
     }
     var ddl_buf: [512]u8 = undefined;
     // The same row shape in each server's dialect, *without* `payer_did`: the
-    // schema an install older than this column has. (`migrate`'s own CREATE
-    // TABLE is SQLite's — `AUTOINCREMENT` — so on these servers the DDL is the
-    // application's, which is what this probe exists to handle.)
+    // schema an install older than this column has. (`migrate`'s DDL is
+    // dialect-aware now, but an install that predates that still has this
+    // table, and the probe must find the missing column on it either way.)
     const create = try switch (driver) {
         .postgres => std.fmt.bufPrint(&ddl_buf, "CREATE TABLE {s} (id SERIAL PRIMARY KEY, invoice_id TEXT NOT NULL UNIQUE, payee_did TEXT NOT NULL, amount BIGINT NOT NULL, currency TEXT NOT NULL, chain_id BIGINT NOT NULL DEFAULT 1, deadline BIGINT NOT NULL, description TEXT NOT NULL DEFAULT '', status INTEGER NOT NULL DEFAULT 0, created_at BIGINT NOT NULL, redeemed_at BIGINT, tx_hash TEXT)", .{table}),
         .mysql => std.fmt.bufPrint(&ddl_buf, "CREATE TABLE {s} (id INT AUTO_INCREMENT PRIMARY KEY, invoice_id VARCHAR(255) NOT NULL UNIQUE, payee_did VARCHAR(255) NOT NULL, amount BIGINT NOT NULL, currency VARCHAR(32) NOT NULL, chain_id BIGINT NOT NULL DEFAULT 1, deadline BIGINT NOT NULL, description VARCHAR(255) NOT NULL DEFAULT '', status INT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL, redeemed_at BIGINT, tx_hash VARCHAR(255))", .{table}),

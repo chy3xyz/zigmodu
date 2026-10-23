@@ -153,6 +153,8 @@ catalog_slot.set(try router.finish());
 
 For database-backed role permissions, pass `try zmodu.security.CatalogPermDb.loaderFromClient(&db_client)`.
 
+Seed the catalog with `CatalogPermDb.ensureSchema(&db_client)` + `CatalogPermDb.grant(&db_client, role, permission)` once at startup; both are dialect-aware, so the same call works on SQLite, PostgreSQL and MySQL (`grant` is idempotent — re-running it is a no-op).
+
 ### 3.2 Multi-Portal Identity & Custom Permission Loaders
 
 zmodu does not add a custom `type` enum to `JwtPayload`. Instead, map multi-portal identities (e.g., storefront customer, merchant staff, supplier, platform admin) onto standard JWT claims:

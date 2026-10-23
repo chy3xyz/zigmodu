@@ -518,6 +518,20 @@ pub fn Repository(comptime T: type) type {
 
 `data.bulk` (`src/sqlx/Bulk.zig`) generates multi-row statements for hand-written SQL: `bulk.insertMany(alloc, &client, table, columns, rows, dialect, .{ .conflict_columns = ... })`. `sqlx.Client`, `sqlx.Transaction` and `SqlxBackend` are all valid exec targets. A conflict suffix renders as `ON CONFLICT (...) DO UPDATE` on SQLite/PostgreSQL and `ON DUPLICATE KEY UPDATE` on MySQL.
 
+### Embedded tables — startup DDL, per dialect
+
+The framework ships a few tables of its own. Each entry point builds its DDL from the connection's dialect (SQLite / PostgreSQL / MySQL), so the same call works on all three; run them once at startup:
+
+| Table | Call | Notes |
+|-------|------|-------|
+| `event_outbox` | `OutboxPublisher.ensureTable(&client)` | `migrationSql()` alone answers MySQL DDL; prefer `ensureTable` / `migrationSqlFor(driver)` |
+| `ai_run_audit` | `RunAuditStore.init(alloc, &backend).migrate()` | adds missing columns; `created_at` is Unix wall-clock seconds |
+| `approval_queue` | `PersistentApprovalQueue.init(alloc, &backend).migrate()` | durable human-approval queue |
+| `web4_invoice` | `X402Store.init(alloc, &backend).migrate()` | x402 invoice ledger |
+| `role_permission` | `CatalogPermDb.ensureSchema(&client)` + `grant(&client, role, perm)` | Path A RBAC catalog; `grant` is idempotent |
+
+`RunAuditStore.aggregate()` and `kpi.query` read `SUM`/`COUNT` columns through a driver-neutral reader: PostgreSQL returns `NUMERIC` as decimal text and MySQL returns `DECIMAL` as a float, and both are accepted.
+
 ## 18. Cluster
 
 `zmodu.ClusterMembership.init(allocator, node_id, address, bus)` plus `start(config)`, `stop()`, `connectToSeed(node_id, address)`, `getNodeCount()`, `getHealthyNodeCount()`, `getLeader()`. For request-path reads use `zmodu.ClusterView` (`acquire` / `release`, `pick(key)`), not the membership table maintained by the gossip loop. Leader election lives in `src/core/cluster/RaftElection.zig` and is experimental; see [`PRODUCTION_ROADMAP.md`](../archive/status/PRODUCTION_ROADMAP.md).

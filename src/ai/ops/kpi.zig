@@ -77,7 +77,12 @@ fn runSql(
         .int => |i| @floatFromInt(i),
         .float => |f| f,
         .null => 0,
-        .string, .bool => return error.InvalidMetricValue,
+        // PostgreSQL answers `SUM(NUMERIC)` as NUMERIC, which the driver
+        // decodes as decimal text, and MySQL may hand DECIMAL back the same
+        // way — this used to fail every SUM-backed metric on PostgreSQL with
+        // `InvalidMetricValue`. A metric is a number; parse it.
+        .string => |text| std.fmt.parseFloat(f64, text) catch return error.InvalidMetricValue,
+        .bool => return error.InvalidMetricValue,
     };
     _ = allocator;
     return .{ .name = metric.name, .value = value };
@@ -181,6 +186,30 @@ test "kpi.query returns an app-registered metric" {
 
     try std.testing.expectEqual(@as(f64, 100), res.object.get("value").?.float);
     try std.testing.expectEqualStrings("Revenue from paid orders", res.object.get("description").?.string);
+}
+
+test "Kpi.query reads a decimal-text value (SUM on PostgreSQL arrives as NUMERIC text)" {
+    const allocator = std.testing.allocator;
+    var client = sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    _ = try client.exec("CREATE TABLE orders (id INTEGER PRIMARY KEY, amount INTEGER)", &.{});
+    _ = try client.exec("INSERT INTO orders (amount) VALUES (100)", &.{});
+
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    // SQLite hands this back as TEXT — the shape PostgreSQL's NUMERIC takes
+    // once the driver decodes it.
+    const metric = KpiMetric{
+        .name = "revenue",
+        .description = "Revenue",
+        .sql = "SELECT CAST(SUM(amount) AS TEXT) AS value FROM orders",
+    };
+    const res = try query(allocator, &backend, metric);
+    try std.testing.expectEqual(@as(f64, 100), res.value);
+
+    // A non-numeric string stays a refusal, not a zero.
+    const bad = KpiMetric{ .name = "bad", .description = "", .sql = "SELECT 'n/a' AS value" };
+    try std.testing.expectError(error.InvalidMetricValue, query(allocator, &backend, bad));
 }
 
 // Same harness as the "kpi.query returns an app-registered metric" test, with

@@ -57,6 +57,14 @@ Each generated module follows the `@initialized` model (annotated with `//! @ini
 
 ## 3. Zero-Boilerplate CRUD (`zmodu saas` & `http.CrudApi`)
 
+`zmodu saas <model.json>` writes `saas-schema.sql` and the module sources. The schema is applied by your application, so tell the generator which server it will run on:
+
+```bash
+zmodu saas model.json --dialect postgres   # sqlite (default) | postgres | mysql
+```
+
+Without `--dialect` the emitted DDL is SQLite's (`id INTEGER PRIMARY KEY AUTOINCREMENT`); `postgres` emits `BIGSERIAL PRIMARY KEY` + `BIGINT`, `mysql` emits `BIGINT AUTO_INCREMENT PRIMARY KEY`. The same flag semantics apply to embedded framework tables — see the per-store `migrate()` / `ensureTable()` calls in [API](../reference/API.md).
+
 Modules generated with `zmodu saas` use `zmodu.http.CrudApi(Entity, Service, opts)` to register five standard endpoints in a single declaration:
 
 ```zig

@@ -877,24 +877,27 @@ fn cmdRuntime(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8
     if (code != 0) std.process.exit(code);
 }
 
-/// `zmodu saas <model.json> [--out <dir>] [--tenant-column <col>] [--dry-run] [--force]`
+/// `zmodu saas <model.json> [--out <dir>] [--tenant-column <col>] [--dialect <sqlite|postgres|mysql>] [--dry-run] [--force]`
 /// — emit an org-scoped schema from a business model and feed it to the
 /// canonical `zmodu orm` pipeline (model/persistence/service/api + routes).
 fn cmdSaas(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len == 0 or args[0].len == 0) {
-        std.log.err("Usage: zmodu saas <model.json> [--out <dir>] [--tenant-column <col>] [--dry-run] [--force]", .{});
+        std.log.err("Usage: zmodu saas <model.json> [--out <dir>] [--tenant-column <col>] [--dialect <sqlite|postgres|mysql>] [--dry-run] [--force]", .{});
         return error.CliUsage;
     }
     const model_path = args[0];
     var out_dir: []const u8 = "src/modules";
     var tenant_col: []const u8 = "org_id";
+    // The generated schema is applied by the app, so the default stays SQLite
+    // (what this command always emitted) and the flag opts into a server.
+    var dialect: saas_mod.Dialect = .sqlite;
     var dry_run = false;
     var force = false;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--out")) {
             if (i + 1 >= args.len) {
-                std.log.err("Missing value after --out. Usage: zmodu saas <model.json> [--out <dir>] [--tenant-column <col>] [--dry-run] [--force]", .{});
+                std.log.err("Missing value after --out. Usage: zmodu saas <model.json> [--out <dir>] [--tenant-column <col>] [--dialect <sqlite|postgres|mysql>] [--dry-run] [--force]", .{});
                 return error.CliUsage;
             }
             i += 1;
@@ -906,12 +909,22 @@ fn cmdSaas(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !
             }
             i += 1;
             tenant_col = args[i];
+        } else if (std.mem.eql(u8, args[i], "--dialect")) {
+            if (i + 1 >= args.len) {
+                std.log.err("Missing value after --dialect. Usage: zmodu saas <model.json> --dialect <sqlite|postgres|mysql>", .{});
+                return error.CliUsage;
+            }
+            i += 1;
+            dialect = std.meta.stringToEnum(saas_mod.Dialect, args[i]) orelse {
+                std.log.err("Unknown dialect '{s}'. Expected sqlite, postgres or mysql.", .{args[i]});
+                return error.CliUsage;
+            };
         } else if (std.mem.eql(u8, args[i], "--dry-run")) {
             dry_run = true;
         } else if (std.mem.eql(u8, args[i], "--force")) {
             force = true;
         } else {
-            std.log.err("Unknown option for `zmodu saas`: {s}. Usage: zmodu saas <model.json> [--out <dir>] [--tenant-column <col>] [--dry-run] [--force]", .{args[i]});
+            std.log.err("Unknown option for `zmodu saas`: {s}. Usage: zmodu saas <model.json> [--out <dir>] [--tenant-column <col>] [--dialect <sqlite|postgres|mysql>] [--dry-run] [--force]", .{args[i]});
             return error.CliUsage;
         }
     }
@@ -921,7 +934,7 @@ fn cmdSaas(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !
     };
     defer allocator.free(model_json);
 
-    const schema_sql = saas_mod.emitSchemaSql(allocator, model_json) catch |err| {
+    const schema_sql = saas_mod.emitSchemaSqlFor(allocator, model_json, dialect) catch |err| {
         std.log.err("Invalid business model '{s}': {s}", .{ model_path, @errorName(err) });
         return error.CliUsage;
     };
@@ -938,11 +951,13 @@ fn cmdSaas(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !
         const file = try Io.Dir.cwd().createFile(io, schema_path, .{});
         defer file.close(io);
         try file.writeStreamingAll(io, schema_sql);
+        std.log.info("saas: schema written to {s}", .{schema_path});
     }
-    std.log.info("saas: schema written to {s}", .{schema_path});
 
     if (dry_run) {
-        std.log.info("saas: dry-run — schema written, module generation skipped", .{});
+        // `--dry-run` writes nothing, so it must not claim otherwise; print the
+        // schema it would have written instead.
+        std.log.info("saas: dry-run — would write {s}; module generation skipped", .{schema_path});
         return;
     }
     try saas_mod.generateModule(io, allocator, model_json, out_dir);

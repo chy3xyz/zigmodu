@@ -29,17 +29,16 @@ pub const PersistentApprovalQueue = struct {
     /// Create the queue table (idempotent). Call once at startup.
     pub fn migrate(self: *Self) !void {
         try sqlx.validateIdentifier(self.table);
-        const sql = try self.allocator.print(
-            "CREATE TABLE IF NOT EXISTS {s} (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, subject TEXT NOT NULL, amount INTEGER NOT NULL, note TEXT NOT NULL DEFAULT '', step_name TEXT NOT NULL, tenant_id INTEGER, status INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)",
-            .{self.table},
-        );
+        const sql = try createTableSql(self.allocator, self.backend.dialect(), self.table);
         defer self.allocator.free(sql);
         _ = try self.backend.exec(sql, &.{});
     }
 
     pub fn push(self: *Self, item: PendingApproval) !void {
         try sqlx.validateIdentifier(self.table);
-        const now = @import("../../core/Time.zig").monotonicNowSeconds();
+        // Wall clock: a pending row outlives the process, and "waiting since
+        // 3h after boot" is not an answer an operator can act on.
+        const now = @import("../../core/Time.zig").wallClockSeconds(self.backend.client.io);
         if (item.tenant_id) |tid| {
             const sql = try self.allocator.print(
                 "INSERT INTO {s} (run_id, subject, amount, note, step_name, tenant_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
@@ -110,7 +109,7 @@ pub const PersistentApprovalQueue = struct {
     /// a row was updated.
     pub fn resolve(self: *Self, run_id: []const u8, tenant_id: ?i64) !bool {
         try sqlx.validateIdentifier(self.table);
-        const now = @import("../../core/Time.zig").monotonicNowSeconds();
+        const now = @import("../../core/Time.zig").wallClockSeconds(self.backend.client.io);
         const sql = if (tenant_id) |tid| try self.allocator.print(
             "UPDATE {s} SET status = 1, updated_at = ? WHERE run_id = ? AND tenant_id = {d} AND status = 0",
             .{ self.table, tid },
@@ -135,6 +134,27 @@ pub const PersistentApprovalQueue = struct {
         return @intCast((try cursor.next()).?.get("n").?.int);
     }
 };
+
+/// `CREATE TABLE` for the approval queue, in the connection's dialect.
+/// `INTEGER PRIMARY KEY AUTOINCREMENT` is SQLite's spelling and is rejected by
+/// PostgreSQL and MySQL — with it, `migrate()` failed on those servers and the
+/// first `push()` reported `relation "approval_queue" does not exist`.
+fn createTableSql(allocator: std.mem.Allocator, driver: sqlx.Driver, table: []const u8) ![]u8 {
+    return switch (driver) {
+        .sqlite => allocator.print(
+            "CREATE TABLE IF NOT EXISTS {s} (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, subject TEXT NOT NULL, amount INTEGER NOT NULL, note TEXT NOT NULL DEFAULT '', step_name TEXT NOT NULL, tenant_id INTEGER, status INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)",
+            .{table},
+        ),
+        .postgres => allocator.print(
+            "CREATE TABLE IF NOT EXISTS {s} (id BIGSERIAL PRIMARY KEY, run_id TEXT NOT NULL, subject TEXT NOT NULL, amount BIGINT NOT NULL, note TEXT NOT NULL DEFAULT '', step_name TEXT NOT NULL, tenant_id BIGINT, status INTEGER NOT NULL DEFAULT 0, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL)",
+            .{table},
+        ),
+        .mysql => allocator.print(
+            "CREATE TABLE IF NOT EXISTS {s} (id BIGINT AUTO_INCREMENT PRIMARY KEY, run_id VARCHAR(255) NOT NULL, subject VARCHAR(255) NOT NULL, amount BIGINT NOT NULL, note VARCHAR(1024) NOT NULL DEFAULT '', step_name VARCHAR(255) NOT NULL, tenant_id BIGINT NULL, status INT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL)",
+            .{table},
+        ),
+    };
+}
 
 /// Hook for `ApprovalFlow.on_escalated` backed by the persistent queue
 /// (userdata must be `*PersistentApprovalQueue`).
@@ -162,6 +182,32 @@ pub fn queuedEscalationPersistent(
 // allocator before the scan; the failing allocator covers only the copies
 // `listPending` makes (and the growth of `out`), so the induced failures never
 // reach the driver.
+test "PersistentApprovalQueue emits each dialect's CREATE TABLE" {
+    const allocator = std.testing.allocator;
+
+    const pg = try createTableSql(allocator, .postgres, "approval_queue");
+    defer allocator.free(pg);
+    try std.testing.expect(std.mem.indexOf(u8, pg, "BIGSERIAL PRIMARY KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pg, "AUTOINCREMENT") == null);
+    try std.testing.expect(std.mem.indexOf(u8, pg, "AUTO_INCREMENT") == null);
+
+    const my = try createTableSql(allocator, .mysql, "approval_queue");
+    defer allocator.free(my);
+    try std.testing.expect(std.mem.indexOf(u8, my, "AUTO_INCREMENT PRIMARY KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, my, "AUTOINCREMENT") == null);
+
+    const lite = try createTableSql(allocator, .sqlite, "approval_queue");
+    defer allocator.free(lite);
+    try std.testing.expect(std.mem.indexOf(u8, lite, "INTEGER PRIMARY KEY AUTOINCREMENT") != null);
+
+    const columns = [_][]const u8{ "run_id", "subject", "amount", "note", "step_name", "tenant_id", "status", "created_at", "updated_at" };
+    for ([_][]const u8{ pg, my, lite }) |sql| {
+        for (columns) |column| {
+            try std.testing.expect(std.mem.indexOf(u8, sql, column) != null);
+        }
+    }
+}
+
 test "PersistentApprovalQueue.listPending hands back its rows at every allocation point (OOM scan)" {
     const allocator = std.testing.allocator;
     var client = @import("../../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });

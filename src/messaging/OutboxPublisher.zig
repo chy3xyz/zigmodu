@@ -12,6 +12,7 @@
 const std = @import("std");
 const EventBus = @import("../core/EventBus.zig").TypedEventBus;
 const Time = @import("../core/Time.zig");
+const sqlx = @import("../sqlx/sqlx.zig");
 
 /// A single outbox message stored in the database.
 pub const OutboxEntry = struct {
@@ -71,10 +72,31 @@ pub const OutboxPublisher = struct {
         return .{ .allocator = allocator, .config = config };
     }
 
-    /// Build SQL to create the outbox table (MySQL dialect, backwards
-    /// compatible default). Call once at startup.
+    /// Build SQL to create the outbox table (MySQL dialect — the value this
+    /// returned before dialects existed; kept so existing callers are not
+    /// broken).
+    ///
+    /// Prefer `ensureTable` (when you have a client) or `migrationSqlFor`: this
+    /// no-argument form answers MySQL DDL, and SQLite / PostgreSQL reject
+    /// `BIGINT AUTO_INCREMENT`.
     pub fn migrationSql() []const u8 {
         return migrationSqlWithDialect(.mysql);
+    }
+
+    /// Build the outbox DDL for `driver` — the dialect-safe form of
+    /// `migrationSql()`.
+    pub fn migrationSqlFor(driver: sqlx.Driver) []const u8 {
+        return migrationSqlWithDialect(switch (driver) {
+            .sqlite => .sqlite,
+            .postgres => .postgres,
+            .mysql => .mysql,
+        });
+    }
+
+    /// Create the outbox table on `client`'s connection, in its dialect.
+    /// Call once at startup; `CREATE TABLE IF NOT EXISTS` makes it idempotent.
+    pub fn ensureTable(client: *sqlx.Client) !void {
+        _ = try client.exec(migrationSqlFor(client.config.driver), &.{});
     }
 
     /// Build SQL to create the outbox table for the given dialect.
@@ -512,6 +534,23 @@ test "OutboxPublisher migrationSql dialects" {
 
     const mysql = OutboxPublisher.migrationSqlWithDialect(.mysql);
     try std.testing.expectEqualStrings(OutboxPublisher.migrationSql(), mysql);
+}
+
+test "OutboxPublisher migrationSqlFor maps the driver, ensureTable builds the table" {
+    // `migrationSql()` answers MySQL DDL; the driver-aware entry points must
+    // not hand SQLite a `BIGINT AUTO_INCREMENT`.
+    try std.testing.expectEqualStrings(OutboxPublisher.migrationSqlWithDialect(.sqlite), OutboxPublisher.migrationSqlFor(.sqlite));
+    try std.testing.expectEqualStrings(OutboxPublisher.migrationSqlWithDialect(.postgres), OutboxPublisher.migrationSqlFor(.postgres));
+    try std.testing.expectEqualStrings(OutboxPublisher.migrationSql(), OutboxPublisher.migrationSqlFor(.mysql));
+    try std.testing.expect(std.mem.indexOf(u8, OutboxPublisher.migrationSqlFor(.sqlite), "AUTO_INCREMENT") == null);
+
+    const allocator = std.testing.allocator;
+    var client = sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    try OutboxPublisher.ensureTable(&client);
+    // Idempotent: a second startup call must not fail.
+    try OutboxPublisher.ensureTable(&client);
 }
 
 test "OutboxPublisher buildResubmit full reset" {

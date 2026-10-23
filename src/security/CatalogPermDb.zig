@@ -1,7 +1,10 @@
-//! SQLite-backed role → permission loader for ComptimeRouter catalog JWT.
+//! Role → permission loader for ComptimeRouter catalog JWT, backed by SQL.
 //!
 //! Pair with `http.jwtAuthFromCatalogWithPermissions` + `permissionGateWith(.{ .mode = .rbac })`.
 //! Does not touch `ctx.user_data` (safe with ComptimeRouter).
+//!
+//! Works on SQLite, PostgreSQL and MySQL: the schema and the idempotent grant
+//! are built per driver (`schemaSql` / `grantSql`).
 //!
 //! Schema:
 //!   CREATE TABLE role_permission (
@@ -23,13 +26,44 @@ pub const SCHEMA =
     \\)
 ;
 
+/// MySQL rejects a `TEXT` column in a primary key without a key length, so the
+/// same table takes bounded `VARCHAR` there.
+pub const MYSQL_SCHEMA =
+    \\CREATE TABLE IF NOT EXISTS role_permission (
+    \\    role_name VARCHAR(191) NOT NULL,
+    \\    permission VARCHAR(191) NOT NULL,
+    \\    PRIMARY KEY (role_name, permission)
+    \\)
+;
+
+/// DDL for `driver`.
+pub fn schemaSql(driver: sqlx.Driver) []const u8 {
+    return switch (driver) {
+        .sqlite, .postgres => SCHEMA,
+        .mysql => MYSQL_SCHEMA,
+    };
+}
+
 pub fn ensureSchema(client: *sqlx.Client) !void {
-    _ = try client.exec(SCHEMA, &.{});
+    _ = try client.exec(schemaSql(client.config.driver), &.{});
+}
+
+/// Idempotent grant for `driver`.
+///
+/// `INSERT OR IGNORE` is SQLite's spelling: PostgreSQL reports a syntax error
+/// at `OR`, and MySQL expects `INSERT IGNORE`. The PostgreSQL form names the
+/// conflict target, which matches the composite primary key above.
+pub fn grantSql(driver: sqlx.Driver) []const u8 {
+    return switch (driver) {
+        .sqlite => "INSERT OR IGNORE INTO role_permission (role_name, permission) VALUES (?, ?)",
+        .postgres => "INSERT INTO role_permission (role_name, permission) VALUES (?, ?) ON CONFLICT (role_name, permission) DO NOTHING",
+        .mysql => "INSERT IGNORE INTO role_permission (role_name, permission) VALUES (?, ?)",
+    };
 }
 
 pub fn grant(client: *sqlx.Client, role: []const u8, permission: []const u8) !void {
     _ = try client.exec(
-        "INSERT OR IGNORE INTO role_permission (role_name, permission) VALUES (?, ?)",
+        grantSql(client.config.driver),
         &.{ .{ .string = role }, .{ .string = permission } },
     );
 }
@@ -178,6 +212,7 @@ test "CatalogPermDb loads permissions from sqlite" {
 
     try ensureSchema(&client);
     try grant(&client, "admin", "tenant:suspend");
+    try grant(&client, "admin", "tenant:suspend"); // idempotent: the second grant must not raise
     try grant(&client, "admin", "tenant:read");
     try grant(&client, "user", "tenant:read");
 
@@ -190,6 +225,29 @@ test "CatalogPermDb loads permissions from sqlite" {
     defer allocator.free(user_csv);
     try std.testing.expect(std.mem.indexOf(u8, user_csv, "tenant:suspend") == null);
     try std.testing.expect(std.mem.indexOf(u8, user_csv, "tenant:read") != null);
+}
+
+test "CatalogPermDb emits each dialect's schema and grant" {
+    // SQLite's `INSERT OR IGNORE` is rejected by PostgreSQL (`OR` is a syntax
+    // error there) and not understood by MySQL either, so each arm is asserted
+    // apart rather than assumed equivalent.
+    const lite = grantSql(.sqlite);
+    try std.testing.expect(std.mem.indexOf(u8, lite, "INSERT OR IGNORE") != null);
+
+    const pg = grantSql(.postgres);
+    try std.testing.expect(std.mem.indexOf(u8, pg, "ON CONFLICT (role_name, permission) DO NOTHING") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pg, "INSERT OR IGNORE") == null);
+
+    const my = grantSql(.mysql);
+    try std.testing.expect(std.mem.indexOf(u8, my, "INSERT IGNORE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, my, "ON CONFLICT") == null);
+
+    // A `TEXT` column cannot carry the composite key on MySQL without a key
+    // length, so that arm takes bounded `VARCHAR`.
+    try std.testing.expect(std.mem.indexOf(u8, schemaSql(.sqlite), "TEXT NOT NULL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schemaSql(.postgres), "TEXT NOT NULL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schemaSql(.mysql), "VARCHAR(191)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schemaSql(.mysql), "TEXT NOT NULL") == null);
 }
 
 test "each loaderFromClient reads its own database" {

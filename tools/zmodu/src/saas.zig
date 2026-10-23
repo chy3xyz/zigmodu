@@ -15,6 +15,40 @@ const std = @import("std");
 
 const SqlType = enum { text, integer, real };
 
+/// Target database for `emitSchemaSqlFor`. Auto-increment syntax and the
+/// numeric types differ per server, and nothing downstream rewrites the DDL.
+pub const Dialect = enum { sqlite, postgres, mysql };
+
+const TypeMap = struct {
+    auto_id: []const u8,
+    text: []const u8,
+    integer: []const u8,
+    real: []const u8,
+};
+
+fn typeMapFor(dialect: Dialect) TypeMap {
+    return switch (dialect) {
+        .sqlite => .{
+            .auto_id = "INTEGER PRIMARY KEY AUTOINCREMENT",
+            .text = "TEXT",
+            .integer = "INTEGER",
+            .real = "REAL",
+        },
+        .postgres => .{
+            .auto_id = "BIGSERIAL PRIMARY KEY",
+            .text = "TEXT",
+            .integer = "BIGINT",
+            .real = "DOUBLE PRECISION",
+        },
+        .mysql => .{
+            .auto_id = "BIGINT AUTO_INCREMENT PRIMARY KEY",
+            .text = "TEXT",
+            .integer = "BIGINT",
+            .real = "DOUBLE",
+        },
+    };
+}
+
 fn sqlTypeFor(field_type: []const u8) !SqlType {
     if (std.mem.eql(u8, field_type, "string") or std.mem.eql(u8, field_type, "text") or std.mem.eql(u8, field_type, "date")) return .text;
     if (std.mem.eql(u8, field_type, "number") or std.mem.eql(u8, field_type, "boolean")) return .integer;
@@ -22,8 +56,19 @@ fn sqlTypeFor(field_type: []const u8) !SqlType {
 }
 
 /// Convert a business model JSON document into CREATE TABLE SQL for the
-/// `zmodu orm` pipeline. Each entity gets `org_id` as the tenant column.
+/// `zmodu orm` pipeline, in SQLite's dialect (the historical default).
 pub fn emitSchemaSql(allocator: std.mem.Allocator, model_json: []const u8) ![]const u8 {
+    return emitSchemaSqlFor(allocator, model_json, .sqlite);
+}
+
+/// Convert a business model JSON document into CREATE TABLE SQL for `dialect`.
+/// Each entity gets `org_id` as the tenant column.
+///
+/// The schema is applied by the application, not by the generator, so it has to
+/// speak the server's dialect: `INTEGER PRIMARY KEY AUTOINCREMENT` is SQLite's
+/// spelling and PostgreSQL / MySQL reject it (`zmodu saas --dialect postgres`).
+pub fn emitSchemaSqlFor(allocator: std.mem.Allocator, model_json: []const u8, dialect: Dialect) ![]const u8 {
+    const types = typeMapFor(dialect);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, model_json, .{});
     defer parsed.deinit();
     const root = parsed.value;
@@ -42,7 +87,9 @@ pub fn emitSchemaSql(allocator: std.mem.Allocator, model_json: []const u8) ![]co
 
         try buf.appendSlice(allocator, "CREATE TABLE ");
         try buf.appendSlice(allocator, name_v.string);
-        try buf.appendSlice(allocator, " (\n  id INTEGER PRIMARY KEY AUTOINCREMENT,\n  org_id INTEGER NOT NULL,\n");
+        try buf.appendSlice(allocator, " (\n  id ");
+        try buf.appendSlice(allocator, types.auto_id);
+        try buf.appendSlice(allocator, ",\n  org_id INTEGER NOT NULL,\n");
         for (fields_v.array.items) |f| {
             if (f != .object) return error.InvalidModel;
             const fname = f.object.get("name") orelse return error.InvalidModel;
@@ -53,9 +100,9 @@ pub fn emitSchemaSql(allocator: std.mem.Allocator, model_json: []const u8) ![]co
             try buf.appendSlice(allocator, fname.string);
             try buf.appendSlice(allocator, " ");
             try buf.appendSlice(allocator, switch (sql_type) {
-                .text => "TEXT",
-                .integer => "INTEGER",
-                .real => "REAL",
+                .text => types.text,
+                .integer => types.integer,
+                .real => types.real,
             });
             if (f.object.get("required")) |req| {
                 if (req == .bool and req.bool) try buf.appendSlice(allocator, " NOT NULL");
@@ -649,6 +696,39 @@ test "emitSchemaSql produces org-scoped CREATE TABLE" {
     try std.testing.expect(std.mem.indexOf(u8, sql, "customer TEXT NOT NULL") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "amount INTEGER") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "created_at INTEGER NOT NULL") != null);
+}
+
+test "emitSchemaSqlFor speaks each target dialect" {
+    const allocator = std.testing.allocator;
+    const model =
+        \\{"entities":[{"name":"orders","fields":[
+        \\  {"name":"customer","type":"string","required":true},
+        \\  {"name":"amount","type":"number"},
+        \\  {"name":"ratio","type":"number"}
+        \\]}]}
+    ;
+
+    // PostgreSQL and MySQL reject SQLite's `AUTOINCREMENT`, so the id column is
+    // the part that must never be shared verbatim.
+    const pg = try emitSchemaSqlFor(allocator, model, .postgres);
+    defer allocator.free(pg);
+    try std.testing.expect(std.mem.indexOf(u8, pg, "id BIGSERIAL PRIMARY KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pg, "amount BIGINT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pg, "AUTOINCREMENT") == null);
+    try std.testing.expect(std.mem.indexOf(u8, pg, "AUTO_INCREMENT") == null);
+
+    const my = try emitSchemaSqlFor(allocator, model, .mysql);
+    defer allocator.free(my);
+    try std.testing.expect(std.mem.indexOf(u8, my, "id BIGINT AUTO_INCREMENT PRIMARY KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, my, "AUTOINCREMENT") == null);
+
+    // The historical entry point keeps answering SQLite DDL.
+    const lite = try emitSchemaSql(allocator, model);
+    defer allocator.free(lite);
+    const lite_explicit = try emitSchemaSqlFor(allocator, model, .sqlite);
+    defer allocator.free(lite_explicit);
+    try std.testing.expect(std.mem.indexOf(u8, lite, "id INTEGER PRIMARY KEY AUTOINCREMENT") != null);
+    try std.testing.expectEqualStrings(lite, lite_explicit);
 }
 
 test "emitSchemaSql rejects unsupported types" {

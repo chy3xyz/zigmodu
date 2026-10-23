@@ -100,7 +100,7 @@ All AI business tools (`ai.approval`, `ai.recon`, `ai.notify`, `ai.risk`, `ai.al
 
 `zmodu.ai.approval_api` provides an in-memory queue: attach `queuedEscalation` to `ApprovalFlow.on_escalated` and escalated runs enqueue themselves. The `ApprovalApi` ComptimeRouter module exposes `GET /approvals/pending`, `POST /approvals/{id}/approve` and `POST /approvals/{id}/reject`, the last two gated by `permission = approval:decide`. The queue is application-owned memory; pair it with an outbox consumer or a database when it must survive restarts.
 
-`zmodu.ai.approval_store.PersistentApprovalQueue` has the same interface (`push`, `listPending`, `resolve`, `count`) but stores rows in SQL (`migrate()` creates the table, so restarts do not lose state). `queuedEscalationPersistent` is its escalation hook, and `ApprovalApi` is generic over both (`ApprovalApi(ApprovalQueue)` or `ApprovalApi(PersistentApprovalQueue)`).
+`zmodu.ai.approval_store.PersistentApprovalQueue` has the same interface (`push`, `listPending`, `resolve`, `count`) but stores rows in SQL (`migrate()` creates the table in the connection's dialect — SQLite, PostgreSQL or MySQL — so restarts do not lose state; call it once at startup). `queuedEscalationPersistent` is its escalation hook, and `ApprovalApi` is generic over both (`ApprovalApi(ApprovalQueue)` or `ApprovalApi(PersistentApprovalQueue)`).
 
 `registerApprovalRequestSkills` exposes `approval.request` (subject plus amount; chain and policy are application-registered), so an `.agent` step can request approval and the run resumes with `resumeRun` after a human decides.
 

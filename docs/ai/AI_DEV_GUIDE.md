@@ -241,7 +241,7 @@ p.risk = review.toPort();
 ## 8. Observability
 
 - `zmodu.ai.observability.AiMetrics` merges `WorkflowMetrics`, `AgentMetrics` and `TokenQuota` into one Prometheus document; attach the pointers and names and a single `/metrics` endpoint covers the AI stack.
-- `zmodu.ai.run_audit.RunAuditStore` stores workflow, agent and approval run history (`GET /api/ai/runs`, tenant-scoped). Each row carries `prompt_tokens` / `completion_tokens` (`Agent` accumulates them; `recordRunWithUsage` serves custom entry points), making it the persistent usage ledger. In-memory `TokenQuota` is lost on restart, so billing and settlement read this table. `migrate()` adds missing columns by consulting the catalog.
+- `zmodu.ai.run_audit.RunAuditStore` stores workflow, agent and approval run history (`GET /api/ai/runs`, tenant-scoped). Each row carries `prompt_tokens` / `completion_tokens` (`Agent` accumulates them; `recordRunWithUsage` serves custom entry points), making it the persistent usage ledger. In-memory `TokenQuota` is lost on restart, so billing and settlement read this table. `migrate()` creates the table in the connection's dialect (SQLite, PostgreSQL, MySQL) and adds missing columns by consulting the catalog; call it once at startup before the first run. `created_at` is Unix wall-clock seconds, so `aggregate`'s `since_seconds` window means the same after a restart.
 - `mgr.listProviders(allocator)` snapshots status, failures and call counts per provider/key; `enableKey` and `enableProvider` allow manual intervention.
 - Model-free debugging: inject fake JSON through `LlmPolicyCtx.json_fn` (`examples/llm-policies`), or point `AiProvider` at a local mock OpenAI endpoint (the agent end-to-end tests do this).
 
