@@ -1,6 +1,6 @@
 # Engineering Best Practices
 
-Version: zmodu **v0.43.0** · Zig 0.17.0
+Version: zmodu **v0.43.1** · Zig 0.17.0
 
 This guide consolidates the architectural, security, concurrency, resilience, and testing practices for building production services with zmodu.
 
@@ -169,4 +169,4 @@ bash scripts/test-fast.sh --force-run
 - [ ] `http.productionProfile`, `zmodu.panicHook`, and `zmodu.Preflight` are wired in `src/main.zig`.
 
 ---
-Version: zmodu **v0.43.0**
+Version: zmodu **v0.43.1**

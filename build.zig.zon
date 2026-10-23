@@ -1,6 +1,6 @@
 .{
     .name = .zmodu,
-    .version = "0.43.0",
+    .version = "0.43.1",
     .fingerprint = 0xde7987a02b121580,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{},

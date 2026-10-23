@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.43.1] - 2026-10-23
 
 ### 修复：嵌入式存储的 DDL 只写 SQLite 语法（PostgreSQL / MySQL 上建表失败）
 
