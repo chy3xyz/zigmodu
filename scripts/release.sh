@@ -142,6 +142,11 @@ perl -0pi -e "s/\*\*框架版本\*\*: v$OLD/**框架版本**: v$VERSION/" docs/a
 perl -0pi -e "s/zmodu \*\*v$OLD\*\*/zmodu **v$VERSION**/" docs/archive/status/EVALUATION_REPORT.md
 perl -0pi -e "s/\*\*版本口径\*\*: v$OLD/**版本口径**: v$VERSION/" docs/archive/status/PRODUCTION_ROADMAP.md
 perl -0pi -e "s/\*\*本文描述的版本\*\*：zmodu v$OLD/**本文描述的版本**：zmodu v$VERSION/" docs/guide/BEST_PRACTICES.md
+# BEST_PRACTICES carries two self-declared footers ("Version: zmodu **vX**",
+# top and bottom) that check-version.sh gates on; bump both, or the gate goes
+# red on every release. Narrow to the footer form so historical mentions in
+# the body stay accurate.
+perl -0pi -e "s/^(Version: zmodu \*\*)v$OLD(\*\*)/\${1}v$VERSION\${2}/mg" docs/guide/BEST_PRACTICES.md
 fi
 
 # 2. CHANGELOG: promote Unreleased to the new version.
